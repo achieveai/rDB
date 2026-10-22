@@ -8289,4 +8289,186 @@ mod tests {
             Ok(seen) => panic!("a token from before the push still read: {seen:?}"),
         }
     }
+
+    /// A raw write of `value` over the root of `object`, as `rdb_dev admin damage` sends it.
+    fn damage_write(request: u64, object: &[u8], value: Bytes) -> TxnRequest {
+        TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(request),
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: root_key(TenantId(1), AFFINITY, object).to_bytes(),
+                value,
+                expected_version: None,
+            }],
+        }
+    }
+
+    /// A sound document envelope with `codec_version` `0x02` and its digest recomputed: a record
+    /// a newer build could have written, as `rdb_dev admin damage --as newer` writes it.
+    fn newer_build_document() -> Bytes {
+        use rdb_value::envelope::{digest, seal, Kind, HEADER_LEN};
+        let mut bytes = seal(Kind::Document, &[0xf6]).expect("a null fits").to_vec();
+        bytes[2] = 0x02;
+        let head: [u8; 8] = bytes[..8].try_into().expect("a header is 40 bytes");
+        let sum = digest(&head, &bytes[HEADER_LEN..]);
+        bytes[8..HEADER_LEN].copy_from_slice(&sum);
+        Bytes::from(bytes)
+    }
+
+    fn clear_call(request: u64, object: &'static [u8]) -> ClientCall {
+        compile_change(request, object, Change::Clear, None)
+    }
+
+    /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
+    /// given without sending are reads, so a node gives them only while a read would be given.
+    /// Admitting: a healthy object is CONDITION_FAILED, a missing one `unchanged`, a newer
+    /// build's one INCOMPATIBLE_VERSION, and a clear with an expect INVALID_ARGUMENT, none
+    /// naming a request. Fenced: healthy and missing are refused as a plain read is, with
+    /// `no_mutation`, never CONDITION_FAILED or `unchanged`; newer is still
+    /// INCOMPATIBLE_VERSION, which claims nothing about the object; a damaged one compiles, is
+    /// sent, and the kernel refuses it. Once node 1 admits again that clear publishes.
+    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn m9_s6_a_clear_answers_without_sending_only_while_a_read_would_be_answered() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let doc = || Change::Doc(Delta(vec![Op::Replace(text("v"))]));
+        assert_eq!(
+            trio.write(compile_change(1, b"healthy", doc(), None)),
+            Ok(2)
+        );
+        assert_eq!(
+            trio.write(compile_change(2, b"damaged", doc(), None)),
+            Ok(3)
+        );
+        assert_eq!(trio.write(compile_change(3, b"newer", doc(), None)), Ok(4));
+        let broken = Bytes::from_static(b"damaged");
+        assert_eq!(trio.sent(damage_write(4, b"damaged", broken)), Ok(5));
+        assert_eq!(
+            trio.sent(damage_write(5, b"newer", newer_build_document())),
+            Ok(6)
+        );
+
+        let kind = |answer| refusal(answer).0;
+        let (not_damaged, _, _, request) = refusal(trio.ask(clear_call(6, b"healthy")));
+        assert_eq!((not_damaged, request), (ErrorKind::ConditionFailed, false));
+        match trio.ask(clear_call(7, b"missing")) {
+            Answer::Unchanged => {}
+            other => panic!("a clear of nothing: {other:?}"),
+        }
+        let newer = (ErrorKind::IncompatibleVersion, RetryRule::Quarantine, false);
+        let quarantined = |answer| {
+            let (kind, retry, _, request) = refusal(answer);
+            (kind, retry, request)
+        };
+        assert_eq!(quarantined(trio.ask(clear_call(8, b"newer"))), newer);
+        let expect = Some(Expected::Version(2));
+        assert_eq!(
+            kind(trio.ask(compile_change(9, b"healthy", Change::Clear, expect))),
+            ErrorKind::InvalidArgument,
+            "a clear takes no expect"
+        );
+
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
+        let read = ClientCall::Get {
+            identity: identity(10),
+            object: Bytes::from_static(b"healthy"),
+            look: Look::Doc,
+        };
+        let refused = match trio.ask(read) {
+            Answer::Read {
+                outcome: ReadServiceOutcome::Rejected(kind),
+                ..
+            } => crate::db::refused_read(kind),
+            other => panic!("a read while fenced: {other:?}"),
+        };
+        assert_eq!(refused.kind, ErrorKind::LeaseExpired, "{refused:?}");
+        for (request, object) in [(11, &b"healthy"[..]), (12, &b"missing"[..])] {
+            assert_eq!(
+                refusal(trio.ask(clear_call(request, object))),
+                (refused.kind, refused.retry, true, false),
+                "{} while fenced, as the read but sending nothing",
+                String::from_utf8_lossy(object)
+            );
+        }
+        assert_eq!(
+            quarantined(trio.ask(clear_call(13, b"newer"))),
+            newer,
+            "newer while fenced"
+        );
+        let request = trio.compiled(clear_call(14, b"damaged"));
+        assert_eq!(
+            trio.sent(request),
+            Err(Refused::ByKernel(ErrorKind::LeaseExpired)),
+            "a damaged object's clear is sent, and the fenced kernel refuses it"
+        );
+
+        trio.mem.stop_failing();
+        trio.ready();
+        assert!(trio.write(clear_call(15, b"damaged")).is_ok(), "cleared");
+        match trio.ask(clear_call(16, b"damaged")) {
+            Answer::Unchanged => {}
+            other => panic!("a clear once cleared: {other:?}"),
+        }
+    }
+
+    /// M9 S6 contract 5, held copies, guard 15: with both secondaries cut off, node 1 applies a
+    /// clear that cannot publish. The clear asked again meanwhile finds nothing stored, above
+    /// P1's published seq, so it is UNKNOWN_OUTCOME naming no request, never `unchanged`: the
+    /// first clear may still be lost. After the heal the held clear publishes, and the next is
+    /// `unchanged`. Trio, about 1 s.
+    #[test]
+    fn m9_s6_a_clear_asked_again_before_the_first_publishes_is_an_unknown_outcome() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let doc = Change::Doc(Delta(vec![Op::Replace(text("v"))]));
+        assert_eq!(trio.write(compile_change(1, b"d", doc, None)), Ok(2));
+        let broken = Bytes::from_static(b"damaged");
+        assert_eq!(trio.sent(damage_write(2, b"d", broken)), Ok(3));
+        let request = trio.compiled(clear_call(3, b"d"));
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let held = trio.call(ClientCall::Resend { request });
+        trio.until("node 1 applied the clear", |trio| {
+            (trio.head() == Some(4)).then_some(())
+        });
+
+        assert_eq!(
+            refusal(trio.ask(clear_call(4, b"d"))),
+            (
+                ErrorKind::UnknownOutcome,
+                RetryRule::QueryStatus,
+                false,
+                false
+            ),
+            "nothing is stored, and that is not published"
+        );
+        assert!(held.try_recv().is_err(), "no copy acknowledged the clear");
+
+        trio.links.heal_all();
+        match trio.answer(&held) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(4)),
+            other => panic!("the held clear after the heal: {other:?}"),
+        }
+        match trio.ask(clear_call(5, b"d")) {
+            Answer::Unchanged => {}
+            other => panic!("a clear once published: {other:?}"),
+        }
+    }
 }

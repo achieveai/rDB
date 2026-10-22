@@ -6,16 +6,19 @@
 mod common;
 
 use bytes::Bytes;
-use common::{int, text, Kernel};
-use rdb_core::{AffinityId, TenantId};
+use common::{float, int, text, Kernel, Refused};
+use rdb_core::{AffinityId, Condition, Generation, Mutation, TenantId};
+use rdb_value::blob::{publish, put_chunk, read_blob, read_range, Upload};
 use rdb_value::cbor::{decode, encode};
 use rdb_value::collection::{collection, compile_collection, members, CollectionKind, ElemOp};
+use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::envelope::{digest, open, seal, EnvelopeError, Kind};
-use rdb_value::keys::{element_key, parse, root_key, RootKey, Sub};
+use rdb_value::keys::{chunk_key, element_key, item_key, parse, root_key, RootKey, Sub};
 use rdb_value::list::{compile_list, create_list, items, list, ListOp, Start, DEFAULT_BLOCK_MAX};
 use rdb_value::repair::clear_object;
 use rdb_value::value::{Int, MapKey, Value};
-use rdb_value::{BlockFault, Corrupt, Expected, ValueError};
+use rdb_value::{compile, read, BlockFault, Corrupt, Expected, ValueError};
+use sha2::{Digest as _, Sha256};
 
 fn object(id: &[u8]) -> RootKey {
     root_key(TenantId(1), AffinityId(1), id)
@@ -351,10 +354,440 @@ fn p5_upload_chunks_alone_are_named_and_not_cleared() {
         Bytes::from_static(b"chunk"),
     );
     let got = clear_object(&k.snapshot(), &root);
-    assert_eq!(
-        got,
-        Err(ValueError::Apply(rdb_value::delta::ApplyError::OnlyChunks))
-    );
+    assert_eq!(got, Err(ValueError::Apply(ApplyError::OnlyChunks)));
     let text = got.unwrap_err().to_string();
     assert!(text.contains("blob gc"), "{text}");
+}
+
+// ---- material contracts (after tester-s6's thumbs-up on c3fd2b3) ----------------------------
+
+/// The kinds a clear proves damaged, each by its own read.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    Doc,
+    Map,
+    Set,
+    List,
+    Blob,
+}
+
+const SHAPES: [Shape; 5] = [Shape::Doc, Shape::Map, Shape::Set, Shape::List, Shape::Blob];
+
+/// The upload every blob here is written under.
+const UP: Upload = [7; 16];
+
+/// A blob's bytes: three chunks of 4.
+const BLOB: &[u8] = b"0123456789";
+
+/// Create a healthy `shape` at `root` as the app writes it, through the kernel's checks.
+fn create(k: &mut Kernel, root: &RootKey, shape: Shape) {
+    let s = k.snapshot();
+    match shape {
+        Shape::Doc => {
+            let delta = Delta(vec![Op::Replace(text("v"))]);
+            k.commit(&compile(&s, root, Expected::Absent, &delta).unwrap());
+        }
+        Shape::Map => {
+            let ops = [
+                ElemOp::Put(text("a"), text("1")),
+                ElemOp::Put(text("b"), text("2")),
+            ];
+            let made =
+                compile_collection(&s, root, CollectionKind::Map, Expected::Absent, &ops).unwrap();
+            k.commit(&made);
+        }
+        Shape::Set => {
+            let ops = [ElemOp::Add(int(1)), ElemOp::Add(int(2))];
+            let made =
+                compile_collection(&s, root, CollectionKind::Set, Expected::Absent, &ops).unwrap();
+            k.commit(&made);
+        }
+        Shape::List => {
+            let push: Vec<_> = ["x", "y", "z"]
+                .iter()
+                .map(|v| ListOp::Push(text(v)))
+                .collect();
+            let made = create_list(&s, root, false, DEFAULT_BLOCK_MAX, &push).unwrap();
+            k.commit(made.compiled());
+        }
+        Shape::Blob => {
+            for (index, piece) in (0..).zip(BLOB.chunks(4)) {
+                k.commit(&put_chunk(&k.snapshot(), root, &UP, index, piece).unwrap());
+            }
+            let sha: [u8; 32] = Sha256::digest(BLOB).into();
+            let made = publish(
+                &k.snapshot(),
+                root,
+                Expected::Absent,
+                &UP,
+                BLOB.len() as u64,
+                4,
+                &sha,
+                Generation(k.generation),
+            )
+            .unwrap();
+            k.commit(&made);
+        }
+    }
+}
+
+/// The record of `shape` that [`damage`] breaks: the root of a document, an element of a map
+/// or set, a list's block, a blob's middle chunk.
+fn damaged_key(k: &Kernel, root: &RootKey, shape: Shape) -> Bytes {
+    match shape {
+        Shape::Doc => root.to_bytes(),
+        Shape::Map => element_key(root, &text("a")).unwrap(),
+        Shape::Set => element_key(root, &int(1)).unwrap(),
+        Shape::List => k
+            .records
+            .keys()
+            .find(|key| parse(key).is_ok_and(|p| p.sub == Sub::Block && p.slot.is_none()))
+            .expect("the list has a block base")
+            .clone(),
+        Shape::Blob => chunk_key(root, &UP, 1),
+    }
+}
+
+/// Break one record of `shape` in place, at the version it had: what `admin damage` does.
+fn damage(k: &mut Kernel, root: &RootKey, shape: Shape) {
+    let key = damaged_key(k, root, shape);
+    let at = k.records[&key].0;
+    k.records.insert(key, (at, Bytes::from_static(b"damaged")));
+}
+
+/// The whole object as the app reads it: `true` when it reads back, `false` when it is absent.
+fn whole(k: &Kernel, root: &RootKey, shape: Shape) -> Result<bool, ValueError> {
+    let s = k.snapshot();
+    match shape {
+        Shape::Doc => read(&s, root).map(|found| found.is_some()),
+        Shape::Map | Shape::Set => match collection(&s, root)? {
+            None => Ok(false),
+            Some(_) => members(&s, root, None, usize::MAX).map(|_| true),
+        },
+        Shape::List => match list(&s, root)? {
+            None => Ok(false),
+            Some(_) => items(&s, root, Start::Position(0), usize::MAX).map(|_| true),
+        },
+        Shape::Blob => match read_blob(&s, root)? {
+            None => Ok(false),
+            Some(blob) => read_range(&s, root, 0, blob.manifest.size).map(|_| true),
+        },
+    }
+}
+
+/// Clear `root` batch by batch until nothing is stored; the number of batches.
+fn clear_to_the_end(k: &mut Kernel, root: &RootKey) -> usize {
+    let mut batches = 0;
+    while let Some(cleared) = clear_object(&k.snapshot(), root).unwrap() {
+        k.commit_any_order(&cleared.compiled);
+        batches += 1;
+        assert!(batches < 10, "the clear ends");
+    }
+    batches
+}
+
+/// Contract 1: an admin clears a damaged object of every kind, the object then reads as absent
+/// with nothing left under it, and the app creates it again as new.
+#[test]
+fn contract_1_every_kind_damaged_is_cleared_to_absent_and_created_again() {
+    for shape in SHAPES {
+        let mut k = Kernel::new();
+        let root = object(b"o");
+        create(&mut k, &root, shape);
+        assert_eq!(whole(&k, &root, shape), Ok(true), "{shape:?} healthy");
+        damage(&mut k, &root, shape);
+        let read = whole(&k, &root, shape);
+        assert!(
+            matches!(read, Err(ValueError::Corrupt(_))),
+            "{shape:?} damaged: {read:?}"
+        );
+        assert_eq!(clear_to_the_end(&mut k, &root), 1, "{shape:?}");
+        assert!(k.records.is_empty(), "{shape:?}: {:?}", k.records.keys());
+        assert_eq!(whole(&k, &root, shape), Ok(false), "{shape:?} absent");
+        create(&mut k, &root, shape);
+        assert_eq!(whole(&k, &root, shape), Ok(true), "{shape:?} created again");
+    }
+}
+
+/// Contract 2: a healthy object of every kind, an empty one, a missing one and a newer build's
+/// one compile no clear at all. The host's answers to these, and that they send nothing, are
+/// its own rows.
+#[test]
+fn contract_2_healthy_empty_missing_and_newer_objects_are_never_cleared() {
+    let not_damaged = Err(ValueError::Apply(ApplyError::NotDamaged));
+    for shape in SHAPES {
+        let mut k = Kernel::new();
+        let root = object(b"o");
+        create(&mut k, &root, shape);
+        assert_eq!(clear_object(&k.snapshot(), &root), not_damaged, "{shape:?}");
+    }
+
+    // Empty: a map and a set whose one element was removed, a list of no items, a blob of no
+    // bytes.
+    let root = object(b"e");
+    for (kind, element) in [
+        (CollectionKind::Map, ElemOp::Put(text("a"), text("1"))),
+        (CollectionKind::Set, ElemOp::Add(int(1))),
+    ] {
+        let mut k = Kernel::new();
+        let made = compile_collection(&k.snapshot(), &root, kind, Expected::Absent, &[element]);
+        k.commit(&made.unwrap());
+        let key = match kind {
+            CollectionKind::Map => text("a"),
+            CollectionKind::Set => int(1),
+        };
+        let version = Expected::Version(root_version(&k, &root));
+        let removed =
+            compile_collection(&k.snapshot(), &root, kind, version, &[ElemOp::Remove(key)]);
+        k.commit(&removed.unwrap());
+        assert_eq!(collection(&k.snapshot(), &root).unwrap().unwrap().count, 0);
+        assert_eq!(clear_object(&k.snapshot(), &root), not_damaged, "{kind:?}");
+    }
+    let mut k = Kernel::new();
+    let made = create_list(&k.snapshot(), &root, false, DEFAULT_BLOCK_MAX, &[]).unwrap();
+    k.commit(made.compiled());
+    assert_eq!(
+        clear_object(&k.snapshot(), &root),
+        not_damaged,
+        "empty list"
+    );
+    let mut k = Kernel::new();
+    let sha: [u8; 32] = Sha256::digest(b"").into();
+    let made = publish(
+        &k.snapshot(),
+        &root,
+        Expected::Absent,
+        &UP,
+        0,
+        4,
+        &sha,
+        Generation(k.generation),
+    );
+    k.commit(&made.unwrap());
+    assert_eq!(
+        clear_object(&k.snapshot(), &root),
+        not_damaged,
+        "empty blob"
+    );
+
+    // Missing: nothing is stored, so there is nothing to clear.
+    assert_eq!(clear_object(&Kernel::new().snapshot(), &root), Ok(None));
+
+    // A newer build's root: its error, which the host answers INCOMPATIBLE_VERSION.
+    let mut k = Kernel::new();
+    overwrite(&mut k, root.to_bytes(), newer_build_record());
+    let got = clear_object(&k.snapshot(), &root);
+    assert!(
+        matches!(&got, Err(ValueError::Corrupt(c)) if c.is_newer_build()),
+        "{got:?}"
+    );
+}
+
+/// Contract 3: a clear's request sent again after the object was cleared and created again is
+/// refused whole, so a late retry never deletes the new object.
+#[test]
+fn contract_3_a_late_retry_of_a_clear_never_deletes_the_object_created_since() {
+    for shape in SHAPES {
+        let mut k = Kernel::new();
+        let root = object(b"o");
+        create(&mut k, &root, shape);
+        damage(&mut k, &root, shape);
+        let cleared = clear_object(&k.snapshot(), &root)
+            .unwrap()
+            .expect("damaged");
+        k.commit_any_order(&cleared.compiled);
+        create(&mut k, &root, shape);
+        let before = k.clone();
+        let late = k.apply_any_order(&cleared.compiled, None);
+        assert!(
+            matches!(late, Err(Refused::ExpectedVersion(_))),
+            "{shape:?}: {late:?}"
+        );
+        assert_eq!(k, before, "{shape:?}");
+        assert_eq!(whole(&k, &root, shape), Ok(true), "{shape:?}");
+    }
+}
+
+/// Guard 5 (arch §8): each delete names the version the clear read. A clean record written
+/// again between the compile and the apply, the root untouched, refuses the whole batch.
+#[test]
+fn guard_5_a_record_written_again_before_apply_refuses_the_whole_clear() {
+    let mut k = Kernel::new();
+    let root = object(b"m");
+    create(&mut k, &root, Shape::Map);
+    damage(&mut k, &root, Shape::Map);
+    let cleared = clear_object(&k.snapshot(), &root)
+        .unwrap()
+        .expect("damaged");
+    // Clean records go first: `b` is the first delete.
+    let b = element_key(&root, &text("b")).unwrap();
+    assert!(
+        matches!(&cleared.compiled.mutations[0], Mutation::Delete { key, .. } if *key == b),
+        "{:?}",
+        cleared.compiled.mutations
+    );
+    let bytes = k.records[&b].1.clone();
+    overwrite(&mut k, b, bytes);
+    let before = k.clone();
+    assert_eq!(
+        k.apply_any_order(&cleared.compiled, None),
+        Err(Refused::ExpectedVersion(0))
+    );
+    assert_eq!(k, before);
+}
+
+/// Contract 4 and guard 6: a batch that does not empty the object keeps the root and is
+/// guarded by it. The app writing the object between the compile and the apply refuses it.
+#[test]
+fn guard_6_a_batch_that_keeps_the_root_is_refused_once_the_root_is_written() {
+    let mut k = Kernel::new();
+    let root = object(b"big");
+    let keys = filled(&mut k, &root, CollectionKind::Map, 300);
+    let damaged = element_key(&root, &keys[150]).unwrap();
+    let at = k.records[&damaged].0;
+    k.records
+        .insert(damaged, (at, Bytes::from_static(b"damaged")));
+    let first = clear_object(&k.snapshot(), &root)
+        .unwrap()
+        .expect("damaged");
+    let root_bytes = root.to_bytes();
+    assert!(
+        !first
+            .compiled
+            .mutations
+            .iter()
+            .any(|m| matches!(m, Mutation::Delete { key, .. } if *key == root_bytes)),
+        "the first batch keeps the root"
+    );
+    let version = Expected::Version(root_version(&k, &root));
+    let put = [ElemOp::Put(text("z"), text("1"))];
+    let made = compile_collection(&k.snapshot(), &root, CollectionKind::Map, version, &put);
+    k.commit(&made.unwrap());
+    let before = k.clone();
+    assert_eq!(
+        k.apply_any_order(&first.compiled, None),
+        Err(Refused::Condition(0))
+    );
+    assert_eq!(k, before);
+}
+
+/// Guard 16: a chunk the blob names and the proof found missing gets an `Absent` condition. A
+/// chunk stored again before the apply refuses the clear, so it is never left behind unproved.
+#[test]
+fn guard_16_a_chunk_found_missing_and_stored_again_before_apply_refuses_the_clear() {
+    let mut k = Kernel::new();
+    let root = object(b"b");
+    create(&mut k, &root, Shape::Blob);
+    let gone = chunk_key(&root, &UP, 1);
+    let (_, bytes) = k.records.remove(&gone).unwrap();
+    let cleared = clear_object(&k.snapshot(), &root)
+        .unwrap()
+        .expect("damaged");
+    let absent = Condition::Absent { key: gone.clone() };
+    let at = cleared
+        .compiled
+        .conditions
+        .iter()
+        .position(|c| *c == absent)
+        .expect("an Absent for the missing chunk");
+    overwrite(&mut k, gone, bytes);
+    let before = k.clone();
+    assert_eq!(
+        k.apply_any_order(&cleared.compiled, None),
+        Err(Refused::Condition(at))
+    );
+    assert_eq!(k, before);
+}
+
+/// Guard 17: the proof also compiles the drop, which finds damage the read does not look for.
+/// An item record beside an empty list reads cleanly, and is still proved damaged and cleared.
+#[test]
+fn guard_17_an_orphan_item_beside_an_empty_list_is_damage_the_drop_finds() {
+    let mut k = Kernel::new();
+    let root = object(b"l");
+    let made = create_list(&k.snapshot(), &root, false, DEFAULT_BLOCK_MAX, &[]).unwrap();
+    k.commit(made.compiled());
+    let at = k.records[&root.to_bytes()].0;
+    let orphan = seal(Kind::Document, &[0xf6]).unwrap();
+    k.records.insert(item_key(&root, 7), (at, orphan));
+    let s = k.snapshot();
+    assert_eq!(
+        whole(&k, &root, Shape::List),
+        Ok(true),
+        "the read does not look"
+    );
+    let cleared = clear_object(&s, &root).unwrap().expect("damaged");
+    assert_eq!(cleared.damage, Corrupt::OrphanElement);
+    k.commit_any_order(&cleared.compiled);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Contract 6 (tester-s6): a healthy map and set of mixed keys, after an overwrite of one and a
+/// del of a key not stored, read whole at every limit that reaches the end, and are not damaged.
+#[test]
+fn contract_6_a_healthy_map_and_set_of_mixed_keys_read_whole_and_are_not_damaged() {
+    let keys = [
+        text("a"),
+        int(-5),
+        int(7),
+        float(1.5),
+        float(-0.0),
+        Value::Bytes(vec![0, 1]),
+    ];
+    for kind in [CollectionKind::Map, CollectionKind::Set] {
+        let mut k = Kernel::new();
+        let root = object(b"mixed");
+        let element = |key: &Value| match kind {
+            CollectionKind::Map => ElemOp::Put(key.clone(), text("1")),
+            CollectionKind::Set => ElemOp::Add(key.clone()),
+        };
+        let ops: Vec<_> = keys.iter().map(element).collect();
+        let made = compile_collection(&k.snapshot(), &root, kind, Expected::Absent, &ops);
+        k.commit(&made.unwrap());
+        let again = match kind {
+            CollectionKind::Map => ElemOp::Put(float(-0.0), text("2")),
+            CollectionKind::Set => ElemOp::Add(float(-0.0)),
+        };
+        for op in [again, ElemOp::Remove(text("missing"))] {
+            let version = Expected::Version(root_version(&k, &root));
+            let made = compile_collection(&k.snapshot(), &root, kind, version, &[op]).unwrap();
+            if !made.mutations.is_empty() {
+                k.commit(&made);
+            }
+        }
+        let s = k.snapshot();
+        let n = keys.len();
+        for limit in [n, n + 1, usize::MAX] {
+            let got = members(&s, &root, None, limit).unwrap();
+            assert_eq!(got.members.len(), n, "{kind:?} limit {limit}");
+        }
+        assert_eq!(
+            clear_object(&s, &root),
+            Err(ValueError::Apply(ApplyError::NotDamaged)),
+            "{kind:?}"
+        );
+    }
+}
+
+/// Guard 3 (A-R139): envelope kind 0 is no kind any build writes, so a root of kind 0 is damage
+/// and the clear deletes it. Only a kind above the known ones is a newer build's.
+#[test]
+fn guard_3_a_root_of_kind_0_is_damage_and_is_cleared() {
+    let mut k = Kernel::new();
+    let root = object(b"d");
+    let mut bytes = seal(Kind::Document, &[0xf6]).unwrap().to_vec();
+    bytes[1] = 0x00;
+    let head: [u8; 8] = bytes[..8].try_into().unwrap();
+    let sum = digest(&head, &bytes[40..]);
+    bytes[8..40].copy_from_slice(&sum);
+    overwrite(&mut k, root.to_bytes(), Bytes::from(bytes));
+    let cleared = clear_object(&k.snapshot(), &root)
+        .unwrap()
+        .expect("damaged");
+    assert_eq!(
+        cleared.damage,
+        Corrupt::Envelope(EnvelopeError::UnknownKind(0))
+    );
+    k.commit_any_order(&cleared.compiled);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
 }

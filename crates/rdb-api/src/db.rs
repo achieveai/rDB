@@ -4080,4 +4080,66 @@ mod tests {
         }
         db.shutdown();
     }
+
+    /// M9 S6 guard 18 (Q3): every answer to a clear that `Db::write` gets before sending says
+    /// `no_mutation` and hands back no request, INCOMPATIBLE_VERSION included, which
+    /// `ApiError::new` alone leaves `false`. A clear of nothing stored is `Ok(None)`.
+    /// Integration (~1 s): three node threads on wall-clock time.
+    #[test]
+    fn m9_s6_a_clear_refused_before_sending_says_it_sent_nothing() {
+        use rdb_value::envelope::{digest, seal, Kind, HEADER_LEN};
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        db.put(b"d", b"1", None).expect("put d");
+        // A record a newer build could have written, as `rdb_dev admin damage --as newer` does.
+        let mut newer = seal(Kind::Document, &[0xf6]).expect("a null fits").to_vec();
+        newer[2] = 0x02;
+        let head: [u8; 8] = newer[..8].try_into().expect("a header is 40 bytes");
+        let sum = digest(&head, &newer[HEADER_LEN..]);
+        newer[8..HEADER_LEN].copy_from_slice(&sum);
+        let raw = TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TENANT,
+                client: ClientId(2),
+                request: RequestId(1),
+            },
+            affinity: GROUP,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: rdb_value::keys::root_key(TENANT, GROUP, b"n").to_bytes(),
+                value: Bytes::from(newer),
+                expected_version: None,
+            }],
+        };
+        db.resend(raw).expect("write the newer build's record");
+
+        let unsent = |object: &[u8]| {
+            let refused = db
+                .write(object, Change::Clear, None)
+                .expect_err("refused before sending");
+            (
+                refused.error.kind,
+                refused.error.no_mutation,
+                refused.request.is_none(),
+            )
+        };
+        assert_eq!(unsent(b"d"), (ErrorKind::ConditionFailed, true, true));
+        assert_eq!(unsent(b"n"), (ErrorKind::IncompatibleVersion, true, true));
+        let nothing = db.write(b"missing", Change::Clear, None);
+        assert!(matches!(nothing, Ok(None)), "{nothing:?}");
+        db.shutdown();
+    }
 }
