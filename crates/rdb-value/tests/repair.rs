@@ -13,7 +13,7 @@ use rdb_value::cbor::{decode, encode};
 use rdb_value::collection::{collection, compile_collection, members, CollectionKind, ElemOp};
 use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::envelope::{digest, open, seal, EnvelopeError, Kind};
-use rdb_value::keys::{chunk_key, element_key, item_key, parse, root_key, RootKey, Sub};
+use rdb_value::keys::{chunk_key, element_key, item_key, parse, root_key, KeyError, RootKey, Sub};
 use rdb_value::list::{compile_list, create_list, items, list, ListOp, Start, DEFAULT_BLOCK_MAX};
 use rdb_value::repair::clear_object;
 use rdb_value::value::{Int, MapKey, Value};
@@ -1205,5 +1205,284 @@ fn f005_a_read_of_a_newer_builds_list_block_names_a_newer_build() {
             )) if c.is_newer_build()
         ),
         "{read:?}"
+    );
+}
+
+/// Review R-1 (PR #53): an empty list with 254 sound orphan items beside its block base. Item
+/// keys sort before block keys, so a first batch of 254 deleted every orphan and kept the base
+/// and the root: a healthy empty list, and the next clear answered "not damaged" with the object
+/// still there. A batch that keeps any record leaves the object still proved damaged, so
+/// the first batch takes back one orphan delete (253), and the second takes the last orphan,
+/// the base and the root (3).
+#[test]
+fn r1_an_empty_list_with_254_orphan_items_is_cleared_to_the_end() {
+    let mut k = Kernel::new();
+    let root = object(b"l");
+    let made = create_list(&k.snapshot(), &root, false, DEFAULT_BLOCK_MAX, &[]).unwrap();
+    k.commit(made.compiled());
+    let at = k.records[&root.to_bytes()].0;
+    for id in 1..=254 {
+        let orphan = seal(Kind::Document, &[0xf6]).unwrap();
+        k.records.insert(item_key(&root, id), (at, orphan));
+    }
+    assert_eq!(calls_to_clear(&mut k, &root), vec![253, 3]);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Clears the object until `Ok(None)`, and returns how many deletes each batch sent. Any error
+/// fails the test, with the call it came on.
+fn calls_to_clear(k: &mut Kernel, root: &RootKey) -> Vec<usize> {
+    let mut sent = Vec::new();
+    loop {
+        let cleared = match clear_object(&k.snapshot(), root) {
+            Ok(Some(cleared)) => cleared,
+            Ok(None) => return sent,
+            Err(error) => panic!(
+                "call {} with {} records left: {error:?}",
+                sent.len() + 1,
+                k.records.len()
+            ),
+        };
+        sent.push(cleared.compiled.mutations.len());
+        assert!(sent.len() < 5, "the clear ends: {sent:?}");
+        k.commit_any_order(&cleared.compiled);
+    }
+}
+
+/// `n` upload chunks stored under the object, whatever its root's kind: `put_chunk` does not
+/// check it.
+fn stray_chunks(k: &mut Kernel, root: &RootKey, n: u32) {
+    for i in 0..n {
+        let upload = [u8::try_from(i / 255).unwrap() + 1; 16];
+        k.seq += 1;
+        let chunk = seal(Kind::Chunk, b"x").unwrap();
+        k.records
+            .insert(chunk_key(root, &upload, i % 255), (k.seq, chunk));
+    }
+}
+
+/// No root, one orphan element, and `chunks` upload chunks: they sort after the orphan.
+fn orphan_beside(chunks: u32) -> (Kernel, RootKey) {
+    let mut k = Kernel::new();
+    let root = object(b"o");
+    map_of_two(&mut k, &root);
+    k.records.remove(&root.to_bytes()).unwrap();
+    k.records
+        .remove(&element_key(&root, &text("b")).unwrap())
+        .unwrap();
+    stray_chunks(&mut k, &root, chunks);
+    (k, root)
+}
+
+/// Review R2-01 (PR #53), case A: with no root, the chunks go in the first batch and the orphan
+/// stays, so the object still proves damaged; the next batch takes the orphan. Before the fix
+/// the chunks sorted after the orphan, every delete was taken back, and each call answered
+/// `TooLarge`.
+#[test]
+fn r2_01_a_rootless_orphan_beside_254_chunks_is_cleared_to_the_end() {
+    let (mut k, root) = orphan_beside(254);
+    assert_eq!(calls_to_clear(&mut k, &root), vec![254, 1]);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Review R2-01, control C: 1 orphan and 253 chunks fit one batch, which is final.
+#[test]
+fn r2_01_c_a_rootless_orphan_beside_253_chunks_is_cleared_in_one_batch() {
+    let (mut k, root) = orphan_beside(253);
+    assert_eq!(calls_to_clear(&mut k, &root), vec![254]);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Review R2-01, case B: a map whose root says 0 elements, with 2 and 300 chunks. The first
+/// batch is 254 chunks and is sent whole, so it costs one proof and not one per delete taken
+/// back; the second takes the rest and the root.
+#[test]
+fn r2_01_b_a_map_counting_0_beside_300_chunks_is_cleared_to_the_end() {
+    let mut k = Kernel::new();
+    let root = object(b"m");
+    map_of_two(&mut k, &root);
+    let (at, bytes) = k.records[&root.to_bytes()].clone();
+    let Value::Map(mut fields) = decode(open(&bytes).unwrap().payload).unwrap() else {
+        panic!("a map root");
+    };
+    *fields.get_mut(&MapKey::new("count")).unwrap() = int(0);
+    let sealed = seal(Kind::Map, &encode(&Value::Map(fields)).unwrap()).unwrap();
+    k.records.insert(root.to_bytes(), (at, sealed));
+    stray_chunks(&mut k, &root, 300);
+    assert_eq!(calls_to_clear(&mut k, &root), vec![254, 49]);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Review R-4 and Q-1 (PR #53): the clear of a list compiled while `gone` is missing carries
+/// an `Absent` for it. Left missing, the batch applies. Stored again alone, with the root not
+/// rewritten, the whole batch is refused and nothing changes: the proof is stale, since the
+/// list may now read back cleanly.
+fn assert_missing_record_guarded(mut k: Kernel, root: &RootKey, gone: &Bytes) {
+    let (_, bytes) = k.records.remove(gone).expect("the record to remove");
+    let cleared = clear_object(&k.snapshot(), root).unwrap().expect("damaged");
+    let absent = Condition::Absent { key: gone.clone() };
+    let at = cleared
+        .compiled
+        .conditions
+        .iter()
+        .position(|c| *c == absent)
+        .expect("an Absent for the missing record");
+    let mut control = k.clone();
+    assert!(
+        control.apply_any_order(&cleared.compiled, None).is_ok(),
+        "the batch applies while the record is still missing"
+    );
+    overwrite(&mut k, gone.clone(), bytes);
+    let before = k.clone();
+    assert_eq!(
+        k.apply_any_order(&cleared.compiled, None),
+        Err(Refused::Condition(at))
+    );
+    assert_eq!(k, before);
+}
+
+/// Review R-4: a block base the list names, found missing.
+#[test]
+fn r4_a_list_block_found_missing_and_stored_again_before_apply_refuses_the_clear() {
+    let mut k = Kernel::new();
+    let root = object(b"l");
+    create(&mut k, &root, Shape::List);
+    let base = damaged_key(&k, &root, Shape::List);
+    assert_missing_record_guarded(k, &root, &base);
+}
+
+/// Review R-4: an item record the list names, found missing.
+#[test]
+fn r4_a_list_item_found_missing_and_stored_again_before_apply_refuses_the_clear() {
+    let mut k = Kernel::new();
+    let root = object(b"l");
+    let push: Vec<_> = ["x", "y", "z"]
+        .iter()
+        .map(|v| ListOp::Push(text(v)))
+        .collect();
+    let made = create_list(&k.snapshot(), &root, true, DEFAULT_BLOCK_MAX, &push).unwrap();
+    k.commit(made.compiled());
+    let item = k
+        .records
+        .keys()
+        .find(|key| parse(key).is_ok_and(|p| p.sub == Sub::Item))
+        .expect("the list stores its items as records")
+        .clone();
+    assert_missing_record_guarded(k, &root, &item);
+}
+
+/// Review Q-1: a pending change slot the root names, found missing (`BlockFault::OpMissing`).
+#[test]
+fn q1_a_pending_slot_found_missing_and_stored_again_before_apply_refuses_the_clear() {
+    let mut k = Kernel::new();
+    let root = object(b"l");
+    let slot = list_with_a_pending_slot(&mut k, &root);
+    assert_missing_record_guarded(k, &root, &slot);
+}
+
+/// Review Q-1, the other side: a pending slot that is stored but holds another op is also
+/// `OpMissing`. It is deleted at its version, never guarded `Absent`, or no batch could apply.
+#[test]
+fn q1_a_slot_holding_another_op_is_deleted_not_guarded_absent() {
+    let mut k = Kernel::new();
+    let root = object(b"l");
+    let first = list_with_a_pending_slot(&mut k, &root);
+    let version = list(&k.snapshot(), &root).unwrap().unwrap().version;
+    let push = [ListOp::Push(text("v"))];
+    let made = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Version(version),
+        DEFAULT_BLOCK_MAX,
+        &push,
+    )
+    .unwrap();
+    k.commit(made.compiled());
+    let second = k
+        .records
+        .keys()
+        .find(|key| **key != first && parse(key).is_ok_and(|p| p.slot.is_some()))
+        .expect("the second push is pending in a slot")
+        .clone();
+    let at = k.records[&first].0;
+    let other = k.records[&second].1.clone();
+    k.records.insert(first.clone(), (at, other));
+    let cleared = clear_object(&k.snapshot(), &root)
+        .unwrap()
+        .expect("damaged");
+    assert!(
+        matches!(
+            cleared.damage,
+            Corrupt::Block {
+                fault: BlockFault::OpMissing { .. },
+                ..
+            }
+        ),
+        "{:?}",
+        cleared.damage
+    );
+    assert!(
+        !cleared
+            .compiled
+            .conditions
+            .iter()
+            .any(|c| matches!(c, Condition::Absent { key } if *key == first)),
+        "{:?}",
+        cleared.compiled.conditions
+    );
+    assert_eq!(clear_to_the_end(&mut k, &root), 1);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// A map element key under tag `0x11`, which profile 1 does not define: a key type a newer
+/// build may add (ADR-rdb-0013 decision 4).
+fn unknown_tag_key(root: &RootKey) -> Bytes {
+    let mut key = root.element_prefix();
+    key.extend_from_slice(&[0x11, 0x01, 0x02]);
+    Bytes::from(key)
+}
+
+/// Review R-3 (PR #53, A-R145): an entry under an element key tag this build does not know may
+/// be a newer build's valid entry, so it refuses the whole clear as an unknown sub does, and
+/// nothing is deleted. In a sound map the read finds it first; beside a root that does not open,
+/// only the scan does. A read of the map names it a newer build's too.
+#[test]
+fn r3_a_map_entry_under_an_unknown_key_tag_refuses_the_clear() {
+    let root = object(b"m");
+    let refused = Err(ValueError::Corrupt(Corrupt::Key(KeyError::UnknownTag(
+        0x11,
+    ))));
+
+    let mut k = Kernel::new();
+    map_of_two(&mut k, &root);
+    let (at, bytes) = k.records[&root.to_bytes()].clone();
+    let Value::Map(mut fields) = decode(open(&bytes).unwrap().payload).unwrap() else {
+        panic!("a map root is a map");
+    };
+    *fields.get_mut(&MapKey::new("count")).unwrap() = int(3);
+    let sealed = seal(Kind::Map, &encode(&Value::Map(fields)).unwrap()).unwrap();
+    k.records.insert(root.to_bytes(), (at, sealed));
+    let entry = k.records[&element_key(&root, &text("a")).unwrap()]
+        .1
+        .clone();
+    k.records
+        .insert(unknown_tag_key(&root), (at, entry.clone()));
+    let read = members(&k.snapshot(), &root, None, usize::MAX);
+    assert!(
+        matches!(&read, Err(ValueError::Corrupt(c)) if c.is_newer_build()),
+        "{read:?}"
+    );
+    assert_eq!(clear_object(&k.snapshot(), &root), refused, "a sound map");
+
+    let mut k = Kernel::new();
+    map_of_two(&mut k, &root);
+    let at = k.records[&root.to_bytes()].0;
+    k.records
+        .insert(root.to_bytes(), (at, Bytes::from_static(b"damaged")));
+    k.records.insert(unknown_tag_key(&root), (at, entry));
+    assert_eq!(
+        clear_object(&k.snapshot(), &root),
+        refused,
+        "beside a root that does not open"
     );
 }

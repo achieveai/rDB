@@ -805,7 +805,10 @@ impl Db {
     /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
     ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
     ///   [`Self::status`] about that publish. Likewise for a `Clear` that finds nothing stored
-    ///   at a view not yet published (C-2): if an earlier clear sent deletes, ask its status;
+    ///   at a view not yet published (C-2): if an earlier clear sent deletes, ask its status.
+    ///   And for a `Clear` that finds the object healthy, or only chunks, at such a view (review
+    ///   R-2): a repair applied and not yet published may still be lost, so clear again once it
+    ///   is;
     /// - for a `Publish` of the blob already at the object, or a `Clear` of an object that is
     ///   healthy, missing or only chunks, while A1 refuses reads: the kind and retry rule
     ///   [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), with
