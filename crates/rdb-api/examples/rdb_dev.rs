@@ -172,8 +172,8 @@
 //!                                         healthy object answers `CONDITION_FAILED`, a newer
 //!                                         build's record `INCOMPATIBLE_VERSION`, both with
 //!                                         `request=-`. Nothing left but not yet published
-//!                                         answers `UNKNOWN_OUTCOME` with `request=-`: ask
-//!                                         `status` of the clear that sent the deletes. While
+//!                                         answers `UNKNOWN_OUTCOME` with `request=-`: if an
+//!                                         earlier clear sent deletes, ask its `status`. While
 //!                                         reads are refused, as after a fence, it answers as
 //!                                         `read` does. `retry` resends it unchanged
 //! admin damage <o> [--element K] [--as digest|kind0|newer]

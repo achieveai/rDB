@@ -404,8 +404,10 @@ pub struct PutOp {
 
 /// What one write changes. The kind of the object is fixed when it is created; a change of
 /// another kind is `INVALID_ARGUMENT` (`KindMismatch`). `Chunk`, `Gc` and `Clear` are the
-/// exceptions: none of them is refused for the object's kind. A chunk is stored under an object of any kind, or none,
-/// and only its publish is refused (A-R127); a gc deletes the chunks that no blob names.
+/// exceptions. A chunk is stored under an object of any kind, or none, and only its publish is
+/// refused (A-R127); a gc deletes the chunks that no blob names. A clear takes every kind but
+/// one: a chunk record at the root key, which no write puts there and no read takes, is
+/// `KindMismatch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// Document ops, applied in order to the whole document (ADR-rdb-0012).
@@ -3513,9 +3515,17 @@ impl Host {
                 self.read_admitted(partition, "\"not damaged\" is not confirmed")?;
                 Err(compile_error(&error))
             }
-            // No read gate (A-R139): INCOMPATIBLE_VERSION and the other refusals claim nothing
-            // about the object, and no_mutation=true holds on any view.
-            Err(error) => Err(compile_error(&error)),
+            // No read gate (A-R139): none of these says the object is healthy or that nothing
+            // is stored, and no_mutation=true holds on any view: INCOMPATIBLE_VERSION, a chunk
+            // record at the root key (`KindMismatch`), a batch over the size limit, or
+            // CORRUPT_HISTORY for a stored version with no value (`VersionWithoutValue`).
+            Err(error) => {
+                let mut refused = compile_error(&error);
+                if refused.kind == ErrorKind::IncompatibleVersion {
+                    refused.detail.push_str("; not cleared");
+                }
+                Err(refused)
+            }
         }
     }
 
@@ -3970,8 +3980,8 @@ fn compile_error(error: &ValueError) -> ApiError {
 /// C-2 (M9 S6): a clear answers "nothing to clear" only when the view it read is published: its
 /// position at or below P1's published position, in the view's generation. Above it, a write
 /// is applied and not yet published, an earlier clear perhaps, so the empty object may still
-/// be lost: that is `UNKNOWN_OUTCOME`, nothing sent, and the clear that sent it is the one to
-/// ask about.
+/// be lost: that is `UNKNOWN_OUTCOME`, nothing sent. If an earlier clear sent deletes, that clear
+/// is the one to ask about; the object may never have been written at all.
 fn view_published(
     view: &RocksSnapshot,
     published: Option<(Generation, Seq)>,
@@ -3994,8 +4004,8 @@ fn view_published(
             Err(ApiError::new(
                 ErrorKind::UnknownOutcome,
                 format!(
-                    "nothing to clear at seq {}, {through}; ask the status of the clear that \
-                     sent the deletes",
+                    "nothing to clear at seq {}, {through}; if an earlier clear sent deletes, ask \
+                     its status",
                     view.at().0
                 ),
             ))
@@ -8325,10 +8335,11 @@ mod tests {
 
     /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
     /// given without sending are reads, so a node gives them only while a read would be given.
-    /// Admitting: a healthy object is CONDITION_FAILED, a missing one `unchanged`, a newer
-    /// build's one INCOMPATIBLE_VERSION, and a clear with an expect INVALID_ARGUMENT, none
-    /// naming a request. Fenced: healthy and missing are refused as a plain read is, with
-    /// `no_mutation`, never CONDITION_FAILED or `unchanged`; newer is still
+    /// Admitting: a healthy object and one with only upload chunks are CONDITION_FAILED, a
+    /// missing one `unchanged`, a newer build's one INCOMPATIBLE_VERSION, and a clear with an
+    /// expect INVALID_ARGUMENT, none naming a request. Fenced: healthy, chunks-only and missing
+    /// are refused as a plain read is, with `no_mutation`, never CONDITION_FAILED or
+    /// `unchanged`; newer is still
     /// INCOMPATIBLE_VERSION, which claims nothing about the object; a damaged one compiles, is
     /// sent, and the kernel refuses it. Once node 1 admits again that clear publishes.
     /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
@@ -8358,11 +8369,17 @@ mod tests {
             trio.sent(damage_write(5, b"newer", newer_build_document())),
             Ok(6)
         );
+        assert_eq!(
+            trio.write(chunk_call(6, b"chunks", 0, b"HELL", None)),
+            Ok(7)
+        );
 
         let kind = |answer| refusal(answer).0;
-        let (not_damaged, _, _, request) = refusal(trio.ask(clear_call(6, b"healthy")));
+        let (not_damaged, _, _, request) = refusal(trio.ask(clear_call(7, b"healthy")));
         assert_eq!((not_damaged, request), (ErrorKind::ConditionFailed, false));
-        match trio.ask(clear_call(7, b"missing")) {
+        let (only_chunks, _, _, request) = refusal(trio.ask(clear_call(8, b"chunks")));
+        assert_eq!((only_chunks, request), (ErrorKind::ConditionFailed, false));
+        match trio.ask(clear_call(9, b"missing")) {
             Answer::Unchanged => {}
             other => panic!("a clear of nothing: {other:?}"),
         }
@@ -8371,10 +8388,10 @@ mod tests {
             let (kind, retry, _, request) = refusal(answer);
             (kind, retry, request)
         };
-        assert_eq!(quarantined(trio.ask(clear_call(8, b"newer"))), newer);
+        assert_eq!(quarantined(trio.ask(clear_call(10, b"newer"))), newer);
         let expect = Some(Expected::Version(2));
         assert_eq!(
-            kind(trio.ask(compile_change(9, b"healthy", Change::Clear, expect))),
+            kind(trio.ask(compile_change(11, b"healthy", Change::Clear, expect))),
             ErrorKind::InvalidArgument,
             "a clear takes no expect"
         );
@@ -8385,7 +8402,7 @@ mod tests {
             });
         trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
         let read = ClientCall::Get {
-            identity: identity(10),
+            identity: identity(12),
             object: Bytes::from_static(b"healthy"),
             look: Look::Doc,
         };
@@ -8397,7 +8414,11 @@ mod tests {
             other => panic!("a read while fenced: {other:?}"),
         };
         assert_eq!(refused.kind, ErrorKind::LeaseExpired, "{refused:?}");
-        for (request, object) in [(11, &b"healthy"[..]), (12, &b"missing"[..])] {
+        for (request, object) in [
+            (13, &b"healthy"[..]),
+            (14, &b"chunks"[..]),
+            (15, &b"missing"[..]),
+        ] {
             assert_eq!(
                 refusal(trio.ask(clear_call(request, object))),
                 (refused.kind, refused.retry, true, false),
@@ -8406,11 +8427,11 @@ mod tests {
             );
         }
         assert_eq!(
-            quarantined(trio.ask(clear_call(13, b"newer"))),
+            quarantined(trio.ask(clear_call(16, b"newer"))),
             newer,
             "newer while fenced"
         );
-        let request = trio.compiled(clear_call(14, b"damaged"));
+        let request = trio.compiled(clear_call(17, b"damaged"));
         assert_eq!(
             trio.sent(request),
             Err(Refused::ByKernel(ErrorKind::LeaseExpired)),
@@ -8419,11 +8440,125 @@ mod tests {
 
         trio.mem.stop_failing();
         trio.ready();
-        assert!(trio.write(clear_call(15, b"damaged")).is_ok(), "cleared");
-        match trio.ask(clear_call(16, b"damaged")) {
+        assert!(trio.write(clear_call(18, b"damaged")).is_ok(), "cleared");
+        match trio.ask(clear_call(19, b"damaged")) {
             Answer::Unchanged => {}
             other => panic!("a clear once cleared: {other:?}"),
         }
+    }
+
+    /// M9 S6 review F-006: the `clear_compiled` line names the root `deleted` when the batch
+    /// deletes it, `guarded` when a version condition keeps it, and `absent` when the guard
+    /// says there is none; `deletes` and `faulting` are the batch's own counts.
+    /// Unit (~10 ms): `log_clear` on three batches built by hand.
+    #[config_log::retcd_test]
+    fn m9_s6_the_clear_line_names_what_the_batch_does_to_the_root() {
+        const METHOD: &str = "m9_s6_the_clear_line_names_what_the_batch_does_to_the_root";
+        let root = root_key(TenantId(1), AFFINITY, b"o");
+        let element = Bytes::from_static(b"an element key");
+        let delete = |key: Bytes| Mutation::Delete {
+            key,
+            expected_version: Some(3),
+        };
+        let batches = [
+            (
+                1,
+                vec![delete(element.clone()), delete(root.to_bytes())],
+                vec![Condition::VersionEquals {
+                    key: root.to_bytes(),
+                    version: 3,
+                }],
+                1,
+            ),
+            (
+                2,
+                vec![delete(element.clone())],
+                vec![Condition::VersionEquals {
+                    key: root.to_bytes(),
+                    version: 3,
+                }],
+                0,
+            ),
+            (
+                3,
+                vec![delete(element)],
+                vec![Condition::Absent {
+                    key: root.to_bytes(),
+                }],
+                1,
+            ),
+        ];
+        for (request, mutations, conditions, faulting) in batches {
+            let cleared = Cleared {
+                compiled: Compiled {
+                    mutations,
+                    conditions,
+                },
+                damage: Corrupt::VersionWithoutValue,
+                faulting,
+            };
+            log_clear(NodeId(1), identity(request), &root, &cleared);
+        }
+
+        let lines = logged!(METHOD, "clear_compiled");
+        let seen: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["request"].clone(),
+                    line["root"].clone(),
+                    line["deletes"].clone(),
+                    line["faulting"].clone(),
+                    line["object"].clone(),
+                )
+            })
+            .collect();
+        let want = |request: u64, root: &str, deletes: u64, faulting: u64| {
+            (
+                request.into(),
+                root.into(),
+                deletes.into(),
+                faulting.into(),
+                "o".into(),
+            )
+        };
+        assert_eq!(
+            seen,
+            vec![
+                want(1, "deleted", 2, 1),
+                want(2, "guarded", 1, 0),
+                want(3, "absent", 1, 1),
+            ],
+            "{lines:?}"
+        );
+    }
+
+    /// M9 S6 review Q-1: "nothing to clear" is answered only for a view P1 has published in the
+    /// view's own generation. A published position of another generation, or none yet, is
+    /// UNKNOWN_OUTCOME naming the generations; the same seq in the view's generation is Ok.
+    /// The host adopts a generation from A1 and P1 takes its lineage from recovery, so the two
+    /// can differ for a step (`deliver`'s AdoptAuthority; publication's `on_recovered`).
+    /// Unit (~50 ms): one empty engine, no thread.
+    #[test]
+    fn m9_s6_nothing_to_clear_needs_a_publish_in_the_views_own_generation() {
+        let dir = config_testkit::fs::temp_dir();
+        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+        let view = engine
+            .snapshot(PartitionId(1), Generation(1), SnapshotHandle(0))
+            .expect("snapshot");
+        assert_eq!(
+            view_published(&view, Some((Generation(1), view.at()))),
+            Ok(())
+        );
+        let other = view_published(&view, Some((Generation(0), view.at()))).expect_err("other");
+        assert_eq!(other.kind, ErrorKind::UnknownOutcome, "{other:?}");
+        assert!(
+            other.detail.contains("of generation 0, not generation 1"),
+            "{other:?}"
+        );
+        let none = view_published(&view, None).expect_err("none");
+        assert_eq!(none.kind, ErrorKind::UnknownOutcome, "{none:?}");
+        assert!(none.detail.contains("nothing published yet"), "{none:?}");
     }
 
     /// M9 S6 contract 5, held copies, guard 15: with both secondaries cut off, node 1 applies a

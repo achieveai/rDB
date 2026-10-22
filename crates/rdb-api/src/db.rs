@@ -755,9 +755,9 @@ impl Db {
 
     /// Apply `change` to `object`, as one transaction. `expect` says when it may happen:
     /// `None` at the version the owner's compile sees (absent included), `Some(Absent)` only
-    /// as a create, `Some(Version(v))` only at version `v`. A `Chunk` or a `Gc` takes no
-    /// `expect`. The owner compiles the change against the object as it is, so the request
-    /// carries the whole after-image of what it changes.
+    /// as a create, `Some(Version(v))` only at version `v`. A `Chunk`, a `Gc` or a `Clear`
+    /// takes no `expect`. The owner compiles the change against the object as it is, so the
+    /// request carries the whole after-image of what it changes.
     ///
     /// What guards the request:
     /// - `Doc`, `Map`, `Set`, `List` and `Publish`: the object's version it was compiled
@@ -766,6 +766,10 @@ impl Db {
     /// - `Chunk`: only that chunk's key being absent, never the object's version. A chunk is
     ///   stored under an object of any kind, or none (A-R127).
     /// - `Gc`: the object as the compile read it, and each chunk it deletes.
+    /// - `Clear`: the root's version as the compile read it, or its absence, and each record
+    ///   it deletes, at the version it read. A clear proves the object damaged first, then
+    ///   deletes at most 254 records per call, the root in the last, so the object reads as
+    ///   damaged until that call; call again until `Ok(None)`.
     ///
     /// `Ok(None)` is a change that compiles to nothing and is never sent:
     /// - a `Chunk` whose bytes are already stored at its upload and index;
@@ -774,7 +778,8 @@ impl Db {
     ///   the fence, so it is not gated on A1 (ADR-rdb-0014 O9);
     /// - a `Gc` with nothing left to collect;
     /// - a `Publish` of the blob already at the object and published: its version is at or
-    ///   below what P1 has published, in the generation the compile sees.
+    ///   below what P1 has published, in the generation the compile sees;
+    /// - a `Clear` of an object with nothing stored, at a view P1 has published.
     ///
     /// # Errors
     ///
@@ -782,20 +787,27 @@ impl Db {
     /// ready to [`Db::resend`] unchanged. A change the compile refuses sends nothing and
     /// carries no request:
     /// - `CONDITION_FAILED` for a version that moved, or an object or element that a change or
-    ///   a `Need` finds absent or present when it must not be;
+    ///   a `Need` finds absent or present when it must not be; or a `Clear` of an object that
+    ///   reads back cleanly, or that holds only upload chunks (`blob gc` removes those);
     /// - `INVALID_ARGUMENT` for an op that does not fit the object (`KindMismatch`,
-    ///   `NotAContainer`, ...), an `expect` on a `Chunk` or a `Gc`, or a `Publish` whose stored
-    ///   chunks do not match it (`ChunkMissing`, `ChunkLength`, `BlobDigestMismatch`, ...);
+    ///   `NotAContainer`, ...), an `expect` on a `Chunk`, a `Gc` or a `Clear`, or a
+    ///   `Publish` whose stored chunks do not match it (`ChunkMissing`, `ChunkLength`,
+    ///   `BlobDigestMismatch`, ...);
     /// - `UPLOAD_CHUNK_CONFLICT` for a `Chunk` whose upload and index already hold other bytes;
+    /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`) when a record the change reads was written
+    ///   by a newer build; a `Clear` then deletes nothing and says "not cleared";
     /// - `CORRUPT_BLOB` when a blob root that opens is not a v1 manifest, or a chunk it names does
     ///   not open, is not stored, or is not the one the manifest names; `CORRUPT_HISTORY` when any
-    ///   other stored record does not open, a blob root whose envelope does not open included;
+    ///   other stored record does not open, a blob root whose envelope does not open included.
+    ///   Neither is a newer build's record, which is `INCOMPATIBLE_VERSION`;
     /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
     ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
-    ///   [`Self::status`] about that publish;
-    /// - for a `Publish` of the blob already at the object while A1 refuses reads, the kind and
-    ///   retry rule [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), with
-    ///   `no_mutation`, never "unchanged";
+    ///   [`Self::status`] about that publish. Likewise for a `Clear` that finds nothing stored
+    ///   at a view not yet published (C-2): if an earlier clear sent deletes, ask its status;
+    /// - for a `Publish` of the blob already at the object, or a `Clear` of an object that is
+    ///   healthy, missing or only chunks, while A1 refuses reads: the kind and retry rule
+    ///   [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), with
+    ///   `no_mutation`, never "unchanged" or `CONDITION_FAILED`;
     /// - `UNAVAILABLE` when no compile answer came in time.
     pub fn write(
         &self,
