@@ -3685,4 +3685,347 @@ mod tests {
         );
         db.shutdown();
     }
+
+    /// M9 S5: a request over a limit is `INVALID_ARGUMENT`, `Definitive`, `no_mutation`, with no
+    /// request, its detail ending `request R not sent` or `not read`, and nothing reaches the
+    /// owner. `R` is the id it used up.
+    #[track_caller]
+    fn refused_unsent(error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
+        assert_eq!(
+            (
+                error.kind,
+                error.retry,
+                error.no_mutation,
+                error.detail.as_str()
+            ),
+            (
+                ErrorKind::InvalidArgument,
+                RetryRule::Definitive,
+                true,
+                detail
+            ),
+        );
+        assert!(mailbox.try_recv().is_err(), "nothing reached the owner");
+    }
+
+    /// The call a request at the limit sent to the owner; nothing answers it here.
+    #[track_caller]
+    fn reached(mailbox: &mpsc::Receiver<Msg>) -> ClientCall {
+        match mailbox.try_recv() {
+            Ok(Msg::Client(Client { call, .. })) => call,
+            other => panic!("a call at the limit reaches the owner: {other:?}"),
+        }
+    }
+
+    /// M9 S5-1 (G1) and the `limit_refused` line. An object id one byte over 1,024 is refused
+    /// for every write path (`put`, `write`, `txn` naming the put) and every read path (`get`,
+    /// `get_previous`, `read`) before the owner sees it. Each refusal logs one line keyed on
+    /// client and request. An id at the limit, all 0x00 (the longest list escape), is sent.
+    /// Unit (~100 ms): no node thread; the owner's mailbox shows what was sent.
+    #[config_log::retcd_test]
+    fn m9_s5_an_object_id_over_1024_bytes_is_refused_for_every_write_and_read_before_it_is_sent() {
+        const METHOD: &str =
+            "m9_s5_an_object_id_over_1024_bytes_is_refused_for_every_write_and_read_before_it_is_sent";
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(20);
+        let long = vec![b'k'; MAX_OBJECT_ID + 1];
+        let edge = vec![0_u8; MAX_OBJECT_ID];
+        let over = |op: &str, request: u64, done: &str| {
+            format!(
+                "{op}object id 1025 bytes, over the 1024-byte limit; request {request} not {done}"
+            )
+        };
+
+        let put = db.put(&long, b"c", None).expect_err("over the limit");
+        refused_unsent(&put.error, &over("op 0: ", 1, "sent"), &mailbox);
+        assert!(put.request.is_none(), "nothing was compiled");
+        let list = db
+            .write(&long, Change::List(Vec::new()), Some(Expected::Absent))
+            .expect_err("over the limit");
+        refused_unsent(&list.error, &over("op 0: ", 2, "sent"), &mailbox);
+        let short = txn_put(b"a", b"1", None);
+        let txn = db
+            .txn(&[short, txn_put(&long, b"1", None)], MAX_TXN_DEADLINE)
+            .expect_err("over the limit");
+        refused_unsent(&txn.error, &over("op 1: ", 3, "sent"), &mailbox);
+        let get = db.get(&long).expect_err("over the limit");
+        refused_unsent(&get, &over("", 4, "read"), &mailbox);
+        let previous = db.get_previous(&long).expect_err("over the limit");
+        refused_unsent(&previous, &over("", 5, "read"), &mailbox);
+        let range = Look::Range { offset: 0, len: 0 };
+        let read = db.read(&long, range).expect_err("over the limit");
+        refused_unsent(&read, &over("", 6, "read"), &mailbox);
+
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "limit_refused")
+            .collect();
+        let keys: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["client"].clone(),
+                    line["request"].clone(),
+                    line["limit"].clone(),
+                    line["found"].clone(),
+                    line["max"].clone(),
+                )
+            })
+            .collect();
+        let expected: Vec<_> = (1..=6_u64)
+            .map(|request| {
+                (
+                    serde_json::json!(1),
+                    serde_json::json!(request),
+                    serde_json::json!("object_id"),
+                    serde_json::json!(1025),
+                    serde_json::json!(1024),
+                )
+            })
+            .collect();
+        assert_eq!(keys, expected, "one line per refusal: {lines:?}");
+        // No line carries the caller's bytes: the id is 1,025 `k`s, as text or as numbers.
+        for line in lines.iter().map(ToString::to_string) {
+            assert!(
+                !line.contains("kkkkkkkk") && !line.contains("107,107,107"),
+                "the caller's bytes are logged: {line}"
+            );
+        }
+
+        let at = db.put(&edge, b"b", None).expect_err("nothing answers");
+        assert_eq!(at.error.kind, ErrorKind::Unavailable, "{at:?}");
+        match reached(&mailbox) {
+            ClientCall::Compile { puts, .. } => assert_eq!(puts[0].object.len(), MAX_OBJECT_ID),
+            other => panic!("the put at the limit is compiled: {other:?}"),
+        }
+        let at = db.get(&edge).expect_err("nothing answers");
+        assert_eq!(at.kind, ErrorKind::Unavailable, "{at:?}");
+        assert!(
+            matches!(reached(&mailbox), ClientCall::Get { object, .. } if object.len() == MAX_OBJECT_ID)
+        );
+        db.shutdown();
+    }
+
+    /// M9 S5-1 (G1) through `put_as`, which `rdb_dev` has no command for. An object id over
+    /// 1,024 bytes is refused before the owner sees it, the detail naming the caller's own
+    /// request id; `no_mutation` is false, as on every `put_as` refusal (D-S0-1). An id at the
+    /// limit is sent under that request id.
+    /// Unit (~30 ms): no node thread.
+    #[test]
+    fn m9_s5_put_as_refuses_an_object_id_over_1024_bytes_before_it_is_sent() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let long = vec![b'k'; MAX_OBJECT_ID + 1];
+        let refused = db
+            .put_as(RequestId(77), &long, b"v", None)
+            .expect_err("over the limit");
+        assert_eq!(
+            (
+                refused.error.kind,
+                refused.error.retry,
+                refused.error.no_mutation,
+                refused.error.detail.as_str(),
+                refused.request.is_none()
+            ),
+            (
+                ErrorKind::InvalidArgument,
+                RetryRule::Definitive,
+                false,
+                "op 0: object id 1025 bytes, over the 1024-byte limit; request 77 not sent",
+                true
+            ),
+        );
+        assert!(mailbox.try_recv().is_err(), "nothing reached the owner");
+
+        let edge = vec![0_u8; MAX_OBJECT_ID];
+        let at = db
+            .put_as(RequestId(77), &edge, b"v", None)
+            .expect_err("nothing answers");
+        assert_eq!(at.error.kind, ErrorKind::Unavailable, "{at:?}");
+        match reached(&mailbox) {
+            ClientCall::Compile { identity, puts, .. } => assert_eq!(
+                (identity.request, puts[0].object.len()),
+                (RequestId(77), MAX_OBJECT_ID)
+            ),
+            other => panic!("the put at the limit is compiled: {other:?}"),
+        }
+        db.shutdown();
+    }
+
+    /// M9 S5-2 (G3, G4). A change of any op-carrying kind with 256 ops, and a txn of 256 puts,
+    /// is refused before the owner sees it; 255 is sent. The txn's count comes before any
+    /// put's own check, so a put with an over-long id does not answer first.
+    /// Unit (~50 ms): no node thread.
+    #[test]
+    fn m9_s5_a_change_over_255_ops_and_a_txn_over_255_puts_are_refused_before_they_are_sent() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let changes = |ops: usize| {
+            let key = Value::Bool(true);
+            [
+                Change::Doc(Delta(vec![Op::Replace(Value::Null); ops])),
+                Change::Map(vec![ElemOp::NeedPresent(key.clone()); ops]),
+                Change::Set(vec![ElemOp::Remove(key); ops]),
+                Change::List(vec![crate::host::ListEdit::Push(Value::Null); ops]),
+            ]
+        };
+        for (request, change) in (1_u64..).zip(changes(MAX_OPS + 1)) {
+            let kind = change.name();
+            let refused = db.write(b"o", change, None).expect_err(kind);
+            refused_unsent(
+                &refused.error,
+                &format!("op 0: 256 ops, over the 255-op limit; request {request} not sent"),
+                &mailbox,
+            );
+        }
+        let long = vec![b'k'; MAX_OBJECT_ID + 1];
+        let puts = vec![txn_put(&long, b"1", None); MAX_OPS + 1];
+        let txn = db.txn(&puts, MAX_TXN_DEADLINE).expect_err("over the limit");
+        refused_unsent(
+            &txn.error,
+            "256 puts, over the 255-put limit; request 5 not sent",
+            &mailbox,
+        );
+        // The deadline comes before the count, and uses up no request id.
+        let late = MAX_TXN_DEADLINE + Duration::from_millis(1);
+        let txn = db.txn(&puts, late).expect_err("past the deadline");
+        refused_unsent(
+            &txn.error,
+            &format!(
+                "deadline: {} ms is past the maximum of {} ms; nothing was sent",
+                late.as_millis(),
+                MAX_TXN_DEADLINE.as_millis()
+            ),
+            &mailbox,
+        );
+        assert_eq!(db.identity().request, RequestId(6), "no id used up");
+
+        for change in changes(MAX_OPS) {
+            let kind = change.name();
+            let at = db.write(b"o", change, None).expect_err("nothing answers");
+            assert_eq!(at.error.kind, ErrorKind::Unavailable, "{kind}: {at:?}");
+            assert!(
+                matches!(reached(&mailbox), ClientCall::Compile { .. }),
+                "{kind}"
+            );
+        }
+        let puts = vec![txn_put(b"t", b"1", None); MAX_OPS];
+        let at = db
+            .txn(&puts, MAX_TXN_DEADLINE)
+            .expect_err("nothing answers");
+        assert_eq!(at.error.kind, ErrorKind::Unavailable, "{at:?}");
+        match reached(&mailbox) {
+            ClientCall::Compile { puts, .. } => assert_eq!(puts.len(), MAX_OPS),
+            other => panic!("a txn at the limit is compiled: {other:?}"),
+        }
+        db.shutdown();
+    }
+
+    /// M9 S5-4 (G2). A text or byte map key or set member over 1,024 bytes is refused in any
+    /// element op, at any position, and as a `Members` read's `after`; text counts UTF-8 bytes,
+    /// so 513 `é` is 1,026. The checks run in order: object id, ops, key for a write; object
+    /// id, page, `after` for a read. At the limit the call is sent.
+    /// Unit (~100 ms): no node thread.
+    #[test]
+    fn m9_s5_a_key_over_1024_bytes_is_refused_in_a_write_or_a_members_read_before_it_is_sent() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(20);
+        let text = |s: String| Value::Text(s);
+        let long = text("k".repeat(MAX_KEY + 1));
+        let wide = text("é".repeat(MAX_KEY / 2 + 1));
+        let over = |op: &str, found: usize, request: u64, done: &str| {
+            format!("{op}key {found} bytes, over the 1024-byte limit; request {request} not {done}")
+        };
+
+        let map = Change::Map(vec![
+            ElemOp::Put(text("a".into()), Value::Null),
+            ElemOp::NeedAbsent(long.clone()),
+        ]);
+        let refused = db.write(b"m", map, None).expect_err("over the limit");
+        refused_unsent(&refused.error, &over("op 0: ", 1025, 1, "sent"), &mailbox);
+        let bytes = Value::Bytes(vec![0; MAX_KEY + 1]);
+        let set = Change::Set(vec![ElemOp::Add(bytes)]);
+        let refused = db.write(b"s", set, None).expect_err("over the limit");
+        refused_unsent(&refused.error, &over("op 0: ", 1025, 2, "sent"), &mailbox);
+        let set = Change::Set(vec![ElemOp::Remove(wide)]);
+        let refused = db.write(b"s", set, None).expect_err("over the limit");
+        refused_unsent(&refused.error, &over("op 0: ", 1026, 3, "sent"), &mailbox);
+        let after = |after: &Value, limit| Look::Members {
+            after: Some(after.clone()),
+            limit,
+        };
+        let refused = db.read(b"m", after(&long, 1)).expect_err("over the limit");
+        refused_unsent(&refused, &over("", 1025, 4, "read"), &mailbox);
+
+        // Order: an over-long object id answers before an over-long key, and a page over the
+        // limit before an over-long `after`.
+        let id = vec![b'k'; MAX_OBJECT_ID + 1];
+        let both = Change::Map(vec![ElemOp::Remove(long.clone())]);
+        let refused = db.write(&id, both, None).expect_err("over the limit");
+        assert!(
+            refused
+                .error
+                .detail
+                .starts_with("op 0: object id 1025 bytes"),
+            "{refused:?}"
+        );
+        let refused = db
+            .read(b"m", after(&long, MAX_PAGE + 1))
+            .expect_err("over the limit");
+        assert!(refused.detail.starts_with("page limit 1001"), "{refused:?}");
+
+        let at = text("k".repeat(MAX_KEY));
+        let narrow = text("é".repeat(MAX_KEY / 2));
+        let map = Change::Map(vec![ElemOp::Put(at.clone(), Value::Null)]);
+        let set = Change::Set(vec![ElemOp::Add(narrow)]);
+        for change in [map, set] {
+            let kind = change.name();
+            let sent = db.write(b"o", change, None).expect_err("nothing answers");
+            assert_eq!(sent.error.kind, ErrorKind::Unavailable, "{kind}: {sent:?}");
+            assert!(
+                matches!(reached(&mailbox), ClientCall::Compile { .. }),
+                "{kind}"
+            );
+        }
+        let sent = db.read(b"m", after(&at, 1)).expect_err("nothing answers");
+        assert_eq!(sent.kind, ErrorKind::Unavailable, "{sent:?}");
+        assert!(matches!(reached(&mailbox), ClientCall::Get { .. }));
+        db.shutdown();
+    }
+
+    /// M9 S5-3 (G5). A `Members`, `Items` or `ItemsAfter` page of 1,001 is refused before the
+    /// owner sees it; 1,000 is sent.
+    /// Unit (~100 ms): no node thread.
+    #[test]
+    fn m9_s5_a_page_over_1000_items_is_refused_before_it_is_read() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(20);
+        let token = rdb_value::list::Token {
+            generation: Generation(1),
+            version: 2,
+            position: 1,
+        };
+        let looks = |limit| {
+            [
+                Look::Members { after: None, limit },
+                Look::Items { at: 0, limit },
+                Look::ItemsAfter { token, limit },
+            ]
+        };
+        for (request, look) in (1_u64..).zip(looks(MAX_PAGE + 1)) {
+            let refused = db.read(b"l", look).expect_err("over the limit");
+            refused_unsent(
+                &refused,
+                &format!("page limit 1001, over 1000; request {request} not read"),
+                &mailbox,
+            );
+        }
+        for look in looks(MAX_PAGE) {
+            let at = db.read(b"l", look.clone()).expect_err("nothing answers");
+            assert_eq!(at.kind, ErrorKind::Unavailable, "{look:?}: {at:?}");
+            assert!(
+                matches!(reached(&mailbox), ClientCall::Get { look: sent, .. } if sent == look),
+                "{look:?}"
+            );
+        }
+        db.shutdown();
+    }
 }
