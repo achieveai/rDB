@@ -27,8 +27,8 @@ config-testkit = { workspace = true }
 # `m9_host_vs_sim` runs one client script through the simulator and through the real host
 # (`rdb_api::Db` over `config_testkit::MemStore`) and compares the replies (M9 close-out C1,
 # ruling A-R150). Allowed: `deps` forbids only `config-*` -> `rdb-*`; no product crate takes
-# rdb-sim. rdb-api has no workspace entry, so it is named by path.
-rdb-api = { path = "../rdb-api" }
+# rdb-sim.
+rdb-api = { workspace = true }
 # The script's keys (`keys::root_key`), values (the byte-document envelope) and the decode of the
 # simulator's read, by the same functions the host uses.
 rdb-value = { workspace = true }

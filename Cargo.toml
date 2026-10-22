@@ -40,6 +40,7 @@ config-testkit = { path = "crates/config-testkit" }
 # rDB data plane (M7). The arrow points one way: `rdb-*` may take `config-log` and
 # `config-log-macros` for JSONL test logging, and no `config-*` crate may ever depend on a
 # `rdb-*` crate (rdb ADR-0002).
+rdb-api = { path = "crates/rdb-api" }
 rdb-core = { path = "crates/rdb-core" }
 rdb-sim = { path = "crates/rdb-sim" }
 rdb-storage = { path = "crates/rdb-storage" }
