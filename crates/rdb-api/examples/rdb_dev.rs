@@ -176,15 +176,20 @@
 //!                                         earlier clear sent deletes, ask its `status`. While
 //!                                         reads are refused, as after a fence, it answers as
 //!                                         `read` does. `retry` resends it unchanged
-//! admin damage <o> [--element K] [--as digest|kind0|newer]
+//! admin damage <o> [--element K | --item P] [--as digest|kind0|newer] [--api-version N]
 //!                                         dev only: overwrite the object's stored root, or
 //!                                         with --element its stored map entry or set member
-//!                                         K (JSON, as `map` takes it), with a sealed document
+//!                                         K (JSON, as `map` takes it), or with --item list
+//!                                         item P's own record, with a sealed document
 //!                                         whose digest fails (`digest`, the default), whose
 //!                                         kind is 0x00 (`kind0`), or whose codec is 0x02,
 //!                                         digest correct (`newer`: a newer build's record). A
 //!                                         set member holding any bytes is damage too. A
-//!                                         missing record is refused
+//!                                         missing record is refused, and so is an item kept
+//!                                         inside its block (`no stored record`).
+//!                                         --api-version N sends the write as API version N
+//!                                         (default 1): any other is a newer build's request,
+//!                                         refused before apply
 //! admin damage-chunk <o> --upload U --index I
 //!                                         dev only: overwrite that stored chunk with other
 //!                                         bytes, so a range read over it (`--offset`/`--len`)
@@ -2070,17 +2075,25 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
     else {
         return Err(usage());
     };
-    let (mut how, mut element) = (None, None);
+    let (mut how, mut element, mut item, mut api_version) = (None, None, None, None);
     while let Some(flag) = words.next() {
         match (flag, words.rest.trim_start()) {
             ("--as", _) if how.is_none() => match words.next() {
                 Some(word @ ("digest" | "kind0" | "newer")) => how = Some(word),
                 _ => return Err(usage()),
             },
-            ("--element", text) if element.is_none() => {
+            ("--element", text) if element.is_none() && item.is_none() => {
                 let value = words.key("--element K")?;
                 let typed = text[..text.len() - words.rest.len()].trim_end();
                 element = Some((value, typed));
+            }
+            ("--item", _) if item.is_none() && element.is_none() => {
+                let p = words.next().ok_or_else(usage)?;
+                item = Some(p.parse::<i64>().map_err(|_| usage())?);
+            }
+            ("--api-version", _) if api_version.is_none() => {
+                let n = words.next().ok_or_else(usage)?;
+                api_version = Some(n.parse::<u16>().map_err(|_| usage())?);
             }
             _ => return Err(usage()),
         }
@@ -2107,16 +2120,50 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
     let root = rdb_value::keys::root_key(TenantId(1), AffinityId(1), object.as_bytes());
     // An element gets the same bytes: a map entry that does not open, or a set member that holds
     // bytes, either of which a read refuses. So no read is needed to learn the kind.
-    let (key, what) = match &element {
-        None => (root.to_bytes(), object.to_owned()),
-        Some((k, typed)) => (
+    let (key, what) = match (&element, item) {
+        (Some((k, typed)), _) => (
             rdb_value::keys::element_key(&root, k)
                 .map_err(|e| format!("admin damage: --element {e}"))?,
             format!("{object} element {typed}"),
         ),
+        // M9 S7: an item's own record, found by one items read. An inline item has none, so its
+        // key is not stored and the `Present` condition refuses it.
+        (None, Some(at)) => {
+            let what = format!("{object} item {at}");
+            let page = match db.read(object.as_bytes(), Look::Items { at, limit: 1 }) {
+                Ok(ReadOk {
+                    seen: rdb_api::Seen::Items(page),
+                    ..
+                }) => page,
+                Ok(ReadOk {
+                    seen: rdb_api::Seen::Absent,
+                    ..
+                }) => {
+                    say(&format!("err admin damage: no stored record at {what}"));
+                    return Ok(());
+                }
+                Ok(_) => return Err(format!("admin damage: --item: {object} is not a list")),
+                Err(error) => {
+                    // The lookup's own error, without a retry rule: nothing was written.
+                    say(&format!(
+                        "err admin damage: --item read {} ({})",
+                        error.name(),
+                        error.detail
+                    ));
+                    return Ok(());
+                }
+            };
+            let Some(found) = page.items.first() else {
+                say(&format!("err admin damage: no stored record at {what}"));
+                return Ok(());
+            };
+            (rdb_value::keys::item_key(&root, found.id), what)
+        }
+        (None, None) => (root.to_bytes(), object.to_owned()),
     };
     let request = TxnRequest {
-        api_version: rdb_core::contracts::version::API_VERSION,
+        // M9 S7: `--api-version N` sends the write as a newer (or older) build's request.
+        api_version: api_version.unwrap_or(rdb_core::contracts::version::API_VERSION),
         identity: RequestIdentity {
             tenant: TenantId(1),
             client: ClientId(2),
@@ -2153,8 +2200,9 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-const DAMAGE_RECORD_USAGE: &str =
-    "admin damage <object> [--element K] [--as digest|kind0|newer]; K is a map key or set member";
+const DAMAGE_RECORD_USAGE: &str = "admin damage <object> [--element K | --item P] \
+     [--as digest|kind0|newer] [--api-version N]; K is a map key or set member, P a list \
+     position, N 0..=65535";
 
 /// `read`'s words after the object: nothing, the manifest alone, or `--offset O --len L`.
 fn parse_range(rest: &[&str]) -> Result<Look, String> {

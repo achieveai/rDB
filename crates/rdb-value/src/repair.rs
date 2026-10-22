@@ -26,7 +26,7 @@ use crate::collection::{
 };
 use crate::compile::{read, record, BlockFault, Compiled, Corrupt, SlotFault, ValueError};
 use crate::delta::{ApplyError, SizeLimit};
-use crate::envelope::{open, Kind};
+use crate::envelope::{newer_build, open, Kind};
 use crate::keys::{block_key, chunk_key, item_key, parse, KeyError, RootKey, Sub};
 use crate::list::{check_base, check_item, check_slot, drop_list, items, list, Start};
 
@@ -335,10 +335,8 @@ fn faulting(
     let element = matches!(&parsed, Ok(p) if matches!(p.sub, Sub::Element));
     let set = matches!(reader, Reader::Collection(c) if c.kind == CollectionKind::Set);
     if !(element && (set || bytes.is_empty())) {
-        if let Err(error) = open(bytes) {
-            if error.is_newer_build() {
-                return Err(ValueError::Corrupt(Corrupt::Envelope(error)));
-            }
+        if let Some(error) = newer_build(bytes) {
+            return Err(ValueError::Corrupt(Corrupt::Envelope(error)));
         }
     }
     let Ok(parsed) = parsed else {

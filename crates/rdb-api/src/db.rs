@@ -795,7 +795,9 @@ impl Db {
     ///   `BlobDigestMismatch`, ...);
     /// - `UPLOAD_CHUNK_CONFLICT` for a `Chunk` whose upload and index already hold other bytes;
     /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`) when a record the change reads was written
-    ///   by a newer build; a `Clear` then deletes nothing and says "not cleared";
+    ///   by a newer build; a `Clear` then deletes nothing and says "not cleared". A map change
+    ///   reads every stored entry it names (`Put`, `Remove`, `NeedPresent`, `NeedAbsent`), so
+    ///   it never overwrites, deletes or vouches for a newer build's entry (M9 S7);
     /// - `CORRUPT_BLOB` when a blob root that opens is not a v1 manifest, or a chunk it names does
     ///   not open, is not stored, or is not the one the manifest names; `CORRUPT_HISTORY` when any
     ///   other stored record does not open, a blob root whose envelope does not open included.
@@ -1016,6 +1018,9 @@ impl Db {
     ///
     /// [`ApiError`]: a §5.4 refusal, or `UNAVAILABLE` when no answer came in time.
     /// `INVALID_ARGUMENT` (`KindMismatch`) when `look` does not fit the object's kind.
+    /// `INCOMPATIBLE_VERSION` (retry `Quarantine`) when a record the read meets was written by a
+    /// newer build, named before anything else about that record (M9 S7); a page that stops
+    /// before that record answers as usual.
     pub fn read(&self, object: &[u8], look: Look) -> Result<ReadOk, ApiError> {
         self.read_call(ClientCall::Get {
             identity: self.identity(),

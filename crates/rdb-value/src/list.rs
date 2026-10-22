@@ -36,7 +36,7 @@ use crate::compile::{
     SlotFault, ValueError,
 };
 use crate::delta::{ApplyError, SizeLimit};
-use crate::envelope::{open, seal, Kind, HEADER_LEN};
+use crate::envelope::{newer_build, open, seal, Kind, HEADER_LEN};
 use crate::keys::{
     block_key, item_key, slot_key, KeyError, RootKey, LIST_ID_LEN, LIST_SLOTS, SUB_BLOCK, SUB_ITEM,
 };
@@ -672,6 +672,10 @@ fn load_block(
     let version = snapshot
         .version(Namespace::User, &key)
         .ok_or(ValueError::Corrupt(Corrupt::VersionWithoutValue))?;
+    // A newer build's base is named before its version (M9 S7).
+    if let Some(error) = newer_build(&bytes) {
+        return Err(fault(BlockFault::Envelope(error)));
+    }
     if version > root_version {
         return Err(fault(BlockFault::NewerThanRoot {
             block: version,
@@ -929,6 +933,10 @@ fn read_item(
     let corrupt = ValueError::Corrupt;
     let (version, bytes) =
         record(snapshot, &item_key(root, id))?.ok_or(corrupt(Corrupt::ItemMissing { id }))?;
+    // A newer build's item is named before its version (M9 S7).
+    if let Some(error) = newer_build(&bytes) {
+        return Err(corrupt(Corrupt::Envelope(error)));
+    }
     if version > root_version {
         return Err(corrupt(Corrupt::ElementNewerThanRoot {
             element: version,
