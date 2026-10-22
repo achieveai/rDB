@@ -401,6 +401,9 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   "orphan state" names element records (`sub` `0x01`) only, so nothing changes there.
 - ADR-rdb-0013's `clear_object` (O7) covers a blob too: it deletes chunks, then the root, in batches
   bounded as in decision 8. This is the amendment to decision 11's damaged-object table (header).
+  (Status 2026-10-21, M9 S6: built. A blob with chunks and no root is refused with `OnlyChunks`,
+  `CONDITION_FAILED`: uploads in progress are GC's, not the clear's. Each chunk the manifest
+  names that is not stored gets an `Absent` condition.)
 - A collection or document created at an id with leftover chunks does not see them; GC removes them,
   because a non-blob root names no upload.
 

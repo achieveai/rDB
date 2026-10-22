@@ -367,6 +367,8 @@ stateDiagram-v2
 | `STALE_CONTINUATION` | Restart the scan at a new snapshot/version; never silently continue against changed ordering |
 | `CORRUPT_BLOB`, `CORRUPT_HISTORY`, `INCOMPATIBLE_VERSION`, `STATUS_EXPIRED` | Quarantine/reject; operator or rollout action; corrupt blob streams yield no successful partial result |
 
+(Status 2026-10-21, M9 S6: a stored record written by a newer build answers `INCOMPATIBLE_VERSION`, not `CORRUPT_HISTORY` or `CORRUPT_BLOB`: it may be valid, and it waits for the rollout. Damage stays `CORRUPT_*`, and the admin clear (`Change::Clear`) removes it; the clear refuses a newer build's record. A read that meets another fault first still answers `CORRUPT_HISTORY` until M9 S7. [ADR-rdb-0012](../ADRs/rdb/0012-document-encoding-cbor-profile.md) §12.)
+
 ## 6. Replication and durability
 
 ```mermaid
