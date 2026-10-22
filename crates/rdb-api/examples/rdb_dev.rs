@@ -15,6 +15,10 @@
 //! `retry` of a trimmed request is no longer recognised and is sent afresh; every rdb_dev write
 //! carries a version condition, so it answers `CONDITION_FAILED` rather than applying twice.
 //!
+//! Limits, checked before anything is compiled, sent or read: an object id is at most 1,024
+//! bytes, for every write and read. A request over a limit answers `INVALID_ARGUMENT` with
+//! `request=-`, and its detail ends `request R not sent` (or `not read`): R is the id it used up.
+//!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
 //! word starts a comment; one inside a word, as in `{"tag":"#1"}`, or inside a `"..."`
 //! string, as in `{"m":"hello #world"}`, is kept, so a comment after JSON needs a space

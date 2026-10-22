@@ -66,6 +66,17 @@ const GROUP: AffinityId = AffinityId(1);
 /// So a queued call waits behind every call ahead of it first, and no bound covers that wait.
 pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// The longest object id, in raw bytes, that any write or read accepts (M9 S5). A longer one is
+/// `INVALID_ARGUMENT` before anything is compiled, sent or read, and its request id is used up.
+/// A read keeps this limit even if a later version lowers the write limit: data already written
+/// stays readable, so a lower write limit needs its own constant.
+pub const MAX_OBJECT_ID: usize = 1_024;
+
+// A list escapes its id into each item key: every 0x00 doubles and 2 bytes end it. The longest
+// id, all 0x00, must still fit the list's escaped-id cap, so a list never refuses an id this
+// layer admits.
+const _: () = assert!(2 * MAX_OBJECT_ID + 2 <= rdb_value::list::MAX_ID_ESCAPED);
+
 /// A failed call, with the §5.4 name and what the caller may do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -774,6 +785,14 @@ impl Db {
         deadline: Duration,
         wait: Duration,
     ) -> Result<Option<PutOk>, PutError> {
+        // A request over a limit is refused here, before it reaches the owner's thread: nothing
+        // is compiled or sent, and its request id is used up (M9 S5).
+        if let Some(error) = write_refusal(&puts, identity.request) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
         // Compile first, send second (defect w24): the request is in hand before anything is
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
@@ -949,6 +968,10 @@ impl Db {
     }
 
     fn read_call(&self, call: ClientCall) -> Result<ReadOk, ApiError> {
+        // A read over a limit is refused before it reaches the owner's thread (M9 S5).
+        if let Some(error) = read_refusal(&call) {
+            return Err(error);
+        }
         let answered = match self.call(call, self.timeouts.read) {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
@@ -1485,6 +1508,70 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
             MAX_TXN_DEADLINE.as_millis()
         ))
     })
+}
+
+/// The first limit `puts` breaks, as `INVALID_ARGUMENT` naming the put as `op <index>`, or
+/// `None` when every put is within every limit. `request` is the id the refused request used up.
+fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
+    puts.iter().enumerate().find_map(|(index, put)| {
+        (put.object.len() > MAX_OBJECT_ID).then(|| {
+            limit_refused(
+                request,
+                "object_id",
+                put.object.len(),
+                MAX_OBJECT_ID,
+                format!(
+                    "op {index}: object id {} bytes, over the {MAX_OBJECT_ID}-byte limit; \
+                     request {} not sent",
+                    put.object.len(),
+                    request.0
+                ),
+            )
+        })
+    })
+}
+
+/// The first limit a read `call` breaks, as `INVALID_ARGUMENT`, or `None` when it is within
+/// every limit. A call that is not a read is never refused here: [`Db::read_call`] sends reads
+/// only.
+fn read_refusal(call: &ClientCall) -> Option<ApiError> {
+    let (identity, object) = match call {
+        ClientCall::Get {
+            identity, object, ..
+        }
+        | ClientCall::GetPrevious { identity, object } => (identity, object),
+        ClientCall::Put { .. }
+        | ClientCall::Compile { .. }
+        | ClientCall::Resend { .. }
+        | ClientCall::Status { .. } => return None,
+    };
+    let request = identity.request;
+    (object.len() > MAX_OBJECT_ID).then(|| {
+        limit_refused(
+            request,
+            "object_id",
+            object.len(),
+            MAX_OBJECT_ID,
+            format!(
+                "object id {} bytes, over the {MAX_OBJECT_ID}-byte limit; request {} not read",
+                object.len(),
+                request.0
+            ),
+        )
+    })
+}
+
+/// A request over a limit: one `limit_refused` line, which never carries the caller's bytes,
+/// and `INVALID_ARGUMENT` with `detail`.
+fn limit_refused(
+    request: RequestId,
+    limit: &'static str,
+    found: usize,
+    max: usize,
+    detail: String,
+) -> ApiError {
+    tracing::info!(request = request.0, limit, found, max, "limit_refused");
+    ApiError::invalid(detail)
 }
 
 /// The time a transaction's send waits: its deadline plus twice the host's waiter margin, so

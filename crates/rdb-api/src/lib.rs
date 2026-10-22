@@ -43,7 +43,7 @@ mod test_store;
 
 pub use db::{
     ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, ReadOk, Timeouts, TxnPut,
-    MAX_TXN_DEADLINE,
+    MAX_OBJECT_ID, MAX_TXN_DEADLINE,
 };
 pub use host::{Change, ListEdit, Look, Seen};
 // The value types an app builds a change from, by name only (S4 A-8): no `rdb_value` internals.
