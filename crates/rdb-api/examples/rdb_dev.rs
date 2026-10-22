@@ -48,7 +48,7 @@
 //!                                         timeout; past 30000 it is refused
 //! txn& [--deadline-ms N] <op>...          the same txn in the background, as `put&`: `bg txn:
 //!                                         queued`, then `bg txn: <answer>`; not remembered
-//! retry [<request>]                       send a put's or txn's request again, unchanged: the
+//! retry [<request>]                       send a write's request again, unchanged: the
 //!                                         latest one's, or the one this session sent as
 //!                                         <request>
 //! retry [<request>] --deadline-ms N       the same request with a fresh deadline of N ms
@@ -165,6 +165,26 @@
 //!                                         in M9 (no takeover runs), `partition-in-transfer
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
+//! admin clear <o>                        clear a damaged object: prove it damaged, then
+//!                                         delete one batch of its records, each at the version
+//!                                         it was read at (`clear ok ...`). Repeat until `clear
+//!                                         unchanged (nothing to clear; nothing sent)`. A
+//!                                         healthy object answers `CONDITION_FAILED`, a newer
+//!                                         build's record `INCOMPATIBLE_VERSION`, both with
+//!                                         `request=-`. Nothing left but not yet published
+//!                                         answers `UNKNOWN_OUTCOME` with `request=-`: if an
+//!                                         earlier clear sent deletes, ask its `status`. While
+//!                                         reads are refused, as after a fence, it answers as
+//!                                         `read` does. `retry` resends it unchanged
+//! admin damage <o> [--element K] [--as digest|kind0|newer]
+//!                                         dev only: overwrite the object's stored root, or
+//!                                         with --element its stored map entry or set member
+//!                                         K (JSON, as `map` takes it), with a sealed document
+//!                                         whose digest fails (`digest`, the default), whose
+//!                                         kind is 0x00 (`kind0`), or whose codec is 0x02,
+//!                                         digest correct (`newer`: a newer build's record). A
+//!                                         set member holding any bytes is damage too. A
+//!                                         missing record is refused
 //! admin damage-chunk <o> --upload U --index I
 //!                                         dev only: overwrite that stored chunk with other
 //!                                         bytes, so a range read over it (`--offset`/`--len`)
@@ -799,6 +819,10 @@ fn waits_on_line(
         {
             format!("the start record's outcome (seq {})", seq.0)
         }
+        // Status does not know an admin damage write: it is another client's (S6 P-3).
+        Some(request) if request.0 >= DAMAGE_REQUEST_BASE => {
+            format!("an admin damage write's outcome (seq {})", seq.0)
+        }
         Some(request) => format!("request {}'s outcome (seq {})", request.0, seq.0),
         None => format!("the outcome of seq {}", seq.0),
     };
@@ -1139,7 +1163,7 @@ fn repl<'scope, 'env>(
             },
             ["retry", rest @ ..] => sent.pick(rest).map(|(request, kind)| {
                 let answer = match kind {
-                    Kind::Put { .. } | Kind::Value => db.resend(request),
+                    Kind::Put { .. } | Kind::Value | Kind::Clear => db.resend(request),
                     // A txn waits as it was sent: its own deadline, not the put timeout.
                     Kind::Txn => {
                         let deadline = Duration::from_millis(request.remaining_millis);
@@ -1195,8 +1219,22 @@ fn repl<'scope, 'env>(
                 );
             }),
             ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
+            ["admin", "damage", _, ..] => damage_record(db, &line),
+            ["admin", "clear", object] => {
+                let answer = db.write(object.as_bytes(), Change::Clear, None);
+                kind_write_line(
+                    db,
+                    "clear ",
+                    "nothing to clear",
+                    answer,
+                    &mut sent,
+                    Kind::Clear,
+                );
+                Ok(())
+            }
             ["admin", ..] => Err(format!(
-                "admin clear-grant <n>: n is 1, 2 or 3 | {DAMAGE_USAGE}"
+                "admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | {DAMAGE_USAGE} | \
+                 {DAMAGE_RECORD_USAGE}"
             )),
             ["control", "lifecycle", partition, word] => {
                 parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
@@ -1722,18 +1760,30 @@ fn labelled_write_line(
     answer: Result<Option<rdb_api::PutOk>, PutError>,
     sent: &mut Sent,
 ) -> bool {
+    kind_write_line(db, label, unchanged, answer, sent, Kind::Value)
+}
+
+/// [`labelled_write_line`] for a write `retry` names as `kind`.
+fn kind_write_line(
+    db: &Db,
+    label: &str,
+    unchanged: &str,
+    answer: Result<Option<rdb_api::PutOk>, PutError>,
+    sent: &mut Sent,
+    kind: Kind,
+) -> bool {
     match answer {
         Ok(None) => {
             say(&format!("{label}unchanged ({unchanged}; nothing sent)"));
-            sent.record(None, Kind::Value);
+            sent.record(None, kind);
             true
         }
         Ok(Some(ok)) => {
-            labelled_put_line(db, label, Ok(ok), Some((sent, Kind::Value)));
+            labelled_put_line(db, label, Ok(ok), Some((sent, kind)));
             true
         }
         Err(e) => {
-            labelled_put_line(db, label, Err(e), Some((sent, Kind::Value)));
+            labelled_put_line(db, label, Err(e), Some((sent, kind)));
             false
         }
     }
@@ -1930,8 +1980,14 @@ fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), 
     Ok(())
 }
 
-/// Request ids for `admin damage-chunk`, under its own client so they never meet the `Db`'s.
-static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// The first request id of `admin damage` and `damage-chunk`. Node status names an in-flight
+/// request by id alone, with no client, so these ids start far above any the `Db` sends, and a
+/// note can tell them apart (S6 P-3).
+const DAMAGE_REQUEST_BASE: u64 = 1 << 32;
+
+/// Request ids for `admin damage` and `damage-chunk`, under their own client.
+static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DAMAGE_REQUEST_BASE);
 
 /// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
 /// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
@@ -1990,6 +2046,115 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
 }
 
 const DAMAGE_USAGE: &str = "admin damage-chunk <object> --upload U --index I";
+
+/// `admin damage`: overwrite an object's stored root record, through a replicated write under
+/// damage-chunk's own client, so a later read of it fails (M9 S6). A dev tool only; the product
+/// never writes a record this way. `--as`:
+/// - `digest` (the default): a sealed document with one payload byte flipped, so the digest
+///   check fails: `CORRUPT_HISTORY`;
+/// - `kind0`: `kind` `0x00`, digest recomputed: damage, since no build writes kind 0;
+/// - `newer`: `codec_version` `0x02`, digest recomputed: a record a newer build could have
+///   written, valid but unreadable here.
+///
+/// Only a stored record is overwritten: a missing one is refused, never written.
+fn damage_record(db: &Db, line: &str) -> Result<(), String> {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+    use rdb_core::contracts::txn::{Condition, Mutation};
+    use rdb_value::envelope::{digest, seal, Kind};
+    // Read from the raw line, as a value verb is, so a quoted K keeps its quotes: `"b"` is the
+    // text b, `1` the integer.
+    let mut words = Words::new(line);
+    let usage = || DAMAGE_RECORD_USAGE.to_owned();
+    let (Some("admin"), Some("damage"), Some(object)) = (words.next(), words.next(), words.next())
+    else {
+        return Err(usage());
+    };
+    let (mut how, mut element) = (None, None);
+    while let Some(flag) = words.next() {
+        match (flag, words.rest.trim_start()) {
+            ("--as", _) if how.is_none() => match words.next() {
+                Some(word @ ("digest" | "kind0" | "newer")) => how = Some(word),
+                _ => return Err(usage()),
+            },
+            ("--element", text) if element.is_none() => {
+                let value = words.key("--element K")?;
+                let typed = text[..text.len() - words.rest.len()].trim_end();
+                element = Some((value, typed));
+            }
+            _ => return Err(usage()),
+        }
+    }
+    let how = how.unwrap_or("digest");
+    let payload = rdb_value::cbor::encode(&rdb_value::value::Value::Map(Default::default()))
+        .expect("an empty map encodes");
+    let mut bytes = seal(Kind::Document, &payload)
+        .expect("an empty map fits an envelope")
+        .to_vec();
+    match how {
+        "digest" => bytes[rdb_value::envelope::HEADER_LEN] ^= 0xFF,
+        reseal => {
+            if reseal == "kind0" {
+                bytes[1] = 0x00;
+            } else {
+                bytes[2] = 0x02;
+            }
+            let head: [u8; 8] = bytes[..8].try_into().expect("a header is 40 bytes");
+            let sum = digest(&head, &bytes[rdb_value::envelope::HEADER_LEN..]);
+            bytes[8..rdb_value::envelope::HEADER_LEN].copy_from_slice(&sum);
+        }
+    }
+    let root = rdb_value::keys::root_key(TenantId(1), AffinityId(1), object.as_bytes());
+    // An element gets the same bytes: a map entry that does not open, or a set member that holds
+    // bytes, either of which a read refuses. So no read is needed to learn the kind.
+    let (key, what) = match &element {
+        None => (root.to_bytes(), object.to_owned()),
+        Some((k, typed)) => (
+            rdb_value::keys::element_key(&root, k)
+                .map_err(|e| format!("admin damage: --element {e}"))?,
+            format!("{object} element {typed}"),
+        ),
+    };
+    let request = TxnRequest {
+        api_version: rdb_core::contracts::version::API_VERSION,
+        identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(2),
+            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+        },
+        affinity: AffinityId(1),
+        expected_generation: None,
+        remaining_millis: 5_000,
+        // Only a stored record is damaged; a missing one is refused, never written.
+        conditions: vec![Condition::Present { key: key.clone() }],
+        mutations: vec![Mutation::Put {
+            key,
+            value: Bytes::from(bytes),
+            expected_version: None,
+        }],
+    };
+    // No request id is printed, as for damage-chunk (PB-5): another client's number.
+    say(&match db.resend(request) {
+        Ok(ok) => format!(
+            "damage ok p=1 gen={} seq={} {:?} as={how} request=- (damage's own client; status \
+             does not know it)",
+            ok.generation.0, ok.seq.0, ok.durability
+        ),
+        Err(PutError { error, .. }) if error.kind == ErrorKind::ConditionFailed => {
+            format!("err admin damage: no stored record at {what}")
+        }
+        Err(PutError { error, .. }) => format!(
+            "err admin damage: {} retry={:?} request=- ({})",
+            error.name(),
+            error.retry,
+            error.detail
+        ),
+    });
+    Ok(())
+}
+
+const DAMAGE_RECORD_USAGE: &str =
+    "admin damage <object> [--element K] [--as digest|kind0|newer]; K is a map key or set member";
 
 /// `read`'s words after the object: nothing, the manifest alone, or `--offset O --len L`.
 fn parse_range(rest: &[&str]) -> Result<Look, String> {
@@ -2276,6 +2441,10 @@ fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>),
              unchanged, or send a new write",
             request.0
         )),
+        Kind::Clear => Err(format!(
+            "retry --payload changes a put's value; request {} was a clear: retry it unchanged",
+            request.0
+        )),
     }
 }
 
@@ -2292,9 +2461,11 @@ enum Kind {
     /// A `Db::write`: `doc`, `map`, `set`, `list` or a `blob` line. Resent unchanged, never with
     /// another payload (S4 A-5).
     Value,
+    /// An `admin clear`, resent unchanged as a value write is.
+    Clear,
 }
 
-/// Every put and txn request this session sent, and which came last. `retry` replays the
+/// Every write request this session sent, and which came last. `retry` replays the
 /// latest, whatever it answered, or nothing when the latest sent nothing (PC11).
 #[derive(Debug, Default)]
 struct Sent {
@@ -2342,9 +2513,9 @@ impl Sent {
     fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Kind), String> {
         let id = match rest {
             [] => match self.latest {
-                None => return Err("no put or txn to retry yet".to_owned()),
+                None => return Err("no write to retry yet".to_owned()),
                 Some(None) => {
-                    return Err("the latest put or txn sent no request; nothing to retry".to_owned())
+                    return Err("the latest write sent no request; nothing to retry".to_owned())
                 }
                 Some(Some(id)) => id,
             },
@@ -2356,7 +2527,7 @@ impl Sent {
         self.by_id
             .get(&id)
             .cloned()
-            .ok_or_else(|| format!("this session sent no put or txn as request {id}"))
+            .ok_or_else(|| format!("this session sent no write as request {id}"))
     }
 }
 

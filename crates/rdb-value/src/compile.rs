@@ -86,6 +86,11 @@ pub enum Corrupt {
     /// newer build, not damage (ADR-rdb-0012 §12).
     #[error("unknown element key profile {0}")]
     UnknownKeyProfile(i128),
+    /// A record under the object sits at a `sub` this build does not know
+    /// ([`crate::keys::Sub::Reserved`]). No build this one knows writes there, so it is a newer
+    /// build's record, not damage (ADR-rdb-0012 §12). Only a clear looks there (M9 S6).
+    #[error("a record at unknown sub {0:#04x}")]
+    UnknownSub(u8),
     /// A map entry's envelope is not a document.
     #[error("map entry envelope is a {found:?}, not a Document")]
     EntryNotDocument {
@@ -124,11 +129,15 @@ pub enum Corrupt {
     /// (ADR-rdb-0013 §11).
     #[error("element records exist that the root does not account for")]
     OrphanElement,
-    /// The root's `count` is above 0 but no element record exists (ADR-rdb-0013 §11).
-    #[error("the root counts {count} elements but none exists")]
+    /// The root's `count` is not the number of element records: above 0 with none stored
+    /// (ADR-rdb-0013 §11), or any other number, as a read of every element or a clear's proof
+    /// finds it (M9 S6, A-R142).
+    #[error("the root counts {count} elements, but {stored} are stored")]
     CountMismatch {
         /// The root's count.
         count: u64,
+        /// The element records stored.
+        stored: u64,
     },
     /// A blob root's payload is not a v1 manifest (ADR-rdb-0014 §2, "strict reading").
     #[error("blob manifest: {0}")]
@@ -169,6 +178,35 @@ pub enum Corrupt {
         /// The chunk's index.
         index: u32,
     },
+}
+
+impl Corrupt {
+    /// Whether the record that fails is a newer build's, not damage (ADR-rdb-0012 §12): an
+    /// envelope [`EnvelopeError::is_newer_build`] names, the root's or a chunk's, list block's or
+    /// change slot's; an unknown element key profile; an unknown sub; or an element key tag
+    /// profile 1 does not define, since new key types come as new tags (ADR-rdb-0013 decision 4;
+    /// review R-3, A-R145). Such a record may be valid, so it is answered `INCOMPATIBLE_VERSION`
+    /// and never cleared.
+    #[must_use]
+    pub fn is_newer_build(&self) -> bool {
+        match self {
+            Self::Envelope(error)
+            | Self::Chunk { error, .. }
+            | Self::Block {
+                fault:
+                    BlockFault::Envelope(error)
+                    | BlockFault::OpBad {
+                        fault: SlotFault::Envelope(error),
+                        ..
+                    },
+                ..
+            } => error.is_newer_build(),
+            Self::UnknownKeyProfile(_)
+            | Self::UnknownSub(_)
+            | Self::Key(KeyError::UnknownTag(_)) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Why a list block is refused (ADR-rdb-0016 §7). An unknown kind, codec or format inside

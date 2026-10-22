@@ -4,7 +4,7 @@
 
 #![allow(dead_code)] // each test binary uses its own subset
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use proptest::prelude::*;
@@ -434,10 +434,6 @@ impl Kernel {
     /// `generation: None` is an unfenced request; `Some(g)` is refused unless `g` is serving.
     pub fn apply(&mut self, compiled: &Compiled, generation: Option<u64>) -> Result<u64, Refused> {
         assert!(
-            !compiled.mutations.is_empty(),
-            "an empty Compiled is never submitted (the kernel refuses it, check 10)"
-        );
-        assert!(
             compiled
                 .mutations
                 .windows(2)
@@ -445,6 +441,26 @@ impl Kernel {
             "a write set whose keys do not strictly ascend is never submitted (stricter than the \
              kernel on purpose: check 10 refuses only a repeated key): {:?}",
             compiled.mutations.iter().map(key_of).collect::<Vec<_>>()
+        );
+        self.apply_any_order(compiled, generation)
+    }
+
+    /// [`Self::apply`] with only the kernel's own shape check, no key twice (check 10): for a
+    /// clear, whose deletes go clean records first and the root last, not in key order (M9 S6).
+    pub fn apply_any_order(
+        &mut self,
+        compiled: &Compiled,
+        generation: Option<u64>,
+    ) -> Result<u64, Refused> {
+        assert!(
+            !compiled.mutations.is_empty(),
+            "an empty Compiled is never submitted (the kernel refuses it, check 10)"
+        );
+        let keys: BTreeSet<&Bytes> = compiled.mutations.iter().map(key_of).collect();
+        assert_eq!(
+            keys.len(),
+            compiled.mutations.len(),
+            "a write set with a key twice is never submitted (check 10)"
         );
         if generation.is_some_and(|g| g != self.generation) {
             return Err(Refused::GenerationChanged);
@@ -495,6 +511,13 @@ impl Kernel {
     pub fn commit(&mut self, compiled: &Compiled) -> u64 {
         let generation = self.generation;
         self.apply(compiled, Some(generation))
+            .expect("the request holds")
+    }
+
+    /// [`Self::commit`] of a clear's batch, through [`Self::apply_any_order`].
+    pub fn commit_any_order(&mut self, compiled: &Compiled) -> u64 {
+        let generation = self.generation;
+        self.apply_any_order(compiled, Some(generation))
             .expect("the request holds")
     }
 }

@@ -198,6 +198,9 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 
 ### 7. Damage: refused, never served (ADR-rdb-0013 decision 11); every row is repaired by `clear_object` (M9)
 (Status 2026-10-19, M9 S4, A-R113 C-5: `clear_object` is built in M9 S6, with the admin path.)
+(Status 2026-10-21, M9 S6: built. Its proof reads the list, then compiles its drop, so it also finds
+what a read does not: an item or slot record beside an empty list is `OrphanElement` at the drop,
+and the clear removes it.)
 
 | Damage | Error |
 |---|---|

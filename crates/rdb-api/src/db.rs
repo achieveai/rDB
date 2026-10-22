@@ -128,7 +128,7 @@ impl ApiError {
     /// |---|---|---|
     /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
     /// | `UnknownOutcome` | `QueryStatus` | `false` |
-    /// | `CorruptHistory`, `CorruptBlob` | `Quarantine` | `false` |
+    /// | `CorruptHistory`, `CorruptBlob`, `IncompatibleVersion` | `Quarantine` | `false` |
     /// | `UploadChunkConflict` | `Reconcile` | `true` |
     /// | any other | `BoundedJitter` | `false` |
     ///
@@ -143,7 +143,9 @@ impl ApiError {
                 (RetryRule::Definitive, true)
             }
             ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
-            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob => (RetryRule::Quarantine, false),
+            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob | ErrorKind::IncompatibleVersion => {
+                (RetryRule::Quarantine, false)
+            }
             ErrorKind::UploadChunkConflict => (RetryRule::Reconcile, true),
             _ => (RetryRule::BoundedJitter, false),
         };
@@ -753,9 +755,9 @@ impl Db {
 
     /// Apply `change` to `object`, as one transaction. `expect` says when it may happen:
     /// `None` at the version the owner's compile sees (absent included), `Some(Absent)` only
-    /// as a create, `Some(Version(v))` only at version `v`. A `Chunk` or a `Gc` takes no
-    /// `expect`. The owner compiles the change against the object as it is, so the request
-    /// carries the whole after-image of what it changes.
+    /// as a create, `Some(Version(v))` only at version `v`. A `Chunk`, a `Gc` or a `Clear`
+    /// takes no `expect`. The owner compiles the change against the object as it is, so the
+    /// request carries the whole after-image of what it changes.
     ///
     /// What guards the request:
     /// - `Doc`, `Map`, `Set`, `List` and `Publish`: the object's version it was compiled
@@ -764,6 +766,10 @@ impl Db {
     /// - `Chunk`: only that chunk's key being absent, never the object's version. A chunk is
     ///   stored under an object of any kind, or none (A-R127).
     /// - `Gc`: the object as the compile read it, and each chunk it deletes.
+    /// - `Clear`: the root's version as the compile read it, or its absence, and each record
+    ///   it deletes, at the version it read. A clear proves the object damaged first, then
+    ///   deletes at most 254 records besides the root per call. The last call also deletes the
+    ///   root, so the object reads as damaged until then; call again until `Ok(None)`.
     ///
     /// `Ok(None)` is a change that compiles to nothing and is never sent:
     /// - a `Chunk` whose bytes are already stored at its upload and index;
@@ -772,7 +778,8 @@ impl Db {
     ///   the fence, so it is not gated on A1 (ADR-rdb-0014 O9);
     /// - a `Gc` with nothing left to collect;
     /// - a `Publish` of the blob already at the object and published: its version is at or
-    ///   below what P1 has published, in the generation the compile sees.
+    ///   below what P1 has published, in the generation the compile sees;
+    /// - a `Clear` of an object with nothing stored, at a view P1 has published.
     ///
     /// # Errors
     ///
@@ -780,20 +787,30 @@ impl Db {
     /// ready to [`Db::resend`] unchanged. A change the compile refuses sends nothing and
     /// carries no request:
     /// - `CONDITION_FAILED` for a version that moved, or an object or element that a change or
-    ///   a `Need` finds absent or present when it must not be;
+    ///   a `Need` finds absent or present when it must not be; or a `Clear` of an object that
+    ///   reads back cleanly, or that holds only upload chunks (`blob gc` removes those);
     /// - `INVALID_ARGUMENT` for an op that does not fit the object (`KindMismatch`,
-    ///   `NotAContainer`, ...), an `expect` on a `Chunk` or a `Gc`, or a `Publish` whose stored
-    ///   chunks do not match it (`ChunkMissing`, `ChunkLength`, `BlobDigestMismatch`, ...);
+    ///   `NotAContainer`, ...), an `expect` on a `Chunk`, a `Gc` or a `Clear`, or a
+    ///   `Publish` whose stored chunks do not match it (`ChunkMissing`, `ChunkLength`,
+    ///   `BlobDigestMismatch`, ...);
     /// - `UPLOAD_CHUNK_CONFLICT` for a `Chunk` whose upload and index already hold other bytes;
+    /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`) when a record the change reads was written
+    ///   by a newer build; a `Clear` then deletes nothing and says "not cleared";
     /// - `CORRUPT_BLOB` when a blob root that opens is not a v1 manifest, or a chunk it names does
     ///   not open, is not stored, or is not the one the manifest names; `CORRUPT_HISTORY` when any
-    ///   other stored record does not open, a blob root whose envelope does not open included;
+    ///   other stored record does not open, a blob root whose envelope does not open included.
+    ///   Neither is a newer build's record, which is `INCOMPATIBLE_VERSION`;
     /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
     ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
-    ///   [`Self::status`] about that publish;
-    /// - for a `Publish` of the blob already at the object while A1 refuses reads, the kind and
-    ///   retry rule [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), with
-    ///   `no_mutation`, never "unchanged";
+    ///   [`Self::status`] about that publish. Likewise for a `Clear` that finds nothing stored
+    ///   at a view not yet published (C-2): if an earlier clear sent deletes, ask its status.
+    ///   And for a `Clear` that finds the object healthy, or only chunks, at such a view (review
+    ///   R-2): a repair applied and not yet published may still be lost, so clear again once it
+    ///   is;
+    /// - for a `Publish` of the blob already at the object, or a `Clear` of an object that is
+    ///   healthy, missing or only chunks, while A1 refuses reads: the kind and retry rule
+    ///   [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), with
+    ///   `no_mutation`, never "unchanged" or `CONDITION_FAILED`;
     /// - `UNAVAILABLE` when no compile answer came in time.
     pub fn write(
         &self,
@@ -841,7 +858,11 @@ impl Db {
             puts,
             remaining_millis: millis(deadline),
         };
-        let refused = |error| {
+        // Every answer here sent nothing: the compile refused, or never answered (Q3, M9 S6).
+        // `put_as` takes this back to `false` through `Self::retried`: its request id may have
+        // applied on an earlier send.
+        let refused = |mut error: ApiError| {
+            error.no_mutation = true;
             Err(PutError {
                 error: self.explained(error),
                 request: None,
@@ -1586,7 +1607,8 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
             | Change::List(_)
             | Change::Chunk { .. }
             | Change::Publish { .. }
-            | Change::Gc { .. } => &[],
+            | Change::Gc { .. }
+            | Change::Clear => &[],
         };
         elems
             .iter()
@@ -1653,7 +1675,7 @@ fn op_count(change: &Change) -> usize {
         Change::Doc(delta) => delta.0.len(),
         Change::Map(ops) | Change::Set(ops) => ops.len(),
         Change::List(edits) => edits.len(),
-        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } => 0,
+        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } | Change::Clear => 0,
     }
 }
 
@@ -4109,6 +4131,68 @@ mod tests {
                 "{look:?}"
             );
         }
+        db.shutdown();
+    }
+
+    /// M9 S6 guard 18 (Q3): every answer to a clear that `Db::write` gets before sending says
+    /// `no_mutation` and hands back no request, INCOMPATIBLE_VERSION included, which
+    /// `ApiError::new` alone leaves `false`. A clear of nothing stored is `Ok(None)`.
+    /// Integration (~1 s): three node threads on wall-clock time.
+    #[test]
+    fn m9_s6_a_clear_refused_before_sending_says_it_sent_nothing() {
+        use rdb_value::envelope::{digest, seal, Kind, HEADER_LEN};
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        db.put(b"d", b"1", None).expect("put d");
+        // A record a newer build could have written, as `rdb_dev admin damage --as newer` does.
+        let mut newer = seal(Kind::Document, &[0xf6]).expect("a null fits").to_vec();
+        newer[2] = 0x02;
+        let head: [u8; 8] = newer[..8].try_into().expect("a header is 40 bytes");
+        let sum = digest(&head, &newer[HEADER_LEN..]);
+        newer[8..HEADER_LEN].copy_from_slice(&sum);
+        let raw = TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TENANT,
+                client: ClientId(2),
+                request: RequestId(1),
+            },
+            affinity: GROUP,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: rdb_value::keys::root_key(TENANT, GROUP, b"n").to_bytes(),
+                value: Bytes::from(newer),
+                expected_version: None,
+            }],
+        };
+        db.resend(raw).expect("write the newer build's record");
+
+        let unsent = |object: &[u8]| {
+            let refused = db
+                .write(object, Change::Clear, None)
+                .expect_err("refused before sending");
+            (
+                refused.error.kind,
+                refused.error.no_mutation,
+                refused.request.is_none(),
+            )
+        };
+        assert_eq!(unsent(b"d"), (ErrorKind::ConditionFailed, true, true));
+        assert_eq!(unsent(b"n"), (ErrorKind::IncompatibleVersion, true, true));
+        let nothing = db.write(b"missing", Change::Clear, None);
+        assert!(matches!(nothing, Ok(None)), "{nothing:?}");
         db.shutdown();
     }
 }

@@ -405,6 +405,7 @@ pub fn drop_collection(
         (true, true) => Err(ApplyError::NotEmpty { count: found.count }.into()),
         (true, false) => Err(ValueError::Corrupt(Corrupt::CountMismatch {
             count: found.count,
+            stored: 0,
         })),
         (false, true) => Err(ValueError::Corrupt(Corrupt::OrphanElement)),
     }
@@ -437,6 +438,19 @@ fn element_value(
     }
 }
 
+/// Check one element record under `root` as [`members`] checks it: its key, version and bytes
+/// (M9 S6, a clear's classification).
+pub(crate) fn check_element(
+    root: &RootKey,
+    found: &Collection,
+    key: &[u8],
+    version: u64,
+    bytes: &[u8],
+) -> Result<(), ValueError> {
+    decode_element_key(root, key).map_err(|e| ValueError::Corrupt(Corrupt::Key(e)))?;
+    element_value(found, version, bytes).map(drop)
+}
+
 /// The element `key` of the collection at `root`, or `None` when it is absent.
 ///
 /// # Errors
@@ -460,13 +474,34 @@ pub fn member(
         .transpose()
 }
 
+/// The root's count against the elements stored, when every one of them has been read: one
+/// rule for a read that starts at the first element and reaches the last, and for a clear's
+/// proof (A-R142). A page that starts after an element, or stops short of the last, cannot
+/// apply it.
+///
+/// # Errors
+/// [`Corrupt::CountMismatch`] when they differ.
+pub(crate) fn check_count(found: &Collection, stored: usize) -> Result<(), ValueError> {
+    let stored = u64::try_from(stored).unwrap_or(u64::MAX);
+    if stored == found.count {
+        Ok(())
+    } else {
+        Err(ValueError::Corrupt(Corrupt::CountMismatch {
+            count: found.count,
+            stored,
+        }))
+    }
+}
+
 /// Up to `limit` elements of the collection at `root`, in element order, starting after `after`
-/// (which need not be an element) or at the first.
+/// (which need not be an element) or at the first. One record past the page is looked at, not
+/// read, to learn whether the page reaches the last element: a page that starts at the first
+/// and reaches the last checks the root's count ([`check_count`]).
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`] when there is no root; [`ApplyError::KindMismatch`] for a
 /// document; [`ApplyError::UnsupportedKeyType`] for `after`; [`ValueError::Corrupt`] for the
-/// first element that does not read back.
+/// first element that does not read back, then [`Corrupt::CountMismatch`].
 pub fn members(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -482,8 +517,13 @@ pub fn members(
         from.push(0x00);
     }
     let mut out = Vec::new();
-    for (key, bytes) in snapshot.scan(Namespace::User, &from, limit) {
+    let mut more = false;
+    for (key, bytes) in snapshot.scan(Namespace::User, &from, limit.saturating_add(1)) {
         if !key.starts_with(&prefix) {
+            break;
+        }
+        if out.len() == limit {
+            more = true;
             break;
         }
         let element =
@@ -496,6 +536,9 @@ pub fn members(
             value: element_value(&found, version, &bytes)?,
             version,
         });
+    }
+    if after.is_none() && !more {
+        check_count(&found, out.len())?;
     }
     Ok(Members {
         collection: found,

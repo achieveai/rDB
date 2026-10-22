@@ -637,7 +637,7 @@ struct Loaded {
 }
 
 /// The slot op no `op` lives in: `op mod 240`.
-fn slot_of(op: u64) -> u8 {
+pub(crate) fn slot_of(op: u64) -> u8 {
     u8::try_from(op % SLOTS).expect("a slot is below 240")
 }
 
@@ -678,16 +678,7 @@ fn load_block(
             root: root_version,
         }));
     }
-    let opened = open(&bytes).map_err(|e| fault(BlockFault::Envelope(e)))?;
-    if opened.kind != Kind::ListBlock {
-        return Err(fault(BlockFault::NotABlock { found: opened.kind }));
-    }
-    let base_len = opened.payload.len();
-    if base_len > MAX_BLOCK_PAYLOAD {
-        return Err(fault(BlockFault::TooLarge { len: base_len }));
-    }
-    let payload = decode(opened.payload).map_err(|e| fault(BlockFault::Codec(e)))?;
-    let (mut entries, folded) = parse_block(&payload).map_err(|w| fault(BlockFault::Shape(w)))?;
+    let (base_len, mut entries, folded) = open_base(&bytes).map_err(fault)?;
     if folded > block.head {
         return Err(fault(BlockFault::Shape(
             "a list block's folded is past its root entry's head",
@@ -725,12 +716,7 @@ fn load_block(
                     fault: BlockFault::OpBad { op, fault },
                 })
             };
-            let opened = open(raw).map_err(|e| bad(SlotFault::Envelope(e)))?;
-            if opened.kind != Kind::ListSlot {
-                return Err(bad(SlotFault::NotASlot { found: opened.kind }));
-            }
-            let value = decode(opened.payload).map_err(|e| bad(SlotFault::Codec(e)))?;
-            let (op_no, change) = parse_slot(&value).map_err(|w| bad(SlotFault::Shape(w)))?;
+            let (op_no, change, slot_len) = open_slot(raw).map_err(bad)?;
             // A slot is trusted by its op no: the root names the pending range, and only a write
             // of that root put op `op` here (ADR-rdb-0016 §7).
             if op_no != op {
@@ -739,7 +725,7 @@ fn load_block(
             if !change.apply(&mut entries) {
                 return Err(fault(BlockFault::OpOutOfRange { op }));
             }
-            pending_bytes += opened.payload.len();
+            pending_bytes += slot_len;
         }
     }
     if len_u64(entries.len()) != block.count {
@@ -753,6 +739,67 @@ fn load_block(
         entries,
         pending_bytes,
     })
+}
+
+/// Open a block base record and decode it: its payload length, entries and `folded`.
+fn open_base(bytes: &[u8]) -> Result<(usize, Vec<Entry>, u64), BlockFault> {
+    let opened = open(bytes).map_err(BlockFault::Envelope)?;
+    if opened.kind != Kind::ListBlock {
+        return Err(BlockFault::NotABlock { found: opened.kind });
+    }
+    let base_len = opened.payload.len();
+    if base_len > MAX_BLOCK_PAYLOAD {
+        return Err(BlockFault::TooLarge { len: base_len });
+    }
+    let payload = decode(opened.payload).map_err(BlockFault::Codec)?;
+    let (entries, folded) = parse_block(&payload).map_err(BlockFault::Shape)?;
+    Ok((base_len, entries, folded))
+}
+
+/// Open a change slot record and decode it: its op no, its op and its payload length.
+fn open_slot(raw: &[u8]) -> Result<(u64, Change, usize), SlotFault> {
+    let opened = open(raw).map_err(SlotFault::Envelope)?;
+    if opened.kind != Kind::ListSlot {
+        return Err(SlotFault::NotASlot { found: opened.kind });
+    }
+    let value = decode(opened.payload).map_err(SlotFault::Codec)?;
+    let (op_no, change) = parse_slot(&value).map_err(SlotFault::Shape)?;
+    Ok((op_no, change, opened.payload.len()))
+}
+
+/// Check one block base record of a list whose root is at `root_version`, as a read checks it
+/// before replay: its version, envelope, kind, size and shape (M9 S6, a clear's classification).
+pub(crate) fn check_base(
+    id: u128,
+    version: u64,
+    root_version: u64,
+    bytes: &[u8],
+) -> Result<(), Corrupt> {
+    let fault = |fault| Corrupt::Block { id, fault };
+    if version > root_version {
+        return Err(fault(BlockFault::NewerThanRoot {
+            block: version,
+            root: root_version,
+        }));
+    }
+    open_base(bytes).map(drop).map_err(fault)
+}
+
+/// Check one change slot record as a read checks a pending one: its envelope, kind and shape
+/// (M9 S6, a clear's classification). A stale slot is checked too.
+pub(crate) fn check_slot(raw: &[u8]) -> Result<(), SlotFault> {
+    open_slot(raw).map(drop)
+}
+
+/// Check one item record under a root at `root_version` as [`items`] checks it (M9 S6, a
+/// clear's classification).
+pub(crate) fn check_item(
+    snapshot: &dyn SnapshotRead,
+    root: &RootKey,
+    id: u128,
+    root_version: u64,
+) -> Result<(), ValueError> {
+    read_item(snapshot, root, id, root_version).map(drop)
 }
 
 // ---- reads ---------------------------------------------------------------------------------

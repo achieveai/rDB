@@ -102,9 +102,8 @@ impl Kind {
 ///   never be offered for deletion as damage;
 /// - **damage**: everything else.
 ///
-/// [`Self::UnknownKind`]`(0)` sits between the two: no build writes `kind` `0x00`, but with a
-/// correct digest it reads as `UnknownKind` and is refused. Telling it apart from a newer
-/// build's record is M9 debt.
+/// [`Self::UnknownKind`]`(0)` is damage: no build writes `kind` `0x00`, but with a correct digest
+/// it reads as `UnknownKind`. [`Self::is_newer_build`] tells the two apart (M9 S6).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvelopeError {
     /// Shorter than the header.
@@ -122,9 +121,8 @@ pub enum EnvelopeError {
     /// `envelope_format` is not one this build reads: written by a newer build.
     #[error("unknown envelope format {0:#04x}")]
     UnknownFormat(u8),
-    /// `kind` is reserved (written by a newer build) or `0x00`. No build writes `0x00`, but with
-    /// a correct digest it reads as this error and is refused; the newer-build vs damage split
-    /// for it is M9 debt.
+    /// `kind` is reserved (written by a newer build) or `0x00`. No build writes `0x00`, so with
+    /// a correct digest it reads as this error and is damage ([`Self::is_newer_build`]).
     #[error("unknown envelope kind {0:#04x}")]
     UnknownKind(u8),
     /// `codec_version` is not one this build reads: written by a newer build.
@@ -145,6 +143,23 @@ pub enum EnvelopeError {
     /// digest covers, the payload or the digest itself is damaged.
     #[error("header bytes 0..8 and the payload do not hash to the stored digest")]
     DigestMismatch,
+}
+
+impl EnvelopeError {
+    /// Whether the record was written by a newer build (ADR-rdb-0012 §12): an unknown format,
+    /// codec or digest algorithm, or a reserved `kind`. `kind` `0x00` is not: no build writes
+    /// it, so it is damage. Such a record may be valid; it is never cleared as damage.
+    #[must_use]
+    pub const fn is_newer_build(&self) -> bool {
+        match self {
+            Self::UnknownFormat(_) | Self::UnknownCodec(_) | Self::UnknownDigest(_) => true,
+            Self::UnknownKind(kind) => *kind != 0,
+            Self::Truncated { .. }
+            | Self::TooLarge { .. }
+            | Self::LengthMismatch { .. }
+            | Self::DigestMismatch => false,
+        }
+    }
 }
 
 /// [`seal`] was handed a payload over [`MAX_PAYLOAD`].

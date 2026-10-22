@@ -61,7 +61,7 @@ use rdb_core::contracts::storage::{
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
-use rdb_core::contracts::txn::{TxnRequest, TxnResult, TxnStatus};
+use rdb_core::contracts::txn::{Condition, Mutation, TxnRequest, TxnResult, TxnStatus};
 use rdb_core::contracts::version::{API_VERSION, ENVELOPE_VERSION};
 use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{Publication, ReplicationView};
@@ -75,6 +75,7 @@ use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
 use rdb_value::keys::{root_key, RootKey};
 use rdb_value::list::{Items, ListOp, Start, Token, DEFAULT_BLOCK_MAX};
+use rdb_value::repair::Cleared;
 use rdb_value::value::Value;
 use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 
@@ -402,9 +403,11 @@ pub struct PutOp {
 }
 
 /// What one write changes. The kind of the object is fixed when it is created; a change of
-/// another kind is `INVALID_ARGUMENT` (`KindMismatch`). `Chunk` and `Gc` are the exceptions:
-/// neither reads the object's kind. A chunk is stored under an object of any kind, or none,
-/// and only its publish is refused (A-R127); a gc deletes the chunks that no blob names.
+/// another kind is `INVALID_ARGUMENT` (`KindMismatch`). `Chunk`, `Gc` and `Clear` are the
+/// exceptions. A chunk is stored under an object of any kind, or none, and only its publish is
+/// refused (A-R127); a gc deletes the chunks that no blob names. A clear takes every kind but
+/// one: a chunk record at the root key, which no write puts there and no read takes, is
+/// `KindMismatch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// Document ops, applied in order to the whole document (ADR-rdb-0012).
@@ -449,6 +452,14 @@ pub enum Change {
         /// The highest chunk version that may go.
         floor: u64,
     },
+    /// Clear a damaged object (M9 S6; ADR-rdb-0013 decision 11): prove it damaged, then delete
+    /// one batch of its records, each at the version the proof read. Clean records go first;
+    /// faulting records and the root go last, so the object reads as damaged until the batch
+    /// that empties it. Takes no `expect`. An object that reads back cleanly is
+    /// `CONDITION_FAILED`, and a newer build's record `INCOMPATIBLE_VERSION`, both never sent.
+    /// Nothing stored compiles to nothing ([`Answer::Unchanged`]) once the view is published;
+    /// `UNKNOWN_OUTCOME`, never sent, while it is applied and not yet published.
+    Clear,
 }
 
 impl Change {
@@ -463,6 +474,7 @@ impl Change {
             Self::Chunk { .. } => "chunk",
             Self::Publish { .. } => "publish",
             Self::Gc { .. } => "gc",
+            Self::Clear => "clear",
         }
     }
 }
@@ -3371,7 +3383,9 @@ impl Host {
                 )
                 .map_err(|e| compile_error(&e)),
                 Change::List(edits) => list_compile(view, &root, expected, edits),
-                Change::Chunk { .. } | Change::Gc { .. } if put.expect.is_some() => {
+                Change::Chunk { .. } | Change::Gc { .. } | Change::Clear
+                    if put.expect.is_some() =>
+                {
                     Err(ApiError::invalid(format!(
                         "a {} takes no expect: it is guarded by what it reads",
                         put.change.name()
@@ -3379,6 +3393,7 @@ impl Host {
                 }
                 Change::Gc { floor } => rdb_value::blob::collect_garbage(view, &root, *floor)
                     .map_err(|e| compile_error(&e)),
+                Change::Clear => self.clear(partition, identity, &root, view, published),
                 Change::Chunk {
                     upload,
                     index,
@@ -3410,7 +3425,7 @@ impl Host {
                 })
                 .and_then(|compiled| {
                     if compiled.mutations.is_empty() {
-                        self.read_admitted(partition)?;
+                        self.read_admitted(partition, "the publish is not confirmed")?;
                         already_published(view, &root, published)?;
                     }
                     Ok(compiled)
@@ -3446,8 +3461,9 @@ impl Host {
 
     /// "Already published" is a read (ADR-rdb-0014 O9), so it is given only while A1 admits a
     /// read: A1's verdict on the adopted lineage, the one it answers P1's read check with. A deny
-    /// is refused as a read refused for it is (review F1).
-    fn read_admitted(&self, partition: PartitionId) -> Result<(), ApiError> {
+    /// is refused as a read refused for it is (review F1). `unconfirmed` says what the refusal
+    /// leaves unsaid, for the detail.
+    fn read_admitted(&self, partition: PartitionId, unconfirmed: &str) -> Result<(), ApiError> {
         let adopted = self.adopted(partition);
         let lineage = Lineage {
             partition,
@@ -3462,10 +3478,64 @@ impl Host {
             Verdict::Deny(reason) => {
                 let mut refused =
                     crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
-                refused.detail =
-                    format!("a read is refused now ({reason:?}), so the publish is not confirmed");
+                refused.detail = format!("a read is refused now ({reason:?}), so {unconfirmed}");
                 // Nothing was sent: this gate refuses before any send.
                 refused.no_mutation = true;
+                Err(refused)
+            }
+        }
+    }
+
+    /// The `Clear` arm (M9 S6): one batch of the clear, or one of the answers it gives without
+    /// sending. Both of those are reads, so each passes A1's read check first (C-2): "not
+    /// damaged" and "nothing to clear". Each also needs the view published
+    /// ([`view_published`]): a write applied and not yet published may still be lost, an
+    /// earlier clear or a repair (review R-2).
+    fn clear(
+        &self,
+        partition: PartitionId,
+        identity: RequestIdentity,
+        root: &RootKey,
+        view: &RocksSnapshot,
+        published: Option<(Generation, Seq)>,
+    ) -> Result<Compiled, ApiError> {
+        match rdb_value::repair::clear_object(view, root) {
+            Ok(Some(cleared)) => {
+                log_clear(self.node, identity, root, &cleared);
+                Ok(cleared.compiled)
+            }
+            Ok(None) => {
+                self.read_admitted(partition, "nothing to clear is not confirmed")?;
+                view_published(
+                    view,
+                    published,
+                    "nothing to clear",
+                    "if an earlier clear sent deletes, ask its status",
+                )?;
+                Ok(Compiled {
+                    mutations: Vec::new(),
+                    conditions: Vec::new(),
+                })
+            }
+            Err(error @ ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks)) => {
+                self.read_admitted(partition, "\"not damaged\" is not confirmed")?;
+                view_published(
+                    view,
+                    published,
+                    "not damaged",
+                    "a write applied since may still be lost; clear again once it is published",
+                )?;
+                Err(compile_error(&error))
+            }
+            // No read gate (A-R139): none of these says the object is healthy or that nothing
+            // is stored, and no_mutation=true holds on any view: INCOMPATIBLE_VERSION, a chunk
+            // record at the root key (`KindMismatch`), a batch over the size limit, or
+            // CORRUPT_HISTORY for a stored version with no value (`VersionWithoutValue`).
+            Err(error) => {
+                let mut refused = compile_error(&error);
+                if refused.kind == ErrorKind::IncompatibleVersion {
+                    refused.detail.push_str("; not cleared");
+                }
                 Err(refused)
             }
         }
@@ -3885,6 +3955,16 @@ fn fail_waiter(reply: &Sender<Answer>, detail: String) -> String {
 /// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
 fn compile_error(error: &ValueError) -> ApiError {
     match error {
+        // M9 S6: a clear of an object that reads back cleanly.
+        ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks) => {
+            ApiError::new(ErrorKind::ConditionFailed, error.to_string())
+        }
+        // M9 S6 (ADR-rdb-0012 §12): a newer build's record is valid, not damage, for every read,
+        // write and clear. Ahead of `CORRUPT_BLOB`, which also matches a chunk that does not open.
+        ValueError::Corrupt(corrupt) if corrupt.is_newer_build() => ApiError::new(
+            ErrorKind::IncompatibleVersion,
+            format!("written by a newer build: {corrupt}"),
+        ),
         ValueError::Apply(
             ApplyError::VersionConflict { .. }
             | ApplyError::ObjectAbsent
@@ -3907,6 +3987,77 @@ fn compile_error(error: &ValueError) -> ApiError {
         ) => ApiError::new(ErrorKind::CorruptBlob, error.to_string()),
         ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
     }
+}
+
+/// C-2 (M9 S6): a clear answers "nothing to clear", "not damaged" or "only chunks" only when the
+/// view it read is published: its position at or below P1's published position, in the view's
+/// generation. Above it, a write is applied and not yet published, so what the clear read may
+/// still be lost: that is `UNKNOWN_OUTCOME`, nothing sent. For "nothing to clear" that write may
+/// be an earlier clear, the one to ask about; the object may never have been written at all. For
+/// "not damaged" it may be a repair (review R-2). `claim` names the answer, `then` what to do.
+fn view_published(
+    view: &RocksSnapshot,
+    published: Option<(Generation, Seq)>,
+    claim: &str,
+    then: &str,
+) -> Result<(), ApiError> {
+    match published {
+        Some((generation, seq)) if generation == view.generation() && view.at() <= seq => Ok(()),
+        _ => {
+            let through = match published {
+                Some((generation, seq)) if generation == view.generation() => {
+                    format!("published only through seq {}", seq.0)
+                }
+                Some((generation, seq)) => format!(
+                    "published through seq {} of generation {}, not generation {}",
+                    seq.0,
+                    generation.0,
+                    view.generation().0
+                ),
+                None => "nothing published yet".to_owned(),
+            };
+            Err(ApiError::new(
+                ErrorKind::UnknownOutcome,
+                format!("{claim} at seq {}, {through}; {then}", view.at().0),
+            ))
+        }
+    }
+}
+
+/// One warn line per clear batch compiled (M9 S6): what it deletes and the damage that proved
+/// it. `root` is `deleted` in the batch that empties the object, `guarded` while it is kept,
+/// and `absent` when there is none. No record bytes are logged.
+fn log_clear(node: NodeId, identity: RequestIdentity, root: &RootKey, cleared: &Cleared) {
+    let compiled = &cleared.compiled;
+    let root_word = if compiled
+        .mutations
+        .iter()
+        .any(|m| matches!(m, Mutation::Delete { key, .. } if key.as_ref() == root.as_bytes()))
+    {
+        "deleted"
+    } else if compiled
+        .conditions
+        .iter()
+        .any(|c| matches!(c, Condition::Absent { key } if key.as_ref() == root.as_bytes()))
+    {
+        "absent"
+    } else {
+        "guarded"
+    };
+    tracing::warn!(
+        node = node.0,
+        client = identity.client.0,
+        request = identity.request.0,
+        object = %match rdb_value::keys::parse(root.as_bytes()) {
+            Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
+            Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
+        },
+        deletes = compiled.mutations.len(),
+        faulting = cleared.faulting,
+        root = root_word,
+        damage = %cleared.damage,
+        "clear_compiled"
+    );
 }
 
 /// C-3: a publish whose blob is already at the root answers unchanged only when that root is
@@ -8158,5 +8309,403 @@ mod tests {
             ),
             Ok(seen) => panic!("a token from before the push still read: {seen:?}"),
         }
+    }
+
+    /// A raw write of `value` over the root of `object`, as `rdb_dev admin damage` sends it.
+    fn damage_write(request: u64, object: &[u8], value: Bytes) -> TxnRequest {
+        TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(request),
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: root_key(TenantId(1), AFFINITY, object).to_bytes(),
+                value,
+                expected_version: None,
+            }],
+        }
+    }
+
+    /// A sound document envelope with `codec_version` `0x02` and its digest recomputed: a record
+    /// a newer build could have written, as `rdb_dev admin damage --as newer` writes it.
+    fn newer_build_document() -> Bytes {
+        use rdb_value::envelope::{digest, seal, Kind, HEADER_LEN};
+        let mut bytes = seal(Kind::Document, &[0xf6]).expect("a null fits").to_vec();
+        bytes[2] = 0x02;
+        let head: [u8; 8] = bytes[..8].try_into().expect("a header is 40 bytes");
+        let sum = digest(&head, &bytes[HEADER_LEN..]);
+        bytes[8..HEADER_LEN].copy_from_slice(&sum);
+        Bytes::from(bytes)
+    }
+
+    fn clear_call(request: u64, object: &'static [u8]) -> ClientCall {
+        compile_change(request, object, Change::Clear, None)
+    }
+
+    /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
+    /// given without sending are reads, so a node gives them only while a read would be given.
+    /// Admitting: a healthy object and one with only upload chunks are CONDITION_FAILED, a
+    /// missing one `unchanged`, a newer build's one INCOMPATIBLE_VERSION, and a clear with an
+    /// expect INVALID_ARGUMENT, none naming a request. Fenced: healthy, chunks-only and missing
+    /// are refused as a plain read is, with `no_mutation`, never CONDITION_FAILED or
+    /// `unchanged`; newer is still
+    /// INCOMPATIBLE_VERSION, which claims nothing about the object; a damaged one compiles, is
+    /// sent, and the kernel refuses it. Once node 1 admits again that clear publishes.
+    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn m9_s6_a_clear_answers_without_sending_only_while_a_read_would_be_answered() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let doc = || Change::Doc(Delta(vec![Op::Replace(text("v"))]));
+        assert_eq!(
+            trio.write(compile_change(1, b"healthy", doc(), None)),
+            Ok(2)
+        );
+        assert_eq!(
+            trio.write(compile_change(2, b"damaged", doc(), None)),
+            Ok(3)
+        );
+        assert_eq!(trio.write(compile_change(3, b"newer", doc(), None)), Ok(4));
+        let broken = Bytes::from_static(b"damaged");
+        assert_eq!(trio.sent(damage_write(4, b"damaged", broken)), Ok(5));
+        assert_eq!(
+            trio.sent(damage_write(5, b"newer", newer_build_document())),
+            Ok(6)
+        );
+        assert_eq!(
+            trio.write(chunk_call(6, b"chunks", 0, b"HELL", None)),
+            Ok(7)
+        );
+
+        let kind = |answer| refusal(answer).0;
+        let (not_damaged, _, _, request) = refusal(trio.ask(clear_call(7, b"healthy")));
+        assert_eq!((not_damaged, request), (ErrorKind::ConditionFailed, false));
+        let (only_chunks, _, _, request) = refusal(trio.ask(clear_call(8, b"chunks")));
+        assert_eq!((only_chunks, request), (ErrorKind::ConditionFailed, false));
+        match trio.ask(clear_call(9, b"missing")) {
+            Answer::Unchanged => {}
+            other => panic!("a clear of nothing: {other:?}"),
+        }
+        let newer = (ErrorKind::IncompatibleVersion, RetryRule::Quarantine, false);
+        let quarantined = |answer| {
+            let (kind, retry, _, request) = refusal(answer);
+            (kind, retry, request)
+        };
+        assert_eq!(quarantined(trio.ask(clear_call(10, b"newer"))), newer);
+        let expect = Some(Expected::Version(2));
+        assert_eq!(
+            kind(trio.ask(compile_change(11, b"healthy", Change::Clear, expect))),
+            ErrorKind::InvalidArgument,
+            "a clear takes no expect"
+        );
+
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
+        let read = ClientCall::Get {
+            identity: identity(12),
+            object: Bytes::from_static(b"healthy"),
+            look: Look::Doc,
+        };
+        let refused = match trio.ask(read) {
+            Answer::Read {
+                outcome: ReadServiceOutcome::Rejected(kind),
+                ..
+            } => crate::db::refused_read(kind),
+            other => panic!("a read while fenced: {other:?}"),
+        };
+        assert_eq!(refused.kind, ErrorKind::LeaseExpired, "{refused:?}");
+        for (request, object) in [
+            (13, &b"healthy"[..]),
+            (14, &b"chunks"[..]),
+            (15, &b"missing"[..]),
+        ] {
+            assert_eq!(
+                refusal(trio.ask(clear_call(request, object))),
+                (refused.kind, refused.retry, true, false),
+                "{} while fenced, as the read but sending nothing",
+                String::from_utf8_lossy(object)
+            );
+        }
+        assert_eq!(
+            quarantined(trio.ask(clear_call(16, b"newer"))),
+            newer,
+            "newer while fenced"
+        );
+        let request = trio.compiled(clear_call(17, b"damaged"));
+        assert_eq!(
+            trio.sent(request),
+            Err(Refused::ByKernel(ErrorKind::LeaseExpired)),
+            "a damaged object's clear is sent, and the fenced kernel refuses it"
+        );
+
+        trio.mem.stop_failing();
+        trio.ready();
+        assert!(trio.write(clear_call(18, b"damaged")).is_ok(), "cleared");
+        match trio.ask(clear_call(19, b"damaged")) {
+            Answer::Unchanged => {}
+            other => panic!("a clear once cleared: {other:?}"),
+        }
+    }
+
+    /// M9 S6 review F-006: the `clear_compiled` line names the root `deleted` when the batch
+    /// deletes it, `guarded` when a version condition keeps it, and `absent` when the guard
+    /// says there is none; `deletes` and `faulting` are the batch's own counts.
+    /// Unit (~10 ms): `log_clear` on three batches built by hand.
+    #[config_log::retcd_test]
+    fn m9_s6_the_clear_line_names_what_the_batch_does_to_the_root() {
+        const METHOD: &str = "m9_s6_the_clear_line_names_what_the_batch_does_to_the_root";
+        let root = root_key(TenantId(1), AFFINITY, b"o");
+        let element = Bytes::from_static(b"an element key");
+        let delete = |key: Bytes| Mutation::Delete {
+            key,
+            expected_version: Some(3),
+        };
+        let batches = [
+            (
+                1,
+                vec![delete(element.clone()), delete(root.to_bytes())],
+                vec![Condition::VersionEquals {
+                    key: root.to_bytes(),
+                    version: 3,
+                }],
+                1,
+            ),
+            (
+                2,
+                vec![delete(element.clone())],
+                vec![Condition::VersionEquals {
+                    key: root.to_bytes(),
+                    version: 3,
+                }],
+                0,
+            ),
+            (
+                3,
+                vec![delete(element)],
+                vec![Condition::Absent {
+                    key: root.to_bytes(),
+                }],
+                1,
+            ),
+        ];
+        for (request, mutations, conditions, faulting) in batches {
+            let cleared = Cleared {
+                compiled: Compiled {
+                    mutations,
+                    conditions,
+                },
+                damage: Corrupt::VersionWithoutValue,
+                faulting,
+            };
+            log_clear(NodeId(1), identity(request), &root, &cleared);
+        }
+
+        let lines = logged!(METHOD, "clear_compiled");
+        let seen: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["request"].clone(),
+                    line["root"].clone(),
+                    line["deletes"].clone(),
+                    line["faulting"].clone(),
+                    line["object"].clone(),
+                )
+            })
+            .collect();
+        let want = |request: u64, root: &str, deletes: u64, faulting: u64| {
+            (
+                request.into(),
+                root.into(),
+                deletes.into(),
+                faulting.into(),
+                "o".into(),
+            )
+        };
+        assert_eq!(
+            seen,
+            vec![
+                want(1, "deleted", 2, 1),
+                want(2, "guarded", 1, 0),
+                want(3, "absent", 1, 1),
+            ],
+            "{lines:?}"
+        );
+    }
+
+    /// M9 S6 review Q-1: "nothing to clear" is answered only for a view P1 has published in the
+    /// view's own generation. A published position of another generation, or none yet, is
+    /// UNKNOWN_OUTCOME naming the generations; the same seq in the view's generation is Ok.
+    /// The host adopts a generation from A1 and P1 takes its lineage from recovery, so the two
+    /// can differ for a step (`deliver`'s AdoptAuthority; publication's `on_recovered`).
+    /// Unit (~50 ms): one empty engine, no thread.
+    #[test]
+    fn m9_s6_nothing_to_clear_needs_a_publish_in_the_views_own_generation() {
+        const CLAIM: &str = "nothing to clear";
+        const THEN: &str = "if an earlier clear sent deletes, ask its status";
+        let dir = config_testkit::fs::temp_dir();
+        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+        let view = engine
+            .snapshot(PartitionId(1), Generation(1), SnapshotHandle(0))
+            .expect("snapshot");
+        assert_eq!(
+            view_published(&view, Some((Generation(1), view.at())), CLAIM, THEN),
+            Ok(())
+        );
+        let other = view_published(&view, Some((Generation(0), view.at())), CLAIM, THEN)
+            .expect_err("other");
+        assert_eq!(other.kind, ErrorKind::UnknownOutcome, "{other:?}");
+        assert!(
+            other.detail.contains("of generation 0, not generation 1"),
+            "{other:?}"
+        );
+        let none = view_published(&view, None, CLAIM, THEN).expect_err("none");
+        assert_eq!(none.kind, ErrorKind::UnknownOutcome, "{none:?}");
+        assert!(none.detail.contains("nothing published yet"), "{none:?}");
+    }
+
+    /// M9 S6 contract 5, held copies, guard 15: with both secondaries cut off, node 1 applies a
+    /// clear that cannot publish. The clear asked again meanwhile finds nothing stored, above
+    /// P1's published seq, so it is UNKNOWN_OUTCOME naming no request, never `unchanged`: the
+    /// first clear may still be lost. After the heal the held clear publishes, and the next is
+    /// `unchanged`. Trio, about 1 s.
+    #[test]
+    fn m9_s6_a_clear_asked_again_before_the_first_publishes_is_an_unknown_outcome() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let doc = Change::Doc(Delta(vec![Op::Replace(text("v"))]));
+        assert_eq!(trio.write(compile_change(1, b"d", doc, None)), Ok(2));
+        let broken = Bytes::from_static(b"damaged");
+        assert_eq!(trio.sent(damage_write(2, b"d", broken)), Ok(3));
+        let request = trio.compiled(clear_call(3, b"d"));
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let held = trio.call(ClientCall::Resend { request });
+        trio.until("node 1 applied the clear", |trio| {
+            (trio.head() == Some(4)).then_some(())
+        });
+
+        assert_eq!(
+            refusal(trio.ask(clear_call(4, b"d"))),
+            (
+                ErrorKind::UnknownOutcome,
+                RetryRule::QueryStatus,
+                false,
+                false
+            ),
+            "nothing is stored, and that is not published"
+        );
+        assert!(held.try_recv().is_err(), "no copy acknowledged the clear");
+
+        trio.links.heal_all();
+        match trio.answer(&held) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(4)),
+            other => panic!("the held clear after the heal: {other:?}"),
+        }
+        match trio.ask(clear_call(5, b"d")) {
+            Answer::Unchanged => {}
+            other => panic!("a clear once published: {other:?}"),
+        }
+    }
+    /// Review R-2 (PR #53): "not damaged" is a read of the step view, which holds writes applied
+    /// and not yet published. With both secondaries cut off, an app put repairs a map's damaged
+    /// entry and applies on node 1 only. A clear asked meanwhile finds the map healthy, but the
+    /// repair may still be lost, so it is UNKNOWN_OUTCOME naming no request, never
+    /// CONDITION_FAILED. After the heal the repair publishes, and the clear is CONDITION_FAILED.
+    /// Trio, about 1 s.
+    #[test]
+    fn m9_s6_a_clear_that_finds_an_unpublished_repair_is_an_unknown_outcome() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let put = |n| Change::Map(vec![ElemOp::Put(text("a"), int(n))]);
+        assert_eq!(trio.write(compile_change(1, b"m", put(1), None)), Ok(2));
+        // The entry's bytes broken, and the root written again in the same commit, so the
+        // entry is not newer than its root and an app put still compiles over it.
+        let root = root_key(TenantId(1), AFFINITY, b"m");
+        let mut fields = rdb_value::value::Map::new();
+        fields.insert(rdb_value::value::MapKey::new("keys"), int(1));
+        fields.insert(rdb_value::value::MapKey::new("count"), int(1));
+        let payload = rdb_value::cbor::encode(&Value::Map(fields)).expect("a root encodes");
+        let sealed = rdb_value::envelope::seal(rdb_value::envelope::Kind::Map, &payload)
+            .expect("a root fits");
+        let damage = TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(2),
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![
+                rdb_core::contracts::txn::Mutation::Put {
+                    key: root.to_bytes(),
+                    value: sealed,
+                    expected_version: None,
+                },
+                rdb_core::contracts::txn::Mutation::Put {
+                    key: rdb_value::keys::element_key(&root, &text("a")).expect("a text key"),
+                    value: Bytes::from_static(b"damaged"),
+                    expected_version: None,
+                },
+            ],
+        };
+        assert_eq!(trio.sent(damage), Ok(3));
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        match trio.look(10, b"m", members) {
+            Err(error) => assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}"),
+            other => panic!("members of a damaged map: {other:?}"),
+        }
+        let repair = trio.compiled(compile_change(3, b"m", put(2), None));
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let held = trio.call(ClientCall::Resend { request: repair });
+        trio.until("node 1 applied the repair", |trio| {
+            (trio.head() == Some(4)).then_some(())
+        });
+
+        assert_eq!(
+            refusal(trio.ask(clear_call(4, b"m"))),
+            (
+                ErrorKind::UnknownOutcome,
+                RetryRule::QueryStatus,
+                false,
+                false
+            ),
+            "the map reads back cleanly only through a repair not yet published"
+        );
+        assert!(held.try_recv().is_err(), "no copy acknowledged the repair");
+
+        trio.links.heal_all();
+        match trio.answer(&held) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(4)),
+            other => panic!("the held repair after the heal: {other:?}"),
+        }
+        assert_eq!(
+            refusal(trio.ask(clear_call(5, b"m"))),
+            (
+                ErrorKind::ConditionFailed,
+                RetryRule::Definitive,
+                true,
+                false
+            ),
+            "once the repair is published the map is not damaged"
+        );
     }
 }

@@ -204,6 +204,55 @@ fn open_chunk(index: u32, bytes: &[u8]) -> Result<Opened<'_>, ValueError> {
     Ok(opened)
 }
 
+/// Open chunk `index` of the blob `m` names and check it is that chunk: its kind, length and
+/// digest (ADR-rdb-0014 §7). A read and a clear check it alike.
+fn checked_chunk<'a>(m: &Manifest, index: u32, bytes: &'a [u8]) -> Result<Opened<'a>, ValueError> {
+    let opened = open_chunk(index, bytes)?;
+    let digest: [u8; 32] = Sha256::digest(opened.payload).into();
+    if opened.payload.len() as u64 != m.chunk_len(index) || digest != m.chunk_sha256[index as usize]
+    {
+        return Err(ValueError::Corrupt(Corrupt::ChunkMismatch { index }));
+    }
+    Ok(opened)
+}
+
+/// Check every chunk the manifest `m` names under `root` as [`read_range`] checks the ones it
+/// reads, keeping no bytes (M9 S6, a clear's proof).
+///
+/// # Errors
+/// The first chunk's [`Corrupt::ChunkMissing`], [`Corrupt::Chunk`] or [`Corrupt::ChunkMismatch`].
+pub(crate) fn verify_chunks(
+    snapshot: &dyn SnapshotRead,
+    root: &RootKey,
+    m: &Manifest,
+) -> Result<(), ValueError> {
+    for index in 0..m.chunks() {
+        let (_, bytes) = record(snapshot, &chunk_key(root, &m.upload, index))?
+            .ok_or(ValueError::Corrupt(Corrupt::ChunkMissing { index }))?;
+        checked_chunk(m, index, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Check one stored chunk record of `upload` under a blob whose manifest is `m` (M9 S6, a
+/// clear's classification): a chunk the manifest names as a read checks it; any other only by
+/// its open and kind, since no read takes it.
+///
+/// # Errors
+/// [`Corrupt::Chunk`], [`Corrupt::ChunkMismatch`].
+pub(crate) fn check_chunk(
+    m: &Manifest,
+    upload: &Upload,
+    index: u32,
+    bytes: &[u8],
+) -> Result<(), ValueError> {
+    if *upload == m.upload && index < m.chunks() {
+        checked_chunk(m, index, bytes).map(drop)
+    } else {
+        open_chunk(index, bytes).map(drop)
+    }
+}
+
 /// The blob at `root`, or `None` when there is no root record (ADR-rdb-0014 §7).
 ///
 /// # Errors
@@ -244,13 +293,7 @@ pub fn read_range(
         let key = chunk_key(root, &m.upload, index);
         let (_, bytes) =
             record(snapshot, &key)?.ok_or(ValueError::Corrupt(Corrupt::ChunkMissing { index }))?;
-        let opened = open_chunk(index, &bytes)?;
-        let digest: [u8; 32] = Sha256::digest(opened.payload).into();
-        if opened.payload.len() as u64 != m.chunk_len(index)
-            || digest != m.chunk_sha256[index as usize]
-        {
-            return Err(ValueError::Corrupt(Corrupt::ChunkMismatch { index }));
-        }
+        let opened = checked_chunk(m, index, &bytes)?;
         let start = u64::from(index) * m.chunk_size;
         let from = usize::try_from(offset.saturating_sub(start)).expect("below chunk_size");
         let to = usize::try_from(end.min(start + m.chunk_len(index)) - start)

@@ -159,7 +159,7 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
 | Offset | Size | Field | v1 value |
 |---|---|---|---|
 | 0 | 1 | `envelope_format` | `0x01` |
-| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7), `0x04` blob root (the manifest), `0x05` blob chunk (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2), `0x06` list root, `0x07` list block, `0x08` list change slot (amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt (status 2026-10-19, M9 S4, A-R113 C-5: paid in M9 S6, with the admin path). `0x09` onward is unallocated and reserved for later kinds. The table lives in `envelope.rs` |
+| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7), `0x04` blob root (the manifest), `0x05` blob chunk (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2), `0x06` list root, `0x07` list block, `0x08` list change slot (amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt (status 2026-10-19, M9 S4, A-R113 C-5: paid in M9 S6, with the admin path; status 2026-10-21, M9 S6: paid. `EnvelopeError::is_newer_build` is false for `0x00`, so it is damage, and `Change::Clear` clears it). `0x09` onward is unallocated and reserved for later kinds. The table lives in `envelope.rs` |
 | 2 | 1 | `codec_version` | `0x01`, read per `kind`: for kinds `0x01`–`0x04` and `0x06`–`0x08` it is `rdb-cbor-document` v1 (lists amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1); for kind `0x05` (blob chunk) the payload is stored as given. The byte stays `0x01`, so `open` is unchanged (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2) |
 | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of header bytes 0..8, then the payload (amended 2026-10-04, L-R186s; ADR-rdb-0013 decision 7) |
 | 4 | 4 | `payload_len` | u32 BE; must equal the remaining bytes. For a document this **is** the logical length |
@@ -180,6 +180,8 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
   - **A `kind` of `0x00`** is never written, but with a correct digest it reads as `UnknownKind` and is
     refused (amended 2026-10-04, ADR-rdb-0013). Telling it apart from a newer build's record is M9 debt.
     (Status 2026-10-19, M9 S4, A-R113 C-5: paid in M9 S6, with the admin path.)
+    (Status 2026-10-21, M9 S6: paid. `EnvelopeError::is_newer_build` is false for `UnknownKind(0)`, so it
+    is damage, and `Change::Clear` clears it.)
 - **Forward compatibility** is by bumping `envelope_format` or `codec_version`. There are no optional
   fields to skip in v1. Readers keep old decoders while old data or snapshots exist (spec §4.3).
 - **v1 encoder output is frozen.** The v1 decoder accepts only the bytes the v1 encoder writes: it
@@ -286,6 +288,8 @@ upgrade note.
   - The variant is one (`Corrupt`) in v1; a caller tells the groups apart by the `EnvelopeError`
     inside. A separate variant or predicate is due before the M9 admin path is built.
     (Status 2026-10-19, M9 S4, A-R113 C-5: the predicate and the admin path are both M9 S6.)
+    (Status 2026-10-21, M9 S6: built. The predicate is `Corrupt::is_newer_build`, over
+    `EnvelopeError::is_newer_build`; the variant stays one.)
   - **Known gap, accepted (L-R185m A2):** a corrupt record cannot be overwritten through this
     crate. `Expected::Version` reads and opens the record first, so it fails `Corrupt`; and
     `Expected::Absent` fails its `Absent` condition at apply, because a record exists. Only a
@@ -293,9 +297,15 @@ upgrade note.
     unconditional replace for a **damaged** record. It must **not** offer either for a record
     written by a newer build: that would destroy valid data during an upgrade.
     (Status 2026-10-19, M9 S4, A-R113 C-5: the admin path is M9 S6.)
+    (Status 2026-10-21, M9 S6: built. The admin path is `Change::Clear` through `Db::write`. It
+    deletes only; there is no unconditional replace. It proves the damage first, and a newer
+    build's record anywhere under the object refuses it with `INCOMPATIBLE_VERSION`, deleting
+    nothing.)
   - **Narrowed (amended 2026-10-04, L-R186aa; ADR-rdb-0013 decision 11):** for a record under an
     object prefix, the storage `Delete` is allowed only for a document root. Every other damaged
     record is repaired through the `rdb-value` functions in ADR-rdb-0013 decision 11.
+    (Status 2026-10-21, M9 S6: a document root is cleared by `clear_object` too, never by a raw
+    storage `Delete`; see ADR-rdb-0013 decision 11's document row.)
 - Mapping to the client error categories (spec §5.4) belongs to M9 `rdb-api`.
   (Status 2026-10-19, M9 S4: done in `rdb-api`'s `compile_error`. `VersionConflict`,
   `ObjectAbsent`, `ElementAbsent` and `ElementExists` are `CONDITION_FAILED`; `ChunkConflict` is
@@ -303,6 +313,9 @@ upgrade note.
   `CORRUPT_BLOB`: `Manifest`, `Chunk`, `ChunkMissing` and `ChunkMismatch`. Any other `Corrupt` is
   `CORRUPT_HISTORY`, a blob root whose envelope does not open (`Envelope`) included. A list token
   whose list moved is the kernel's `STALE_CONTINUATION`.)
+  (Status 2026-10-21, M9 S6: a `Corrupt` that `is_newer_build` names is `INCOMPATIBLE_VERSION`,
+  checked ahead of `CORRUPT_BLOB`, so a newer build's chunk is not blob damage. A read that
+  finds another fault first still answers `CORRUPT_HISTORY`; M9 S7 closes that.)
 
 ### 13. Who owns the object-key layout
 - A document lives at its object's root key, and the document API takes only a root key (amended
@@ -407,6 +420,7 @@ Through the kernel the version is the writing `seq`, so it rises but can skip nu
   budget before clients can send documents in parallel.
 - **A corrupt record needs an admin path to clear** (§12): owned by M9.
   (Status 2026-10-19, M9 S4, A-R113 C-5: built in M9 S6.)
+  (Status 2026-10-21, M9 S6: built: `Change::Clear`, delete only.)
 
 ## Related, not part of this ADR: two kernel stalls (decided; stream K)
 Found while drafting, and completed by the critic (F1, by reading; not executed).
