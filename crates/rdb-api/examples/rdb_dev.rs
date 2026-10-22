@@ -165,6 +165,12 @@
 //!                                         in M9 (no takeover runs), `partition-in-transfer
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
+//! admin damage <o> [--as digest|kind0|newer]
+//!                                         dev only: overwrite the object's stored root with a
+//!                                         sealed document whose digest fails (`digest`, the
+//!                                         default), whose kind is 0x00 (`kind0`), or whose
+//!                                         codec is 0x02, digest correct (`newer`: a newer
+//!                                         build's record). A missing object is refused
 //! admin damage-chunk <o> --upload U --index I
 //!                                         dev only: overwrite that stored chunk with other
 //!                                         bytes, so a range read over it (`--offset`/`--len`)
@@ -1195,8 +1201,9 @@ fn repl<'scope, 'env>(
                 );
             }),
             ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
+            ["admin", "damage", object, rest @ ..] => damage_record(db, object, rest),
             ["admin", ..] => Err(format!(
-                "admin clear-grant <n>: n is 1, 2 or 3 | {DAMAGE_USAGE}"
+                "admin clear-grant <n>: n is 1, 2 or 3 | {DAMAGE_USAGE} | {DAMAGE_RECORD_USAGE}"
             )),
             ["control", "lifecycle", partition, word] => {
                 parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
@@ -1990,6 +1997,84 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
 }
 
 const DAMAGE_USAGE: &str = "admin damage-chunk <object> --upload U --index I";
+
+/// `admin damage`: overwrite an object's stored root record, through a replicated write under
+/// damage-chunk's own client, so a later read of it fails (M9 S6). A dev tool only; the product
+/// never writes a record this way. `--as`:
+/// - `digest` (the default): a sealed document with one payload byte flipped, so the digest
+///   check fails: `CORRUPT_HISTORY`;
+/// - `kind0`: `kind` `0x00`, digest recomputed: damage, since no build writes kind 0;
+/// - `newer`: `codec_version` `0x02`, digest recomputed: a record a newer build could have
+///   written, valid but unreadable here.
+///
+/// Only a stored record is overwritten: a missing one is refused, never written.
+fn damage_record(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+    use rdb_core::contracts::txn::{Condition, Mutation};
+    use rdb_value::envelope::{digest, seal, Kind};
+    let how = match rest {
+        [] | ["--as", "digest"] => "digest",
+        ["--as", how @ ("kind0" | "newer")] => how,
+        _ => return Err(DAMAGE_RECORD_USAGE.to_owned()),
+    };
+    let payload = rdb_value::cbor::encode(&rdb_value::value::Value::Map(Default::default()))
+        .expect("an empty map encodes");
+    let mut bytes = seal(Kind::Document, &payload)
+        .expect("an empty map fits an envelope")
+        .to_vec();
+    match how {
+        "digest" => bytes[rdb_value::envelope::HEADER_LEN] ^= 0xFF,
+        reseal => {
+            if reseal == "kind0" {
+                bytes[1] = 0x00;
+            } else {
+                bytes[2] = 0x02;
+            }
+            let head: [u8; 8] = bytes[..8].try_into().expect("a header is 40 bytes");
+            let sum = digest(&head, &bytes[rdb_value::envelope::HEADER_LEN..]);
+            bytes[8..rdb_value::envelope::HEADER_LEN].copy_from_slice(&sum);
+        }
+    }
+    let key = rdb_value::keys::root_key(TenantId(1), AffinityId(1), object.as_bytes()).to_bytes();
+    let request = TxnRequest {
+        api_version: rdb_core::contracts::version::API_VERSION,
+        identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(2),
+            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+        },
+        affinity: AffinityId(1),
+        expected_generation: None,
+        remaining_millis: 5_000,
+        // Only a stored record is damaged; a missing one is refused, never written.
+        conditions: vec![Condition::Present { key: key.clone() }],
+        mutations: vec![Mutation::Put {
+            key,
+            value: Bytes::from(bytes),
+            expected_version: None,
+        }],
+    };
+    // No request id is printed, as for damage-chunk (PB-5): another client's number.
+    say(&match db.resend(request) {
+        Ok(ok) => format!(
+            "damage ok p=1 gen={} seq={} {:?} as={how} request=- (damage's own client; status              does not know it)",
+            ok.generation.0, ok.seq.0, ok.durability
+        ),
+        Err(PutError { error, .. }) if error.kind == ErrorKind::ConditionFailed => {
+            format!("err admin damage: no stored record at {object}")
+        }
+        Err(PutError { error, .. }) => format!(
+            "err admin damage: {} retry={:?} request=- ({})",
+            error.name(),
+            error.retry,
+            error.detail
+        ),
+    });
+    Ok(())
+}
+
+const DAMAGE_RECORD_USAGE: &str = "admin damage <object> [--as digest|kind0|newer]";
 
 /// `read`'s words after the object: nothing, the manifest alone, or `--offset O --len L`.
 fn parse_range(rest: &[&str]) -> Result<Look, String> {
