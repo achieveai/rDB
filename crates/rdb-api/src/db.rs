@@ -30,6 +30,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
+use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
 use rdb_value::value::Value;
 use rdb_value::{Document, Expected};
@@ -82,6 +83,12 @@ const _: () = assert!(2 * MAX_OBJECT_ID + 2 <= rdb_value::list::MAX_ID_ESCAPED);
 /// anything is compiled or sent. A change's writes are capped separately, at compile: a map or
 /// set change also writes its root, so it takes at most 254 element changes.
 pub const MAX_OPS: usize = rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
+
+/// The longest map key or set member, in bytes, that a write or a `Members` read's `after`
+/// accepts (M9 S5): a text key's UTF-8 length, or a byte key's length, so `é` counts 2. Other
+/// key types are short by their type. A longer one is `INVALID_ARGUMENT` before anything is
+/// compiled, sent or read.
+pub const MAX_KEY: usize = 1_024;
 
 /// The largest page one read asks for: the most members, or list items, a `Members`, `Items`
 /// or `ItemsAfter` look takes (M9 S5). A larger `limit` is `INVALID_ARGUMENT` before anything is
@@ -1559,8 +1566,8 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
             ));
         }
         let ops = op_count(&put.change);
-        (ops > MAX_OPS).then(|| {
-            limit_refused(
+        if ops > MAX_OPS {
+            return Some(limit_refused(
                 request,
                 "ops",
                 ops,
@@ -1569,9 +1576,72 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
                     "op {index}: {ops} ops, over the {MAX_OPS}-op limit; request {} not sent",
                     request.0
                 ),
-            )
-        })
+            ));
+        }
+        let elems = match &put.change {
+            Change::Map(elems) | Change::Set(elems) => elems.as_slice(),
+            Change::Doc(_)
+            | Change::List(_)
+            | Change::Chunk { .. }
+            | Change::Publish { .. }
+            | Change::Gc { .. } => &[],
+        };
+        elems
+            .iter()
+            .find_map(|elem| key_refusal(elem_key(elem), request, Some(index), "sent"))
     })
+}
+
+/// `INVALID_ARGUMENT` for a map key or set member over [`MAX_KEY`], or `None`. `index` names
+/// the put, when there is one; `done` ends the detail: `request R not <done>`.
+fn key_refusal(
+    key: &Value,
+    request: RequestId,
+    index: Option<usize>,
+    done: &str,
+) -> Option<ApiError> {
+    let found = key_len(key)?;
+    (found > MAX_KEY).then(|| {
+        let op = index.map_or_else(String::new, |index| format!("op {index}: "));
+        limit_refused(
+            request,
+            "key",
+            found,
+            MAX_KEY,
+            format!(
+                "{op}key {found} bytes, over the {MAX_KEY}-byte limit; request {} not {done}",
+                request.0
+            ),
+        )
+    })
+}
+
+/// The key an element op names.
+fn elem_key(elem: &ElemOp) -> &Value {
+    match elem {
+        ElemOp::Put(key, _)
+        | ElemOp::Add(key)
+        | ElemOp::Remove(key)
+        | ElemOp::NeedPresent(key)
+        | ElemOp::NeedAbsent(key) => key,
+    }
+}
+
+/// A text key's UTF-8 length or a byte key's length. `None` for any other scalar, which is
+/// short by its type, and for a container, which is no key: the compile refuses it.
+fn key_len(key: &Value) -> Option<usize> {
+    match key {
+        Value::Text(text) => Some(text.len()),
+        Value::Bytes(bytes) => Some(bytes.len()),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Integer(_)
+        | Value::Float(_)
+        | Value::Decimal(_)
+        | Value::Timestamp(_)
+        | Value::Array(_)
+        | Value::Map(_) => None,
+    }
 }
 
 /// How many ops `change` carries. Every kind is named, so a new one does not compile until
@@ -1623,8 +1693,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         ) => *limit,
         Some(Look::Doc | Look::Range { .. }) | None => 0,
     };
-    (page > MAX_PAGE).then(|| {
-        limit_refused(
+    if page > MAX_PAGE {
+        return Some(limit_refused(
             request,
             "page",
             page,
@@ -1633,8 +1703,21 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
                 "page limit {page}, over {MAX_PAGE}; request {} not read",
                 request.0
             ),
+        ));
+    }
+    match look {
+        Some(Look::Members {
+            after: Some(after), ..
+        }) => key_refusal(after, request, None, "read"),
+        Some(
+            Look::Members { after: None, .. }
+            | Look::Doc
+            | Look::Items { .. }
+            | Look::ItemsAfter { .. }
+            | Look::Range { .. },
         )
-    })
+        | None => None,
+    }
 }
 
 /// A request over a limit: one `limit_refused` line, which never carries the caller's bytes,

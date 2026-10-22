@@ -19,7 +19,9 @@
 //! bytes, for every write and read; a `doc`, `map`, `set` or `list` write carries at most 255
 //! ops, and a `txn` at most 255 puts. A map or set write also writes its root, so with distinct
 //! keys the compile's 255-write cap refuses it first, at 255 keys. `members` and `items` take
-//! `--limit` 1,000 at most, a count of items, not bytes. A request over a limit answers `INVALID_ARGUMENT` with
+//! `--limit` 1,000 at most, a count of items, not bytes. A text or byte map key or set member,
+//! in a write or in `members --after`, is at most 1,024 bytes (`é` counts 2). A request over a
+//! limit answers `INVALID_ARGUMENT` with
 //! `request=-`, and its detail ends `request R not sent` (or `not read`): R is the id it used up.
 //!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
