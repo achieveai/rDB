@@ -127,6 +127,8 @@ place with its ruling.
 
 #### 2. Object id encoding: escaped bytes, two-byte terminator
 - `object_id` is a byte string of any length, 0 included. No byte is forbidden.
+  (Amended 2026-10-21, M9 S5, A-R134: the encoding still takes any length, but the API does not.
+  `rdb_api::Db` refuses an id over 1,024 bytes on every write and read, before compile. See O1.)
 - `esc(b)`: copy `b`, writing each `0x00` as `0x00 0xFF`, then append the terminator `0x00 0x01`.
 - Decoding: after a `0x00`, the next byte must be `0xFF` (an escaped zero) or `0x01` (the end).
   Anything else is damage.
@@ -550,6 +552,12 @@ compares `count` with one scanned element (decision 9).
   (Status 2026-10-19, M9 S4, A-R114 Q4: carried to M10. The raw path closes at the M10 wire. Until
   then `Db::resend` and `Db::resend_within` accept a raw `TxnRequest` from the one in-process
   embedder; S4 adds no opaque request type.)
+- **Request limits (M9 S5, A-R134 A1).** The limits of O1 and spec §4.2's "API request limits" row
+  are checked in one place: `rdb_api::Db`, at its write funnel (`compile_and_send`, plus the put
+  count in `txn`) and its read funnel (`read_call`). **M10's wire must enter through `Db`, or call
+  the same checks, before compile.** A path that builds a `ClientCall` or a `TxnRequest` itself skips
+  them. Until M10 that is `Db::resend` with a raw request (above); kernel admission still caps its
+  mutation count.
 - **Definitions.** An object is **damaged** when any of three things holds:
   - `rdb-value` returns `Corrupt` for one of its records. That covers every cause in decisions 4, 7, 9,
     10 and 13. It includes `Corrupt(Root(..))` for a count that a compile would push above `u64::MAX`
@@ -666,6 +674,8 @@ compares `count` with one scanned element (decision 9).
 - Deleting a large collection takes several transactions: remove members, at most 254 per transaction,
   then drop. A single-call delete is Open O6.
 - Object ids and element keys have no length limit beyond the transaction envelope (Open O1).
+  (Amended 2026-10-21, M9 S5, A-R134: `rdb-value` and the kernel still set none. The API limits
+  both to 1,024 bytes; see O1.)
 
 ## Verification
 Tests live in `crates/rdb-value/tests/collections.rs` unless another file is named. A test's name
@@ -710,6 +720,18 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
 - **O1 Length limits** for object ids and element keys. No spec number exists. M9 sets one with its
   request limits. Adding a limit later refuses only new writes.
   (Status 2026-10-19, M9 S4, A-R113 C-5: set in M9 S5, with the other request limits.)
+  **Closed** 2026-10-21 by M9 S5 (A-R134). `rdb_api::Db` refuses, as `INVALID_ARGUMENT` before
+  anything is compiled, sent or read:
+  - an object id over 1,024 bytes (`MAX_OBJECT_ID`), on every write and every read;
+  - a text or byte map key or set member over 1,024 bytes (`MAX_KEY`; text counts UTF-8 bytes), in
+    any element op and as a members page's `after`. Other scalar keys are short by their type.
+  - Why 1,024: an id of 1,024 bytes escapes to at most 2,050 (every byte `0x00`). That is inside
+    ADR-rdb-0016's 3,072-byte escaped bound for lists, which a const assert in `rdb-api` pins.
+    ADR-rdb-0014 O4 asks only for an id limit of 3,745 bytes or less.
+  - Reads of an over-long id are refused too. No stored id can exceed the write limit, so the
+    refusal hides nothing. **A later, lower write limit needs its own read constant**, or ids written
+    under the old limit can no longer be read. Raising a limit is free; lowering one is not.
+  - Spec §4.2 lists the limits ("API request limits"). Decision 11 says where M10 must check them.
 - **O2 Lists** (S4): records, pages, scan tokens and the envelope `kind`. **Closed** 2026-10-05 by
   ADR-rdb-0016 decisions 1 and 6 (L-R186ee); blocks and change slots replace pages.
 - **O3 Chunk placement and tail** (S5). **Closed** 2026-10-05 by ADR-rdb-0014 decision 1 (Gautam,

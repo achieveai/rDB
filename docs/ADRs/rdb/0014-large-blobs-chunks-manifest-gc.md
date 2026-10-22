@@ -556,6 +556,11 @@ seen to fail under a named fault (a mutant), then pass.
   (decisions 6, 8) need a redesign; and a `History` after-image, or ADR-rdb-0010 decision 6 cannot rebuild them.
 - **O4 Id length (ADR-rdb-0013 O1):** an id limit of 3,745 bytes or less keeps a full chunk writable.
   GC no longer depends on it (decision 8's byte bound).
+  (Status 2026-10-21, M9 S5, A-R134: **met.** The API refuses an object id over 1,024 bytes on every
+  write and read, before compile (ADR-rdb-0013 O1).)
+- **Range read length (M10):** `read_range` checks `len` only against the blob's size, so one read may
+  ask for up to 254 MiB and allocate it. M9 S5 sets no cap. A range length cap is carried to M10, with
+  read sessions (O2) and the streaming read. (Carried 2026-10-21, M9 S5, A-R134; spec §4.2.)
 - **O5 GC scheduling (M9/M10):** which objects to visit, and a key-only scan so GC does not load chunk values.
   (Status 2026-10-19, M9 S4, A-R113 C-5: M10, with upload sessions (O1). In M9 GC runs on request.)
 - **O6 Lazy snapshot** for large blobs.
