@@ -768,8 +768,8 @@ impl Db {
     /// - `Gc`: the object as the compile read it, and each chunk it deletes.
     /// - `Clear`: the root's version as the compile read it, or its absence, and each record
     ///   it deletes, at the version it read. A clear proves the object damaged first, then
-    ///   deletes at most 254 records per call, the root in the last, so the object reads as
-    ///   damaged until that call; call again until `Ok(None)`.
+    ///   deletes at most 254 records besides the root per call. The last call also deletes the
+    ///   root, so the object reads as damaged until then; call again until `Ok(None)`.
     ///
     /// `Ok(None)` is a change that compiles to nothing and is never sent:
     /// - a `Chunk` whose bytes are already stored at its upload and index;
