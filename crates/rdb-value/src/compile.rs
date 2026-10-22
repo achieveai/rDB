@@ -129,8 +129,9 @@ pub enum Corrupt {
     /// (ADR-rdb-0013 §11).
     #[error("element records exist that the root does not account for")]
     OrphanElement,
-    /// The root's `count` is above 0 but no element record exists (ADR-rdb-0013 §11).
-    #[error("the root counts {count} elements but none exists")]
+    /// The root's `count` is not the number of element records: above 0 with none stored
+    /// (ADR-rdb-0013 §11), or, as a clear proves it, any other number (M9 S6).
+    #[error("the root counts {count} elements, but that many are not stored")]
     CountMismatch {
         /// The root's count.
         count: u64,
@@ -178,13 +179,24 @@ pub enum Corrupt {
 
 impl Corrupt {
     /// Whether the record that fails is a newer build's, not damage (ADR-rdb-0012 §12): an
-    /// envelope [`EnvelopeError::is_newer_build`] names. Such a record may be valid, so it is
-    /// answered `INCOMPATIBLE_VERSION` and never cleared.
+    /// envelope [`EnvelopeError::is_newer_build`] names, the root's or a chunk's, list block's or
+    /// change slot's; an unknown element key profile; or an unknown sub. Such a record may be
+    /// valid, so it is answered `INCOMPATIBLE_VERSION` and never cleared.
     #[must_use]
     pub fn is_newer_build(&self) -> bool {
         match self {
-            Self::Envelope(error) => error.is_newer_build(),
-            Self::UnknownSub(_) => true,
+            Self::Envelope(error)
+            | Self::Chunk { error, .. }
+            | Self::Block {
+                fault:
+                    BlockFault::Envelope(error)
+                    | BlockFault::OpBad {
+                        fault: SlotFault::Envelope(error),
+                        ..
+                    },
+                ..
+            } => error.is_newer_build(),
+            Self::UnknownKeyProfile(_) | Self::UnknownSub(_) => true,
             _ => false,
         }
     }

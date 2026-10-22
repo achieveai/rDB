@@ -3513,6 +3513,8 @@ impl Host {
                 self.read_admitted(partition, "\"not damaged\" is not confirmed")?;
                 Err(compile_error(&error))
             }
+            // No read gate (A-R139): INCOMPATIBLE_VERSION and the other refusals claim nothing
+            // about the object, and no_mutation=true holds on any view.
             Err(error) => Err(compile_error(&error)),
         }
     }

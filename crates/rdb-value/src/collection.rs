@@ -437,6 +437,19 @@ fn element_value(
     }
 }
 
+/// Check one element record under `root` as [`members`] checks it: its key, version and bytes
+/// (M9 S6, a clear's classification).
+pub(crate) fn check_element(
+    root: &RootKey,
+    found: &Collection,
+    key: &[u8],
+    version: u64,
+    bytes: &[u8],
+) -> Result<(), ValueError> {
+    decode_element_key(root, key).map_err(|e| ValueError::Corrupt(Corrupt::Key(e)))?;
+    element_value(found, version, bytes).map(drop)
+}
+
 /// The element `key` of the collection at `root`, or `None` when it is absent.
 ///
 /// # Errors
