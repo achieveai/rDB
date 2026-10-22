@@ -9,12 +9,19 @@
 //! in what they submit after it: a retry of an identity the prior generation retained, and
 //! retries of one identity under the same and another digest.
 
-use rdb_core::contracts::authority::Checkpoint;
-use rdb_core::contracts::event::Budgets;
+use rdb_core::authority::partition::PartitionRecord;
+use rdb_core::contracts::authority::{Checkpoint, Lineage};
+use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::event::{Budgets, EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
-    ClientId, ConfigVersion, NodeId, PartitionId, ReplicaRole, RequestId, Seq, TenantId,
+    ClientId, ConfigVersion, DurableSeq, Generation, NodeId, OwnerEpoch, PartitionId, ReplicaRole,
+    RequestId, Seq, TenantId,
 };
+use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
 use rdb_core::contracts::trace::{KeyId, Provenance};
+use rdb_sim::harness::run::RunPlan;
 
 use super::grammar::{
     Budget, ClientOp, NetworkOp, Placement, RecoveryOp, Scenario, ScenarioOp, TimeOp, Topology,
@@ -489,6 +496,103 @@ pub const M9_S0_MAX_TICKS: u64 = M9_S0_SUBMIT_AT + 2_000;
 
 /// The M9 S0 case's one client request.
 pub const M9_S0_REQUEST: RequestId = RequestId(10);
+
+/// The M9 S0 empty-partition world, for rows that edit the lowered plan: the survivors in
+/// `survivors` hold the prior lineage through `head`, placement's plan reaches F1 at
+/// [`PLAN_AT`], and the run ends at `max_ticks`.
+///
+/// Moved here from `m9_start_record.rs` with [`m9_s0_case_b`] (M9 close-out C1), so the host
+/// comparison runs the same world as the S0 rows.
+#[must_use]
+pub fn m9_s0_held(survivors: &[NodeId], head: Seq, max_ticks: u64) -> Scenario {
+    let mut ops: Vec<ScenarioOp> = survivors
+        .iter()
+        .map(|node| {
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: *node,
+                to: head,
+            })
+        })
+        .collect();
+    ops.extend([
+        ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+        ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+            partition: PARTITION,
+            window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
+        }),
+        ScenarioOp::Time(TimeOp::Advance {
+            ticks: max_ticks - PLAN_AT,
+        }),
+    ]);
+    authored(
+        "m9_s0_empty_partition",
+        Budget {
+            max_events: 50_000,
+            max_ticks,
+        },
+        ops,
+    )
+}
+
+/// M9 S0 case B, the real host's shape, with no client request: the caller adds its own seeds.
+/// Three empty copies; the lowering's plan is edited so the prior lineage is generation 0,
+/// epoch 0, owned by B, and A is an empty survivor too, so F1 creates generation 1. The run
+/// ends at `max_ticks`.
+#[must_use]
+pub fn m9_s0_case_b(max_ticks: u64) -> RunPlan {
+    let mut plan =
+        super::run::lower(&m9_s0_held(&[B_NODE, C_NODE], Seq::ZERO, max_ticks)).expect("lowers");
+    let gen0 = |lineage: &mut Lineage| {
+        assert_eq!(
+            lineage.generation,
+            Generation(1),
+            "the lowering's prior lineage"
+        );
+        lineage.generation = Generation(0);
+        lineage.owner_epoch = OwnerEpoch(0);
+    };
+    for (key, value) in &mut plan.control_records {
+        if *key == ControlKey::Partition(PARTITION) {
+            let mut record = PartitionRecord::decode(value).expect("decodes");
+            record.generation = Generation(0);
+            record.owner_epoch = OwnerEpoch(0);
+            record.owner = B_NODE;
+            *value = record.encode();
+        }
+    }
+    for seed in &mut plan.seed {
+        match &mut seed.kind {
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(p))) => {
+                gen0(&mut p.anchor.lineage);
+                gen0(&mut p.authority_view.lineage);
+            }
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(f))) => {
+                f.prior_generation = Generation(0);
+                f.prior_owner_epoch = OwnerEpoch(0);
+            }
+            _ => {}
+        }
+    }
+    for (_, _, generation, _) in &mut plan.preload_durable {
+        *generation = Generation(0);
+    }
+    for (_, _, inventory) in &mut plan.survivors {
+        gen0(&mut inventory.anchor_seen.lineage);
+        assert_eq!(
+            inventory.head,
+            (Seq::ZERO, Digest::ROOT),
+            "an empty survivor heads at the root"
+        );
+    }
+    let a_inventory = SurvivorInventory {
+        copy: CopyId(2),
+        ..plan.survivors[0].2.clone()
+    };
+    plan.preload_durable
+        .push((A_NODE, PARTITION, Generation(0), DurableSeq(0)));
+    plan.survivors.push((A_NODE, PARTITION, a_inventory));
+    plan
+}
 
 /// M9 S0: an empty recovery followed by a submit (lead ruling "S0 start record", Gautam chose A
 /// on 2026-10-07).
