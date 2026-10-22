@@ -67,7 +67,9 @@ const GROUP: AffinityId = AffinityId(1);
 /// So a queued call waits behind every call ahead of it first, and no bound covers that wait.
 pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The longest object id, in raw bytes, that any write or read accepts (M9 S5). A longer one is
+/// The longest object id, in raw bytes, that any write or read through `Db` accepts (M9 S5). A
+/// raw `ClientCall` sent with `NodeHandle::send`, or a `TxnRequest` given to [`Db::resend`],
+/// is not checked (ADR-rdb-0013 decision 11). A longer one is
 /// `INVALID_ARGUMENT` before anything is compiled, sent or read, and its request id is used up.
 /// A read keeps this limit even if a later version lowers the write limit: data already written
 /// stays readable, so a lower write limit needs its own constant.

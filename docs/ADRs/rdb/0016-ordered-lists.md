@@ -338,7 +338,7 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
   (Status 2026-10-19, M9 S4, A-R113 C-5: both caps are set in M9 S5. S4 adds neither.)
   **Closed** 2026-10-21 by M9 S5 (A-R134). `rdb_api::Db` refuses, as `INVALID_ARGUMENT` before compile:
   a page over 1,000 items (`items`, items after a token, and map or set members); and a change over 255
-  ops, or a transaction over 255 puts. A list delta of 255 ops keeps k small: the k² replay above is
+  ops, or a transaction over 255 puts. A list delta of 255 ops keeps k small: the k² replay below is
   24 ms at k = 5,000. `rdb-value` stays caller-bounded; the cap lives in the API. **M10's wire must
   call the same checks** (ADR-rdb-0013 decision 11). The page cap counts items, not bytes; a page
   byte cap is carried to M10 (spec §4.2).

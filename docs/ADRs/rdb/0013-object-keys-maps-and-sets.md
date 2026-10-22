@@ -556,8 +556,9 @@ compares `count` with one scanned element (decision 9).
   are checked in one place: `rdb_api::Db`, at its write funnel (`compile_and_send`, plus the put
   count in `txn`) and its read funnel (`read_call`). **M10's wire must enter through `Db`, or call
   the same checks, before compile.** A path that builds a `ClientCall` or a `TxnRequest` itself skips
-  them. Until M10 that is `Db::resend` with a raw request (above); kernel admission still caps its
-  mutation count.
+  them. Until M10 there are two such paths: `Db::resend` with a raw `TxnRequest` (above), and
+  `host::NodeHandle::send` with a hand-built `ClientCall::Put` or `ClientCall::Compile`. Kernel
+  admission still caps their mutation count.
 - **Definitions.** An object is **damaged** when any of three things holds:
   - `rdb-value` returns `Corrupt` for one of its records. That covers every cause in decisions 4, 7, 9,
     10 and 13. It includes `Corrupt(Root(..))` for a count that a compile would push above `u64::MAX`
@@ -728,8 +729,8 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
   - Why 1,024: an id of 1,024 bytes escapes to at most 2,050 (every byte `0x00`). That is inside
     ADR-rdb-0016's 3,072-byte escaped bound for lists, which a const assert in `rdb-api` pins.
     ADR-rdb-0014 O4 asks only for an id limit of 3,745 bytes or less.
-  - Reads of an over-long id are refused too. No stored id can exceed the write limit, so the
-    refusal hides nothing. **A later, lower write limit needs its own read constant**, or ids written
+  - Reads of an over-long id are refused too. No id written through `Db` can exceed the write
+    limit, so the refusal hides nothing. **A later, lower write limit needs its own read constant**, or ids written
     under the old limit can no longer be read. Raising a limit is free; lowering one is not.
   - Spec §4.2 lists the limits ("API request limits"). Decision 11 says where M10 must check them.
 - **O2 Lists** (S4): records, pages, scan tokens and the envelope `kind`. **Closed** 2026-10-05 by

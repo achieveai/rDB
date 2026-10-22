@@ -21,8 +21,9 @@
 //! keys the compile's 255-write cap refuses it first, at 255 keys. `members` and `items` take
 //! `--limit` 1,000 at most, a count of items, not bytes. A text or byte map key or set member,
 //! in a write or in `members --after`, is at most 1,024 bytes (`é` counts 2). A request over a
-//! limit answers `INVALID_ARGUMENT` with
-//! `request=-`, and its detail ends `request R not sent` (or `not read`): R is the id it used up.
+//! limit answers `INVALID_ARGUMENT`, and its detail ends `request R not sent` (a write) or
+//! `request R not read` (a read): R is the id it used up. A write also prints `request=-`; a
+//! read prints no `request=` field, so its R is in the detail only.
 //!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
 //! word starts a comment; one inside a word, as in `{"tag":"#1"}`, or inside a `"..."`
