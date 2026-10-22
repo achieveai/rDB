@@ -188,8 +188,12 @@ fn measure(
         step_us.push(started.elapsed().as_secs_f64() * 1e6);
         assert!(found.is_some(), "the write just made reads back");
     }
-    let (view_ms, get_us, miss_us, step_us) =
-        (sorted(view_ms), sorted(get_us), sorted(miss_us), sorted(step_us));
+    let (view_ms, get_us, miss_us, step_us) = (
+        sorted(view_ms),
+        sorted(get_us),
+        sorted(miss_us),
+        sorted(step_us),
+    );
     format!(
         "view_ms_p50={:.3} view_ms_max={:.3} get_us_p50={:.2} get_us_p99={:.2} \
          miss_us_p50={:.2} miss_us_p99={:.2} step_us_p50={:.1} step_us_max={:.1}",
@@ -216,7 +220,11 @@ fn load(engine: &mut RocksEngine, keys: u64, depth: u64, rng: &mut Lcg) -> Gener
     for level in 2..=depth {
         let child = Generation(level);
         let linked = engine.inherit(P, top, child, Seq(seq)).expect("inherit");
-        assert_eq!(linked, Inherited::Linked, "a reopen links at the applied seq");
+        assert_eq!(
+            linked,
+            Inherited::Linked,
+            "a reopen links at the applied seq"
+        );
         top = child;
         for _ in 0..10 {
             seq += 1;
@@ -252,7 +260,11 @@ fn main() -> ExitCode {
     };
     println!(
         "snapshot_bench profile={} samples={}",
-        if cfg!(debug_assertions) { "dev" } else { "release" },
+        if cfg!(debug_assertions) {
+            "dev"
+        } else {
+            "release"
+        },
         args.samples
     );
     for &keys in &args.keys {
