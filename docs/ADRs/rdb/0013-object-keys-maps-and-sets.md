@@ -720,6 +720,7 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
 ## Open (none blocks S3)
 - **O1 Length limits** for object ids and element keys. No spec number exists. M9 sets one with its
   request limits. Adding a limit later refuses only new writes.
+  (Superseded 2026-10-21 by M9 S5: `Db` refuses reads of an over-long id too. See below.)
   (Status 2026-10-19, M9 S4, A-R113 C-5: set in M9 S5, with the other request limits.)
   **Closed** 2026-10-21 by M9 S5 (A-R134). `rdb_api::Db` refuses, as `INVALID_ARGUMENT` before
   anything is compiled, sent or read:
@@ -729,9 +730,14 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
   - Why 1,024: an id of 1,024 bytes escapes to at most 2,050 (every byte `0x00`). That is inside
     ADR-rdb-0016's 3,072-byte escaped bound for lists, which a const assert in `rdb-api` pins.
     ADR-rdb-0014 O4 asks only for an id limit of 3,745 bytes or less.
-  - Reads of an over-long id are refused too. No id written through `Db` can exceed the write
-    limit, so the refusal hides nothing. **A later, lower write limit needs its own read constant**, or ids written
-    under the old limit can no longer be read. Raising a limit is free; lowering one is not.
+  - Reads of an over-long id are refused too. No id written through `Db`'s checked calls can
+    exceed the write limit, so for those the refusal hides nothing. The exception is the two raw
+    paths in decision 11's "Request limits" bullet: `Db::resend` and `resend_within` with a raw
+    `TxnRequest`, and `host::NodeHandle::send` with a hand-built `ClientCall::Put` or
+    `ClientCall::Compile`. They skip the checks, so an over-long id can be written that way. The
+    cost: such an id cannot be read back through `Db` until M10's wire closes those paths.
+    **A later, lower write limit needs its own read constant**, or ids written under the old
+    limit can no longer be read. Raising a limit is free; lowering one is not.
   - Spec §4.2 lists the limits ("API request limits"). Decision 11 says where M10 must check them.
 - **O2 Lists** (S4): records, pages, scan tokens and the envelope `kind`. **Closed** 2026-10-05 by
   ADR-rdb-0016 decisions 1 and 6 (L-R186ee); blocks and change slots replace pages.

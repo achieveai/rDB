@@ -4036,6 +4036,44 @@ mod tests {
         db.shutdown();
     }
 
+    /// M9 S5-4 (G2), the byte edge. A byte map key or set member of 1,024 bytes, all 0x00, is
+    /// sent unchanged; 1,025 is refused before the owner sees it.
+    /// Unit (~100 ms): no node thread.
+    #[test]
+    fn m9_s5_a_byte_key_at_1024_bytes_is_sent_and_one_byte_over_is_refused() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let changes = |len: usize| {
+            let key = Value::Bytes(vec![0; len]);
+            [
+                Change::Map(vec![ElemOp::Put(key.clone(), Value::Null)]),
+                Change::Set(vec![ElemOp::Add(key)]),
+            ]
+        };
+
+        for (request, change) in (1_u64..).zip(changes(MAX_KEY + 1)) {
+            let refused = db.write(b"o", change, None).expect_err("over the limit");
+            refused_unsent(
+                &refused.error,
+                &format!(
+                    "op 0: key 1025 bytes, over the 1024-byte limit; request {request} not sent"
+                ),
+                &mailbox,
+            );
+        }
+        for change in changes(MAX_KEY) {
+            let kind = change.name();
+            let sent = db
+                .write(b"o", change.clone(), None)
+                .expect_err("nothing answers");
+            assert_eq!(sent.error.kind, ErrorKind::Unavailable, "{kind}: {sent:?}");
+            match reached(&mailbox) {
+                ClientCall::Compile { puts, .. } => assert_eq!(puts[0].change, change, "{kind}"),
+                other => panic!("{kind}: the key at the limit is compiled: {other:?}"),
+            }
+        }
+        db.shutdown();
+    }
+
     /// M9 S5-3 (G5). A `Members`, `Items` or `ItemsAfter` page of 1,001 is refused before the
     /// owner sees it; 1,000 is sent.
     /// Unit (~100 ms): no node thread.
