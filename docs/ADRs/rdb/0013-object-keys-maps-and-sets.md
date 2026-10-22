@@ -519,7 +519,9 @@ How it is proved:
     is written. This needs no extra read.
   - **Checked (M9 S7, A-R144 Q2): whether a named map entry is a newer build's.** For each stored
     map entry a `put`, `del` or `need` names, `compile_collection` `get`s its bytes and asks
-    `envelope::newer_build`. A newer build's entry is refused with `Corrupt(Envelope(..))`, which
+    `envelope::newer_build`. A newer build's entry is refused with `Corrupt::Entry { key, error }`
+    (amended 2026-10-22, M9 close-out, #55: it was `Corrupt(Envelope(..))`; the refusal now names
+    the entry's key to the caller, and no log line carries the key's text, A-R154), which
     the API answers `INCOMPATIBLE_VERSION`; nothing is sent, and the entry keeps its bytes. It costs
     one `get` per named entry, and no hash for a v1 header.
     - **Precedence.** It runs inside the op loop, before `ElementNewerThanRoot` and so before
