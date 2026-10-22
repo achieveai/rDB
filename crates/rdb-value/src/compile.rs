@@ -223,7 +223,8 @@ impl Corrupt {
 /// The longest key text [`key_text`] shows, in chars, before it cuts the rest to `…`.
 const KEY_TEXT_CAP: usize = 64;
 
-/// A map key as an error names it (#55, ruling A-R150 F5), safe for a terminal or a log line:
+/// A map key as an error names it to the caller (#55, ruling A-R150 F5), safe for a terminal
+/// (never for a log line, which carries a key only as `key_hex`: ADR-0013, ruling A-R154):
 /// text quoted with every control char escaped (`escape_debug`), bytes as `h'<hex>'`, numbers,
 /// `true`/`false`/`null` canonical, a decimal as `4([exponent, mantissa])` and a timestamp as
 /// `1001({1: secs, -9: nanos})`, as CBOR's diagnostic notation writes them. A key whose text,
