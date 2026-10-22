@@ -2740,8 +2740,10 @@ fn restarted_nodes(boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
 /// `status Unknown`, with the restart note when there is one, unless this session never sent
 /// the request (`ours` false): that outcome is known (tester walk 5). After the owner's
 /// restart its outcome waits for M10. Otherwise it follows what node 1 holds (Msg 8, W6-D1): a
-/// request not `in_flight` there was refused before it was queued, or never arrived, and
-/// nothing will resolve it. One in flight waits for M10 after both secondaries' restarts, and
+/// request not `in_flight` there was refused before it was queued, or never arrived, or was
+/// answered and its answer trimmed past retention, so it may have applied (M9 close-out D1:
+/// `Sent` keeps no answer, so the line cannot tell these apart), and nothing will resolve it.
+/// One in flight waits for M10 after both secondaries' restarts, and
 /// after one secondary's resolves once the other can take it, as when a held link heals
 /// (W5-D1). `in_flight` is `None` when node 1 did not answer in time: whether it holds the
 /// request is then not known, so the line promises nothing and says to ask again (F-025).
@@ -2766,7 +2768,8 @@ fn unknown_line(
         ),
         _ if !owner_restarted && in_flight == Some(false) => format!(
             "status Unknown (node 1 does not hold it in flight, so waiting will not change \
-             this: it was refused before it was queued, or never arrived; {note})"
+             this: it was refused before it was queued, or never arrived, or its answer was \
+             trimmed after retention (it may have applied); {note})"
         ),
         [other] if !owner_restarted => format!(
             "status Unknown (not evidence of a lost write: it resolves once node {other}, which \
@@ -4158,7 +4161,8 @@ mod tests {
         );
         assert_eq!(unknown_line(true, Some(false), &[NodeId(1)], note), m10);
         let refused = "status Unknown (node 1 does not hold it in flight, so waiting will not \
-                       change this: it was refused before it was queued, or never arrived; NOTE)";
+                       change this: it was refused before it was queued, or never arrived, or \
+                       its answer was trimmed after retention (it may have applied); NOTE)";
         assert_eq!(unknown_line(true, Some(false), &[NodeId(3)], note), refused);
         assert_eq!(
             unknown_line(true, Some(false), &[NodeId(2), NodeId(3)], note),
@@ -4189,6 +4193,26 @@ mod tests {
             "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
              restarted node rejoins, which is M10; NOTE)"
         );
+    }
+
+    /// M9 close-out D1 (tester-m9c, `m9c-walks/d1-repro.txt`): after node 2's restart, `status`
+    /// of a write this session saw `ok` (seq 2), once its answer was trimmed past
+    /// `--dedup-retention-ms`, said only "refused before it was queued, or never arrived". The
+    /// write had applied. Node 1 not holding a request this session sent must leave room for an
+    /// applied write whose answer was trimmed. Unit.
+    #[test]
+    fn status_unknown_of_a_request_not_in_flight_allows_a_trimmed_answer() {
+        for restarted in [&[NodeId(2)][..], &[NodeId(3)], &[NodeId(2), NodeId(3)]] {
+            let line = unknown_line(true, Some(false), restarted, Some("NOTE"));
+            assert!(
+                line.contains("its answer was trimmed after retention (it may have applied)"),
+                "{restarted:?}: {line}"
+            );
+            assert!(
+                !line.contains("or never arrived;"),
+                "refused or lost is not the only cause: {restarted:?}: {line}"
+            );
+        }
     }
 
     /// Msg 9 adjacent defect: `node_status` leaves out a node whose restart failed (SF), so a
