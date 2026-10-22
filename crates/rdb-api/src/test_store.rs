@@ -7,7 +7,7 @@
 //! Written out by hand because `async-trait` is not a dependency of this crate.
 
 use std::future::Future;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -16,9 +16,30 @@ use config_core::{
     ListResponse, MutationResponse, PutRequest, WatchRequest, WatchStream,
 };
 use config_testkit::MemStore;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 
 type Reply<'a, T> = Pin<Box<dyn Future<Output = Result<T, ConfigError>> + Send + 'a>>;
+
+/// Take a permit from `gate`, notifying `parked` from inside the first poll that finds the gate
+/// shut, just before that poll returns `Pending` (#49). The task has then yielded by the time a
+/// woken waiter can act, so an `abort` sent after the notification lands before the permit is
+/// used. Notifying before the first poll left a window: the waiter could forget the node and
+/// release the gate while this task was still running, and its next poll took the permit and
+/// went on without a yield. A gate that is open on the first poll never notifies.
+async fn park_at<'g>(gate: &'g Semaphore, parked: &Notify) -> SemaphorePermit<'g> {
+    let mut acquire = pin!(gate.acquire());
+    let mut notified = false;
+    std::future::poll_fn(|cx| {
+        let poll = acquire.as_mut().poll(cx);
+        if poll.is_pending() && !notified {
+            notified = true;
+            parked.notify_one();
+        }
+        poll
+    })
+    .await
+    .expect("the gates are never closed")
+}
 
 /// What the store does to the calls still to come.
 #[derive(Debug, Default)]
@@ -57,15 +78,17 @@ pub(crate) struct Scripted {
     script: Mutex<Script>,
     /// Every put takes a permit first. Open unless built by [`Scripted::gated`].
     gate: Semaphore,
-    /// Notified when a put arrives, before it waits at the gate.
+    /// Notified when a put has parked at the shut gate (from the poll that parks it). Never
+    /// notified by a put that finds the gate open, so never on an ungated [`Scripted::new`].
     pub(crate) put_arrived: Notify,
     /// A held list takes a permit before it answers. Starts closed.
     list_gate: Semaphore,
     /// A held watch takes a permit before it opens. Starts closed.
     watch_gate: Semaphore,
-    /// Notified when a held watch has arrived, before it waits at its gate.
+    /// Notified when a held watch has parked at its shut gate (from the poll that parks it).
     pub(crate) watch_held: Notify,
-    /// Notified when a held list has read, before it waits at its gate.
+    /// Notified when a held list has read and parked at its shut gate (from the poll that
+    /// parks it).
     pub(crate) list_held: Notify,
     /// The gate a blocked list waits at, on its worker thread.
     blocked: (Mutex<Blocked>, Condvar),
@@ -206,12 +229,7 @@ impl ConfigStore for Scripted {
         }
         Box::pin(async move {
             let answer = self.inner.list(request).await;
-            self.list_held.notify_one();
-            let _permit = self
-                .list_gate
-                .acquire()
-                .await
-                .expect("the list gate is never closed");
+            let _permit = park_at(&self.list_gate, &self.list_held).await;
             answer
         })
     }
@@ -222,8 +240,7 @@ impl ConfigStore for Scripted {
         Self: 'b,
     {
         Box::pin(async move {
-            self.put_arrived.notify_one();
-            let _permit = self.gate.acquire().await.expect("the gate is never closed");
+            let _permit = park_at(&self.gate, &self.put_arrived).await;
             if self.take(|script| &mut script.drop_puts) {
                 return Err(ConfigError::DeadlineExceededUnknownOutcome);
             }
@@ -260,12 +277,7 @@ impl ConfigStore for Scripted {
             return self.inner.watch(request);
         }
         Box::pin(async move {
-            self.watch_held.notify_one();
-            let _permit = self
-                .watch_gate
-                .acquire()
-                .await
-                .expect("the watch gate is never closed");
+            let _permit = park_at(&self.watch_gate, &self.watch_held).await;
             self.inner.watch(request).await
         })
     }
