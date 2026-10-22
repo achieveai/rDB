@@ -1753,7 +1753,10 @@ fn r11_orphans_on_create_and_drop_and_count_drift_on_drop() {
     );
     assert_eq!(
         dropping(&with(Some(1), false), 4),
-        corrupt(Corrupt::CountMismatch { count: 1 }),
+        corrupt(Corrupt::CountMismatch {
+            count: 1,
+            stored: 0
+        }),
         "C21"
     );
     assert_eq!(

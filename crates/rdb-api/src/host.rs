@@ -3509,7 +3509,7 @@ impl Host {
                     conditions: Vec::new(),
                 })
             }
-            Err(error @ ValueError::Apply(ApplyError::NotDamaged)) => {
+            Err(error @ ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks)) => {
                 self.read_admitted(partition, "\"not damaged\" is not confirmed")?;
                 Err(compile_error(&error))
             }
@@ -3934,7 +3934,7 @@ fn fail_waiter(reply: &Sender<Answer>, detail: String) -> String {
 fn compile_error(error: &ValueError) -> ApiError {
     match error {
         // M9 S6: a clear of an object that reads back cleanly.
-        ValueError::Apply(ApplyError::NotDamaged) => {
+        ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks) => {
             ApiError::new(ErrorKind::ConditionFailed, error.to_string())
         }
         // M9 S6 (ADR-rdb-0012 §12): a newer build's record is valid, not damage, for every read,

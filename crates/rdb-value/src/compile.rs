@@ -130,11 +130,14 @@ pub enum Corrupt {
     #[error("element records exist that the root does not account for")]
     OrphanElement,
     /// The root's `count` is not the number of element records: above 0 with none stored
-    /// (ADR-rdb-0013 §11), or, as a clear proves it, any other number (M9 S6).
-    #[error("the root counts {count} elements, but that many are not stored")]
+    /// (ADR-rdb-0013 §11), or any other number, as a read of every element or a clear's proof
+    /// finds it (M9 S6, A-R142).
+    #[error("the root counts {count} elements, but {stored} are stored")]
     CountMismatch {
         /// The root's count.
         count: u64,
+        /// The element records stored.
+        stored: u64,
     },
     /// A blob root's payload is not a v1 manifest (ADR-rdb-0014 §2, "strict reading").
     #[error("blob manifest: {0}")]

@@ -22,7 +22,7 @@ use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
 
 use crate::blob::{check_chunk, read_blob, verify_chunks, Manifest};
 use crate::collection::{
-    check_element, collection, drop_collection, members, Collection, CollectionKind,
+    check_count, check_element, collection, drop_collection, members, Collection, CollectionKind,
 };
 use crate::compile::{read, record, BlockFault, Compiled, Corrupt, SlotFault, ValueError};
 use crate::delta::{ApplyError, SizeLimit};
@@ -89,7 +89,8 @@ struct Found {
 /// goes in the batch that empties the rest. Call again until `Ok(None)`.
 ///
 /// # Errors
-/// [`ApplyError::NotDamaged`] when the object reads back cleanly; [`ValueError::Corrupt`] with a
+/// [`ApplyError::NotDamaged`] when the object reads back cleanly, [`ApplyError::OnlyChunks`]
+/// when only upload chunks are stored under it; [`ValueError::Corrupt`] with a
 /// newer build's error ([`Corrupt::is_newer_build`]) when any record under the object is one;
 /// [`ApplyError::KindMismatch`] for a chunk record at the root key, which no read takes.
 pub fn clear_object(
@@ -141,7 +142,7 @@ fn prove_absent(records: &[Found]) -> Result<Corrupt, ValueError> {
             Ok(_) => {}
         }
     }
-    Err(ApplyError::NotDamaged.into())
+    Err(ApplyError::OnlyChunks.into())
 }
 
 /// A read's verdict: `None` when it reads back cleanly, the damage otherwise. A newer build's
@@ -212,16 +213,10 @@ fn prove_collection(
         Ok(Some(found)) => found,
         other => return proven(verdict(other.map(drop))?, Reader::Envelope, Vec::new()),
     };
-    let read = members(snapshot, root, None, usize::MAX).and_then(|listed| {
-        let stored = u64::try_from(listed.members.len()).unwrap_or(u64::MAX);
-        if stored == found.count {
-            Ok(())
-        } else {
-            Err(ValueError::Corrupt(Corrupt::CountMismatch {
-                count: found.count,
-            }))
-        }
-    });
+    // Every element in one call, so the read applies the count rule itself; it is applied here
+    // too, by the same helper, so the proof never depends on how `members` pages.
+    let read = members(snapshot, root, None, usize::MAX)
+        .and_then(|listed| check_count(&found, listed.members.len()));
     let damage = match verdict(read)? {
         Some(damage) => Some(damage),
         None => drop_verdict(drop_collection(snapshot, root, version).map(drop))?,

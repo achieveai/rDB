@@ -269,6 +269,10 @@ pub enum ApplyError {
     /// decision 11). A healthy object is never cleared.
     #[error("the object reads back cleanly: not damaged, nothing to clear")]
     NotDamaged,
+    /// A clear of an object with no root found only upload chunks under it: no read takes
+    /// them, so they are not damage, and `blob gc` removes them (M9 S6 P-5, ADR-rdb-0014 §9).
+    #[error("only upload chunks are stored, with no root: not damaged, nothing to clear; blob gc removes them")]
+    OnlyChunks,
     /// A scan token, or a fenced request, from another generation: the versions it names may
     /// have been reused (ADR-rdb-0016 §6, §8).
     #[error("the token or request names generation {expected}; the snapshot is at {found}")]
