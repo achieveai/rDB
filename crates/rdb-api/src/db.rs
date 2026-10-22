@@ -83,6 +83,12 @@ const _: () = assert!(2 * MAX_OBJECT_ID + 2 <= rdb_value::list::MAX_ID_ESCAPED);
 /// set change also writes its root, so it takes at most 254 element changes.
 pub const MAX_OPS: usize = rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
 
+/// The largest page one read asks for: the most members, or list items, a `Members`, `Items`
+/// or `ItemsAfter` look takes (M9 S5). A larger `limit` is `INVALID_ARGUMENT` before anything is
+/// read; follow a page's token for more. It counts items, not bytes, so a page of large items
+/// can still be large.
+pub const MAX_PAGE: usize = 1_000;
+
 /// A failed call, with the §5.4 name and what the caller may do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -1583,19 +1589,21 @@ fn op_count(change: &Change) -> usize {
 /// every limit. A call that is not a read is never refused here: [`Db::read_call`] sends reads
 /// only.
 fn read_refusal(call: &ClientCall) -> Option<ApiError> {
-    let (identity, object) = match call {
+    let (identity, object, look) = match call {
         ClientCall::Get {
-            identity, object, ..
-        }
-        | ClientCall::GetPrevious { identity, object } => (identity, object),
+            identity,
+            object,
+            look,
+        } => (identity, object, Some(look)),
+        ClientCall::GetPrevious { identity, object } => (identity, object, None),
         ClientCall::Put { .. }
         | ClientCall::Compile { .. }
         | ClientCall::Resend { .. }
         | ClientCall::Status { .. } => return None,
     };
     let request = identity.request;
-    (object.len() > MAX_OBJECT_ID).then(|| {
-        limit_refused(
+    if object.len() > MAX_OBJECT_ID {
+        return Some(limit_refused(
             request,
             "object_id",
             object.len(),
@@ -1603,6 +1611,26 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
             format!(
                 "object id {} bytes, over the {MAX_OBJECT_ID}-byte limit; request {} not read",
                 object.len(),
+                request.0
+            ),
+        ));
+    }
+    let page = match look {
+        Some(
+            Look::Members { limit, .. }
+            | Look::Items { limit, .. }
+            | Look::ItemsAfter { limit, .. },
+        ) => *limit,
+        Some(Look::Doc | Look::Range { .. }) | None => 0,
+    };
+    (page > MAX_PAGE).then(|| {
+        limit_refused(
+            request,
+            "page",
+            page,
+            MAX_PAGE,
+            format!(
+                "page limit {page}, over {MAX_PAGE}; request {} not read",
                 request.0
             ),
         )

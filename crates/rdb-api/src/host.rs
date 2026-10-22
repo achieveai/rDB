@@ -3192,6 +3192,7 @@ impl Host {
                 tracing::info!(
                     node = self.node.0,
                     partition = partition.0,
+                    client = identity.client.0,
                     request = identity.request.0,
                     puts = puts.len(),
                     change = puts.first().map_or("none", |put| put.change.name()),
@@ -3257,6 +3258,7 @@ impl Host {
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
+            client = identity.client.0,
             request = identity.request.0,
             call = match &kind {
                 EventKind::Client(event) => client_name(event),
