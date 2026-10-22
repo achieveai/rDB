@@ -119,12 +119,16 @@ pub fn clear_object(
     };
     let reader = proof.as_ref().map_or(&Reader::Unchecked, |p| &p.reader);
     let records = scan(snapshot, root, reader)?;
+    let count = match reader {
+        Reader::Collection(found) => Some(found.count),
+        _ => None,
+    };
     let (damage, missing) = match proof {
         Some(proof) => (proof.damage, proof.missing),
         None if records.is_empty() => return Ok(None),
         None => (prove_absent(&records)?, Vec::new()),
     };
-    let (compiled, faulting) = batch(root, root_version, missing, records)?;
+    let (compiled, faulting) = batch(root, root_version, count, missing, records)?;
     Ok(Some(Cleared {
         compiled,
         damage,
@@ -386,15 +390,21 @@ fn faulting(
 
 /// Clean records in key order, then faulting ones, then the root in the batch that empties the
 /// rest. Every batch carries an `Absent` for each key the proof found missing, and every batch
-/// that keeps the root is guarded by it as read: its version, or its absence. Also returns how
-/// many faulting records the batch deletes.
+/// that keeps the root is guarded by it as read: its version, or its absence. A batch that keeps
+/// the root of a map or set never leaves exactly the `count` elements the root names (review
+/// F-003). Also returns how many faulting records the batch deletes.
 fn batch(
     root: &RootKey,
     root_version: Option<u64>,
+    count: Option<u64>,
     missing: Vec<Bytes>,
     records: Vec<Found>,
 ) -> Result<(Compiled, usize), ValueError> {
     let total = records.len();
+    let elements = records
+        .iter()
+        .filter(|f| matches!(f.sub, Ok(Sub::Element)))
+        .count();
     let (clean, faulting): (Vec<_>, Vec<_>) = records.into_iter().partition(|f| !f.faulting);
     let clean_len = clean.len();
     let guard = match root_version {
@@ -411,16 +421,20 @@ fn batch(
         .map(|key| Condition::Absent { key })
         .collect();
     let mut mutations = Vec::new();
+    // Per delete: whether it is of an element, and of a faulting record.
+    let mut deleted = Vec::new();
     for found in clean.into_iter().chain(faulting) {
         if mutations.len() == MAX_CLEAR_DELETES {
             break;
         }
+        deleted.push((matches!(found.sub, Ok(Sub::Element)), found.faulting));
         mutations.push(Mutation::Delete {
             key: found.key,
             expected_version: Some(found.version),
         });
         if record_len(absent.len() + 1, &mutations) > MAX_ENVELOPE_BYTES {
             mutations.pop();
+            deleted.pop();
             break;
         }
     }
@@ -442,13 +456,23 @@ fn batch(
         }
         mutations.pop();
     }
+    // C-1: with the root kept and every element left clean, `count` elements left would read
+    // back as healthy. One element fewer in this batch leaves one more, so the object still
+    // reads as damaged.
+    let left = elements - deleted.iter().filter(|(element, _)| *element).count();
+    if count.is_some_and(|count| u64::try_from(left).is_ok_and(|left| left == count)) {
+        if let Some(at) = deleted.iter().rposition(|(element, _)| *element) {
+            mutations.remove(at);
+            deleted.remove(at);
+        }
+    }
     if mutations.is_empty() {
         return Err(ApplyError::TooLarge {
             limit: SizeLimit::Write,
         }
         .into());
     }
-    let faulting = mutations.len().saturating_sub(clean_len);
+    let faulting = deleted.iter().filter(|(_, faulting)| *faulting).count();
     let mut conditions = vec![guard];
     conditions.extend(absent);
     Ok((

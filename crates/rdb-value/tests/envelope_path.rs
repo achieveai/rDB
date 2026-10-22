@@ -198,6 +198,40 @@ fn l_r186s_a_newer_builds_record_reads_as_unknown_never_as_damage() {
     );
 }
 
+/// M9 S6 review F-001 (ADR-rdb-0012 §12): which `open` errors name a newer build's record, for
+/// every variant. A newer build's record may be valid, so a clear never deletes it; every other
+/// error is damage, which a clear may delete. Kind 0 is damage: no build writes it.
+#[test]
+fn m9_s6_is_newer_build_names_only_an_unknown_format_codec_digest_or_reserved_kind() {
+    use EnvelopeError::*;
+    let table = [
+        (UnknownFormat(0x02), true),
+        (UnknownCodec(0x02), true),
+        (UnknownDigest(0x02), true),
+        (UnknownKind(0x09), true),
+        (UnknownKind(0xff), true),
+        (UnknownKind(0x00), false),
+        (Truncated { len: 0 }, false),
+        (
+            TooLarge {
+                len: MAX_ENVELOPE + 1,
+            },
+            false,
+        ),
+        (
+            LengthMismatch {
+                declared: 1,
+                actual: 0,
+            },
+            false,
+        ),
+        (DigestMismatch, false),
+    ];
+    for (error, newer) in table {
+        assert_eq!(error.is_newer_build(), newer, "{error:?}");
+    }
+}
+
 /// Scenario: the largest payload seals to exactly 1 MiB; one byte more is refused.
 #[test]
 fn seal_accepts_exactly_the_limit() {

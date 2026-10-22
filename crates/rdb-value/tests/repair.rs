@@ -1074,3 +1074,125 @@ fn gap_4_a_clear_of_wide_keys_is_cut_by_bytes_and_keeps_the_root_until_the_end()
     assert!(earlier.iter().all(|b| !b.1), "{sizes:?}");
     assert!(k.records.is_empty(), "{:?}", k.records.keys());
 }
+
+/// Whether `cleared` deletes the root of `root`: the batch that empties the object.
+fn deletes_root(cleared: &rdb_value::repair::Cleared, root: &RootKey) -> bool {
+    let root = root.to_bytes();
+    cleared
+        .compiled
+        .mutations
+        .iter()
+        .any(|m| matches!(m, Mutation::Delete { key, .. } if *key == root))
+}
+
+/// Review F-003 (C-1): a map root that counts 46 elements over 300 stored, every element clean.
+/// A first batch of 254 would leave exactly the 46 the root counts, so the map would read back
+/// as healthy while half cleared, and the next clear would answer "not damaged" over 46
+/// leftovers. A batch that keeps the root never leaves exactly `count` elements, so after every
+/// call but the last the map still reads as damaged. Not reachable through any M9 write.
+#[test]
+fn f003_a_batch_that_keeps_the_root_never_leaves_the_count_it_names() {
+    let mut k = Kernel::new();
+    let root = object(b"big");
+    filled(&mut k, &root, CollectionKind::Map, 300);
+    let (version, bytes) = k.records[&root.to_bytes()].clone();
+    let Value::Map(mut fields) = decode(open(&bytes).unwrap().payload).unwrap() else {
+        panic!("a map root is a map");
+    };
+    *fields.get_mut(&MapKey::new("count")).unwrap() = int(46);
+    let sealed = seal(Kind::Map, &encode(&Value::Map(fields)).unwrap()).unwrap();
+    k.records.insert(root.to_bytes(), (version, sealed));
+
+    let mut calls = 0;
+    while let Some(cleared) = clear_object(&k.snapshot(), &root).unwrap() {
+        calls += 1;
+        assert!(calls < 5, "the clear ends");
+        let last = deletes_root(&cleared, &root);
+        k.commit_any_order(&cleared.compiled);
+        if !last {
+            let read = members(&k.snapshot(), &root, None, usize::MAX);
+            assert!(
+                matches!(
+                    &read,
+                    Err(ValueError::Corrupt(Corrupt::CountMismatch {
+                        count: 46,
+                        ..
+                    }))
+                ),
+                "after call {calls}, the root kept: {read:?}"
+            );
+        }
+    }
+    assert_eq!(calls, 2);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Review F-006: `Cleared.faulting` counts the faulting records a batch deletes, on a batch that
+/// keeps the root too. A map of 300 with 290 damaged: the first batch deletes the 10 clean
+/// elements, then 244 faulting ones, and keeps the root; the second deletes the last 46 and the
+/// root.
+#[test]
+fn f006_faulting_counts_the_faulting_deletes_of_every_batch() {
+    let mut k = Kernel::new();
+    let root = object(b"big");
+    let keys = filled(&mut k, &root, CollectionKind::Map, 300);
+    for key in &keys[10..] {
+        let key = element_key(&root, key).unwrap();
+        let at = k.records[&key].0;
+        k.records.insert(key, (at, Bytes::from_static(b"damaged")));
+    }
+    let mut batches = Vec::new();
+    while let Some(cleared) = clear_object(&k.snapshot(), &root).unwrap() {
+        batches.push((
+            cleared.compiled.mutations.len(),
+            cleared.faulting,
+            deletes_root(&cleared, &root),
+        ));
+        k.commit_any_order(&cleared.compiled);
+        assert!(batches.len() < 5, "the clear ends");
+    }
+    assert_eq!(batches, vec![(254, 244, false), (47, 46, true)]);
+}
+
+/// `shape` created, then the record [`damage`] would break replaced by a newer build's, at the
+/// version it had, so the read opens it rather than stopping at a version check. The whole read.
+fn whole_with_a_newer_build_record(shape: Shape) -> Result<bool, ValueError> {
+    let mut k = Kernel::new();
+    let root = object(b"o");
+    create(&mut k, &root, shape);
+    let key = damaged_key(&k, &root, shape);
+    let at = k.records[&key].0;
+    k.records.insert(key, (at, newer_build_record()));
+    whole(&k, &root, shape)
+}
+
+/// Review F-005 (ADR-rdb-0012 §12): a range read that meets a newer build's chunk names a newer
+/// build's record, which the host answers `INCOMPATIBLE_VERSION`, not `CORRUPT_BLOB`, and logs
+/// no `stored_damage` for.
+#[test]
+fn f005_a_read_of_a_newer_builds_chunk_names_a_newer_build() {
+    let read = whole_with_a_newer_build_record(Shape::Blob);
+    assert!(
+        matches!(&read, Err(ValueError::Corrupt(c @ Corrupt::Chunk { .. })) if c.is_newer_build()),
+        "{read:?}"
+    );
+}
+
+/// Review F-005: an items read that meets a newer build's list block base names a newer build's
+/// record, which the host answers `INCOMPATIBLE_VERSION`, not `CORRUPT_HISTORY`.
+#[test]
+fn f005_a_read_of_a_newer_builds_list_block_names_a_newer_build() {
+    let read = whole_with_a_newer_build_record(Shape::List);
+    assert!(
+        matches!(
+            &read,
+            Err(ValueError::Corrupt(
+                c @ Corrupt::Block {
+                    fault: BlockFault::Envelope(_),
+                    ..
+                }
+            )) if c.is_newer_build()
+        ),
+        "{read:?}"
+    );
+}
