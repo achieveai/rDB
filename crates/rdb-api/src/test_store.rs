@@ -7,7 +7,7 @@
 //! Written out by hand because `async-trait` is not a dependency of this crate.
 
 use std::future::Future;
-use std::pin::{Pin, pin};
+use std::pin::{pin, Pin};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
