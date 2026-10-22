@@ -625,8 +625,9 @@ fn log_table(labels: &[&str], sim: &[Reply], host: &[Reply]) {
 /// C1: the script gets the same replies from the simulator and from the real host, step by
 /// step, and both end on the same published position.
 ///
-/// Integration (~10 s): three host node threads on wall-clock time and RocksDB; the spec's
-/// resume hold alone keeps writes out for 5 s after the open.
+/// Integration (~8 s, 7.5 s of it waiting for the host to admit writes): three host node
+/// threads on wall-clock time and RocksDB, with the spec's budgets as the simulator runs them.
+/// The resume hold alone keeps writes out for 5 s after the open; `Db::open` takes no other.
 #[retcd_test]
 fn m9_c1_01_one_script_gets_the_same_replies_from_the_simulator_and_the_host() {
     support::preamble();
