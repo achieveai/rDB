@@ -129,9 +129,25 @@ fn write(label: &'static str, request: u64, mutations: Vec<Mutation>) -> Step {
 /// Another group of the same tenant, for the cross-group refusal.
 const OTHER_GROUP: AffinityId = AffinityId(2);
 
+/// What step 1 writes at `a`, and step 2 must read back.
+const HELLO: &[u8] = b"hello";
+
+/// The kinds the script means each step to get, in step order (review F-001). Step 4 is the
+/// identical retry of step 1: the kernel replays its answer as `Published`, or as
+/// `RecoveredApplied` from retained history; either is the same write.
+const INTENDED: [&[&str]; 7] = [
+    &["Published"],
+    &["Read"],
+    &["ConditionFailed"],
+    &["Published", "RecoveredApplied"],
+    &["RequestIdReuse"],
+    &["Published"],
+    &["CrossAffinity"],
+];
+
 /// The script: S0 and S1 shapes.
 fn script() -> Vec<Step> {
-    let first = vec![put(GROUP, b"a", b"hello", None)];
+    let first = vec![put(GROUP, b"a", HELLO, None)];
     vec![
         write("put a", 1, first.clone()),
         Step {
@@ -623,7 +639,7 @@ fn log_table(labels: &[&str], sim: &[Reply], host: &[Reply]) {
 }
 
 /// C1: the script gets the same replies from the simulator and from the real host, step by
-/// step, and both end on the same published position.
+/// step, both end on the same published position, and those are the answers the script means.
 ///
 /// Integration (~8 s, 7.5 s of it waiting for the host to admit writes): three host node
 /// threads on wall-clock time and RocksDB, with the spec's budgets as the simulator runs them.
@@ -657,6 +673,50 @@ fn m9_c1_01_one_script_gets_the_same_replies_from_the_simulator_and_the_host() {
     assert_eq!(
         sim_published, host_published,
         "final published (generation, seq) differs: sim {sim_published:?}, host {host_published:?}"
+    );
+    // The host equals the simulator, so pinning the simulator pins both.
+    assert_script_intent(&labels, &sim, sim_published);
+}
+
+/// The simulator got the answers the script means (review F-001). Without this, a drift in a
+/// helper both sides share (the api version, the key or value format) refuses every step on
+/// both sides alike, and the comparison alone stays green.
+fn assert_script_intent(labels: &[&str], sim: &[Reply], published: (Generation, Seq)) {
+    assert_eq!(sim.len(), INTENDED.len(), "one intended kind per step");
+    for (index, (reply, intended)) in sim.iter().zip(INTENDED).enumerate() {
+        assert!(
+            intended.contains(&reply.kind.as_str()),
+            "script intent: step {} ({}) answered {}, meant {intended:?}",
+            index + 1,
+            labels[index],
+            reply.kind
+        );
+    }
+    let (first, retry, txn) = (&sim[0], &sim[3], &sim[5]);
+    assert_eq!(
+        (retry.seq, retry.generation),
+        (first.seq, first.generation),
+        "script intent: step 4, the identical retry, answers step 1's position"
+    );
+    let first_seq = first.seq.expect("step 1 published");
+    assert_eq!(
+        sim[1].read,
+        ReadBytes::Found {
+            version: first_seq,
+            bytes: HELLO.to_vec(),
+        },
+        "script intent: step 2 reads what step 1 wrote"
+    );
+    let txn_seq = txn.seq.expect("step 6 published");
+    assert_eq!(
+        txn_seq,
+        first_seq + 1,
+        "script intent: the two-key txn is the next write after step 1"
+    );
+    assert_eq!(
+        (published.0 .0, published.1 .0),
+        (txn.generation.expect("step 6 published"), txn_seq),
+        "script intent: the two-key txn is the last write published"
     );
 }
 
