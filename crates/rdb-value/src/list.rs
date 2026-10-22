@@ -705,12 +705,16 @@ fn load_block(
         let found = snapshot.scan(Namespace::User, &slot_key(root, id, slot_of(from)), limit);
         for (op, i) in (from..from + len).zip(0..) {
             // A scan entry past this op's slot means the slot is missing (§3); one before it is a
-            // stray key between two slots, and is named as a drop names one.
+            // stray key between two slots, and is named as a drop names one, unless a newer
+            // build wrote it: that is named first, as for the base (M9 S7).
             let expected = slot_key(root, id, slot_of(op));
             let raw = match found.get(i) {
                 Some((found_key, value)) if *found_key == expected => value,
-                Some((found_key, _)) if *found_key < expected => {
-                    return Err(stray(root, found_key))
+                Some((found_key, value)) if *found_key < expected => {
+                    if let Some(error) = newer_build(value) {
+                        return Err(fault(BlockFault::Envelope(error)));
+                    }
+                    return Err(stray(root, found_key));
                 }
                 _ => return Err(fault(BlockFault::OpMissing { op })),
             };
