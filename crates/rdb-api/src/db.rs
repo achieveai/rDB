@@ -128,7 +128,7 @@ impl ApiError {
     /// |---|---|---|
     /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
     /// | `UnknownOutcome` | `QueryStatus` | `false` |
-    /// | `CorruptHistory`, `CorruptBlob` | `Quarantine` | `false` |
+    /// | `CorruptHistory`, `CorruptBlob`, `IncompatibleVersion` | `Quarantine` | `false` |
     /// | `UploadChunkConflict` | `Reconcile` | `true` |
     /// | any other | `BoundedJitter` | `false` |
     ///
@@ -143,7 +143,9 @@ impl ApiError {
                 (RetryRule::Definitive, true)
             }
             ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
-            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob => (RetryRule::Quarantine, false),
+            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob | ErrorKind::IncompatibleVersion => {
+                (RetryRule::Quarantine, false)
+            }
             ErrorKind::UploadChunkConflict => (RetryRule::Reconcile, true),
             _ => (RetryRule::BoundedJitter, false),
         };
@@ -841,7 +843,11 @@ impl Db {
             puts,
             remaining_millis: millis(deadline),
         };
-        let refused = |error| {
+        // Every answer here sent nothing: the compile refused, or never answered (Q3, M9 S6).
+        // `put_as` takes this back to `false` through `Self::retried`: its request id may have
+        // applied on an earlier send.
+        let refused = |mut error: ApiError| {
+            error.no_mutation = true;
             Err(PutError {
                 error: self.explained(error),
                 request: None,
@@ -1586,7 +1592,8 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
             | Change::List(_)
             | Change::Chunk { .. }
             | Change::Publish { .. }
-            | Change::Gc { .. } => &[],
+            | Change::Gc { .. }
+            | Change::Clear => &[],
         };
         elems
             .iter()
@@ -1653,7 +1660,7 @@ fn op_count(change: &Change) -> usize {
         Change::Doc(delta) => delta.0.len(),
         Change::Map(ops) | Change::Set(ops) => ops.len(),
         Change::List(edits) => edits.len(),
-        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } => 0,
+        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } | Change::Clear => 0,
     }
 }
 

@@ -86,6 +86,11 @@ pub enum Corrupt {
     /// newer build, not damage (ADR-rdb-0012 §12).
     #[error("unknown element key profile {0}")]
     UnknownKeyProfile(i128),
+    /// A record under the object sits at a `sub` this build does not know
+    /// ([`crate::keys::Sub::Reserved`]). No build this one knows writes there, so it is a newer
+    /// build's record, not damage (ADR-rdb-0012 §12). Only a clear looks there (M9 S6).
+    #[error("a record at unknown sub {0:#04x}")]
+    UnknownSub(u8),
     /// A map entry's envelope is not a document.
     #[error("map entry envelope is a {found:?}, not a Document")]
     EntryNotDocument {
@@ -169,6 +174,20 @@ pub enum Corrupt {
         /// The chunk's index.
         index: u32,
     },
+}
+
+impl Corrupt {
+    /// Whether the record that fails is a newer build's, not damage (ADR-rdb-0012 §12): an
+    /// envelope [`EnvelopeError::is_newer_build`] names. Such a record may be valid, so it is
+    /// answered `INCOMPATIBLE_VERSION` and never cleared.
+    #[must_use]
+    pub fn is_newer_build(&self) -> bool {
+        match self {
+            Self::Envelope(error) => error.is_newer_build(),
+            Self::UnknownSub(_) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Why a list block is refused (ADR-rdb-0016 §7). An unknown kind, codec or format inside

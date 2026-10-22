@@ -12,6 +12,8 @@
 //! - [`blob`]: large blobs, chunk records and one manifest root (ADR-rdb-0014).
 //! - [`list`]: ordered lists: a root, blocks with change slots, and a record for each item too
 //!   large for its block (ADR-rdb-0016).
+//! - [`repair`]: prove an object damaged, then clear it, one batch of deletes at a time
+//!   (M9 S6; ADR-rdb-0013 decision 11).
 //! - [`testing::MapSnapshot`]: an in-memory `SnapshotRead`.
 //!
 //! Pure (ADR-rdb-0011): no clock, no I/O, no logging. Every outcome is a returned value.
@@ -29,6 +31,7 @@ pub mod envelope;
 pub mod keys;
 pub mod list;
 pub mod path;
+pub mod repair;
 pub mod testing;
 pub mod value;
 

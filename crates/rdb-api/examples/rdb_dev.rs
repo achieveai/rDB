@@ -165,6 +165,17 @@
 //!                                         in M9 (no takeover runs), `partition-in-transfer
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
+//! admin clear <o>                        clear a damaged object: prove it damaged, then
+//!                                         delete one batch of its records, each at the version
+//!                                         it was read at (`clear ok ...`). Repeat until `clear
+//!                                         unchanged (nothing to clear; nothing sent)`. A
+//!                                         healthy object answers `CONDITION_FAILED`, a newer
+//!                                         build's record `INCOMPATIBLE_VERSION`, both with
+//!                                         `request=-`. Nothing left but not yet published
+//!                                         answers `UNKNOWN_OUTCOME` with `request=-`: ask
+//!                                         `status` of the clear that sent the deletes. While
+//!                                         reads are refused, as after a fence, it answers as
+//!                                         `read` does. `retry` resends it unchanged
 //! admin damage <o> [--as digest|kind0|newer]
 //!                                         dev only: overwrite the object's stored root with a
 //!                                         sealed document whose digest fails (`digest`, the
@@ -1202,8 +1213,14 @@ fn repl<'scope, 'env>(
             }),
             ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
             ["admin", "damage", object, rest @ ..] => damage_record(db, object, rest),
+            ["admin", "clear", object] => {
+                let answer = db.write(object.as_bytes(), Change::Clear, None);
+                labelled_write_line(db, "clear ", "nothing to clear", answer, &mut sent);
+                Ok(())
+            }
             ["admin", ..] => Err(format!(
-                "admin clear-grant <n>: n is 1, 2 or 3 | {DAMAGE_USAGE} | {DAMAGE_RECORD_USAGE}"
+                "admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | {DAMAGE_USAGE} | \
+                 {DAMAGE_RECORD_USAGE}"
             )),
             ["control", "lifecycle", partition, word] => {
                 parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
