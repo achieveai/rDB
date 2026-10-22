@@ -546,8 +546,13 @@ How it is proved:
 
 #### 11. Integrity rule: records under an object prefix are written and repaired only through `rdb-value`
 This closes the critic's F1 and F2 together. **It adopts the critic's rule**: writes and repairs go only
-through `rdb-value`, and a create refuses leftovers (decision 9). **It adds one cheap check:** `drop`
-compares `count` with one scanned element (decision 9).
+through `rdb-value`, and a create refuses leftovers (decision 9). **It adds cheap checks:** `drop`
+compares `count` with one scanned element (decision 9), and a full `members` read compares `count`
+with every entry it lists (status below).
+(Status 2026-10-22, M9 S6, A-R142: a `members` read from the start to the last entry compares the
+root's `count` with the entries it listed, and answers `CORRUPT_HISTORY` "the root counts N
+elements, but M are stored" when they differ. A page with `--after`, or one that stops short of the
+last entry, cannot check this. A clear's proof makes the same check, through the same function.)
 - **Writes.** Every record whose key starts with an object prefix is written only by `rdb-value`'s
   compiled output. Decision 1 makes that true inside `rdb-value`. M9 must give clients no raw path to
   these keys. That includes the plain KV API, the admin path and backup restore of single keys.
@@ -567,6 +572,7 @@ compares `count` with one scanned element (decision 9).
     (decision 9): the root opens, but its count is impossible.
   - It is in the **count-mismatch** state: the root opens cleanly, and its `count` is possible, but it
     disagrees with the element records present. `drop` reports this as `Corrupt(CountMismatch)`.
+    (Status 2026-10-22, M9 S6, A-R142: so does a full `members` read, and a clear's proof.)
   - It is in the **orphan** state: element records exist that the root does not account for. Three
     places report it as `Corrupt(OrphanElement)`:
     - a create, when there is no root;
