@@ -126,14 +126,46 @@ fn write(label: &'static str, request: u64, mutations: Vec<Mutation>) -> Step {
     }
 }
 
+/// Another group of the same tenant, for the cross-group refusal.
+const OTHER_GROUP: AffinityId = AffinityId(2);
+
 /// The script: S0 and S1 shapes.
 fn script() -> Vec<Step> {
+    let first = vec![put(GROUP, b"a", b"hello", None)];
     vec![
-        write("put a", 1, vec![put(GROUP, b"a", b"hello", None)]),
+        write("put a", 1, first.clone()),
         Step {
             label: "get a",
             action: Action::Read(b"a"),
         },
+        // `a` is at version 2; this asks for 7.
+        write(
+            "put a if version 7",
+            2,
+            vec![put(GROUP, b"a", b"world", Some(7))],
+        ),
+        write("put a again, same request", 1, first),
+        write(
+            "request 1, changed payload",
+            1,
+            vec![put(GROUP, b"a", b"other", None)],
+        ),
+        write(
+            "txn put b and c",
+            3,
+            vec![
+                put(GROUP, b"b", b"bee", None),
+                put(GROUP, b"c", b"sea", None),
+            ],
+        ),
+        write(
+            "txn across two groups",
+            4,
+            vec![
+                put(GROUP, b"d", b"dee", None),
+                put(OTHER_GROUP, b"e", b"eee", None),
+            ],
+        ),
     ]
 }
 
