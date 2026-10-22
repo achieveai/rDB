@@ -554,7 +554,36 @@ async fn m1_12_isolated_former_leader_rejects_write() {
         other => panic!("an isolated leader accepted a write, or refused it wrongly: {other:?}"),
     }
 
+    // Depose `leader` before healing. The ghost is already in its log, so while it is still
+    // the only leader a heal lets it commit that entry legitimately — the outcome above was
+    // "unknown", not "refused". A follower only campaigns after `leader_lease` plus its
+    // election timeout (2.25-3 s with the default timers), which outlasts the 2 s write
+    // timeout, so the put returning does not mean a successor exists. Observed 2026-09-27:
+    // no election, and the ghost committed when the read lost a race with replication.
+    let survivors: Vec<NodeId> = cluster
+        .ids()
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect();
+    cluster
+        .wait_for("a leader among the survivors", cluster.deadline(15), || {
+            survivors
+                .iter()
+                .copied()
+                .find(|id| cluster.metrics(*id).role == NodeRole::Leader)
+        })
+        .await
+        .unwrap_or_else(|t| panic!("the majority never elected a leader: {t}"));
+
     cluster.heal();
+    // `leader_now` returns the lowest-id node in `Leader` role, which can still be the stale
+    // `leader` until it hears the higher term.
+    cluster
+        .wait_for("the former leader steps down", cluster.deadline(15), || {
+            (cluster.metrics(leader).role != NodeRole::Leader).then_some(())
+        })
+        .await
+        .unwrap_or_else(|t| panic!("the former leader never stepped down after heal: {t}"));
     cluster
         .wait_converged(cluster.deadline(15))
         .await

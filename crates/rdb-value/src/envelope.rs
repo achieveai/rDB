@@ -162,6 +162,27 @@ impl EnvelopeError {
     }
 }
 
+/// The newer build's error [`open`] would give for `bytes`, if it would give one; `None` for a
+/// v1 envelope and for damage, whose own checks then name it (M9 S7).
+///
+/// One rule for every record a read, a map write or a clear meets (A-R139 D1, A-R144): within one
+/// record, a newer build's envelope is named before anything else about the record is checked.
+///
+/// Fast path, with no hash: a size `open` takes and header bytes 0–3 all v1 values (a known
+/// `kind`). `open` names a newer build only for a non-v1 header byte, so the answer is `None`.
+#[must_use]
+pub fn newer_build(bytes: &[u8]) -> Option<EnvelopeError> {
+    let v1_header = (HEADER_LEN..=MAX_ENVELOPE).contains(&bytes.len())
+        && bytes[0] == ENVELOPE_FORMAT_V1
+        && Kind::from_byte(bytes[1]).is_some()
+        && bytes[2] == CODEC_DOCUMENT_V1
+        && bytes[3] == DIGEST_SHA256;
+    if v1_header {
+        return None;
+    }
+    open(bytes).err().filter(EnvelopeError::is_newer_build)
+}
+
 /// [`seal`] was handed a payload over [`MAX_PAYLOAD`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("payload of {len} bytes is over the {LIMIT_TEXT} limit")]

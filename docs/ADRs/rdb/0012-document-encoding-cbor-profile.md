@@ -316,6 +316,14 @@ upgrade note.
   (Status 2026-10-21, M9 S6: a `Corrupt` that `is_newer_build` names is `INCOMPATIBLE_VERSION`,
   checked ahead of `CORRUPT_BLOB`, so a newer build's chunk is not blob damage. A read that
   finds another fault first still answers `CORRUPT_HISTORY`; M9 S7 closes that.)
+  (Status 2026-10-22, M9 S7: closed within one record. Reads, map writes and the clear share one
+  rule, `envelope::newer_build`: a newer build's envelope is named before the record's key,
+  version or kind is checked. Across records, a read names the first record it cannot serve; the
+  clear stays at least as strict, so it still deletes nothing a newer build wrote. Scope: that
+  order is for what a stored record says about itself. A caller's `expect` is checked first
+  (`check_version` reads only the root's version, before the root is opened), so a stale `expect`
+  against a newer build's root answers `CONDITION_FAILED`, not `INCOMPATIBLE_VERSION`. That is
+  intended and safe: nothing is written either way.)
 
 ### 13. Who owns the object-key layout
 - A document lives at its object's root key, and the document API takes only a root key (amended

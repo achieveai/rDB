@@ -24,7 +24,7 @@ use crate::compile::{
     check_version, record, refuse_list_record_at_root, Compiled, Corrupt, Expected, ValueError,
 };
 use crate::delta::{ApplyError, SizeLimit};
-use crate::envelope::{open, seal, Kind};
+use crate::envelope::{newer_build, open, seal, Kind};
 use crate::keys::{decode_element_key, element_key, encode_element, RootKey};
 use crate::value::{Int, Map, MapKey, Value};
 
@@ -257,6 +257,17 @@ pub fn compile_collection(
                     Expected::Version(_) => snapshot.version(Namespace::User, entry.key()),
                     Expected::Absent => None,
                 };
+                // M9 S7 (A-R144 Q2): a map write never overwrites, deletes or vouches for a newer
+                // build's entry. Named before its version, as a read names it; a damaged entry
+                // still passes, so `put`/`del` stays the app's repair (ADR-rdb-0013 §10).
+                if kind == CollectionKind::Map && version.is_some() {
+                    if let Some(error) = snapshot
+                        .get(Namespace::User, entry.key())
+                        .and_then(|bytes| newer_build(&bytes))
+                    {
+                        return Err(ValueError::Corrupt(Corrupt::Envelope(error)));
+                    }
+                }
                 // Lead ruling on tester W1 A2: a touched element newer than its root is the
                 // same breach a read reports, so the write that would mask it is refused.
                 if let (Some(element), Expected::Version(root)) = (version, expected) {
@@ -418,6 +429,12 @@ fn element_value(
     bytes: &[u8],
 ) -> Result<Option<Value>, ValueError> {
     let corrupt = ValueError::Corrupt;
+    // A newer build's entry is named before its version (M9 S7). A set member has no envelope.
+    if root.kind == CollectionKind::Map {
+        if let Some(error) = newer_build(bytes) {
+            return Err(corrupt(Corrupt::Envelope(error)));
+        }
+    }
     if version > root.version {
         return Err(corrupt(Corrupt::ElementNewerThanRoot {
             element: version,
@@ -525,6 +542,12 @@ pub fn members(
         if out.len() == limit {
             more = true;
             break;
+        }
+        // A newer build's entry is named before its key is decoded (M9 S7).
+        if found.kind == CollectionKind::Map {
+            if let Some(error) = newer_build(&bytes) {
+                return Err(ValueError::Corrupt(Corrupt::Envelope(error)));
+            }
         }
         let element =
             decode_element_key(root, &key).map_err(|e| ValueError::Corrupt(Corrupt::Key(e)))?;

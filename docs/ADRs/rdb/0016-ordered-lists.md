@@ -201,6 +201,11 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 (Status 2026-10-21, M9 S6: built. Its proof reads the list, then compiles its drop, so it also finds
 what a read does not: an item or slot record beside an empty list is `OrphanElement` at the drop,
 and the clear removes it.)
+(Status 2026-10-22, M9 S7: a block base or item record a newer build wrote is named before its
+version: the read answers `Corrupt(Block{id, Envelope})` or `Corrupt(Envelope)` with a newer
+build's error, which the API answers `INCOMPATIBLE_VERSION`, not `NewerThanRoot` or
+`ElementNewerThanRoot`. A stale slot is never opened by a read; list upkeep overwrites or deletes
+it (M10).)
 
 | Damage | Error |
 |---|---|

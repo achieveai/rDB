@@ -33,6 +33,16 @@ A page that starts with `--after` cannot see the whole object and says so in the
 
 ## Why it works
 "Damaged" is now one definition. Anything the clear may delete, a read refuses to serve as
-healthy, so no state between clear calls reads as a good object. The same split is the
-open S7 item: a newer build's map entry reads CORRUPT_HISTORY but the clear answers
-INCOMPATIBLE_VERSION. Check new damage rules against both paths.
+healthy, so no state between clear calls reads as a good object. Check new damage rules
+against both paths.
+
+M9 S7 settled the same split for a newer build's record, with three rules (A-R144):
+- Within one record, a newer build is named first. A site that checks a key, version or kind
+  before `open` calls `newer_build` first; the rest rely on `open`, which names a newer header
+  first.
+- Across records, a read names the first record it cannot serve. So an object holding a
+  damaged entry and a newer build's entry may read CORRUPT_HISTORY.
+- The clear stays at least as strict: it refuses on the newer record and deletes nothing.
+  That is what keeps the cross-record split safe, together with map writes refusing to touch
+  a newer build's entry. Soften either and the app's S6 repair (`put`/`del`) or the clear can
+  delete valid data again.

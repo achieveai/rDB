@@ -36,7 +36,7 @@ use crate::compile::{
     SlotFault, ValueError,
 };
 use crate::delta::{ApplyError, SizeLimit};
-use crate::envelope::{open, seal, Kind, HEADER_LEN};
+use crate::envelope::{newer_build, open, seal, Kind, HEADER_LEN};
 use crate::keys::{
     block_key, item_key, slot_key, KeyError, RootKey, LIST_ID_LEN, LIST_SLOTS, SUB_BLOCK, SUB_ITEM,
 };
@@ -672,6 +672,10 @@ fn load_block(
     let version = snapshot
         .version(Namespace::User, &key)
         .ok_or(ValueError::Corrupt(Corrupt::VersionWithoutValue))?;
+    // A newer build's base is named before its version (M9 S7).
+    if let Some(error) = newer_build(&bytes) {
+        return Err(fault(BlockFault::Envelope(error)));
+    }
     if version > root_version {
         return Err(fault(BlockFault::NewerThanRoot {
             block: version,
@@ -701,12 +705,16 @@ fn load_block(
         let found = snapshot.scan(Namespace::User, &slot_key(root, id, slot_of(from)), limit);
         for (op, i) in (from..from + len).zip(0..) {
             // A scan entry past this op's slot means the slot is missing (§3); one before it is a
-            // stray key between two slots, and is named as a drop names one.
+            // stray key between two slots, and is named as a drop names one, unless a newer
+            // build wrote it: that is named first, as for the base (M9 S7).
             let expected = slot_key(root, id, slot_of(op));
             let raw = match found.get(i) {
                 Some((found_key, value)) if *found_key == expected => value,
-                Some((found_key, _)) if *found_key < expected => {
-                    return Err(stray(root, found_key))
+                Some((found_key, value)) if *found_key < expected => {
+                    if let Some(error) = newer_build(value) {
+                        return Err(fault(BlockFault::Envelope(error)));
+                    }
+                    return Err(stray(root, found_key));
                 }
                 _ => return Err(fault(BlockFault::OpMissing { op })),
             };
@@ -929,6 +937,10 @@ fn read_item(
     let corrupt = ValueError::Corrupt;
     let (version, bytes) =
         record(snapshot, &item_key(root, id))?.ok_or(corrupt(Corrupt::ItemMissing { id }))?;
+    // A newer build's item is named before its version (M9 S7).
+    if let Some(error) = newer_build(&bytes) {
+        return Err(corrupt(Corrupt::Envelope(error)));
+    }
     if version > root_version {
         return Err(corrupt(Corrupt::ElementNewerThanRoot {
             element: version,

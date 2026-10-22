@@ -517,13 +517,32 @@ How it is proved:
   - **Checked.** `compile_collection` already reads `snapshot.version(..)` for every element it touches.
     If that version is above the root's, it refuses with `Corrupt(ElementNewerThanRoot)`, and nothing
     is written. This needs no extra read.
+  - **Checked (M9 S7, A-R144 Q2): whether a named map entry is a newer build's.** For each stored
+    map entry a `put`, `del` or `need` names, `compile_collection` `get`s its bytes and asks
+    `envelope::newer_build`. A newer build's entry is refused with `Corrupt(Envelope(..))`, which
+    the API answers `INCOMPATIBLE_VERSION`; nothing is sent, and the entry keeps its bytes. It costs
+    one `get` per named entry, and no hash for a v1 header.
+    - **Precedence.** It runs inside the op loop, before `ElementNewerThanRoot` and so before
+      `TooManyWrites` and `TooLarge`: a write that names a newer build's entry answers
+      `INCOMPATIBLE_VERSION` even when it is also too big.
+    - Set members are never checked: a member has no envelope, so bytes in one are damage.
+    - **Frozen rule (M9 S7, review Q5):** a set member never carries a newer build's bytes under
+      today's set root. A future set-member encoding that carries bytes must bump the set root's
+      format or kind, so an old build meets the newer root first and refuses it. Guarded by
+      `s7_a_set_member_is_never_a_newer_builds` (`crates/rdb-value/tests/newer_build.rs`).
+    - Why: before S7 a `put` or `del` over a newer build's entry at or below its root replaced or
+      removed it with no error, an old build destroying valid data during a rollback, which
+      ADR-rdb-0012 §12 forbids.
   - **Not checked: the contents of a touched element.** A write does not open a touched element's
     value.
     - A `put` or `del` over an element with a bad digest, an `EntryNotDocument` kind, or set bytes
       replaces or removes it with no error.
     - That is an accepted repair. It is written through `rdb-value`, with the root rewritten, so it
       keeps decision 11's rule.
-    - The alternative is one `get` per touched element.
+    - The alternative is one `get` per touched element. (Status 2026-10-22, M9 S7: taken for
+      newer builds only, above. A damaged entry still passes, so this repair still works, except
+      an entry damaged in header byte 0 or 3, which reads as a newer build's and stays until M10's
+      `repair_element`.)
     - **An `Add` or `need` that touches a damaged set member is not a repair** (L-R186aq). Touched
       elements are compared by version, never opened, so it succeeds and writes nothing for the
       member. Tester example: with member `"b"` holding the byte `78`, `add "b"` exits 0 and writes
