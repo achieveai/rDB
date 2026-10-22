@@ -54,6 +54,15 @@ fn is_newer(got: &ValueError) -> bool {
 
 const NEWER: ValueError = ValueError::Corrupt(Corrupt::Envelope(EnvelopeError::UnknownCodec(0x02)));
 
+/// What a map write naming `key`, whose entry a newer build wrote, answers (#55): the entry's
+/// error, with its key. A read or a clear meeting the same entry answers [`NEWER`].
+fn newer_entry(key: Value) -> ValueError {
+    ValueError::Corrupt(Corrupt::Entry {
+        key,
+        error: EnvelopeError::UnknownCodec(0x02),
+    })
+}
+
 /// A-R144 / A-1, guard 2: the fast path is exact. For every value of every header byte 0–3,
 /// with a correct digest and with a flipped payload byte, and at the size edges, `newer_build`
 /// answers exactly what `open` would: its error when that is a newer build's, else `None`.
@@ -201,8 +210,9 @@ fn s7_members_names_a_newer_entry_before_its_key() {
 
 /// S7-1 steps 4, 8, 9 and row 1.10, guards 5 and 6 (A-R144 Q2, A-R146): a map write that names a
 /// newer build's entry — `put`, `del`, `need`, as the first op or a later one — is refused as a
-/// newer build's, above or at its root, before `ElementNewerThanRoot`. One naming other keys
-/// compiles and writes nothing for the entry.
+/// newer build's, above or at its root, before `ElementNewerThanRoot`, and names the entry's key,
+/// single-op too (#55, A-R150 F7). One naming other keys compiles and writes nothing for the
+/// entry.
 #[test]
 fn s7_a_map_write_naming_a_newer_entry_is_refused() {
     for above_root in [true, false] {
@@ -225,7 +235,11 @@ fn s7_a_map_write_naming_a_newer_entry_is_refused() {
             vec![ElemOp::Remove(text("b")), ElemOp::Put(text("z"), int(1))],
         ] {
             let got = compile_collection(&s, &root, CollectionKind::Map, version, &ops);
-            assert_eq!(got.unwrap_err(), NEWER, "above_root={above_root} {ops:?}");
+            assert_eq!(
+                got.unwrap_err(),
+                newer_entry(text("b")),
+                "above_root={above_root} {ops:?}"
+            );
         }
         let others = [
             ElemOp::Put(text("a"), int(7)),
@@ -271,7 +285,57 @@ fn s7_a_newer_entry_is_named_before_too_many_writes() {
             ops.push(named);
         }
         let got = compile_collection(&s, &root, CollectionKind::Map, version, &ops);
-        assert_eq!(got.unwrap_err(), NEWER, "first={first}");
+        assert_eq!(got.unwrap_err(), newer_entry(text("b")), "first={first}");
+    }
+}
+
+/// #55 (A-R150 F5): a refused map write shows the key it names safely. A text key is quoted with
+/// its control chars escaped, so a newline or an ESC never reaches a terminal raw; a byte key is
+/// hex; a number is itself; a key over 64 chars is cut there and ends `…`. A read of the same
+/// object keeps its un-keyed text.
+#[test]
+fn s7_a_refused_map_write_shows_its_key_safely() {
+    let long = "k".repeat(100);
+    let cases = [
+        (text("b\nc\u{1b}"), r#""b\nc\u{1b}""#.to_owned()),
+        (Value::Bytes(vec![0x00, 0xff]), "h'00ff'".to_owned()),
+        (int(-3), "-3".to_owned()),
+        (text(&long), format!("\"{}…", "k".repeat(63))),
+    ];
+    for (key, shown) in cases {
+        let mut k = Kernel::new();
+        let root = object(b"m");
+        let create = [ElemOp::Put(key.clone(), int(1))];
+        let made = compile_collection(
+            &k.snapshot(),
+            &root,
+            CollectionKind::Map,
+            Expected::Absent,
+            &create,
+        )
+        .unwrap();
+        k.commit(&made);
+        store(
+            &mut k,
+            element_key(&root, &key).unwrap(),
+            newer_record(),
+            false,
+        );
+        let s = k.snapshot();
+        let version = Expected::Version(root_version(&k, &root));
+        let put = [ElemOp::Put(key.clone(), int(2))];
+        let got = compile_collection(&s, &root, CollectionKind::Map, version, &put).unwrap_err();
+        assert_eq!(
+            got.to_string(),
+            format!("corrupt record: map entry {shown}: unknown codec version 0x02"),
+            "{key:?}"
+        );
+        assert!(is_newer(&got), "{key:?}");
+        assert_eq!(
+            members(&s, &root, None, usize::MAX).unwrap_err(),
+            NEWER,
+            "a read keeps its text: {key:?}"
+        );
     }
 }
 
@@ -436,7 +500,7 @@ fn s7_two_faults_in_one_map_never_lose_the_newer_entry() {
     let del_b = [ElemOp::Remove(text("b"))];
     assert_eq!(
         compile_collection(&s, &root, CollectionKind::Map, version, &del_b).unwrap_err(),
-        NEWER
+        newer_entry(text("b"))
     );
     assert_eq!(clear_object(&s, &root).unwrap_err(), NEWER);
     assert_eq!(

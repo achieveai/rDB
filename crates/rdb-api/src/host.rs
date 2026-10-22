@@ -8344,6 +8344,78 @@ mod tests {
         compile_change(request, object, Change::Clear, None)
     }
 
+    /// #55 (A-R150 F6, F7): a map write that names a newer build's entry is refused at the
+    /// compile, and the detail names the entry's key, after the op index and the newer-build
+    /// prefix: `op 0: written by a newer build: map entry "b": ...`. Two ops or one, the same
+    /// text. Nothing is sent, so `d` keeps its value; a page after `b` reads it.
+    /// Integration (~1 s): Trio, three map writes and a page.
+    #[config_log::retcd_test]
+    fn m9_s7_a_map_write_refused_for_a_newer_entry_names_its_key() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let made = Change::Map(vec![
+            ElemOp::Put(text("a"), int(1)),
+            ElemOp::Put(text("b"), int(2)),
+            ElemOp::Put(text("d"), int(3)),
+        ]);
+        assert_eq!(
+            trio.write(compile_change(1, b"m", made, Some(Expected::Absent))),
+            Ok(2)
+        );
+        // `admin damage m --element "b" --as newer`: the entry's record, not the root's.
+        let root = root_key(TenantId(1), AFFINITY, b"m");
+        let damage = TxnRequest {
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: rdb_value::keys::element_key(&root, &text("b")).expect("a text key"),
+                value: newer_build_document(),
+                expected_version: None,
+            }],
+            ..damage_write(2, b"m", Bytes::new())
+        };
+        assert_eq!(trio.sent(damage), Ok(3));
+
+        let named = "op 0: written by a newer build: map entry \"b\": unknown codec version 0x02";
+        for (request, ops) in [
+            (
+                3,
+                vec![
+                    ElemOp::Put(text("d"), int(4)),
+                    ElemOp::Put(text("b"), int(9)),
+                ],
+            ),
+            (4, vec![ElemOp::Put(text("b"), int(9))]),
+        ] {
+            match trio.ask(compile_change(request, b"m", Change::Map(ops), None)) {
+                Answer::Error {
+                    error,
+                    request: sent,
+                } => assert_eq!(
+                    (error.kind, error.detail.as_str(), sent.is_some()),
+                    (ErrorKind::IncompatibleVersion, named, false),
+                    "request {request}"
+                ),
+                other => panic!("not refused: {other:?}"),
+            }
+        }
+        let after_b = Look::Members {
+            after: Some(text("b")),
+            limit: 10,
+        };
+        match trio.look(5, b"m", after_b) {
+            Ok(Seen::Members(page)) => {
+                let entries: Vec<_> = page
+                    .members
+                    .iter()
+                    .map(|member| (member.key.clone(), member.value.clone()))
+                    .collect();
+                assert_eq!(entries, [(text("d"), Some(int(3)))], "d is unchanged");
+            }
+            other => panic!("members of m after b: {other:?}"),
+        }
+    }
+
     /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
     /// given without sending are reads, so a node gives them only while a read would be given.
     /// Admitting: a healthy object and one with only upload chunks are CONDITION_FAILED, a
