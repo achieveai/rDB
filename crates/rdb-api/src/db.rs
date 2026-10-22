@@ -3922,10 +3922,13 @@ mod tests {
     /// M9 S5-4 (G2). A text or byte map key or set member over 1,024 bytes is refused in any
     /// element op, at any position, and as a `Members` read's `after`; text counts UTF-8 bytes,
     /// so 513 `é` is 1,026. The checks run in order: object id, ops, key for a write; object
-    /// id, page, `after` for a read. At the limit the call is sent.
+    /// id, page, `after` for a read. Each refusal's `limit_refused` line names its limit. At the
+    /// limit the call is sent.
     /// Unit (~100 ms): no node thread.
-    #[test]
+    #[config_log::retcd_test]
     fn m9_s5_a_key_over_1024_bytes_is_refused_in_a_write_or_a_members_read_before_it_is_sent() {
+        const METHOD: &str =
+            "m9_s5_a_key_over_1024_bytes_is_refused_in_a_write_or_a_members_read_before_it_is_sent";
         let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
         db.timeouts.read = Duration::from_millis(20);
         let text = |s: String| Value::Text(s);
@@ -3971,6 +3974,38 @@ mod tests {
             .read(b"m", after(&long, MAX_PAGE + 1))
             .expect_err("over the limit");
         assert!(refused.detail.starts_with("page limit 1001"), "{refused:?}");
+        // An op count over the limit answers before an over-long key in those ops.
+        let many = Change::Map(vec![ElemOp::Remove(long.clone()); MAX_OPS + 1]);
+        let refused = db.write(b"m", many, None).expect_err("over the limit");
+        assert!(
+            refused.error.detail.starts_with("op 0: 256 ops"),
+            "{refused:?}"
+        );
+        let puts = vec![txn_put(b"t", b"1", None); MAX_OPS + 1];
+        let refused = db.txn(&puts, MAX_TXN_DEADLINE).expect_err("over the limit");
+        assert!(refused.error.detail.starts_with("256 puts"), "{refused:?}");
+
+        // Each refusal logs one line naming the limit it broke, in request order.
+        let limits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "limit_refused")
+            .map(|line| (line["request"].clone(), line["limit"].clone()))
+            .collect();
+        let expected: Vec<_> = [
+            "key",
+            "key",
+            "key",
+            "key",
+            "object_id",
+            "page",
+            "ops",
+            "puts",
+        ]
+        .into_iter()
+        .zip(1_u64..)
+        .map(|(limit, request)| (serde_json::json!(request), serde_json::json!(limit)))
+        .collect();
+        assert_eq!(limits, expected);
 
         let at = text("k".repeat(MAX_KEY));
         let narrow = text("é".repeat(MAX_KEY / 2));
