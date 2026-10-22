@@ -1325,6 +1325,59 @@ impl Db {
         }
     }
 
+    /// Day-1 spike (M10 W1): start the three nodes again on the `nodes/` an earlier open left,
+    /// at `boot`, with no bootstrap. Crate tests only; the real reopen is `Db::open`.
+    #[cfg(test)]
+    pub(crate) fn spike_reopen(
+        config: &DbConfig,
+        store: Arc<dyn ConfigStore>,
+        rt: Handle,
+        budgets: Budgets,
+        boot: BootId,
+    ) -> Result<Self, OpenError> {
+        let nodes_dir = config.dir.join("nodes");
+        let limits = limits(config.dedup_cap)?;
+        let clock = HostClock::start();
+        let links = Links::new();
+        let control = ControlAdapter::new(store, rt, Arc::clone(&links));
+        let db = Self {
+            nodes: Mutex::new(Vec::with_capacity(3)),
+            respawn: Some(Respawn {
+                nodes_dir: nodes_dir.clone(),
+                budgets,
+                limits,
+            }),
+            links,
+            control,
+            clock,
+            timeouts: config.timeouts,
+            next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+        };
+        for n in 1..=3u32 {
+            let handle = host::spawn_with(
+                NodeId(n),
+                nodes_dir.join(n.to_string()),
+                Arc::clone(&db.links),
+                Arc::clone(&db.control),
+                db.clock,
+                budgets,
+                limits,
+                boot,
+            )
+            .map_err(OpenError::Node)?;
+            lock(&db.nodes).push(handle);
+        }
+        Ok(db)
+    }
+
+    /// Send `msg` to node 1. Crate tests only (the spike's heal).
+    #[cfg(test)]
+    pub(crate) fn send_owner(&self, msg: Msg) -> Result<(), NodeStopped> {
+        self.send_to(OWNER, msg)
+    }
+
     /// Stop `node`'s process and start it again on the same data at its boot plus one, as a
     /// process supervisor would (M9 S2b; a real supervisor takes over in M10). Returns the new
     /// boot.
@@ -4199,5 +4252,232 @@ mod tests {
         let nothing = db.write(b"missing", Change::Clear, None);
         assert!(matches!(nothing, Ok(None)), "{nothing:?}");
         db.shutdown();
+    }
+
+    /// Which revision the spike's fence names as `control_revision`.
+    #[derive(Debug, Clone, Copy)]
+    enum SpikeRevision {
+        /// R3a exactly: the revision the exact-revision delete of `grants/1` landed at.
+        GrantDelete,
+        /// `partitions/1`'s `mod_revision` as read before the heal.
+        PartitionRecord,
+    }
+
+    /// M10 W1 day-1 spike: bootstrap, write, stop, start the same `nodes/` again at boot 2,
+    /// clear `grants/1` by its exact revision once it is proven expired, hand node 1 a second
+    /// recovery's `Plan` and an `ExpiryProven` fence, and read the write back from generation 2.
+    /// Returns node 1's F1 phase when it stops moving, and the read when it admits.
+    fn spike(which: SpikeRevision) -> (Option<String>, Option<GetOk>) {
+        use config_core::GetRequest;
+        use rdb_core::authority::grant::GrantRecord;
+        use rdb_core::authority::partition::PartitionRecord;
+        use rdb_core::contracts::authority::{
+            AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
+        };
+        use rdb_core::contracts::control::ControlKey;
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::event::{EventKind, KernelEvent};
+        use rdb_core::contracts::ids::{
+            AuthorityGeneration, ConfigVersion, CorrelationId, ReplicaRole, Revision,
+        };
+        use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+        use rdb_core::contracts::recovery::{
+            Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan,
+        };
+        use rdb_core::contracts::time::Tick;
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = fast();
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                budgets,
+            ))
+            .expect("first open");
+        admits(&db, "first open");
+        let put = db.put(b"a", b"hello", None).expect("put a=hello");
+        tracing::info!(seq = put.seq.0, generation = put.generation.0, "spike_put");
+        db.shutdown();
+        drop(db);
+
+        let boot = BootId(2);
+        let db = Db::spike_reopen(
+            &config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            budgets,
+            boot,
+        )
+        .expect("reopen");
+        let read = |key: ControlKey| {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from(key.encode()),
+            }))
+            .expect("get")
+            .record
+        };
+        let found = read(ControlKey::Partition(PARTITION)).expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("decodes");
+        let partition_revision = Revision(found.mod_revision);
+        let grant = read(ControlKey::Grant(OWNER)).expect("grants/1");
+        let held = GrantRecord::decode(&grant.value).expect("decodes");
+        tracing::info!(
+            ?record,
+            partition_revision = partition_revision.0,
+            ?held,
+            grant_revision = grant.mod_revision,
+            "spike_read"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deleted = loop {
+            match rt.block_on(admin::clear_grant(&db, &*store, OWNER)) {
+                Ok(admin::Clearance::Cleared(revision)) => break revision,
+                Ok(admin::Clearance::Refused { .. }) => {
+                    assert!(std::time::Instant::now() < deadline, "never cleared");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                other => panic!("clear grants/1: {other:?}"),
+            }
+        };
+        let now = db.now();
+        let sample = HostClock::control_time(now, &budgets);
+        let control_revision = match which {
+            SpikeRevision::GrantDelete => deleted,
+            SpikeRevision::PartitionRecord => partition_revision,
+        };
+        tracing::info!(
+            deleted = deleted.0,
+            control_revision = control_revision.0,
+            ?which,
+            "spike_cleared"
+        );
+
+        let lineage = Lineage {
+            partition: PARTITION,
+            generation: record.generation,
+            owner_epoch: record.owner_epoch,
+        };
+        let anchor = LineageAnchor {
+            lineage,
+            base_seq: Seq::ZERO,
+            base_digest: Digest::ROOT,
+        };
+        let version = ConfigVersion(record.config_version.0 + 1);
+        let members: Vec<Member> = (1..=3u8)
+            .map(|n| Member {
+                copy: CopyId(n - 1),
+                node: NodeId(u32::from(n)),
+                boot,
+                role: if n == 1 {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::RegularSecondary
+                },
+            })
+            .collect();
+        let config = PartitionConfig::new(PARTITION, version, members);
+        let plan = RecoveryPlan {
+            anchor,
+            candidates: config
+                .members
+                .iter()
+                .map(|member| Candidate {
+                    copy: member.copy,
+                    primary_eligible: true,
+                    healthy: true,
+                    within_capacity: true,
+                    has_valid_grant: true,
+                })
+                .collect(),
+            rebuild_required: config.members.iter().map(|member| member.copy).collect(),
+            authority_view: AuthorityView {
+                lineage,
+                grant_id: held.grant,
+                boot_id: boot,
+                authority_generation: held.authority_generation,
+                config_version: version,
+                authority_seq: 1,
+                valid_through_tick: Tick(u64::MAX),
+                past_horizon: DenyReason::NoGrant,
+            },
+            retention_millis: 1_000,
+            config,
+        };
+        let fence = FencingProof {
+            partition: PARTITION,
+            prior_generation: record.generation,
+            prior_owner_epoch: record.owner_epoch,
+            prior_grant_id: held.grant,
+            prior_boot_id: held.boot,
+            revocation: Revocation::ExpiryProven {
+                frozen_expiry_utc_ms: held.expiry_utc_ms,
+                authority_utc_ms: i64::try_from(sample.estimate.0).expect("utc ms"),
+                authority_tick: now,
+                epsilon_ms: u32::try_from(budgets.clock_error_millis).expect("eps"),
+                delta_ms: u32::try_from(budgets.dispatch_margin_millis).expect("delta"),
+            },
+            control_revision,
+            decision_tick: now,
+        };
+        for event in [
+            RecoveryEvent::Plan(Box::new(plan)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ] {
+            db.send_owner(Msg::Inject {
+                partition: PARTITION,
+                correlation: CorrelationId(2),
+                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+            })
+            .expect("node 1 runs");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut phase = None;
+        loop {
+            let owner = db.node_status().into_iter().find(|s| s.node == OWNER);
+            if let Some(owner) = &owner {
+                if owner.recovery != phase {
+                    tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
+                    phase.clone_from(&owner.recovery);
+                }
+                if owner.admits == Some(true) {
+                    let got = db.get(b"a").expect("get a");
+                    tracing::info!(?got, "spike_read_back");
+                    return (phase, Some(got));
+                }
+                let terminal = phase
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with("Blocked") || p == "Quarantined");
+                if terminal {
+                    return (phase, None);
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return (phase, None);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The spike with R3a's proof exactly (`control_revision` = the grant delete's revision).
+    /// Integration (~5 s): a grant must be proven expired on wall-clock time.
+    #[config_log::retcd_test]
+    fn m10_spike_r3a_exact() {
+        let (phase, read) = spike(SpikeRevision::GrantDelete);
+        tracing::info!(?phase, ?read, "spike_result");
+        eprintln!("SPIKE r3a_exact phase={phase:?} read={read:?}");
+    }
+
+    /// The spike with `control_revision` = `partitions/1`'s revision, for comparison.
+    /// Integration (~5 s).
+    #[config_log::retcd_test]
+    fn m10_spike_partition_revision() {
+        let (phase, read) = spike(SpikeRevision::PartitionRecord);
+        tracing::info!(?phase, ?read, "spike_result");
+        eprintln!("SPIKE partition_revision phase={phase:?} read={read:?}");
     }
 }

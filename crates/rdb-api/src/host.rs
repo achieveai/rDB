@@ -2969,15 +2969,49 @@ impl Host {
         }
     }
 
-    /// What this copy reports. M9 serves only an empty copy: it reports the plan's anchor at
-    /// the root. A copy holding anything answers `InventoryFailed`: reading a real survivor's
-    /// ladder is M10's (`host_unsupported`), and an invented inventory is never an answer.
+    /// What this copy reports for a plan anchored at `anchor`.
+    ///
+    /// * An anchor at generation 0 (the first open's bootstrap): an empty copy reports the
+    ///   anchor at the root, and a copy holding anything answers `InventoryFailed`, since an
+    ///   invented empty inventory would drop what it holds.
+    /// * An anchor at a later generation (a reopen, M10): the copy reports from its own engine
+    ///   ([`Self::survivor`]): the anchor, its applied head and every stored record digest from
+    ///   the base through the head. Anything it cannot prove from what it stores answers
+    ///   `InventoryFailed`, logged as `inventory_failed{reason}`, never an invented ladder.
     fn inventory(
         &self,
         partition: PartitionId,
         copy: CopyId,
         anchor: LineageAnchor,
     ) -> RecoveryEvent {
+        if anchor.lineage.generation > Generation(0) {
+            return match self.survivor(partition, copy, anchor) {
+                Ok(inventory) => {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        head = inventory.head.0 .0,
+                        "inventory_reported"
+                    );
+                    RecoveryEvent::InventoryReported(Box::new(inventory))
+                }
+                Err(reason) => {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        reason,
+                        "inventory_failed"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
+            };
+        }
         let holds =
             self.engine.lineages().into_iter().any(|(p, g)| {
                 p == partition && (g.0 > 0 || self.engine.buffered_applied(p, g).0 > 0)
@@ -3006,6 +3040,65 @@ impl Host {
             ladder: vec![(Seq::ZERO, Digest::ROOT)],
             quarantined: None,
         }))
+    }
+
+    /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
+    /// `Dispatcher::current_inventory` reports, read from this engine alone.
+    ///
+    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at
+    /// `anchor.base_seq` (its stored link), and the digest it stores at the base is
+    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). A copy holding a newer generation of the
+    /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
+    /// plan is made, never here.
+    fn survivor(
+        &self,
+        partition: PartitionId,
+        copy: CopyId,
+        anchor: LineageAnchor,
+    ) -> Result<SurvivorInventory, &'static str> {
+        let generation = anchor.lineage.generation;
+        let lineages = self.engine.lineages();
+        if lineages
+            .iter()
+            .any(|(p, g)| *p == partition && *g > generation)
+        {
+            return Err("copy_ahead_of_anchor");
+        }
+        if !lineages.contains(&(partition, generation)) {
+            return Err("anchor_generation_absent");
+        }
+        let link = self
+            .engine
+            .link(partition, generation)
+            .ok_or("anchor_generation_unlinked")?;
+        if link.base != anchor.base_seq {
+            return Err("base_differs");
+        }
+        let digest_at = |seq: Seq| -> Result<Digest, &'static str> {
+            if seq == Seq::ZERO {
+                return Ok(Digest::ROOT);
+            }
+            self.checked(partition, generation, seq)
+                .map(|(_, digest)| digest)
+        };
+        if digest_at(anchor.base_seq)? != anchor.base_digest {
+            return Err("base_digest_differs");
+        }
+        let head = Seq(self.engine.buffered_applied(partition, generation).0);
+        if head < anchor.base_seq {
+            return Err("head_below_base");
+        }
+        let ladder = (anchor.base_seq.0..=head.0)
+            .map(|seq| digest_at(Seq(seq)).map(|digest| (Seq(seq), digest)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let head_digest = ladder.last().map_or(anchor.base_digest, |(_, d)| *d);
+        Ok(SurvivorInventory {
+            copy,
+            anchor_seen: anchor,
+            head: (head, head_digest),
+            ladder,
+            quarantined: None,
+        })
     }
 
     /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`). `None` is a
@@ -5651,10 +5744,29 @@ mod tests {
         );
         trio.bootstrap();
         trio.ready();
+        let bootstrap = LineageAnchor {
+            lineage: Lineage {
+                generation: Generation(0),
+                owner_epoch: OwnerEpoch(0),
+                ..root.lineage
+            },
+            ..root
+        };
         assert_eq!(
-            report(&trio, root),
+            report(&trio, bootstrap),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "a copy holding generation 1"
+            "a copy holding generation 1, asked for the bootstrap's empty anchor"
+        );
+        // M10 (reopen): a copy holding the anchor's generation reports from its engine, and
+        // one whose stored base is not the anchor's answers nothing.
+        assert!(
+            matches!(report(&trio, root), RecoveryEvent::InventoryReported(_)),
+            "a copy holding generation 1 at its anchor"
+        );
+        assert_eq!(
+            report(&trio, past_root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "a copy whose generation 1 starts elsewhere"
         );
     }
 
