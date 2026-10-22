@@ -226,36 +226,69 @@ const KEY_TEXT_CAP: usize = 64;
 /// A map key as an error names it (#55, ruling A-R150 F5), safe for a terminal or a log line:
 /// text quoted with every control char escaped (`escape_debug`), bytes as `h'<hex>'`, numbers,
 /// `true`/`false`/`null` canonical, a decimal as `4([exponent, mantissa])` and a timestamp as
-/// `1001({1: secs, -9: nanos})`, as CBOR's diagnostic notation writes them. Anything over
-/// [`KEY_TEXT_CAP`] chars is cut there and ends `…`.
+/// `1001({1: secs, -9: nanos})`, as CBOR's diagnostic notation writes them. A key whose text,
+/// without its quotes or `h'`, runs over [`KEY_TEXT_CAP`] chars is cut to at most that many and
+/// ends `…`. The cut falls between escapes, never inside one (A-R152).
 fn key_text(key: &Value) -> String {
     use std::fmt::Write as _;
-    let mut text = match key {
-        Value::Null => "null".to_owned(),
-        Value::Bool(b) => b.to_string(),
-        Value::Integer(i) => i.get().to_string(),
-        Value::Float(f) => format!("{:?}", f.get()),
-        Value::Decimal(d) => format!("4([{}, {}])", d.exponent(), d.mantissa().get()),
-        Value::Timestamp(t) if t.nanos() == 0 => format!("1001({{1: {}}})", t.secs()),
-        Value::Timestamp(t) => format!("1001({{1: {}, -9: {}}})", t.secs(), t.nanos()),
-        Value::Text(s) => format!("\"{}\"", s.escape_debug()),
+    let (open, body, close) = match key {
+        Value::Text(s) => ("\"", s.escape_debug().to_string(), "\""),
         Value::Bytes(b) => {
-            let mut hex = String::with_capacity(b.len() * 2 + 3);
-            hex.push_str("h'");
+            let mut hex = String::with_capacity(b.len() * 2);
             for byte in b {
                 write!(hex, "{byte:02x}").expect("writing to a String does not fail");
             }
-            hex.push('\'');
-            hex
+            ("h'", hex, "'")
         }
+        Value::Null => ("", "null".to_owned(), ""),
+        Value::Bool(b) => ("", b.to_string(), ""),
+        Value::Integer(i) => ("", i.get().to_string(), ""),
+        Value::Float(f) => ("", format!("{:?}", f.get()), ""),
+        Value::Decimal(d) => (
+            "",
+            format!("4([{}, {}])", d.exponent(), d.mantissa().get()),
+            "",
+        ),
+        Value::Timestamp(t) if t.nanos() == 0 => ("", format!("1001({{1: {}}})", t.secs()), ""),
+        Value::Timestamp(t) => (
+            "",
+            format!("1001({{1: {}, -9: {}}})", t.secs(), t.nanos()),
+            "",
+        ),
         // Not a key type (`UnsupportedKeyType`); never named by a write that got this far.
-        Value::Array(_) => "an array".to_owned(),
-        Value::Map(_) => "a map".to_owned(),
+        Value::Array(_) => ("", "an array".to_owned(), ""),
+        Value::Map(_) => ("", "a map".to_owned(), ""),
     };
-    if let Some((cut, _)) = text.char_indices().nth(KEY_TEXT_CAP) {
-        text.truncate(cut);
-        text.push('…');
+    if body.chars().count() <= KEY_TEXT_CAP {
+        return format!("{open}{body}{close}");
     }
+    let mut text = open.to_owned();
+    let mut kept = 0;
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        // One unit: a plain char, or a whole escape `escape_debug` wrote (`\n`, `\\`, `\u{1b}`).
+        let mut unit = String::from(c);
+        if c == '\\' {
+            let next = chars
+                .next()
+                .expect("escape_debug never ends on a lone backslash");
+            unit.push(next);
+            if next == 'u' {
+                for d in chars.by_ref() {
+                    unit.push(d);
+                    if d == '}' {
+                        break;
+                    }
+                }
+            }
+        }
+        kept += unit.chars().count();
+        if kept > KEY_TEXT_CAP {
+            break;
+        }
+        text.push_str(&unit);
+    }
+    text.push('…');
     text
 }
 

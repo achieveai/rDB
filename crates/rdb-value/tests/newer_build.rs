@@ -291,16 +291,31 @@ fn s7_a_newer_entry_is_named_before_too_many_writes() {
 
 /// #55 (A-R150 F5): a refused map write shows the key it names safely. A text key is quoted with
 /// its control chars escaped, so a newline or an ESC never reaches a terminal raw; a byte key is
-/// hex; a number is itself; a key over 64 chars is cut there and ends `…`. A read of the same
-/// object keeps its un-keyed text.
+/// hex; a number is itself. A key whose escaped text runs over 64 chars is cut there and ends
+/// `…`; the quotes and `h'` do not count, and an escape is kept whole or dropped whole, never split
+/// (A-R152). A read of the same object keeps its un-keyed text.
 #[test]
 fn s7_a_refused_map_write_shows_its_key_safely() {
     let long = "k".repeat(100);
+    let exactly = "m".repeat(64);
+    let a63 = format!("{}\n", "a".repeat(63));
+    let a62 = format!("{}\nX", "a".repeat(62));
     let cases = [
         (text("b\nc\u{1b}"), r#""b\nc\u{1b}""#.to_owned()),
         (Value::Bytes(vec![0x00, 0xff]), "h'00ff'".to_owned()),
         (int(-3), "-3".to_owned()),
-        (text(&long), format!("\"{}…", "k".repeat(63))),
+        (text(&long), format!("\"{}…", "k".repeat(64))),
+        // A-R152 (PC-2): exactly 64 chars is shown whole, closing quote and all.
+        (text(&exactly), format!("\"{exactly}\"")),
+        // A-R152 (PC-1): the `\n` would be chars 64-65, so it goes whole; no `\…`.
+        (text(&a63), format!("\"{}…", "a".repeat(63))),
+        // A-R152 (PC-1): the `\n` fits exactly at 63-64 and is kept whole.
+        (text(&a62), format!("\"{}\\n…", "a".repeat(62))),
+        // 40 bytes is 80 hex chars: cut at 64.
+        (
+            Value::Bytes(vec![0xab; 40]),
+            format!("h'{}…", "ab".repeat(32)),
+        ),
     ];
     for (key, shown) in cases {
         let mut k = Kernel::new();
