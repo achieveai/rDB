@@ -25,8 +25,8 @@ pub mod keys;
 mod lineage;
 mod snapshot;
 
-pub use engine::{dump, InjectedFault, OpenError, RawRecord, RocksEngine};
+pub use engine::{dump, BindError, InjectedFault, OpenError, RawRecord, RocksEngine};
 pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
-pub use keys::Link;
+pub use keys::{Link, INSTANCE_LEN};
 pub use lineage::{verify_lineage, LineageFault, VerifiedLineage};
 pub use snapshot::RocksSnapshot;
