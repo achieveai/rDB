@@ -107,7 +107,8 @@ fn g4_a_newer_build_map_entry_refuses_the_clear_beside_a_bad_payload_root() {
 }
 
 /// Guard 4 in a list: a newer build's block base written after the root, where `NewerThanRoot`
-/// is checked first.
+/// was checked first. Since M9 S7 the proof's own read names the newer base before its version
+/// (A-R144), so the refusal names the block; before, the scan named the bare envelope.
 #[test]
 fn g4_a_newer_build_list_block_refuses_the_clear_of_a_sound_list() {
     let mut k = Kernel::new();
@@ -125,7 +126,17 @@ fn g4_a_newer_build_list_block_refuses_the_clear_of_a_sound_list() {
         .expect("the list has a block base")
         .clone();
     overwrite(&mut k, block, newer_build_record());
-    assert_newer_build_refused(&k, &list, "sound list root");
+    let got = clear_object(&k.snapshot(), &list);
+    assert!(
+        matches!(
+            &got,
+            Err(ValueError::Corrupt(Corrupt::Block {
+                fault: BlockFault::Envelope(EnvelopeError::UnknownCodec(0x02)),
+                ..
+            }))
+        ),
+        "sound list root: {got:?}"
+    );
 }
 
 /// A map of two at `id`, whose records sort right after every record of `of` (tester-s6 M1):
