@@ -3507,6 +3507,7 @@ name = "rdb-api"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "config-client",
  "config-core",
  "config-log",
  "config-log-macros",
