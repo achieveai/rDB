@@ -5719,6 +5719,8 @@ mod tests {
         }
         assert_eq!(not_advancing!(METHOD).len(), 0, "level with the head");
 
+        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
+        trio.admits_for(1_000);
         match trio.ask(put(1, b"a", b"1", None)) {
             Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
             other => panic!("put a=1: {other:?}"),
@@ -6769,6 +6771,8 @@ mod tests {
             .count();
         assert_eq!(dequeued, 1, "the queued resend was released by the expiry");
 
+        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
+        trio.admits_for(1_000);
         match trio.ask(ClientCall::Resend { request: compiled }) {
             Answer::Txn { result, .. } => assert_eq!(result, status, "the replayed result"),
             other => panic!("request 1 resent after expiry: {other:?}"),
@@ -7122,6 +7126,8 @@ mod tests {
         trio.bootstrap();
         trio.ready();
         assert!(logged!(METHOD, "authority_check_denied").is_empty());
+        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
+        trio.admits_for(1_000);
         trio.mem
             .failing_with(config_core::ConfigError::Unavailable {
                 reason: "the control store is down".to_owned(),
