@@ -39,7 +39,8 @@ use rdb_core::contracts::trace::Version;
 use crate::keys::{
     self, decode_copying, decode_key, decode_mark, encode_key, frame, ns_byte, ns_from_byte,
     private_key, tombstone, unframe, Frame, Link, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
-    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY,
+    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, PARENT_KEY,
+    PRIVATE_NS, SEALED_KEY,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -115,6 +116,29 @@ pub enum OpenError {
     },
 }
 
+/// Why [`RocksEngine::bind_instance`] refused. Nothing was written in either case.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BindError {
+    /// The copy is already bound to another instance id. A copy is never rebound.
+    #[error(
+        "copy is bound to instance {}, refusing to bind {}",
+        hex(found),
+        hex(wanted)
+    )]
+    OtherInstance {
+        /// The id the copy holds.
+        found: [u8; INSTANCE_LEN],
+        /// The id the caller asked to bind.
+        wanted: [u8; INSTANCE_LEN],
+    },
+    /// RocksDB refused the synced write; the copy stays unbound.
+    #[error("instance marker write failed: {detail}")]
+    WriteFailed {
+        /// RocksDB's message.
+        detail: String,
+    },
+}
+
 /// One lineage's engine-private records as the engine holds them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Marks {
@@ -137,6 +161,8 @@ pub struct RocksEngine {
     pub(crate) db: DB,
     path: PathBuf,
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
+    /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
+    instance: Option<[u8; INSTANCE_LEN]>,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
 }
@@ -182,6 +208,7 @@ impl std::fmt::Debug for RocksEngine {
         f.debug_struct("RocksEngine")
             .field("path", &self.path)
             .field("lineages", &self.lineages)
+            .field("instance", &self.instance.map(|id| hex(&id)))
             .finish_non_exhaustive()
     }
 }
@@ -256,6 +283,7 @@ impl RocksEngine {
         let db = DB::open_cf_descriptors(&db_options(!existed), &path, descriptors())
             .map_err(|e| backend(&path, &e))?;
         let created = ensure_format(&db, &path, existed)?;
+        let instance = read_instance(&db, &path)?;
         let lineages = restore_lineages(&db, &path)?;
         for (&(partition, generation), marks) in &lineages {
             tracing::info!(
@@ -277,12 +305,14 @@ impl RocksEngine {
             format_version = FORMAT_VERSION,
             created,
             lineages = lineages.len(),
+            instance_hex = instance.map(|id| hex(&id)),
             "storage_open"
         );
         Ok(Self {
             db,
             path,
             lineages,
+            instance,
             injected: None,
         })
     }
@@ -305,17 +335,20 @@ impl RocksEngine {
             Err(OpenError::NoDatabase { path: path.clone() })
         };
         let (db, lineages) = opened.map_err(refused)?;
+        let instance = read_instance(&db, &path).map_err(refused)?;
         tracing::info!(
             target: LOG_TARGET,
             path = %path.display(),
             format_version = FORMAT_VERSION,
             lineages = lineages.len(),
+            instance_hex = instance.map(|id| hex(&id)),
             "storage_open_read_only"
         );
         Ok(Self {
             db,
             path,
             lineages,
+            instance,
             injected: None,
         })
     }
@@ -330,6 +363,53 @@ impl RocksEngine {
     #[must_use]
     pub fn lineages(&self) -> Vec<(PartitionId, Generation)> {
         self.lineages.keys().copied().collect()
+    }
+
+    /// The instance id this copy is bound to (M10, arch R3b), or `None` when it is unbound.
+    /// Read at open; a marker of the wrong length was refused there.
+    #[must_use]
+    pub const fn instance(&self) -> Option<[u8; INSTANCE_LEN]> {
+        self.instance
+    }
+
+    /// Bind this copy to instance `id`, with a synced write, before this returns `Ok`.
+    ///
+    /// Binding the id the copy already holds is a no-op that writes nothing, so an open that
+    /// died part way through binding its copies can bind them all again (arch R3b fresh step 2).
+    /// Never rebinds: a copy bound to another id is refused, and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// [`BindError::OtherInstance`] when the copy is bound to another id;
+    /// [`BindError::WriteFailed`] when RocksDB refuses the write (the copy stays unbound).
+    pub fn bind_instance(&mut self, id: [u8; INSTANCE_LEN]) -> Result<(), BindError> {
+        match self.instance {
+            Some(found) if found == id => return Ok(()),
+            Some(found) => {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    found_hex = hex(&found),
+                    wanted_hex = hex(&id),
+                    "instance_bind_refused"
+                );
+                return Err(BindError::OtherInstance { found, wanted: id });
+            }
+            None => {}
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        if let Err(e) = self
+            .db
+            .put_cf_opt(self.cf(CF_METADATA), INSTANCE_KEY, id, &opts)
+        {
+            tracing::error!(target: LOG_TARGET, error = %e, "instance_bind_failed");
+            return Err(BindError::WriteFailed {
+                detail: e.to_string(),
+            });
+        }
+        self.instance = Some(id);
+        tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
+        Ok(())
     }
 
     /// Apply a batch atomically and advance `buffered_applied`. **Buffered, not durable.**
@@ -737,6 +817,9 @@ impl std::fmt::Display for RawRecord {
                     );
                 return write!(f, "format_marker={format}");
             }
+            if self.key.as_ref() == INSTANCE_KEY {
+                return write!(f, "instance_marker={}", hex(&self.value));
+            }
             return write!(
                 f,
                 "unknown key={} value={}",
@@ -878,9 +961,32 @@ fn read_only(path: &Path) -> Result<(DB, Lineages), OpenError> {
     let db = DB::open_cf_for_read_only(&db_options(false), path, COLUMN_FAMILIES, false)
         .map_err(|e| backend(path, &e))?;
     check_format(&db, path, true)?;
+    read_instance(&db, path)?;
     let lineages = restore_lineages(&db, path)?;
     check_marks(&lineages)?;
     Ok((db, lineages))
+}
+
+/// The instance marker, `None` when absent. A marker that is not [`INSTANCE_LEN`] bytes is a
+/// corrupt record: refused at open, never read as unbound.
+fn read_instance(db: &DB, path: &Path) -> Result<Option<[u8; INSTANCE_LEN]>, OpenError> {
+    let meta = handle(db, path, CF_METADATA)?;
+    let Some(raw) = db
+        .get_cf(meta, INSTANCE_KEY)
+        .map_err(|e| backend(path, &e))?
+    else {
+        return Ok(None);
+    };
+    <[u8; INSTANCE_LEN]>::try_from(raw.as_slice())
+        .map(Some)
+        .map_err(|_| OpenError::CorruptRecord {
+            path: path.to_path_buf(),
+            key_hex: hex(INSTANCE_KEY),
+            problem: format!(
+                "the instance marker is {} bytes, not {INSTANCE_LEN}",
+                raw.len()
+            ),
+        })
 }
 
 /// Refuse a lineage with `durable > applied`.

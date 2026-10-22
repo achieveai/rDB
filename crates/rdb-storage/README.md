@@ -13,6 +13,9 @@ one (linked), or gets a copy of it as of `base` (copied). Format 1
 - Private records (ns `0xFF`, `metadata`): `applied`, `durable` (8 B each); `parent` (17 B:
   parent, base, flags bit0 `copied`); `sealed` on a parent (8 B: the child); `copying` on a
   child mid full copy (16 B: parent, base).
+- Instance marker (M10): `metadata` key `instance`, 16 B, the instance id this copy is bound to
+  (`bind_instance`, synced, never rebound). Absent means unbound. Short like `format`, so an
+  older format-1 build skips it: no format bump. `dump` shows `instance_marker=<hex>`.
 - A stored `Meta` record is refused at open; a `Meta` write is refused at commit.
 
 ## Read through the chain
