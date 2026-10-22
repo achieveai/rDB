@@ -13,15 +13,24 @@
 # A drift table is only as fresh as its last re-read, and "remember to re-read it" is a
 # convention. This makes it a red build instead.
 #
-# The rule: a plan's declared basis must be the newest commit that touched the contract surface.
-# If the surface has moved since, the plan was written against something that no longer exists
-# and its author has to look again.
+# The rule: a plan's declared basis must match the contract surface as it is now. Name the
+# contracts tree (below); a legacy commit basis is accepted when its contracts surface matches the
+# current one. If the surface has moved since, the plan was written against something that no
+# longer exists and its author has to look again.
 #
 # Declare the basis in the plan with a marker on its own line, anywhere in the file:
 #
-#     <!-- drift-basis: 6893442 -->
+#     <!-- drift-basis: 90cfbdd5e33d5855eb258a88ab159bad1324113d -->
 #
 # It is an HTML comment, so it renders as nothing. Short or full hashes both work.
+#
+# Name the contracts folder's **tree** hash, not a commit: `git rev-parse
+# HEAD:crates/rdb-core/src/contracts`. A tree hash is the folder's content, so a squash merge
+# keeps it. A branch commit does not survive one: PR #48 set all four markers to its branch
+# commit 7d8fa9c, the squash merge made 0e64d47 instead, and main failed this stage from then on
+# (2026-10-19, ruling A-R118). A tree basis passes when it equals the current contracts tree and
+# fails, listing the changed files, when it does not. A legacy commit basis passes when its
+# contracts surface matches the current one.
 #
 # Usage:
 #   scripts/drift-check.sh            check every plan
@@ -53,7 +62,9 @@ if [ -z "$current" ]; then
   exit 1
 fi
 
-echo "== drift (contract surface at ${current:0:7})"
+current_tree="$(git rev-parse "HEAD:$surface")"
+
+echo "== drift (contract surface at ${current:0:7}, tree ${current_tree:0:7})"
 
 bad=0
 
@@ -77,8 +88,9 @@ for plan in "${plans[@]}"; do
 
   if [ "$count" -eq 0 ]; then
     echo "drift: $name: no basis marker." >&2
-    echo "       Add one line naming the commit the plan's section 15 was written against:" >&2
-    echo "       <!-- drift-basis: ${current:0:7} -->" >&2
+    echo "       Add one line naming the contracts tree the plan's section 15 was written against" >&2
+    echo "       (after the re-read, never to clear the build):" >&2
+    echo "       <!-- drift-basis: $current_tree -->" >&2
     if grep -q 'drift-basis:' "$plan"; then
       echo "       ('drift-basis:' does appear in this file, but not as a line of its own." >&2
       echo "        A marker is the whole line; anything else is prose about a marker.)" >&2
@@ -95,8 +107,29 @@ for plan in "${plans[@]}"; do
 
   basis="$(grep "$marker_re" "$plan" | grep -o '[0-9a-fA-F]\{7,40\}' | head -1)"
 
-  if ! git cat-file -e "$basis^{commit}" 2>/dev/null; then
-    echo "drift: $name: basis $basis is not a commit in this repository" >&2
+  basis_type="$(git cat-file -t "$basis" 2>/dev/null || true)"
+
+  # A tree basis names the contracts folder's content, which a squash merge keeps (A-R118).
+  if [ "$basis_type" = "tree" ]; then
+    basis_tree="$(git rev-parse "$basis")"
+    if [ "$basis_tree" = "$current_tree" ]; then
+      echo "drift: $name OK (tree ${basis:0:7})"
+      continue
+    fi
+    echo "drift: $name: basis tree ${basis:0:7} is stale. The contract surface is now tree ${current_tree:0:7}." >&2
+    echo "       Re-read section 15 against these files:" >&2
+    git diff --name-only "$basis_tree" "$current_tree" | sed "s|^|         $surface/|" >&2
+    echo "       then set the marker to:" >&2
+    echo "       <!-- drift-basis: $current_tree -->" >&2
+    bad=1
+    continue
+  fi
+
+  if [ "$basis_type" != "commit" ]; then
+    echo "drift: $name: basis $basis is not a commit or a contracts tree in this repository." >&2
+    echo "       It may be a branch commit that a squash merge erased (PR #48's 7d8fa9c was one)." >&2
+    echo "       After re-reading section 15, name the contracts tree instead; a squash keeps it:" >&2
+    echo "       <!-- drift-basis: $current_tree -->" >&2
     bad=1
     continue
   fi
@@ -128,8 +161,10 @@ for plan in "${plans[@]}"; do
   fi
 
   echo "drift: $name: basis ${basis:0:7} is stale. The contract surface moved at ${current:0:7}." >&2
-  echo "       Re-read section 15 against these files, then update the marker:" >&2
+  echo "       Re-read section 15 against these files:" >&2
   echo "$changed" | sed 's/^/         /' >&2
+  echo "       then set the marker to the contracts tree, which a squash merge keeps:" >&2
+  echo "       <!-- drift-basis: $current_tree -->" >&2
   bad=1
 done
 

@@ -29,11 +29,12 @@
     the same reason the drift stage does.
 
     The drift stage is the second non-cargo check. Every M7 test plan declares the contract
-    commit its section 15 was written against; this fails when that commit is no longer the
-    newest one to touch crates/rdb-core/src/contracts. All four teams held a stale basis at
-    once on 2026-09-20, and a stale basis always over-holds: rows report Unavailable on types
-    that have already landed. The rule lives in scripts/drift-check.sh and this script calls
-    it rather than restating it, because two copies of a rule drift apart.
+    surface its section 15 was written against; this fails when that basis no longer matches
+    crates/rdb-core/src/contracts at HEAD. The basis is the contracts tree; a legacy commit basis
+    passes when its contracts surface matches the current one. All four teams held a stale
+    basis at once on 2026-09-20, and a stale basis always over-holds: rows report Unavailable on
+    types that have already landed. The rule lives in scripts/drift-check.sh and this script
+    calls it rather than restating it, because two copies of a rule drift apart.
 
     Kept in sync with scripts/gate.sh.
 

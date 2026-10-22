@@ -183,13 +183,21 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   Before 2026-10-01 both scripts prefixed `$PWD`, so `C:/rdb_test_data/...` logged into
   `<repo>/C:/rdb_test_data/...`. The `gate:` line prints the resolved `logs=`; read it.
 - The `drift` stage checks the M7 test plans, not the code. Each plan's section 15 says which
-  contract commit it was written against, in a marker line `<!-- drift-basis: <sha> -->`, and
-  the stage fails when that commit is no longer the newest one to touch
-  `crates/rdb-core/src/contracts`. It exists because on 2026-09-20 all four teams held a stale
+  contract surface it was written against, in a marker line `<!-- drift-basis: <hash> -->`, and
+  the stage fails when that surface no longer matches `crates/rdb-core/src/contracts` at HEAD.
+  The basis is the contracts tree (below); a legacy commit basis is accepted when its contracts
+  surface matches the current one. It exists because on 2026-09-20 all four teams held a stale
   basis at the same time, and the failure is silent and always over-holds: a plan reports rows
   `Unavailable` on types that have already landed. One plan named a commit predating the
   contracts entirely. Re-reading the table is a convention; this makes it a red build. When it
   fires, re-read section 15 against the files it lists, then move the marker.
+- **Name the contracts tree, not a commit.** Get it with
+  `git rev-parse HEAD:crates/rdb-core/src/contracts`. A tree hash is the folder's content, so a
+  squash merge keeps it; a branch commit does not survive one. PR #48 set all four markers to its
+  branch commit `7d8fa9c`, the squash merge made `0e64d47` instead, and main failed the stage
+  from then on (2026-10-19, ruling A-R118). A tree basis passes only when it equals the current
+  contracts tree; otherwise the stage lists the changed files and prints the tree to set. A legacy
+  commit basis passes when its contracts surface matches the current one.
 - What it does not check: the stage compares the basis, not the table. A plan passes with a
   fresh hash and a table nobody re-read, because moving a marker is one edit. It catches the
   plan that forgot; it cannot catch the author who skipped. Set the marker after the re-read,

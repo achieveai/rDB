@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, DenyReason, FenceScope, Lineage, PartitionMode, Verdict,
+    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceScope, Lineage, PartitionMode,
+    Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -69,10 +70,13 @@ use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
-use rdb_value::delta::{ApplyError, Delta, Op};
+use rdb_value::blob::{Blob, Upload};
+use rdb_value::collection::{CollectionKind, ElemOp, Members};
+use rdb_value::delta::{ApplyError, Delta};
 use rdb_value::keys::{root_key, RootKey};
+use rdb_value::list::{Items, ListOp, Start, Token, DEFAULT_BLOCK_MAX};
 use rdb_value::value::Value;
-use rdb_value::{Expected, ValueError};
+use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
@@ -324,17 +328,16 @@ pub struct Client {
 /// `Db` never does this: each of its gets mints a fresh identity.
 #[derive(Debug, Clone)]
 pub enum ClientCall {
-    /// Replace object `object` with the byte string `value` (Decision 2), compiled here against
-    /// the step view.
+    /// Apply `change` to object `object`, compiled here against the step view and sent.
     Put {
         /// The identity minted for it.
         identity: RequestIdentity,
         /// The object id.
         object: Bytes,
-        /// The bytes.
-        value: Bytes,
-        /// Write only if the object is at this version.
-        if_version: Option<u64>,
+        /// What the write changes.
+        change: Change,
+        /// When the write may happen; `None` is the version the compile sees.
+        expect: Option<Expected>,
         /// The kernel deadline.
         remaining_millis: u64,
     },
@@ -363,6 +366,8 @@ pub enum ClientCall {
         identity: RequestIdentity,
         /// The object id.
         object: Bytes,
+        /// What to read of it.
+        look: Look,
     },
     /// Read object `object` from the previously published view, at once (P1's
     /// `ReadPrevious`): it never waits for a write in flight.
@@ -381,19 +386,181 @@ pub enum ClientCall {
     },
 }
 
-/// One put of a [`ClientCall::Compile`]: replace `object` in affinity group `group` with the
-/// byte string `value`.
+/// One write of a [`ClientCall::Compile`]: apply `change` to `object` in affinity group
+/// `group`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutOp {
     /// The affinity group the object lives in.
     pub group: AffinityId,
     /// The object id.
     pub object: Bytes,
-    /// The bytes.
-    pub value: Bytes,
-    /// Write only if the object is at this version; `None` means the version the compile sees
-    /// (absent included).
-    pub if_version: Option<u64>,
+    /// What the write changes.
+    pub change: Change,
+    /// When the write may happen. `None` is the version the compile sees, absent included;
+    /// `Some(Absent)` creates only; `Some(Version(v))` writes only at version `v`.
+    pub expect: Option<Expected>,
+}
+
+/// What one write changes. The kind of the object is fixed when it is created; a change of
+/// another kind is `INVALID_ARGUMENT` (`KindMismatch`). `Chunk` and `Gc` are the exceptions:
+/// neither reads the object's kind. A chunk is stored under an object of any kind, or none,
+/// and only its publish is refused (A-R127); a gc deletes the chunks that no blob names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Document ops, applied in order to the whole document (ADR-rdb-0012).
+    Doc(Delta),
+    /// Map ops, applied in order (ADR-rdb-0013): `Put`, `Remove` and the `Need` checks.
+    Map(Vec<ElemOp>),
+    /// Set ops, applied in order (ADR-rdb-0013): `Add`, `Remove` and the `Need` checks.
+    Set(Vec<ElemOp>),
+    /// List edits, applied in order (ADR-rdb-0016). A create makes an ordinary list (`records`
+    /// false) with the default block size.
+    List(Vec<ListEdit>),
+    /// Store chunk `index` of upload `upload` for the blob at the object (ADR-rdb-0014 §5). The
+    /// caller mints the upload id (S4 Q1). Takes no `expect`. The same bytes already stored
+    /// compile to nothing, never sent ([`Answer::Unchanged`]).
+    Chunk {
+        /// The upload the chunk belongs to.
+        upload: Upload,
+        /// The chunk's position, from 0.
+        index: u32,
+        /// The chunk's bytes.
+        bytes: Bytes,
+    },
+    /// Publish upload `upload` as the blob at the object (ADR-rdb-0014 §6): every chunk is
+    /// checked against `size`, `chunk_size` and `sha256` before the root is written. That blob
+    /// already at the root compiles to nothing: [`Answer::Unchanged`] once it is published,
+    /// `UNKNOWN_OUTCOME` while it is applied and not yet published (C-3).
+    Publish {
+        /// The upload whose chunks the blob is.
+        upload: Upload,
+        /// The blob's length in bytes.
+        size: u64,
+        /// Every chunk's length, except the last.
+        chunk_size: u64,
+        /// SHA-256 of the whole blob.
+        sha256: [u8; 32],
+    },
+    /// Delete one batch of the object's chunks that its blob does not name, at a version at or
+    /// below `floor` (ADR-rdb-0014 §8). The caller picks the floor (S4 Q1): a chunk of an upload
+    /// still in progress above it is kept. Takes no `expect`. Nothing left to delete compiles to
+    /// nothing, never sent ([`Answer::Unchanged`]).
+    Gc {
+        /// The highest chunk version that may go.
+        floor: u64,
+    },
+}
+
+impl Change {
+    /// The kind's name, for logs.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Doc(_) => "doc",
+            Self::Map(_) => "map",
+            Self::Set(_) => "set",
+            Self::List(_) => "list",
+            Self::Chunk { .. } => "chunk",
+            Self::Publish { .. } => "publish",
+            Self::Gc { .. } => "gc",
+        }
+    }
+}
+
+/// One list edit (A-R116). A position counts from the start, or from the end when negative:
+/// `-1` is the last item. Positions read the list as the earlier edits left it, as
+/// `rdb_value`'s `ListOp` positions do. The owner turns them into `ListOp`s against the list
+/// version the write is checked against, so a concurrent change cannot shift one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListEdit {
+    /// Add the value at the end.
+    Push(Value),
+    /// Add the value before position `at`; `at` may also be the count, the end.
+    Insert {
+        /// The new item's position.
+        at: i64,
+        /// The new item's value.
+        value: Value,
+    },
+    /// Remove the item at `at`.
+    Remove {
+        /// The item's position.
+        at: i64,
+    },
+    /// Replace the value of the item at `at`.
+    Replace {
+        /// The item's position.
+        at: i64,
+        /// Its new value.
+        value: Value,
+    },
+    /// Move the item at `from` so that it ends at `to`.
+    Move {
+        /// The item's position now.
+        from: i64,
+        /// Its position after the move.
+        to: i64,
+    },
+}
+
+/// What a read looks at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Look {
+    /// The whole document.
+    Doc,
+    /// Up to `limit` map entries or set members in element order, after `after` (which need not
+    /// be an element) or from the first. Element order is encoded-key order: by type first, then
+    /// by value, so the integer `3` lists before the float `1.5` (A-R122).
+    Members {
+        /// Start after this key.
+        after: Option<Value>,
+        /// The most elements to return.
+        limit: usize,
+    },
+    /// Up to `limit` list items from position `at`. A negative `at` counts from the end: `-1` is
+    /// the last item, read against the count of the list this read sees (A-R116).
+    Items {
+        /// The first position.
+        at: i64,
+        /// The most items to return.
+        limit: usize,
+    },
+    /// Up to `limit` list items from where an earlier page stopped. A token from another
+    /// generation or list version is `STALE_CONTINUATION` (C-2).
+    ItemsAfter {
+        /// The earlier page's `next`.
+        token: Token,
+        /// The most items to return.
+        limit: usize,
+    },
+    /// Bytes `offset … offset + len` of a blob, with its manifest, from one view (ADR-rdb-0014
+    /// §7). `len` 0 reads the manifest alone.
+    Range {
+        /// The first byte.
+        offset: u64,
+        /// How many bytes.
+        len: u64,
+    },
+}
+
+/// What a read saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seen {
+    /// No object at that id.
+    Absent,
+    /// A document and its version.
+    Doc(Document),
+    /// A page of a map or set, with its root.
+    Members(Members),
+    /// A page of a list, with its root and where to resume.
+    Items(Items),
+    /// A blob's manifest and version, and the asked bytes of it.
+    Range {
+        /// The blob's root as read.
+        blob: Blob,
+        /// The bytes asked for.
+        bytes: Bytes,
+    },
 }
 
 /// A node's answer to a client call.
@@ -410,8 +577,8 @@ pub enum Answer {
     Read {
         /// How P1 served it.
         outcome: ReadServiceOutcome,
-        /// The object's version and bytes, `None` when absent.
-        value: Option<(u64, Bytes)>,
+        /// What it saw.
+        seen: Seen,
         /// The generation of the view it was served from.
         generation: Generation,
         /// The position of that view.
@@ -419,6 +586,8 @@ pub enum Answer {
     },
     /// A put compiled and not sent. Send it with [`ClientCall::Resend`].
     Compiled(TxnRequest),
+    /// The writes compiled to nothing: what they ask is already stored. Nothing was sent.
+    Unchanged,
     /// A status query was answered.
     Status(TxnStatus),
     /// The call failed.
@@ -721,7 +890,7 @@ struct Pending {
 #[derive(Debug)]
 enum PendingKind {
     Txn(TxnRequest),
-    Read(RootKey),
+    Read(RootKey, Look),
     Previous(RootKey),
 }
 
@@ -1116,7 +1285,7 @@ impl Host {
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
-                PendingKind::Read(_) | PendingKind::Previous(_) => None,
+                PendingKind::Read(..) | PendingKind::Previous(_) => None,
             };
             tracing::info!(
                 node = self.node.0,
@@ -2970,8 +3139,8 @@ impl Host {
             ClientCall::Put {
                 identity,
                 object,
-                value,
-                if_version,
+                change,
+                expect,
                 remaining_millis,
             } => match self
                 .compile(
@@ -2980,18 +3149,22 @@ impl Host {
                     &[PutOp {
                         group: AFFINITY,
                         object,
-                        value,
-                        if_version,
+                        change,
+                        expect,
                     }],
                     remaining_millis,
                 )
                 .map_err(|detail| fail_waiter(&reply, detail))?
             {
-                Ok(request) => (
+                Ok(Some(request)) => (
                     identity,
                     EventKind::Client(ClientEvent::Submit(request.clone())),
                     Some(PendingKind::Txn(request)),
                 ),
+                Ok(None) => {
+                    let _ = reply.send(Answer::Unchanged);
+                    return Ok(());
+                }
                 Err(error) => {
                     let _ = reply.send(Answer::Error {
                         error,
@@ -3009,7 +3182,8 @@ impl Host {
                     .compile(partition, identity, &puts, remaining_millis)
                     .map_err(|detail| fail_waiter(&reply, detail))?
                 {
-                    Ok(request) => Answer::Compiled(request),
+                    Ok(Some(request)) => Answer::Compiled(request),
+                    Ok(None) => Answer::Unchanged,
                     Err(error) => Answer::Error {
                         error,
                         request: None,
@@ -3020,7 +3194,10 @@ impl Host {
                     partition = partition.0,
                     request = identity.request.0,
                     puts = puts.len(),
+                    change = puts.first().map_or("none", |put| put.change.name()),
                     compiled = matches!(answer, Answer::Compiled(_)),
+                    unchanged = matches!(answer, Answer::Unchanged),
+                    reason = %match &answer { Answer::Error { error, .. } => error.to_string(), _ => String::new() },
                     "client_compile"
                 );
                 let _ = reply.send(answer);
@@ -3031,7 +3208,11 @@ impl Host {
                 EventKind::Client(ClientEvent::Submit(request.clone())),
                 Some(PendingKind::Txn(request)),
             ),
-            ClientCall::Get { identity, object } => {
+            ClientCall::Get {
+                identity,
+                object,
+                look,
+            } => {
                 let root = root_key(identity.tenant, AFFINITY, &object);
                 (
                     identity,
@@ -3039,7 +3220,7 @@ impl Host {
                         identity,
                         key: root.to_bytes(),
                     }),
-                    Some(PendingKind::Read(root)),
+                    Some(PendingKind::Read(root, look)),
                 )
             }
             ClientCall::GetPrevious { identity, object } => (
@@ -3120,16 +3301,17 @@ impl Host {
         Ok(())
     }
 
-    /// Compile byte-string puts as one transaction against the step view. The outer error
+    /// Compile writes as one transaction against the step view. The outer error
     /// faults the node (the step view could not be built); the inner one is the caller's: the
     /// first put that does not compile refuses them all, named by its index, never its key.
+    /// `None` is a compile with nothing to write, which is never sent.
     fn compile(
         &mut self,
         partition: PartitionId,
         identity: RequestIdentity,
         puts: &[PutOp],
         remaining_millis: u64,
-    ) -> Result<Result<TxnRequest, ApiError>, String> {
+    ) -> Result<Result<Option<TxnRequest>, ApiError>, String> {
         let generation = self.adopted(partition).generation;
         // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
         // Refused here and never sent (lead ruling on D1, 2026-10-07).
@@ -3140,6 +3322,12 @@ impl Host {
         let Some((_, view)) = self.views.get(&partition) else {
             return Err("step view missing after refresh".into());
         };
+        // What P1 has published here, as `status` reads it: a publish answers unchanged only
+        // at or below it (C-3).
+        let published = self
+            .publication
+            .view(self.node, partition)
+            .map(|view| (view.published.generation, view.published.seq));
         // The first put's group is the request's affinity. A put in another group is refused
         // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
         let affinity = puts.first().map_or(AFFINITY, |put| put.group);
@@ -3154,26 +3342,96 @@ impl Host {
                 return Ok(Err(refused));
             }
             let root = root_key(identity.tenant, put.group, &put.object);
-            let expected = match put.if_version {
-                Some(version) => Expected::Version(version),
-                None => view
-                    .version(Namespace::User, root.as_bytes())
-                    .map_or(Expected::Absent, Expected::Version),
+            let expected = put.expect.unwrap_or_else(|| {
+                view.version(Namespace::User, root.as_bytes())
+                    .map_or(Expected::Absent, Expected::Version)
+            });
+            // The damaged chunk a Chunk or Publish arm met, with its upload, for the log (A-R132).
+            let mut chunk = None;
+            let compiled = match &put.change {
+                Change::Doc(delta) => {
+                    rdb_value::compile(view, &root, expected, delta).map_err(|e| compile_error(&e))
+                }
+                Change::Map(ops) => rdb_value::collection::compile_collection(
+                    view,
+                    &root,
+                    CollectionKind::Map,
+                    expected,
+                    ops,
+                )
+                .map_err(|e| compile_error(&e)),
+                Change::Set(ops) => rdb_value::collection::compile_collection(
+                    view,
+                    &root,
+                    CollectionKind::Set,
+                    expected,
+                    ops,
+                )
+                .map_err(|e| compile_error(&e)),
+                Change::List(edits) => list_compile(view, &root, expected, edits),
+                Change::Chunk { .. } | Change::Gc { .. } if put.expect.is_some() => {
+                    Err(ApiError::invalid(format!(
+                        "a {} takes no expect: it is guarded by what it reads",
+                        put.change.name()
+                    )))
+                }
+                Change::Gc { floor } => rdb_value::blob::collect_garbage(view, &root, *floor)
+                    .map_err(|e| compile_error(&e)),
+                Change::Chunk {
+                    upload,
+                    index,
+                    bytes,
+                } => rdb_value::blob::put_chunk(view, &root, upload, *index, bytes).map_err(|e| {
+                    chunk = damaged_chunk(&e).map(|index| (*upload, index));
+                    compile_error(&e)
+                }),
+                // `serving` is the adopted generation the request will be fenced with
+                // (ADR-rdb-0014 §6 check 0).
+                Change::Publish {
+                    upload,
+                    size,
+                    chunk_size,
+                    sha256,
+                } => rdb_value::blob::publish(
+                    view,
+                    &root,
+                    expected,
+                    upload,
+                    *size,
+                    *chunk_size,
+                    sha256,
+                    generation,
+                )
+                .map_err(|e| {
+                    chunk = damaged_chunk(&e).map(|index| (*upload, index));
+                    compile_error(&e)
+                })
+                .and_then(|compiled| {
+                    if compiled.mutations.is_empty() {
+                        self.read_admitted(partition)?;
+                        already_published(view, &root, published)?;
+                    }
+                    Ok(compiled)
+                }),
             };
-            let delta = Delta(vec![Op::Replace(Value::Bytes(put.value.to_vec()))]);
-            match rdb_value::compile(view, &root, expected, &delta) {
+            match compiled {
                 Ok(compiled) => {
                     conditions.extend(compiled.conditions);
                     mutations.extend(compiled.mutations);
                 }
-                Err(error) => {
-                    let mut refused = compile_error(&error);
+                Err(mut refused) => {
+                    log_stored_damage(self.node, &root, &refused, chunk);
                     refused.detail = format!("op {index}: {}", refused.detail);
                     return Ok(Err(refused));
                 }
             }
         }
-        Ok(Ok(TxnRequest {
+        // Puts with nothing to write: never sent, since the kernel refuses an empty request (S4
+        // guard 7). No puts at all is still sent, for the kernel to refuse as malformed.
+        if mutations.is_empty() && !puts.is_empty() {
+            return Ok(Ok(None));
+        }
+        Ok(Ok(Some(TxnRequest {
             api_version: API_VERSION,
             identity,
             affinity,
@@ -3181,7 +3439,34 @@ impl Host {
             remaining_millis,
             conditions,
             mutations,
-        }))
+        })))
+    }
+
+    /// "Already published" is a read (ADR-rdb-0014 O9), so it is given only while A1 admits a
+    /// read: A1's verdict on the adopted lineage, the one it answers P1's read check with. A deny
+    /// is refused as a read refused for it is (review F1).
+    fn read_admitted(&self, partition: PartitionId) -> Result<(), ApiError> {
+        let adopted = self.adopted(partition);
+        let lineage = Lineage {
+            partition,
+            generation: adopted.generation,
+            owner_epoch: adopted.owner_epoch,
+        };
+        match self
+            .authority
+            .may_admit_at(lineage, self.clock.now(), &self.budgets)
+        {
+            Verdict::Admit => Ok(()),
+            Verdict::Deny(reason) => {
+                let mut refused =
+                    crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
+                refused.detail =
+                    format!("a read is refused now ({reason:?}), so the publish is not confirmed");
+                // Nothing was sent: this gate refuses before any send.
+                refused.no_mutation = true;
+                Err(refused)
+            }
+        }
     }
 
     fn reply(&mut self, partition: PartitionId, reply: &ReplyEffect) -> Result<(), String> {
@@ -3243,8 +3528,8 @@ impl Host {
                 error: ApiError::from_kernel(error),
                 request: None,
             },
-            (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root)) => self
-                .read_answer(partition, *outcome, *value, &root)
+            (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
+                .read_answer(partition, *outcome, *value, &root, &look)
                 .map_err(|detail| fail_waiter(&pending.reply, detail))?,
             (reply, kind) => {
                 return Err(fail_waiter(
@@ -3333,7 +3618,7 @@ impl Host {
         let answer = match handle {
             Err(kind) => Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
-                value: None,
+                seen: Seen::Absent,
                 generation: Generation(0),
                 at: Seq::ZERO,
             },
@@ -3344,7 +3629,14 @@ impl Host {
                         format!("previous view {} is not bound", handle.0),
                     )
                 })?;
-                document_answer(view, &root, ReadServiceOutcome::Served)
+                object_answer(
+                    self.node,
+                    view,
+                    &root,
+                    &Look::Doc,
+                    ReadServiceOutcome::Served,
+                )
+                .map_err(|detail| fail_waiter(&pending.reply, detail))?
             }
         };
         let _ = pending.reply.send(answer);
@@ -3359,6 +3651,7 @@ impl Host {
         outcome: ReadServiceOutcome,
         value: Option<(u64, Digest)>,
         root: &RootKey,
+        look: &Look,
     ) -> Result<Answer, String> {
         let Some((_, view)) = self.views.get(&partition) else {
             return Err("read reply with no step view".into());
@@ -3367,7 +3660,7 @@ impl Host {
         let Some((version, digest)) = value else {
             return Ok(Answer::Read {
                 outcome,
-                value: None,
+                seen: Seen::Absent,
                 generation,
                 at,
             });
@@ -3386,7 +3679,7 @@ impl Host {
         if matches!(rdb_value::read(view, root), Ok(None)) {
             return Err("read reply names a value the step view does not decode".into());
         }
-        Ok(document_answer(view, root, outcome))
+        object_answer(self.node, view, root, look, outcome)
     }
 
     // ------------------------------------------------------------------ inspection
@@ -3590,11 +3883,192 @@ fn fail_waiter(reply: &Sender<Answer>, detail: String) -> String {
 /// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
 fn compile_error(error: &ValueError) -> ApiError {
     match error {
-        ValueError::Apply(ApplyError::VersionConflict { .. } | ApplyError::ObjectAbsent) => {
-            ApiError::new(ErrorKind::ConditionFailed, error.to_string())
+        ValueError::Apply(
+            ApplyError::VersionConflict { .. }
+            | ApplyError::ObjectAbsent
+            | ApplyError::ElementAbsent
+            | ApplyError::ElementExists,
+        ) => ApiError::new(ErrorKind::ConditionFailed, error.to_string()),
+        // S4b (A-R114 Q2): other bytes under a stored chunk's upload and index.
+        ValueError::Apply(ApplyError::ChunkConflict { .. }) => {
+            ApiError::new(ErrorKind::UploadChunkConflict, error.to_string())
         }
         ValueError::Apply(_) => ApiError::new(ErrorKind::InvalidArgument, error.to_string()),
+        // These four only: a blob root that is not a v1 manifest, or a chunk that does not
+        // open, is not stored, or is not the one the manifest names. A blob root whose envelope
+        // does not open is `Corrupt::Envelope`, so CORRUPT_HISTORY, as for any object.
+        ValueError::Corrupt(
+            Corrupt::Manifest(_)
+            | Corrupt::Chunk { .. }
+            | Corrupt::ChunkMismatch { .. }
+            | Corrupt::ChunkMissing { .. },
+        ) => ApiError::new(ErrorKind::CorruptBlob, error.to_string()),
         ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
+    }
+}
+
+/// C-3: a publish whose blob is already at the root answers unchanged only when that root is
+/// published: its version at or below P1's published position, in the step view's generation.
+/// Above it, the root was applied and not yet published, so it may still be lost: that is
+/// `UNKNOWN_OUTCOME`, nothing sent, and the publish that wrote it is the one to ask about.
+fn already_published(
+    view: &RocksSnapshot,
+    root: &RootKey,
+    published: Option<(Generation, Seq)>,
+) -> Result<(), ApiError> {
+    let version = view.version(Namespace::User, root.as_bytes());
+    match (version, published) {
+        (Some(version), Some((generation, seq)))
+            if generation == view.generation() && version <= seq.0 =>
+        {
+            Ok(())
+        }
+        _ => {
+            let at = version.map_or_else(|| "-".to_owned(), |v| v.to_string());
+            let through = match published {
+                Some((generation, seq)) if generation == view.generation() => {
+                    format!("published only through seq {}", seq.0)
+                }
+                Some((generation, seq)) => format!(
+                    "published through seq {} of generation {}, not generation {}",
+                    seq.0,
+                    generation.0,
+                    view.generation().0
+                ),
+                None => "nothing published yet".to_owned(),
+            };
+            Err(ApiError::new(
+                ErrorKind::UnknownOutcome,
+                format!(
+                    "the blob is at version {at}, {through}; ask the status of the publish that \
+                     wrote it"
+                ),
+            ))
+        }
+    }
+}
+
+/// Where `Look::Items` starts: `at` itself, or for `-k` the list's count in `view` less k. Below 0
+/// is the caller's `INVALID_ARGUMENT`; the outer error is reading the list root.
+fn items_start(
+    view: &RocksSnapshot,
+    root: &RootKey,
+    at: i64,
+) -> Result<Result<Start, ApiError>, ValueError> {
+    if let Ok(position) = u64::try_from(at) {
+        return Ok(Ok(Start::Position(position)));
+    }
+    let count = rdb_value::list::list(view, root)?
+        .ok_or(ApplyError::ObjectAbsent)?
+        .count;
+    Ok(resolve_position(at, count)
+        .map(Start::Position)
+        .ok_or_else(|| {
+            ApiError::invalid(format!("position {at} is not inside the list of {count}"))
+        }))
+}
+
+/// Compile `edits` against the list at `root` in `view`. Each position is resolved against the
+/// list's count in the same view, carried through the edits (A-R116). A create starts at 0 and
+/// makes an ordinary list with the default block size. The guard is checked first: when a
+/// position, or reading the count, is refused, the edits are compiled empty, so a stale or
+/// missing list answers `CONDITION_FAILED` whatever its positions say.
+fn list_compile(
+    view: &RocksSnapshot,
+    root: &RootKey,
+    expected: Expected,
+    edits: &[ListEdit],
+) -> Result<Compiled, ApiError> {
+    let compile = |ops: &[ListOp]| {
+        match expected {
+            Expected::Absent => {
+                rdb_value::list::create_list(view, root, false, DEFAULT_BLOCK_MAX, ops)
+            }
+            Expected::Version(_) => {
+                rdb_value::list::compile_list(view, root, expected, DEFAULT_BLOCK_MAX, ops)
+            }
+        }
+        .map(|compiled| compiled.compiled().clone())
+        .map_err(|e| compile_error(&e))
+    };
+    let count = match expected {
+        Expected::Absent => Ok(0),
+        // No root: the compile below refuses it (`ObjectAbsent`); 0 resolves nothing wrongly,
+        // because that refusal comes first.
+        Expected::Version(_) => rdb_value::list::list(view, root)
+            .map(|found| found.map_or(0, |list| list.count))
+            .map_err(|e| compile_error(&e)),
+    };
+    match count.and_then(|count| resolve_edits(edits, count)) {
+        Ok(ops) => compile(&ops),
+        Err(refused) => {
+            compile(&[])?;
+            Err(refused)
+        }
+    }
+}
+
+/// `edits` as `ListOp`s against a list of `count` items: `-k` is `count - k`, and the count
+/// moves as the edits do (push and insert +1, remove -1). A position outside the list as the
+/// earlier edits left it is `INVALID_ARGUMENT`, named by its edit and as it was written.
+fn resolve_edits(edits: &[ListEdit], mut count: u64) -> Result<Vec<ListOp>, ApiError> {
+    let mut ops = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        // An insert may name the end; every other position names an item.
+        let at = |at: i64, end_ok: bool| {
+            let len = count + u64::from(end_ok);
+            resolve_position(at, count)
+                .filter(|position| *position < len)
+                .ok_or_else(|| {
+                    ApiError::invalid(format!(
+                        "edit {index}: position {at} is not inside the list of {count}"
+                    ))
+                })
+        };
+        ops.push(match edit {
+            ListEdit::Push(value) => {
+                count += 1;
+                ListOp::Push(value.clone())
+            }
+            ListEdit::Insert {
+                at: position,
+                value,
+            } => {
+                let at = at(*position, true)?;
+                count += 1;
+                ListOp::Insert {
+                    at,
+                    value: value.clone(),
+                }
+            }
+            ListEdit::Remove { at: position } => {
+                let at = at(*position, false)?;
+                count -= 1;
+                ListOp::Remove { at }
+            }
+            ListEdit::Replace {
+                at: position,
+                value,
+            } => ListOp::Replace {
+                at: at(*position, false)?,
+                value: value.clone(),
+            },
+            ListEdit::Move { from, to } => ListOp::Move {
+                from: at(*from, false)?,
+                to: at(*to, false)?,
+            },
+        });
+    }
+    Ok(ops)
+}
+
+/// `at` against a list of `count` items: itself when not negative, `count - k` for `-k`, and
+/// `None` below 0.
+fn resolve_position(at: i64, count: u64) -> Option<u64> {
+    if at < 0 {
+        count.checked_sub(at.unsigned_abs())
+    } else {
+        u64::try_from(at).ok()
     }
 }
 
@@ -3609,37 +4083,131 @@ fn margin_ms(horizon: Tick, at: Tick) -> i64 {
     i64::try_from(ahead).unwrap_or(if ahead < 0 { i64::MIN } else { i64::MAX })
 }
 
-/// A byte-string read of `root` from `view`: absent, its version and bytes, or why not.
-fn document_answer(view: &RocksSnapshot, root: &RootKey, outcome: ReadServiceOutcome) -> Answer {
+/// What `look` sees of the object at `root` in `view`, the view P1 just answered from (or, for
+/// `get --previous`, the kept view P1 handed out). A refusal of the read itself, such as
+/// another kind's look (`KindMismatch`), is the caller's error. The outer error faults the
+/// node: the view cannot back the answer P1 gave.
+fn object_answer(
+    node: NodeId,
+    view: &RocksSnapshot,
+    root: &RootKey,
+    look: &Look,
+    outcome: ReadServiceOutcome,
+) -> Result<Answer, String> {
     let (generation, at) = (view.generation(), view.at());
-    let document = match rdb_value::read(view, root) {
-        Ok(Some(document)) => document,
-        Ok(None) => {
-            return Answer::Read {
-                outcome,
-                value: None,
-                generation,
-                at,
-            };
+    // A range read's upload, from the manifest it opened, for a damaged chunk's log (A-R132).
+    let mut upload = None;
+    let seen = match look {
+        Look::Doc => rdb_value::read(view, root).map(|found| found.map_or(Seen::Absent, Seen::Doc)),
+        Look::Members { after, limit } => {
+            rdb_value::collection::members(view, root, after.as_ref(), *limit).map(Seen::Members)
         }
+        Look::Items { at: from, limit } => match items_start(view, root, *from) {
+            Ok(Ok(start)) => rdb_value::list::items(view, root, start, *limit).map(Seen::Items),
+            Ok(Err(refused)) => {
+                return Ok(Answer::Error {
+                    error: refused,
+                    request: None,
+                })
+            }
+            Err(error) => Err(error),
+        },
+        Look::ItemsAfter { token, limit } => {
+            match rdb_value::list::items(view, root, Start::Token(*token), *limit) {
+                // The list moved on since the token: restart the read (C-2). The kernel's kind
+                // and retry rule, with the reason `rdb_value` gave.
+                Err(ValueError::Apply(
+                    reason @ (ApplyError::GenerationChanged { .. }
+                    | ApplyError::VersionConflict { .. }),
+                )) => {
+                    let mut stale = ApiError::from_kernel(&RdbError::StaleContinuation);
+                    stale.detail = reason.to_string();
+                    return Ok(Answer::Error {
+                        error: stale,
+                        request: None,
+                    });
+                }
+                read => read.map(Seen::Items),
+            }
+        }
+        Look::Range { offset, len } => rdb_value::blob::read_blob(view, root).and_then(|blob| {
+            let blob = blob.ok_or(ApplyError::ObjectAbsent)?;
+            upload = Some(blob.manifest.upload);
+            rdb_value::blob::read_range(view, root, *offset, *len)
+                .map(|bytes| Seen::Range { blob, bytes })
+        }),
+    };
+    Ok(match seen {
+        // P1 found a root record, so the view holds one: its absence here is not an answer (A-4).
+        Err(ValueError::Apply(ApplyError::ObjectAbsent)) => {
+            return Err(format!(
+                "the read view holds no root record for an object P1 answered as present ({look:?})"
+            ));
+        }
+        Ok(seen) => Answer::Read {
+            outcome,
+            seen,
+            generation,
+            at,
+        },
         Err(error) => {
-            return Answer::Error {
-                error: compile_error(&error),
+            let chunk = upload.zip(damaged_chunk(&error));
+            let error = compile_error(&error);
+            log_stored_damage(node, root, &error, chunk);
+            Answer::Error {
+                error,
                 request: None,
-            };
+            }
         }
+    })
+}
+
+/// The index of the chunk a blob refusal found damaged: one that does not open, is not the one
+/// the manifest names, or is missing.
+const fn damaged_chunk(error: &ValueError) -> Option<u32> {
+    match error {
+        ValueError::Corrupt(
+            Corrupt::Chunk { index, .. }
+            | Corrupt::ChunkMismatch { index }
+            | Corrupt::ChunkMissing { index },
+        ) => Some(*index),
+        _ => None,
+    }
+}
+
+/// Stored damage a compile or a read found, refused as `CORRUPT_BLOB` or `CORRUPT_HISTORY`: one
+/// warn line naming the object and the kind (review F-005), since the caller's refusal reaches
+/// no log of its own. `chunk` adds `upload` (hex) and `index` where the finder knew them: a
+/// chunk that failed its check (A-R132). Damage to the manifest itself names no upload, so the
+/// line leaves both out rather than guess one.
+fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Option<(Upload, u32)>) {
+    if !matches!(
+        error.kind,
+        ErrorKind::CorruptBlob | ErrorKind::CorruptHistory
+    ) {
+        return;
+    }
+    let object = match rdb_value::keys::parse(root.as_bytes()) {
+        Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
+        Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
     };
-    let Value::Bytes(bytes) = document.value else {
-        return Answer::Error {
-            error: ApiError::invalid("the object is not a byte string (S4a reads documents)"),
-            request: None,
-        };
-    };
-    Answer::Read {
-        outcome,
-        value: Some((document.version, Bytes::from(bytes))),
-        generation,
-        at,
+    match chunk {
+        Some((upload, index)) => tracing::warn!(
+            node = node.0,
+            %object,
+            kind = %error.name(),
+            upload = %format!("{:032x}", u128::from_be_bytes(upload)),
+            index,
+            detail = %error.detail,
+            "stored_damage"
+        ),
+        None => tracing::warn!(
+            node = node.0,
+            %object,
+            kind = %error.name(),
+            detail = %error.detail,
+            "stored_damage"
+        ),
     }
 }
 
@@ -3693,6 +4261,9 @@ mod tests {
     use rdb_core::contracts::errors::RetryRule;
     use rdb_core::contracts::ids::{ClientId, ReceivedSeq, RequestId, TenantId};
     use rdb_core::contracts::txn::{Durability, Outcome};
+    use rdb_value::delta::Op;
+    use rdb_value::path::Path;
+    use rdb_value::value::{Int, Map, MapKey};
 
     /// This test's log lines whose message is `$message`. A macro, because the JSON value type
     /// is not nameable here without a `serde_json` dependency.
@@ -3839,8 +4410,8 @@ mod tests {
             call: ClientCall::Put {
                 identity,
                 object: Bytes::from_static(b"a"),
-                value: Bytes::from_static(b"v"),
-                if_version: None,
+                change: byte_doc(b"v"),
+                expect: None,
                 remaining_millis: 5_000,
             },
             reply,
@@ -4326,8 +4897,12 @@ mod tests {
             other => panic!("request 1 with another value: {other:?}"),
         }
         match trio.ask(get(4, b"a")) {
-            Answer::Read { value, .. } => {
-                assert_eq!(value, Some((2, Bytes::from_static(b"1"))), "a is unchanged");
+            Answer::Read { seen, .. } => {
+                assert_eq!(
+                    doc_bytes(seen),
+                    Some((2, Bytes::from_static(b"1"))),
+                    "a is unchanged"
+                );
             }
             other => panic!("get a: {other:?}"),
         }
@@ -4383,11 +4958,11 @@ mod tests {
         }) {
             Answer::Read {
                 outcome,
-                value,
+                seen,
                 generation,
                 at,
             } => assert_eq!(
-                (outcome, value, generation, at),
+                (outcome, doc_bytes(seen), generation, at),
                 (
                     ReadServiceOutcome::Served,
                     Some((2, Bytes::from_static(b"old"))),
@@ -4406,9 +4981,9 @@ mod tests {
         }
         match trio.answer(&barrier) {
             Answer::Read {
-                outcome, value, at, ..
+                outcome, seen, at, ..
             } => assert_eq!(
-                (outcome, value, at),
+                (outcome, doc_bytes(seen), at),
                 (
                     ReadServiceOutcome::WaitedAtBarrier,
                     Some((3, Bytes::from_static(b"new"))),
@@ -4631,9 +5206,9 @@ mod tests {
             previous.try_recv().ok()
         }) {
             Answer::Read {
-                outcome, value, at, ..
+                outcome, seen, at, ..
             } => assert_eq!(
-                (outcome, value, at),
+                (outcome, doc_bytes(seen), at),
                 (ReadServiceOutcome::Served, None, Seq(0)),
                 "answered from the view kept at seq 0"
             ),
@@ -5503,7 +6078,9 @@ mod tests {
             other => panic!("put a=1: {other:?}"),
         }
         match trio.ask(get(2, b"a")) {
-            Answer::Read { value, .. } => assert_eq!(value, Some((2, Bytes::from_static(b"1")))),
+            Answer::Read { seen, .. } => {
+                assert_eq!(doc_bytes(seen), Some((2, Bytes::from_static(b"1"))))
+            }
             other => panic!("get a: {other:?}"),
         }
 
@@ -5515,7 +6092,7 @@ mod tests {
             identity(3),
             Pending {
                 reply,
-                kind: PendingKind::Read(root),
+                kind: PendingKind::Read(root, Look::Doc),
                 event: EventId(0),
                 since: Tick(0),
             },
@@ -5609,7 +6186,10 @@ mod tests {
                 "read reply to a previous-view call",
                 PendingKind::Previous(root.clone()),
             ),
-            ("previous view to a read", PendingKind::Read(root.clone())),
+            (
+                "previous view to a read",
+                PendingKind::Read(root.clone(), Look::Doc),
+            ),
             ("unbound previous view", PendingKind::Previous(root)),
         ];
         for (n, (name, kind)) in (1u64..).zip(cases) {
@@ -5762,6 +6342,9 @@ mod tests {
         assert_eq!(trio.head(), Some(3), "request 10 published once");
 
         // (b)
+        // A-R124d: put 20 needs node 1's grant, which can lapse after (a)'s hold. No retention
+        // or deadline here depends on the time.
+        trio.admits_for(1_000);
         hold(&trio);
         let put_b = trio.call(put(20, b"b", b"1", None));
         trio.until("node 1 applied request 20", |trio| {
@@ -5789,8 +6372,8 @@ mod tests {
             other => panic!("put b: {other:?}"),
         }
         match trio.answer(&read) {
-            Answer::Read { outcome, value, .. } => assert_eq!(
-                (outcome, value),
+            Answer::Read { outcome, seen, .. } => assert_eq!(
+                (outcome, doc_bytes(seen)),
                 (
                     ReadServiceOutcome::WaitedAtBarrier,
                     Some((4, Bytes::from_static(b"1")))
@@ -5956,8 +6539,8 @@ mod tests {
             puts: vec![PutOp {
                 group: AFFINITY,
                 object: Bytes::from_static(b"a"),
-                value: Bytes::from_static(b"1"),
-                if_version: None,
+                change: byte_doc(b"1"),
+                expect: None,
             }],
             remaining_millis: REMAINING_MILLIS,
         }) {
@@ -6152,6 +6735,9 @@ mod tests {
             lines[0]["node"] == 1 && lines[0]["request"] == 2,
             "{lines:?}"
         );
+        // A-R124d: after a 2 s-scale hold node 1's grant can lapse, and a fenced node answers
+        // `status` `Unknown`. The default retention is a day, so the wait moves nothing past it.
+        trio.admits_for(1_000);
         match trio.ask(ClientCall::Status {
             identity: identity(2),
             generation: None,
@@ -6180,7 +6766,9 @@ mod tests {
             host.budgets.dedup_retention_millis = RETENTION_MILLIS;
         });
         trio.bootstrap();
-        trio.ready();
+        // A-R124b: the status and resend inside the 1.5 s retention need the grant for about
+        // 1.2 s more, and no wait can come between them without passing the retention.
+        trio.admits_for(RETENTION_MILLIS);
         let first = match trio.ask(compile(1, b"a", b"1")) {
             Answer::Compiled(request) => request,
             other => panic!("compile request 1: {other:?}"),
@@ -6236,6 +6824,9 @@ mod tests {
             Some(true),
             "{trims:?}"
         );
+        // A-R124b: node 1's grant can lapse and fence it here; a fenced node answers `Unknown`
+        // and refuses the resend `LEASE_EXPIRED`. Both are trimmed already, so waiting only ages them.
+        trio.admits_for(1_000);
         for request in [1, 2] {
             match status(&mut trio, request) {
                 Answer::Status(TxnStatus::Unknown) => {}
@@ -6294,8 +6885,9 @@ mod tests {
     /// trim takes it, and a resend runs afresh and fails its condition. Aged from the commit,
     /// the host would trim it while held, when T1 has no entry for it yet, and never again:
     /// the entry would outlive the retention and the last resend would still replay.
-    /// Trio (~5 s): a 300 ms retention; each wait is the retention plus one trim period and a
-    /// margin, so a trim tick falls after the write has aged.
+    /// Trio (~4 s): a 300 ms retention. The hold ends at node 1's first trim tick once the
+    /// write is 300 ms old; the wait after publication is the retention, a trim period and a
+    /// margin.
     #[config_log::retcd_test]
     fn a_write_held_past_the_retention_ages_from_its_publication_not_its_commit() {
         let dir = config_testkit::fs::temp_dir();
@@ -6321,12 +6913,15 @@ mod tests {
         trio.until("node 1 applied request 3", |trio| {
             (trio.head() == Some(3)).then_some(())
         });
-        let healed = trio
-            .clock
-            .now()
-            .plus_millis(300 + HOST_TRIM_EVERY_MILLIS + 200);
+        // A-R124a: held until node 1's first trim tick at or past the write's age, 0.3 to
+        // 1.3 s, not a fixed 1.5 s, since P1 answers a held write UNKNOWN_OUTCOME 2 s after it
+        // applies. A tick that trims nothing logs nothing, so the tick is read from
+        // `next_trim`, which each tick sets to its own time plus the period.
+        // Residual exposure: a stall over about 2 s minus this hold still crosses that deadline.
+        let aged = trio.clock.now().plus_millis(300);
         trio.until("held past the retention and then a trim tick", |trio| {
-            (trio.clock.now() >= healed).then_some(())
+            let ticked = trio.nodes[0].0.next_trim.0 - HOST_TRIM_EVERY_MILLIS;
+            (ticked >= aged.0).then_some(())
         });
         trio.links.heal_all();
         match trio.answer(&answer) {
@@ -6346,6 +6941,9 @@ mod tests {
         trio.until("aged from its publication, then a trim tick", |trio| {
             (trio.clock.now() >= aged).then_some(())
         });
+        // A-R123: by now the grant may have expired and fenced node 1, and a resend inside that
+        // window is refused `LEASE_EXPIRED` rather than run. Waiting only ages the entry more.
+        trio.admits_for(1_000);
         match trio.ask(ClientCall::Resend { request: held }) {
             Answer::Error { error, .. } => {
                 assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
@@ -6422,9 +7020,26 @@ mod tests {
         ClientCall::Put {
             identity: identity(request),
             object: Bytes::from_static(object),
-            value: Bytes::from_static(value),
-            if_version,
+            change: byte_doc(value),
+            expect: if_version.map(Expected::Version),
             remaining_millis: 5_000,
+        }
+    }
+
+    /// A byte-string document, as `Db::put` writes one.
+    fn byte_doc(value: &[u8]) -> Change {
+        Change::Doc(Delta(vec![Op::Replace(Value::Bytes(value.to_vec()))]))
+    }
+
+    /// A read's version and bytes when it saw a byte-string document, `None` when absent.
+    fn doc_bytes(seen: Seen) -> Option<(u64, Bytes)> {
+        match seen {
+            Seen::Absent => None,
+            Seen::Doc(Document {
+                version,
+                value: Value::Bytes(bytes),
+            }) => Some((version, Bytes::from(bytes))),
+            other => panic!("not a byte-string document: {other:?}"),
         }
     }
 
@@ -6434,8 +7049,8 @@ mod tests {
             puts: vec![PutOp {
                 group: AFFINITY,
                 object: Bytes::from_static(object),
-                value: Bytes::from_static(value),
-                if_version: None,
+                change: byte_doc(value),
+                expect: None,
             }],
             remaining_millis: 5_000,
         }
@@ -6445,6 +7060,521 @@ mod tests {
         ClientCall::Get {
             identity: identity(request),
             object: Bytes::from_static(object),
+            look: Look::Doc,
+        }
+    }
+
+    /// The upload every S4-4 row writes under.
+    const U1: Upload = [1; 16];
+
+    /// A compile of chunk `index` of [`U1`] under `object`.
+    fn chunk_call(
+        request: u64,
+        object: &'static [u8],
+        index: u32,
+        bytes: &'static [u8],
+        expect: Option<Expected>,
+    ) -> ClientCall {
+        let change = chunk_of(U1, index, bytes);
+        compile_change(request, object, change, expect)
+    }
+
+    /// Chunk `index` of `upload`.
+    fn chunk_of(upload: Upload, index: u32, bytes: &'static [u8]) -> Change {
+        Change::Chunk {
+            upload,
+            index,
+            bytes: Bytes::from_static(bytes),
+        }
+    }
+
+    /// A compile of the publish of `blob`, uploaded as [`U1`] in chunks of 4.
+    fn publish_call(
+        request: u64,
+        object: &'static [u8],
+        blob: &[u8],
+        expect: Option<Expected>,
+    ) -> ClientCall {
+        compile_change(request, object, publish_of(U1, blob), expect)
+    }
+
+    /// The publish of `blob`, uploaded as `upload` in chunks of 4.
+    fn publish_of(upload: Upload, blob: &[u8]) -> Change {
+        use sha2::Digest as _;
+        Change::Publish {
+            upload,
+            size: blob.len() as u64,
+            chunk_size: 4,
+            sha256: sha2::Sha256::digest(blob).into(),
+        }
+    }
+
+    /// A refusal as `(kind, retry, no_mutation, whether it names a request)`.
+    fn refusal(answer: Answer) -> (ErrorKind, RetryRule, bool, bool) {
+        match answer {
+            Answer::Error { error, request } => (
+                error.kind,
+                error.retry,
+                error.no_mutation,
+                request.is_some(),
+            ),
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// S4-4 main line, 4c, 4x: arch §4 guards 7, 8, 10 and 11, and both blob kinds end to end.
+    /// A repeated chunk, a gc with nothing to collect, and the same publish compile to nothing,
+    /// and nothing is sent. The publish's check 0 needs `serving` to be the adopted generation.
+    /// A chunk under other bytes is UPLOAD_CHUNK_CONFLICT. A chunk or gc with an `expect` is
+    /// refused. A read of a damaged chunk is CORRUPT_BLOB. Every refusal is at the compile and
+    /// names no request.
+    /// Mutants: m7 (empty compile sent) and m8 (`Generation(0)`) answer `Compiled`. m10a and
+    /// m10b (rows dropped) answer `BoundedJitter`. m11 (expect ignored) answers `Unchanged`.
+    /// Trio, about 1 s.
+    #[test]
+    fn a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"b", 0, b"HELL", None)), Ok(2));
+        assert_eq!(trio.write(chunk_call(2, b"b", 1, b"O", None)), Ok(3));
+        let publish = publish_call(3, b"b", b"HELLO", Some(Expected::Absent));
+        assert_eq!(trio.write(publish), Ok(4));
+
+        for (what, call) in [
+            ("the same chunk", chunk_call(4, b"b", 0, b"HELL", None)),
+            (
+                "a gc with nothing to collect",
+                compile_change(5, b"b", Change::Gc { floor: 4 }, None),
+            ),
+            (
+                "the same publish",
+                publish_call(6, b"b", b"HELLO", Some(Expected::Absent)),
+            ),
+        ] {
+            match trio.ask(call) {
+                Answer::Unchanged => {}
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            refusal(trio.ask(chunk_call(7, b"b", 0, b"XXXX", None))),
+            (
+                ErrorKind::UploadChunkConflict,
+                RetryRule::Reconcile,
+                true,
+                false
+            ),
+            "other bytes under a stored chunk"
+        );
+        let stale = Some(Expected::Version(4));
+        for (what, call) in [
+            ("a chunk", chunk_call(8, b"b", 0, b"HELL", stale)),
+            (
+                "a gc",
+                compile_change(9, b"b", Change::Gc { floor: 4 }, stale),
+            ),
+        ] {
+            assert_eq!(
+                refusal(trio.ask(call)),
+                (
+                    ErrorKind::InvalidArgument,
+                    RetryRule::Definitive,
+                    true,
+                    false
+                ),
+                "{what} with an expect"
+            );
+        }
+
+        let range = |trio: &mut Trio, request, offset, len| {
+            trio.look(request, b"b", Look::Range { offset, len })
+                .map(|seen| match seen {
+                    Seen::Range { bytes, .. } => bytes,
+                    other => panic!("a range read: {other:?}"),
+                })
+        };
+        assert_eq!(range(&mut trio, 10, 0, 5), Ok(Bytes::from_static(b"HELLO")));
+
+        // Other bytes over chunk 1, written as `rdb_dev admin damage-chunk` does.
+        let root = root_key(TenantId(1), AFFINITY, b"b");
+        let damage = TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(11),
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: rdb_value::keys::chunk_key(&root, &U1, 1),
+                value: rdb_value::envelope::seal(rdb_value::envelope::Kind::Chunk, b"damaged")
+                    .expect("seven bytes fit an envelope"),
+                expected_version: None,
+            }],
+        };
+        match trio.ask(ClientCall::Resend { request: damage }) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(5)),
+            other => panic!("the damage write: {other:?}"),
+        }
+        assert_eq!(
+            range(&mut trio, 12, 0, 4),
+            Ok(Bytes::from_static(b"HELL")),
+            "chunk 0 is intact"
+        );
+        match range(&mut trio, 13, 4, 1) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptBlob, RetryRule::Quarantine, false)
+            ),
+            Ok(bytes) => panic!("a damaged chunk read as {bytes:?}"),
+        }
+
+        // A blob root whose envelope does not open is none of the four blob variants: it is
+        // CORRUPT_HISTORY, as for any object (review F4).
+        let damage = TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(14),
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: root.to_bytes(),
+                value: Bytes::from_static(b"not an envelope"),
+                expected_version: None,
+            }],
+        };
+        match trio.ask(ClientCall::Resend { request: damage }) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(6)),
+            other => panic!("the root damage write: {other:?}"),
+        }
+        match range(&mut trio, 15, 0, 4) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, false)
+            ),
+            Ok(bytes) => panic!("a damaged root read as {bytes:?}"),
+        }
+    }
+
+    /// S4-4 4h, C-3: arch §4 guard 9. With both secondaries cut off, node 1 applies a publish
+    /// that cannot publish. The same publish re-issued meanwhile finds its blob at the root, but
+    /// above P1's published seq. So it is UNKNOWN_OUTCOME at the compile, naming no request, and
+    /// never `unchanged`. After the heal the held publish publishes, and the re-issue is
+    /// `unchanged`. Mutant m9 (the check dropped) answers `Unchanged` while held.
+    /// Trio, about 1 s.
+    #[test]
+    fn a_publish_reissued_before_its_blob_publishes_is_an_unknown_outcome_not_unchanged() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"h", 0, b"abcd", None)), Ok(2));
+        let publish = |request| publish_call(request, b"h", b"abcd", Some(Expected::Absent));
+        let request = match trio.ask(publish(2)) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile the publish: {other:?}"),
+        };
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let held = trio.call(ClientCall::Resend { request });
+        trio.until("node 1 applied the publish", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+
+        assert_eq!(
+            refusal(trio.ask(publish(3))),
+            (
+                ErrorKind::UnknownOutcome,
+                RetryRule::QueryStatus,
+                false,
+                false
+            ),
+            "the blob is at the root and not published"
+        );
+        assert!(held.try_recv().is_err(), "no copy acknowledged the publish");
+
+        trio.links.heal_all();
+        match trio.answer(&held) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("the held publish after the heal: {other:?}"),
+        }
+        match trio.ask(publish(4)) {
+            Answer::Unchanged => {}
+            other => panic!("the publish once published: {other:?}"),
+        }
+    }
+
+    /// Review F1 (A-R133), C-3 and ADR-rdb-0014 O9: "already published" is a read, so it is
+    /// given only while a read would be. A blob publishes; the control store then fails until
+    /// A1 fences node 1, and a plain read is refused. The same publish re-issued meanwhile is
+    /// refused as that read is, and sends nothing, so it says `no_mutation`. Once the store
+    /// returns and node 1 admits again, the re-issue is `unchanged`. Mutant m24 (the read gate
+    /// cut) answers `Unchanged` while fenced, as 2cc5b24 did; mutant m28 (`no_mutation` not set)
+    /// says `false`.
+    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn a_publish_reissued_while_fenced_is_refused_as_a_read_is_and_unchanged_once_admitted() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"f", 0, b"abcd", None)), Ok(2));
+        let publish = |request| publish_call(request, b"f", b"abcd", Some(Expected::Absent));
+        assert_eq!(trio.write(publish(2)), Ok(3));
+
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
+        let read = ClientCall::Get {
+            identity: identity(3),
+            object: Bytes::from_static(b"f"),
+            look: Look::Range { offset: 0, len: 4 },
+        };
+        let refused = match trio.ask(read) {
+            Answer::Read {
+                outcome: ReadServiceOutcome::Rejected(kind),
+                ..
+            } => crate::db::refused_read(kind),
+            other => panic!("a read while fenced: {other:?}"),
+        };
+        assert_eq!(
+            refusal(trio.ask(publish(4))),
+            (refused.kind, refused.retry, true, false),
+            "the publish while fenced, as the read ({refused:?}) but sending nothing"
+        );
+
+        trio.mem.stop_failing();
+        trio.ready();
+        match trio.ask(publish(5)) {
+            Answer::Unchanged => {}
+            other => panic!("the publish once node 1 admits again: {other:?}"),
+        }
+    }
+
+    /// Review F-002, the Set arm: arch §4 guard 2. A set change compiled at version 2 and sent
+    /// after another write moved the set to 3 is refused by the kernel, on the version the
+    /// compile attached. Mutant m15 (the Set arm's version guard cut from what it compiles)
+    /// publishes it. Trio, about 1 s.
+    #[test]
+    fn a_set_change_sent_after_the_set_moved_is_refused_by_the_kernel() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let add = |n| Change::Set(vec![ElemOp::Add(int(n))]);
+        let created = compile_change(1, b"s", add(1), Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let stale = trio.compiled(compile_change(2, b"s", add(2), None));
+        assert_eq!(trio.write(compile_change(3, b"s", add(3), None)), Ok(3));
+        assert_eq!(
+            trio.sent(stale),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "compiled at version 2, sent at 3"
+        );
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        match trio.look(4, b"s", members) {
+            Ok(Seen::Members(page)) => {
+                let keys: Vec<_> = page.members.into_iter().map(|m| m.key).collect();
+                assert_eq!(keys, vec![int(1), int(3)], "2 was never added");
+            }
+            other => panic!("members of s: {other:?}"),
+        }
+    }
+
+    /// Review F2 (A-R133), the Map arm: arch §4 guard 2. A map change compiled at version 2 and
+    /// sent after another write moved the map to 3 is refused by the kernel, on the version the
+    /// compile attached. The map keeps the other write's keys, values and count. Mutant m23 (the
+    /// Map arm's version guard cut from what it compiles) publishes it. Trio, about 1 s.
+    #[test]
+    fn a_map_change_sent_after_the_map_moved_is_refused_by_the_kernel() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let put = |key, n| Change::Map(vec![ElemOp::Put(text(key), int(n))]);
+        let created = compile_change(1, b"m", put("a", 1), Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let stale = trio.compiled(compile_change(2, b"m", put("b", 2), None));
+        assert_eq!(
+            trio.write(compile_change(3, b"m", put("c", 3), None)),
+            Ok(3)
+        );
+        assert_eq!(
+            trio.sent(stale),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "compiled at version 2, sent at 3"
+        );
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        match trio.look(4, b"m", members) {
+            Ok(Seen::Members(page)) => {
+                let entries: Vec<_> = page.members.into_iter().map(|m| (m.key, m.value)).collect();
+                assert_eq!(
+                    (page.collection.version, page.collection.count, entries),
+                    (
+                        3,
+                        2,
+                        vec![(text("a"), Some(int(1))), (text("c"), Some(int(3)))]
+                    ),
+                    "b was never put"
+                );
+            }
+            other => panic!("members of m: {other:?}"),
+        }
+    }
+
+    /// Review F-002, the Publish arm: arch §4 guard 2. A publish of upload 2 compiled over the
+    /// blob at version 3 and sent after a publish of upload 3 replaced it is refused by the
+    /// kernel. Mutant m16 (the Publish arm's version guard cut from what it compiles) publishes
+    /// it. Trio, about 1 s.
+    #[test]
+    fn a_publish_sent_after_the_blob_moved_is_refused_by_the_kernel() {
+        const U2: Upload = [2; 16];
+        const U3: Upload = [3; 16];
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"p", 0, b"abcd", None)), Ok(2));
+        let first = publish_call(2, b"p", b"abcd", Some(Expected::Absent));
+        assert_eq!(trio.write(first), Ok(3));
+        let chunk = |request, upload, bytes| {
+            compile_change(request, b"p", chunk_of(upload, 0, bytes), None)
+        };
+        assert_eq!(trio.write(chunk(3, U2, b"wxyz")), Ok(4));
+        assert_eq!(trio.write(chunk(4, U3, b"1234")), Ok(5));
+        let stale = trio.compiled(compile_change(5, b"p", publish_of(U2, b"wxyz"), None));
+        let replace = publish_of(U3, b"1234");
+        let replace = compile_change(6, b"p", replace, Some(Expected::Version(3)));
+        assert_eq!(trio.write(replace), Ok(6));
+        assert_eq!(
+            trio.sent(stale),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "compiled over version 3, sent at 6"
+        );
+        match trio.look(7, b"p", Look::Range { offset: 0, len: 4 }) {
+            Ok(Seen::Range { blob, bytes }) => assert_eq!(
+                (blob.version, blob.manifest.upload, bytes),
+                (6, U3, Bytes::from_static(b"1234"))
+            ),
+            other => panic!("a range read of p: {other:?}"),
+        }
+    }
+
+    /// Review F-003: arch §4 guards 2 and 12 together. A list edit with a stale guard and a
+    /// position outside the list is CONDITION_FAILED, not INVALID_ARGUMENT: the guard is
+    /// compiled first, so a write that raced this one reads as the race. So is an edit to a
+    /// list that is not there. Mutant m17 (`list_compile` returns the position's refusal without
+    /// compiling the guard) answers INVALID_ARGUMENT for both. Trio, about 1 s.
+    #[test]
+    fn a_stale_list_edit_at_a_bad_position_is_a_condition_failure() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let push = |s: &str| ListEdit::Push(text(s));
+        let created = Change::List(vec![push("a"), push("b"), push("c")]);
+        let created = compile_change(1, b"l", created, Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let more = compile_change(2, b"l", Change::List(vec![push("d")]), None);
+        assert_eq!(trio.write(more), Ok(3));
+        for (request, object, at) in [(3, &b"l"[..], -5), (4, &b"none"[..], 0)] {
+            let call = ClientCall::Compile {
+                identity: identity(request),
+                puts: vec![PutOp {
+                    group: AFFINITY,
+                    object: Bytes::copy_from_slice(object),
+                    change: Change::List(vec![ListEdit::Remove { at }]),
+                    expect: Some(Expected::Version(2)),
+                }],
+                remaining_millis: 5_000,
+            };
+            assert_eq!(
+                trio.write(call),
+                Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
+                "remove {at} at version 2 of {object:?}"
+            );
+        }
+    }
+
+    /// Review F-004: a gc's floor reaches `collect_garbage` as the caller gave it. Two chunks of
+    /// an upload nothing publishes, at versions 2 and 3: a gc with floor 2 deletes the first and
+    /// keeps the second, so the first compiles to a write again and the second to nothing.
+    /// Mutant m18a (floor 0) collects nothing, so the gc answers `Unchanged`; m18b (floor
+    /// `u64::MAX`) collects both. Trio, about 1 s.
+    #[test]
+    fn a_gc_deletes_the_unnamed_chunks_at_or_below_its_floor_and_keeps_the_rest() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"g", 0, b"abcd", None)), Ok(2));
+        assert_eq!(trio.write(chunk_call(2, b"g", 1, b"ef", None)), Ok(3));
+        let gc = compile_change(3, b"g", Change::Gc { floor: 2 }, None);
+        assert_eq!(trio.write(gc), Ok(4));
+        match trio.ask(chunk_call(4, b"g", 0, b"abcd", None)) {
+            Answer::Compiled(_) => {}
+            other => panic!("chunk 0, at version 2, was collected: {other:?}"),
+        }
+        match trio.ask(chunk_call(5, b"g", 1, b"ef", None)) {
+            Answer::Unchanged => {}
+            other => panic!("chunk 1, at version 3, was kept: {other:?}"),
+        }
+    }
+
+    /// Review F-008, the `GenerationChanged` half of a stale token (C-2): a token from another
+    /// generation is `STALE_CONTINUATION`, retry `Reconcile`, as one from another list version
+    /// is. Forged here, since no generation changes in a Trio row. Mutant m21 (that variant cut
+    /// from the arm) answers `INVALID_ARGUMENT`. Trio, about 1 s.
+    #[test]
+    fn a_token_from_another_generation_must_reconcile() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let created = Change::List(vec![ListEdit::Push(text("a")), ListEdit::Push(text("b"))]);
+        let created = compile_change(1, b"l", created, Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let first = match trio.look(2, b"l", Look::Items { at: 0, limit: 1 }) {
+            Ok(Seen::Items(items)) => items,
+            other => panic!("items of l: {other:?}"),
+        };
+        let token = first.next.expect("a page of 1 of 2 has a next token");
+        let forged = Token {
+            generation: Generation(token.generation.0 + 1),
+            ..token
+        };
+        match trio.look(
+            3,
+            b"l",
+            Look::ItemsAfter {
+                token: forged,
+                limit: 10,
+            },
+        ) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry),
+                (ErrorKind::StaleContinuation, RetryRule::Reconcile),
+                "{error:?}"
+            ),
+            Ok(seen) => panic!(
+                "a token from generation {} read: {seen:?}",
+                forged.generation.0
+            ),
         }
     }
 
@@ -6590,6 +7720,24 @@ mod tests {
             });
         }
 
+        /// [`Self::ready`], and node 1's grant runs at least `millis` more (A-R123, A-R124).
+        /// Under full-suite load a grant sometimes stops renewing and lapses; `admits` stays
+        /// true until the fence, but a check in the last 100 ms is refused `LEASE_EXPIRED`
+        /// (seen 2026-10-19 at margin 29 ms). A lapsed grant makes this wait for the fence and
+        /// the re-acquire.
+        fn admits_for(&mut self, millis: u64) {
+            self.until("node 1 admits writes with time left on its grant", |trio| {
+                let now = trio.clock.now().0;
+                let left = trio.nodes[0]
+                    .0
+                    .authority_views
+                    .get(&PartitionId(1))
+                    .map(|view| view.valid_through_tick.0.saturating_sub(now));
+                (trio.status(0).admits == Some(true) && left.is_some_and(|left| left >= millis))
+                    .then_some(())
+            });
+        }
+
         /// The head node 1 has applied.
         fn head(&self) -> Option<u64> {
             self.status(0).holds.map(|held| held.applied)
@@ -6616,6 +7764,397 @@ mod tests {
         fn ask(&mut self, call: ClientCall) -> Answer {
             let answer = self.call(call);
             self.answer(&answer)
+        }
+    }
+
+    /// A `ClientCall::Compile` of one change to `object`, as `Db::write` sends first.
+    fn compile_change(
+        request: u64,
+        object: &'static [u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> ClientCall {
+        ClientCall::Compile {
+            identity: identity(request),
+            puts: vec![PutOp {
+                group: AFFINITY,
+                object: Bytes::from_static(object),
+                change,
+                expect,
+            }],
+            remaining_millis: 5_000,
+        }
+    }
+
+    fn text(s: &str) -> Value {
+        Value::Text(s.to_owned())
+    }
+
+    fn int(n: u64) -> Value {
+        Value::Integer(Int::from(n))
+    }
+
+    fn json_map(entries: &[(&str, Value)]) -> Value {
+        let mut map = Map::new();
+        for (key, value) in entries {
+            map.insert(MapKey::new(*key), value.clone());
+        }
+        Value::Map(map)
+    }
+
+    fn path(text: &str) -> Path {
+        Path::parse(text).expect("a path")
+    }
+
+    /// Where a write was refused, as `rdb_dev` prints it: the compile answered an error, so no
+    /// request was built (`request=-`), or it compiled and the kernel refused the request it was
+    /// sent as (`request=<R>`).
+    #[derive(Debug, PartialEq, Eq)]
+    enum Refused {
+        AtCompile(ErrorKind),
+        ByKernel(ErrorKind),
+    }
+
+    impl Trio {
+        /// Compile `call`, then send what it compiled to, as `Db::write` does. `Ok` is the
+        /// published seq.
+        fn write(&mut self, call: ClientCall) -> Result<u64, Refused> {
+            let request = match self.ask(call) {
+                Answer::Compiled(request) => request,
+                Answer::Error { error, .. } => return Err(Refused::AtCompile(error.kind)),
+                other => panic!("compile: {other:?}"),
+            };
+            self.sent(request)
+        }
+
+        /// The request `call` compiles to, not yet sent.
+        fn compiled(&mut self, call: ClientCall) -> TxnRequest {
+            match self.ask(call) {
+                Answer::Compiled(request) => request,
+                other => panic!("compile: {other:?}"),
+            }
+        }
+
+        /// Send `request`, as [`Self::write`] does once it has compiled.
+        fn sent(&mut self, request: TxnRequest) -> Result<u64, Refused> {
+            match self.ask(ClientCall::Resend { request }) {
+                Answer::Txn { result, .. } => Ok(result.seq.0),
+                Answer::Error { error, .. } => Err(Refused::ByKernel(error.kind)),
+                other => panic!("send: {other:?}"),
+            }
+        }
+
+        /// What a read of `object` through `look` saw, or its refusal.
+        fn look(
+            &mut self,
+            request: u64,
+            object: &'static [u8],
+            look: Look,
+        ) -> Result<Seen, ApiError> {
+            let call = ClientCall::Get {
+                identity: identity(request),
+                object: Bytes::from_static(object),
+                look,
+            };
+            match self.ask(call) {
+                Answer::Read { seen, .. } => Ok(seen),
+                Answer::Error { error, .. } => Err(error),
+                other => panic!("read: {other:?}"),
+            }
+        }
+    }
+
+    /// S4-1 (main line, 1k): arch §4 guards 1 and 2. A stale `Version` guard is refused by the
+    /// compile, before a request exists. A create over an existing document compiles, and the
+    /// kernel refuses it on the `Absent` condition the compile attached. Mutant m1 (the compile
+    /// ignores `expect`) publishes the stale change; m2 (conditions dropped) publishes the
+    /// create and empties the document. Trio, about 1 s.
+    #[test]
+    fn a_stale_document_change_is_refused_by_the_compile_and_a_create_over_one_by_the_kernel() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let replace = |value: Value| Change::Doc(Delta(vec![Op::Replace(value)]));
+        let created = json_map(&[
+            ("n", int(1)),
+            ("tags", Value::Array(vec![text("a"), text("x")])),
+        ]);
+        assert_eq!(
+            trio.write(compile_change(
+                1,
+                b"d",
+                replace(created),
+                Some(Expected::Absent)
+            )),
+            Ok(2)
+        );
+        let change = Change::Doc(Delta(vec![
+            Op::Increment(path("/n"), Int::from(5_u64)),
+            Op::Set(path("/tags/1"), text("b")),
+        ]));
+        assert_eq!(
+            trio.write(compile_change(2, b"d", change, Some(Expected::Version(2)))),
+            Ok(3)
+        );
+        let changed = Seen::Doc(Document {
+            version: 3,
+            value: json_map(&[
+                ("n", int(6)),
+                ("tags", Value::Array(vec![text("a"), text("b")])),
+            ]),
+        });
+        assert_eq!(trio.look(3, b"d", Look::Doc), Ok(changed.clone()));
+
+        let stale = Change::Doc(Delta(vec![Op::Increment(path("/n"), Int::from(1_u64))]));
+        assert_eq!(
+            trio.write(compile_change(4, b"d", stale, Some(Expected::Version(2)))),
+            Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
+            "a stale guard is refused before a request exists"
+        );
+        let over = replace(json_map(&[]));
+        assert_eq!(
+            trio.write(compile_change(5, b"d", over, Some(Expected::Absent))),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "a create compiles without reading; the kernel's Absent condition refuses it"
+        );
+        assert_eq!(trio.look(6, b"d", Look::Doc), Ok(changed), "d is unchanged");
+    }
+
+    /// S4-2 (2n, 2k, 2p): arch §4 guards 2, 3 and 5. A failed `need` is a failed condition,
+    /// either way round. A create over an existing map is refused by the kernel. A document read
+    /// of a map is refused, never `absent`. Mutant m3 (the element arm cut) answers
+    /// `INVALID_ARGUMENT` for the needs; m5 (read errors as `Seen::Absent`) reads the map as
+    /// absent; m2 publishes the create. Trio, about 1 s.
+    #[test]
+    fn a_failed_need_is_a_condition_failure_and_a_map_never_reads_as_a_document() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let map = Change::Map(vec![
+            ElemOp::Put(text("a"), int(1)),
+            ElemOp::Put(text("b"), int(2)),
+        ]);
+        assert_eq!(
+            trio.write(compile_change(1, b"m", map, Some(Expected::Absent))),
+            Ok(2)
+        );
+        let set = Change::Set(vec![ElemOp::Add(int(1))]);
+        assert_eq!(
+            trio.write(compile_change(2, b"s", set, Some(Expected::Absent))),
+            Ok(3)
+        );
+
+        for (request, need) in [
+            (3, ElemOp::NeedPresent(int(9))),
+            (4, ElemOp::NeedAbsent(int(1))),
+        ] {
+            let change = Change::Set(vec![need.clone()]);
+            assert_eq!(
+                trio.write(compile_change(
+                    request,
+                    b"s",
+                    change,
+                    Some(Expected::Version(3))
+                )),
+                Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
+                "{need:?}"
+            );
+        }
+        let over = Change::Map(vec![ElemOp::Put(text("z"), int(1))]);
+        assert_eq!(
+            trio.write(compile_change(5, b"m", over, Some(Expected::Absent))),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "a create over the map is the kernel's refusal"
+        );
+        match trio.look(6, b"m", Look::Doc) {
+            Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
+            Ok(seen) => panic!("a map read as a document: {seen:?}"),
+        }
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        match trio.look(7, b"m", members) {
+            Ok(Seen::Members(page)) => {
+                let keys: Vec<_> = page
+                    .members
+                    .iter()
+                    .map(|member| member.key.clone())
+                    .collect();
+                assert_eq!(
+                    (page.collection.version, page.collection.count, keys),
+                    (2, 2, vec![text("a"), text("b")]),
+                    "m is as created"
+                );
+            }
+            other => panic!("members of m: {other:?}"),
+        }
+    }
+
+    /// S4-3 3n2, 3n4, 3n5, 3n6 and the running count (3x): arch §4 guards 12 and 13 (A-R116).
+    /// `-k` names `count - k`; a position below 0 or past the end is refused, naming the edit;
+    /// each push or insert moves the count up and each remove moves it down, so a later edit
+    /// resolves against the list as the earlier edits leave it. Mutant m12a (below 0 clamps to 0)
+    /// removes item 0; m12b (negatives never resolved) refuses `-1`; m12c (off by one) removes
+    /// item 1; m13 (a push does not move the count) removes the old last item. Unit.
+    #[test]
+    fn a_negative_position_counts_from_the_end_of_the_list_the_earlier_edits_leave() {
+        let z = || Value::Text("z".to_owned());
+        assert_eq!(
+            resolve_edits(&[ListEdit::Remove { at: -1 }], 3),
+            Ok(vec![ListOp::Remove { at: 2 }]),
+            "-1 is the last item"
+        );
+        assert_eq!(
+            resolve_edits(&[ListEdit::Push(z()), ListEdit::Remove { at: -1 }], 3),
+            Ok(vec![ListOp::Push(z()), ListOp::Remove { at: 3 }]),
+            "the push moved the end"
+        );
+        assert_eq!(
+            resolve_edits(
+                &[
+                    ListEdit::Insert { at: -1, value: z() },
+                    ListEdit::Move { from: -1, to: 0 }
+                ],
+                2
+            ),
+            Ok(vec![
+                ListOp::Insert { at: 1, value: z() },
+                ListOp::Move { from: 2, to: 0 }
+            ]),
+            "the insert moved the end"
+        );
+        assert_eq!(
+            resolve_edits(&[ListEdit::Replace { at: -1, value: z() }], 3),
+            Ok(vec![ListOp::Replace { at: 2, value: z() }]),
+            "a replace resolves -1 as every edit does"
+        );
+        for (edits, count, refused) in [
+            (
+                vec![ListEdit::Remove { at: -4 }],
+                3,
+                "edit 0: position -4 is not inside the list of 3",
+            ),
+            (
+                vec![ListEdit::Remove { at: -1 }, ListEdit::Remove { at: -1 }],
+                1,
+                "edit 1: position -1 is not inside the list of 0",
+            ),
+            (
+                vec![ListEdit::Insert { at: -1, value: z() }],
+                0,
+                "edit 0: position -1 is not inside the list of 0",
+            ),
+            (
+                vec![ListEdit::Replace { at: 3, value: z() }],
+                3,
+                "edit 0: position 3 is not inside the list of 3",
+            ),
+        ] {
+            let error = resolve_edits(&edits, count).expect_err(refused);
+            assert_eq!(
+                (error.kind, error.detail.as_str()),
+                (ErrorKind::InvalidArgument, refused)
+            );
+        }
+    }
+
+    /// Review F-008: an insert may name the count, the end of the list; no other edit may.
+    /// Mutant m19 (the end never allowed) refuses it. Unit.
+    #[test]
+    fn an_insert_at_the_count_adds_at_the_end() {
+        let z = Value::Text("z".to_owned());
+        assert_eq!(
+            resolve_edits(
+                &[ListEdit::Insert {
+                    at: 3,
+                    value: z.clone()
+                }],
+                3
+            ),
+            Ok(vec![ListOp::Insert { at: 3, value: z }])
+        );
+    }
+
+    /// Review F-008: a move's destination counts from the end when negative, as its source
+    /// does: `-1` is the last position. Mutant m20 (`to` never resolved) refuses it. Unit.
+    #[test]
+    fn a_move_to_a_negative_position_counts_from_the_end() {
+        assert_eq!(
+            resolve_edits(&[ListEdit::Move { from: 0, to: -1 }], 3),
+            Ok(vec![ListOp::Move { from: 0, to: 2 }])
+        );
+    }
+
+    /// S4-3 3n1, 3n2, 3e and 3t: arch §4 guards 14, 12 and 4. A read's negative `--from`
+    /// resolves against the list the read sees, and a start before 0 or past the end is refused.
+    /// `-4` of 3 is refused by the compile, before a request exists. A fresh continuation token
+    /// continues after its page; one whose list has changed is `STALE_CONTINUATION` with retry
+    /// `Reconcile`, as the kernel's own stale continuation is. Mutant m14 (resolved against 0)
+    /// refuses `-1`; m12c (off by one) lists from item 1; m12a publishes the `-4` remove; m4a
+    /// (built with `ApiError::new`) answers retry `BoundedJitter`; m4b (the arm cut) answers
+    /// `CONDITION_FAILED`. Trio, about 1 s.
+    #[test]
+    fn a_list_read_resolves_its_start_against_the_list_and_a_stale_token_must_reconcile() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let push = |s: &str| ListEdit::Push(text(s));
+        let created = Change::List(vec![push("a"), push("b"), push("c")]);
+        assert_eq!(
+            trio.write(compile_change(1, b"l", created, Some(Expected::Absent))),
+            Ok(2)
+        );
+        let page = |seen: Result<Seen, ApiError>| match seen {
+            Ok(Seen::Items(items)) => items,
+            other => panic!("items of l: {other:?}"),
+        };
+        let last = page(trio.look(2, b"l", Look::Items { at: -1, limit: 10 }));
+        let listed = |items: Items| -> Vec<(u64, Value)> {
+            items
+                .items
+                .into_iter()
+                .map(|item| (item.position, item.value))
+                .collect()
+        };
+        assert_eq!(listed(last), vec![(2, text("c"))], "-1 is the last of 3");
+        for (request, at) in [(3, -4), (4, 99)] {
+            match trio.look(request, b"l", Look::Items { at, limit: 10 }) {
+                Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
+                Ok(seen) => panic!("a read from {at} of 3 was answered: {seen:?}"),
+            }
+        }
+
+        let past = Change::List(vec![ListEdit::Remove { at: -4 }]);
+        assert_eq!(
+            trio.write(compile_change(5, b"l", past, Some(Expected::Version(2)))),
+            Err(Refused::AtCompile(ErrorKind::InvalidArgument)),
+            "-4 of 3 is refused before a request exists"
+        );
+
+        let first = page(trio.look(6, b"l", Look::Items { at: 0, limit: 2 }));
+        let token = first.next.expect("a page of 2 of 3 has a next token");
+        let rest = page(trio.look(7, b"l", Look::ItemsAfter { token, limit: 10 }));
+        assert_eq!(
+            listed(rest),
+            vec![(2, text("c"))],
+            "a fresh token continues after its page"
+        );
+        let more = Change::List(vec![push("z")]);
+        assert_eq!(
+            trio.write(compile_change(8, b"l", more, Some(Expected::Version(2)))),
+            Ok(3)
+        );
+        match trio.look(9, b"l", Look::ItemsAfter { token, limit: 10 }) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry),
+                (ErrorKind::StaleContinuation, RetryRule::Reconcile),
+                "{error:?}"
+            ),
+            Ok(seen) => panic!("a token from before the push still read: {seen:?}"),
         }
     }
 }

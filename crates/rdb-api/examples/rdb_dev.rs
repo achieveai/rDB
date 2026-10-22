@@ -15,8 +15,13 @@
 //! `retry` of a trimmed request is no longer recognised and is sent afresh; every rdb_dev write
 //! carries a version condition, so it answers `CONDITION_FAILED` rather than applying twice.
 //!
-//! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
-//! on spaces; `"..."` makes one word, so `""` is an empty object or value:
+//! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
+//! word starts a comment; one inside a word, as in `{"tag":"#1"}`, or inside a `"..."`
+//! string, as in `{"m":"hello #world"}`, is kept, so a comment after JSON needs a space
+//! before its `#`: `{"a":1} # note`, not `{"a":1}# note`. Words split on
+//! spaces; `"..."` makes one word, so `""` is an empty object or value. A value verb (`doc`,
+//! `map`, `set`, `members`, `list`, `items`) reads its JSON values from the line as written,
+//! quotes and all:
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
@@ -40,7 +45,74 @@
 //! retry [<request>] --payload <value>     the same put and request id with another value,
 //!                                         compiled afresh (REQUEST_ID_REUSE); not remembered.
 //!                                         A put's only, never a txn's
-//! get <object>                            read at the publication barrier
+//! doc <object> [--absent | --expect V] <op>...
+//!                                         change a JSON document, ops in order, as one write.
+//!                                         An op is `--json J` (the whole document), `set
+//!                                         <path> J`, `remove <path>` or `incr <path> N`; a path
+//!                                         is `/a/0`. `--absent`: only if missing; `--expect
+//!                                         V`: only at version V; neither: at the version the
+//!                                         owner sees. `retry` resends it unchanged; `retry
+//!                                         --payload` refuses it
+//! map|set <object> [--absent | --expect V] <op>...
+//!                                         change a map or a set, ops in order, as one write.
+//!                                         An op is `put K J`, `add K`, `del K` or `need K
+//!                                         present|absent`; K is a JSON scalar, or
+//!                                         `{"$bytes":"<hex>"}` for a byte string. A map takes
+//!                                         `put`, a set `add`: the other is refused
+//!                                         (`KindMismatch`). No ops with `--absent` creates an
+//!                                         empty one. Guards and `retry` as for `doc`
+//! members <object> [--after K] [--limit N]
+//!                                         a page of a map or set in key order (type, then
+//!                                         value: `3` before `1.5`), after K or
+//!                                         from the first, N at most (default 100): `map
+//!                                         version=V count=C listed=L ...`, then `  K = J` per
+//!                                         entry or `  K` per member
+//! list <object> [--absent | --expect V] <op>...
+//!                                         change a list, ops in order, as one write. An op is
+//!                                         `push J`, `insert P J`, `remove P`, `replace P J` or
+//!                                         `move P Q`. A negative P counts from the end (`-1`
+//!                                         is the last item), read against the list as the
+//!                                         earlier ops left it. No ops with `--absent` creates
+//!                                         an empty list. Guards and `retry` as for `doc`
+//! items <object> [--from P | --token G:V:P] [--limit N]
+//!                                         a page of a list from position P (default 0; `-1`
+//!                                         the last) or from a page's token, N at most
+//!                                         (default 100): `list version=V count=C listed=L
+//!                                         ...`, then `  P J` per item (`inline=false` when it
+//!                                         has its own record), then `token=G:V:P` when items
+//!                                         remain. A token the list moved past answers
+//!                                         `STALE_CONTINUATION`: read again from the start
+//! blob upload <object> [--absent | --expect V] --upload U --chunk-size N <text>
+//!       [--stop-after K]                  store <text> as a blob: chunk i is its bytes from
+//!                                         i*N, each one write (`chunk i ok ...`), then the
+//!                                         publish (`publish ok ...`). U, the upload id, is 32
+//!                                         hex digits the caller picks. The guard is the
+//!                                         publish's; chunks take none. It stops at a refused
+//!                                         chunk. `--stop-after K` sends K chunks, then prints
+//!                                         the `blob publish` line to finish with. `""` is a
+//!                                         blob of no chunks
+//! blob chunk <object> --upload U --index I <text>
+//!                                         store one chunk. The same bytes again answer
+//!                                         `unchanged (already stored)`, and send nothing
+//! blob publish <object> [--absent | --expect V] --upload U --size N --chunk-size N
+//!       --sha256 H                        publish upload U as the blob; H is 64 hex digits.
+//!                                         That blob already there and published answers
+//!                                         `unchanged (already published)`; already there
+//!                                         but not yet published, `UNKNOWN_OUTCOME` with
+//!                                         `request=-`: ask `status` of the publish that
+//!                                         wrote it. While reads are refused, as after a
+//!                                         fence, it answers as `read` does. Each sends
+//!                                         nothing
+//! blob gc <object> --floor F             delete one batch of the object's chunks its blob
+//!                                         does not name, at versions up to F. Nothing left to
+//!                                         delete answers `unchanged (nothing to collect)`
+//! read <object> [--offset O --len L]      read a blob at the publication barrier: `blob
+//!                                         version=V size=S chunks=N upload=U ...`, with
+//!                                         `bytes="..."` for a range of at least one byte.
+//!                                         Without `--offset`/`--len` it reads the manifest
+//!                                         only, so a damaged chunk shows on a range read only
+//! get <object>                         read at the publication barrier: `value=` for a byte
+//!                                         string, `doc=<json>` for any other document
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
@@ -83,6 +155,11 @@
 //!                                         in M9 (no takeover runs), `partition-in-transfer
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
+//! admin damage-chunk <o> --upload U --index I
+//!                                         dev only: overwrite that stored chunk with other
+//!                                         bytes, so a range read over it (`--offset`/`--len`)
+//!                                         is `CORRUPT_BLOB`. A plain `read` reads the
+//!                                         manifest only and does not see it
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store
@@ -152,6 +229,8 @@
 
 #[path = "support/hostile_store.rs"]
 mod hostile_store;
+#[path = "../../rdb-value/examples/doc_scenario/json.rs"]
+mod json;
 
 use std::io::{BufRead, Write as _};
 use std::path::PathBuf;
@@ -168,7 +247,10 @@ use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::TestTimers;
 use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
-use rdb_api::{ApiError, Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
+use rdb_api::{
+    ApiError, Change, CollectionKind, Db, DbConfig, Delta, ElemOp, Expected, Int, ListEdit, Look,
+    Op, OpenError, Path, PutError, ReadOk, Timeouts, Token, TxnPut, Value,
+};
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::contracts::authority::DenyReason;
@@ -177,6 +259,7 @@ use rdb_core::contracts::errors::RetryRule;
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{AffinityId, BootId, Generation, NodeId, PartitionId, RequestId};
 use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
+use sha2::{Digest as _, Sha256};
 
 use hostile_store::{HostileStore, ListFault, PutFault};
 
@@ -700,6 +783,12 @@ fn waits_on_line(
     let seq = owner.waits_on.filter(|_| owner.fence.is_none())?;
     let node = owner.node.0;
     let what = match owner.in_flight {
+        // The kernel's own start record carries a reserved id, not a client's (PB-3).
+        Some(request)
+            if request == rdb_core::contracts::ids::RequestIdentity::START_RECORD.request =>
+        {
+            format!("the start record's outcome (seq {})", seq.0)
+        }
         Some(request) => format!("request {}'s outcome (seq {})", request.0, seq.0),
         None => format!("the outcome of seq {}", seq.0),
     };
@@ -949,6 +1038,30 @@ fn repl<'scope, 'env>(
             say(&format!("> {line}"));
         }
         tracing::info!(command = %line, "repl_command");
+        // A value verb reads its JSON from the raw line (risk R1), so it skips `split_words`.
+        if let Some(verb) = line
+            .split_whitespace()
+            .next()
+            .filter(|verb| VALUE_VERBS.contains(verb))
+        {
+            let read = match verb {
+                "members" => Some(parse_members(&line)),
+                "items" => Some(parse_items(&line)),
+                _ => None,
+            };
+            let done = if let Some(read) = read {
+                read.map(|(object, look)| read_line(db.read(object.as_bytes(), look)))
+            } else {
+                parse_change(&line).map(|(object, expect, change)| {
+                    write_line(db, db.write(object.as_bytes(), change, expect), &mut sent);
+                })
+            };
+            if let Err(e) = done {
+                say(&format!("usage: {e}; {}", usage_of(verb)));
+                bad = true;
+            }
+            continue;
+        }
         let words = match split_words(&line) {
             Ok(words) => words,
             Err(e) => {
@@ -1016,7 +1129,7 @@ fn repl<'scope, 'env>(
             },
             ["retry", rest @ ..] => sent.pick(rest).map(|(request, kind)| {
                 let answer = match kind {
-                    Kind::Put { .. } => db.resend(request),
+                    Kind::Put { .. } | Kind::Value => db.resend(request),
                     // A txn waits as it was sent: its own deadline, not the put timeout.
                     Kind::Txn => {
                         let deadline = Duration::from_millis(request.remaining_millis);
@@ -1026,9 +1139,18 @@ fn repl<'scope, 'env>(
                 put_line(db, answer, None);
             }),
             ["get", object] => {
-                get_line(db.get(object.as_bytes()));
+                read_line(db.read(object.as_bytes(), Look::Doc));
                 Ok(())
             }
+            ["blob", "upload", object, rest @ ..] => blob_upload(db, object, rest, &mut sent),
+            ["blob", "chunk", object, rest @ ..] => blob_chunk(db, object, rest, &mut sent),
+            ["blob", "publish", object, rest @ ..] => blob_publish(db, object, rest, &mut sent),
+            ["blob", "gc", object, rest @ ..] => blob_gc(db, object, rest, &mut sent),
+            ["blob", ..] => Err(BLOB_USAGE.to_owned()),
+            ["read", object, rest @ ..] => parse_range(rest).map(|look| {
+                read_line(db.read(object.as_bytes(), look));
+            }),
+            ["read", ..] => Err(READ_USAGE.to_owned()),
             ["get", object, "--previous"] => {
                 get_line(db.get_previous(object.as_bytes()));
                 Ok(())
@@ -1062,7 +1184,10 @@ fn repl<'scope, 'env>(
                     },
                 );
             }),
-            ["admin", ..] => Err("admin clear-grant <n>: n is 1, 2 or 3".to_owned()),
+            ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
+            ["admin", ..] => Err(format!(
+                "admin clear-grant <n>: n is 1, 2 or 3 | {DAMAGE_USAGE}"
+            )),
             ["control", "lifecycle", partition, word] => {
                 parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
                     say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
@@ -1200,8 +1325,783 @@ fn repl<'scope, 'env>(
 /// PowerShell 5.1 wrote as UTF-16LE, otherwise ran nothing and exited 0.
 fn command(line: std::io::Result<String>) -> Result<Option<String>, String> {
     let line = line.map_err(|e| format!("input: {e}; scripts must be UTF-8"))?;
-    let line = line.split('#').next().unwrap_or("").trim().to_owned();
+    let line = uncommented(&line).trim().to_owned();
     Ok((!line.is_empty()).then_some(line))
+}
+
+/// `line` up to its comment: a `#` at the start of a word and outside a `"..."` string, so JSON
+/// such as `{"tag":"#1"}` or `{"m":"hello #world"}` is kept whole. A `\"` does not end a
+/// string (S4 A-2, review F3).
+fn uncommented(line: &str) -> &str {
+    let (mut word_start, mut quoted, mut escaped) = (true, false, false);
+    for (at, c) in line.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+        } else if c == '#' && word_start {
+            return &line[..at];
+        } else if c == '"' {
+            quoted = true;
+        }
+        word_start = c.is_whitespace();
+    }
+    line
+}
+
+/// The size limit `json.rs` reads an argument under. `rdb_dev` reads its values from the
+/// line instead, so this only satisfies the shared file's import.
+const MAX_JSON_TEXT: usize = 1 << 20;
+/// What a JSON integer refusal advises instead. `rdb_dev` has no CBOR input, so not `--cbor-hex`
+/// (tester P1-2).
+const JSON_INTEGER_ADVICE: &str = "write 0 or write a float";
+
+/// A JSON input refusal, as `json.rs` builds it.
+#[derive(Debug)]
+struct Failure {
+    error: String,
+    detail: String,
+}
+
+impl Failure {
+    const fn refused(error: String, detail: String) -> Self {
+        Self { error, detail }
+    }
+}
+
+/// An argument as text, refused over `limit` bytes; `json.rs`'s import.
+fn arg_text(arg: &str, limit: usize) -> Result<String, Failure> {
+    if arg.len() > limit {
+        return Err(Failure::refused(
+            "InputTooLarge".into(),
+            format!("over the {limit}-byte limit"),
+        ));
+    }
+    Ok(arg.to_owned())
+}
+
+/// A value verb's line, read word by word. A JSON value is read from the raw text with
+/// serde's stream reader (risk R1), so its quotes and spaces are kept: `split_words` would turn
+/// `"b"` into `b`.
+struct Words<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Words<'a> {
+    const fn new(line: &'a str) -> Self {
+        Self { rest: line }
+    }
+
+    /// The next word, up to whitespace.
+    fn next(&mut self) -> Option<&'a str> {
+        let text = self.rest.trim_start();
+        if text.is_empty() {
+            self.rest = text;
+            return None;
+        }
+        let end = text.find(char::is_whitespace).unwrap_or(text.len());
+        self.rest = &text[end..];
+        Some(&text[..end])
+    }
+
+    /// The next word, which `what` needs.
+    fn take(&mut self, what: &str) -> Result<&'a str, String> {
+        self.next().ok_or_else(|| format!("missing {what}"))
+    }
+
+    /// The next JSON value, for `what`. A value that does not end at whitespace or the end of
+    /// the line is refused: `1x` is not `1` then `x`.
+    fn json(&mut self, what: &str) -> Result<Value, String> {
+        let text = self.rest.trim_start();
+        if text.is_empty() {
+            return Err(format!("missing {what} (a JSON value)"));
+        }
+        let (value, used) =
+            json::json_value(text).map_err(|f| format!("{what}: {}: {}", f.error, f.detail))?;
+        let after = &text[used..];
+        if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+            return Err(format!(
+                "{what}: the JSON value ends at {:?}, not at a space",
+                &text[..used]
+            ));
+        }
+        self.rest = after;
+        Ok(value)
+    }
+
+    /// The next map key or set member, for `what`: a JSON value, or `{"$bytes":"<hex>"}` for a
+    /// byte string, the form a read prints (A-R121). Only at key position: a map is never a key,
+    /// so the form cannot mean a map here, and no `$$` escape applies. A document value takes no
+    /// `$bytes` input.
+    fn key(&mut self, what: &str) -> Result<Value, String> {
+        let value = self.json(what)?;
+        let digits = match &value {
+            Value::Map(map) => {
+                let mut entries = map.iter();
+                match (entries.next(), entries.next()) {
+                    (Some((name, Value::Text(text))), None) if name.as_str() == "$bytes" => {
+                        Some(text.clone())
+                    }
+                    (Some((name, _)), None) if name.as_str() == "$bytes" => {
+                        return Err(format!(
+                            r#"{what}: $bytes needs a hex string, as {{"$bytes":"00ff"}}"#
+                        ));
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(digits) = digits else {
+            return Ok(value);
+        };
+        hex::decode(&digits)
+            .map(Value::Bytes)
+            .map_err(|e| format!("{what}: $bytes {digits:?} is not hex: {e}"))
+    }
+}
+
+/// `--absent` or `--expect V`, once, before the ops; neither is `None`.
+fn parse_expect(words: &mut Words<'_>) -> Result<Option<Expected>, String> {
+    let before = words.rest;
+    match words.next() {
+        Some("--absent") => Ok(Some(Expected::Absent)),
+        Some("--expect") => {
+            let v = words.take("a version after --expect")?;
+            v.parse()
+                .map(|v| Some(Expected::Version(v)))
+                .map_err(|_| format!("--expect {v:?} is not a version"))
+        }
+        _ => {
+            words.rest = before;
+            Ok(None)
+        }
+    }
+}
+
+/// The value verbs, each read from the raw line (risk R1).
+const VALUE_VERBS: [&str; 6] = ["doc", "map", "set", "members", "list", "items"];
+
+const DOC_USAGE: &str = "doc <object> [--absent | --expect V] <op>...; an op is --json J, \
+                         set <path> J, remove <path> or incr <path> N";
+const COLLECTION_USAGE: &str = "map|set <object> [--absent | --expect V] <op>...; an op is put K \
+                                J, add K, del K or need K present|absent";
+const MEMBERS_USAGE: &str = "members <object> [--after K] [--limit N]";
+const LIST_USAGE: &str =
+    "list <object> [--absent | --expect V] <op>...; an op is push J, insert P J, \
+                          remove P, replace P J or move P Q; a negative P counts from the end";
+const ITEMS_USAGE: &str = "items <object> [--from P | --token G:V:P] [--limit N]";
+
+/// The usage line for `verb`'s refusals.
+fn usage_of(verb: &str) -> &'static str {
+    match verb {
+        "doc" => DOC_USAGE,
+        "members" => MEMBERS_USAGE,
+        "list" => LIST_USAGE,
+        "items" => ITEMS_USAGE,
+        _ => COLLECTION_USAGE,
+    }
+}
+
+/// `doc|map|set|list <object> [--absent | --expect V] <op>...`: the object, the guard and the change.
+fn parse_change(line: &str) -> Result<(String, Option<Expected>, Change), String> {
+    let mut words = Words::new(line);
+    let verb = words.take("a verb")?;
+    let object = words.take("<object>")?.to_owned();
+    let expect = parse_expect(&mut words)?;
+    let change = match verb {
+        "doc" => Change::Doc(Delta(doc_ops(&mut words)?)),
+        "map" => Change::Map(elem_ops(&mut words)?),
+        "set" => Change::Set(elem_ops(&mut words)?),
+        "list" => Change::List(list_edits(&mut words)?),
+        other => return Err(format!("{other:?} is not a write")),
+    };
+    Ok((object, expect, change))
+}
+
+/// A `doc` line's ops; at least one.
+fn doc_ops(words: &mut Words<'_>) -> Result<Vec<Op>, String> {
+    let mut ops = Vec::new();
+    while let Some(word) = words.next() {
+        let path = |words: &mut Words<'_>| {
+            let text = words.take("a path")?;
+            Path::parse(text).map_err(|e| format!("{e} in path {text:?}"))
+        };
+        ops.push(match word {
+            "--json" => Op::Replace(words.json("--json")?),
+            "set" => Op::Set(path(words)?, words.json("set")?),
+            "remove" => Op::Remove(path(words)?),
+            "incr" => {
+                let at = path(words)?;
+                let n = words.take("an integer")?;
+                let by = n
+                    .parse::<i128>()
+                    .ok()
+                    .and_then(Int::new)
+                    .ok_or_else(|| format!("incr {n:?} is not an integer in -2^64..2^64-1"))?;
+                Op::Increment(at, by)
+            }
+            "--absent" | "--expect" => return Err(format!("{word} goes before the ops")),
+            other => return Err(format!("unexpected {other:?}")),
+        });
+    }
+    if ops.is_empty() {
+        return Err("no op".to_owned());
+    }
+    Ok(ops)
+}
+
+/// A `map` or `set` line's ops, possibly none (a create of an empty collection). Either verb
+/// takes `put` and `add`, as `doc_scenario` does: the library refuses the other kind's op
+/// (`KindMismatch`), so the refusal is the library's, not the tool's.
+fn elem_ops(words: &mut Words<'_>) -> Result<Vec<ElemOp>, String> {
+    let mut ops = Vec::new();
+    while let Some(word) = words.next() {
+        ops.push(match word {
+            "put" => ElemOp::Put(words.key("put K")?, words.json("put's value J")?),
+            "add" => ElemOp::Add(words.key("add K")?),
+            "del" => ElemOp::Remove(words.key("del K")?),
+            "need" => {
+                let key = words.key("need K")?;
+                match words.take("present or absent")? {
+                    "present" => ElemOp::NeedPresent(key),
+                    "absent" => ElemOp::NeedAbsent(key),
+                    other => return Err(format!("need takes present or absent, not {other:?}")),
+                }
+            }
+            "--absent" | "--expect" => return Err(format!("{word} goes before the ops")),
+            other => return Err(format!("unexpected {other:?}")),
+        });
+    }
+    Ok(ops)
+}
+
+/// `rdb_dev` lists this many elements when `--limit` is not given (arch §2: `limit` is uncapped
+/// until S5).
+const DEFAULT_LIMIT: usize = 100;
+
+/// `members <object> [--after K] [--limit N]`: the object and the look.
+fn parse_members(line: &str) -> Result<(String, Look), String> {
+    let mut words = Words::new(line);
+    words.next(); // `members`
+    let object = words.take("<object>")?.to_owned();
+    let (mut after, mut limit) = (None, None);
+    while let Some(word) = words.next() {
+        match word {
+            "--after" if after.is_none() => after = Some(words.key("--after K")?),
+            "--limit" if limit.is_none() => {
+                let n = words.take("a count after --limit")?;
+                limit = Some(
+                    n.parse::<usize>()
+                        .map_err(|_| format!("--limit {n:?} is not a count"))?,
+                );
+            }
+            other => return Err(format!("unexpected {other:?}")),
+        }
+    }
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    Ok((object, Look::Members { after, limit }))
+}
+
+/// A `list` line's edits, possibly none (a create of an empty list). A position is an integer;
+/// negative counts from the end, resolved by the owner (A-R116).
+fn list_edits(words: &mut Words<'_>) -> Result<Vec<ListEdit>, String> {
+    let position = |words: &mut Words<'_>, what: &str| {
+        let text = words.take(what)?;
+        text.parse::<i64>()
+            .map_err(|_| format!("{what} {text:?} is not a position"))
+    };
+    let mut edits = Vec::new();
+    while let Some(word) = words.next() {
+        edits.push(match word {
+            "push" => ListEdit::Push(words.json("push J")?),
+            "insert" => ListEdit::Insert {
+                at: position(words, "insert P")?,
+                value: words.json("insert's value J")?,
+            },
+            "remove" => ListEdit::Remove {
+                at: position(words, "remove P")?,
+            },
+            "replace" => ListEdit::Replace {
+                at: position(words, "replace P")?,
+                value: words.json("replace's value J")?,
+            },
+            "move" => ListEdit::Move {
+                from: position(words, "move P")?,
+                to: position(words, "move's Q")?,
+            },
+            "--absent" | "--expect" => return Err(format!("{word} goes before the ops")),
+            other => return Err(format!("unexpected {other:?}")),
+        });
+    }
+    Ok(edits)
+}
+
+/// `items <object> [--from P | --token G:V:P] [--limit N]`: the object and the look. Without
+/// either start it reads from position 0.
+fn parse_items(line: &str) -> Result<(String, Look), String> {
+    let mut words = Words::new(line);
+    words.next(); // `items`
+    let object = words.take("<object>")?.to_owned();
+    let (mut from, mut token, mut limit) = (None, None, None);
+    while let Some(word) = words.next() {
+        match word {
+            "--from" if from.is_none() && token.is_none() => {
+                let p = words.take("a position after --from")?;
+                from = Some(
+                    p.parse::<i64>()
+                        .map_err(|_| format!("--from {p:?} is not a position"))?,
+                );
+            }
+            "--token" if from.is_none() && token.is_none() => {
+                token = Some(parse_token(words.take("G:V:P after --token")?)?);
+            }
+            "--limit" if limit.is_none() => {
+                let n = words.take("a count after --limit")?;
+                limit = Some(
+                    n.parse::<usize>()
+                        .map_err(|_| format!("--limit {n:?} is not a count"))?,
+                );
+            }
+            other => return Err(format!("unexpected {other:?}")),
+        }
+    }
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let look = match token {
+        Some(token) => Look::ItemsAfter { token, limit },
+        None => Look::Items {
+            at: from.unwrap_or(0),
+            limit,
+        },
+    };
+    Ok((object, look))
+}
+
+/// `G:V:P`, as `items` prints a page's `token=`.
+fn parse_token(text: &str) -> Result<Token, String> {
+    let parts: Vec<&str> = text.split(':').collect();
+    let [g, v, p] = parts.as_slice() else {
+        return Err(format!("--token {text:?} is not G:V:P"));
+    };
+    let number = |part: &str| {
+        part.parse::<u64>()
+            .map_err(|_| format!("--token {text:?} is not G:V:P"))
+    };
+    Ok(Token {
+        generation: Generation(number(g)?),
+        version: number(v)?,
+        position: number(p)?,
+    })
+}
+
+/// A value write's answer, remembered for `retry` as [`Kind::Value`].
+fn write_line(db: &Db, answer: Result<Option<rdb_api::PutOk>, PutError>, sent: &mut Sent) {
+    labelled_write_line(db, "", "nothing to write", answer, sent);
+}
+
+/// [`write_line`] with `label` before the answer, and `unchanged` saying why a write that
+/// compiled to nothing was not sent. Such a write is the latest and sent nothing, so a bare
+/// `retry` after it has nothing to send. Whether the write was sent or answered unchanged.
+fn labelled_write_line(
+    db: &Db,
+    label: &str,
+    unchanged: &str,
+    answer: Result<Option<rdb_api::PutOk>, PutError>,
+    sent: &mut Sent,
+) -> bool {
+    match answer {
+        Ok(None) => {
+            say(&format!("{label}unchanged ({unchanged}; nothing sent)"));
+            sent.record(None, Kind::Value);
+            true
+        }
+        Ok(Some(ok)) => {
+            labelled_put_line(db, label, Ok(ok), Some((sent, Kind::Value)));
+            true
+        }
+        Err(e) => {
+            labelled_put_line(db, label, Err(e), Some((sent, Kind::Value)));
+            false
+        }
+    }
+}
+
+const BLOB_USAGE: &str = "blob upload <object> [--absent | --expect V] --upload U --chunk-size N \
+                          <text> [--stop-after K] | blob chunk <object> --upload U --index I \
+                          <text> | blob publish <object> [--absent | --expect V] --upload U \
+                          --size N --chunk-size N --sha256 H | blob gc <object> --floor F; U is \
+                          32 hex digits, H 64";
+const READ_USAGE: &str = "read <object> [--offset O --len L]";
+
+/// A `blob` line's words after the object: `--absent` or `--expect V`, the `--name value`
+/// flags in `takes`, each once, and at most one other word, the text.
+#[derive(Debug, Default)]
+struct BlobArgs<'a> {
+    expect: Option<Expected>,
+    flags: std::collections::BTreeMap<&'a str, &'a str>,
+    text: Option<&'a str>,
+}
+
+impl<'a> BlobArgs<'a> {
+    fn parse(words: &[&'a str], takes: &[&str]) -> Result<Self, String> {
+        let mut args = Self::default();
+        let mut words = words.iter();
+        while let Some(&word) = words.next() {
+            match word {
+                "--absent" if args.expect.is_none() => args.expect = Some(Expected::Absent),
+                "--expect" if args.expect.is_none() => {
+                    let v = words.next().ok_or("missing a version after --expect")?;
+                    let v = v
+                        .parse()
+                        .map_err(|_| format!("--expect {v:?} is not a version"))?;
+                    args.expect = Some(Expected::Version(v));
+                }
+                flag if takes.contains(&flag) => {
+                    let value = words
+                        .next()
+                        .ok_or_else(|| format!("missing a value after {flag}"))?;
+                    if args.flags.insert(flag, value).is_some() {
+                        return Err(format!("{flag} given twice"));
+                    }
+                }
+                text if args.text.is_none() && !text.starts_with("--") => args.text = Some(text),
+                other => return Err(format!("unexpected {other:?}")),
+            }
+        }
+        Ok(args)
+    }
+
+    /// The value of `flag`, which must be given.
+    fn flag(&self, flag: &str) -> Result<&'a str, String> {
+        self.flags
+            .get(flag)
+            .copied()
+            .ok_or_else(|| format!("missing {flag}"))
+    }
+
+    /// The number after `flag`, which must be given.
+    fn number<T: std::str::FromStr>(&self, flag: &str) -> Result<T, String> {
+        let text = self.flag(flag)?;
+        text.parse()
+            .map_err(|_| format!("{flag} {text:?} is not a number"))
+    }
+
+    fn text(&self) -> Result<&'a str, String> {
+        self.text.ok_or_else(|| "missing <text>".to_owned())
+    }
+
+    /// `--upload U`: 32 hex digits, the 16-byte upload id (S4 A-7).
+    fn upload(&self) -> Result<rdb_api::Upload, String> {
+        let text = self.flag("--upload")?;
+        hex_bytes(text).map_err(|e| format!("--upload {text:?}: {e}; it is 32 hex digits"))
+    }
+}
+
+/// `text` as exactly `N` bytes of hex.
+fn hex_bytes<const N: usize>(text: &str) -> Result<[u8; N], String> {
+    let bytes = hex::decode(text).map_err(|e| e.to_string())?;
+    <[u8; N]>::try_from(bytes).map_err(|bytes| format!("{} bytes, not {N}", bytes.len()))
+}
+
+/// `blob upload`: each chunk, then the publish, unless `--stop-after` stops it first.
+fn blob_upload(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--upload", "--chunk-size", "--stop-after"])?;
+    let upload = args.upload()?;
+    let text = args.text()?.as_bytes();
+    let chunk_size: u64 = args.number("--chunk-size")?;
+    let piece = usize::try_from(chunk_size)
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| format!("--chunk-size {chunk_size} is not a chunk length"))?;
+    let stop_after = match args.flags.get("--stop-after") {
+        Some(_) => Some(args.number::<usize>("--stop-after")?),
+        None => None,
+    };
+    let size = u64::try_from(text.len()).expect("a line fits u64");
+    let sha256: [u8; 32] = Sha256::digest(text).into();
+    let chunks = text.chunks(piece).take(stop_after.unwrap_or(usize::MAX));
+    for (index, bytes) in chunks.enumerate() {
+        let change = Change::Chunk {
+            upload,
+            index: u32::try_from(index).map_err(|_| format!("chunk {index} is past u32"))?,
+            bytes: Bytes::copy_from_slice(bytes),
+        };
+        let answer = db.write(object.as_bytes(), change, None);
+        if !labelled_write_line(
+            db,
+            &format!("chunk {index} "),
+            "already stored",
+            answer,
+            sent,
+        ) {
+            return Ok(());
+        }
+    }
+    if let Some(k) = stop_after {
+        let k = k.min(text.len().div_ceil(piece));
+        let guard = match args.expect {
+            Some(Expected::Absent) => " --absent".to_owned(),
+            Some(Expected::Version(v)) => format!(" --expect {v}"),
+            None => String::new(),
+        };
+        say(&format!(
+            "stopped after {k} chunks; finish with: blob publish {object}{guard} --upload {} \
+             --size {size} --chunk-size {chunk_size} --sha256 {}",
+            hex::encode(upload),
+            hex::encode(sha256)
+        ));
+        return Ok(());
+    }
+    let change = Change::Publish {
+        upload,
+        size,
+        chunk_size,
+        sha256,
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(db, "publish ", "already published", answer, sent);
+    Ok(())
+}
+
+/// `blob chunk`: one chunk. A guard is passed on for the owner to refuse.
+fn blob_chunk(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--upload", "--index"])?;
+    let index: u32 = args.number("--index")?;
+    let change = Change::Chunk {
+        upload: args.upload()?,
+        index,
+        bytes: Bytes::copy_from_slice(args.text()?.as_bytes()),
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(
+        db,
+        &format!("chunk {index} "),
+        "already stored",
+        answer,
+        sent,
+    );
+    Ok(())
+}
+
+/// `blob publish`: publish an upload whose chunks are stored.
+fn blob_publish(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--upload", "--size", "--chunk-size", "--sha256"])?;
+    if args.text.is_some() {
+        return Err("blob publish takes no <text>".to_owned());
+    }
+    let sha = args.flag("--sha256")?;
+    let change = Change::Publish {
+        upload: args.upload()?,
+        size: args.number("--size")?,
+        chunk_size: args.number("--chunk-size")?,
+        sha256: hex_bytes(sha)
+            .map_err(|e| format!("--sha256 {sha:?}: {e}; it is 64 hex digits"))?,
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(db, "publish ", "already published", answer, sent);
+    Ok(())
+}
+
+/// `blob gc`: one batch of the object's unreachable chunks at or below the floor. A guard is
+/// passed on for the owner to refuse.
+fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--floor"])?;
+    if args.text.is_some() {
+        return Err("blob gc takes no <text>".to_owned());
+    }
+    let change = Change::Gc {
+        floor: args.number("--floor")?,
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(db, "gc ", "nothing to collect", answer, sent);
+    Ok(())
+}
+
+/// Request ids for `admin damage-chunk`, under its own client so they never meet the `Db`'s.
+static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
+/// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
+/// tool only, to reach that answer by hand; the product never writes a chunk this way.
+fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+    use rdb_core::contracts::txn::{Condition, Mutation};
+    let args = BlobArgs::parse(rest, &["--upload", "--index"])?;
+    if args.expect.is_some() || args.text.is_some() {
+        return Err(DAMAGE_USAGE.to_owned());
+    }
+    let index: u32 = args.number("--index")?;
+    let upload = args.flag("--upload")?;
+    let root = rdb_value::keys::root_key(TenantId(1), AffinityId(1), object.as_bytes());
+    let key = rdb_value::keys::chunk_key(&root, &args.upload()?, index);
+    let value = rdb_value::envelope::seal(rdb_value::envelope::Kind::Chunk, b"damaged")
+        .expect("seven bytes fit an envelope");
+    let request = TxnRequest {
+        api_version: rdb_core::contracts::version::API_VERSION,
+        identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(2),
+            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+        },
+        affinity: AffinityId(1),
+        expected_generation: None,
+        remaining_millis: 5_000,
+        // PB-6: only a stored chunk is damaged; a missing one is refused, never written.
+        conditions: vec![Condition::Present { key: key.clone() }],
+        mutations: vec![Mutation::Put {
+            key,
+            value,
+            expected_version: None,
+        }],
+    };
+    // PB-5: no request id is printed. This write is under damage-chunk's own client, so
+    // `status` and `retry` would look up another write under the same number.
+    say(&match db.resend(request) {
+        Ok(ok) => format!(
+            "damage-chunk ok p=1 gen={} seq={} {:?} request=- (damage-chunk's own client; \
+             status does not know it)",
+            ok.generation.0, ok.seq.0, ok.durability
+        ),
+        Err(PutError { error, .. }) if error.kind == ErrorKind::ConditionFailed => format!(
+            "err admin damage-chunk: no stored chunk {index} for upload {upload} under {object}"
+        ),
+        Err(PutError { error, .. }) => format!(
+            "err admin damage-chunk: {} retry={:?} request=- ({})",
+            error.name(),
+            error.retry,
+            error.detail
+        ),
+    });
+    Ok(())
+}
+
+const DAMAGE_USAGE: &str = "admin damage-chunk <object> --upload U --index I";
+
+/// `read`'s words after the object: nothing, the manifest alone, or `--offset O --len L`.
+fn parse_range(rest: &[&str]) -> Result<Look, String> {
+    let number = |flag: &str, text: &str| {
+        text.parse::<u64>()
+            .map_err(|_| format!("{flag} {text:?} is not a number"))
+    };
+    match rest {
+        [] => Ok(Look::Range { offset: 0, len: 0 }),
+        ["--offset", offset, "--len", len] | ["--len", len, "--offset", offset] => {
+            Ok(Look::Range {
+                offset: number("--offset", offset)?,
+                len: number("--len", len)?,
+            })
+        }
+        _ => Err(READ_USAGE.to_owned()),
+    }
+}
+
+/// A `Db::read` answer as lines. A byte-string document prints as `get` always has; any other
+/// document as JSON.
+fn read_line(answer: Result<ReadOk, ApiError>) {
+    let ok = match answer {
+        Ok(ok) => ok,
+        Err(error) => {
+            // `retry=` too: a stale token's `Reconcile` is the line's point (C-2).
+            say(&format!(
+                "err {} retry={:?} ({})",
+                error.name(),
+                error.retry,
+                error.detail
+            ));
+            return;
+        }
+    };
+    let view = format!(
+        "gen={} at={}{}",
+        ok.generation.0,
+        ok.at.0,
+        if ok.waited { " waited" } else { "" }
+    );
+    match ok.seen {
+        rdb_api::Seen::Absent => say(&format!("absent {view}")),
+        rdb_api::Seen::Doc(doc) => match doc.value {
+            Value::Bytes(bytes) => say(&format!(
+                "value={} version={} {view}",
+                String::from_utf8_lossy(&bytes),
+                doc.version
+            )),
+            value => say(&format!(
+                "doc={} version={} {view}",
+                json::render(&value),
+                doc.version
+            )),
+        },
+        // `map version=V count=N`, then one line per element: `K = J` for a map entry, `K` for
+        // a set member.
+        rdb_api::Seen::Members(page) => {
+            let root = page.collection;
+            let kind = match root.kind {
+                CollectionKind::Map => "map",
+                CollectionKind::Set => "set",
+            };
+            say(&format!(
+                "{kind} version={} count={} listed={} {view}",
+                root.version,
+                root.count,
+                page.members.len()
+            ));
+            for member in page.members {
+                match member.value {
+                    Some(value) => say(&format!(
+                        "  {} = {}",
+                        json::render(&member.key),
+                        json::render(&value)
+                    )),
+                    None => say(&format!("  {}", json::render(&member.key))),
+                }
+            }
+        }
+        // `list version=V count=C listed=L`, one `  P J` line per item (`inline=false` when the
+        // item has its own record), then `token=G:V:P` when items remain.
+        rdb_api::Seen::Items(page) => {
+            let root = page.list;
+            say(&format!(
+                "list version={} count={} listed={} {view}",
+                root.version,
+                root.count,
+                page.items.len()
+            ));
+            for item in page.items {
+                say(&format!(
+                    "  {} {}{}",
+                    item.position,
+                    json::render(&item.value),
+                    if item.inline { "" } else { " inline=false" }
+                ));
+            }
+            if let Some(next) = page.next {
+                say(&format!(
+                    "token={}:{}:{}",
+                    next.generation.0, next.version, next.position
+                ));
+            }
+        }
+        // `blob version=V size=S chunks=N upload=U`, then `bytes="..."` for a non-empty range.
+        rdb_api::Seen::Range { blob, bytes } => {
+            let m = &blob.manifest;
+            let range = if bytes.is_empty() {
+                String::new()
+            } else {
+                format!(" bytes={:?}", String::from_utf8_lossy(&bytes))
+            };
+            say(&format!(
+                "blob version={} size={} chunks={} upload={}{range} {view}",
+                blob.version,
+                m.size,
+                m.chunks(),
+                hex::encode(m.upload)
+            ));
+        }
+    }
 }
 
 /// Split a command line on spaces; `"..."` is one word, and `""` an empty one.
@@ -1361,6 +2261,11 @@ fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>),
             "retry --payload changes a put's value; request {} was a txn",
             request.0
         )),
+        Kind::Value => Err(format!(
+            "retry --payload changes a put's value; request {} was a value write: retry it \
+             unchanged, or send a new write",
+            request.0
+        )),
     }
 }
 
@@ -1374,6 +2279,9 @@ enum Kind {
     },
     /// A txn.
     Txn,
+    /// A `Db::write`: `doc`, `map`, `set`, `list` or a `blob` line. Resent unchanged, never with
+    /// another payload (S4 A-5).
+    Value,
 }
 
 /// Every put and txn request this session sent, and which came last. `retry` replays the
@@ -1446,12 +2354,22 @@ impl Sent {
 /// refusal is followed by a `note:` line when node 1's queue waits on a write it applied and
 /// has not published ([`waits_note`]).
 fn put_line(db: &Db, answer: Result<rdb_api::PutOk, PutError>, record: Option<(&mut Sent, Kind)>) {
+    labelled_put_line(db, "", answer, record);
+}
+
+/// [`put_line`] with `label` before the answer, as `chunk 0 ok ...`.
+fn labelled_put_line(
+    db: &Db,
+    label: &str,
+    answer: Result<rdb_api::PutOk, PutError>,
+    record: Option<(&mut Sent, Kind)>,
+) {
     let remember = |request: Option<TxnRequest>| {
         if let Some((sent, kind)) = record {
             sent.record(request, kind);
         }
     };
-    say(&put_text(&answer));
+    say(&format!("{label}{}", put_text(&answer)));
     if answer.is_err() {
         if let Some(note) = waits_note(db) {
             say(&note);
@@ -1549,10 +2467,34 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
             let ours = sent.by_id.contains_key(&request);
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
         }
-        Ok(status) => say(&format!("status {status:?}")),
+        Ok(status) => say(&known_status_line(request, &status)),
         Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
     }
     Ok(())
+}
+
+/// A `status` answer other than `Unknown`, in plain numbers as a put's `ok` line (PB-2).
+fn known_status_line(request: u64, status: &TxnStatus) -> String {
+    use rdb_core::contracts::txn::Outcome;
+    match status {
+        TxnStatus::Resolved(result) => format!(
+            "status resolved: {} p={} gen={} seq={} epoch={} {:?} request={request}",
+            match result.outcome {
+                Outcome::Published => "published",
+                Outcome::RecoveredApplied => "recovered-applied",
+            },
+            result.partition.0,
+            result.generation.0,
+            result.seq.0,
+            result.owner_epoch.0,
+            result.durability,
+        ),
+        TxnStatus::Unresolved { seq } => {
+            format!("status unresolved: seq={} request={request}", seq.0)
+        }
+        TxnStatus::Unknown => "status Unknown".to_owned(),
+        TxnStatus::Expired => format!("status expired request={request}"),
+    }
 }
 
 /// The nodes that restarted, from each node's boot (`boot_of`), never from the nodes that
@@ -3405,6 +4347,106 @@ mod tests {
         assert_eq!(
             command(Ok("put a 1 # set a".to_owned())),
             Ok(Some("put a 1".to_owned()))
+        );
+    }
+
+    /// Review F3 (A-R133): a `#` inside a `"..."` string is kept, even at the start of a word;
+    /// a `\"` does not end the string; and a `#` word after the string is still a comment. At
+    /// 2cc5b24 the first two lines were cut at their `#`. Unit.
+    #[test]
+    fn a_hash_inside_a_json_string_is_kept_and_one_after_it_is_a_comment() {
+        let command = |line: &str| command(Ok(line.to_owned()));
+        let kept = |line: &str| Ok(Some(line.to_owned()));
+        let spaced = r##"doc d --absent --json {"m":"hello #world"}"##;
+        assert_eq!(command(spaced), kept(spaced), "a spaced # in a string");
+        let escaped = r##"doc d --absent --json {"m":"say \" #hi"}"##;
+        assert_eq!(
+            command(escaped),
+            kept(escaped),
+            "a # after an escaped quote"
+        );
+        assert_eq!(
+            command(r##"doc d --absent --json {"m":"a #b"}  # a real comment"##),
+            kept(r##"doc d --absent --json {"m":"a #b"}"##),
+            "a trailing comment"
+        );
+    }
+
+    /// S4-1 1j, guard 6 (A-2): a `#` starts a comment only at the start of a word, so one
+    /// inside a JSON value is kept, and the value is read from the raw line with its quotes
+    /// (R1). Mutant m6 (cut at any `#`) fails the first assertion. Unit.
+    #[test]
+    fn a_hash_inside_a_word_is_kept_and_json_is_read_from_the_raw_line() {
+        assert_eq!(
+            command(Ok(
+                r##"doc t --absent --json {"tag":"#1"}   # a comment"##.to_owned()
+            )),
+            Ok(Some(r##"doc t --absent --json {"tag":"#1"}"##.to_owned()))
+        );
+        assert_eq!(command(Ok("#only a comment".to_owned())), Ok(None));
+        let (object, expect, change) =
+            parse_change(r#"doc d --expect 2 incr /n 5 set /tags/1 "b""#).expect("a doc line");
+        let path = |text| Path::parse(text).expect("a path");
+        assert_eq!(
+            (object.as_str(), expect, change),
+            (
+                "d",
+                Some(Expected::Version(2)),
+                Change::Doc(Delta(vec![
+                    Op::Increment(path("/n"), Int::from(5_u64)),
+                    Op::Set(path("/tags/1"), Value::Text("b".to_owned())),
+                ]))
+            ),
+            "the quotes around \"b\" survive: it is text, not a bare word"
+        );
+        let refused =
+            parse_change(r#"doc d set /a "a"x"#).expect_err("\"a\"x is not one JSON value");
+        assert!(refused.contains("not at a space"), "{refused}");
+    }
+
+    /// S4-1 1s (A-5): `retry <R> --payload` refuses a value write; it is resent unchanged or not
+    /// at all. Unit.
+    #[test]
+    fn retry_payload_refuses_a_value_write() {
+        let refused =
+            payload_put(Kind::Value, RequestId(5)).expect_err("a value write takes no payload");
+        assert!(refused.contains("request 5 was a value write"), "{refused}");
+    }
+
+    /// A-R121: at key position only, `{"$bytes":"<hex>"}` is a byte-string key, the form a
+    /// read prints. Bad hex is refused; `$$bytes` is no escape there, so it stays a map, which
+    /// the owner refuses as a key. It fails if `Words::key` is `Words::json`. Unit.
+    #[test]
+    fn a_bytes_key_is_entered_as_a_read_prints_it() {
+        let (_, _, change) =
+            parse_change(r#"map m --absent put {"$bytes":"00ff"} 1"#).expect("a map line");
+        assert_eq!(
+            change,
+            Change::Map(vec![ElemOp::Put(
+                Value::Bytes(vec![0x00, 0xff]),
+                Value::Integer(Int::from(1_u64))
+            )])
+        );
+        let (_, look) = parse_members(r#"members m --after {"$bytes":"00"}"#).expect("a page");
+        assert_eq!(
+            look,
+            Look::Members {
+                after: Some(Value::Bytes(vec![0x00])),
+                limit: DEFAULT_LIMIT
+            }
+        );
+        let refused = parse_change(r#"set s add {"$bytes":"zz"}"#).expect_err("zz is not hex");
+        assert!(refused.contains("is not hex"), "{refused}");
+        // P3-2 (A-R124c): a `$bytes` that is not a string names the form it expects.
+        let refused = parse_change(r#"set s add {"$bytes":1}"#).expect_err("1 is not hex text");
+        assert!(
+            refused.contains(r#"$bytes needs a hex string, as {"$bytes":"00ff"}"#),
+            "{refused}"
+        );
+        let (_, _, escaped) = parse_change(r#"set s add {"$$bytes":"00"}"#).expect("a set line");
+        assert!(
+            matches!(&escaped, Change::Set(ops) if matches!(ops[..], [ElemOp::Add(Value::Map(_))])),
+            "{escaped:?}"
         );
     }
 }

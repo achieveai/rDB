@@ -107,6 +107,8 @@ and the full-copy fallback (scope ruling 2026-10-02).
 - Format-1 `RocksEngine` refuses `Meta` writes and any stored `Meta` key. The first `Meta` writer
   (M9/M10) must give `Meta` writes an after-image in `History` before lifting the refusal, or a
   late-write full copy cannot rebuild it.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: not in M9; M10 or later. No M9 slice writes `Meta`:
+  the S4 API writes `User` records only.)
 
 ## Verification
 

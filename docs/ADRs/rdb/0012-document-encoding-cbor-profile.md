@@ -63,6 +63,9 @@ Each edit is marked in place with its ruling.
 - **The document root may be any value**, a scalar included: `5`, `"x"` and `null` are documents.
   Path ops below the root need a container there and are refused `NotAContainer{at: Root}`
   otherwise; `Replace` works on any root. Reversible until M9 has clients (L-R185m Q1).
+  (Status 2026-10-19, M9 S4: kept. `Change::Doc` hands its delta to `rdb_value::compile` with no
+  check on the root's type, and every `Db::put` stores a byte-string root, so S4's clients already
+  depend on a scalar root.)
 - **No cross-type equality.** `1`, `1.0` and decimal `[0, 1]` are three different values.
 - Tag 1001's inner map has integer keys. That is part of the timestamp type, not a document map.
 
@@ -88,6 +91,10 @@ Each edit is marked in place with its ruling.
     **normal** feature. Today only `rdb-value`'s example parses JSON, and the feature is on its
     dev-dependency, so it reaches test and example builds only. Without it, about one float in three
     parses one ULP off (L-R185o D1).
+  (Status 2026-10-19, M9 S4, both M9 lines above: no M9 crate parses client JSON in a normal build.
+  The `Db` takes `Value`s and parses no text. Only the `rdb_dev` example reads JSON, through
+  `doc_scenario`'s `json.rs`, with `float_roundtrip` on `rdb-api`'s `serde_json` dev-dependency.
+  The rule binds the first non-example crate that parses client JSON.)
 - Tags: only 4 and 1001, in the forms above. Every other tag is refused.
 - **`encode` refuses** a value deeper than 64 levels (`TooDeep`) or larger than the limit (`TooLarge`).
   So the writer can never produce bytes the reader refuses (decision 11).
@@ -112,6 +119,8 @@ Each edit is marked in place with its ruling.
   disagree on an error.
 - A lenient "accept and normalise" entry point may be added at the client API (M9) if a client needs
   it. It is additive and not in v1.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: not in M9; M10 or later. No consumer: the S4 `Db` takes
+  typed values and parses no JSON.)
 
 ### 5. Limits (v1, format-versioned constants)
 - Envelope ≤ 1 MiB (1,048,576 bytes): checked before decode, and by `encode` on every write.
@@ -150,7 +159,7 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
 | Offset | Size | Field | v1 value |
 |---|---|---|---|
 | 0 | 1 | `envelope_format` | `0x01` |
-| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7), `0x04` blob root (the manifest), `0x05` blob chunk (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2), `0x06` list root, `0x07` list block, `0x08` list change slot (amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt. `0x09` onward is unallocated and reserved for later kinds. The table lives in `envelope.rs` |
+| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7), `0x04` blob root (the manifest), `0x05` blob chunk (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2), `0x06` list root, `0x07` list block, `0x08` list change slot (amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt (status 2026-10-19, M9 S4, A-R113 C-5: paid in M9 S6, with the admin path). `0x09` onward is unallocated and reserved for later kinds. The table lives in `envelope.rs` |
 | 2 | 1 | `codec_version` | `0x01`, read per `kind`: for kinds `0x01`–`0x04` and `0x06`–`0x08` it is `rdb-cbor-document` v1 (lists amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1); for kind `0x05` (blob chunk) the payload is stored as given. The byte stays `0x01`, so `open` is unchanged (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2) |
 | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of header bytes 0..8, then the payload (amended 2026-10-04, L-R186s; ADR-rdb-0013 decision 7) |
 | 4 | 4 | `payload_len` | u32 BE; must equal the remaining bytes. For a document this **is** the logical length |
@@ -170,6 +179,7 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
     `LengthMismatch`, `DigestMismatch`), or a v1 payload that does not decode as canonical CBOR.
   - **A `kind` of `0x00`** is never written, but with a correct digest it reads as `UnknownKind` and is
     refused (amended 2026-10-04, ADR-rdb-0013). Telling it apart from a newer build's record is M9 debt.
+    (Status 2026-10-19, M9 S4, A-R113 C-5: paid in M9 S6, with the admin path.)
 - **Forward compatibility** is by bumping `envelope_format` or `codec_version`. There are no optional
   fields to skip in v1. Readers keep old decoders while old data or snapshots exist (spec §4.3).
 - **v1 encoder output is frozen.** The v1 decoder accepts only the bytes the v1 encoder writes: it
@@ -275,16 +285,24 @@ upgrade note.
       `VersionWithoutValue` (a snapshot breaking its own promise).
   - The variant is one (`Corrupt`) in v1; a caller tells the groups apart by the `EnvelopeError`
     inside. A separate variant or predicate is due before the M9 admin path is built.
+    (Status 2026-10-19, M9 S4, A-R113 C-5: the predicate and the admin path are both M9 S6.)
   - **Known gap, accepted (L-R185m A2):** a corrupt record cannot be overwritten through this
     crate. `Expected::Version` reads and opens the record first, so it fails `Corrupt`; and
     `Expected::Absent` fails its `Absent` condition at apply, because a record exists. Only a
     storage `Delete` clears it. Owner: the **M9 admin path**, which must offer a delete or an
     unconditional replace for a **damaged** record. It must **not** offer either for a record
     written by a newer build: that would destroy valid data during an upgrade.
+    (Status 2026-10-19, M9 S4, A-R113 C-5: the admin path is M9 S6.)
   - **Narrowed (amended 2026-10-04, L-R186aa; ADR-rdb-0013 decision 11):** for a record under an
     object prefix, the storage `Delete` is allowed only for a document root. Every other damaged
     record is repaired through the `rdb-value` functions in ADR-rdb-0013 decision 11.
 - Mapping to the client error categories (spec §5.4) belongs to M9 `rdb-api`.
+  (Status 2026-10-19, M9 S4: done in `rdb-api`'s `compile_error`. `VersionConflict`,
+  `ObjectAbsent`, `ElementAbsent` and `ElementExists` are `CONDITION_FAILED`; `ChunkConflict` is
+  `UPLOAD_CHUNK_CONFLICT`; every other `Apply` error is `INVALID_ARGUMENT`. Four blob damages are
+  `CORRUPT_BLOB`: `Manifest`, `Chunk`, `ChunkMissing` and `ChunkMismatch`. Any other `Corrupt` is
+  `CORRUPT_HISTORY`, a blob root whose envelope does not open (`Envelope`) included. A list token
+  whose list moved is the kernel's `STALE_CONTINUATION`.)
 
 ### 13. Who owns the object-key layout
 - A document lives at its object's root key, and the document API takes only a root key (amended
@@ -298,6 +316,11 @@ upgrade note.
 ### 14. Showing a document as JSON: the `$` rule (L-R185o A3)
 - The library has no JSON form; the example (`crates/rdb-value/examples/doc_scenario.rs`) shows
   documents as JSON for people. M9's API inherits this rule if it shows JSON.
+  (Status 2026-10-19, M9 S4: the `Db` shows no JSON. `rdb_dev` shows values with `doc_scenario`'s
+  own `render`, so this rule holds there unchanged. One input exception, A-R121: at a map-key or
+  set-member position only, `rdb_dev` reads `{"$bytes":"<hex>"}` as a byte string, the form a
+  read prints. A document value still takes no tagged input
+  (`a_bytes_key_is_entered_as_a_read_prints_it`).)
 - Types JSON lacks are shown as one-key objects with a single leading `$`: `{"$bytes":"<hex>"}`,
   `{"$decimal":[exponent, mantissa]}`, `{"$timestamp":{"secs":S,"nanos":N}}`.
 - **A map key that starts with `$` is shown with one more `$`**, at any depth: `$bytes` → `$$bytes`,
@@ -383,6 +406,7 @@ Through the kernel the version is the writing `seq`, so it rises but can skip nu
   **M9 risk:** the primary decodes on every path op, so it needs a decode-concurrency or memory
   budget before clients can send documents in parallel.
 - **A corrupt record needs an admin path to clear** (§12): owned by M9.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: built in M9 S6.)
 
 ## Related, not part of this ADR: two kernel stalls (decided; stream K)
 Found while drafting, and completed by the critic (F1, by reading; not executed).

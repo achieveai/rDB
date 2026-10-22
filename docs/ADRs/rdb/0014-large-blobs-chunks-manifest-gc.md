@@ -94,6 +94,8 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   `Corrupt(Key(ChunkTail{len}))`.
 - `upload_id` is chosen by the caller. `rdb-value` is pure; ids are arguments (ADR-rdb-0011 decision 2).
   M9 decides who mints it (Open O1).
+  (Status 2026-10-19, M9 S4, A-R114 Q1: the caller mints it and passes it in `Change::Chunk` and
+  `Change::Publish`. See Open O1.)
 - Chunks are `Namespace::User` records written by ordinary transactions (decision 5). So they have a
   version, a `History` after-image, and dedup like any write. ADR-rdb-0010 decision 6's full copy
   rebuilds them like any other key.
@@ -270,9 +272,18 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
        callers are `doc_scenario` (its store has one generation) and the tests' kernel stand-in. In M9 the
        executor takes it from the `Recovered` its node last acted on (`RecoveryResult.new_generation`, an
        existing contract type), the same input that makes the node primary (Open O9).
+       (Status 2026-10-19, M9 S4: `Host::compile` passes as `serving` the generation the node last
+       adopted from the kernel's `AdoptAuthority` effect (`Host::adopted`), the one it builds the
+       compile's view for, never the snapshot's. Guard 8, row
+       `a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds`.)
      - Check 0's answer is a **read**: it is as fresh as M9's read path makes any read. A node that does
        not yet know it was deposed answers stale reads of every kind; that is the read path's lease rule,
        not this check's.
+       (Status 2026-10-19, M9 S4, A-R113 C-3: in S4 check 0's "unchanged" also needs the root to be
+       published. `already_published` answers it only when the root's version is at or below P1's
+       published seq in the view's generation. Above that, the re-issued publish is
+       `UNKNOWN_OUTCOME` and nothing is sent. Guard 9, row
+       `a_publish_reissued_before_its_blob_publishes_is_an_unknown_outcome_not_unchanged`.)
      - **Safe default.** A caller that cannot name `serving` passes one that matches no snapshot. Check 0
        then never answers; retries get dedup's answer or a refusal, never a false success.
   1. `chunk_size` in `1 … MAX_CHUNK`, else `InvalidChunkSize{found}` (0 would divide by zero; `TooLarge`
@@ -348,13 +359,16 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   published or abandoned. **It protects uploads in progress, and nothing else.** A wrong floor costs an
   upload, never the current blob: that publish then fails `ChunkMissing` or its chunk condition
   (decision 6). M9's upload sessions compute it (Open O1). In M8 the caller passes it.
+  (Status 2026-10-19, M9 S4, A-R114 Q1: in M9 too the caller passes it, as `Change::Gc{floor}`.
+  Upload sessions are carried to M10. See Open O1.)
 - **What `floor` cannot protect.** It is compared with when a chunk was *written*. A reader of an older
   state needs chunks by when they stopped being *used*: blob `u1` published at 10, replaced at 100, and a
   reader at 50 still needs `u1`'s chunks, written at 1–3. GC at `floor = 50` deletes them. No `floor`
   value protects that reader. So GC must not run while a reader, read session or backup older than the GC
   snapshot may still read the object. **In M8 there is none:** every read is one engine snapshot, and
   both engines' snapshots are owned copies (Context). Read sessions (M9) and backups (M10) need a second
-  input, Open O2.
+  input, Open O2. (Status 2026-10-19, M9 S4, A-R113 C-5: read sessions are carried to M10. In M9
+  every read is one step view, and nothing promises consistency across calls.)
 - **Output:** `Delete`s in key order, each with `expected_version: Some(its version)`, plus **one root
   guard**: `VersionEquals{root, v}`, or `Absent{root}` when there is no root. A batch stops at 255
   `Delete`s (`MAX_REQUEST_MUTATIONS`) **or** when one more would put `record_len` over
@@ -378,6 +392,7 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
     `Delete`, so ADR-rdb-0010 decision 6's copy "as of `base`" is exact. `History` retention is ADR-rdb-0010 O4.
   - Lagging replicas apply the same records in order. Read sessions across requests and backups: Open O2, O3.
 - Which objects to visit, and when, is a scheduler's job: M9 or M10 (Open O5).
+  (Status 2026-10-19, M9 S4, A-R113 C-5: M10. In M9 GC runs only when the app asks for it.)
 
 ### 9. Integrity rule (ADR-rdb-0013 decision 11) for blobs
 - Chunk and manifest records are written only by `rdb-value`'s compiled output, as decision 11 says for
@@ -400,6 +415,12 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   chunk is a client error at publish (the upload is incomplete) and damage after it.
 - **Envelope `kind`** gains `0x04` blob and `0x05` chunk. A reserved `kind` stays written-by-a-newer-build.
 - Mapping to spec §5.4 (`UPLOAD_CHUNK_CONFLICT`, `CORRUPT_BLOB`) is M9's.
+  (Status 2026-10-19, M9 S4, A-R114 Q2: done. `ErrorKind::UploadChunkConflict` and
+  `ErrorKind::CorruptBlob` are appended to the contract. `compile_error` maps `ChunkConflict` to the
+  first. It maps `Corrupt::Manifest`, `Chunk`, `ChunkMismatch` and `ChunkMissing` to the second. A
+  chunk missing at publish stays `INVALID_ARGUMENT`. `ApiError::new` gives them `Reconcile` (no
+  mutation) and `Quarantine`. Guards 10 and 11, row
+  `a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds`.)
 
 ### 11. `Compiled` carries a list of conditions
 - Publish needs up to 256 conditions. S3 already spells `Compiled { mutations: Vec<Mutation>, conditions:
@@ -461,6 +482,8 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
 - Publish is O(blob) on the primary: it rereads and hashes every chunk.
 - Small binary values need no blob: a document whose root is a byte string (ADR-rdb-0012 §2) holds up to
   1,048,536 bytes. The M9 API chooses the threshold (Open O7).
+  (Status 2026-10-19, M9 S4: the API sets no threshold. The app chooses. `Db::put` writes a
+  byte-string document, and `Change::Chunk` with `Change::Publish` writes a blob.)
 
 ## Verification
 Built and tested in M8 S5. Tests live in `crates/rdb-value/tests/blobs.rs` unless named otherwise. No
@@ -517,12 +540,16 @@ seen to fail under a named fault (a mutant), then pass.
 
 ## Open (none blocks S5)
 - **O1 Upload sessions (M9):** who mints `upload_id`, the abandonment timeout, and the GC `floor`.
+  (Status 2026-10-19, M9 S4, A-R114 Q1: in M9 the caller mints `upload_id` and passes the GC
+  `floor`. Upload sessions and the abandonment timeout are carried to M10, with GC scheduling (O5).)
 - **O2 Read sessions (M9) and backups (M10):** `floor` cannot protect them (decision 8); rev 1's "or the
   floor must also cover it" is withdrawn. Either the reader holds one engine snapshot for its whole life,
   or GC gets a second input: the oldest retained reader's `seq`, compared with when a chunk became
   unreachable. A present root bounds that from above by its own version. A deleted root leaves no
   version, so a delete would need to leave its `seq` somewhere, such as a tombstone root kind. That is a
   stored-format choice for M9, not a constant. A lazy `RocksSnapshot` must pin a RocksDB snapshot.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: read sessions and the tombstone choice are carried to M10.
+  M9 has no read session across calls, so nothing in M9 needs the second input.)
 - **O3 Replication (M10):** the upload stream, 256 KiB frames, the prepared-secondary token,
   `BLOB_DEPENDENCY_UNAVAILABLE`, and V14's ACK clause. If M10 writes chunks outside transactions, it must
   give them a version **from the partition's own `seq`**, checked by the kernel at apply, or both guards
@@ -530,8 +557,13 @@ seen to fail under a named fault (a mutant), then pass.
 - **O4 Id length (ADR-rdb-0013 O1):** an id limit of 3,745 bytes or less keeps a full chunk writable.
   GC no longer depends on it (decision 8's byte bound).
 - **O5 GC scheduling (M9/M10):** which objects to visit, and a key-only scan so GC does not load chunk values.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: M10, with upload sessions (O1). In M9 GC runs on request.)
 - **O6 Lazy snapshot** for large blobs.
 - **O7 Inline binary:** the API threshold between a bytes document and a blob.
+  (Status 2026-10-19, M9 S4: closed for M9 with no threshold. The app picks. `Db::put` writes a
+  byte-string document, and `Change::Chunk` with `Change::Publish` writes a blob. `rdb-api` never
+  switches between them: a value too large for a document is refused `INVALID_ARGUMENT`, not stored
+  as a blob. Nothing is carried to M10.)
 - **O8 Compression or encryption:** a new `codec_version` on chunk records.
 - **O9 The generation fence for every compile (lead):** document and collection requests have the same
   version-reuse exposure as a lost update (ADR-rdb-0012 §11, ADR-rdb-0013). If ruled general, it moves
@@ -544,6 +576,13 @@ seen to fail under a named fault (a mutant), then pass.
   refusal of a retry (the fence, a condition, an `expected_version` or the compile), the executor
   re-reads a fresh snapshot and compiles again before it reports failure (decision 6, check 0
   precondition).
+  **Amended 2026-10-19 (M9 S4, A-R113 C-4, A-R114 Q3): in M9 the app re-issues, not the executor.**
+  `Db` keeps no re-read-and-compile step after a refused retry: it reports the refusal as the kernel
+  gave it (`CONDITION_FAILED request=<R>`, S4 recipe 4o). The app then sends the same change again
+  as a new request, which compiles on a fresh snapshot. A re-issued publish answers "unchanged"
+  only when the root's version is at or below the host's published seq for that partition; above
+  it, the answer is `UNKNOWN_OUTCOME` and nothing is sent (S4 edge 4h, A-R113 C-3). `Gc`'s empty
+  answer and `put_chunk`'s "already stored" are exempt from that check (A-R113 C-3).
 
 ## References
 - Spec §4.2, §4.3, §4.3.1, §5.4; validation plan V14.

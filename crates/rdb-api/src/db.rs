@@ -30,14 +30,17 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
+use rdb_value::delta::{Delta, Op};
+use rdb_value::value::Value;
+use rdb_value::{Document, Expected};
 use tokio::runtime::Handle;
 
 use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
 use crate::host::{
-    self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus, NodeStopped, PutOp,
-    TXN_WAITER_MARGIN_MILLIS,
+    self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
+    PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
 use crate::transport::Links;
 
@@ -93,7 +96,8 @@ impl ApiError {
     /// |---|---|---|
     /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
     /// | `UnknownOutcome` | `QueryStatus` | `false` |
-    /// | `CorruptHistory` | `Quarantine` | `false` |
+    /// | `CorruptHistory`, `CorruptBlob` | `Quarantine` | `false` |
+    /// | `UploadChunkConflict` | `Reconcile` | `true` |
     /// | any other | `BoundedJitter` | `false` |
     ///
     /// This is not what the kernel attaches to the same kind: for example a kernel
@@ -107,7 +111,8 @@ impl ApiError {
                 (RetryRule::Definitive, true)
             }
             ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
-            ErrorKind::CorruptHistory => (RetryRule::Quarantine, false),
+            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob => (RetryRule::Quarantine, false),
+            ErrorKind::UploadChunkConflict => (RetryRule::Reconcile, true),
             _ => (RetryRule::BoundedJitter, false),
         };
         Self {
@@ -283,6 +288,19 @@ pub struct GetOk {
     /// it can still be the predecessor generation: the new generation has written nothing
     /// yet, so both views hold identical contents. Never fence on it; a write fences with the
     /// generation the node adopted, not with this one.
+    pub generation: Generation,
+    /// The position of that view.
+    pub at: Seq,
+    /// Whether it waited at the barrier for an in-flight write.
+    pub waited: bool,
+}
+
+/// A served [`Db::read`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOk {
+    /// What it saw, with the version it saw.
+    pub seen: Seen,
+    /// The storage generation of the view it was read from; as [`GetOk::generation`].
     pub generation: Generation,
     /// The position of that view.
     pub at: Seq,
@@ -640,13 +658,14 @@ impl Db {
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
-        let put = TxnPut {
+        let put = PutOp {
             group: GROUP,
-            object,
-            value,
-            if_version,
+            object: Bytes::copy_from_slice(object),
+            change: byte_doc(value),
+            expect: if_version.map(Expected::Version),
         };
-        self.compile_and_send(identity, &[put], self.timeouts.put, self.timeouts.put)
+        self.compile_and_send(identity, vec![put], self.timeouts.put, self.timeouts.put)
+            .and_then(written)
     }
 
     /// Write every put in `puts` as one transaction, or none of them, with a kernel deadline of
@@ -669,7 +688,81 @@ impl Db {
                 request: None,
             });
         }
+        let puts = puts
+            .iter()
+            .map(|put| PutOp {
+                group: put.group,
+                object: Bytes::copy_from_slice(put.object),
+                change: byte_doc(put.value),
+                expect: put.if_version.map(Expected::Version),
+            })
+            .collect();
         self.compile_and_send(self.identity(), puts, deadline, send_wait(deadline))
+            .and_then(written)
+    }
+
+    /// Apply `change` to `object`, as one transaction. `expect` says when it may happen:
+    /// `None` at the version the owner's compile sees (absent included), `Some(Absent)` only
+    /// as a create, `Some(Version(v))` only at version `v`. A `Chunk` or a `Gc` takes no
+    /// `expect`. The owner compiles the change against the object as it is, so the request
+    /// carries the whole after-image of what it changes.
+    ///
+    /// What guards the request:
+    /// - `Doc`, `Map`, `Set`, `List` and `Publish`: the object's version it was compiled
+    ///   against. A write to the object that lands first makes this one `CONDITION_FAILED`, at
+    ///   the compile or at the kernel. A `Publish` is also guarded by each chunk's version.
+    /// - `Chunk`: only that chunk's key being absent, never the object's version. A chunk is
+    ///   stored under an object of any kind, or none (A-R127).
+    /// - `Gc`: the object as the compile read it, and each chunk it deletes.
+    ///
+    /// `Ok(None)` is a change that compiles to nothing and is never sent:
+    /// - a `Chunk` whose bytes are already stored at its upload and index;
+    /// - that `Chunk` answer even while A1 refuses reads, as after a fence: "already stored" is
+    ///   never final, because a `Publish` re-reads every chunk and is admitted or refused under
+    ///   the fence, so it is not gated on A1 (ADR-rdb-0014 O9);
+    /// - a `Gc` with nothing left to collect;
+    /// - a `Publish` of the blob already at the object and published: its version is at or
+    ///   below what P1 has published, in the generation the compile sees.
+    ///
+    /// # Errors
+    ///
+    /// Once sent, as [`Self::put`]: a §5.4 refusal, or `UNKNOWN_OUTCOME` carrying the request,
+    /// ready to [`Db::resend`] unchanged. A change the compile refuses sends nothing and
+    /// carries no request:
+    /// - `CONDITION_FAILED` for a version that moved, or an object or element that a change or
+    ///   a `Need` finds absent or present when it must not be;
+    /// - `INVALID_ARGUMENT` for an op that does not fit the object (`KindMismatch`,
+    ///   `NotAContainer`, ...), an `expect` on a `Chunk` or a `Gc`, or a `Publish` whose stored
+    ///   chunks do not match it (`ChunkMissing`, `ChunkLength`, `BlobDigestMismatch`, ...);
+    /// - `UPLOAD_CHUNK_CONFLICT` for a `Chunk` whose upload and index already hold other bytes;
+    /// - `CORRUPT_BLOB` when a blob root that opens is not a v1 manifest, or a chunk it names does
+    ///   not open, is not stored, or is not the one the manifest names; `CORRUPT_HISTORY` when any
+    ///   other stored record does not open, a blob root whose envelope does not open included;
+    /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
+    ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
+    ///   [`Self::status`] about that publish;
+    /// - for a `Publish` of the blob already at the object while A1 refuses reads, the kind and
+    ///   retry rule [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), with
+    ///   `no_mutation`, never "unchanged";
+    /// - `UNAVAILABLE` when no compile answer came in time.
+    pub fn write(
+        &self,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
+        let put = PutOp {
+            group: GROUP,
+            object: Bytes::copy_from_slice(object),
+            change,
+            expect,
+        };
+        self.compile_and_send(
+            self.identity(),
+            vec![put],
+            self.timeouts.put,
+            self.timeouts.put,
+        )
     }
 
     /// Compile `puts` under `identity` with kernel deadline `deadline`, waiting
@@ -677,25 +770,17 @@ impl Db {
     fn compile_and_send(
         &self,
         identity: RequestIdentity,
-        puts: &[TxnPut<'_>],
+        puts: Vec<PutOp>,
         deadline: Duration,
         wait: Duration,
-    ) -> Result<PutOk, PutError> {
+    ) -> Result<Option<PutOk>, PutError> {
         // Compile first, send second (defect w24): the request is in hand before anything is
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
         let call = ClientCall::Compile {
             identity,
-            puts: puts
-                .iter()
-                .map(|put| PutOp {
-                    group: put.group,
-                    object: Bytes::copy_from_slice(put.object),
-                    value: Bytes::copy_from_slice(put.value),
-                    if_version: put.if_version,
-                })
-                .collect(),
+            puts,
             remaining_millis: millis(deadline),
         };
         let refused = |error| {
@@ -707,7 +792,10 @@ impl Db {
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(call, self.timeouts.put) {
-            Some(Answer::Compiled(request)) => self.send(ClientCall::Resend { request }, wait),
+            Some(Answer::Compiled(request)) => {
+                self.send(ClientCall::Resend { request }, wait).map(Some)
+            }
+            Some(Answer::Unchanged) => Ok(None),
             Some(Answer::Error { error, .. }) => refused(error),
             Some(other) => refused(ApiError::host(&format!(
                 "a put compile was answered with {other:?}"
@@ -814,16 +902,20 @@ impl Db {
         })
     }
 
-    /// Read `object` at the publication barrier.
+    /// Read `object` at the publication barrier, as a byte string.
     ///
     /// # Errors
     ///
     /// [`ApiError`]: a §5.4 refusal, or `UNAVAILABLE` when no answer came in time.
+    /// `INVALID_ARGUMENT` when the object is a document that is not a byte string, or another
+    /// kind: read those with [`Self::read`].
     pub fn get(&self, object: &[u8]) -> Result<GetOk, ApiError> {
-        self.read(ClientCall::Get {
+        self.read_call(ClientCall::Get {
             identity: self.identity(),
             object: Bytes::copy_from_slice(object),
+            look: Look::Doc,
         })
+        .and_then(byte_string)
     }
 
     /// Read `object` from the previously published view, at once: it never waits for a write
@@ -832,15 +924,31 @@ impl Db {
     /// # Errors
     ///
     /// [`ApiError`]: P1's refusal (`UNAVAILABLE` before any view is kept), or `UNAVAILABLE`
-    /// when no answer came in time.
+    /// when no answer came in time. As [`Self::get`] for an object that is not a byte string.
     pub fn get_previous(&self, object: &[u8]) -> Result<GetOk, ApiError> {
-        self.read(ClientCall::GetPrevious {
+        self.read_call(ClientCall::GetPrevious {
             identity: self.identity(),
             object: Bytes::copy_from_slice(object),
         })
+        .and_then(byte_string)
     }
 
-    fn read(&self, call: ClientCall) -> Result<GetOk, ApiError> {
+    /// Read `look` of `object` at the publication barrier: one consistent view, with the
+    /// version of what it saw. A missing object is [`Seen::Absent`], not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError`]: a §5.4 refusal, or `UNAVAILABLE` when no answer came in time.
+    /// `INVALID_ARGUMENT` (`KindMismatch`) when `look` does not fit the object's kind.
+    pub fn read(&self, object: &[u8], look: Look) -> Result<ReadOk, ApiError> {
+        self.read_call(ClientCall::Get {
+            identity: self.identity(),
+            object: Bytes::copy_from_slice(object),
+            look,
+        })
+    }
+
+    fn read_call(&self, call: ClientCall) -> Result<ReadOk, ApiError> {
         let answered = match self.call(call, self.timeouts.read) {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
@@ -848,11 +956,11 @@ impl Db {
             }) => Err(refused_read(kind)),
             Some(Answer::Read {
                 outcome,
-                value,
+                seen,
                 generation,
                 at,
-            }) => Ok(GetOk {
-                value,
+            }) => Ok(ReadOk {
+                seen,
                 generation,
                 at,
                 waited: outcome == ReadServiceOutcome::WaitedAtBarrier,
@@ -1262,10 +1370,49 @@ impl Drop for Db {
     }
 }
 
+/// A byte-string document: what [`Db::put`] and [`Db::txn`] write.
+fn byte_doc(value: &[u8]) -> Change {
+    Change::Doc(Delta(vec![Op::Replace(Value::Bytes(value.to_vec()))]))
+}
+
+/// A byte write's answer. A byte document always compiles to a root `Put`, so a compile with
+/// nothing to send is the host's fault, never a success.
+fn written(answer: Option<PutOk>) -> Result<PutOk, PutError> {
+    answer.ok_or_else(|| PutError {
+        error: ApiError::host("a byte write compiled to nothing; nothing was sent"),
+        request: None,
+    })
+}
+
+/// A document read as [`Db::get`] answers it: its bytes, or `INVALID_ARGUMENT` when it
+/// is not a byte string.
+fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
+    let value = match read.seen {
+        Seen::Absent => None,
+        Seen::Doc(Document {
+            version,
+            value: Value::Bytes(bytes),
+        }) => Some((version, Bytes::from(bytes))),
+        // `get` looks with `Look::Doc`, so `Members` and `Items` are not expected here; either
+        // way it is no byte string.
+        Seen::Doc(_) | Seen::Members(_) | Seen::Items(_) | Seen::Range { .. } => {
+            return Err(ApiError::invalid(
+                "the object is not a byte string; read it with Db::read",
+            ))
+        }
+    };
+    Ok(GetOk {
+        value,
+        generation: read.generation,
+        at: read.at,
+        waited: read.waited,
+    })
+}
+
 /// A read P1 refused with `kind`, with the retry rule and mutation proof the kernel's own table
 /// gives that kind, as a put's refusal has (F-011). The `RdbError` here only carries the kind
 /// to that table: its fields are placeholders, so its message never reaches the detail.
-fn refused_read(kind: ErrorKind) -> ApiError {
+pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
     let partition = PARTITION;
     let identity = RequestIdentity {
         tenant: TENANT,
@@ -1833,7 +1980,7 @@ mod tests {
                 reply
                     .send(Answer::Read {
                         outcome: ReadServiceOutcome::Rejected(kind),
-                        value: None,
+                        seen: Seen::Absent,
                         generation: Generation(1),
                         at: Seq(1),
                     })
@@ -3147,5 +3294,141 @@ mod tests {
         assert_eq!(wire_name(ErrorKind::ProtectionPaused), "PROTECTION_PAUSED");
         assert_eq!(wire_name(ErrorKind::UnknownOutcome), "UNKNOWN_OUTCOME");
         assert_eq!(wire_name(ErrorKind::Unavailable), "UNAVAILABLE");
+    }
+
+    /// Ruling A-R120 (tester coverage review, MATERIAL): the public `Db::write` and `Db::read`,
+    /// end to end for a list, and `Db::get` on a document that is no byte string. A write carries
+    /// its change and its guard: a stale `Version` is refused at the compile with no request, and
+    /// a create over the list is the kernel's refusal, carrying the change's own request. A read
+    /// carries its look: `Items { at: -1 }` lists the last item. It fails if `write` sends
+    /// `expect: None` (the stale write publishes), if `read` forwards `Look::Doc` (the list read
+    /// is `INVALID_ARGUMENT`), or if `byte_string` answers a map document as `Ok`.
+    /// Integration (~1 s): three node threads on wall-clock time.
+    #[test]
+    fn the_public_write_and_read_carry_the_change_its_guard_and_the_look() {
+        use crate::host::ListEdit;
+        use rdb_value::value::{Int, Map, MapKey};
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        let text = |s: &str| Value::Text(s.to_owned());
+        let push = |s: &str| ListEdit::Push(text(s));
+
+        let created = db
+            .write(
+                b"l",
+                Change::List(vec![push("a"), push("b"), push("c")]),
+                Some(Expected::Absent),
+            )
+            .expect("create l")
+            .expect("a create is sent");
+        assert_eq!((created.request, created.seq), (RequestId(1), Seq(2)));
+        match db
+            .read(b"l", Look::Items { at: -1, limit: 10 })
+            .expect("items of l")
+            .seen
+        {
+            Seen::Items(items) => {
+                let root = (items.list.version, items.list.count);
+                let listed: Vec<_> = items
+                    .items
+                    .into_iter()
+                    .map(|item| (item.position, item.value))
+                    .collect();
+                assert_eq!((root, listed), ((2, 3), vec![(2, text("c"))]));
+            }
+            other => panic!("items of l: {other:?}"),
+        }
+
+        let stale = db
+            .write(
+                b"l",
+                Change::List(vec![push("q")]),
+                Some(Expected::Version(1)),
+            )
+            .expect_err("l is at version 2");
+        assert_eq!(stale.error.name(), "CONDITION_FAILED", "{stale:?}");
+        assert!(stale.request.is_none(), "refused at the compile: {stale:?}");
+        let over = db
+            .write(b"l", Change::List(vec![push("q")]), Some(Expected::Absent))
+            .expect_err("l exists");
+        assert_eq!(over.error.name(), "CONDITION_FAILED", "{over:?}");
+        assert_eq!(
+            over.request.map(|request| request.identity.request),
+            Some(RequestId(4)),
+            "the kernel's refusal carries the change's own request"
+        );
+
+        let mut map = Map::new();
+        map.insert(MapKey::new("n"), Value::Integer(Int::from(1_u64)));
+        let doc = Value::Map(map);
+        let written = db
+            .write(
+                b"d",
+                Change::Doc(Delta(vec![Op::Replace(doc.clone())])),
+                Some(Expected::Absent),
+            )
+            .expect("create d")
+            .expect("a create is sent");
+        assert_eq!(
+            db.read(b"d", Look::Doc).expect("read d").seen,
+            Seen::Doc(Document {
+                version: written.seq.0,
+                value: doc
+            })
+        );
+        let refused = db.get(b"d").expect_err("d holds a map, not bytes");
+        assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused:?}");
+        assert!(refused.detail.contains("not a byte string"), "{refused:?}");
+        db.shutdown();
+    }
+
+    /// Review F-008: `Db::write` answers a change that compiles to nothing as `Ok(None)`: a gc
+    /// with nothing to collect, and a chunk already stored. Nothing is sent, so the next write
+    /// lands at the next seq. Mutant m22 (the `Unchanged` arm cut from `compile_and_send`)
+    /// answers each as a host error. Integration (~1 s): three node threads on wall-clock time.
+    #[test]
+    fn a_write_that_compiles_to_nothing_is_ok_none() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        let chunk = |index, bytes| Change::Chunk {
+            upload: [1; 16],
+            index,
+            bytes: Bytes::from_static(bytes),
+        };
+
+        let gc = db.write(b"g", Change::Gc { floor: u64::MAX }, None);
+        assert_eq!(gc.expect("a gc of nothing").map(|ok| ok.seq), None);
+        let first = db.write(b"g", chunk(0, b"abcd"), None).expect("chunk 0");
+        let first = first.expect("a new chunk is sent").seq;
+        let again = db.write(b"g", chunk(0, b"abcd"), None);
+        assert_eq!(again.expect("chunk 0 again").map(|ok| ok.seq), None);
+        let next = db.write(b"g", chunk(1, b"ef"), None).expect("chunk 1");
+        assert_eq!(
+            next.map(|ok| ok.seq),
+            Some(Seq(first.0 + 1)),
+            "nothing was sent in between"
+        );
+        db.shutdown();
     }
 }

@@ -81,6 +81,10 @@ pub enum RetryRule {
 /// [`Self::Unavailable`], the spike's own "not wired in this build" answer (spike §8), and
 /// [`Self::DivergenceRequiresOperator`] (lead ruling R-S2). Both are here because a trace, and
 /// in the second case a client reply, has to be able to say them.
+///
+/// The last two, [`Self::UploadChunkConflict`] and [`Self::CorruptBlob`], are ADR-0014 §10's
+/// blob errors (M9 ruling A-R114 Q2). The API raises them; the kernel never does, so no
+/// [`RdbError`] variant carries them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ErrorKind {
     /// [`RdbError::NotPrimary`].
@@ -126,6 +130,11 @@ pub enum ErrorKind {
     DivergenceRequiresOperator,
     /// [`RdbError::Unavailable`].
     Unavailable,
+    /// A blob chunk already stored under this upload and index holds other bytes. Reconcile:
+    /// the upload id was reused for different content.
+    UploadChunkConflict,
+    /// A stored blob's manifest or chunks fail their checks. Quarantine and escalate.
+    CorruptBlob,
 }
 
 /// Every error the rDB kernel may return to a caller or to the harness.
