@@ -17,7 +17,7 @@ use rdb_value::keys::{chunk_key, element_key, item_key, parse, root_key, RootKey
 use rdb_value::list::{compile_list, create_list, items, list, ListOp, Start, DEFAULT_BLOCK_MAX};
 use rdb_value::repair::clear_object;
 use rdb_value::value::{Int, MapKey, Value};
-use rdb_value::{compile, read, BlockFault, Corrupt, Expected, ValueError};
+use rdb_value::{compile, read, BlockFault, Corrupt, Expected, SlotFault, ValueError};
 use sha2::{Digest as _, Sha256};
 
 fn object(id: &[u8]) -> RootKey {
@@ -128,6 +128,16 @@ fn g4_a_newer_build_list_block_refuses_the_clear_of_a_sound_list() {
     assert_newer_build_refused(&k, &list, "sound list root");
 }
 
+/// A map of two at `id`, whose records sort right after every record of `of` (tester-s6 M1):
+/// a page that reaches the last element of `of` then meets this object's first record.
+fn neighbour(k: &mut Kernel, of: &RootKey, id: &[u8]) {
+    let next = object(id);
+    assert!(next.object_prefix() > of.object_prefix(), "sorts after");
+    map_of_two(k, &next);
+    let (last, _) = k.records.iter().next_back().unwrap();
+    assert!(last.starts_with(next.object_prefix()), "the last object");
+}
+
 /// The root version of the map or set at `root`.
 fn root_version(k: &Kernel, root: &RootKey) -> u64 {
     collection(&k.snapshot(), root).unwrap().unwrap().version
@@ -194,12 +204,14 @@ fn half_cleared_then_fixed(k: &mut Kernel, root: &RootKey, kind: CollectionKind,
 /// the app's own fix, a full `members` answered ok with `count=300 listed=46`, while the next
 /// clear proved the same state damaged. A read that starts at the first element and reaches the
 /// last, judged by looking one element past the page, now checks the count as the clear does.
+/// Another object follows, so the record past the page is the neighbour's, not none (M1).
 #[test]
 fn w2a_a_half_cleared_map_or_set_never_reads_as_healthy() {
     for kind in [CollectionKind::Map, CollectionKind::Set] {
         let mut k = Kernel::new();
         let root = object(b"big");
         let stored = half_cleared_then_fixed(&mut k, &root, kind, 300);
+        neighbour(&mut k, &root, b"bih");
         let s = k.snapshot();
         let want = Corrupt::CountMismatch { count: 300, stored };
         // A page of exactly the elements left reaches the end too.
@@ -724,6 +736,7 @@ fn guard_17_an_orphan_item_beside_an_empty_list_is_damage_the_drop_finds() {
 
 /// Contract 6 (tester-s6): a healthy map and set of mixed keys, after an overwrite of one and a
 /// del of a key not stored, read whole at every limit that reaches the end, and are not damaged.
+/// Another object follows, and its records are never read as elements (M1).
 #[test]
 fn contract_6_a_healthy_map_and_set_of_mixed_keys_read_whole_and_are_not_damaged() {
     let keys = [
@@ -755,6 +768,7 @@ fn contract_6_a_healthy_map_and_set_of_mixed_keys_read_whole_and_are_not_damaged
                 k.commit(&made);
             }
         }
+        neighbour(&mut k, &root, b"mixee");
         let s = k.snapshot();
         let n = keys.len();
         for limit in [n, n + 1, usize::MAX] {
@@ -789,5 +803,274 @@ fn guard_3_a_root_of_kind_0_is_damage_and_is_cleared() {
         Corrupt::Envelope(EnvelopeError::UnknownKind(0))
     );
     k.commit_any_order(&cleared.compiled);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+// ---- coverage gaps (tester-s6's review of ef7653c) -------------------------------------------
+
+/// Clear what is stored under `root` while it has no root: one batch that deletes every record,
+/// guarded by the root's absence. A root written before the apply refuses it whole.
+fn assert_rootless_clear(mut k: Kernel, root: &RootKey, want: impl Fn(&Corrupt) -> bool) {
+    let stored = k.records.len();
+    let cleared = clear_object(&k.snapshot(), root).unwrap().expect("damaged");
+    assert!(want(&cleared.damage), "{:?}", cleared.damage);
+    let absent = Condition::Absent {
+        key: root.to_bytes(),
+    };
+    assert_eq!(cleared.compiled.conditions, vec![absent]);
+    assert_eq!(
+        cleared.compiled.mutations.len(),
+        stored,
+        "every record, no root"
+    );
+
+    let mut raced = k.clone();
+    overwrite(
+        &mut raced,
+        root.to_bytes(),
+        seal(Kind::Document, &[0xf6]).unwrap(),
+    );
+    let before = raced.clone();
+    assert_eq!(
+        raced.apply_any_order(&cleared.compiled, None),
+        Err(Refused::Condition(0))
+    );
+    assert_eq!(raced, before);
+
+    k.commit_any_order(&cleared.compiled);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+    assert_eq!(clear_object(&k.snapshot(), root), Ok(None));
+}
+
+/// Gap 2: records with no root are an orphan (an element, an item, a block) or damage (a key
+/// that does not parse). The clear deletes them, guarded by the root being absent.
+#[test]
+fn gap_2_records_with_no_root_are_cleared_while_the_root_stays_absent() {
+    let root = object(b"o");
+    let orphan = |c: &Corrupt| *c == Corrupt::OrphanElement;
+
+    // Map elements.
+    let mut k = Kernel::new();
+    map_of_two(&mut k, &root);
+    k.records.remove(&root.to_bytes()).unwrap();
+    assert_rootless_clear(k, &root, orphan);
+
+    // List items first, then its block; and a list's block alone.
+    for records in [true, false] {
+        let mut k = Kernel::new();
+        let push: Vec<_> = ["x", "y"].iter().map(|v| ListOp::Push(text(v))).collect();
+        let made = create_list(&k.snapshot(), &root, records, DEFAULT_BLOCK_MAX, &push).unwrap();
+        k.commit(made.compiled());
+        k.records.remove(&root.to_bytes()).unwrap();
+        let first = parse(k.records.keys().next().unwrap()).unwrap().sub;
+        assert_eq!(first, if records { Sub::Item } else { Sub::Block });
+        assert_rootless_clear(k, &root, orphan);
+    }
+
+    // An item key whose id is 3 bytes, not 16.
+    let mut k = Kernel::new();
+    let mut bad = root.sub_prefix(2);
+    bad.extend_from_slice(&[1, 2, 3]);
+    assert!(parse(&bad).is_err(), "the key does not parse");
+    overwrite(
+        &mut k,
+        Bytes::from(bad),
+        seal(Kind::Document, &[0xf6]).unwrap(),
+    );
+    assert_rootless_clear(k, &root, |c| matches!(c, Corrupt::Key(_)));
+}
+
+/// A list of 40 items at `root` with one push pending in a change slot: a push far below a
+/// quarter of the block's base is not folded into it. The slot's key.
+fn list_with_a_pending_slot(k: &mut Kernel, root: &RootKey) -> Bytes {
+    let push: Vec<_> = (0..40)
+        .map(|i| ListOp::Push(text(&format!("item {i}"))))
+        .collect();
+    let made = create_list(&k.snapshot(), root, false, DEFAULT_BLOCK_MAX, &push).unwrap();
+    k.commit(made.compiled());
+    let version = list(&k.snapshot(), root).unwrap().unwrap().version;
+    let push = [ListOp::Push(text("w"))];
+    let made = compile_list(
+        &k.snapshot(),
+        root,
+        Expected::Version(version),
+        DEFAULT_BLOCK_MAX,
+        &push,
+    )
+    .unwrap();
+    k.commit(made.compiled());
+    k.records
+        .keys()
+        .find(|key| parse(key).is_ok_and(|p| p.slot.is_some()))
+        .expect("the push is pending in a slot")
+        .clone()
+}
+
+/// Gap 3: never delete what this build cannot read. Each record below is a newer build's, beside
+/// or inside an object that is otherwise damaged or sound, and refuses the whole clear.
+#[test]
+fn gap_3_records_only_a_newer_build_writes_refuse_the_clear() {
+    let root = object(b"o");
+
+    // A record under a `sub` no build this one knows writes, beside a damaged map.
+    let mut k = Kernel::new();
+    create(&mut k, &root, Shape::Map);
+    damage(&mut k, &root, Shape::Map);
+    overwrite(
+        &mut k,
+        Bytes::from(root.sub_prefix(0x09)),
+        seal(Kind::Document, &[0xf6]).unwrap(),
+    );
+    assert_eq!(
+        clear_object(&k.snapshot(), &root),
+        Err(ValueError::Corrupt(Corrupt::UnknownSub(0x09)))
+    );
+
+    // A map root of an element key profile this build does not know.
+    let mut k = Kernel::new();
+    let mut fields = rdb_value::value::Map::new();
+    fields.insert(MapKey::new("keys"), int(2));
+    fields.insert(MapKey::new("count"), int(0));
+    let payload = encode(&Value::Map(fields)).unwrap();
+    overwrite(&mut k, root.to_bytes(), seal(Kind::Map, &payload).unwrap());
+    assert_eq!(
+        clear_object(&k.snapshot(), &root),
+        Err(ValueError::Corrupt(Corrupt::UnknownKeyProfile(2)))
+    );
+
+    // A pending change slot a newer build wrote, inside a sound list.
+    let mut k = Kernel::new();
+    let slot = list_with_a_pending_slot(&mut k, &root);
+    let at = k.records[&slot].0;
+    k.records.insert(slot, (at, newer_build_record()));
+    let got = clear_object(&k.snapshot(), &root);
+    assert!(
+        matches!(
+            &got,
+            Err(ValueError::Corrupt(Corrupt::Block {
+                fault: BlockFault::OpBad {
+                    fault: SlotFault::Envelope(EnvelopeError::UnknownCodec(0x02)),
+                    ..
+                },
+                ..
+            }))
+        ),
+        "{got:?}"
+    );
+}
+
+/// Gap 3, the other side: a pending slot that is damaged, not a newer build's, and a block base
+/// stored again after the root, are damage. Each is faulting, and the clear deletes it.
+#[test]
+fn gap_3_a_damaged_slot_and_a_block_newer_than_its_root_are_cleared() {
+    let root = object(b"o");
+
+    let mut k = Kernel::new();
+    let slot = list_with_a_pending_slot(&mut k, &root);
+    let at = k.records[&slot].0;
+    k.records.insert(slot, (at, Bytes::from_static(b"damaged")));
+    let cleared = clear_object(&k.snapshot(), &root)
+        .unwrap()
+        .expect("damaged");
+    assert!(
+        matches!(
+            cleared.damage,
+            Corrupt::Block {
+                fault: BlockFault::OpBad { .. },
+                ..
+            }
+        ),
+        "{:?}",
+        cleared.damage
+    );
+    assert_eq!(cleared.faulting, 1, "the slot");
+    k.commit_any_order(&cleared.compiled);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+
+    let mut k = Kernel::new();
+    create(&mut k, &root, Shape::List);
+    let block = damaged_key(&k, &root, Shape::List);
+    let bytes = k.records[&block].1.clone();
+    overwrite(&mut k, block, bytes);
+    let cleared = clear_object(&k.snapshot(), &root)
+        .unwrap()
+        .expect("damaged");
+    assert!(
+        matches!(
+            cleared.damage,
+            Corrupt::Block {
+                fault: BlockFault::NewerThanRoot { .. },
+                ..
+            }
+        ),
+        "{:?}",
+        cleared.damage
+    );
+    assert_eq!(cleared.faulting, 1, "the block");
+    k.commit_any_order(&cleared.compiled);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Gap 4: a batch is cut by bytes before it is cut by count. A map of 300 elements with ~5 KiB
+/// keys does not fit one 1 MiB record, so its first batch holds fewer than 254 deletes, keeps
+/// the root and is guarded by it, and the root goes only in the batch that empties the rest.
+/// Not reachable through the API, whose keys are at most 1 KiB (tester-s6).
+#[test]
+fn gap_4_a_clear_of_wide_keys_is_cut_by_bytes_and_keeps_the_root_until_the_end() {
+    use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
+    use rdb_core::transaction::record_len;
+
+    let mut k = Kernel::new();
+    let root = object(b"wide");
+    let pad = "x".repeat(5000);
+    let keys: Vec<Value> = (0..300).map(|i| text(&format!("{i:04}{pad}"))).collect();
+    for (i, chunk) in keys.chunks(50).enumerate() {
+        let ops: Vec<_> = chunk
+            .iter()
+            .map(|key| ElemOp::Put(key.clone(), text("1")))
+            .collect();
+        let expected = if i == 0 {
+            Expected::Absent
+        } else {
+            Expected::Version(root_version(&k, &root))
+        };
+        let made =
+            compile_collection(&k.snapshot(), &root, CollectionKind::Map, expected, &ops).unwrap();
+        k.commit(&made);
+    }
+    let damaged = element_key(&root, &keys[150]).unwrap();
+    let at = k.records[&damaged].0;
+    k.records
+        .insert(damaged, (at, Bytes::from_static(b"damaged")));
+
+    let root_bytes = root.to_bytes();
+    let mut sizes = Vec::new();
+    while let Some(cleared) = clear_object(&k.snapshot(), &root).unwrap() {
+        let c = &cleared.compiled;
+        assert!(
+            record_len(c.conditions.len(), &c.mutations) <= MAX_ENVELOPE_BYTES,
+            "batch {} fits one record",
+            sizes.len()
+        );
+        let deletes_root = c
+            .mutations
+            .iter()
+            .any(|m| matches!(m, Mutation::Delete { key, .. } if *key == root_bytes));
+        if !deletes_root {
+            let guard = Condition::VersionEquals {
+                key: root_bytes.clone(),
+                version: root_version(&k, &root),
+            };
+            assert_eq!(c.conditions, vec![guard], "batch {}", sizes.len());
+        }
+        sizes.push((c.mutations.len(), deletes_root));
+        k.commit_any_order(c);
+        assert!(sizes.len() < 10, "the clear ends");
+    }
+    assert!(sizes.len() >= 2, "{sizes:?}");
+    assert!(sizes[0].0 < 254, "cut by bytes, not count: {sizes:?}");
+    let (last, earlier) = sizes.split_last().unwrap();
+    assert!(last.1, "the last batch deletes the root: {sizes:?}");
+    assert!(earlier.iter().all(|b| !b.1), "{sizes:?}");
     assert!(k.records.is_empty(), "{:?}", k.records.keys());
 }
