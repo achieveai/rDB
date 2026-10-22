@@ -1201,7 +1201,8 @@ fn f005_a_read_of_a_newer_builds_list_block_names_a_newer_build() {
 /// keys sort before block keys, so a first batch of 254 deleted every orphan and kept the base
 /// and the root: a healthy empty list, and the next clear answered "not damaged" with the object
 /// still there. A batch that keeps any record leaves the object still proved damaged, so
-/// repeated clears end with nothing stored.
+/// the first batch takes back one orphan delete (253), and the second takes the last orphan,
+/// the base and the root (3).
 #[test]
 fn r1_an_empty_list_with_254_orphan_items_is_cleared_to_the_end() {
     let mut k = Kernel::new();
@@ -1213,22 +1214,91 @@ fn r1_an_empty_list_with_254_orphan_items_is_cleared_to_the_end() {
         let orphan = seal(Kind::Document, &[0xf6]).unwrap();
         k.records.insert(item_key(&root, id), (at, orphan));
     }
-    let mut calls = 0;
+    assert_eq!(calls_to_clear(&mut k, &root), vec![253, 3]);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Clears the object until `Ok(None)`, and returns how many deletes each batch sent. Any error
+/// fails the test, with the call it came on.
+fn calls_to_clear(k: &mut Kernel, root: &RootKey) -> Vec<usize> {
+    let mut sent = Vec::new();
     loop {
-        let cleared = match clear_object(&k.snapshot(), &root) {
+        let cleared = match clear_object(&k.snapshot(), root) {
             Ok(Some(cleared)) => cleared,
-            Ok(None) => break,
+            Ok(None) => return sent,
             Err(error) => panic!(
                 "call {} with {} records left: {error:?}",
-                calls + 1,
+                sent.len() + 1,
                 k.records.len()
             ),
         };
-        calls += 1;
-        assert!(calls < 5, "the clear ends");
+        sent.push(cleared.compiled.mutations.len());
+        assert!(sent.len() < 5, "the clear ends: {sent:?}");
         k.commit_any_order(&cleared.compiled);
     }
-    assert_eq!(calls, 2);
+}
+
+/// `n` upload chunks stored under the object, whatever its root's kind: `put_chunk` does not
+/// check it.
+fn stray_chunks(k: &mut Kernel, root: &RootKey, n: u32) {
+    for i in 0..n {
+        let upload = [u8::try_from(i / 255).unwrap() + 1; 16];
+        k.seq += 1;
+        let chunk = seal(Kind::Chunk, b"x").unwrap();
+        k.records
+            .insert(chunk_key(root, &upload, i % 255), (k.seq, chunk));
+    }
+}
+
+/// No root, one orphan element, and `chunks` upload chunks: they sort after the orphan.
+fn orphan_beside(chunks: u32) -> (Kernel, RootKey) {
+    let mut k = Kernel::new();
+    let root = object(b"o");
+    map_of_two(&mut k, &root);
+    k.records.remove(&root.to_bytes()).unwrap();
+    k.records
+        .remove(&element_key(&root, &text("b")).unwrap())
+        .unwrap();
+    stray_chunks(&mut k, &root, chunks);
+    (k, root)
+}
+
+/// Review R2-01 (PR #53), case A: with no root, the chunks go in the first batch and the orphan
+/// stays, so the object still proves damaged; the next batch takes the orphan. Before the fix
+/// the chunks sorted after the orphan, every delete was taken back, and each call answered
+/// `TooLarge`.
+#[test]
+fn r2_01_a_rootless_orphan_beside_254_chunks_is_cleared_to_the_end() {
+    let (mut k, root) = orphan_beside(254);
+    assert_eq!(calls_to_clear(&mut k, &root), vec![254, 1]);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Review R2-01, control C: 1 orphan and 253 chunks fit one batch, which is final.
+#[test]
+fn r2_01_c_a_rootless_orphan_beside_253_chunks_is_cleared_in_one_batch() {
+    let (mut k, root) = orphan_beside(253);
+    assert_eq!(calls_to_clear(&mut k, &root), vec![254]);
+    assert!(k.records.is_empty(), "{:?}", k.records.keys());
+}
+
+/// Review R2-01, case B: a map whose root says 0 elements, with 2 and 300 chunks. The first
+/// batch is 254 chunks and is sent whole, so it costs one proof and not one per delete taken
+/// back; the second takes the rest and the root.
+#[test]
+fn r2_01_b_a_map_counting_0_beside_300_chunks_is_cleared_to_the_end() {
+    let mut k = Kernel::new();
+    let root = object(b"m");
+    map_of_two(&mut k, &root);
+    let (at, bytes) = k.records[&root.to_bytes()].clone();
+    let Value::Map(mut fields) = decode(open(&bytes).unwrap().payload).unwrap() else {
+        panic!("a map root");
+    };
+    *fields.get_mut(&MapKey::new("count")).unwrap() = int(0);
+    let sealed = seal(Kind::Map, &encode(&Value::Map(fields)).unwrap()).unwrap();
+    k.records.insert(root.to_bytes(), (at, sealed));
+    stray_chunks(&mut k, &root, 300);
+    assert_eq!(calls_to_clear(&mut k, &root), vec![254, 49]);
     assert!(k.records.is_empty(), "{:?}", k.records.keys());
 }
 

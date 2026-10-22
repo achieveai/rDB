@@ -106,13 +106,23 @@ pub fn clear_object(
     let (root_version, proof) = assess(snapshot, root)?;
     let reader = proof.as_ref().map_or(&Reader::Unchecked, |p| &p.reader);
     let records = scan(snapshot, root, reader)?;
+    // Only a blob's read takes its chunks, so under any other root, or none, no proof rests on
+    // one (review R2-01).
+    let chunks_first = !matches!(reader, Reader::Blob(_));
     let (damage, missing) = match proof {
         Some(proof) => (proof.damage, proof.missing),
         None if records.is_empty() => return Ok(None),
         None => (prove_absent(&records)?, Vec::new()),
     };
     let still_damaged = |deletes: &[Mutation]| proves_after(snapshot, root, deletes);
-    let (compiled, faulting) = batch(root, root_version, missing, records, still_damaged)?;
+    let (compiled, faulting) = batch(
+        root,
+        root_version,
+        missing,
+        records,
+        chunks_first,
+        still_damaged,
+    )?;
     Ok(Some(Cleared {
         compiled,
         damage,
@@ -508,21 +518,26 @@ fn faulting(
     }
 }
 
-/// Clean records in key order, then faulting ones, then the root in the batch that empties the
-/// rest. Every batch carries an `Absent` for each key the proof found missing, and every batch
-/// that keeps the root is guarded by it as read: its version, or its absence. A batch that
-/// leaves any record leaves the object `still_damaged` (review F-003 for a map's count, R-1
-/// for every kind). Also returns how many faulting records the batch deletes.
+/// Chunks first when `chunks_first`, then clean records in key order, then faulting ones, then
+/// the root in the batch that empties the rest. Every batch carries an `Absent` for each key the
+/// proof found missing, and every batch that keeps the root is guarded by it as read: its
+/// version, or its absence. A batch that leaves any record leaves the object `still_damaged`
+/// (review F-003 for a map's count, R-1 for every kind). Chunks go first when no proof rests on them: otherwise they sort after the
+/// object's last damage witness, fill the batch, and every delete is taken back (R2-01). Also
+/// returns how many faulting records the batch deletes.
 fn batch(
     root: &RootKey,
     root_version: Option<u64>,
     missing: Vec<Bytes>,
     records: Vec<Found>,
+    chunks_first: bool,
     still_damaged: impl Fn(&[Mutation]) -> Result<bool, ValueError>,
 ) -> Result<(Compiled, usize), ValueError> {
     let total = records.len();
-    let (clean, faulting): (Vec<_>, Vec<_>) = records.into_iter().partition(|f| !f.faulting);
-    let clean_len = clean.len();
+    let (chunks, rest): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|f| chunks_first && matches!(f.sub, Ok(Sub::Chunk)));
+    let (clean, faulting): (Vec<_>, Vec<_>) = rest.into_iter().partition(|f| !f.faulting);
     let guard = match root_version {
         Some(version) => Condition::VersionEquals {
             key: root.to_bytes(),
@@ -539,7 +554,7 @@ fn batch(
     let mut mutations = Vec::new();
     // Per delete: whether it is of a faulting record.
     let mut deleted = Vec::new();
-    for found in clean.into_iter().chain(faulting) {
+    for found in chunks.into_iter().chain(clean).chain(faulting) {
         if mutations.len() == MAX_CLEAR_DELETES {
             break;
         }
@@ -561,7 +576,7 @@ fn batch(
             expected_version: Some(version),
         });
         if record_len(absent.len(), &mutations) <= MAX_ENVELOPE_BYTES {
-            let faulting = total - clean_len;
+            let faulting = deleted.iter().filter(|faulting| **faulting).count();
             return Ok((
                 Compiled {
                     mutations,
