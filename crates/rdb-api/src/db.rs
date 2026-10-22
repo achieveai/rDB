@@ -3957,6 +3957,12 @@ mod tests {
         };
         let refused = db.read(b"m", after(&long, 1)).expect_err("over the limit");
         refused_unsent(&refused, &over("", 1025, 4, "read"), &mailbox);
+        let put = Change::Map(vec![ElemOp::Put(long.clone(), Value::Null)]);
+        let refused = db.write(b"m", put, None).expect_err("over the limit");
+        refused_unsent(&refused.error, &over("op 0: ", 1025, 5, "sent"), &mailbox);
+        let present = Change::Map(vec![ElemOp::NeedPresent(long.clone())]);
+        let refused = db.write(b"m", present, None).expect_err("over the limit");
+        refused_unsent(&refused.error, &over("op 0: ", 1025, 6, "sent"), &mailbox);
 
         // Order: an over-long object id answers before an over-long key, and a page over the
         // limit before an over-long `after`.
@@ -3992,6 +3998,8 @@ mod tests {
             .map(|line| (line["request"].clone(), line["limit"].clone()))
             .collect();
         let expected: Vec<_> = [
+            "key",
+            "key",
             "key",
             "key",
             "key",
