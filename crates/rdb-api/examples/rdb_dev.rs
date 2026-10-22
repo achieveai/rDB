@@ -2058,7 +2058,8 @@ fn damage_record(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
     // No request id is printed, as for damage-chunk (PB-5): another client's number.
     say(&match db.resend(request) {
         Ok(ok) => format!(
-            "damage ok p=1 gen={} seq={} {:?} as={how} request=- (damage's own client; status              does not know it)",
+            "damage ok p=1 gen={} seq={} {:?} as={how} request=- (damage's own client; status \
+             does not know it)",
             ok.generation.0, ok.seq.0, ok.durability
         ),
         Err(PutError { error, .. }) if error.kind == ErrorKind::ConditionFailed => {
