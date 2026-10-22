@@ -129,6 +129,8 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   - **So every list compile refuses an object id with e > 3,072 (`TooLarge{ObjectId}`)**; emptying and dropping then never
     fail on bytes. M9's object-id limit (O1) must be ≤ 3,072 B escaped for lists.
     (Status 2026-10-19, M9 S4, A-R113 C-5: the limit is set in M9 S5.)
+    (Status 2026-10-21, M9 S5, A-R134: set. The API refuses an id over 1,024 bytes, which escapes to at
+    most 2,050 B; `rdb-api` pins `2 × 1,024 + 2 ≤ MAX_ID_ESCAPED` with a const assert. ADR-rdb-0013 O1.)
   - Writes: root, ≤ 2 blocks × (base + split block), one item record, one retired block (≤ 241 deletes): ≤ 247 < 255.
     Drop: root + block + ≤ 240 slots = 242.
   - `MAX_ITEM` = 524,288 (Q2, kept). Multi-op deltas are counted against both caps and refused `TooManyWrites`/`TooLarge`
@@ -327,11 +329,19 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
   limit must be ≤ 3,072 B escaped for lists (decision 4).
   (Status 2026-10-19, M9 S4: id-addressed reads and the preconditions are carried to M10 (A-R114 Q5);
   the object-id limit is set in M9 S5 (A-R113 C-5).)
+  (Status 2026-10-21, M9 S5, A-R134: the object-id limit is 1,024 bytes, inside the 3,072-byte bound
+  (decision 4). ADR-rdb-0013 O1.)
 - **O2** Range removal and one-call delete (ADR-rdb-0013 O6). **O3** A second index level past 512 blocks.
 - **O4** RocksDB Merge, only with a measured need and §4.3.4's gates.
 - **O5** `rdb-value` is caller-bounded: `items()` takes any `limit`, and one delta any number of ops. M9 caps both: the
   `items()` page size, and the ops per request.
   (Status 2026-10-19, M9 S4, A-R113 C-5: both caps are set in M9 S5. S4 adds neither.)
+  **Closed** 2026-10-21 by M9 S5 (A-R134). `rdb_api::Db` refuses, as `INVALID_ARGUMENT` before compile:
+  a page over 1,000 items (`items`, items after a token, and map or set members); and a change over 255
+  ops, or a transaction over 255 puts. A list delta of 255 ops keeps k small: the k² replay below is
+  24 ms at k = 5,000. `rdb-value` stays caller-bounded; the cap lives in the API. **M10's wire must
+  call the same checks** (ADR-rdb-0013 decision 11). The page cap counts items, not bytes; a page
+  byte cap is carried to M10 (spec §4.2).
   - Measured at 02b5236 on the dev's run (release build, one thread), by the ignored probe `l_r186ee_probe_d2_one_delta_of_k_front_inserts`: one
     delta's compile cost grows with k² for front inserts. k = 5,000: 24 ms; 20,000: 318 ms; 43,000: 1.5 s.
   - A delta that will be refused `TooLarge{List}` still pays the full replay first (k = 100,000: 7.6 s, refused).
@@ -339,5 +349,6 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
     same k² shape.
   - So M9's per-request op cap must keep k small (L-R186ef).
     (Status 2026-10-19, M9 S4, A-R113 C-5: the op cap is set in M9 S5.)
+    (Status 2026-10-21, M9 S5, A-R134: 255 ops per change. See O5 above.)
   - Reads are not the concern: `l_r186ee_probe_d1_a_full_block_with_240_pending_front_inserts` reads a block of 10,000
     entries with 240 pending front inserts in 11.6 ms, dominated by decoding the base.
