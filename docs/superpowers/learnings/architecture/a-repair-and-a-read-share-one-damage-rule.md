@@ -37,8 +37,9 @@ healthy, so no state between clear calls reads as a good object. Check new damag
 against both paths.
 
 M9 S7 settled the same split for a newer build's record, with three rules (A-R144):
-- Within one record, a newer build is named first. Reads, map writes and the clear call one
-  function, `envelope::newer_build`, before any other check on the record.
+- Within one record, a newer build is named first. A site that checks a key, version or kind
+  before `open` calls `newer_build` first; the rest rely on `open`, which names a newer header
+  first.
 - Across records, a read names the first record it cannot serve. So an object holding a
   damaged entry and a newer build's entry may read CORRUPT_HISTORY.
 - The clear stays at least as strict: it refuses on the newer record and deletes nothing.

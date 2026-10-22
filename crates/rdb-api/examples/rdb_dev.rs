@@ -188,8 +188,8 @@
 //!                                         missing record is refused, and so is an item kept
 //!                                         inside its block (`no stored record`).
 //!                                         --api-version N sends the write as API version N
-//!                                         (default 1): any other is a newer build's request,
-//!                                         refused before apply
+//!                                         (default 1): any other is another build's request
+//!                                         (newer or older), refused before apply
 //! admin damage-chunk <o> --upload U --index I
 //!                                         dev only: overwrite that stored chunk with other
 //!                                         bytes, so a range read over it (`--offset`/`--len`)

@@ -204,7 +204,8 @@ and the clear removes it.)
 (Status 2026-10-22, M9 S7: a block base or item record a newer build wrote is named before its
 version: the read answers `Corrupt(Block{id, Envelope})` or `Corrupt(Envelope)` with a newer
 build's error, which the API answers `INCOMPATIBLE_VERSION`, not `NewerThanRoot` or
-`ElementNewerThanRoot`. A stale slot is still never opened.)
+`ElementNewerThanRoot`. A stale slot is never opened by a read; list upkeep overwrites or deletes
+it (M10).)
 
 | Damage | Error |
 |---|---|
