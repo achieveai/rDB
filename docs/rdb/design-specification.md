@@ -369,6 +369,8 @@ stateDiagram-v2
 
 (Status 2026-10-21, M9 S6: a stored record written by a newer build answers `INCOMPATIBLE_VERSION`, not `CORRUPT_HISTORY` or `CORRUPT_BLOB`: it may be valid, and it waits for the rollout. Damage stays `CORRUPT_*`, and the admin clear (`Change::Clear`) removes it; the clear refuses a newer build's record. A read that meets another fault first still answers `CORRUPT_HISTORY` until M9 S7. [ADR-rdb-0012](../ADRs/rdb/0012-document-encoding-cbor-profile.md) §12.)
 
+(Status 2026-10-22, M9 S7: within one record, a newer build's envelope is named first, by reads, writes and the clear alike, so a map entry or list item a newer build wrote reads `INCOMPATIBLE_VERSION` even when its version is above its root's. A map write that names a newer build's entry (`put`, `del`, `need`) is refused with `INCOMPATIBLE_VERSION` and nothing is sent. Across records, a read names the first record it cannot serve, so an object holding damage and a newer build's record may read `CORRUPT_HISTORY` while the clear refuses it. [ADR-rdb-0013](../ADRs/rdb/0013-object-keys-maps-and-sets.md) §10.)
+
 ## 6. Replication and durability
 
 ```mermaid
