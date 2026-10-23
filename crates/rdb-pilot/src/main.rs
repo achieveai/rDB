@@ -24,7 +24,9 @@
 //!
 //! Every open prints `ready ms=<open-to-ready> heal=<HealState>` (`reopen i ready ...` for a
 //! reopen). Exits: 0 done; 1 a write or read failed; 2 bad arguments or setup; 3 the folder was
-//! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`); 4 `--verify`
+//! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`), or with
+//! `--nodes` a node refused the link (`links down: node N: refused: ...`: another CA, the
+//! wrong node at that address, something that is not TLS, a newer protocol); 4 `--verify`
 //! found a journalled key missing or wrong; 5 not ready in time.
 //!
 //! Logs go to `L/pilot_kv.jsonl` (default `D` with `.logs` appended) and never carry key or
@@ -43,6 +45,11 @@
 //! `links up nodes=1,2,3`, or names each node that is not: a refused handshake exits 3, a node
 //! not reached in time exits 5. `D` then holds only the journal. `--put` writes one value and
 //! prints `put seq=<seq> request=<id>`; `--get` prints `get value=<text>` or `get absent`.
+//! A put that gets no answer prints `put <error> request=<id>: ...` and then the request's
+//! `status ...`; with `--retry-for S` it then sends the same request again until answered,
+//! printing `retry ok seq=<seq> outcome=<Published|RecoveredApplied>` (scenario S2-7).
+//! `--request-id N` sends the put under the app's own id `app_request_id(N)`, so two pilots
+//! with different `--client-id` can send the same id (scenario S2-8).
 //! `scripts/local-rdb.sh up` prints the exact command for its run.
 
 use std::fs::OpenOptions;
@@ -60,7 +67,7 @@ use rdb_api::net::faults::Faults;
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
-use rdb_api::{BootId, ClientId, Db, DbConfig, NodeId, Timeouts};
+use rdb_api::{BootId, ClientId, Db, DbConfig, NodeId, PutError, Timeouts, TxnRequest, TxnStatus};
 
 /// The ack journal's file name, inside the rDB folder.
 const JOURNAL: &str = "pilot_kv.journal";
@@ -82,12 +89,16 @@ struct Args {
     client_id: u32,
     put: Option<(String, String)>,
     get: Option<String>,
+    /// `--retry-for`: how long a `--put` with no answer is sent again. Zero: never.
+    retry_for: Duration,
+    /// `--request-id`: the app's own request number for `--put` (`app_request_id`).
+    request_id: Option<u64>,
 }
 
 const USAGE: &str = "usage: pilot_kv --dir D --control host:port[,host:port...] [--log-dir L] \
                      [--ready-secs S] [--write N] [--reopens K] [--verify] [--bench] \
                      [--nodes 1=ADDR,2=ADDR,3=ADDR --cert-dir C [--app NAME] [--client-id N]] \
-                     [--put KEY=VALUE] [--get KEY]";
+                     [--put KEY=VALUE [--request-id N] [--retry-for S]] [--get KEY]";
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut dir = None;
@@ -104,6 +115,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut client_id = rdb_api::db::DEFAULT_CLIENT.0;
     let mut put = None;
     let mut get = None;
+    let mut retry_for = Duration::ZERO;
+    let mut request_id = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -170,6 +183,20 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 put = Some((k.to_owned(), v.to_owned()));
             }
             "--get" => get = Some(value("--get")?),
+            "--request-id" => {
+                let text = value("--request-id")?;
+                let n = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--request-id takes a number, got {text}"))?;
+                request_id = Some(n);
+            }
+            "--retry-for" => {
+                let text = value("--retry-for")?;
+                let secs = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--retry-for takes whole seconds, got {text}"))?;
+                retry_for = Duration::from_secs(secs);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -200,6 +227,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         client_id,
         put,
         get,
+        retry_for,
+        request_id,
     })
 }
 
@@ -502,13 +531,92 @@ fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, Exit
     }
 }
 
+/// A status answer as one line: `resolved seq=<seq> outcome=<..>`, `unknown`, `expired`.
+fn status_line(status: &TxnStatus) -> String {
+    match status {
+        TxnStatus::Resolved(result) => format!(
+            "resolved seq={} outcome={}",
+            result.seq.0,
+            variant(&result.outcome)
+        ),
+        TxnStatus::Unresolved { seq } => format!("unresolved seq={}", seq.0),
+        TxnStatus::Unknown => "unknown".to_owned(),
+        TxnStatus::Expired => "expired".to_owned(),
+    }
+}
+
+/// `--retry-for`: send `request` again, same identity and payload, until it is answered or
+/// `within` passes. Prints `retry <i> <error>` for each refusal and `retry ok seq=..
+/// outcome=..` for the answer: `RecoveredApplied` says the first send had applied and this one
+/// applied nothing. Exit 1 when it is still unanswered.
+fn retry(db: &Db, request: TxnRequest, within: Duration) -> Result<(), ExitCode> {
+    let deadline = Instant::now() + within;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match db.resend_within(request.clone(), Duration::from_secs(10)) {
+            Ok(ok) => {
+                let outcome = variant(&ok.outcome);
+                tracing::info!(attempt, seq = ok.seq.0, outcome, "pilot_retry_answered");
+                println!(
+                    "retry ok seq={} outcome={outcome} attempt={attempt}",
+                    ok.seq.0
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                let name = error.error.name();
+                tracing::warn!(attempt, error = name, "pilot_retry_refused");
+                println!("retry {attempt} {}: {}", name.to_lowercase(), error.error);
+                if Instant::now() >= deadline {
+                    return Err(ExitCode::from(1));
+                }
+                let pause = error
+                    .error
+                    .retry_after
+                    .unwrap_or(Duration::from_millis(500));
+                std::thread::sleep(pause.min(Duration::from_secs(2)));
+            }
+        }
+    }
+}
+
 /// `--put` then `--get`, each once. Exit 1 when either fails.
 fn point_phase(db: &Db, args: &Args) -> ExitCode {
     if let Some((key, value)) = &args.put {
-        match db.put(key.as_bytes(), value.as_bytes(), None) {
+        let sent = match args.request_id {
+            Some(n) => match rdb_api::app_request_id(n) {
+                Some(request) => db.put_as(request, key.as_bytes(), value.as_bytes(), None),
+                None => {
+                    println!("put failed: --request-id {n} is 2^63 or more");
+                    return ExitCode::from(2);
+                }
+            },
+            None => db.put(key.as_bytes(), value.as_bytes(), None),
+        };
+        match sent {
             Ok(ok) => {
                 tracing::info!(seq = ok.seq.0, "pilot_put");
                 println!("put seq={} request={}", ok.seq.0, ok.request.0);
+            }
+            Err(PutError {
+                error,
+                request: Some(request),
+            }) => {
+                let name = error.name();
+                let id = request.identity.request.0;
+                tracing::warn!(error = name, request = id, "pilot_put_unanswered");
+                println!("put {} request={id}: {error}", name.to_lowercase());
+                match db.status(request.identity.request, None) {
+                    Ok(status) => println!("status {}", status_line(&status)),
+                    Err(error) => println!("status {}: {error}", error.name().to_lowercase()),
+                }
+                if args.retry_for.is_zero() {
+                    return ExitCode::from(1);
+                }
+                if let Err(code) = retry(db, *request, args.retry_for) {
+                    return code;
+                }
             }
             Err(error) => {
                 tracing::error!(error = %error.error, "pilot_put_failed");
@@ -686,17 +794,22 @@ fn check_phase(db: &Db, args: &Args) -> ExitCode {
 /// Put `n` keys from `first`, appending each acknowledged one to the journal at `path` before
 /// the next put. Stops at the first refusal: a put that was not acknowledged is not journalled,
 /// and the pilot does not guess at it.
+/// Open the ack journal for appending, creating it and its folder: an app-only open
+/// (`--nodes`) claims no folder, so nothing else makes `--dir`.
+fn open_journal(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
 fn write(db: &Db, path: &Path, first: u64, n: u64) -> Result<(), ExitCode> {
     // No `BufWriter`: each line goes to the OS in its own write, so a killed process has
     // handed over every line it wrote. Not fsynced; the proof is a process kill, not power loss.
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| {
-            println!("journal: {}: {error}", path.display());
-            ExitCode::from(1)
-        })?;
+    let mut file = open_journal(path).map_err(|error| {
+        println!("journal: {}: {error}", path.display());
+        ExitCode::from(1)
+    })?;
     let started = Instant::now();
     for index in first..first.saturating_add(n) {
         let ok = match db.put(key(index).as_bytes(), &value(index), None) {
@@ -884,6 +997,18 @@ mod tests {
         assert_eq!(args.log_dir, PathBuf::from("D.logs"));
     }
 
+    /// M10 S2, found walking S2-8: with `--nodes` the Db claims no folder, so nothing made
+    /// `--dir` and the first journal line failed "cannot find the path". The journal makes its
+    /// own folder.
+    #[test]
+    fn the_journal_opens_in_a_folder_nothing_made_yet() {
+        let root = config_testkit::fs::temp_dir();
+        let path = root.path().join("not-yet").join(JOURNAL);
+        let mut file = open_journal(&path).expect("opens");
+        writeln!(file, "x").expect("writes");
+        assert!(path.is_file());
+    }
+
     /// M10 S2 (A-R226): `--nodes` names the node processes and needs the run's certificates;
     /// `--client-id`, `--app`, `--put` and `--get` parse as given, and default to one client.
     #[test]
@@ -910,6 +1035,10 @@ mod tests {
             "7",
             "--put",
             "k=v=w",
+            "--request-id",
+            "5",
+            "--retry-for",
+            "30",
             "--get",
             "k",
         ])
@@ -921,9 +1050,13 @@ mod tests {
         assert_eq!((args.app.as_str(), args.client_id), ("pilot-a", 7));
         assert_eq!(args.put, Some(("k".to_owned(), "v=w".to_owned())));
         assert_eq!(args.get.as_deref(), Some("k"));
+        assert_eq!(args.request_id, Some(5));
+        assert_eq!(args.retry_for, Duration::from_secs(30));
         let local = with(&[]).expect("parses");
         assert!(local.nodes.is_empty());
         assert_eq!(local.client_id, rdb_api::db::DEFAULT_CLIENT.0);
+        assert_eq!((local.request_id, local.retry_for), (None, Duration::ZERO));
+        assert!(with(&["--retry-for", "soon"]).is_err());
         assert!(with(&["--put", "novalue"]).is_err());
         assert!(with(&["--nodes", "x=a:1", "--cert-dir", "C"]).is_err());
     }

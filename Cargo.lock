@@ -3558,6 +3558,7 @@ dependencies = [
  "config-client",
  "config-core",
  "config-log",
+ "config-testkit",
  "rdb-api",
  "tokio",
  "tracing",

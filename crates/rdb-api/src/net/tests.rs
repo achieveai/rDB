@@ -572,6 +572,16 @@ struct Side {
     links: Arc<Links>,
     net: Arc<Net>,
     mail: Receiver<Msg>,
+    /// The node's mailbox and boot, while a row holds its registration back.
+    unregistered: Option<(NodeId, mpsc::Sender<Msg>, BootId)>,
+}
+
+impl Side {
+    /// Register the node a row held back, as `Db::open` does once its copy is open.
+    fn register(&mut self) {
+        let (node, tx, boot) = self.unregistered.take().expect("held back");
+        self.links.register(node, tx, boot);
+    }
 }
 
 struct Spec<'a> {
@@ -586,6 +596,8 @@ struct Spec<'a> {
     version: u32,
     dial: BTreeMap<NodeId, String>,
     peers: &'a [u32],
+    /// Whether its node is registered before its links start.
+    registered: bool,
 }
 
 impl<'a> Spec<'a> {
@@ -598,7 +610,14 @@ impl<'a> Spec<'a> {
             version: PROTOCOL_VERSION,
             dial: BTreeMap::new(),
             peers,
+            registered: true,
         }
+    }
+
+    /// Start the links before the node is registered, as `rdb_node` does: its `Db` opens after.
+    fn unregistered(mut self) -> Self {
+        self.registered = false;
+        self
     }
 
     fn dialling(mut self, node: u32, addr: std::net::SocketAddr) -> Self {
@@ -613,7 +632,13 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
     let tls = certs::load(spec.certs, spec.cert_of.as_ref().unwrap_or(&own)).expect("certs");
     let links = Links::new();
     let (tx, mail) = mpsc::channel();
-    links.register(NodeId(spec.node), tx, BootId(u64::from(spec.node) * 11));
+    let boot = BootId(u64::from(spec.node) * 11);
+    let unregistered = if spec.registered {
+        links.register(NodeId(spec.node), tx, boot);
+        None
+    } else {
+        Some((NodeId(spec.node), tx, boot))
+    };
     let listener = if listen {
         Some(config_testkit::ports::ephemeral_listener().await.0)
     } else {
@@ -633,7 +658,12 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
         listener,
     )
     .expect("net starts");
-    Side { links, net, mail }
+    Side {
+        links,
+        net,
+        mail,
+        unregistered,
+    }
 }
 
 fn certs_for(dir: &FsPath, nodes: &[u32]) {
@@ -857,7 +887,8 @@ async fn a_newer_protocol_version_is_refused_naming_both_sides() {
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
-/// link, and the dialler says why. Integration (~2 s: waits out a link that must not come up).
+/// link: the dialler is refused at once, naming the certificate (arch-s2 S2-1: "wrong cert
+/// refused at handshake"; tester-s2 found it waited, then said "not reachable"). Integration.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_certificate_from_another_ca_gets_no_link() {
     let dir = config_testkit::fs::temp_dir();
@@ -870,9 +901,165 @@ async fn a_certificate_from_another_ca_gets_no_link() {
     let stranger = side(Spec::node(2, &other, &[1]).dialling(1, addr), false).await;
     let error = stranger
         .net
-        .wait_up(&[NodeId(1)], Duration::from_secs(2))
+        .wait_up(&[NodeId(1)], PATIENCE)
         .await
         .expect_err("no link");
-    assert!(error.contains("node 1: not reachable"), "{error}");
+    assert!(error.contains("node 1: refused"), "{error}");
+    assert!(
+        error.contains("certificate"),
+        "names the certificate: {error}"
+    );
+    assert!(
+        matches!(stranger.net.states()[&NodeId(1)], LinkState::Refused(_)),
+        "a certificate the peer rejects does not heal by waiting"
+    );
     assert!(!matches!(one.net.states()[&NodeId(2)], LinkState::Up(_)));
+}
+
+/// M10 S2, found walking `lr up`: node 3's link came up while its `Db` was still opening, so
+/// node 1's recovery ask reached a process whose node could not take it yet and was dropped
+/// (`net_deliver_unreachable`), and node 1 healed `DegradedRf2`. A node's link now comes up
+/// only once its node is registered, so nothing sent on it arrives before the node can take it.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_link_comes_up_only_once_its_node_can_take_messages() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let mut one = side(Spec::node(1, dir.path(), &[2]).unregistered(), true).await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    let early = two
+        .net
+        .wait_up(&[NodeId(1)], Duration::from_millis(600))
+        .await;
+    assert!(
+        early.is_err(),
+        "node 1 cannot take messages yet, so its link is not up: {early:?}"
+    );
+    assert_eq!(two.links.boot_of(NodeId(1)), None, "no handshake yet");
+
+    one.register();
+    two.net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("up once node 1 is registered");
+    let ask = || Msg::Restore {
+        partition: PartitionId(1),
+        seed: seed(),
+    };
+    two.links.send(NodeId(2), NodeId(1), ask()).expect("sent");
+    let (got, _mail) = next(one.mail).await;
+    assert_eq!(
+        format!("{got:?}"),
+        format!("{:?}", ask()),
+        "delivered, not dropped"
+    );
+}
+
+/// The dialling half of the row above: node 2's process dials node 1 only once node 2 is
+/// registered, so node 1 never holds a link to a node that cannot take its messages yet.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_dials_only_once_its_node_can_take_messages() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let mut two = side(
+        Spec::node(2, dir.path(), &[1])
+            .dialling(1, addr)
+            .unregistered(),
+        false,
+    )
+    .await;
+    let early = one
+        .net
+        .wait_up(&[NodeId(2)], Duration::from_millis(600))
+        .await;
+    assert!(
+        early.is_err(),
+        "node 2 cannot take messages yet, so it has not dialled: {early:?}"
+    );
+    assert_eq!(one.links.boot_of(NodeId(2)), None, "no handshake yet");
+
+    two.register();
+    one.net
+        .wait_up(&[NodeId(2)], PATIENCE)
+        .await
+        .expect("up once node 2 is registered");
+    let ask = || Msg::Restore {
+        partition: PartitionId(1),
+        seed: seed(),
+    };
+    one.links.send(NodeId(1), NodeId(2), ask()).expect("sent");
+    let (got, _mail) = next(two.mail).await;
+    assert_eq!(
+        format!("{got:?}"),
+        format!("{:?}", ask()),
+        "delivered, not dropped"
+    );
+}
+
+/// tester-s2 S2-1 F: a handshake that cannot succeed is refused at once, saying why, instead of
+/// waiting out `--ready-secs` as "not reachable". Node 1 dialled at node 3's address meets a
+/// certificate for another name; an address held by something that does not speak TLS answers
+/// garbage. Both name the address and ask whether it is that node of this run.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_that_cannot_succeed_is_refused_naming_the_address() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2, 3]);
+    let three = side(Spec::node(3, dir.path(), &[2]), true).await;
+    let wrong = three.net.addr().expect("listening");
+    let (plain, foreign) = config_testkit::ports::ephemeral_listener().await;
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        // Held open after the answer: dropping a socket with the hello unread resets it on
+        // Windows (os error 10053), and the dialler may see the reset before the garbage.
+        let mut held = Vec::new();
+        while let Ok((mut socket, _)) = plain.accept().await {
+            let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            held.push(socket);
+        }
+    });
+    for (addr, names) in [(wrong, "certificate"), (foreign, "InvalidContentType")] {
+        let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+        let error = two
+            .net
+            .wait_up(&[NodeId(1)], PATIENCE)
+            .await
+            .expect_err("no link");
+        assert!(error.contains("node 1: refused"), "{error}");
+        assert!(error.contains(names), "says why ({names}): {error}");
+        assert!(
+            error.contains(&addr.to_string()) && error.contains("node-1 of this run"),
+            "names the address and what was expected there: {error}"
+        );
+    }
+}
+
+/// Walking the row above by hand: an address whose listener accepts and never answers (rEtcd's
+/// plain HTTP health port) left the dial waiting forever, so the pilot waited out `--ready-secs`
+/// and said only "not reachable yet". A connect now ends after `CONNECT`, naming the address.
+/// Not a refusal: a slow node may answer next time. Integration (~2 s, the connect bound).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_address_that_never_answers_the_tls_hello_says_so() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let (silent, addr) = config_testkit::ports::ephemeral_listener().await;
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    let error = two
+        .net
+        .wait_up(&[NodeId(1)], Duration::from_secs(4))
+        .await
+        .expect_err("no link");
+    assert!(
+        error.contains("node 1: not reachable: ")
+            && error.contains("no TLS answer")
+            && error.contains(&addr.to_string()),
+        "{error}"
+    );
 }
