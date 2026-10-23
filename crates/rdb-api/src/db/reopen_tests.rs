@@ -1236,6 +1236,7 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         clock: crate::clock::HostClock::start(),
         owner,
         within: Duration::from_millis(300),
+        member_boot: Arc::new(move |_| Some(open)),
     }));
     let sent: Vec<_> = mailbox.try_iter().collect();
 
@@ -1335,6 +1336,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
         clock,
         owner,
         within: Duration::from_millis(300),
+        member_boot: Arc::new(|_| Some(BootId((1 << 16) + 1))),
     }));
     let error = healed.expect_err("a grant still in use is not cleared");
     assert!(
@@ -1803,4 +1805,390 @@ fn m10_r195_an_app_id_never_names_a_write_this_db_numbered_itself() {
         );
     }
     db.shutdown();
+}
+
+// dev-w5's slice-2 rows (arch-s2 B1, rulings A-R226 h2, A-R231): a `Db` that runs no node, a
+// node process that opens one copy, and an undecodable `partitions/1` (tester-s2).
+
+/// An app-only config: no node of its own, `links` to reach them, and its own client.
+fn app_config(dir: &Path, links: &Arc<Links>, client: ClientId) -> DbConfig {
+    DbConfig {
+        local: Vec::new(),
+        links: Some(Arc::clone(links)),
+        client,
+        ..config(dir)
+    }
+}
+
+fn open_app(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    links: &Arc<Links>,
+    client: ClientId,
+) -> Db {
+    let dir = config_testkit::fs::temp_dir();
+    rt.block_on(Db::open_with(
+        app_config(dir.path(), links, client),
+        Arc::clone(store),
+        rt.handle().clone(),
+        fast(),
+    ))
+    .expect("the app-only open")
+}
+
+/// A config that runs only `nodes` of the folder at `dir`: a node process (A-R231(a)).
+fn node_config(dir: &Path, nodes: &[u32]) -> DbConfig {
+    DbConfig {
+        local: nodes.iter().map(|node| NodeId(*node)).collect(),
+        links: Some(Arc::new(Links::default())),
+        ..config(dir)
+    }
+}
+
+fn open_node(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    store: &Arc<dyn ConfigStore>,
+    nodes: &[u32],
+) -> Result<Db, OpenError> {
+    rt.block_on(Db::open_with(
+        node_config(dir, nodes),
+        Arc::clone(store),
+        rt.handle().clone(),
+        fast(),
+    ))
+}
+
+/// The messages this test logged, in order.
+fn messages(method: &str) -> Vec<String> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter_map(|line| line["@m"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A-R226 h2: a `Db` with `local = []` runs no node, takes the owner from `partitions/1`,
+/// counts one open, and numbers its writes above that open's floor. Its put goes over the
+/// links to node 1 of the `Db` that runs the nodes, which reads it back, as does the app.
+/// Integration (~1 s): one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_s2_h2_an_app_only_db_writes_over_the_links_and_the_node_db_reads_it() {
+    const METHOD: &str = "m10_s2_h2_an_app_only_db_writes_over_the_links_and_the_node_db_reads_it";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut nodes = open(&rt, dir.path(), &store).expect("the fresh open");
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
+    assert!(app.node_status().is_empty(), "the app runs no node");
+    let put = app.put(b"a", b"1", None).expect("the app's put");
+    assert_eq!(
+        put.request,
+        RequestId(request_floor(2) + 1),
+        "the app's open is the folder's second, so its ids start above floor(2)"
+    );
+    for (who, db) in [("node db", &nodes), ("app", &app)] {
+        assert_eq!(
+            db.get(b"a").expect("get a").value.map(|(_, v)| v),
+            Some(Bytes::from_static(b"1")),
+            "{who} reads the app's write"
+        );
+    }
+    app.shutdown();
+    nodes.shutdown();
+    let logged = messages(METHOD);
+    assert!(logged.iter().any(|m| m == "db_open_app"), "{logged:?}");
+}
+
+/// A-R231(b): the pilot restarts under the same client id. Its second open counts again, so
+/// its first put has a fresh request id: it lands as a new write, never `REQUEST_ID_REUSE`
+/// against the first open's put. Integration (~1 s): one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_s2_h2_an_app_reopened_under_the_same_client_writes_with_fresh_ids() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut nodes = open(&rt, dir.path(), &store).expect("the fresh open");
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+
+    let mut first = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let one = first.put(b"a", b"1", None).expect("the first open's put");
+    first.shutdown();
+    drop(first);
+    let mut second = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let two = second
+        .put(b"a", b"2", None)
+        .unwrap_or_else(|e| panic!("the restarted app's first put is fresh: {e}"));
+    assert!(two.request > one.request, "{one:?} then {two:?}");
+    assert!(
+        two.seq > one.seq,
+        "two writes, not one replayed: {one:?} {two:?}"
+    );
+    assert_eq!(
+        nodes.get(b"a").expect("get a").value.map(|(_, v)| v),
+        Some(Bytes::from_static(b"2"))
+    );
+    second.shutdown();
+    nodes.shutdown();
+}
+
+/// A-R226 h2: an app `Db` whose route names a node that answers `NOT_PRIMARY` re-reads the
+/// owner from `partitions/1`; the refusal goes back to the app with its `RefreshRoute` rule,
+/// so the app retries, not the `Db`. Node 2 is a stand-in that answers every call
+/// `NOT_PRIMARY` the way admission check 4 does: in this host a real secondary refuses a put
+/// earlier, as not adopted (see the report). Integration (~1 s): one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_s2_h2_not_primary_refreshes_the_app_route() {
+    const METHOD: &str = "m10_s2_h2_not_primary_refreshes_the_app_route";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let links = Arc::new(Links::default());
+    let (stand_in, calls) = std::sync::mpsc::channel();
+    links.register(NodeId(2), stand_in);
+    let answering = std::thread::spawn(move || {
+        let mut answered = 0;
+        while let Ok(msg) = calls.recv() {
+            if let Msg::Client(Client { reply, .. }) = msg {
+                let error = ApiError::from_kernel(&RdbError::NotPrimary {
+                    partition: PARTITION,
+                    hint: None,
+                });
+                let _ = reply.send(Answer::Error {
+                    error,
+                    request: None,
+                });
+                answered += 1;
+            }
+        }
+        answered
+    });
+    let mut app = open_app(&rt, &store, &links, ClientId(2));
+    app.route.owner.store(2, Ordering::Relaxed);
+    let refused = app
+        .put(b"a", b"1", None)
+        .expect_err("node 2 is not the owner");
+    assert_eq!(
+        (refused.error.kind, refused.error.retry),
+        (ErrorKind::NotPrimary, RetryRule::RefreshRoute),
+        "{refused}"
+    );
+    assert_eq!(app.route.owner(), NodeId(1), "the route was refreshed");
+    app.shutdown();
+    drop(app);
+    drop(links);
+    assert_eq!(
+        answering.join().expect("the stand-in"),
+        1,
+        "one call reached node 2"
+    );
+    let logged = messages(METHOD);
+    assert!(
+        logged.iter().any(|m| m == "db_owner_refreshed"),
+        "{logged:?}"
+    );
+}
+
+/// Defect tester-s2: `partitions/1` holding bytes this build cannot decode is its own
+/// refusal naming the key, never "the store has no partitions/1". Both a folder's reopen and
+/// an app-only open say so; the reopen changed no data, so with the record put back the
+/// write made before reads back. Integration (~4 s): one fresh open until ready, two refused
+/// opens, one reopen until ready.
+#[config_log::retcd_test]
+fn m10_s2_an_undecodable_partition_record_is_refused_by_its_key_and_changes_nothing() {
+    const METHOD: &str =
+        "m10_s2_an_undecodable_partition_record_is_refused_by_its_key_and_changes_nothing";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let key = Bytes::from(ControlKey::Partition(PARTITION).encode());
+    let found = rt
+        .block_on(store.get(config_core::GetRequest { key: key.clone() }))
+        .expect("read partitions/1")
+        .record
+        .expect("partitions/1 exists");
+    let damaged = rt
+        .block_on(store.put(config_core::PutRequest {
+            key: key.clone(),
+            value: Bytes::from_static(b"not a record"),
+            expected_mod_revision: Some(found.mod_revision),
+            dedup: None,
+        }))
+        .expect("damage partitions/1");
+
+    let reopen = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::Undecodable { .. }) => error,
+        other => panic!(
+            "damaged bytes are Undecodable, not {:?}",
+            other.map(|_| "Db")
+        ),
+    };
+    let links = Arc::new(Links::default());
+    let app = match rt.block_on(Db::open_with(
+        app_config(dir.path(), &links, ClientId(2)),
+        Arc::clone(&store),
+        rt.handle().clone(),
+        fast(),
+    )) {
+        Err(error @ OpenError::Undecodable { .. }) => error,
+        other => panic!(
+            "damaged bytes are Undecodable, not {:?}",
+            other.map(|_| "Db")
+        ),
+    };
+    for (who, refused) in [("reopen", &reopen), ("app", &app)] {
+        let text = refused.to_string();
+        assert!(
+            text.starts_with("partitions/1 in the control store does not decode: ")
+                && text.contains("This open changed nothing"),
+            "{who}: the text names the key and says nothing changed: {text}"
+        );
+        assert!(!text.contains("no partitions/1"), "{who}: {text}");
+    }
+
+    rt.block_on(store.put(config_core::PutRequest {
+        key,
+        value: found.value.clone(),
+        expected_mod_revision: Some(damaged.revision),
+        dedup: None,
+    }))
+    .expect("put partitions/1 back");
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen after the record is back");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    assert_eq!(
+        db.get(b"a").expect("read a back").value.map(|(_, v)| v),
+        Some(Bytes::from_static(b"1")),
+        "the acknowledged write is intact after the refusal"
+    );
+    db.shutdown();
+    assert_eq!(
+        refusals(METHOD),
+        vec![
+            ("Warning".to_owned(), "Undecodable".to_owned()),
+            ("Warning".to_owned(), "Undecodable".to_owned())
+        ],
+        "one db_open_refused per refused open, naming the kind"
+    );
+}
+
+/// A-R231(a): a node process started on a folder no formation wrote is refused before it
+/// creates anything, and says to form the database first. Unit (~20 ms): nothing opens.
+#[config_log::retcd_test]
+fn m10_s2_a_node_process_on_an_unformed_folder_says_to_form_it_first() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let refused = match open_node(&rt, dir.path(), &store, &[2]) {
+        Err(error @ OpenError::Config(_)) => error,
+        other => panic!(
+            "an unformed folder is Config, not {:?}",
+            other.map(|_| "Db")
+        ),
+    };
+    let text = refused.to_string();
+    assert!(
+        text.contains(
+            "holds no copy of node 2: form the database first (lr up), then start node 2 again"
+        ),
+        "{text}"
+    );
+    assert!(
+        !dir.path().join("nodes").join("2").exists(),
+        "no copy was created"
+    );
+}
+
+/// A-R231(a): a node process whose copy exists but holds no data (formation never reached
+/// it) is refused before it binds or bootstraps, and says to form the database first.
+/// Unit (~100 ms): one empty RocksDB copy.
+#[config_log::retcd_test]
+fn m10_s2_a_node_process_on_an_empty_copy_says_to_form_it_first() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let copy = dir.path().join("nodes").join("2");
+    drop(RocksEngine::open(&copy).expect("an empty copy"));
+    let refused = match open_node(&rt, dir.path(), &store, &[2]) {
+        Err(error @ OpenError::Config(_)) => error,
+        other => panic!("an empty copy is Config, not {:?}", other.map(|_| "Db")),
+    };
+    let text = refused.to_string();
+    assert!(
+        text.contains("the copy of node 2 holds no data: form the database first (lr up)"),
+        "{text}"
+    );
+    let partitions = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        }))
+        .expect("read partitions/1");
+    assert!(partitions.record.is_none(), "nothing was bootstrapped");
+}
+
+/// A-R231(a), B1 case 1: after formation, node 2's process opens its own copy only. It is not
+/// the owner `partitions/1` names, so it starts no heal; node 1's process heals.
+/// Integration (~1 s): one fresh open until ready, one node-process open.
+#[config_log::retcd_test]
+fn m10_s2_a_non_owner_node_process_opens_its_copy_without_a_heal() {
+    const METHOD: &str = "m10_s2_a_non_owner_node_process_opens_its_copy_without_a_heal";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let mut db = open_node(&rt, dir.path(), &store, &[2]).expect("node 2's process opens");
+    let running: Vec<NodeId> = lock(&db.nodes).iter().map(|handle| handle.node).collect();
+    assert_eq!(running, vec![NodeId(2)], "it runs node 2 only");
+    db.shutdown();
+    let logged = messages(METHOD);
+    assert!(
+        logged.iter().any(|m| m == "db_open_not_owner"),
+        "{logged:?}"
+    );
+    assert!(
+        !logged.iter().any(|m| m == "db_heal_started"),
+        "neither open heals: the first is fresh, the second is not the owner: {logged:?}"
+    );
+}
+
+/// A-R231(a): `DbConfig::local` names each of nodes 1-3 at most once, and a `Db` that runs no
+/// node needs `links`. Each is refused before anything opens. Unit (~10 ms).
+#[config_log::retcd_test]
+fn m10_s2_a_repeated_or_unknown_local_node_and_an_app_open_without_links_are_refused() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    for nodes in [&[2, 2][..], &[4][..]] {
+        match open_node(&rt, dir.path(), &store, nodes) {
+            Err(OpenError::Config(text)) => assert!(
+                text.contains("name each of nodes 1, 2 and 3 at most once"),
+                "{nodes:?}: {text}"
+            ),
+            other => panic!("{nodes:?} is Config, not {:?}", other.map(|_| "Db")),
+        }
+    }
+    let no_links = DbConfig {
+        local: Vec::new(),
+        ..config(dir.path())
+    };
+    match rt.block_on(Db::open_with(
+        no_links,
+        Arc::clone(&store),
+        rt.handle().clone(),
+        fast(),
+    )) {
+        Err(OpenError::Config(text)) => assert!(text.contains("set links"), "{text}"),
+        other => panic!("no links is Config, not {:?}", other.map(|_| "Db")),
+    }
+    assert!(!dir.path().join("nodes").exists(), "nothing was created");
 }

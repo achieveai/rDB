@@ -305,6 +305,23 @@ pub enum OpenError {
     /// instances, or the store's `partitions/1` or open counter does not name this one.
     #[error("this directory and the control store do not belong together: {0}")]
     Mismatch(String),
+    /// A control record this open reads holds bytes this build does not decode. Nothing was
+    /// started or changed (tester-s2).
+    #[error(
+        "{key} in the control store does not decode: {detail}. This open changed nothing. If a \
+         newer build wrote it, open with that build; otherwise the record is damaged: stop and \
+         report it with this message"
+    )]
+    Undecodable {
+        /// The control key.
+        key: String,
+        /// What did not decode.
+        detail: String,
+    },
+    /// The open's settings, or the database it names, do not allow this open yet (M10 S2): the
+    /// text names what to do first. Nothing was started or changed.
+    #[error("{0}")]
+    Config(String),
     /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward. Either
     /// another folder, or a newer backup of this one, holds that generation, or a commit of it
     /// landed and the process stopped before it was used. The refusal changes no data, and the
@@ -387,6 +404,8 @@ pub struct Db {
     unwind: Option<PathBuf>,
     /// What this open is: its boots and its heal.
     opened: Opened,
+    /// Where this `Db` sends its calls: the owner `partitions/1` names (ruling A-R226 h2).
+    route: Route,
 }
 
 /// What one open of a directory is (M10, arch R3b).
@@ -412,6 +431,72 @@ impl Default for Opened {
             stuck: Mutex::new(None),
         }
     }
+}
+
+/// Where a `Db` sends its calls (ruling A-R226 h2): the owner `partitions/1` names, and, for a
+/// `Db` that can look again, the store and runtime it reads the record with.
+struct Route {
+    /// The node calls go to.
+    owner: std::sync::atomic::AtomicU32,
+    /// What a `NOT_PRIMARY` answer re-reads `partitions/1` with. `None`: the owner is fixed.
+    refresh: Option<(Arc<dyn ConfigStore>, Handle)>,
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Self {
+            owner: std::sync::atomic::AtomicU32::new(OWNER.0),
+            refresh: None,
+        }
+    }
+}
+
+impl Route {
+    fn owner(&self) -> NodeId {
+        NodeId(self.owner.load(Ordering::Relaxed))
+    }
+}
+
+/// The node `partitions/1` names as owner, its instance, and the record's mod revision.
+///
+/// # Errors
+///
+/// [`OpenError::Control`] when the store does not answer, and [`OpenError::Config`] when it
+/// holds no `partitions/1` yet: a node process must form the database first.
+/// [`OpenError::Undecodable`] when the record, or its instance, does not decode.
+async fn read_owner(
+    store: &Arc<dyn ConfigStore>,
+) -> Result<(NodeId, [u8; INSTANCE_LEN]), OpenError> {
+    let key = ControlKey::Partition(PARTITION).encode();
+    let read = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| {
+            let step = match error {
+                config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
+                _ => "",
+            };
+            OpenError::Control(format!("get partitions/1: {error}{step}"))
+        })?;
+    let found = read.record.ok_or_else(|| {
+        OpenError::Config(
+            "the control store holds no partitions/1, so no node serves this database yet: \
+             form the database first (lr up), then open again"
+                .to_owned(),
+        )
+    })?;
+    let record = PartitionRecord::decode(&found.value)
+        .ok_or_else(|| undecodable(&key, "not a partition record this build reads"))?;
+    let root = PartitionRoot::decode(&found.value).ok_or_else(|| {
+        OpenError::Config(
+            "partitions/1 names no instance yet, so the database is still forming: wait for \
+             its first open (lr up) to finish, then open again"
+                .to_owned(),
+        )
+    })?;
+    Ok((record.owner, root.instance))
 }
 
 /// How a reopen's heal stands.
@@ -643,6 +728,11 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
+        if config.local.is_empty() {
+            return Self::open_app(config, store, rt)
+                .await
+                .map_err(open_refused);
+        }
         let limits = limits(config.dedup_cap).map_err(open_refused)?;
         let budgets = Budgets {
             dedup_retention_millis: config
@@ -678,6 +768,55 @@ impl Db {
         Ok(db)
     }
 
+    /// An app-only open, `DbConfig::local` empty (ruling A-R226 h2, amended by A-R231(b)): this
+    /// process runs no node, claims no folder, bootstraps and heals nothing. It reads the owner
+    /// from `partitions/1`, counts one open on the instance that record names so its own request
+    /// ids start above every earlier open's, and sends every call over `DbConfig::links`. A
+    /// `NOT_PRIMARY` answer makes it read the owner again.
+    async fn open_app(
+        config: DbConfig,
+        store: Arc<dyn ConfigStore>,
+        rt: Handle,
+    ) -> Result<Self, OpenError> {
+        let links = config.links.clone().ok_or_else(|| {
+            OpenError::Config(
+                "DbConfig::local is empty, so this process runs no node and needs \
+                 DbConfig::links to reach one: set links, or list the nodes this process runs"
+                    .to_owned(),
+            )
+        })?;
+        let (owner, instance) = read_owner(&store).await?;
+        let n = admin::count_open(&*store, &instance, false, admin::COUNT_WITHIN)
+            .await
+            .map_err(|error| counter_refused(&instance, error))?;
+        tracing::info!(
+            instance_hex = %admin::instance_hex(&instance),
+            owner = owner.0,
+            n,
+            client = config.client.0,
+            request_floor = request_floor(n),
+            "db_open_app"
+        );
+        let control = ControlAdapter::new(Arc::clone(&store), rt.clone(), Arc::clone(&links));
+        Ok(Self {
+            nodes: Mutex::new(Vec::new()),
+            respawn: None,
+            links,
+            control,
+            clock: HostClock::start(),
+            timeouts: config.timeouts,
+            next_request: AtomicU64::new(request_floor(n) + 1),
+            client: config.client,
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+            route: Route {
+                owner: std::sync::atomic::AtomicU32::new(owner.0),
+                refresh: Some((store, rt)),
+            },
+        })
+    }
+
     /// [`Self::open_with`] with `spawn` starting each node, so a crate test can fail one.
     /// `budgets` are the ones the heal judges grants with.
     async fn open_spawning(
@@ -695,7 +834,24 @@ impl Db {
         ) -> Result<NodeHandle, String>,
     ) -> Result<Self, OpenError> {
         std::fs::create_dir_all(&config.dir)?;
+        let partial = local_nodes(&config.local)?;
         let nodes_dir = config.dir.join("nodes");
+        // A node process opens only its own copy, and only one a formed database left (ruling
+        // A-R231(a)): it never creates a copy, binds an instance or bootstraps.
+        if partial {
+            for node in &config.local {
+                let dir = nodes_dir.join(node.0.to_string());
+                if !dir.join("CURRENT").exists() {
+                    return Err(OpenError::Config(format!(
+                        "{} holds no copy of node {}: form the database first (lr up), then \
+                         start node {} again",
+                        dir.display(),
+                        node.0,
+                        node.0
+                    )));
+                }
+            }
+        }
         let created = match std::fs::create_dir(&nodes_dir) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -704,7 +860,7 @@ impl Db {
         // Opening the engines takes their `LOCK`s, so of two opens racing on one directory one
         // is refused `InUse` here (F-001). Only an open that created `nodes/` and holds node 1's
         // `LOCK` may remove it.
-        let engines = match open_engines(&nodes_dir) {
+        let engines = match open_engines(&nodes_dir, &config.local) {
             Ok(engines) => engines,
             Err((error, held_owner)) => {
                 if created && held_owner {
@@ -719,7 +875,7 @@ impl Db {
             engines,
             created: created.then(|| nodes_dir.clone()),
         };
-        let found = Self::check(&mut claim.engines, &store).await?;
+        let found = Self::check(&mut claim.engines, &store, partial).await?;
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
             None => admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
@@ -777,7 +933,7 @@ impl Db {
             "db_open_found"
         );
         let clock = HostClock::start();
-        let links = Links::new();
+        let links = config.links.clone().unwrap_or_default();
         let control = ControlAdapter::new(Arc::clone(&store), rt.clone(), Arc::clone(&links));
         for (a, b) in &config.hold {
             links.hold(*a, *b);
@@ -800,6 +956,10 @@ impl Db {
             opened: Opened {
                 base_boot: boot,
                 ..Opened::default()
+            },
+            route: Route {
+                owner: std::sync::atomic::AtomicU32::new(found.owner.0),
+                refresh: partial.then(|| (Arc::clone(&store), rt.clone())),
             },
         };
         let mut failed = None;
@@ -825,8 +985,11 @@ impl Db {
         }
         if found.fresh {
             admin::bootstrap_at(&store, db.clock.now(), boot, |msg| db.send_to(OWNER, msg)).await?;
+        } else if config.local.contains(&found.owner) {
+            db.start_heal(&store, &rt, budgets, boot, found.owner, &config.local)?;
         } else {
-            db.start_heal(&store, &rt, budgets, boot)?;
+            // The owner's process heals (arch-s2 B1): this one only runs its copy.
+            tracing::info!(owner = found.owner.0, "db_open_not_owner");
         }
         db.unwind = None;
         Ok(db)
@@ -835,10 +998,12 @@ impl Db {
     /// The reopen checks of arch R3b, all before anything is counted or started: one instance in
     /// every copy, bound now on a fresh directory; and on a directory with data, a
     /// `partitions/1` and counter of that instance, and a copy that holds the generation the
-    /// record names.
+    /// record names. A `partial` open (a node process) refuses a copy that holds no data before
+    /// binding anything: only a formed database's copy opens there (ruling A-R231(a)).
     async fn check(
         engines: &mut BTreeMap<NodeId, RocksEngine>,
         store: &Arc<dyn ConfigStore>,
+        partial: bool,
     ) -> Result<Found, OpenError> {
         let bound: BTreeSet<[u8; INSTANCE_LEN]> =
             engines.values().filter_map(RocksEngine::instance).collect();
@@ -850,6 +1015,14 @@ impl Db {
             )));
         }
         let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
+        if partial && !holds_data {
+            let nodes: Vec<String> = engines.keys().map(|node| node.0.to_string()).collect();
+            return Err(OpenError::Config(format!(
+                "the copy of node {} holds no data: form the database first (lr up), then start \
+                 the node again",
+                nodes.join(", ")
+            )));
+        }
         if holds_data {
             if let Some((node, _)) = engines.iter().find(|(_, e)| e.instance().is_none()) {
                 return Err(OpenError::Unbound(PathBuf::from(format!(
@@ -883,14 +1056,27 @@ impl Db {
                 };
                 OpenError::Control(format!("get partitions/1: {error}{step}"))
             })?;
-        let root = read
-            .record
-            .as_ref()
-            .and_then(|found| Some((PartitionRecord::decode(&found.value)?, found)))
-            .map(|(record, found)| (record, PartitionRoot::decode(&found.value)));
+        // A record that does not decode is its own refusal, never "no partitions/1": that would
+        // send the reader looking for a record that is there (tester-s2).
+        let root = match read.record.as_ref() {
+            None => None,
+            Some(found) => {
+                let record = PartitionRecord::decode(&found.value).ok_or_else(|| {
+                    undecodable(
+                        &ControlKey::Partition(PARTITION).encode(),
+                        &format!(
+                            "{} bytes that are not a partition record this build reads",
+                            found.value.len()
+                        ),
+                    )
+                })?;
+                Some((record, PartitionRoot::decode(&found.value)))
+            }
+        };
         let fresh = Found {
             instance,
             fresh: true,
+            owner: OWNER,
             roll: None,
         };
         let untouched = read
@@ -948,6 +1134,7 @@ impl Db {
                 Ok(copies) => Ok(Found {
                     instance,
                     fresh: false,
+                    owner: record.owner,
                     roll: Some(Roll {
                         count,
                         revision,
@@ -975,6 +1162,7 @@ impl Db {
         Ok(Found {
             instance,
             fresh: false,
+            owner: record.owner,
             roll: None,
         })
     }
@@ -989,24 +1177,38 @@ impl Db {
         rt: &Handle,
         budgets: Budgets,
         boot: BootId,
+        owner: NodeId,
+        local: &[NodeId],
     ) -> Result<(), OpenError> {
-        let (owner, started) = {
+        let (sender, started) = {
             let nodes = lock(&self.nodes);
-            let owner = nodes
+            let sender = nodes
                 .iter()
-                .find(|handle| handle.node == OWNER)
+                .find(|handle| handle.node == owner)
                 .map(NodeHandle::sender);
-            (owner, nodes.len())
+            (sender, nodes.len())
         };
-        let owner = owner.ok_or_else(|| OpenError::Node("no owner node".into()))?;
+        let sender = sender.ok_or_else(|| OpenError::Node("no owner node".into()))?;
         tracing::info!(nodes_started = started, boot = boot.0, "db_heal_started");
+        // This open's nodes all run at `boot`; another process's node at the boot its last
+        // handshake reported (arch-s2 B1).
+        let links = Arc::clone(&self.links);
+        let local = local.to_vec();
+        let member_boot = move |node: NodeId| {
+            if local.contains(&node) {
+                Some(boot)
+            } else {
+                links.boot_of(node)
+            }
+        };
         let ctx = admin::HealCtx {
             store: Arc::clone(store),
             boot,
             budgets,
             clock: self.clock,
-            owner,
+            owner: sender,
             within: heal_within(&budgets),
+            member_boot: Arc::new(member_boot),
         };
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
@@ -1046,7 +1248,7 @@ impl Db {
             if let Some(note) = self.restart_note().filter(|_| self.owner_restarted()) {
                 return Err(ReadyError::Stopped { note });
             }
-            if let Some(owner) = self.inspect(OWNER) {
+            if let Some(owner) = self.inspect(self.route.owner()) {
                 if owner.admits == Some(true) {
                     self.ready_seen.store(true, Ordering::Relaxed);
                     return Ok(());
@@ -1136,14 +1338,21 @@ impl Db {
             call,
             reply,
         });
-        if self.send_to(OWNER, msg).is_err() {
+        if self.send_to(self.route.owner(), msg).is_err() {
             return Some(Answer::Error {
                 error: ApiError::host("the owner's node thread has stopped"),
                 request: None,
             });
         }
         match answer.recv_timeout(wait) {
-            Ok(answer) => Some(answer),
+            Ok(answer) => {
+                if let Answer::Error { error, .. } = &answer {
+                    if error.kind == ErrorKind::NotPrimary {
+                        self.refresh_owner();
+                    }
+                }
+                Some(answer)
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             // The node dropped the call's waiter unanswered: not a timeout, so not the
             // timeout's outcome either (F-001).
@@ -1151,6 +1360,39 @@ impl Db {
                 error: ApiError::host("the owner dropped the call unanswered"),
                 request: None,
             }),
+        }
+    }
+
+    /// After a `NOT_PRIMARY` answer, read the owner `partitions/1` names now, so the caller's
+    /// retry, which `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the
+    /// read timeout. A `Db` whose owner is fixed reads nothing. A read that fails keeps the
+    /// owner it had and logs why: the next `NOT_PRIMARY` reads again.
+    fn refresh_owner(&self) {
+        let Some((store, rt)) = &self.route.refresh else {
+            return;
+        };
+        let (done, read) = mpsc::channel();
+        let store = Arc::clone(store);
+        rt.spawn(async move {
+            // The receiver may have given up; then nobody needs the answer.
+            let _ = done.send(read_owner(&store).await);
+        });
+        let was = self.route.owner();
+        match read.recv_timeout(self.timeouts.read) {
+            Ok(Ok((owner, _))) => {
+                self.route.owner.store(owner.0, Ordering::Relaxed);
+                tracing::info!(was = was.0, owner = owner.0, "db_owner_refreshed");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(was = was.0, error = %error, "db_owner_refresh_failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    was = was.0,
+                    error = "no answer within the read timeout",
+                    "db_owner_refresh_failed"
+                );
+            }
         }
     }
 
@@ -1876,7 +2118,7 @@ impl Db {
         )
         .ok()?;
         let status = answer.recv_timeout(self.timeouts.read).ok()?;
-        if node == OWNER {
+        if node == self.route.owner() {
             *lock(&self.opened.stuck) = stuck_recovery(&status);
         }
         Some(status)
@@ -1959,6 +2201,7 @@ impl Db {
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
+            route: Route::default(),
         }
     }
 
@@ -1994,6 +2237,7 @@ impl Db {
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
+            route: Route::default(),
         };
         for n in 1..=3u32 {
             let handle = host::spawn_with(
@@ -2289,6 +2533,8 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
 struct Found {
     instance: [u8; INSTANCE_LEN],
     fresh: bool,
+    /// The owner `partitions/1` names, or node 1 for a fresh database. Only its process heals.
+    owner: NodeId,
     /// Set when no copy holds the record's generation and it may be rolled forward (A-R184).
     roll: Option<Roll>,
 }
@@ -2417,6 +2663,8 @@ fn open_refused(error: OpenError) -> OpenError {
         OpenError::CopyMissing(_) => "CopyMissing",
         OpenError::Unbound(_) => "Unbound",
         OpenError::Mismatch(_) => "Mismatch",
+        OpenError::Undecodable { .. } => "Undecodable",
+        OpenError::Config(_) => "Config",
         OpenError::Stale { .. } => "Stale",
         OpenError::Counter(_) => "Counter",
         OpenError::Control(_) => "Control",
@@ -2427,6 +2675,15 @@ fn open_refused(error: OpenError) -> OpenError {
     };
     tracing::warn!(kind, error = %error, "db_open_refused");
     error
+}
+
+/// [`OpenError::Undecodable`] for the control record at `key`.
+fn undecodable(key: &str, detail: &str) -> OpenError {
+    tracing::error!(key, detail, "db_open_undecodable");
+    OpenError::Undecodable {
+        key: key.to_owned(),
+        detail: detail.to_owned(),
+    }
 }
 
 /// The words for a new folder against a store that serves another database (tester D1): both
@@ -2475,11 +2732,30 @@ fn heal_within(budgets: &Budgets) -> Duration {
     )
 }
 
-/// Open the three copies under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
+/// Whether `local` names only some of the three nodes: a node process (ruling A-R231(a)).
+///
+/// # Errors
+///
+/// [`OpenError::Config`] when it names a node twice or a node partition 1 does not have.
+fn local_nodes(local: &[NodeId]) -> Result<bool, OpenError> {
+    let named: BTreeSet<NodeId> = local.iter().copied().collect();
+    if named.len() != local.len() || !named.iter().all(|node| ALL_NODES.contains(node)) {
+        return Err(OpenError::Config(format!(
+            "DbConfig::local is {:?}: name each of nodes 1, 2 and 3 at most once",
+            local.iter().map(|node| node.0).collect::<Vec<_>>()
+        )));
+    }
+    Ok(named.len() < ALL_NODES.len())
+}
+
+/// Open the copies of `local` under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
 /// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
 /// missing copy is created only while no copy holds data. On error, says whether node 1's
 /// `LOCK` was held, which is what lets a claim be removed; every engine is closed by then.
-fn open_engines(nodes_dir: &Path) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
+fn open_engines(
+    nodes_dir: &Path,
+    local: &[NodeId],
+) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
         rdb_storage::OpenError::Locked { .. } => OpenError::InUse(dir.to_path_buf()),
         rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(dir.to_path_buf()),
@@ -2487,15 +2763,15 @@ fn open_engines(nodes_dir: &Path) -> Result<BTreeMap<NodeId, RocksEngine>, (Open
     };
     let mut engines = BTreeMap::new();
     let mut missing = Vec::new();
-    for n in 1..=3u32 {
-        let dir = nodes_dir.join(n.to_string());
+    for &node in local {
+        let dir = nodes_dir.join(node.0.to_string());
         if !dir.join("CURRENT").exists() {
-            missing.push((NodeId(n), dir));
+            missing.push((node, dir));
             continue;
         }
         match RocksEngine::open_existing(&dir) {
             Ok(engine) => {
-                engines.insert(NodeId(n), engine);
+                engines.insert(node, engine);
             }
             Err(error) => {
                 let held = engines.contains_key(&OWNER);
@@ -3060,6 +3336,7 @@ mod tests {
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
+            route: Route::default(),
         };
 
         let refused = db
@@ -3263,6 +3540,7 @@ mod tests {
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
+            route: Route::default(),
         };
 
         let started = std::time::Instant::now();
@@ -3313,6 +3591,7 @@ mod tests {
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
+            route: Route::default(),
         };
         let cases = [
             (ErrorKind::ProtectionPaused, RetryRule::RetryAfterRecovery),
@@ -4293,6 +4572,7 @@ mod tests {
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
+            route: Route::default(),
         };
         (db, mailbox, rt)
     }
