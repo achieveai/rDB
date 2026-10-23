@@ -762,7 +762,9 @@ pub struct NodeStatus {
     /// L1's mode, when live.
     pub protection: Option<String>,
     /// Whether this node admits writes now: L1 admits and A1 holds a grant. `None` while L1 is
-    /// not live. `protection` is L1 alone and `authority` A1 alone.
+    /// not live. `protection` is L1 alone and `authority` A1 alone. A transaction still waiting
+    /// to publish can refuse a put `PROTECTION_PAUSED` while this is `true`; `published` and
+    /// `in_flight` show that (D13).
     pub admits: Option<bool>,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
