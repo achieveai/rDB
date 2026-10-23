@@ -383,4 +383,22 @@ pub trait ConfigStore: Send + Sync {
     /// caller must handle both, because whether a cursor can be validated before the first poll
     /// is an implementation detail of the transport, not part of the contract.
     async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError>;
+
+    /// [`ConfigStore::watch`], opened at the leader wherever it is (issue #57).
+    ///
+    /// Watches are leader-served (spec §11.1), and `watch` makes one attempt at one endpoint,
+    /// so through a store that knows several nodes it works only while that endpoint leads.
+    /// This finds the leader **at open**, the way a unary call does: a remote store moves past
+    /// an endpoint it cannot connect to and follows a bounded number of `NotLeader` hints.
+    /// Once the stream is open the contract is `watch`'s, errors included. Nothing re-opens a
+    /// stream after a delivery or a termination; that stays the caller's decision, because the
+    /// caller holds the cursor (test plan M4-106, M4-107).
+    ///
+    /// The default is `watch`, which is right for a store with one place to open a watch.
+    /// **A wrapper must forward `watch_leader` to its inner store.** One that leaves the
+    /// default calls its own `watch`, and so its inner store's `watch`, and silently opens at
+    /// one endpoint again.
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.watch(request).await
+    }
 }

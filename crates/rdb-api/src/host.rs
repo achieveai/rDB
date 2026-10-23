@@ -6007,8 +6007,10 @@ fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
 /// D9b: the code a damage line names stored damage by, never its `Display`, which for a map
 /// entry quotes the app's key (`Corrupt::Entry`). Exhaustive on purpose: a new variant is a
 /// compile error here, not a line that quietly falls back to the text.
-const fn damage_code(corrupt: &Corrupt) -> &'static str {
+fn damage_code(corrupt: &Corrupt) -> &'static str {
     match corrupt {
+        // The element's own fault; its key never reaches a log (#59, A-R230).
+        Corrupt::Element { error, .. } => damage_code(error),
         Corrupt::Envelope(_) => "envelope",
         Corrupt::Codec(_) => "codec",
         Corrupt::VersionWithoutValue => "version_without_value",
