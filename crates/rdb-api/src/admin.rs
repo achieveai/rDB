@@ -115,6 +115,12 @@ pub fn members_at(boot: BootId) -> Vec<Member> {
 
 /// A recovery plan for partition 1 from `anchor`: rf3 at `version`, every node at `boot`, every
 /// copy a candidate and in `rebuild_required`, node 1 primary with `grant` at `generation`.
+///
+/// Only the pinned primary is `primary_eligible` (ruling A-R215). The host acquires, tracks and
+/// adopts on that copy alone, so F1 must lead with it even when another copy holds the longer
+/// prefix: the leader then catches up before its grant. Every copy eligible let `select_leader`
+/// name the prefix source, which owned the record while node 1 held the grant, and the open
+/// served nothing.
 fn recovery_plan(
     anchor: LineageAnchor,
     version: ConfigVersion,
@@ -130,7 +136,7 @@ fn recovery_plan(
             .iter()
             .map(|member| Candidate {
                 copy: member.copy,
-                primary_eligible: true,
+                primary_eligible: member.role == ReplicaRole::Primary,
                 healthy: true,
                 within_capacity: true,
                 has_valid_grant: true,

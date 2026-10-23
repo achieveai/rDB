@@ -7095,6 +7095,102 @@ mod tests {
         db.shutdown();
     }
 
+    /// A-R215: a reopen whose primary copy lags its peers serves every acked write. Node 1's
+    /// WAL is cut back to its length before b and c, as a power loss that took node 1's unsynced
+    /// tail would leave it (the s0 torn-WAL rows cut the same way); nodes 2 and 3 keep them. F1
+    /// selects copy 1's longer prefix, and placement names copy 0 alone primary-eligible, so node
+    /// 1 still leads: it catches up before its grant, owns `partitions/1`, adopts the
+    /// generation, and a..c read back and d lands. Before the fix the leader was the prefix
+    /// source, node 2 owned the record, node 1 held the grant, and the open served nothing.
+    /// Integration (~4 s): two real opens with a cut WAL between them.
+    #[config_log::retcd_test]
+    fn m10_r215_a_reopen_whose_primary_copy_lags_its_peers_serves_every_acked_write() {
+        const METHOD: &str =
+            "m10_r215_a_reopen_whose_primary_copy_lags_its_peers_serves_every_acked_write";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let node_1 = dir.path().join("nodes").join("1");
+        let newest_wal = || {
+            std::fs::read_dir(&node_1)
+                .expect("list node 1")
+                .map(|entry| entry.expect("dir entry").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+                .max()
+                .expect("node 1 has a WAL")
+        };
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the first open");
+        let a = db.put(b"a", b"1", None).expect("put a");
+        publishes(&db, a.seq, "after a");
+        let wal = newest_wal();
+        let cut = std::fs::metadata(&wal).expect("WAL size").len();
+        db.put(b"b", b"1", None).expect("put b");
+        db.put(b"c", b"1", None).expect("put c");
+        db.shutdown();
+        drop(db);
+        assert_eq!(newest_wal(), wal, "node 1 wrote one WAL");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .expect("open node 1's WAL")
+            .set_len(cut)
+            .expect("cut node 1's WAL");
+
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the reopen");
+        db.put(b"d", b"1", None).expect("put d");
+        for key in [&b"a"[..], b"b", b"c", b"d"] {
+            let read = db.get(key).unwrap_or_else(|e| panic!("get {key:?}: {e:?}"));
+            assert_eq!(
+                read.value.map(|(_, value)| value),
+                Some(Bytes::from_static(b"1")),
+                "{key:?} reads back"
+            );
+        }
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1")
+            .record
+            .expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("decodes");
+        assert_eq!(
+            record.owner,
+            NodeId(1),
+            "the pinned primary owns the record"
+        );
+        db.shutdown();
+
+        // The cut took: node 1 reported a shorter prefix than its peers, so F1's source was not
+        // copy 0.
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let heads: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "inventory_reported")
+            .map(|line| (line["copy"].as_u64(), line["head"].as_u64()))
+            .collect();
+        let head = |copy| {
+            heads
+                .iter()
+                .rev()
+                .find(|(c, _)| *c == Some(copy))
+                .and_then(|(_, head)| *head)
+        };
+        assert!(
+            head(0) < head(1) && head(1) == head(2),
+            "copy 0 lags copies 1 and 2 at the reopen: {heads:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line["@m"] == "recovery_fact"
+                && line["effect"]
+                    .as_str()
+                    .is_some_and(|effect| effect.contains("source: CopyId(1)"))),
+            "F1 selected copy 1's prefix"
+        );
+    }
+
     /// D18 (A-R206): a stall of node 1's run loop alone, past L1's pause age, with its own copy
     /// durable and the peers' acks waiting in its mailbox, does not pause writes. The loop drains
     /// the mail it took before it runs the due duties, so the peers' `DurableAdvanced` reaches L1
