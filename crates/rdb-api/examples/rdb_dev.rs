@@ -1388,9 +1388,16 @@ fn repl<'scope, 'env>(
                 let secs = rest.first().map_or(Ok(30), |s| s.parse::<u64>());
                 match secs {
                     Ok(secs) => {
-                        say(&wait_for(progress, what, Duration::from_secs(secs), || {
+                        match wait_for(progress, what, Duration::from_secs(secs), || {
                             db.heal_state()
-                        }));
+                        }) {
+                            Ok(line) => say(&line),
+                            // A script must see that this open will never be ready (A-R191).
+                            Err(line) => {
+                                say(&line);
+                                bad = true;
+                            }
+                        }
                         Ok(())
                     }
                     Err(_) => Err("wait takes whole seconds".to_owned()),
@@ -3522,13 +3529,14 @@ fn start_voter(rt: &tokio::runtime::Runtime, cluster: &Arc<Cluster>, voter: Vote
     }
 }
 
-/// `wait recovered|ready`: the line it ends with.
+/// `wait recovered|ready`: the line it ends with. `Err` when the wait stopped because the open can
+/// never get there (a failed heal): the run then exits 1.
 fn wait_for(
     progress: &Progress,
     what: &str,
     limit: Duration,
     heal: impl Fn() -> rdb_api::db::HealState,
-) -> String {
+) -> Result<String, String> {
     let started = Instant::now();
     loop {
         let seen = progress.seen();
@@ -3537,18 +3545,24 @@ fn wait_for(
             _ => seen.ready,
         };
         if reached {
-            return format!("reached {what} in {}ms", started.elapsed().as_millis());
+            return Ok(format!(
+                "reached {what} in {}ms",
+                started.elapsed().as_millis()
+            ));
         }
         // A failed heal never becomes ready: say why now, not after the whole wait (k151).
         // Node 1 recovers only from the plan the heal hands it, so neither wait can end well.
         if let rdb_api::db::HealState::Failed(error) = heal() {
-            return format!(
+            return Err(format!(
                 "stopped waiting for {what}: {}; this open will not become ready",
                 rdb_api::db::ReadyError::Heal(error)
-            );
+            ));
         }
         if started.elapsed() >= limit {
-            return format!("timeout waiting for {what} after {}s", limit.as_secs());
+            return Ok(format!(
+                "timeout waiting for {what} after {}s",
+                limit.as_secs()
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -5328,7 +5342,7 @@ mod tests {
     /// all 30 s and printed a bare timeout, though the open could never become ready. `wait
     /// ready` and `wait recovered` end as soon as the heal has failed, and say so with the heal's
     /// error: node 1 recovers only from the plan a heal hands it. A heal still running is
-    /// waited on. Unit (~150 ms; the red run waits out the 2 s limit).
+    /// waited on. A stopped wait is an error, so the run exits 1 (A-R191). Unit (~150 ms).
     #[test]
     fn a_wait_ends_at_once_with_the_heal_error_when_the_heal_failed() {
         use rdb_api::db::HealState;
@@ -5337,7 +5351,8 @@ mod tests {
             let started = Instant::now();
             let line = wait_for(&progress, what, Duration::from_secs(2), || {
                 HealState::Failed(admin::HealError::NodeStopped)
-            });
+            })
+            .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
             assert!(
                 started.elapsed() < Duration::from_millis(500),
                 "waited {:?}: {line}",
@@ -5353,7 +5368,8 @@ mod tests {
         }
         let line = wait_for(&progress, "ready", Duration::from_millis(100), || {
             HealState::Running
-        });
+        })
+        .expect("a timeout is said, as before");
         assert_eq!(line, "timeout waiting for ready after 0s");
     }
 
