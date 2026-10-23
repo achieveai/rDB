@@ -791,9 +791,12 @@ pub enum HealError {
     /// The store refused.
     #[error("control store: {0}")]
     Control(String),
-    /// Node 1's thread is gone.
-    #[error("node {} stopped before the heal reached it", OWNER.0)]
-    NodeStopped,
+    /// The owner's thread is gone.
+    #[error("node {} stopped before the heal reached it", .node.0)]
+    NodeStopped {
+        /// The owner the heal was handing the plan to.
+        node: NodeId,
+    },
     /// No handshake from these nodes within the heal's time, so the plan cannot pin their boots.
     #[error(
         "no link to node {who} came up within {secs} seconds, so the heal cannot pin its \
@@ -1010,7 +1013,9 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
                 correlation: HEAL,
                 kind: EventKind::Kernel(KernelEvent::Recovery(event)),
             })
-            .map_err(|_| HealError::NodeStopped)?;
+            .map_err(|_| HealError::NodeStopped {
+                node: ctx.owner_node,
+            })?;
     }
     Ok(healed)
 }
@@ -3185,6 +3190,47 @@ mod tests {
             (refenced.control_revision, refenced.prior_grant_id),
             (fence.control_revision, GrantId(0)),
             "the second run picks up the record and grant the first left"
+        );
+    }
+
+    /// A-R260: after a promote the owner is node 2, so a heal whose owner's thread is gone
+    /// names node 2, not node 1. Cut: the text names `OWNER`. Unit (~10 ms): `MemStore`, a
+    /// mailbox whose receiver is dropped.
+    #[test]
+    fn m10_s2_a_heal_whose_owner_stopped_names_that_owner() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let written = rooted(&*store, &rt, BootId(5));
+        let found = rt
+            .block_on(store.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        let root = PartitionRoot::decode(&found.value).expect("root");
+        let record = PartitionRecord {
+            owner: NodeId(2),
+            ..PartitionRecord::decode(&found.value).expect("record")
+        };
+        put(&store, &rt, record.encode_with(&root), written);
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        drop(mailbox);
+        let ctx = HealCtx {
+            store: Arc::clone(&store),
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_millis(500),
+            member_boot: Arc::new(|_| Some(OPEN_2)),
+            owner_node: NodeId(2),
+        };
+        let stopped = rt.block_on(heal(ctx)).expect_err("node 2's thread is gone");
+        assert_eq!(
+            stopped.to_string(),
+            "node 2 stopped before the heal reached it",
+            "{stopped:?}"
         );
     }
 }

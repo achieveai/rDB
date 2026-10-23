@@ -6507,7 +6507,7 @@ mod tests {
         let progress = Progress::default();
         let started = Instant::now();
         let recovered = wait_recovered(&progress, Duration::from_secs(2), || {
-            HealState::Failed(admin::HealError::NodeStopped)
+            HealState::Failed(admin::HealError::NodeStopped { node: NodeId(1) })
         })
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
         assert!(
@@ -6520,7 +6520,11 @@ mod tests {
             &progress,
             Duration::from_secs(2),
             WAIT_PROGRESS_EVERY,
-            |_| Err(ReadyError::Heal(admin::HealError::NodeStopped)),
+            |_| {
+                Err(ReadyError::Heal(admin::HealError::NodeStopped {
+                    node: NodeId(1),
+                }))
+            },
             |_| (),
         )
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
@@ -7243,7 +7247,7 @@ mod tests {
     fn wait_ready_ends_on_the_first_final_answer_without_another_slice() {
         use rdb_api::db::ReadyError;
         let finals = [
-            ReadyError::Heal(admin::HealError::NodeStopped),
+            ReadyError::Heal(admin::HealError::NodeStopped { node: NodeId(1) }),
             ReadyError::Stopped {
                 note: "node 1 restarted".to_owned(),
             },
