@@ -438,22 +438,36 @@ pub async fn count_open(
 /// What a reopen's heal proved and handed node 1 (M10, arch R3a, ruling A-R163).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Healed {
-    /// The revision node 1's old grant was deleted at.
-    pub grant_delete_revision: Revision,
-    /// The store revision `partitions/1` was then read at: never below the delete.
+    /// How node 1's old grant was found gone: deleted by this heal (case A), or absent (case B).
+    pub cleared: GrantCleared,
+    /// The store revision `partitions/1` was then read at: never below [`Self::cleared`]'s.
     pub read_revision: Revision,
     /// The fence's `control_revision`: `partitions/1`'s `mod_revision` from that read.
     pub control_revision: Revision,
 }
 
+/// How a reopen's heal found node 1's old grant gone (M10, arch R3a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantCleared {
+    /// Case A: the heal deleted it, at this revision ([`Revocation::ExpiryProven`]).
+    Deleted(Revision),
+    /// Case B: a read at this store revision found it absent ([`Revocation::NoGrantHeld`]).
+    Absent(Revision),
+}
+
+impl GrantCleared {
+    /// The revision `partitions/1` must be read at or after.
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        match self {
+            Self::Deleted(revision) | Self::Absent(revision) => revision,
+        }
+    }
+}
+
 /// Why a reopen's heal did not hand node 1 a fence.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HealError {
-    /// `grants/1` holds nothing, so there is no old grant to prove expired.
-    #[error(
-        "grants/1 holds no grant to prove expired; a heal without one is not built yet (M10 S1, case B)"
-    )]
-    NoGrantHeld,
     /// A grant was still not clearable when the heal's time ran out.
     #[error("grants/{node} was not cleared within {within_ms} ms; last answer: {last}")]
     NotCleared {
@@ -471,6 +485,16 @@ pub enum HealError {
         read: u64,
         /// The delete's revision.
         deleted: u64,
+    },
+    /// The `partitions/1` read was served before the read that found `grants/1` absent.
+    #[error(
+        "partitions/1 was read at revision {read}, before grants/1 was read absent at {absent}"
+    )]
+    ReadBeforeAbsence {
+        /// The read's store revision.
+        read: u64,
+        /// The absent read's store revision.
+        absent: u64,
     },
     /// `partitions/1` is not a layout-3 record.
     #[error("partitions/1: {0}")]
@@ -499,29 +523,33 @@ pub(crate) struct HealCtx {
 /// The correlation a heal's two events carry.
 const HEAL: CorrelationId = CorrelationId(2);
 
-/// Heal partition 1 after a reopen (M10, arch R3a, ruling A-R163, case A): clear the three old
-/// grants, node 1's first; only after node 1's delete is acknowledged, read `partitions/1`; then
+/// Heal partition 1 after a reopen (M10, arch R3a, rulings A-R159, A-R163): clear the three old
+/// grants, node 1's first; only after node 1's grant is known gone, read `partitions/1`; then
 /// hand node 1's F1 a `Plan` from the record's root at config version + 1 with this open's
-/// boots, and an `ExpiryProven` fence whose `control_revision` is the record's `mod_revision`.
+/// boots, and a takeover authorization whose `control_revision` is the record's `mod_revision`.
 /// The same proof `bootstrap` and the simulator's `reinspect_now` already use: a CAS at that
 /// revision lands only if nothing wrote `partitions/1` after the read.
 ///
+/// Node 1's grant is gone one of two ways:
+/// - **Case A**, deleted by this heal under `clear_verdict`'s guards:
+///   [`Revocation::ExpiryProven`] from the record it judged.
+/// - **Case B**, read absent (an earlier heal deleted it and its process died before an
+///   acquire): [`Revocation::NoGrantHeld`] at that read's revision, `prior_grant_id`
+///   `GrantId(0)` ("none held") and `prior_boot_id` the record's `owner_boot`, never 0.
+///
 /// Logged as `heal_takeover_authorized{variant, control_revision, prior_boot, prior_grant,
-/// grant_delete_revision, read_revision}`.
+/// grant_delete_revision | absent_revision, read_revision}`.
 ///
 /// # Errors
 ///
 /// [`HealError`]. Nothing is sent to node 1 unless every step held.
 pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
-    let (held, deleted) = match clear_until(&ctx, OWNER, deadline).await? {
-        (Clearance::Cleared(revision), Some(held)) => (held, revision),
-        _ => return Err(HealError::NoGrantHeld),
-    };
+    let gone = clear_until(&ctx, OWNER, deadline).await?;
     for node in [NodeId(2), NodeId(3)] {
         clear_until(&ctx, node, deadline).await?;
     }
-    // Only now, after node 1's delete was acknowledged (A-R163).
+    // Only now, after node 1's delete was acknowledged or its absence read (A-R163).
     let read = ctx
         .store
         .get(GetRequest {
@@ -529,10 +557,20 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         })
         .await
         .map_err(|error| HealError::Control(format!("get partitions/1: {error}")))?;
-    if Revision(read.read_revision) < deleted {
-        return Err(HealError::ReadBeforeDelete {
-            read: read.read_revision,
-            deleted: deleted.0,
+    let cleared = match &gone {
+        Gone::Deleted(revision, _) => GrantCleared::Deleted(*revision),
+        Gone::Absent(revision) => GrantCleared::Absent(*revision),
+    };
+    if Revision(read.read_revision) < cleared.revision() {
+        return Err(match cleared {
+            GrantCleared::Deleted(deleted) => HealError::ReadBeforeDelete {
+                read: read.read_revision,
+                deleted: deleted.0,
+            },
+            GrantCleared::Absent(absent) => HealError::ReadBeforeAbsence {
+                read: read.read_revision,
+                absent: absent.0,
+            },
         });
     }
     let found = read
@@ -548,9 +586,51 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         )));
     };
     let healed = Healed {
-        grant_delete_revision: deleted,
+        cleared,
         read_revision: Revision(read.read_revision),
         control_revision: Revision(found.mod_revision),
+    };
+    let now = ctx.clock.now();
+    // The plan's view: case A carries the old grant, as before; case B has none, so it takes
+    // bootstrap's. A1 replaces the view at its first acquire either way.
+    let (prior_grant, prior_boot, view_grant, view_generation, revocation) = match &gone {
+        Gone::Deleted(_, held) => {
+            let sample = HostClock::control_time(now, &ctx.budgets);
+            let revocation = Revocation::ExpiryProven {
+                frozen_expiry_utc_ms: held.expiry_utc_ms,
+                authority_utc_ms: i64::try_from(sample.estimate.0).unwrap_or(i64::MAX),
+                authority_tick: now,
+                epsilon_ms: u32::try_from(ctx.budgets.clock_error_millis).unwrap_or(u32::MAX),
+                delta_ms: u32::try_from(ctx.budgets.dispatch_margin_millis).unwrap_or(u32::MAX),
+            };
+            let held = *held;
+            (
+                held.grant,
+                held.boot,
+                held.grant,
+                held.authority_generation,
+                revocation,
+            )
+        }
+        Gone::Absent(absent_revision) => {
+            // R5 row 8: the prior boot names a real process, never 0.
+            if root.owner_boot == BootId(0) {
+                return Err(HealError::Record(format!(
+                    "the record at revision {} names owner boot 0",
+                    found.mod_revision
+                )));
+            }
+            let revocation = Revocation::NoGrantHeld {
+                absent_revision: *absent_revision,
+            };
+            (
+                GrantId(0),
+                root.owner_boot,
+                GrantId(1),
+                AuthorityGeneration(1),
+                revocation,
+            )
+        }
     };
     let lineage = Lineage {
         partition: PARTITION,
@@ -563,40 +643,37 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         base_digest: root.base_digest,
     };
     let version = ConfigVersion(record.config_version.0 + 1);
-    let plan = recovery_plan(
-        anchor,
-        version,
-        ctx.boot,
-        held.grant,
-        held.authority_generation,
-    );
-    let now = ctx.clock.now();
-    let sample = HostClock::control_time(now, &ctx.budgets);
+    let plan = recovery_plan(anchor, version, ctx.boot, view_grant, view_generation);
     let fence = FencingProof {
         partition: PARTITION,
         prior_generation: record.generation,
         prior_owner_epoch: record.owner_epoch,
-        prior_grant_id: held.grant,
-        prior_boot_id: held.boot,
-        revocation: Revocation::ExpiryProven {
-            frozen_expiry_utc_ms: held.expiry_utc_ms,
-            authority_utc_ms: i64::try_from(sample.estimate.0).unwrap_or(i64::MAX),
-            authority_tick: now,
-            epsilon_ms: u32::try_from(ctx.budgets.clock_error_millis).unwrap_or(u32::MAX),
-            delta_ms: u32::try_from(ctx.budgets.dispatch_margin_millis).unwrap_or(u32::MAX),
-        },
+        prior_grant_id: prior_grant,
+        prior_boot_id: prior_boot,
+        revocation,
         control_revision: healed.control_revision,
         decision_tick: now,
     };
-    tracing::info!(
-        variant = "ExpiryProven",
-        control_revision = healed.control_revision.0,
-        prior_boot = held.boot.0,
-        prior_grant = held.grant.0,
-        grant_delete_revision = deleted.0,
-        read_revision = read.read_revision,
-        "heal_takeover_authorized"
-    );
+    match cleared {
+        GrantCleared::Deleted(deleted) => tracing::info!(
+            variant = "ExpiryProven",
+            control_revision = healed.control_revision.0,
+            prior_boot = prior_boot.0,
+            prior_grant = prior_grant.0,
+            grant_delete_revision = deleted.0,
+            read_revision = read.read_revision,
+            "heal_takeover_authorized"
+        ),
+        GrantCleared::Absent(absent) => tracing::info!(
+            variant = "NoGrantHeld",
+            control_revision = healed.control_revision.0,
+            prior_boot = prior_boot.0,
+            prior_grant = prior_grant.0,
+            absent_revision = absent.0,
+            read_revision = read.read_revision,
+            "heal_takeover_authorized"
+        ),
+    }
     for event in [
         RecoveryEvent::Plan(Box::new(plan)),
         RecoveryEvent::FenceProven(Box::new(fence)),
@@ -612,18 +689,29 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     Ok(healed)
 }
 
+/// How [`clear_until`] found a node's grant gone.
+enum Gone {
+    /// Deleted at this revision; the record it judged.
+    Deleted(Revision, GrantRecord),
+    /// Read absent at this store revision.
+    Absent(Revision),
+}
+
 /// Run [`judge`] for `node` until it answers `Cleared` or `Absent`, or `deadline` passes. A
 /// guard that still holds is waited out until about when it says it will stop holding.
 async fn clear_until(
     ctx: &HealCtx,
     node: NodeId,
     deadline: tokio::time::Instant,
-) -> Result<(Clearance, Option<GrantRecord>), HealError> {
+) -> Result<Gone, HealError> {
     let mut last = String::from("nothing answered");
     while tokio::time::Instant::now() < deadline {
         match judge(&*ctx.store, node, ctx.boot, &ctx.budgets, ctx.clock).await {
-            Ok(answer @ (Clearance::Cleared(_) | Clearance::Absent, _)) => return Ok(answer),
-            Ok((clearance, _)) => last = format!("{clearance:?}"),
+            Ok((Clearance::Cleared(revision), Some(record), _)) => {
+                return Ok(Gone::Deleted(revision, record));
+            }
+            Ok((Clearance::Absent, None, read)) => return Ok(Gone::Absent(read)),
+            Ok((clearance, ..)) => last = format!("{clearance:?}"),
             // A lost delete reply is read again next time round, as `clear_grant` advises.
             Err(error)
                 if error.retry == RetryRule::BoundedJitter
@@ -726,19 +814,19 @@ async fn judge_and_clear(
     })?;
     judge(store, node, boot, &budgets, db.clock())
         .await
-        .map(|(clearance, _)| clearance)
+        .map(|(clearance, ..)| clearance)
 }
 
 /// [`clear_grant`] for `node` running at `boot`, judged with `budgets` on `clock`, without a
 /// `Db`: the reopen's heal runs it from a task (M10, arch R3c). Also returns the record it
-/// judged, when there was one.
+/// judged, when there was one, and the store revision of the read that found it or its absence.
 async fn judge(
     store: &dyn ConfigStore,
     node: NodeId,
     boot: BootId,
     budgets: &Budgets,
     clock: HostClock,
-) -> Result<(Clearance, Option<GrantRecord>), ApiError> {
+) -> Result<(Clearance, Option<GrantRecord>, Revision), ApiError> {
     let budgets = *budgets;
     let key = ControlKey::Grant(node).encode();
     let read = store
@@ -747,14 +835,16 @@ async fn judge(
         })
         .await
         .map_err(|error| store_failed(&format!("get {key}"), &error, true))?;
+    let read_revision = Revision(read.read_revision);
     let Some(found) = read.record else {
         tracing::info!(
             node = node.0,
             boot = boot.0,
+            read_revision = read_revision.0,
             verdict = ?Clearance::Absent,
             "grant_clear"
         );
-        return Ok((Clearance::Absent, None));
+        return Ok((Clearance::Absent, None, read_revision));
     };
     let record = GrantRecord::decode(&found.value).ok_or_else(|| {
         unreadable(format!(
@@ -794,7 +884,7 @@ async fn judge(
         verdict = ?clearance,
         "grant_clear"
     );
-    Ok((clearance, Some(record)))
+    Ok((clearance, Some(record), read_revision))
 }
 
 /// The whole `partitions/` family, or an error: a failed or truncated list is never read as a
@@ -1322,5 +1412,144 @@ mod tests {
             2,
             "(c) the failure sent nothing"
         );
+    }
+
+    // ---- case B: the heal with no grant held (M10 arch R3a, rulings A-R159, A-R163, A-R171) ----
+
+    /// The boot the reopen in these rows runs at: open 2's first (arch R3b).
+    const OPEN_2: BootId = BootId((1 << 16) + 1);
+
+    /// `partitions/1` as a layout-3 record at generation 3, owner epoch 3, whose owner boot is
+    /// `owner_boot`. Returns the revision it was written at.
+    fn rooted(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, owner_boot: BootId) -> u64 {
+        let record = PartitionRecord {
+            generation: Generation(3),
+            owner_epoch: OwnerEpoch(3),
+            ..record(3)
+        };
+        let root = PartitionRoot {
+            mode: rdb_core::authority::partition::RecordMode::Active,
+            owner_boot,
+            base_seq: Seq(7),
+            base_digest: Digest::ROOT,
+            predecessor_generation: Generation(2),
+            predecessor_cutoff: Seq(7),
+            instance: [7; INSTANCE_LEN],
+            run: Revision(1),
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: record.encode_with(&root),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put partitions/1")
+        .revision
+    }
+
+    /// Run one heal over `store` and return its answer and every message node 1 received.
+    fn heal_once(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+    ) -> (Result<Healed, HealError>, Vec<Msg>) {
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            store,
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_millis(500),
+        };
+        let healed = rt.block_on(heal(ctx));
+        (healed, mailbox.try_iter().collect())
+    }
+
+    /// The `FencingProof` a heal sent node 1, if it sent one.
+    fn fence_sent(sent: &[Msg]) -> Option<FencingProof> {
+        sent.iter().find_map(|msg| match msg {
+            Msg::Inject {
+                kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(fence))),
+                ..
+            } => Some((**fence).clone()),
+            _ => None,
+        })
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+    }
+
+    /// Case B (R3a; R5 rows 6 and 8): every `grants/{n}` absent and a layout-3 `partitions/1`.
+    /// The heal hands node 1 a `Plan`, then a `NoGrantHeld` takeover authorization whose
+    /// `absent_revision` is the read that found `grants/1` absent, whose `control_revision` is
+    /// `partitions/1`'s `mod_revision` read at or after it (A-R163), with `prior_grant_id` 0
+    /// ("none held") and `prior_boot_id` the record's `owner_boot`. Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_reopen_with_no_grant_held_hands_node_1_a_no_grant_held_takeover() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let written = rooted(&*store, &rt, BootId(5));
+        // A later write elsewhere, so the absent read's revision is past the record's.
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from_static(b"unrelated"),
+            value: Bytes::from_static(b"x"),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("put an unrelated key");
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        let healed = healed.expect("case B heals");
+        assert_eq!(sent.len(), 2, "a Plan, then the proof");
+        assert!(matches!(
+            &sent[0],
+            Msg::Inject {
+                kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(_))),
+                ..
+            }
+        ));
+        let fence = fence_sent(&sent).expect("a takeover authorization");
+        let Revocation::NoGrantHeld { absent_revision } = fence.revocation else {
+            panic!("expected NoGrantHeld: {fence:?}");
+        };
+        assert!(absent_revision.0 > written, "{fence:?}");
+        assert_eq!(
+            fence.control_revision,
+            Revision(written),
+            "partitions/1's mod_revision"
+        );
+        assert_eq!(fence.prior_grant_id, GrantId(0));
+        assert_eq!(fence.prior_boot_id, BootId(5));
+        assert_eq!(fence.prior_generation, Generation(3));
+        assert_eq!(fence.prior_owner_epoch, OwnerEpoch(3));
+        assert_eq!(healed.control_revision, fence.control_revision);
+        assert!(healed.read_revision >= absent_revision, "{healed:?}");
+    }
+
+    /// R5 row 8 for case B: a record whose `owner_boot` is 0 cannot name the prior process, so
+    /// the heal refuses it and sends nothing. Unit (~10 ms).
+    #[test]
+    fn a_no_grant_heal_over_owner_boot_0_is_refused_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(0));
+        let (healed, sent) = heal_once(store, &rt);
+        assert!(matches!(healed, Err(HealError::Record(_))), "{healed:?}");
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// Case B over a layout-2 `partitions/1`: no root, so no anchor and no owner boot. Refused,
+    /// and nothing sent. Unit (~10 ms).
+    #[test]
+    fn a_no_grant_heal_over_a_record_with_no_root_is_refused_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        put(&store, &rt, record(3).encode(), 0);
+        let (healed, sent) = heal_once(store, &rt);
+        assert!(matches!(healed, Err(HealError::Record(_))), "{healed:?}");
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
     }
 }

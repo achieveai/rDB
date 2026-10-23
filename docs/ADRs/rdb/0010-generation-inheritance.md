@@ -41,6 +41,16 @@ and the full-copy fallback (scope ruling 2026-10-02).
      but adoption and `History` (`seq ≤ base`) work as in decision 7.
    - The late bytes stay in `g-1`, quarantined and never read by `g`.
    - It is code, not format. It can later shrink to "copy only the keys the suffix touched".
+   - **Amended 2026-10-22 (lead ruling A-R166): the flatten at the ceiling.** An inherit with no late
+     write normally links (decision 3). It copies instead, by this decision's full copy, when the parent
+     already reads through `MAX_CHAIN_DEPTH` = 32 levels. The child gets the parent's merged view:
+     values only, tombstones dropped, versions kept. Its link is flagged `copied`, so it starts again
+     at depth 1, and no read walks more than 32 levels. Measured on the dev host: one-time cost 40 ms
+     at 1k keys, 356 ms at 10k, 3.05 s at 100k (`snapshot_bench --flatten-keys`, `crates/rdb-storage`
+     README). Residuals:
+     - Parents are kept, so disk grows by one full copy every 32 reopens until M11's GC (O4).
+     - The `History` chain still grows one level per reopen: `History` falls through for
+       `seq ≤ base` as in decision 5.
 7. **How an inheriting node reports `g`.** After `inherit`, `RocksEngine` reports `parent(g) = g-1`,
    `base(g) = base`, `applied(g) = base`, `durable(g)` unchanged until a sync, `history_at(g, s ≤ base)`
    from the parent, and `lineages()` lists `g`. This matches `MemoryEngine::parent` and `base`.
