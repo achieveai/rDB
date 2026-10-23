@@ -38,7 +38,12 @@
 //! It is [`config_core::ConfigError::Unavailable`] for mutations exactly as for reads, and the
 //! caller may resubmit freely. Connect failures are retried across the remaining budget, at
 //! most [`GrpcClientOptions::max_hint_follows`] times, because nothing has been submitted yet
-//! and there is nothing to duplicate (ADR-0015, note of 2026-09-18).
+//! and there is nothing to duplicate (ADR-0015, note of 2026-09-18). Each retry dials a
+//! configured endpoint this operation has not dialled yet, and gets an equal share of the time
+//! left, so one dead node cannot spend the whole budget; once every endpoint has been tried it
+//! retries the last one. The endpoint that answers is where later operations start. When none
+//! answers, the error names each endpoint with its reason (ADR-0015, note of 2026-10-22). A
+//! failure after a request was sent never moves to another endpoint.
 //!
 //! Under [`TlsMode::MutualTls`] the connect phase does not end at `connect()`. TLS 1.3 lets
 //! the client finish its half of the handshake before the server has looked at the client
@@ -56,7 +61,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -249,6 +254,11 @@ pub struct GrpcClient {
     opts: GrpcClientOptions,
     capabilities: Capabilities,
     counters: Arc<Counters>,
+    /// The index in `endpoints` an operation starts at (M10 D14, ruling A-R199 F4). It starts
+    /// at the pin and moves to an endpoint the client reached by moving on from a connect
+    /// failure, so a dead node is dialled once and not again by every later operation. Shared
+    /// by clones, like `counters`. [`GrpcClient::pinned_endpoint`] still reports the pin.
+    start: Arc<AtomicUsize>,
     /// `hint_identity_unverified` is a configuration mistake, not an event: one line per
     /// client says it, and a per-request line would bury the log it is meant to warn in.
     warned_unverified_hint: Arc<AtomicBool>,
@@ -266,8 +276,10 @@ impl GrpcClient {
     /// This does not dial. Each endpoint and the TLS profile are validated here — a bad
     /// authority or an unusable certificate is a configuration error and should not wait for
     /// the first request — but the connection itself is established on first use, so a
-    /// cluster that is still starting does not make construction fail. Requests are pinned to
-    /// the first endpoint until a leader hint moves them.
+    /// cluster that is still starting does not make construction fail. Requests start at the
+    /// first endpoint. A leader hint moves them, and so does a failure to connect: the
+    /// operation then dials the next configured endpoint, and later operations start at the
+    /// endpoint that last answered.
     pub fn connect(
         endpoints: Vec<String>,
         opts: GrpcClientOptions,
@@ -291,6 +303,7 @@ impl GrpcClient {
             opts,
             capabilities,
             counters: Arc::new(Counters::default()),
+            start: Arc::new(AtomicUsize::new(0)),
             warned_unverified_hint: Arc::new(AtomicBool::new(false)),
             dedup: None,
         })
@@ -367,12 +380,14 @@ impl GrpcClient {
     /// Used by tests that deliberately address a follower, and by an embedder that prefers a
     /// local node. `endpoint` must be one of the configured endpoints.
     pub fn pinned(mut self, endpoint: &str) -> Result<Self, ClientError> {
-        if !self.endpoints.iter().any(|e| e == endpoint) {
+        let Some(index) = self.endpoints.iter().position(|e| e == endpoint) else {
             return Err(ClientError::UnknownEndpoint {
                 endpoint: endpoint.to_string(),
             });
-        }
+        };
         self.pinned = endpoint.to_string();
+        // A fresh start index: clones taken before the pin keep their own.
+        self.start = Arc::new(AtomicUsize::new(index));
         Ok(self)
     }
 
@@ -705,14 +720,30 @@ impl GrpcClient {
         let started = Instant::now();
         let budget = self.opts.request_deadline;
         let left = || budget.saturating_sub(started.elapsed());
-        let exhausted = |last: Option<ConfigError>| {
+        // Every endpoint a connect failed at in this operation, with its reason, so the error
+        // names them all and not just the last (M10 D14). Only used when the operation ends on
+        // a connect failure: a server's own answer is returned as it is.
+        let mut unreached = Unreached::default();
+        let exhausted = |last: Option<ConfigError>, unreached: &Unreached| {
+            if unreached.ended_on_connect {
+                return unreached.error(&self.endpoints, last);
+            }
             last.unwrap_or(ConfigError::Unavailable {
                 reason: "request deadline budget was exhausted before any attempt".into(),
             })
         };
 
-        let mut endpoint = self.pinned.clone();
+        let mut endpoint = self
+            .endpoints
+            .get(self.start.load(Ordering::Relaxed))
+            .cloned()
+            .unwrap_or_else(|| self.pinned.clone());
         let mut verify_as: Option<NodeId> = None;
+        // Whether `endpoint` came from a leader hint: a hint dial keeps the whole budget left.
+        let mut hinted = false;
+        // Whether `endpoint` was reached by moving on from a connect failure: if it connects,
+        // later operations start there (F4).
+        let mut moved = false;
         let mut follows = 0usize;
         let mut reconnects = 0usize;
         let mut attempt = 0usize;
@@ -728,24 +759,56 @@ impl GrpcClient {
                     reconnects,
                     "request budget exhausted before the next attempt"
                 );
-                return Err(exhausted(last_error));
+                return Err(exhausted(last_error, &unreached));
             }
             attempt += 1;
 
             // Phase one: get a connection. A failure here wrote nothing, so it is plainly
             // `Unavailable` — for a mutation just as much as for a read — and retrying it
-            // duplicates nothing (ADR-0015, note of 2026-09-18).
-            let channel = match self.channel(&endpoint, verify_as, left()).await {
-                Ok(channel) => channel,
+            // duplicates nothing (ADR-0015, note of 2026-09-18). So it is also the one place
+            // the client moves on to another configured endpoint (M10 D14, ruling A-R199).
+            //
+            // A dial that is not a hint's gets an equal share of what is left among the
+            // endpoints not yet dialled, and the last of them gets all of it (F1): a dead node
+            // can take seconds to refuse, and without the share one dial spends the budget
+            // before the next endpoint is tried.
+            let undialled = unreached.undialled(&self.endpoints);
+            let dial_budget = match u32::try_from(undialled) {
+                Ok(share) if !hinted && share > 1 => left() / share,
+                _ => left(),
+            };
+            unreached.dialled(&endpoint);
+            let channel = match self.channel(&endpoint, verify_as, dial_budget).await {
+                Ok(channel) => {
+                    if moved {
+                        if let Some(index) = self.endpoints.iter().position(|e| *e == endpoint) {
+                            self.start.store(index, Ordering::Relaxed);
+                            tracing::debug!(%endpoint, "client start moved");
+                        }
+                    }
+                    unreached.ended_on_connect = false;
+                    channel
+                }
                 Err(error) => {
                     tracing::debug!(%endpoint, attempt, "client connect attempt failed");
+                    unreached.failed(&endpoint, &error);
                     last_error = Some(error);
                     if reconnects < self.opts.max_hint_follows {
                         reconnects += 1;
                         self.counters.reconnects.fetch_add(1, Ordering::Relaxed);
+                        // "Tried" is by address (F2): an endpoint dialled in this operation is
+                        // not dialled again while another is left. Once every one has been, the
+                        // same endpoint is retried with the same identity, as before.
+                        if let Some(next) = unreached.next(&self.endpoints, &endpoint) {
+                            tracing::debug!(from = %endpoint, to = %next, "client connect moved on");
+                            endpoint = next;
+                            verify_as = None;
+                            hinted = false;
+                            moved = true;
+                        }
                         continue;
                     }
-                    return Err(exhausted(last_error));
+                    return Err(exhausted(last_error, &unreached));
                 }
             };
 
@@ -753,7 +816,7 @@ impl GrpcClient {
             // some of it and the server must not be told it has more time than we will wait.
             let remaining = left();
             if remaining.is_zero() {
-                return Err(exhausted(last_error));
+                return Err(exhausted(last_error, &unreached));
             }
             let mut wire = tonic::Request::new(request.clone());
             for (key, value) in ctx.to_headers() {
@@ -781,10 +844,17 @@ impl GrpcClient {
                     return Ok(response.into_inner());
                 }
                 Ok(Err(status)) => status,
-                Err(_) => Status::deadline_exceeded(format!(
-                    "no answer from {endpoint} within the remaining {} ms of the request budget",
-                    remaining.as_millis()
-                )),
+                Err(_) => {
+                    // No answer at all within the budget: the connection may be to a node
+                    // that has stopped. Drop it from the cache so the next operation runs the
+                    // connect phase, and can move on, instead of waiting on it again (D14 F5).
+                    // This is the cache only; the outcome is still classified below.
+                    self.forget_channel(&endpoint, verify_as);
+                    Status::deadline_exceeded(format!(
+                        "no answer from {endpoint} within the remaining {} ms of the request budget",
+                        remaining.as_millis()
+                    ))
+                }
             };
             tracing::debug!(%endpoint, attempt, status = %status.code(), "client attempt");
             if transport_minted(&status) {
@@ -820,6 +890,8 @@ impl GrpcClient {
                     );
                     endpoint = hint.endpoint.clone();
                     verify_as = next_verify_as;
+                    hinted = true;
+                    moved = false;
                     last_error = Some(error);
                 }
                 _ => return Err(error),
@@ -899,6 +971,89 @@ impl PageWalk<'_> {
     }
 }
 
+/// The endpoints one operation has dialled, and the connect failures among them (M10 D14,
+/// ruling A-R199): which endpoint to move on to, and an error that names every one tried.
+#[derive(Debug, Default)]
+struct Unreached {
+    /// Every endpoint dialled in this operation, by address, in dial order.
+    dialled: Vec<String>,
+    /// Each endpoint a connect failed at, with its last reason, in order of first failure.
+    failed: Vec<(String, String)>,
+    /// Whether the operation's last attempt was a connect failure.
+    ended_on_connect: bool,
+}
+
+impl Unreached {
+    fn dialled(&mut self, endpoint: &str) {
+        if !self.dialled.iter().any(|e| e == endpoint) {
+            self.dialled.push(endpoint.to_owned());
+        }
+    }
+
+    fn undialled(&self, endpoints: &[String]) -> usize {
+        endpoints
+            .iter()
+            .filter(|e| !self.dialled.contains(e))
+            .count()
+    }
+
+    fn failed(&mut self, endpoint: &str, error: &ConfigError) {
+        let reason = match error {
+            ConfigError::Unavailable { reason } => reason.clone(),
+            other => other.to_string(),
+        };
+        let reason = if reason.contains(endpoint) {
+            reason
+        } else {
+            format!("{endpoint}: {reason}")
+        };
+        match self.failed.iter_mut().find(|(e, _)| e == endpoint) {
+            Some(entry) => entry.1 = reason,
+            None => self.failed.push((endpoint.to_owned(), reason)),
+        }
+        self.ended_on_connect = true;
+    }
+
+    /// The first configured endpoint after `from`, in ring order, not dialled in this
+    /// operation.
+    fn next(&self, endpoints: &[String], from: &str) -> Option<String> {
+        let at = endpoints
+            .iter()
+            .position(|e| e == from)
+            .unwrap_or(endpoints.len().saturating_sub(1));
+        (1..=endpoints.len())
+            .map(|k| &endpoints[(at + k) % endpoints.len()])
+            .find(|e| !self.dialled.contains(e))
+            .cloned()
+    }
+
+    /// The operation's error once it ends on a connect failure. A client of one endpoint
+    /// keeps that endpoint's own error; a client of several names every endpoint it could not
+    /// connect to, with its reason, and every one the budget ran out before.
+    fn error(&self, endpoints: &[String], last: Option<ConfigError>) -> ConfigError {
+        let last = last.unwrap_or(ConfigError::Unavailable {
+            reason: "request deadline budget was exhausted before any attempt".into(),
+        });
+        if endpoints.len() < 2 {
+            return last;
+        }
+        let tried: Vec<&str> = self.failed.iter().map(|(_, r)| r.as_str()).collect();
+        let mut reason = format!("no rEtcd endpoint could be reached: {}", tried.join("; "));
+        let not_tried: Vec<&str> = endpoints
+            .iter()
+            .filter(|e| !self.dialled.contains(e))
+            .map(String::as_str)
+            .collect();
+        if !not_tried.is_empty() {
+            reason.push_str(&format!(
+                "; not tried, the request budget ran out first: {}",
+                not_tried.join(", ")
+            ));
+        }
+        ConfigError::Unavailable { reason }
+    }
+}
+
 /// A short suffix naming the identity a dial was pinned to, for an error message.
 fn verified_as(domain: &Option<String>) -> String {
     match domain {
@@ -910,7 +1065,9 @@ fn verified_as(domain: &Option<String>) -> String {
 /// Whether this status was produced by the transport rather than decided by a server.
 ///
 /// `DEADLINE_EXCEEDED` is excluded because our own expired budget says nothing about the
-/// connection: the peer may be answering other calls perfectly well.
+/// connection: the peer may be answering other calls perfectly well. The one exception is a
+/// call that got no answer at all before the client's own timer fired; `attempts` drops that
+/// connection where the timer fires (D14 F5), without changing how the call is classified.
 fn transport_minted(status: &Status) -> bool {
     !is_server_rejection(status) && status.code() != tonic::Code::DeadlineExceeded
 }
