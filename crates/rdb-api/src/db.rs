@@ -838,7 +838,10 @@ impl Db {
         })
     }
 
-    /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends.
+    /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
+    /// once every node has started on its open engine (A-R165): a copy queried before it is up
+    /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
+    /// logs how many had started.
     fn start_heal(
         &mut self,
         store: &Arc<dyn ConfigStore>,
@@ -846,11 +849,16 @@ impl Db {
         budgets: Budgets,
         boot: BootId,
     ) -> Result<(), OpenError> {
-        let owner = lock(&self.nodes)
-            .iter()
-            .find(|handle| handle.node == OWNER)
-            .map(NodeHandle::sender)
-            .ok_or_else(|| OpenError::Node("no owner node".into()))?;
+        let (owner, started) = {
+            let nodes = lock(&self.nodes);
+            let owner = nodes
+                .iter()
+                .find(|handle| handle.node == OWNER)
+                .map(NodeHandle::sender);
+            (owner, nodes.len())
+        };
+        let owner = owner.ok_or_else(|| OpenError::Node("no owner node".into()))?;
+        tracing::info!(nodes_started = started, boot = boot.0, "db_heal_started");
         let ctx = admin::HealCtx {
             store: Arc::clone(store),
             boot,
@@ -4911,6 +4919,43 @@ mod tests {
         db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
             .expect("the reopen is ready");
         db
+    }
+
+    /// A-R165 item 3 (critic B2): a reopen starts its heal only after all three nodes have
+    /// started on their open engines, so recovery never queries a copy that is not up yet.
+    /// Integration (~2 s): one open until it admits writes, then one reopen; its heal is not
+    /// waited for.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_heals_only_after_every_node_has_started() {
+        const METHOD: &str = "m10_a_reopen_heals_only_after_every_node_has_started";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.shutdown();
+        drop(db);
+        let mut db = open();
+        db.shutdown();
+        let started: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_heal_started")
+            .map(|line| line["nodes_started"].clone())
+            .collect();
+        assert_eq!(
+            started,
+            vec![serde_json::json!(3)],
+            "one heal, after all three nodes"
+        );
     }
 
     /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a

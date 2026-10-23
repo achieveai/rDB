@@ -280,6 +280,27 @@ impl Collecting {
         Deadline::Closed
     }
 
+    /// Close the open window before its deadline (ruling A-R165), when every queried copy has
+    /// answered, verified or ineligible; a copy still transferring has not. A copy that failed
+    /// keeps the window open to its deadline. `true` when it closed: the answer's own `Recorded`
+    /// is withdrawn, and `CloseWindow` is the last effect this pushes, as on a deadline's close.
+    pub(crate) fn close_if_all_answered(&mut self, emit: &mut Emit<'_>) -> bool {
+        let answered = matches!(self.window, Window::Open { .. })
+            && !self
+                .lost
+                .values()
+                .any(|outcome| matches!(outcome, InventoryOutcome::Failed { .. }))
+            && self
+                .queried
+                .iter()
+                .all(|copy| self.verified.contains_key(copy) || self.lost.contains_key(copy));
+        if answered {
+            emit.retract_ignored();
+            emit.recovery(RecoveryEffect::CloseWindow);
+        }
+        answered
+    }
+
     /// Selection needs these digests: the window becomes a probe wait ending at `deadline`.
     pub(crate) fn start_probing(
         &mut self,

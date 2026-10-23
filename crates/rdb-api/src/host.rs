@@ -99,10 +99,15 @@ pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 /// answers (achieveai/rDB#34).
 pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
 
-/// How long after a recovery the primary's A1 is first woken to acquire its grant. The same
-/// value as the lowering's `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first
-/// `AcquireDue` (A1's own docs).
+/// How long after a recovery the primary's A1 is first woken to acquire its grant, when the
+/// recovery did not commit `Active`. The same value as the lowering's
+/// `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first `AcquireDue` (A1's own
+/// docs).
 pub const ACQUIRE_AFTER_RECOVERED_MILLIS: u64 = 500;
+
+/// [`ACQUIRE_AFTER_RECOVERED_MILLIS`] after a recovery that committed `Active` (ruling A-R165).
+/// Not 0: the peers hear the recovery about 10 ms after the commit.
+pub const ACQUIRE_AFTER_ACTIVE_MILLIS: u64 = 50;
 
 /// The cadence H1 owes L1 (design §4.6), as `rdb_sim::harness::protection` keeps it.
 pub const HEALTH_EVAL_PERIOD_MILLIS: u64 = 50;
@@ -2543,7 +2548,8 @@ impl Host {
     }
 
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
-    /// prior owner acquiring would put its fenced identity back).
+    /// prior owner acquiring would put its fenced identity back). Sooner after an `Active`
+    /// commit: [`ACQUIRE_AFTER_ACTIVE_MILLIS`], else [`ACQUIRE_AFTER_RECOVERED_MILLIS`].
     fn schedule_acquire(&mut self, result: &RecoveryResult, site: Site) {
         let primary = result
             .committed
@@ -2554,12 +2560,18 @@ impl Host {
         if !primary || !self.acquire_scheduled.insert(site.partition) {
             return;
         }
-        let at = self.clock.now().plus_millis(ACQUIRE_AFTER_RECOVERED_MILLIS);
+        let wait = if result.mode == PartitionMode::Active {
+            ACQUIRE_AFTER_ACTIVE_MILLIS
+        } else {
+            ACQUIRE_AFTER_RECOVERED_MILLIS
+        };
+        let at = self.clock.now().plus_millis(wait);
         tracing::info!(
             node = self.node.0,
             partition = site.partition.0,
             kind = "acquire_due",
             at = at.0,
+            wait_ms = wait,
             "host_duty"
         );
         let fired = TimerFired {
@@ -3884,6 +3896,8 @@ impl Host {
             && stored
                 .as_ref()
                 .is_some_and(|bytes| Digest::of(Domain::ReadValue, &[key, bytes]) == digest);
+        // Unreachable today, kept as defence in depth (A-R164): P1 read these bytes through
+        // this view, and the fault is sticky, so the check after its step fails the node first.
         view_whole(view, "read reply check")?;
         if !matches {
             return Err(format!(
@@ -6082,6 +6096,50 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A-R165 item 2: after an `Active` commit the primary's first `Acquire` is queued
+    /// [`ACQUIRE_AFTER_ACTIVE_MILLIS`] out; after any other commit it keeps
+    /// [`ACQUIRE_AFTER_RECOVERED_MILLIS`]. Three nodes with no holds commit `Active`; with node
+    /// 1's links to 2 and 3 held, F1 commits `ReadOnly`. The firing is read off node 1's queue
+    /// in the round the commit lands, before it can fire.
+    /// Integration (~4 s): two discovery windows.
+    #[test]
+    fn the_first_acquire_after_an_active_commit_is_queued_sooner() {
+        let first_acquire = |held: bool| {
+            let dir = config_testkit::fs::temp_dir();
+            let mut trio = Trio::new(dir.path(), Trio::fast);
+            if held {
+                trio.links.hold(NodeId(1), NodeId(2));
+                trio.links.hold(NodeId(1), NodeId(3));
+            }
+            trio.bootstrap();
+            trio.until("F1 committed on node 1", |trio| {
+                trio.status(0).recovered.map(|_| {
+                    let now = trio.clock.now().0;
+                    queued_acquires(&trio.nodes[0].0)
+                        .iter()
+                        .map(|(at, _)| at.0.saturating_sub(now))
+                        .collect::<Vec<_>>()
+                })
+            })
+        };
+        let active = first_acquire(false);
+        let [left] = active.as_slice() else {
+            panic!("one Acquire queued after the Active commit, not {active:?}");
+        };
+        assert!(
+            *left <= ACQUIRE_AFTER_ACTIVE_MILLIS,
+            "Active: due in {left} ms"
+        );
+        let read_only = first_acquire(true);
+        let [left] = read_only.as_slice() else {
+            panic!("one Acquire queued after the ReadOnly commit, not {read_only:?}");
+        };
+        assert!(
+            *left > ACQUIRE_AFTER_ACTIVE_MILLIS && *left <= ACQUIRE_AFTER_RECOVERED_MILLIS,
+            "ReadOnly: due in {left} ms"
+        );
     }
 
     /// Message 6, round 4 (A-R96 host trigger and status). A node fence queues one `Acquire`

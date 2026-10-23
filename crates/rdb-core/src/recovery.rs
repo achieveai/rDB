@@ -559,7 +559,12 @@ impl Recovery {
                     let seen = collect.proof.control_revision;
                     return block_seen(BlockReason::OvertakenByPeer, Some(seen), emit);
                 }
-                Some(Rejected::Ineligible(_)) | None => {}
+                Some(Rejected::Ineligible(_)) | None => {
+                    // Every copy has answered: select now, not at the deadline (A-R165).
+                    if collect.close_if_all_answered(emit) {
+                        return self.decide(ctx, run, emit);
+                    }
+                }
             },
             Input::Recovery(RecoveryEvent::InventoryFailed { copy }) => collect.failed(*copy, emit),
             Input::Recovery(RecoveryEvent::TransferProgress {
