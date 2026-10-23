@@ -429,11 +429,15 @@ pub enum OpenError {
     /// instances, or the store's `partitions/1` or open counter does not name this one.
     #[error("this directory and the control store do not belong together: {0}")]
     Mismatch(String),
-    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward: this
-    /// directory is an older copy of the database, which is history.
+    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward. Either
+    /// another folder, or a newer backup of this one, holds that generation, or a commit of it
+    /// landed and the process stopped before it was used. The refusal changes no data, and the
+    /// copies keep every acknowledged write they hold (lead ruling A-R184).
     #[error(
-        "no copy holds generation {generation} that partitions/1 names: {detail}. This directory \
-         is an older copy of the database: open the folder that holds the current copies instead"
+        "no copy holds generation {generation} that partitions/1 names: {detail}. This open \
+         changed no data, and the acknowledged writes these copies hold are intact: do not \
+         delete this directory. If another folder, or a newer backup of this one, holds \
+         generation {generation}, open that folder or restore those copies here"
     )]
     Stale {
         /// The record's generation.

@@ -1345,13 +1345,24 @@ fn restore_lineages(
     let mut lineages: BTreeMap<(PartitionId, Generation), Marks> = BTreeMap::new();
     for item in db.iterator_cf(meta, IteratorMode::Start) {
         let (key, value) = item.map_err(|e| backend(path, &e))?;
-        let Some((partition, generation, ns, name)) = decode_key(&key) else {
-            continue;
-        };
         let corrupt = |problem: &str| OpenError::CorruptRecord {
             path: path.to_path_buf(),
             key_hex: hex(&key),
             problem: problem.to_string(),
+        };
+        let Some((partition, generation, ns, name)) = decode_key(&key) else {
+            // Shorter than a lineage prefix: only the engine-wide keys this build defines may be
+            // here. Any other is refused by name, as an unknown private record is (A-R164,
+            // lead ruling A-R184), never skipped.
+            if key.as_ref() == FORMAT_KEY
+                || key.as_ref() == INSTANCE_KEY
+                || decode_publish_marks_key(&key).is_some()
+            {
+                continue;
+            }
+            return Err(corrupt(
+                "a metadata key shorter than a lineage prefix that this build does not define",
+            ));
         };
         // Format 1 holds no Meta key: commit refuses Meta writes (critic F1(a)).
         if ns == ns_byte(Namespace::Meta) {
