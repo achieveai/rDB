@@ -2779,6 +2779,18 @@ struct Sent {
     warned: std::collections::BTreeSet<usize>,
 }
 
+/// `true` when `file` is not empty and its last byte is not a newline.
+fn ends_mid_line(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
 /// What `retry <rest>` names, its `--payload V` or `--deadline-ms N` aside.
 #[derive(Debug, PartialEq, Eq)]
 enum RetryTarget {
@@ -2942,10 +2954,14 @@ impl Sent {
             .and_then(|line| {
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)
+                    .read(true)
                     .append(true)
                     .open(path)
                     .map_err(|e| e.to_string())?;
-                writeln!(file, "{line}")
+                // A kill during an append leaves F ending mid-line. Start a line of our own, or
+                // this request would be glued onto that tail and lost to a later run.
+                let torn = ends_mid_line(&mut file).map_err(|e| e.to_string())?;
+                writeln!(file, "{}{line}", if torn { "\n" } else { "" })
                     .and_then(|()| file.sync_data())
                     .map_err(|e| e.to_string())
             });
@@ -5412,6 +5428,19 @@ mod tests {
         );
         assert!(later.pick(&["6"]).is_ok());
         assert_eq!(exit_code(false, &later), ExitCode::SUCCESS);
+
+        // F ends in a torn line: this run's next save starts a line of its own, so a later run
+        // still retries it (an append glued onto the torn tail would lose it).
+        later.record(Some(request(9, b"zqnine")), Kind::Txn);
+        let mut after = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        after.adopt(&["9"]).expect("F reads");
+        assert!(
+            after.pick(&["9"]).is_ok(),
+            "request 9 saved after a torn line"
+        );
 
         // F is a folder: the append fails, and the run exits 1 though every line was fine.
         let mut unwritable = Sent {
