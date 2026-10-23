@@ -455,6 +455,7 @@ impl GrpcClient {
         match client.watch(wire).await {
             Ok(response) => Ok(TrackedWatch::new(Box::pin(WatchItems {
                 inner: response.into_inner(),
+                endpoint,
             }))),
             Err(status) => {
                 if transport_minted(&status) {
@@ -462,7 +463,7 @@ impl GrpcClient {
                 }
                 // `is_mutation: false`: opening a watch writes nothing, so an interrupted
                 // attempt has no outcome to be unsure about.
-                Err(classify(&status, false))
+                Err(classify(&status, false, &endpoint))
             }
         }
     }
@@ -487,8 +488,8 @@ impl GrpcClient {
         self.counters.watch_opens.fetch_add(1, Ordering::Relaxed);
         // `is_mutation: false`: opening a watch writes nothing, so an interrupted attempt has
         // no outcome to be unsure about.
-        let inner = self
-            .attempts(
+        let (inner, endpoint) = self
+            .attempts_at(
                 "watch_leader",
                 false,
                 WireDeadline::Omit,
@@ -498,7 +499,7 @@ impl GrpcClient {
             )
             .instrument(span)
             .await?;
-        Ok(TrackedWatch::new(Box::pin(WatchItems { inner })))
+        Ok(TrackedWatch::new(Box::pin(WatchItems { inner, endpoint })))
     }
 
     /// Send, hint-follow and reconnect counters since construction.
@@ -756,6 +757,27 @@ impl GrpcClient {
         Call: Fn(ConfigServiceClient<Channel>, tonic::Request<Req>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
     {
+        self.attempts_at(op, is_mutation, wire_deadline, request, call, ctx)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// [`Self::attempts`], with the endpoint that answered: a watch stream names it when its
+    /// connection fails later (A-R238).
+    async fn attempts_at<Req, Res, Call, Fut>(
+        &self,
+        op: &'static str,
+        is_mutation: bool,
+        wire_deadline: WireDeadline,
+        request: Req,
+        call: Call,
+        ctx: &TraceContext,
+    ) -> Result<(Res, String), ConfigError>
+    where
+        Req: Clone,
+        Call: Fn(ConfigServiceClient<Channel>, tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
+    {
         let started = Instant::now();
         let budget = self.opts.request_deadline;
         let left = || budget.saturating_sub(started.elapsed());
@@ -884,7 +906,7 @@ impl GrpcClient {
             let status = match outcome {
                 Ok(Ok(response)) => {
                     tracing::debug!(%endpoint, attempt, status = "ok", "client attempt");
-                    return Ok(response.into_inner());
+                    return Ok((response.into_inner(), endpoint));
                 }
                 Ok(Err(status)) => status,
                 Err(_) => {
@@ -907,7 +929,7 @@ impl GrpcClient {
                 self.forget_channel(&endpoint, verify_as);
             }
 
-            let error = classify(&status, is_mutation);
+            let error = classify(&status, is_mutation, &endpoint);
             match &error {
                 // A hint is a pointer to an endpoint we already trust, followed a bounded
                 // number of times. Anything else — including an unknown outcome — stops here.
@@ -1199,10 +1221,16 @@ fn transport_minted(status: &Status) -> bool {
 /// (ADR-0015, note of 2026-09-18). What remains in case 3 is the genuinely ambiguous shape —
 /// the connection accepted our bytes and then died — where "unknown" is the truth.
 ///
-/// The detail string is the code and message only. Neither ever contains request bytes.
-fn classify(status: &Status, is_mutation: bool) -> ConfigError {
+/// The detail string is `endpoint`, the code and the message. None ever contains request
+/// bytes. The endpoint is there because "transport error" alone does not say which node to
+/// look at (A-R238, tester F-002).
+fn classify(status: &Status, is_mutation: bool, endpoint: &str) -> ConfigError {
     if transport_minted(status) {
-        let detail = format!("{}: {}", status.code(), status.message());
+        let detail = format!(
+            "the connection to {endpoint} failed during the request ({}: {})",
+            status.code(),
+            status.message()
+        );
         return if is_mutation {
             tracing::warn!(
                 status = %status.code(),
@@ -1379,6 +1407,8 @@ impl ConfigStore for GrpcClient {
 /// stream and one that refused to open it are the same value to the caller.
 struct WatchItems {
     inner: tonic::Streaming<pb::WatchResponse>,
+    /// The endpoint the stream was opened at, for a transport failure's reason.
+    endpoint: String,
 }
 
 impl futures_core::Stream for WatchItems {
@@ -1387,7 +1417,9 @@ impl futures_core::Stream for WatchItems {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(response))) => Poll::Ready(Some(watch_item_from_pb(response))),
-            Poll::Ready(Some(Err(status))) => Poll::Ready(Some(Err(classify(&status, false)))),
+            Poll::Ready(Some(Err(status))) => {
+                Poll::Ready(Some(Err(classify(&status, false, &self.endpoint))))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -1563,7 +1595,7 @@ impl AdminClient {
             let client = self.connect().await?;
             match f(client).await {
                 Ok(response) => Ok(response.into_inner()),
-                Err(status) => Err(classify(&status, false)),
+                Err(status) => Err(classify(&status, false, self.inner.pinned_endpoint())),
             }
         }
         .instrument(span)
