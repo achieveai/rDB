@@ -52,10 +52,9 @@ use crate::transport::Links;
 /// The node every S0 call goes to: partition 1's owner.
 const OWNER: NodeId = admin::OWNER;
 
-/// The only tenant and client S0 writes as. Not settable by a caller (lead ruling, 2026-10-07:
-/// no raw identity on the REPL).
+/// The only tenant S0 writes as. Not settable by a caller (lead ruling, 2026-10-07: no raw
+/// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
 const TENANT: TenantId = TenantId(1);
-const CLIENT: ClientId = DEFAULT_CLIENT;
 
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads.
 const GROUP: AffinityId = AffinityId(1);
@@ -169,8 +168,8 @@ pub struct DbConfig {
     /// read yet: every open makes its own in-process links.
     pub links: Option<Arc<Links>>,
     /// The client every request of this `Db` is sent as (M10 S2-8: two apps on one node are
-    /// two clients). [`DEFAULT_CLIENT`] is the one client every earlier build used. Not read
-    /// yet: every request is sent as [`DEFAULT_CLIENT`].
+    /// two clients, and the dedup state keys on it). [`DEFAULT_CLIENT`] is the one client every
+    /// earlier build used.
     pub client: ClientId,
 }
 
@@ -372,6 +371,8 @@ pub struct Db {
     clock: HostClock,
     timeouts: Timeouts,
     next_request: AtomicU64,
+    /// The client this `Db` sends every request as (S2-8): [`DbConfig::client`].
+    client: ClientId,
     /// Whether node 1 has been seen admitting writes: by [`Db::node_status`], by a put that
     /// was answered, or by [`Db::restart_node`]'s own look. Never cleared, so a node can still
     /// be restarted once writes have stopped (M9 S2b, D3).
@@ -734,6 +735,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
+            client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind,
             opened: Opened {
@@ -1020,20 +1022,26 @@ impl Db {
     }
 
     /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
-    /// an answer is awaited.
+    /// an answer is awaited. A node this process does not run is reached over the peer links,
+    /// whatever their holds (ruling A-R226 h1): in a three-process database the owner is
+    /// usually another process.
     fn send_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
-        let nodes = lock(&self.nodes);
-        let handle = nodes
-            .iter()
-            .find(|handle| handle.node == node)
-            .ok_or(NodeStopped(node))?;
-        handle.send(msg)
+        {
+            let nodes = lock(&self.nodes);
+            if let Some(handle) = nodes.iter().find(|handle| handle.node == node) {
+                return handle.send(msg);
+            }
+        }
+        self.links.post(node, msg).map_err(|fault| {
+            tracing::warn!(node = node.0, ?fault, "db_send_unreachable");
+            NodeStopped(node)
+        })
     }
 
     fn identity(&self) -> RequestIdentity {
         RequestIdentity {
             tenant: TENANT,
-            client: CLIENT,
+            client: self.client,
             request: RequestId(self.next_request.fetch_add(1, Ordering::Relaxed)),
         }
     }
@@ -1057,7 +1065,7 @@ impl Db {
         }
         Ok(RequestIdentity {
             tenant: TENANT,
-            client: CLIENT,
+            client: self.client,
             request,
         })
     }
@@ -1217,7 +1225,7 @@ impl Db {
         if puts.len() > MAX_OPS {
             return Err(PutError {
                 error: limit_refused(
-                    identity.request,
+                    identity,
                     "puts",
                     puts.len(),
                     MAX_OPS,
@@ -1371,7 +1379,7 @@ impl Db {
     ) -> Result<Option<PutOk>, PutError> {
         // A request over a limit is refused here, before it reaches the owner's thread: nothing
         // is compiled or sent, and its request id is used up (M9 S5).
-        if let Some(error) = write_refusal(&puts, identity.request) {
+        if let Some(error) = write_refusal(&puts, identity) {
             return Err(PutError {
                 error,
                 request: None,
@@ -1614,7 +1622,7 @@ impl Db {
     ) -> Result<TxnStatus, ApiError> {
         let identity = RequestIdentity {
             tenant: TENANT,
-            client: CLIENT,
+            client: self.client,
             request,
         };
         let answered = match self.call(
@@ -1887,6 +1895,7 @@ impl Db {
             clock: HostClock::start(),
             timeouts,
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -1920,6 +1929,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
+            client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -2158,7 +2168,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
     let partition = PARTITION;
     let identity = RequestIdentity {
         tenant: TENANT,
-        client: CLIENT,
+        client: DEFAULT_CLIENT,
         request: RequestId(0),
     };
     let kernel = match kind {
@@ -2497,12 +2507,13 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
 }
 
 /// The first limit `puts` breaks, as `INVALID_ARGUMENT` naming the put as `op <index>`, or
-/// `None` when every put is within every limit. `request` is the id the refused request used up.
-fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
+/// `None` when every put is within every limit. `identity` is the one the refused request used up.
+fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> {
+    let request = identity.request;
     puts.iter().enumerate().find_map(|(index, put)| {
         if put.object.len() > MAX_OBJECT_ID {
             return Some(limit_refused(
-                request,
+                identity,
                 "object_id",
                 put.object.len(),
                 MAX_OBJECT_ID,
@@ -2517,7 +2528,7 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
         let ops = op_count(&put.change);
         if ops > MAX_OPS {
             return Some(limit_refused(
-                request,
+                identity,
                 "ops",
                 ops,
                 MAX_OPS,
@@ -2538,7 +2549,7 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
         };
         elems
             .iter()
-            .find_map(|elem| key_refusal(elem_key(elem), request, Some(index), "sent"))
+            .find_map(|elem| key_refusal(elem_key(elem), identity, Some(index), "sent"))
     })
 }
 
@@ -2546,7 +2557,7 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
 /// the put, when there is one; `done` ends the detail: `request R not <done>`.
 fn key_refusal(
     key: &Value,
-    request: RequestId,
+    identity: RequestIdentity,
     index: Option<usize>,
     done: &str,
 ) -> Option<ApiError> {
@@ -2554,13 +2565,13 @@ fn key_refusal(
     (found > MAX_KEY).then(|| {
         let op = index.map_or_else(String::new, |index| format!("op {index}: "));
         limit_refused(
-            request,
+            identity,
             "key",
             found,
             MAX_KEY,
             format!(
                 "{op}key {found} bytes, over the {MAX_KEY}-byte limit; request {} not {done}",
-                request.0
+                identity.request.0
             ),
         )
     })
@@ -2624,7 +2635,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {
         return Some(limit_refused(
-            request,
+            *identity,
             "object_id",
             object.len(),
             MAX_OBJECT_ID,
@@ -2645,7 +2656,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     };
     if page > MAX_PAGE {
         return Some(limit_refused(
-            request,
+            *identity,
             "page",
             page,
             MAX_PAGE,
@@ -2658,7 +2669,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     match look {
         Some(Look::Members {
             after: Some(after), ..
-        }) => key_refusal(after, request, None, "read"),
+        }) => key_refusal(after, *identity, None, "read"),
         Some(
             Look::Members { after: None, .. }
             | Look::Doc
@@ -2673,7 +2684,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
 /// A request over a limit: one `limit_refused` line, which never carries the caller's bytes,
 /// and `INVALID_ARGUMENT` with `detail`.
 fn limit_refused(
-    request: RequestId,
+    identity: RequestIdentity,
     limit: &'static str,
     found: usize,
     max: usize,
@@ -2681,8 +2692,8 @@ fn limit_refused(
 ) -> ApiError {
     // `client` with `request` is the key a log query joins on: `request` alone is not unique.
     tracing::info!(
-        client = CLIENT.0,
-        request = request.0,
+        client = identity.client.0,
+        request = identity.request.0,
         limit,
         found,
         max,
@@ -2968,6 +2979,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -3169,6 +3181,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -3218,6 +3231,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -4197,6 +4211,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -6661,7 +6676,7 @@ mod tests {
                         GROUP,
                         RequestIdentity {
                             tenant: TENANT,
-                            client: CLIENT,
+                            client: DEFAULT_CLIENT,
                             request: RequestId(request),
                         },
                     ),
@@ -6713,7 +6728,7 @@ mod tests {
         let compile = |request: u64| ClientCall::Compile {
             identity: RequestIdentity {
                 tenant: TENANT,
-                client: CLIENT,
+                client: DEFAULT_CLIENT,
                 request: RequestId(request),
             },
             puts: vec![PutOp {
@@ -7901,5 +7916,90 @@ mod tests {
             ))
             .expect("its own bytes landed");
         assert_eq!(n, read.n + 1);
+    }
+
+    /// M10 S2-8 (ruling A-R226 h3): a `Db` opened as client 2 sends its writes as client 2, looks
+    /// them up as client 2, and names client 2 in a limit refusal, which is what a log query
+    /// joins on. Two apps on one node are two clients, so neither can name the other's write.
+    /// Integration (~2 s): three node threads.
+    #[config_log::retcd_test]
+    fn m10_s2_8_a_db_opened_as_client_2_writes_looks_up_and_logs_as_client_2() {
+        const METHOD: &str =
+            "m10_s2_8_a_db_opened_as_client_2_writes_looks_up_and_logs_as_client_2";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = DbConfig {
+            client: ClientId(2),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "after the open");
+        let put = db.put(b"a", b"1", None).expect("put");
+        match db.status(put.request, None).expect("status") {
+            TxnStatus::Resolved(result) => assert_eq!(result.seq, put.seq),
+            other => panic!("client 2 finds its own write: {other:?}"),
+        }
+        let refused = db
+            .put(&[0; MAX_OBJECT_ID + 1], b"1", None)
+            .expect_err("over the limit");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::InvalidArgument,
+            "{refused:?}"
+        );
+        let clients: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "limit_refused")
+            .map(|line| line["client"].clone())
+            .collect();
+        assert_eq!(clients, vec![serde_json::json!(2)]);
+        db.shutdown();
+    }
+
+    /// Ruling A-R226 h1: a call for a node this process does not run goes over the peer links
+    /// (`Links::post`), and with nothing registered for that node it is refused at once as the
+    /// owner's thread stopped, never a wait. Unit: no node thread.
+    #[test]
+    fn m10_a_call_for_a_node_this_process_does_not_run_goes_over_the_links() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let db = Db::by_hand(
+            Vec::new(),
+            store,
+            rt.handle(),
+            Timeouts {
+                put: Duration::from_millis(20),
+                ..Timeouts::default()
+            },
+            None,
+        );
+
+        let refused = db.put(b"a", b"1", None).expect_err("nobody holds node 1");
+        assert!(
+            refused.error.detail.contains("has stopped"),
+            "{:?}",
+            refused.error
+        );
+
+        let (remote, mailbox) = std::sync::mpsc::channel();
+        db.links().register(OWNER, remote);
+        let unanswered = db.put(b"a", b"1", None).expect_err("nothing answers");
+        assert_eq!(unanswered.error.name(), "UNAVAILABLE", "{unanswered:?}");
+        let sent: Vec<_> = mailbox
+            .try_iter()
+            .map(|msg| match msg {
+                Msg::Client(Client { call, .. }) => format!("{call:?}")
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![Some("Compile".to_owned())]);
     }
 }
