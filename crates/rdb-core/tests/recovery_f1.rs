@@ -2168,10 +2168,12 @@ fn a_lost_required_copy_blocks_before_commit() {
 }
 
 /// M7B-155 (ruling F-a; D §5.1): the wait after selection is bounded by a re-armed discovery
-/// timer. At the deadline, in `Synchronizing` or at the `Barrier`, `BarrierIncomplete` names
+/// timer. At the last attempt's deadline (M10 S2 retry, ruling A-R225 R2-A1: three attempts, at
+/// 2, 4 and 8 windows here), in `Synchronizing` or at the `Barrier`, `BarrierIncomplete` names
 /// exactly the copies still owing their catch-up, or a proof that reaches and binds, and nothing
-/// is committed. Near-miss: every copy answers before the deadline, the recovery CAS is proposed,
-/// and the fire is `StaleTimer` with no block. Promoted in place from the F-a scaffold.
+/// is committed. Each earlier deadline re-sends what is owed instead. Near-miss: every copy
+/// answers before the deadline, the recovery CAS is proposed, and the fire is `StaleTimer` with
+/// no block. Promoted in place from the F-a scaffold; re-cut for the retry in M10 S2.
 #[retcd_test]
 fn m7b_155_the_wait_after_selection_ends_in_barrier_incomplete() {
     let (mut f1, close) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
@@ -2182,6 +2184,14 @@ fn m7b_155_the_wait_after_selection_ends_in_barrier_incomplete() {
     assert_eq!(f1.step(2 * WINDOW, fired(1)), stale);
     assert_eq!(
         f1.step(2 * WINDOW, fired(2)),
+        vec![catch_up(A, B, 20), arm(3, 4 * WINDOW)]
+    );
+    assert_eq!(
+        f1.step(4 * WINDOW, fired(3)),
+        vec![catch_up(A, B, 20), arm(4, 8 * WINDOW)]
+    );
+    assert_eq!(
+        f1.step(8 * WINDOW, fired(4)),
         vec![block(incomplete(vec![B]))]
     );
 
@@ -2194,6 +2204,11 @@ fn m7b_155_the_wait_after_selection_ends_in_barrier_incomplete() {
     assert_eq!(f1.step(2 * WINDOW - 1, fired(2)), stale);
     assert_eq!(
         f1.step(2 * WINDOW, fired(2)),
+        vec![sync(B, 20), sync(C, 20), arm(3, 4 * WINDOW)]
+    );
+    f1.step(4 * WINDOW, fired(3));
+    assert_eq!(
+        f1.step(8 * WINDOW, fired(4)),
         vec![block(incomplete(vec![B, C]))]
     );
     assert_eq!(f1.cas_count(), 0);
@@ -7098,4 +7113,227 @@ fn m10_s1_5_a_resolving_recovery_cas_blocks_on_any_other_record() {
         assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason));
         assert_eq!(f1.cas_count(), 1, "no CAS on another record");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// M10 S2 W9: the `BarrierIncomplete` retry (arch-s2 "BarrierIncomplete retry"; Rev 3 R2-A1). A
+// pre-commit wait that reaches its deadline is tried again, up to three attempts at 1x, 2x and 4x
+// the window, each re-sending every ask still outstanding. Only the deadline retries: a lost
+// required copy blocks at once, divergence quarantines. A newer fence supersedes the run. After
+// the third attempt the run blocks and names each unproven copy. Worst case: writes paused for
+// 7 windows (1 + 2 + 4), then `Blocked`.
+// ---------------------------------------------------------------------------------------------
+
+/// This test's own log lines whose message is `message`, from the per-test JSONL file the
+/// `#[retcd_test]` layer writes. The same reader as `authority_acquisition.rs`'s and
+/// `publication_p1.rs`'s `own_log_lines`: rdb-core has no `config-testkit` dev-dependency.
+fn own_log_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    let run = config_log::testing::test_run_id();
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read test log {}: {e}", path.display()))
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("malformed JSONL line in {}: {e}", path.display()))
+        })
+        .filter(|line| line["testRun"].as_str() == Some(run) && line["@m"] == message)
+        .collect()
+}
+
+/// `(attempt, unproven)` of each `barrier_retry` line this test logged, oldest first.
+fn barrier_retries(method: &str) -> Vec<(u64, String)> {
+    own_log_lines(method, "barrier_retry")
+        .iter()
+        .map(|line| {
+            (
+                line["attempt"].as_u64().expect("attempt is a number"),
+                line["unproven"].as_str().expect("unproven is text").to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn blocked_anywhere(log: &[EffectKind]) -> bool {
+    log.iter().any(|e| {
+        matches!(
+            e,
+            EffectKind::Kernel(KernelEffect::Recovery(
+                RecoveryEffect::BlockPromotion { .. }
+            ))
+        )
+    })
+}
+
+/// A held link dropped B's sync. The first deadline does not block: it re-sends B's ask, and
+/// only B's, under a deadline twice the window. B's link heals during attempt 2, its proof
+/// arrives, and the run commits on the same barrier and cutoff, three copies, `Active`.
+#[retcd_test]
+fn m10_s2_retry_a_held_sync_healed_in_attempt_two_commits() {
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.rec(3_001, durable(C, 20, dg(0, 20)));
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![sync(B, 20), arm(3, 4 * WINDOW)],
+        "attempt 2 re-sends the one outstanding ask"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+
+    let propose = f1.rec(3 * WINDOW, durable(B, 20, dg(0, 20)));
+    assert_eq!(propose.first(), Some(&cas(CONTROL_REV, A)), "{propose:?}");
+    let result = recovered(&f1.step(
+        3 * WINDOW + 1,
+        cas_result(CasOutcome::Committed(Revision(9))),
+    ));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.selected.cutoff_seq, Seq(20), "the same cutoff");
+    assert!(!blocked_anywhere(&f1.log), "{:?}", f1.log);
+    assert_eq!(
+        barrier_retries("m10_s2_retry_a_held_sync_healed_in_attempt_two_commits"),
+        vec![(2, "[2]".to_owned())]
+    );
+}
+
+/// The same retry while synchronising: a held catch-up is asked again in attempt 2, and once it
+/// lands the barrier asks every copy, under attempt 2's deadline.
+#[retcd_test]
+fn m10_s2_retry_resends_every_outstanding_catch_up() {
+    let (mut f1, close) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
+    assert!(close.contains(&catch_up(A, B, 20)), "{close:?}");
+    f1.rec(2_100, caught_up(C, 20, dg(0, 20)));
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![catch_up(A, B, 20), arm(3, 4 * WINDOW)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+    assert_eq!(
+        f1.rec(3 * WINDOW, caught_up(B, 20, dg(0, 20))),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+    );
+    for copy in [A, C] {
+        f1.rec(3 * WINDOW + 1, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(
+        f1.step(4 * WINDOW, fired(3)),
+        vec![sync(B, 20), arm(4, 8 * WINDOW)],
+        "attempt 3 re-sends the sync B still owes"
+    );
+    assert!(!blocked_anywhere(&f1.log));
+}
+
+/// A copy that never proves: attempts 2 and 3 each re-send its ask, and the third deadline, 7
+/// windows after the first ask, blocks and names it. Each fire before its deadline, or of a
+/// superseded version, is stale. Nothing is proposed.
+#[retcd_test]
+fn m10_s2_retry_a_copy_that_never_proves_blocks_after_three_attempts_named() {
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.rec(3_001, durable(C, 20, dg(0, 20)));
+    let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
+    assert_eq!(f1.step(2 * WINDOW - 1, fired(2)), stale);
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![sync(B, 20), arm(3, 4 * WINDOW)]
+    );
+    assert_eq!(f1.step(4 * WINDOW, fired(2)), stale, "superseded version");
+    assert_eq!(f1.step(4 * WINDOW - 1, fired(3)), stale);
+    assert_eq!(
+        f1.step(4 * WINDOW, fired(3)),
+        vec![sync(B, 20), arm(4, 8 * WINDOW)]
+    );
+    assert_eq!(f1.step(8 * WINDOW - 1, fired(4)), stale);
+    assert_eq!(
+        f1.step(8 * WINDOW, fired(4)),
+        vec![block(incomplete(vec![B]))],
+        "blocked 7 windows after the barrier asked (WINDOW .. 8 * WINDOW)"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(incomplete(vec![B])));
+    assert_eq!(f1.cas_count(), 0);
+    assert_eq!(
+        barrier_retries("m10_s2_retry_a_copy_that_never_proves_blocks_after_three_attempts_named"),
+        vec![(2, "[2]".to_owned()), (3, "[2]".to_owned())]
+    );
+}
+
+/// Only the deadline retries. A required copy lost during attempt 2 blocks at once and names
+/// itself; a foreign digest at the cutoff during attempt 2 quarantines, and the attempt's
+/// deadline then asks nobody again.
+#[retcd_test]
+fn m10_s2_retry_never_follows_a_lost_copy_or_divergence() {
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.rec(3_001, durable(C, 20, dg(0, 20)));
+    f1.step(2 * WINDOW, fired(2));
+    assert_eq!(
+        f1.step(2 * WINDOW + 1, lose(B)),
+        vec![block(incomplete(vec![B]))]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(incomplete(vec![B])));
+    assert_eq!(
+        f1.step(4 * WINDOW, fired(3)),
+        vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
+    );
+
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![sync(B, 20), sync(C, 20), arm(3, 4 * WINDOW)]
+    );
+    let diverged = f1.rec(2 * WINDOW + 1, durable(C, 20, dg(1, 20)));
+    assert_eq!(
+        diverged.last(),
+        Some(&block(BlockReason::DivergenceRequiresOperator {
+            diverged: vec![C]
+        })),
+        "{diverged:?}"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+    assert_eq!(
+        f1.step(4 * WINDOW, fired(3)),
+        vec![ign(ReplicaIgnoreReason::QuarantinedTerminal)]
+    );
+}
+
+/// A newer trigger supersedes a retry in progress: a new plan is held, and a fence that read
+/// control after this run's own fence re-enters at once. The run's own fence replayed is out of
+/// phase, and the abandoned attempt's timer is stale.
+#[retcd_test]
+fn m10_s2_retry_a_newer_fence_supersedes_a_retry_in_progress() {
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.step(2 * WINDOW, fired(2));
+    assert_eq!(
+        f1.rec(2 * WINDOW + 1, RecoveryEvent::FenceProven(Box::new(proof()))),
+        vec![ign(ReplicaIgnoreReason::OutOfPhase)],
+        "the run's own fence, replayed"
+    );
+    assert_eq!(
+        f1.rec(2 * WINDOW + 2, RecoveryEvent::Plan(Box::new(plan(&[])))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    let newer = FencingProof {
+        control_revision: Revision(CONTROL_REV.0 + 1),
+        ..proof()
+    };
+    assert_eq!(
+        f1.rec(2 * WINDOW + 3, RecoveryEvent::FenceProven(Box::new(newer))),
+        vec![
+            r(RecoveryEffect::QueryInventory {
+                copies: vec![A, B, C]
+            }),
+            arm(4, 3 * WINDOW + 3),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+    assert_eq!(
+        f1.step(4 * WINDOW, fired(3)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
 }

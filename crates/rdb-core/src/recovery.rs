@@ -34,7 +34,14 @@
 //! the new run's phase alone.
 //!
 //! Nothing before commit waits forever (ruling F-a): Synchronizing and Barrier block with
-//! `BarrierIncomplete` on a lost required copy or when their deadline passes. Nor does a rebuild
+//! `BarrierIncomplete` on a lost required copy at once, or when the deadline of their last
+//! attempt passes. Only the deadline is retried (arch-s2 "BarrierIncomplete retry", ruling
+//! A-R225 R2-A1): [`BARRIER_ATTEMPTS`] attempts at 1x, 2x and 4x the discovery window, each
+//! re-sending every catch-up or sync still owed, on the same barrier, cutoff and `required`.
+//! Divergence quarantines and a lost copy blocks, never retried. A plan is held meanwhile, and a
+//! fence that read control after the run's own supersedes it. **Worst case: writes stay paused
+//! for 7 discovery windows, then `BarrierIncomplete` names each unproven copy.** Each retry logs
+//! `barrier_retry{attempt, unproven}`. Nor does a rebuild
 //! after it (ruling B-R52): each `SyncWalThrough` arms the timer, and a sync unanswered at its
 //! deadline names its copy in `RebuildStalled` without leaving `Rebuilding`. Nor does a CAS exchange
 //! (issue #2, superseding B-R74b's unbounded hold): the recovery CAS and the activation CAS each
@@ -137,6 +144,11 @@ pub const RECOVERY_TIMER_BASE: u64 = 0x00F1 << 48;
 /// activation CAS (issue #2).
 pub const DISCOVERY_TIMER: TimerId = TimerId(RECOVERY_TIMER_BASE);
 
+/// How many attempts the wait after selection gets before `BarrierIncomplete` (arch-s2
+/// "BarrierIncomplete retry", ruling A-R225 R2-A1). Attempt `n` waits `2^(n-1)` discovery
+/// windows: 1x, 2x, 4x. So the worst case pauses writes for 7 windows, then blocks.
+pub const BARRIER_ATTEMPTS: u32 = 3;
+
 /// The partition mode for a count of eligible regular copies holding the barrier
 /// (`design.md` §5.6 mode table).
 #[must_use]
@@ -226,8 +238,14 @@ struct Decided {
     /// The eligible regular copies: the barrier's `required` set.
     required: BTreeSet<CopyId>,
     loss: LossRecord,
-    /// When synchronising and the barrier give up and name who is missing (ruling F-a).
+    /// When the current attempt at synchronising and the barrier ends (ruling F-a): the last
+    /// attempt gives up and names who is missing, an earlier one retries.
     deadline: Tick,
+    /// Which attempt the wait is on, from 1 to [`BARRIER_ATTEMPTS`] (arch-s2, R2-A1).
+    attempt: u32,
+    /// The catch-up each lagging holder was sent at selection, kept so a retry can send it
+    /// again: a held link drops what was posted, so a longer deadline alone recovers nothing.
+    catch_ups: BTreeMap<CopyId, RecoveryEffect>,
 }
 
 impl Decided {
@@ -682,15 +700,24 @@ impl Recovery {
         fired.version == self.timer_version && ctx.now >= deadline
     }
 
-    /// What ends a pre-commit wait before it finishes (ruling F-a): a lost required copy blocks
-    /// at once and names itself; the deadline blocks and names `missing`. Anything else is
-    /// answered and `None` returned, so the phase holds.
+    /// What ends, retries or supersedes a pre-commit wait (ruling F-a; arch-s2 "BarrierIncomplete
+    /// retry", ruling A-R225 R2-A1). `owed` is each copy the wait still needs and the ask it was
+    /// sent.
+    ///
+    /// * A lost required copy blocks at once and names itself. Not a deadline: never retried.
+    /// * The deadline of an attempt before the last retries: see [`Self::retry`]. The last
+    ///   attempt's deadline blocks and names every copy in `owed`.
+    /// * A plan is held. A fence that read control after this run's own fence supersedes the
+    ///   run and re-enters at once; nothing is committed yet, so nothing is lost. This run's
+    ///   own fence, or an older one, replayed is out of phase.
+    ///
+    /// Anything else is answered and `None` returned, so the phase holds.
     fn unfinished(
-        &self,
+        &mut self,
         ctx: &StepCtx<'_>,
-        decided: &Decided,
+        decided: &mut Decided,
         input: Input<'_>,
-        missing: Vec<CopyId>,
+        owed: Vec<(CopyId, RecoveryEffect)>,
         emit: &mut Emit<'_>,
     ) -> Option<Phase> {
         match input {
@@ -705,7 +732,21 @@ impl Recovery {
                 None
             }
             Input::Timer(fired) if self.due(ctx, fired, decided.deadline) => {
+                if decided.attempt < BARRIER_ATTEMPTS {
+                    self.retry(ctx, decided, owed, emit);
+                    return None;
+                }
+                let missing = owed.into_iter().map(|(copy, _)| copy).collect();
                 Some(block(BlockReason::BarrierIncomplete { missing }, emit))
+            }
+            Input::Recovery(RecoveryEvent::Plan(plan)) => {
+                self.hold_plan(plan, emit);
+                None
+            }
+            Input::Recovery(RecoveryEvent::FenceProven(proof))
+                if proof.control_revision > decided.proof.control_revision =>
+            {
+                self.fence(ctx, proof, None, emit)
             }
             _ => {
                 ignore_elsewhere(input, emit);
@@ -714,12 +755,42 @@ impl Recovery {
         }
     }
 
+    /// The next attempt at a pre-commit wait whose deadline passed (R2-A1). The barrier, the
+    /// cutoff and `required` stay as selected (K-B-43: `required` never shrinks; shrinking is
+    /// promote's job). Every ask still owed is sent again, because a held link drops what was
+    /// posted, and the attempt waits twice as long as the one before.
+    fn retry(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        decided: &mut Decided,
+        owed: Vec<(CopyId, RecoveryEffect)>,
+        emit: &mut Emit<'_>,
+    ) {
+        decided.attempt += 1;
+        let windows = 1u64 << (decided.attempt - 1);
+        let millis = ctx.budgets.discovery_window_millis.saturating_mul(windows);
+        decided.deadline = ctx.now.plus_millis(millis);
+        let unproven: Vec<u8> = owed.iter().map(|(copy, _)| copy.0).collect();
+        tracing::info!(
+            partition = emit.event().partition.0,
+            attempt = decided.attempt,
+            unproven = ?unproven,
+            cutoff = decided.selected.cutoff_seq.0,
+            wait_millis = millis,
+            "barrier_retry"
+        );
+        for (_, ask) in owed {
+            emit.recovery(ask);
+        }
+        self.arm(decided.deadline, emit);
+    }
+
     /// Lagging holders catching up to the cutoff. A catch-up short of it is still owed
     /// (advisory 14); a required copy's foreign digest at it is divergence (ruling A-4).
     fn synchronizing(
-        &self,
+        &mut self,
         ctx: &StepCtx<'_>,
-        decided: Box<Decided>,
+        mut decided: Box<Decided>,
         mut awaiting: BTreeSet<CopyId>,
         input: Input<'_>,
         emit: &mut Emit<'_>,
@@ -747,8 +818,11 @@ impl Recovery {
                 Phase::Synchronizing(decided, awaiting)
             }
             _ => {
-                let missing = awaiting.iter().copied().collect();
-                self.unfinished(ctx, &decided, input, missing, emit)
+                let owed = awaiting
+                    .iter()
+                    .filter_map(|copy| Some((*copy, decided.catch_ups.get(copy)?.clone())))
+                    .collect();
+                self.unfinished(ctx, &mut decided, input, owed, emit)
                     .unwrap_or(Phase::Synchronizing(decided, awaiting))
             }
         }
@@ -758,15 +832,19 @@ impl Recovery {
     fn barrier(
         &mut self,
         ctx: &StepCtx<'_>,
-        decided: Box<Decided>,
+        mut decided: Box<Decided>,
         mut proofs: BTreeMap<CopyId, DurableProof>,
         input: Input<'_>,
         emit: &mut Emit<'_>,
     ) -> Phase {
         let Input::Recovery(RecoveryEvent::DurableAt(proof)) = input else {
-            let missing = unproven(&decided, &proofs);
+            let cutoff = decided.selected.cutoff_seq;
+            let owed = unproven(&decided, &proofs)
+                .into_iter()
+                .map(|copy| (copy, RecoveryEffect::SyncWalThrough { copy, cutoff }))
+                .collect();
             return self
-                .unfinished(ctx, &decided, input, missing, emit)
+                .unfinished(ctx, &mut decided, input, owed, emit)
                 .unwrap_or(Phase::Barrier(decided, proofs));
         };
         if !decided.required.contains(&proof.copy) {
@@ -1326,9 +1404,10 @@ fn select(
     let credential = collect.proof.credential_for(selected.source);
     let (from, through) = (selected.source, selected.cutoff_seq);
     let mut awaiting = BTreeSet::new();
+    let mut catch_ups = BTreeMap::new();
     for &to in &required {
         if collect.head_of(to).is_some_and(|head| head < through) {
-            emit.recovery(if to == leader.copy {
+            let ask = if to == leader.copy {
                 RecoveryEffect::CatchUpBeforeGrant {
                     from,
                     to,
@@ -1342,7 +1421,9 @@ fn select(
                     through,
                     credential,
                 }
-            });
+            };
+            emit.recovery(ask.clone());
+            catch_ups.insert(to, ask);
             awaiting.insert(to);
         }
     }
@@ -1377,6 +1458,8 @@ fn select(
         root,
         required,
         deadline,
+        attempt: 1,
+        catch_ups,
     };
     synchronize(Box::new(decided), awaiting, emit)
 }
@@ -1450,6 +1533,8 @@ fn commit(
         required,
         loss,
         deadline: _,
+        attempt: _,
+        catch_ups: _,
     } = decided;
     let mode = mode_for(required.len());
     let cutoff = selected.cutoff_seq;
