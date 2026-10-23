@@ -1002,9 +1002,11 @@ impl Db {
                 admin::instance_hex(&root.instance)
             )));
         }
+        // PR #60 review F1: a copy staged into the generation and never switched in does not
+        // hold it, so it does not stop the roll-forward that resumes it.
         let holds = engines
             .values()
-            .any(|engine| engine.lineages().contains(&(PARTITION, record.generation)));
+            .any(|engine| serves(engine, record.generation));
         if !holds {
             // Ruling A-R184: roll forward only what the open counter proves no host activated.
             let (count, revision) = admin::read_count(&**store, &instance)
@@ -2348,6 +2350,15 @@ struct Roll {
     copies: Vec<NodeId>,
 }
 
+/// Whether `engine` holds `generation` of partition 1 as a generation it can serve. A full copy
+/// staged into it and never switched in, its `copying` record still there, is not that
+/// generation, only the start of one: its keys are partial and it has no link (PR #60 review
+/// F1). Counted as held, it stopped the roll-forward that resumes it, and no open succeeded.
+fn serves(engine: &RocksEngine, generation: Generation) -> bool {
+    engine.lineages().contains(&(PARTITION, generation))
+        && engine.staging(PARTITION, generation).is_none()
+}
+
 /// Ruling A-R184 (arch R3b check 4, critic-rollfwd F2): the copies a reopen may roll forward to
 /// `generation`, which no copy holds. Only when the open counter proves no host ever activated
 /// `generation`, so it never admitted a write, and only onto copies that hold the predecessor
@@ -2387,10 +2398,21 @@ fn roll_forward_copies(
     }
     // A copy that holds a generation after `from` saw the database move on from it, so this
     // root is not the one that generation's successor was built on: nothing to roll forward.
+    // Except `generation` itself staged from this root's base and never switched in (PR #60
+    // review F1): a flatten cut short there. The roll-forward's inherit re-runs it.
+    let resumable = |engine: &RocksEngine, held: Generation| {
+        held == generation && engine.staging(PARTITION, held) == Some((from, cutoff))
+    };
     if let Some(newer) = engines
         .values()
-        .flat_map(RocksEngine::lineages)
-        .filter(|(partition, held)| *partition == PARTITION && *held > from)
+        .flat_map(|engine| {
+            engine
+                .lineages()
+                .into_iter()
+                .filter(move |&(partition, held)| {
+                    partition == PARTITION && held > from && !resumable(engine, held)
+                })
+        })
         .map(|(_, held)| held)
         .max()
     {
@@ -7832,6 +7854,158 @@ mod tests {
         let mut db = open_fast(&rt, dir.path(), &store).expect("the open that rolls forward");
         assert_eq!(rolled_forward(METHOD).len(), 1);
         ready_and_reads_back(&db, "after the roll-forward");
+        db.shutdown();
+    }
+
+    /// `partitions/1` in `store` now: the record, its root and its revision.
+    fn stored_root(
+        rt: &tokio::runtime::Runtime,
+        store: &Arc<dyn ConfigStore>,
+    ) -> (PartitionRecord, PartitionRoot, u64) {
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1")
+            .record
+            .expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("a record");
+        let root = PartitionRoot::decode(&found.value).expect("a root");
+        (record, root, found.mod_revision)
+    }
+
+    /// The record digest `engine` holds at `seq` of `generation`; `Digest::ROOT` at seq 0.
+    fn digest_at(
+        engine: &RocksEngine,
+        generation: Generation,
+        seq: Seq,
+    ) -> rdb_core::contracts::digest::Digest {
+        if seq == Seq::ZERO {
+            return rdb_core::contracts::digest::Digest::ROOT;
+        }
+        let (bytes, _) = engine
+            .history_at(PARTITION, generation, seq)
+            .expect("read history")
+            .expect("a record at the seq");
+        rdb_core::contracts::envelope::ReplicationEnvelope::decode(&bytes)
+            .expect("an envelope")
+            .record_digest
+    }
+
+    /// PR #60 review F1: a reopen whose history is 32 levels deep copies the merged data into
+    /// the new generation in batches, the `copying` marker first and the switch last. A process
+    /// that dies between the two, before node 1 tells the other copies, leaves node 1 holding
+    /// only a staged copy of the generation `partitions/1` names. A staged copy is not that
+    /// generation, so the next open rolls it forward from the verified predecessor on every
+    /// copy, node 1's included (a re-run clears the staged keys and copies again), and reads
+    /// back. Before, the staged copy counted as held: nothing rolled forward, node 1 reported
+    /// it unlinked, nodes 2 and 3 refused a 33rd level, and every open failed the same way.
+    ///
+    /// The 32 levels are built offline, since a real reopen per level would take ~45 s: each
+    /// copy links generations 3..=31 at generation 2's head, and `partitions/1` moves to 31
+    /// with the same root. The crash is a switch fault on node 1's engine, offline, after the
+    /// reopen's commit stopped node 1 (`AfterCommit::Fault`). Cut: `check` counts a staged
+    /// generation as held, and the last open is never ready. Integration (~8 s): four opens.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_after_a_flatten_cut_short_before_its_switch_rolls_forward_and_reads_back() {
+        const METHOD: &str =
+            "m10_a_reopen_after_a_flatten_cut_short_before_its_switch_rolls_forward_and_reads_back";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let nodes = dir.path().join("nodes");
+        wrote_a_and_quit(&rt, dir.path(), &store);
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen to generation 2");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("generation 2 is ready");
+        db.shutdown();
+        drop(db);
+
+        // Generations 3..=31, linked on every copy at generation 2's head: with 0..=2, 32 levels.
+        let (record, root, revision) = stored_root(&rt, &store);
+        assert_eq!(record.generation, Generation(2), "{record:?}");
+        let mut head = None;
+        for n in 1..=3u32 {
+            let mut engine =
+                RocksEngine::open_existing(nodes.join(n.to_string())).expect("open a copy");
+            let applied = Seq(engine.buffered_applied(PARTITION, Generation(2)).0);
+            assert!(head.is_none_or(|head| head == applied), "copies differ");
+            head = Some(applied);
+            for to in 3..=31 {
+                engine
+                    .inherit(PARTITION, Generation(to - 1), Generation(to), applied)
+                    .expect("link a level");
+            }
+            assert_eq!(engine.chain_depth(PARTITION, Generation(31)), 32);
+        }
+        let head = head.expect("three copies");
+        let digest = {
+            let engine = RocksEngine::open_existing(nodes.join("1")).expect("node 1");
+            digest_at(&engine, Generation(31), head)
+        };
+        let moved = PartitionRoot {
+            base_seq: head,
+            base_digest: digest,
+            predecessor_generation: Generation(30),
+            predecessor_cutoff: head,
+            ..root
+        };
+        let record = PartitionRecord {
+            generation: Generation(31),
+            ..record
+        };
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: record.encode_with(&moved),
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        }))
+        .expect("move partitions/1 to generation 31");
+
+        // The reopen commits generation 32, and node 1 stops before it links it.
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen cut short");
+        until_stored(&rt, &store, 32);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+
+        // Node 1 flattens generation 32 and dies before the switch: only the staged copy.
+        let (_, root, _) = stored_root(&rt, &store);
+        let base = root.predecessor_cutoff;
+        assert_eq!(root.predecessor_generation, Generation(31), "{root:?}");
+        {
+            let mut engine = RocksEngine::open_existing(nodes.join("1")).expect("node 1");
+            engine.inject_fault(rdb_storage::InjectedFault::Switch);
+            let cut = engine.inherit(PARTITION, Generation(31), Generation(32), base);
+            assert!(
+                matches!(cut, Err(rdb_storage::InheritError::Storage(_))),
+                "{cut:?}"
+            );
+            assert_eq!(
+                engine.staging(PARTITION, Generation(32)),
+                Some((Generation(31), base))
+            );
+            assert_eq!(engine.link(PARTITION, Generation(32)), None);
+        }
+        for n in 2..=3u32 {
+            let engine =
+                RocksEngine::open_existing(nodes.join(n.to_string())).expect("open a copy");
+            assert!(
+                !engine.lineages().contains(&(PARTITION, Generation(32))),
+                "node {n} never heard of generation 32"
+            );
+        }
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open after the cut flatten");
+        let rolled = rolled_forward(METHOD);
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert_eq!(
+            (&rolled[0]["generation"], &rolled[0]["from"]),
+            (&serde_json::json!(32), &serde_json::json!(31)),
+            "{rolled:?}"
+        );
+        ready_and_reads_back(&db, "after the cut flatten");
         db.shutdown();
     }
 
