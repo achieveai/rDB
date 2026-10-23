@@ -4901,6 +4901,38 @@ mod tests {
         db.shutdown();
     }
 
+    /// A-R178 (S1-8): a node that faulted on a corrupt read refuses as stored damage, not as
+    /// a host fault. The put whose condition read the corrupt value, and a later put of another
+    /// object to the faulted node, both answer `CORRUPT_HISTORY` with retry `Quarantine`, and
+    /// with `no_mutation` as a compile refusal sets it today: nothing was sent.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_s1_8_a_corrupt_read_faults_the_node_and_its_puts_answer_quarantine() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        for (what, key, expected) in [
+            (
+                "the put whose condition read it",
+                b"c07".as_slice(),
+                Some(2),
+            ),
+            ("a later put to the faulted node", b"z".as_slice(), None),
+        ] {
+            let refused = match db.put(key, b"again", expected) {
+                Err(refused) => refused.error,
+                Ok(put) => panic!("{what}: a faulted node answers no put: {put:?}"),
+            };
+            assert_eq!(
+                (refused.kind, refused.retry, refused.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, true),
+                "{what}: {refused:?}"
+            );
+            names_the_fault(&refused);
+        }
+        db.shutdown();
+    }
+
     fn names_the_fault(error: &ApiError) {
         assert!(
             error.detail.contains("storage read fault"),
