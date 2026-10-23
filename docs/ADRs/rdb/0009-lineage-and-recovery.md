@@ -219,6 +219,10 @@ On the deadline:
   have been used → extend by another window;
 - otherwise → record the remaining sources as unavailable too, and close.
 
+**Amendment (2026-10-23, lead ruling A-R165):** the window also closes before its deadline, on the
+answer that leaves every queried copy verified or ineligible, unless a copy failed; nothing that can
+still arrive then changes the selection, and the 2,000 ms budget itself is unchanged.
+
 The extension cap is new and necessary: without it, a source that advertises a longer prefix and
 dribbles one record per window satisfies "progress observed" forever while never arriving, holding
 recovery open indefinitely. Total discovery is bounded at 2,000 + 3 × 2,000 = 8,000 ms. When the cap

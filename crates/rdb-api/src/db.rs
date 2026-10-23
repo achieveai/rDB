@@ -838,7 +838,10 @@ impl Db {
         })
     }
 
-    /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends.
+    /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
+    /// once every node has started on its open engine (A-R165): a copy queried before it is up
+    /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
+    /// logs how many had started.
     fn start_heal(
         &mut self,
         store: &Arc<dyn ConfigStore>,
@@ -846,11 +849,16 @@ impl Db {
         budgets: Budgets,
         boot: BootId,
     ) -> Result<(), OpenError> {
-        let owner = lock(&self.nodes)
-            .iter()
-            .find(|handle| handle.node == OWNER)
-            .map(NodeHandle::sender)
-            .ok_or_else(|| OpenError::Node("no owner node".into()))?;
+        let (owner, started) = {
+            let nodes = lock(&self.nodes);
+            let owner = nodes
+                .iter()
+                .find(|handle| handle.node == OWNER)
+                .map(NodeHandle::sender);
+            (owner, nodes.len())
+        };
+        let owner = owner.ok_or_else(|| OpenError::Node("no owner node".into()))?;
+        tracing::info!(nodes_started = started, boot = boot.0, "db_heal_started");
         let ctx = admin::HealCtx {
             store: Arc::clone(store),
             boot,
@@ -4913,6 +4921,43 @@ mod tests {
         db
     }
 
+    /// A-R165 item 3 (critic B2): a reopen starts its heal only after all three nodes have
+    /// started on their open engines, so recovery never queries a copy that is not up yet.
+    /// Integration (~2 s): one open until it admits writes, then one reopen; its heal is not
+    /// waited for.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_heals_only_after_every_node_has_started() {
+        const METHOD: &str = "m10_a_reopen_heals_only_after_every_node_has_started";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.shutdown();
+        drop(db);
+        let mut db = open();
+        db.shutdown();
+        let started: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_heal_started")
+            .map(|line| line["nodes_started"].clone())
+            .collect();
+        assert_eq!(
+            started,
+            vec![serde_json::json!(3)],
+            "one heal, after all three nodes"
+        );
+    }
+
     /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a
     /// row, and a folder that was opened and closed empty reopens empty. Each reopen heals
     /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again. D3
@@ -4980,6 +5025,149 @@ mod tests {
                 db.shutdown();
             }
         }
+    }
+
+    /// D7 (tester s1-4/onecopy): one copy lagging at a clean quit must not brick the folder. The
+    /// link 1-2 is held for the last two puts, so node 2 stops at the first write while nodes 1
+    /// and 3 hold all three. The reopen selects the longer prefix and must catch node 2 up, then
+    /// become ready and read every acknowledged write back.
+    /// Integration (~5 s): one open, one reopen with a full discovery window.
+    #[config_log::retcd_test]
+    fn m10_d7_a_reopen_catches_up_a_copy_that_lagged_at_the_quit() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let written: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(written[0].0, written[0].1, None).expect("put a");
+        db.links().hold(NodeId(1), NodeId(2));
+        for (key, value) in &written[1..] {
+            db.put(key, value, None).expect("put while 1-2 is held");
+        }
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        db.wait_ready(patience)
+            .unwrap_or_else(|e| panic!("the reopen catches node 2 up and is ready: {e}"));
+        for (key, value) in written {
+            let read = db.get(key).expect("get");
+            assert_eq!(
+                read.value.map(|(_, bytes)| bytes),
+                Some(Bytes::copy_from_slice(value)),
+                "the reopen reads back an acknowledged write"
+            );
+        }
+        db.shutdown();
+    }
+
+    /// A-R173 F5 (critic-d7): a copy that missed a commit. The first reopen holds node 2's links,
+    /// so its commit pins generation 2 on nodes 1 and 3 alone, and node 2 keeps generation 1.
+    /// Neither reopen writes. The second reopen finds node 2 a generation behind the record: it
+    /// must end with node 1 admitting writes and reading the write back, or in a named
+    /// `Blocked`. Never a host fault, and never a failed heal.
+    /// Integration (~10 s): three opens, two discovery windows.
+    #[config_log::retcd_test]
+    #[ignore = "owed: A-R177 option (1), a missed writeless link inherited at inventory"]
+    fn m10_d7_a_copy_that_missed_a_commit_ends_caught_up_or_named_blocked() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = |hold: Vec<(NodeId, NodeId)>| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    hold,
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        // How a reopen ended: node 1's recovered generation and phase, once it admits writes, its
+        // F1 blocks, or (with `committed`) it has committed and holds a grant, so the next open
+        // heals case A, not case B (critic-d7 F5). Any fault or failed heal fails the row.
+        let settle = |db: &Db, what: &str, committed: bool| -> (Option<Generation>, String, bool) {
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                if let HealState::Failed(error) = db.heal_state() {
+                    panic!("{what}: the heal failed: {error}");
+                }
+                for node in db.node_status() {
+                    assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
+                }
+                let owner = db.node_status().into_iter().next().expect("node 1");
+                let phase = owner.recovery.clone().unwrap_or_default();
+                if owner.admits == Some(true)
+                    || phase.starts_with("Blocked")
+                    || (committed
+                        && owner.recovered.is_some()
+                        && owner.authority.starts_with("held("))
+                {
+                    return (owner.recovered, phase, owner.admits == Some(true));
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: neither admits nor Blocked within {patience:?}; phase {phase}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let mut db = open(Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))]);
+        let (first, phase, _) = settle(&db, "the reopen without node 2", true);
+        assert_eq!(
+            first,
+            Some(Generation(2)),
+            "the first reopen commits generation 2 without node 2; phase {phase}"
+        );
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(Vec::new());
+        let (second, phase, admits) = settle(&db, "the reopen with node 2 behind", false);
+        assert!(
+            matches!(
+                db.heal_state(),
+                HealState::Handed(admin::Healed {
+                    cleared: admin::GrantCleared::Deleted(_),
+                    ..
+                })
+            ),
+            "the second reopen heals case A: the first reopen held a grant"
+        );
+        if admits {
+            let read = db.get(b"a").expect("get a");
+            assert_eq!(
+                read.value.map(|(_, bytes)| bytes),
+                Some(Bytes::from_static(b"1")),
+                "the second reopen reads the write back; generation {second:?}"
+            );
+        } else {
+            assert!(
+                phase.starts_with("Blocked(") && phase.len() > "Blocked()".len(),
+                "a named Blocked, not {phase}"
+            );
+        }
+        db.shutdown();
     }
 
     /// M10 W1 day-1 spike (ruling A-R163): bootstrap, write, stop, start the same `nodes/` again

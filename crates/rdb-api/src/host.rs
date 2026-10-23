@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceScope, Lineage, PartitionMode,
-    Verdict,
+    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
+    PartitionMode, Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -47,9 +47,10 @@ use rdb_core::contracts::event::{
 use rdb_core::contracts::ids::{
     AffinityId, AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket,
     Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId,
-    RequestIdentity, Seq, SnapshotHandle, TimerId, TimerVersion,
+    RequestIdentity, Revision, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
-use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::ignore::KernelIgnoredReason;
+use rdb_core::contracts::membership::{CopyId, PartitionConfig};
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
     DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
@@ -66,7 +67,8 @@ use rdb_core::contracts::version::{API_VERSION, ENVELOPE_VERSION};
 use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
-use rdb_core::replication::Replication;
+use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
@@ -99,10 +101,15 @@ pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 /// answers (achieveai/rDB#34).
 pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
 
-/// How long after a recovery the primary's A1 is first woken to acquire its grant. The same
-/// value as the lowering's `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first
-/// `AcquireDue` (A1's own docs).
+/// How long after a recovery the primary's A1 is first woken to acquire its grant, when the
+/// recovery did not commit `Active`. The same value as the lowering's
+/// `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first `AcquireDue` (A1's own
+/// docs).
 pub const ACQUIRE_AFTER_RECOVERED_MILLIS: u64 = 500;
+
+/// [`ACQUIRE_AFTER_RECOVERED_MILLIS`] after a recovery that committed `Active` (ruling A-R165).
+/// Not 0: the peers hear the recovery about 10 ms after the commit.
+pub const ACQUIRE_AFTER_ACTIVE_MILLIS: u64 = 50;
 
 /// The cadence H1 owes L1 (design §4.6), as `rdb_sim::harness::protection` keeps it.
 pub const HEALTH_EVAL_PERIOD_MILLIS: u64 = 50;
@@ -250,6 +257,32 @@ pub enum Msg {
         /// What it asks.
         ask: PeerAsk,
     },
+    /// F1's `CatchUp` or `CatchUpBeforeGrant`, routed to the node holding the source copy (D7).
+    CatchUp {
+        /// The node whose F1 asked: where the source's `CopyCaughtUp` goes.
+        asker: NodeId,
+        /// The partition.
+        partition: PartitionId,
+        /// The asking effect's correlation.
+        correlation: CorrelationId,
+        /// The source copy.
+        from: CopyId,
+        /// The copy to catch up.
+        to: CopyId,
+        /// Through this sequence.
+        through: Seq,
+        /// F1's credential for this transfer.
+        credential: FenceCredential,
+        /// What the source restores its dormant receiver from (A-R173).
+        seed: Box<DormantSeed>,
+    },
+    /// Restore this node's dormant receiver for a catch-up it is the target of (A-R173).
+    Restore {
+        /// The partition.
+        partition: PartitionId,
+        /// What the receiver is restored from.
+        seed: Box<DormantSeed>,
+    },
     /// A kernel event routed here from another node: a recovery answer.
     Routed {
         /// The partition.
@@ -309,6 +342,34 @@ pub enum PeerAsk {
         /// landed the generation waits for the landing before it answers (D7).
         post_commit: bool,
     },
+}
+
+/// What a node restores its dormant R1 receiver from (lead ruling A-R173): the asking F1's
+/// plan configuration (this open's boots), and the lineage and control revision of the
+/// credential F1 minted from its fence proof. All three come from the heal's one
+/// `partitions/{id}` read, never from an engine (critic-d7 F4).
+#[derive(Debug, Clone)]
+pub struct DormantSeed {
+    /// The plan's configuration.
+    pub config: PartitionConfig,
+    /// The prior lineage: partition, generation and owner epoch.
+    pub lineage: Lineage,
+    /// The record's `mod_revision`: row 6R's floor.
+    pub revision: Revision,
+}
+
+impl DormantSeed {
+    fn new(config: PartitionConfig, credential: &FenceCredential) -> Self {
+        Self {
+            config,
+            lineage: Lineage {
+                partition: credential.partition,
+                generation: credential.prior_generation,
+                owner_epoch: credential.prior_owner_epoch,
+            },
+            revision: credential.control_revision,
+        }
+    }
 }
 
 /// A client call and where its answer goes.
@@ -1016,6 +1077,13 @@ struct Host {
     /// not landed. Answered right after the landing's inherit, so the proof is of a generation
     /// this copy holds; the latest ask wins.
     deferred_syncs: BTreeMap<(PartitionId, Generation), (NodeId, CorrelationId, PeerAsk)>,
+    /// D7: each recovery catch-up this node sources, by `(partition, target copy)`: the node
+    /// and correlation of the F1 that asked, where R1's `CopyCaughtUp` for that copy goes (the
+    /// sim's `catch_ups`, B-R59). A newer ask for the same copy replaces it, as R1's cursor does.
+    catch_ups: BTreeMap<(PartitionId, CopyId), (NodeId, CorrelationId)>,
+    /// Partitions whose dormant receiver holds its full ladder (A-R173, critic-d7 F2): built
+    /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
+    ladders: BTreeSet<PartitionId>,
     acquire_scheduled: BTreeSet<PartitionId>,
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
     /// The stall line, per partition, once reported, up to its effect, with the mode it names;
@@ -1091,6 +1159,8 @@ impl Host {
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
             deferred_syncs: BTreeMap::new(),
+            catch_ups: BTreeMap::new(),
+            ladders: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
@@ -1252,6 +1322,27 @@ impl Host {
                 ask,
             } => {
                 self.answer_peer(asker, partition, correlation, &ask);
+                Ok(())
+            }
+            Msg::CatchUp {
+                asker,
+                partition,
+                correlation,
+                from,
+                to,
+                through,
+                credential,
+                seed,
+            } => {
+                let site = Site {
+                    partition,
+                    correlation,
+                };
+                self.source_catch_up(asker, site, (from, to, through), credential, &seed);
+                Ok(())
+            }
+            Msg::Restore { partition, seed } => {
+                self.restore_dormant(partition, &seed, false);
                 Ok(())
             }
             Msg::Routed {
@@ -2101,6 +2192,9 @@ impl Host {
         match kernel {
             KernelEffect::Ignored { reason } => {
                 tracing::debug!(node, from = ?from, ?reason, "ignored");
+                if from == ModuleName::Replication {
+                    self.forget_refused_catch_ups(site, reason);
+                }
             }
             KernelEffect::Alert { reason } => {
                 tracing::warn!(node, from = ?from, ?reason, "alert");
@@ -2159,11 +2253,46 @@ impl Host {
                 from: first,
                 through,
             } => return self.send_envelopes(*copy, *first, *through, site),
-            KernelEffect::SendRecoveryEnvelopes { .. } => {
-                return Err(unsupported(self.node, "send_recovery_envelopes"));
-            }
-            KernelEffect::CopyCaughtUp { copy, head, .. } => {
+            KernelEffect::SendRecoveryEnvelopes {
+                copy,
+                from: first,
+                through,
+                credential,
+            } => return self.send_recovery_envelopes(*copy, (*first, *through), credential, site),
+            KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+                // A catch-up this node sourced for another node's F1 reports there (B-R59).
+                if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
+                {
+                    if asker != self.node {
+                        let msg = Msg::Routed {
+                            partition: site.partition,
+                            correlation,
+                            kind: KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp {
+                                copy: *copy,
+                                head: *head,
+                                digest: *digest,
+                            }),
+                        };
+                        if let Err(fault) = self.links.send(self.node, asker, msg) {
+                            tracing::warn!(
+                                node,
+                                asker = asker.0,
+                                ?fault,
+                                "peer_answer_unreachable"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let site = Site {
+                        partition: site.partition,
+                        correlation,
+                    };
+                    if let Some(event) = route::event_for(kernel) {
+                        self.push(site, EventKind::Kernel(event), true, None);
+                    }
+                    return Ok(());
+                }
             }
             // Recorded for the trim duty, then routed to T1 below.
             KernelEffect::Published { lineage, seq, .. } => {
@@ -2543,7 +2672,8 @@ impl Host {
     }
 
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
-    /// prior owner acquiring would put its fenced identity back).
+    /// prior owner acquiring would put its fenced identity back). Sooner after an `Active`
+    /// commit: [`ACQUIRE_AFTER_ACTIVE_MILLIS`], else [`ACQUIRE_AFTER_RECOVERED_MILLIS`].
     fn schedule_acquire(&mut self, result: &RecoveryResult, site: Site) {
         let primary = result
             .committed
@@ -2554,12 +2684,18 @@ impl Host {
         if !primary || !self.acquire_scheduled.insert(site.partition) {
             return;
         }
-        let at = self.clock.now().plus_millis(ACQUIRE_AFTER_RECOVERED_MILLIS);
+        let wait = if result.mode == PartitionMode::Active {
+            ACQUIRE_AFTER_ACTIVE_MILLIS
+        } else {
+            ACQUIRE_AFTER_RECOVERED_MILLIS
+        };
+        let at = self.clock.now().plus_millis(wait);
         tracing::info!(
             node = self.node.0,
             partition = site.partition.0,
             kind = "acquire_due",
             at = at.0,
+            wait_ms = wait,
             "host_duty"
         );
         let fired = TimerFired {
@@ -2650,6 +2786,72 @@ impl Host {
             "envelopes_sent"
         );
         self.count_resend(partition, sender.generation, copy, through, acked);
+        Ok(())
+    }
+
+    /// R1's `SendRecoveryEnvelopes` (the sim's `send_recovery_envelopes`): this node's stored
+    /// records of its receiver's generation, checked, each wrapped in the fence and unicast in
+    /// order to `copy`'s member; nothing past a gap. The frame names the credential's prior
+    /// lineage as its sender and the receiver's configuration.
+    fn send_recovery_envelopes(
+        &mut self,
+        copy: CopyId,
+        (first, through): (Seq, Seq),
+        credential: &FenceCredential,
+        site: Site,
+    ) -> Result<(), String> {
+        let partition = site.partition;
+        let Some(receiver) = self.replication.receiver(self.node, partition) else {
+            return Err(format!(
+                "send_recovery_envelopes with no receiver for p{}",
+                partition.0
+            ));
+        };
+        let stored = receiver.lineage();
+        let config = receiver.config().config_version;
+        let to = receiver
+            .config()
+            .members
+            .iter()
+            .find(|member| member.copy == copy)
+            .map(|member| member.node)
+            .ok_or_else(|| {
+                format!(
+                    "send_recovery_envelopes to copy {} not in the config",
+                    copy.0
+                )
+            })?;
+        let sender = Lineage {
+            partition: credential.partition,
+            generation: credential.prior_generation,
+            owner_epoch: credential.prior_owner_epoch,
+        };
+        let mut sent = 0u64;
+        for seq in first.0..=through.0 {
+            let Some(record) = self.stored_record(stored, Seq(seq)) else {
+                break;
+            };
+            let frame = Frame {
+                id: MessageId(self.next_frame),
+                protocol: ENVELOPE_VERSION,
+                config,
+                sender,
+                body: wire::encode_recovery_append(credential, &record),
+            };
+            self.next_frame = self.next_frame.wrapping_add(1).max(1);
+            self.send(to, frame, site);
+            sent += 1;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            to = to.0,
+            from = first.0,
+            through = through.0,
+            sent,
+            "recovery_envelopes_sent"
+        );
         Ok(())
     }
 
@@ -2863,8 +3065,20 @@ impl Host {
                 self.ask(holder, site, ask);
                 Ok(())
             }
-            RecoveryEffect::CatchUp { .. } | RecoveryEffect::CatchUpBeforeGrant { .. } => {
-                Err(unsupported(self.node, "recovery_catch_up"))
+            RecoveryEffect::CatchUp {
+                from,
+                to,
+                through,
+                credential,
+            }
+            | RecoveryEffect::CatchUpBeforeGrant {
+                from,
+                to,
+                through,
+                credential,
+            } => {
+                self.route_catch_up(site, (*from, *to, *through), *credential);
+                Ok(())
             }
             RecoveryEffect::ProbeDigestAt { .. } => {
                 Err(unsupported(self.node, "recovery_probe_digest"))
@@ -2925,6 +3139,286 @@ impl Host {
             if let PeerAsk::Inventory { copy, .. } = ask {
                 self.answer_here(site, RecoveryEvent::InventoryFailed { copy });
             }
+        }
+    }
+
+    /// F1's catch-up (B-R59: the sim's `catch_up`). The target's node is told to restore its
+    /// dormant receiver first, then the source's node gets the catch-up. Both seeds are the
+    /// plan's configuration and the credential's lineage and revision: F1 minted that
+    /// credential from the fence proof, the same `partitions/{id}` read (A-R173, critic-d7 F4).
+    /// Unroutable is logged and left to F1's own deadline, which ends Blocked.
+    fn route_catch_up(
+        &mut self,
+        site: Site,
+        (from, to, through): (CopyId, CopyId, Seq),
+        credential: FenceCredential,
+    ) {
+        let Some(config) = self
+            .plans
+            .get(&site.partition)
+            .map(|plan| plan.config.clone())
+        else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = site.partition.0,
+                reason = "no_plan",
+                "catch_up_unroutable"
+            );
+            return;
+        };
+        let (Some(source), Some(target)) = (
+            holder_of(&config.members, from),
+            holder_of(&config.members, to),
+        ) else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = site.partition.0,
+                from = from.0,
+                to = to.0,
+                reason = "not_placed",
+                "catch_up_unroutable"
+            );
+            return;
+        };
+        let seed = DormantSeed::new(config, &credential);
+        tracing::info!(
+            node = self.node.0,
+            partition = site.partition.0,
+            from = from.0,
+            to = to.0,
+            through = through.0,
+            holder = source.0,
+            target = target.0,
+            "catch_up_routed"
+        );
+        if target == self.node {
+            self.restore_dormant(site.partition, &seed, false);
+        } else {
+            let restore = Msg::Restore {
+                partition: site.partition,
+                seed: Box::new(seed.clone()),
+            };
+            self.to_peer(target, restore, site.partition);
+        }
+        if source == self.node {
+            self.source_catch_up(self.node, site, (from, to, through), credential, &seed);
+            return;
+        }
+        let msg = Msg::CatchUp {
+            asker: self.node,
+            partition: site.partition,
+            correlation: site.correlation,
+            from,
+            to,
+            through,
+            credential,
+            seed: Box::new(seed),
+        };
+        self.to_peer(source, msg, site.partition);
+    }
+
+    /// `msg` to `node` over the peer link; a link that cannot carry it is logged as
+    /// `catch_up_unroutable{reason: link}`.
+    fn to_peer(&self, node: NodeId, msg: Msg, partition: PartitionId) {
+        if let Err(fault) = self.links.send(self.node, node, msg) {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                to_node = node.0,
+                ?fault,
+                reason = "link",
+                "catch_up_unroutable"
+            );
+        }
+    }
+
+    /// A catch-up this node sources: restore its dormant receiver with the dense ladder the
+    /// cursor needs, remember who asked, then hand R1 `KernelEvent::CatchUp`. A receiver that
+    /// cannot be restored leaves R1 to refuse the catch-up `NotASource`.
+    fn source_catch_up(
+        &mut self,
+        asker: NodeId,
+        site: Site,
+        (from, to, through): (CopyId, CopyId, Seq),
+        credential: FenceCredential,
+        seed: &DormantSeed,
+    ) {
+        self.restore_dormant(site.partition, seed, true);
+        self.catch_ups
+            .insert((site.partition, to), (asker, site.correlation));
+        let kind = KernelEvent::CatchUp {
+            from,
+            to,
+            through,
+            credential,
+        };
+        self.push(site, EventKind::Kernel(kind), true, None);
+    }
+
+    /// Restore R1's dormant receiver for this node's copy of `partition` (A-R173), from the
+    /// engine's lineage at the seed's generation and the seed's epoch, revision and
+    /// configuration. A node already running a live side keeps it. `with_history` also gives
+    /// the receiver its verified ladder, `(0, ROOT)` through its head, once (critic-d7 F2).
+    ///
+    /// Nothing here faults the node (critic-d7 F5): a copy that cannot be restored is logged
+    /// `dormant_restore_refused{reason}` and holds no receiver, so its catch-up is refused and
+    /// F1's deadline ends the recovery with a named `Blocked`.
+    fn restore_dormant(&mut self, partition: PartitionId, seed: &DormantSeed, with_history: bool) {
+        let node = self.node;
+        let held = self.replication.receiver(node, partition);
+        let dormant = held.map(AppendReceiver::is_dormant);
+        if dormant == Some(false)
+            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
+        {
+            return;
+        }
+        if dormant.is_none() {
+            match self.dormant_receiver(partition, seed) {
+                Ok(receiver) => {
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        copy = receiver.copy().0,
+                        generation = receiver.lineage().generation.0,
+                        head = receiver.applied_head().seq.0,
+                        revision = seed.revision.0,
+                        "dormant_restored"
+                    );
+                    self.replication.install_receiver(receiver);
+                    // A new dormant receiver holds no ladder yet, whatever an earlier one held.
+                    self.ladders.remove(&partition);
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        node = node.0,
+                        partition = partition.0,
+                        generation = seed.lineage.generation.0,
+                        reason,
+                        "dormant_restore_refused"
+                    );
+                    return;
+                }
+            }
+        }
+        if with_history && !self.ladders.contains(&partition) {
+            let started = Instant::now();
+            let built = self
+                .dormant_rungs(partition, seed.lineage.generation)
+                .and_then(|rungs| {
+                    self.replication
+                        .restore_history(node, partition, &rungs)
+                        .map(|()| rungs.len())
+                        .map_err(|_| "ladder_refused")
+                });
+            match built {
+                Ok(rungs) => {
+                    self.ladders.insert(partition);
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        rungs,
+                        millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "dormant_ladder_built"
+                    );
+                }
+                Err(reason) => tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    reason,
+                    "dormant_restore_refused"
+                ),
+            }
+        }
+    }
+
+    /// The dormant receiver this node's engine supports for `seed`, or why there is none.
+    fn dormant_receiver(
+        &self,
+        partition: PartitionId,
+        seed: &DormantSeed,
+    ) -> Result<AppendReceiver, &'static str> {
+        let own = seed
+            .config
+            .members
+            .iter()
+            .find(|member| member.node == self.node)
+            .ok_or("not_a_member")?;
+        let generation = seed.lineage.generation;
+        let lineages = self.engine.lineages();
+        if lineages
+            .iter()
+            .any(|(p, g)| *p == partition && *g > generation)
+        {
+            return Err("copy_ahead_of_seed");
+        }
+        if !lineages.contains(&(partition, generation)) {
+            return Err("seed_generation_absent");
+        }
+        let seq = Seq(self.engine.buffered_applied(partition, generation).0);
+        let digest = if seq == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, generation, seq)?.1
+        };
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: seed.config.clone(),
+                own: own.copy,
+                lineage: seed.lineage,
+                head: Head { seq, digest },
+                // Claims nothing durable: the barrier's proofs come from `SyncWalThrough`.
+                durable: DurableSeq(0),
+            },
+            seed.revision,
+        )
+        .map_err(|_| "receiver_refused")
+    }
+
+    /// Every verified digest `(0, ROOT)` through this copy's head of `generation`. A record
+    /// below the lineage's base is read through its parent, as `history_at` does.
+    fn dormant_rungs(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<Vec<(Seq, Digest)>, &'static str> {
+        let head = self.engine.buffered_applied(partition, generation).0;
+        let mut rungs = Vec::with_capacity(usize::try_from(head + 1).unwrap_or(0));
+        rungs.push((Seq::ZERO, Digest::ROOT));
+        for seq in 1..=head {
+            let (_, digest) = self.checked(partition, generation, Seq(seq))?;
+            rungs.push((Seq(seq), digest));
+        }
+        Ok(rungs)
+    }
+
+    /// R1 answered under a catch-up's correlation and runs no source for its copy: it refused
+    /// the catch-up, or its cursor stopped. Forget the asker, as the sim does, so a later
+    /// `CopyCaughtUp` for that copy never reaches a stale F1; the asker's own deadline re-asks.
+    fn forget_refused_catch_ups(&mut self, site: Site, reason: &KernelIgnoredReason) {
+        let (node, partition) = (self.node, site.partition);
+        let refused: Vec<CopyId> = self
+            .catch_ups
+            .iter()
+            .filter(|(&(p, to), &(_, correlation))| {
+                p == partition
+                    && correlation == site.correlation
+                    && self.replication.source(node, partition, to).is_none()
+            })
+            .map(|(&(_, to), _)| to)
+            .collect();
+        for to in refused {
+            let asker = self
+                .catch_ups
+                .remove(&(partition, to))
+                .map(|(asker, _)| asker);
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                to = to.0,
+                asker = asker.map(|asker| asker.0),
+                ?reason,
+                "catch_up_refused"
+            );
         }
     }
 
@@ -3884,6 +4378,8 @@ impl Host {
             && stored
                 .as_ref()
                 .is_some_and(|bytes| Digest::of(Domain::ReadValue, &[key, bytes]) == digest);
+        // Unreachable today, kept as defence in depth (A-R164): P1 read these bytes through
+        // this view, and the fault is sticky, so the check after its step fails the node first.
         view_whole(view, "read reply check")?;
         if !matches {
             return Err(format!(
@@ -6082,6 +6578,154 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A-R165 item 2: after an `Active` commit the primary's first `Acquire` is queued
+    /// [`ACQUIRE_AFTER_ACTIVE_MILLIS`] out; after any other commit it keeps
+    /// [`ACQUIRE_AFTER_RECOVERED_MILLIS`]. Three nodes with no holds commit `Active`; with node
+    /// 1's links to 2 and 3 held, F1 commits `ReadOnly`. The firing is read off node 1's queue
+    /// in the round the commit lands, before it can fire.
+    /// Integration (~4 s): two discovery windows.
+    #[test]
+    fn the_first_acquire_after_an_active_commit_is_queued_sooner() {
+        let first_acquire = |held: bool| {
+            let dir = config_testkit::fs::temp_dir();
+            let mut trio = Trio::new(dir.path(), Trio::fast);
+            if held {
+                trio.links.hold(NodeId(1), NodeId(2));
+                trio.links.hold(NodeId(1), NodeId(3));
+            }
+            trio.bootstrap();
+            trio.until("F1 committed on node 1", |trio| {
+                trio.status(0).recovered.map(|_| {
+                    let now = trio.clock.now().0;
+                    queued_acquires(&trio.nodes[0].0)
+                        .iter()
+                        .map(|(at, _)| at.0.saturating_sub(now))
+                        .collect::<Vec<_>>()
+                })
+            })
+        };
+        let active = first_acquire(false);
+        let [left] = active.as_slice() else {
+            panic!("one Acquire queued after the Active commit, not {active:?}");
+        };
+        assert!(
+            *left <= ACQUIRE_AFTER_ACTIVE_MILLIS,
+            "Active: due in {left} ms"
+        );
+        let read_only = first_acquire(true);
+        let [left] = read_only.as_slice() else {
+            panic!("one Acquire queued after the ReadOnly commit, not {read_only:?}");
+        };
+        assert!(
+            *left > ACQUIRE_AFTER_ACTIVE_MILLIS && *left <= ACQUIRE_AFTER_RECOVERED_MILLIS,
+            "ReadOnly: due in {left} ms"
+        );
+    }
+
+    /// D7 host wiring (B-R59, the sim's `catch_up`): F1's `CatchUp` on node 1 goes to node 2,
+    /// which holds the source copy; R1 there sends its stored records to node 3 as recovery
+    /// appends, and its `CopyCaughtUp` comes back to node 1, the node that asked. Live receivers
+    /// stand in for the sides a reopen does not have yet (A-R173 rules on those).
+    /// Integration (~3 s): bootstrap's discovery window, then one catch-up.
+    #[config_log::retcd_test]
+    fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
+        use rdb_core::contracts::ids::Revision;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let receivers = |trio: &Trio| {
+            [1usize, 2].map(|i| {
+                let host = &trio.nodes[i].0;
+                host.replication
+                    .receiver(host.node, PartitionId(1))
+                    .map(|receiver| (receiver.lineage(), receiver.applied_head().seq))
+            })
+        };
+        let (lineage, through) = trio.until("nodes 2 and 3 hold node 1's head", |trio| {
+            let head = trio.head()?;
+            match receivers(trio) {
+                [Some((lineage, a)), Some((_, b))] if a.0 == head && b.0 == head && head > 0 => {
+                    Some((lineage, a))
+                }
+                _ => None,
+            }
+        });
+        let credential = FenceCredential {
+            partition: PartitionId(1),
+            prior_generation: lineage.generation,
+            prior_owner_epoch: lineage.owner_epoch,
+            control_revision: Revision(u64::MAX),
+            sender: CopyId(1),
+        };
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(u64::MAX),
+        };
+        let effect = RecoveryEffect::CatchUp {
+            from: CopyId(1),
+            to: CopyId(2),
+            through,
+            credential,
+        };
+        trio.nodes[0]
+            .0
+            .recovery_effect(&effect, site)
+            .expect("routed");
+
+        // Node 1's mail is read here before it is handled, to see the report arrive.
+        let patience = test_patience(Trio::PATIENCE);
+        let deadline = Instant::now() + patience;
+        let reported = loop {
+            let mut reported = None;
+            for (host, _, rx) in &mut trio.nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    if let Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp { copy, head, .. }),
+                        correlation,
+                        ..
+                    } = &msg
+                    {
+                        reported = Some((host.node, *copy, *head, *correlation));
+                    }
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+            if let Some(reported) = reported {
+                break reported;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no CopyCaughtUp reached node 1 within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            reported,
+            (NodeId(1), CopyId(2), through, CorrelationId(u64::MAX)),
+            "node 2's report reaches node 1 under the asking correlation"
+        );
+        assert!(
+            trio.nodes[1].0.catch_ups.is_empty(),
+            "the source forgets the asker once it has reported"
+        );
+        let sent: Vec<_> = config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            "d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked",
+        )
+        .into_iter()
+        .filter(|line| line["@m"] == "recovery_envelopes_sent")
+        .map(|line| (line["node"].clone(), line["to"].clone()))
+        .collect();
+        assert!(
+            sent.contains(&(serde_json::json!(2), serde_json::json!(3))),
+            "node 2 sent recovery appends to node 3: {sent:?}"
+        );
     }
 
     /// Message 6, round 4 (A-R96 host trigger and status). A node fence queues one `Acquire`

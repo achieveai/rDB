@@ -52,6 +52,18 @@ impl<'e> Emit<'e> {
         }));
     }
 
+    /// The step acted after all: withdraw a trailing `Ignored`, so one step never answers both
+    /// "did nothing" and what it then did. A report recorded as `Recorded` that turns out to be
+    /// the last answer the window waited for is the case (A-R165).
+    pub(crate) fn retract_ignored(&mut self) {
+        if matches!(
+            self.out.last().map(|effect| &effect.kind),
+            Some(EffectKind::Kernel(KernelEffect::Ignored { .. }))
+        ) {
+            self.out.pop();
+        }
+    }
+
     pub(crate) fn finish(self) -> Vec<Effect> {
         self.out
     }
