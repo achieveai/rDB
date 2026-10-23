@@ -220,7 +220,7 @@ fn raw_key(partition: PartitionId, generation: Generation, ns: u8, key: &[u8]) -
 }
 
 /// Split a lineage key into `(partition, generation, ns byte, key)`; `None` when it is shorter
-/// than the prefix (the format marker is the only such key).
+/// than the prefix (only the engine-wide keys: format, instance and publish marks).
 pub(crate) fn decode_key(raw: &[u8]) -> Option<(PartitionId, Generation, u8, &[u8])> {
     if raw.len() < PREFIX_LEN {
         return None;

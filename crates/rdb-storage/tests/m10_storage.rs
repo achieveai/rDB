@@ -290,3 +290,69 @@ fn m10_w2_publish_marks_survive_a_reopen_and_no_lineage_scan_meets_them() {
     drop(engine);
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
+
+/// A metadata key shorter than a lineage prefix that this build does not define is refused at
+/// open by name, writable and read-only alike, never skipped (A-R164, lead ruling A-R184). The
+/// format and instance markers and a publish-mark key stay accepted (the rows above reopen
+/// copies holding them); a key that only starts like a publish-mark key is refused too.
+#[retcd_test]
+fn m10_w2_an_unknown_short_metadata_key_is_refused_at_open() {
+    use rdb_storage::keys::CF_METADATA;
+
+    let dir = data_dir("unknown-short-key");
+    let db = dir.join("db");
+    {
+        let mut engine = RocksEngine::open(&db).expect("create");
+        write(&mut engine, 2);
+    }
+    for key in [&b"zzz"[..], &b"publish\x00\x00\x00\x00\x01"[..]] {
+        {
+            let raw = rocksdb::DB::open_cf(
+                &rocksdb::Options::default(),
+                &db,
+                rdb_storage::keys::COLUMN_FAMILIES,
+            )
+            .expect("raw open");
+            let meta = raw.cf_handle(CF_METADATA).expect("metadata cf");
+            raw.put_cf(meta, key, b"x").expect("put the unknown key");
+        }
+        let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        for (row, refused) in [
+            ("writable", RocksEngine::open(&db).expect_err("writable")),
+            (
+                "read-only",
+                RocksEngine::open_read_only(&db).expect_err("read-only"),
+            ),
+        ] {
+            match &refused {
+                OpenError::CorruptRecord {
+                    key_hex: found,
+                    problem,
+                    ..
+                } => assert_eq!(
+                    (found.as_str(), problem.as_str()),
+                    (
+                        key_hex.as_str(),
+                        "a metadata key shorter than a lineage prefix that this build does not \
+                         define"
+                    ),
+                    "{row}"
+                ),
+                other => panic!("{row}: refused as CorruptRecord, not {other:?}"),
+            }
+        }
+        {
+            let raw = rocksdb::DB::open_cf(
+                &rocksdb::Options::default(),
+                &db,
+                rdb_storage::keys::COLUMN_FAMILIES,
+            )
+            .expect("raw open");
+            let meta = raw.cf_handle(CF_METADATA).expect("metadata cf");
+            raw.delete_cf(meta, key).expect("delete the unknown key");
+        }
+        let engine = RocksEngine::open(&db).expect("the copy opens once the key is gone");
+        assert_eq!(engine.buffered_applied(PartitionId(1), Generation(1)).0, 2);
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
