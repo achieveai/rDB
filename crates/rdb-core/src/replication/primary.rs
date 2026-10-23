@@ -107,7 +107,9 @@
 use std::collections::BTreeMap;
 
 use crate::contracts::authority::AuthorityView;
+use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendAck, AppendOutcome};
+use crate::contracts::errors::RdbError;
 use crate::contracts::event::{EffectKind, KernelEffect, KernelEvent};
 use crate::contracts::ids::{
     BootId, NodeId, PartitionId, ReceivedSeq, ReplicaRole, Seq, TimerId, TimerVersion,
@@ -190,6 +192,16 @@ impl Primary {
     #[must_use]
     pub const fn tracker(&self) -> &ProgressTracker {
         &self.tracker
+    }
+
+    /// Fill the tracker's ladder from this node's engine: see
+    /// [`ProgressTracker::restore_history`].
+    ///
+    /// # Errors
+    ///
+    /// What [`ProgressTracker::restore_history`] refuses.
+    pub fn restore_history(&mut self, rungs: &[(Seq, Digest)]) -> Result<(), RdbError> {
+        self.tracker.restore_history(rungs)
     }
 
     /// The keepalive version armed now, while admission is rejected.
@@ -588,12 +600,7 @@ impl Primary {
             .cursors
             .entry(copy)
             .or_insert_with(|| CatchupCursor::new(copy));
-        let effects = cursor.on_outcome_within(
-            outcome,
-            self.tracker.history(),
-            self.tracker.head(),
-            self.tracker.prior_base(),
-        );
+        let effects = cursor.on_outcome(outcome, self.tracker.history(), self.tracker.head());
         let caught_up = effects.iter().any(|effect| {
             matches!(
                 effect,

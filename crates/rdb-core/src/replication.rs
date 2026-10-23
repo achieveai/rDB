@@ -143,6 +143,27 @@ impl Replication {
             .restore_history(rungs)
     }
 
+    /// Give the primary for `(node, partition)` the digests its own engine holds, on demand
+    /// (K3, lead ruling A-R223): the consumer of `SnapshotCatchupRequired` calls this once per
+    /// copy and barrier, and the copy's next `NeedPrefix` walks it record by record instead of
+    /// waiting on a snapshot. See [`ProgressTracker::restore_history`].
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `primary` when none is installed there, or what
+    /// [`ProgressTracker::restore_history`] refuses (`retired`, `rungs`).
+    pub fn restore_primary_history(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        rungs: &[(Seq, Digest)],
+    ) -> Result<(), RdbError> {
+        self.primaries
+            .get_mut(&(node, partition))
+            .ok_or(RdbError::InvalidArgument { field: "primary" })?
+            .restore_history(rungs)
+    }
+
     /// Install (or replace) the primary side for the tracker's own `(node, partition)`, with no
     /// catch-up cursor running.
     pub fn install_primary(&mut self, tracker: ProgressTracker) {
