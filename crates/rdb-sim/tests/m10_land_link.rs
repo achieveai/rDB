@@ -17,6 +17,9 @@
 //! **Guards (C2), one row each.** A holding past the cutoff, below it, or a different record at
 //! it links nothing and logs `land_link_refused` with the host's reason. The host's depth guard
 //! has no twin: the memory engine has no chain-depth ceiling.
+//!
+//! **A refusal differs (A-R185c).** The host stalls here until reopen; the sim walks up (slice-2
+//! residual): a refused copy lands empty and R1 copies it from the root.
 
 mod support;
 
@@ -97,19 +100,15 @@ fn plan(held: Held) -> RunPlan {
             (missed.generation, history(missed, CUTOFF.0))
         }
     };
-    // Durable no further than the cutoff, and for `Past` never flushed past it: the
-    // simulator's lag oracle reads a node's durability whatever the generation, so a prior
-    // generation durable past the cutoff reads as an overshoot of the new generation's resume
-    // barrier. What A applied is what the guard reads.
+    // Durable no further than the cutoff at the start; A's own flushes then sync what it holds,
+    // which for `Past` is the prior generation past the cutoff (A-R185d). What A applied is what
+    // the guard reads.
     let durable = batches
         .iter()
         .map(|batch| batch.seq.0)
         .max()
         .unwrap_or(0)
         .min(CUTOFF.0);
-    if matches!(held, Held::Past) {
-        plan.flushes.retain(|(_, node)| *node != A_NODE);
-    }
     plan.preloads
         .extend(batches.into_iter().map(|batch| (A_NODE, batch)));
     plan.preload_durable

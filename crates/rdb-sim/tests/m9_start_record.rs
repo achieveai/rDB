@@ -886,6 +886,10 @@ fn f1_slow_catch_up() -> RunPlan {
 /// catches up, and the catch-up's last ACK both pins the rebuild at the cutoff and first makes
 /// the copy heard. At cutoff 0 the start record bypasses `admit` and P = 1 > C = 0; that is
 /// `m9_f1_01`.
+///
+/// A-R185b: A holds 19 records, one below the cutoff, on purpose. A copy holding 20 links at
+/// landing and never catches up (`m10_land_link`), so this row would no longer test the pin.
+/// Do not restore 20.
 #[retcd_test]
 fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_for_it() {
     let (replies, trace, violations) = run_judged(&f1_slow_catch_up());

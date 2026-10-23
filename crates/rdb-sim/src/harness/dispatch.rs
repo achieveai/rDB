@@ -2522,6 +2522,8 @@ impl Dispatcher {
         let generation = result.new_generation;
         let cutoff = result.selected.cutoff_seq;
         let digest = result.selected.cutoff_digest;
+        // A-R185c: on a refusal the host stalls here until reopen; the sim walks up (slice-2
+        // residual). The caller lands the copy empty and R1 copies from the root.
         let refused = |reason: &str| {
             tracing::warn!(
                 node = member.0,
