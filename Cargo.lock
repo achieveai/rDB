@@ -3507,6 +3507,7 @@ name = "rdb-api"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "config-client",
  "config-core",
  "config-log",
  "config-log-macros",
@@ -3516,12 +3517,14 @@ dependencies = [
  "rdb-core",
  "rdb-storage",
  "rdb-value",
+ "rocksdb",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

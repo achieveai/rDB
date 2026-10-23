@@ -23,23 +23,26 @@
 //! record a restarted node's old process left behind, through rdb-core's three guards.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::{
     ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, MutationOutcome, PutRequest,
 };
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::partition::{
+    PartitionLifecycle, PartitionRecord, PartitionRoot, INSTANCE_LEN,
+};
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
 };
 use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
-use rdb_core::contracts::event::{EventKind, KernelEvent};
+use rdb_core::contracts::event::{Budgets, EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, ConfigVersion, CorrelationId, Generation, GrantId, NodeId, OwnerEpoch,
-    PartitionId, ReplicaRole, Revision, Seq,
+    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, Generation, GrantId, NodeId,
+    OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
@@ -100,6 +103,55 @@ pub fn members() -> Vec<Member> {
         .collect()
 }
 
+/// The rf3 member set of [`members`], every node at `boot`: the boot one open starts all three
+/// nodes at (M10, arch R3b).
+#[must_use]
+pub fn members_at(boot: BootId) -> Vec<Member> {
+    members()
+        .into_iter()
+        .map(|member| Member { boot, ..member })
+        .collect()
+}
+
+/// A recovery plan for partition 1 from `anchor`: rf3 at `version`, every node at `boot`, every
+/// copy a candidate and in `rebuild_required`, node 1 primary with `grant` at `generation`.
+fn recovery_plan(
+    anchor: LineageAnchor,
+    version: ConfigVersion,
+    boot: BootId,
+    grant: GrantId,
+    generation: AuthorityGeneration,
+) -> RecoveryPlan {
+    let config = PartitionConfig::new(PARTITION, version, members_at(boot));
+    RecoveryPlan {
+        anchor,
+        candidates: config
+            .members
+            .iter()
+            .map(|member| Candidate {
+                copy: member.copy,
+                primary_eligible: true,
+                healthy: true,
+                within_capacity: true,
+                has_valid_grant: true,
+            })
+            .collect(),
+        rebuild_required: config.members.iter().map(|member| member.copy).collect(),
+        authority_view: AuthorityView {
+            lineage: anchor.lineage,
+            grant_id: grant,
+            boot_id: boot,
+            authority_generation: generation,
+            config_version: version,
+            authority_seq: 1,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon: DenyReason::NoGrant,
+        },
+        retention_millis: RETENTION_MILLIS,
+        config,
+    }
+}
+
 /// Write `partitions/1`, then start F1 on node 1 through `send`.
 ///
 /// # Errors
@@ -109,6 +161,20 @@ pub fn members() -> Vec<Member> {
 pub async fn bootstrap(
     store: &Arc<dyn ConfigStore>,
     now: Tick,
+    send: impl Fn(Msg) -> Result<(), NodeStopped>,
+) -> Result<Revision, BootstrapError> {
+    bootstrap_at(store, now, BOOT, send).await
+}
+
+/// [`bootstrap`] with every node at `boot`, the boot this open started them at (M10, arch R3b).
+///
+/// # Errors
+///
+/// As [`bootstrap`].
+pub async fn bootstrap_at(
+    store: &Arc<dyn ConfigStore>,
+    now: Tick,
+    boot: BootId,
     send: impl Fn(Msg) -> Result<(), NodeStopped>,
 ) -> Result<Revision, BootstrapError> {
     let record = PartitionRecord {
@@ -151,40 +217,19 @@ pub async fn bootstrap(
         base_seq: Seq::ZERO,
         base_digest: Digest::ROOT,
     };
-    let config = PartitionConfig::new(PARTITION, CONFIG_VERSION, members());
-    let plan = RecoveryPlan {
+    let plan = recovery_plan(
         anchor,
-        candidates: config
-            .members
-            .iter()
-            .map(|member| Candidate {
-                copy: member.copy,
-                primary_eligible: true,
-                healthy: true,
-                within_capacity: true,
-                has_valid_grant: true,
-            })
-            .collect(),
-        rebuild_required: config.members.iter().map(|member| member.copy).collect(),
-        authority_view: AuthorityView {
-            lineage,
-            grant_id: GrantId(1),
-            boot_id: BOOT,
-            authority_generation: AuthorityGeneration(1),
-            config_version: CONFIG_VERSION,
-            authority_seq: 1,
-            valid_through_tick: Tick(u64::MAX),
-            past_horizon: DenyReason::NoGrant,
-        },
-        retention_millis: RETENTION_MILLIS,
-        config,
-    };
+        CONFIG_VERSION,
+        boot,
+        GrantId(1),
+        AuthorityGeneration(1),
+    );
     let fence = FencingProof {
         partition: PARTITION,
         prior_generation: Generation(0),
         prior_owner_epoch: OwnerEpoch(0),
         prior_grant_id: GrantId(1),
-        prior_boot_id: BOOT,
+        prior_boot_id: boot,
         revocation: Revocation::DurableDrain {
             ack_revision: revision,
         },
@@ -235,6 +280,366 @@ async fn adopt(
     }
     tracing::info!(key = %key, revision = found.mod_revision, "bootstrap_partition_record_adopted");
     Ok(Revision(found.mod_revision))
+}
+
+/// The most opens one data directory may have (arch R3b): `N <= 2^24`, so a boot and a
+/// request id derived from N never wrap.
+pub const MAX_OPENS: u64 = 1 << 24;
+
+/// The version byte of an open counter's value; N follows as a little-endian u64.
+const COUNTER_LAYOUT: u8 = 1;
+
+/// How long [`count_open`] keeps reading and CASing before it gives up.
+pub(crate) const COUNT_WITHIN: Duration = Duration::from_secs(10);
+
+/// An instance id as 32 lowercase hex digits: how logs and keys name it.
+#[must_use]
+pub fn instance_hex(instance: &[u8; INSTANCE_LEN]) -> String {
+    instance.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The key of `instance`'s open counter (M10, arch R3b, ruling A-R160).
+#[must_use]
+pub fn instance_key(instance: &[u8; INSTANCE_LEN]) -> String {
+    format!("rdb/instances/{}", instance_hex(instance))
+}
+
+fn encode_count(n: u64) -> Bytes {
+    let mut out = Vec::with_capacity(9);
+    out.push(COUNTER_LAYOUT);
+    out.extend_from_slice(&n.to_le_bytes());
+    Bytes::from(out)
+}
+
+fn decode_count(body: &[u8]) -> Option<u64> {
+    match body {
+        [COUNTER_LAYOUT, rest @ ..] => Some(u64::from_le_bytes(rest.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// Why [`count_open`] did not count an open.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CounterError {
+    /// The copies name an instance whose counter the store does not hold: the store is not the
+    /// one this directory was opened against.
+    #[error("{key} is absent: this directory was not opened against this control store")]
+    Absent {
+        /// The counter's key.
+        key: String,
+    },
+    /// The directory has been opened [`MAX_OPENS`] times.
+    #[error("{key} has counted {MAX_OPENS} opens, the most one directory may have")]
+    Exhausted {
+        /// The counter's key.
+        key: String,
+    },
+    /// The counter's value is not one this build writes.
+    #[error("{key} at revision {revision} is not an open counter")]
+    Unreadable {
+        /// The counter's key.
+        key: String,
+        /// Where it was read.
+        revision: u64,
+    },
+    /// The store refused, or did not settle the count within [`COUNT_WITHIN`].
+    #[error("control store: {0}")]
+    Control(String),
+}
+
+/// Count one more open of `instance` and return its number N (arch R3b): N = 1 by a create-only
+/// write when `fresh` finds no counter, otherwise N + 1 by a CAS at the revision just read. A
+/// conflict or a lost reply reads again and CASes again, so a lost reply can waste a number but
+/// never hand one out twice. A transient store error waits 50 ms and tries again; all of it is
+/// bounded by `within`. Logged as `open_counted{instance_hex, n, revision}` and each retry as
+/// `open_count_retry{instance_hex, error}`.
+///
+/// # Errors
+///
+/// [`CounterError`].
+pub async fn count_open(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    fresh: bool,
+    within: Duration,
+) -> Result<u64, CounterError> {
+    let key = instance_key(instance);
+    let hex = instance_hex(instance);
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = String::from("nothing answered");
+    while tokio::time::Instant::now() < deadline {
+        let read = match store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => read,
+            Err(error) if crate::control::transient(&error) => {
+                last = error.to_string();
+                tracing::warn!(instance_hex = %hex, error = %error, "open_count_retry");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(error) => return Err(CounterError::Control(format!("get {key}: {error}"))),
+        };
+        let (next, expected) = match read.record {
+            None if fresh => (1, 0),
+            None => return Err(CounterError::Absent { key }),
+            Some(found) => {
+                let n = decode_count(&found.value).ok_or_else(|| CounterError::Unreadable {
+                    key: key.clone(),
+                    revision: found.mod_revision,
+                })?;
+                if n >= MAX_OPENS {
+                    return Err(CounterError::Exhausted { key });
+                }
+                (n + 1, found.mod_revision)
+            }
+        };
+        let written = store
+            .put(PutRequest {
+                key: Bytes::from(key.clone()),
+                value: encode_count(next),
+                expected_mod_revision: Some(expected),
+                dedup: None,
+            })
+            .await;
+        match written {
+            Ok(response) if response.outcome == MutationOutcome::Applied => {
+                tracing::info!(
+                    instance_hex = %hex,
+                    n = next,
+                    revision = response.revision,
+                    "open_counted"
+                );
+                return Ok(next);
+            }
+            Ok(_) => last = format!("CAS at {expected} was not applied"),
+            Err(error)
+                if matches!(
+                    error,
+                    ConfigError::Conflict { .. } | ConfigError::DeadlineExceededUnknownOutcome
+                ) || crate::control::transient(&error) =>
+            {
+                last = error.to_string();
+            }
+            Err(error) => return Err(CounterError::Control(format!("put {key}: {error}"))),
+        }
+        tracing::warn!(instance_hex = %hex, error = %last, "open_count_retry");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(CounterError::Control(format!(
+        "{key} was not counted within {} ms; last: {last}",
+        within.as_millis()
+    )))
+}
+
+/// What a reopen's heal proved and handed node 1 (M10, arch R3a, ruling A-R163).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Healed {
+    /// The revision node 1's old grant was deleted at.
+    pub grant_delete_revision: Revision,
+    /// The store revision `partitions/1` was then read at: never below the delete.
+    pub read_revision: Revision,
+    /// The fence's `control_revision`: `partitions/1`'s `mod_revision` from that read.
+    pub control_revision: Revision,
+}
+
+/// Why a reopen's heal did not hand node 1 a fence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HealError {
+    /// `grants/1` holds nothing, so there is no old grant to prove expired.
+    #[error(
+        "grants/1 holds no grant to prove expired; a heal without one is not built yet (M10 S1, case B)"
+    )]
+    NoGrantHeld,
+    /// A grant was still not clearable when the heal's time ran out.
+    #[error("grants/{node} was not cleared within {within_ms} ms; last answer: {last}")]
+    NotCleared {
+        /// The node.
+        node: u32,
+        /// The heal's bound.
+        within_ms: u128,
+        /// The last answer, in words.
+        last: String,
+    },
+    /// The `partitions/1` read was served before the grant delete it must follow.
+    #[error("partitions/1 was read at revision {read}, before the grant delete at {deleted}")]
+    ReadBeforeDelete {
+        /// The read's store revision.
+        read: u64,
+        /// The delete's revision.
+        deleted: u64,
+    },
+    /// `partitions/1` is not a layout-3 record.
+    #[error("partitions/1: {0}")]
+    Record(String),
+    /// The store refused.
+    #[error("control store: {0}")]
+    Control(String),
+    /// Node 1's thread is gone.
+    #[error("node {} stopped before the heal reached it", OWNER.0)]
+    NodeStopped,
+}
+
+/// What a reopen's heal runs with: it runs as a task, after `Db::open` has returned.
+pub(crate) struct HealCtx {
+    pub(crate) store: Arc<dyn ConfigStore>,
+    /// The boot this open started every node at.
+    pub(crate) boot: BootId,
+    pub(crate) budgets: Budgets,
+    pub(crate) clock: HostClock,
+    /// Node 1's mailbox.
+    pub(crate) owner: std::sync::mpsc::Sender<Msg>,
+    /// How long clearing the old grants may take.
+    pub(crate) within: Duration,
+}
+
+/// The correlation a heal's two events carry.
+const HEAL: CorrelationId = CorrelationId(2);
+
+/// Heal partition 1 after a reopen (M10, arch R3a, ruling A-R163, case A): clear the three old
+/// grants, node 1's first; only after node 1's delete is acknowledged, read `partitions/1`; then
+/// hand node 1's F1 a `Plan` from the record's root at config version + 1 with this open's
+/// boots, and an `ExpiryProven` fence whose `control_revision` is the record's `mod_revision`.
+/// The same proof `bootstrap` and the simulator's `reinspect_now` already use: a CAS at that
+/// revision lands only if nothing wrote `partitions/1` after the read.
+///
+/// Logged as `heal_takeover_authorized{variant, control_revision, prior_boot, prior_grant,
+/// grant_delete_revision, read_revision}`.
+///
+/// # Errors
+///
+/// [`HealError`]. Nothing is sent to node 1 unless every step held.
+pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
+    let deadline = tokio::time::Instant::now() + ctx.within;
+    let (held, deleted) = match clear_until(&ctx, OWNER, deadline).await? {
+        (Clearance::Cleared(revision), Some(held)) => (held, revision),
+        _ => return Err(HealError::NoGrantHeld),
+    };
+    for node in [NodeId(2), NodeId(3)] {
+        clear_until(&ctx, node, deadline).await?;
+    }
+    // Only now, after node 1's delete was acknowledged (A-R163).
+    let read = ctx
+        .store
+        .get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        })
+        .await
+        .map_err(|error| HealError::Control(format!("get partitions/1: {error}")))?;
+    if Revision(read.read_revision) < deleted {
+        return Err(HealError::ReadBeforeDelete {
+            read: read.read_revision,
+            deleted: deleted.0,
+        });
+    }
+    let found = read
+        .record
+        .ok_or_else(|| HealError::Record("absent".to_owned()))?;
+    let (Some(record), Some(root)) = (
+        PartitionRecord::decode(&found.value),
+        PartitionRoot::decode(&found.value),
+    ) else {
+        return Err(HealError::Record(format!(
+            "the record at revision {} carries no root (layout 3)",
+            found.mod_revision
+        )));
+    };
+    let healed = Healed {
+        grant_delete_revision: deleted,
+        read_revision: Revision(read.read_revision),
+        control_revision: Revision(found.mod_revision),
+    };
+    let lineage = Lineage {
+        partition: PARTITION,
+        generation: record.generation,
+        owner_epoch: record.owner_epoch,
+    };
+    let anchor = LineageAnchor {
+        lineage,
+        base_seq: root.base_seq,
+        base_digest: root.base_digest,
+    };
+    let version = ConfigVersion(record.config_version.0 + 1);
+    let plan = recovery_plan(
+        anchor,
+        version,
+        ctx.boot,
+        held.grant,
+        held.authority_generation,
+    );
+    let now = ctx.clock.now();
+    let sample = HostClock::control_time(now, &ctx.budgets);
+    let fence = FencingProof {
+        partition: PARTITION,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: held.grant,
+        prior_boot_id: held.boot,
+        revocation: Revocation::ExpiryProven {
+            frozen_expiry_utc_ms: held.expiry_utc_ms,
+            authority_utc_ms: i64::try_from(sample.estimate.0).unwrap_or(i64::MAX),
+            authority_tick: now,
+            epsilon_ms: u32::try_from(ctx.budgets.clock_error_millis).unwrap_or(u32::MAX),
+            delta_ms: u32::try_from(ctx.budgets.dispatch_margin_millis).unwrap_or(u32::MAX),
+        },
+        control_revision: healed.control_revision,
+        decision_tick: now,
+    };
+    tracing::info!(
+        variant = "ExpiryProven",
+        control_revision = healed.control_revision.0,
+        prior_boot = held.boot.0,
+        prior_grant = held.grant.0,
+        grant_delete_revision = deleted.0,
+        read_revision = read.read_revision,
+        "heal_takeover_authorized"
+    );
+    for event in [
+        RecoveryEvent::Plan(Box::new(plan)),
+        RecoveryEvent::FenceProven(Box::new(fence)),
+    ] {
+        ctx.owner
+            .send(Msg::Inject {
+                partition: PARTITION,
+                correlation: HEAL,
+                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+            })
+            .map_err(|_| HealError::NodeStopped)?;
+    }
+    Ok(healed)
+}
+
+/// Run [`judge`] for `node` until it answers `Cleared` or `Absent`, or `deadline` passes. A
+/// guard that still holds is waited out until about when it says it will stop holding.
+async fn clear_until(
+    ctx: &HealCtx,
+    node: NodeId,
+    deadline: tokio::time::Instant,
+) -> Result<(Clearance, Option<GrantRecord>), HealError> {
+    let mut last = String::from("nothing answered");
+    while tokio::time::Instant::now() < deadline {
+        match judge(&*ctx.store, node, ctx.boot, &ctx.budgets, ctx.clock).await {
+            Ok(answer @ (Clearance::Cleared(_) | Clearance::Absent, _)) => return Ok(answer),
+            Ok((clearance, _)) => last = format!("{clearance:?}"),
+            // A lost delete reply is read again next time round, as `clear_grant` advises.
+            Err(error)
+                if error.retry == RetryRule::BoundedJitter
+                    || error.kind == ErrorKind::UnknownOutcome =>
+            {
+                last = error.detail;
+            }
+            Err(error) => return Err(HealError::Control(error.detail)),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(HealError::NotCleared {
+        node: node.0,
+        within_ms: ctx.within.as_millis(),
+        last,
+    })
 }
 
 /// What [`clear_grant`] did with `grants/{node}`. The simulator's service answers the same way
@@ -319,6 +724,22 @@ async fn judge_and_clear(
     let budgets = db.budgets().ok_or_else(|| {
         ApiError::invalid("this Db was built without budgets, so it cannot judge a grant")
     })?;
+    judge(store, node, boot, &budgets, db.clock())
+        .await
+        .map(|(clearance, _)| clearance)
+}
+
+/// [`clear_grant`] for `node` running at `boot`, judged with `budgets` on `clock`, without a
+/// `Db`: the reopen's heal runs it from a task (M10, arch R3c). Also returns the record it
+/// judged, when there was one.
+async fn judge(
+    store: &dyn ConfigStore,
+    node: NodeId,
+    boot: BootId,
+    budgets: &Budgets,
+    clock: HostClock,
+) -> Result<(Clearance, Option<GrantRecord>), ApiError> {
+    let budgets = *budgets;
     let key = ControlKey::Grant(node).encode();
     let read = store
         .get(GetRequest {
@@ -333,7 +754,7 @@ async fn judge_and_clear(
             verdict = ?Clearance::Absent,
             "grant_clear"
         );
-        return Ok(Clearance::Absent);
+        return Ok((Clearance::Absent, None));
     };
     let record = GrantRecord::decode(&found.value).ok_or_else(|| {
         unreadable(format!(
@@ -342,7 +763,7 @@ async fn judge_and_clear(
         ))
     })?;
     let partitions = list_partitions(store).await?;
-    let now = db.now();
+    let now = clock.now();
     let sample = HostClock::control_time(now, &budgets);
     let verdict = clear_verdict(node, &record, boot, sample, now, &budgets, || {
         Ok::<_, std::convert::Infallible>(partitions)
@@ -373,7 +794,7 @@ async fn judge_and_clear(
         verdict = ?clearance,
         "grant_clear"
     );
-    Ok(clearance)
+    Ok((clearance, Some(record)))
 }
 
 /// The whole `partitions/` family, or an error: a failed or truncated list is never read as a

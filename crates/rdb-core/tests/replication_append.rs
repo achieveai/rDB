@@ -2229,6 +2229,112 @@ fn m7b_123_historical_envelopes_reach_copy_caught_up_and_root_anchor_quarantines
     assert_eq!(rx(&module), &before, "a refused append changes nothing");
 }
 
+/// D3 (lead ruling A-R169): generation 4 wrote nothing, so after `Recovered` into generation 5
+/// at `(10, d10)` the head B holds was sealed under `GEN`, two generations back, and is not
+/// historical (K-B-37 admits the predecessor only). The keepalive that sends it draws
+/// `AlreadyHave` and an ACK and stores nothing; without that ACK L1 never resumes. Twins, each
+/// still `StaleGeneration` and unchanged: another record at 10 (forged digest), one whose bytes
+/// do not hash to the d10 it claims, 11 (above the applied head and the floor), and a receiver
+/// whose floor is below the record it holds (never rebuilt by `Recovered`). From a member that
+/// is not the pinned primary it is `NotAMember`.
+#[retcd_test]
+fn a_head_sealed_two_generations_back_draws_an_ack_and_stores_nothing() {
+    let gen5 = Generation(GEN.0 + 2);
+    let recovered_at_10 = || {
+        let mut module = module();
+        step(
+            &mut module,
+            &event(EventKind::Kernel(KernelEvent::Recovered(Box::new(
+                recovery_at(10, gen5),
+            )))),
+        );
+        assert_eq!(rx(&module).applied_head(), head(10));
+        module
+    };
+    let on_gen5 = |module: &mut Replication, from: NodeId, env: &ReplicationEnvelope| {
+        step(
+            module,
+            &framed_on(B, from, authority(gen5, NEW_EPOCH), NEW_CONFIG, env),
+        )
+    };
+    let held = chain(10).pop().expect("10");
+    assert_eq!(held.header.generation, GEN, "sealed two generations back");
+
+    let mut module = recovered_at_10();
+    let before = rx(&module).clone();
+    let effects = on_gen5(&mut module, C, &held);
+    assert_eq!(
+        effects.len(),
+        2,
+        "a reply and an ACK, no store: {effects:?}"
+    );
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+        AppendOutcome::AlreadyHave
+    );
+    match reply_at(&effects[1], C, FRAME_ID, NEW_CONFIG) {
+        AppendOutcome::Accepted(ack) => {
+            assert_eq!(ack.generation, gen5);
+            assert_eq!(ack.progress.buffered_applied, AppliedSeq(10));
+            assert_eq!(ack.digest_at_buffered, d(10));
+        }
+        other => panic!("an ACK, got {other:?}"),
+    }
+    assert_eq!(rx(&module), &before, "a repeat stores nothing");
+
+    let stale = rejected(AppendReject::StaleGeneration { current: gen5 });
+    let forged = envelope(10, d(9), b"other");
+    // Claims d10 but its bytes hash to something else.
+    let mut unsealed = held.clone();
+    unsealed.mutations[0].value = Some(Bytes::from_static(b"other"));
+    assert_eq!(unsealed.record_digest, d(10));
+    let above = chain(11).pop().expect("11");
+    for (name, env) in [
+        ("forged digest", &forged),
+        ("claimed digest", &unsealed),
+        ("above the head", &above),
+    ] {
+        let mut module = recovered_at_10();
+        let before = rx(&module).clone();
+        let effects = on_gen5(&mut module, C, env);
+        assert_eq!(effects.len(), 1, "{name}: {effects:?}");
+        assert_eq!(
+            reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+            stale,
+            "{name}"
+        );
+        assert_eq!(rx(&module), &before, "{name}: a refusal changes nothing");
+    }
+
+    let effects = on_gen5(&mut recovered_at_10(), A, &held);
+    assert_eq!(
+        reply_at(&effects[0], A, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::NotAMember)
+    );
+
+    // Floor 0: B was never rebuilt by `Recovered`, so 10 is above its floor and generation 5
+    // owns it. The same record is not a repeat there.
+    let mut module = Replication::new();
+    module.install_receiver(
+        AppendReceiver::new(ReceiverInit {
+            config: config(),
+            own: CopyId(1),
+            lineage: authority(gen5, EPOCH),
+            head: head(10),
+            durable: DurableSeq(10),
+        })
+        .expect("B at (10, d10) in generation 5"),
+    );
+    let before = rx(&module).clone();
+    let effects = step(
+        &mut module,
+        &framed_on(B, A, authority(gen5, EPOCH), CONFIG, &held),
+    );
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(reply_of(&effects[0]), stale);
+    assert_eq!(rx(&module), &before);
+}
+
 /// `recovered(cutoff, d(cutoff), takeover_config())`'s result, recovering into `generation`
 /// from the one before it.
 fn recovery_at(cutoff: u64, generation: Generation) -> RecoveryResult {

@@ -425,6 +425,11 @@ impl AppendReceiver {
         if !historical {
             let sender = fence.is_none().then_some(frame);
             if let Some(reject) = self.record_rows(&header, sender) {
+                if matches!(reject, AppendReject::StaleGeneration { .. })
+                    && self.already_holds(&envelope)
+                {
+                    return Verdict::Duplicate;
+                }
                 return refuse(reject);
             }
         }
@@ -435,6 +440,22 @@ impl AppendReceiver {
             Err(error) => return Verdict::Malformed(error.kind()),
         }
         self.sequence_row(envelope, body, historical)
+    }
+
+    /// A record sealed under a generation older than the predecessor, at or below both the
+    /// history floor and the applied head, with the digest the ladder holds at that sequence
+    /// (D3, lead ruling A-R169): a repeat, answered as one (`AlreadyHave` and an ACK) and never
+    /// stored. After a generation that wrote nothing, the head was sealed two generations back,
+    /// and the keepalive that sends it must still draw an ACK. Above the floor the current
+    /// generation owns every sequence, so an older record there is never a plain repeat.
+    fn already_holds(&self, envelope: &ReplicationEnvelope) -> bool {
+        let seq = envelope.header.seq;
+        seq <= self.root.floor
+            && seq <= self.applied_head.seq
+            && envelope
+                .compute_record_digest()
+                .is_ok_and(|digest| digest == envelope.record_digest)
+            && self.history.lookup(seq, envelope.record_digest) == DigestLookup::Match
     }
 
     /// K-B-37: a record at or below the history floor, written under the predecessor
