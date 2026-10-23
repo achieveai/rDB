@@ -8,6 +8,7 @@
 #   scripts/local-rdb.sh hold A-B | heal A-B                      [--run DIR]
 #   scripts/local-rdb.sh drop-request N [--node M] | drop-reply N [--node M]   [--run DIR]
 #   scripts/local-rdb.sh cut-control N | uncut-control N          [--run DIR]
+#   scripts/local-rdb.sh promote N [--drop M]                     [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
@@ -55,6 +56,7 @@ TIMEOUT_SEC=90
 WIPE=0
 ARG=""
 FAULT_NODE=1
+DROP=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -64,6 +66,7 @@ while [ $# -gt 0 ]; do
         --timeout-sec) TIMEOUT_SEC="$2"; shift 2 ;;
         --wipe) WIPE=1; shift ;;
         --node) FAULT_NODE="$2"; shift 2 ;;
+        --drop) DROP="$2"; shift 2 ;;
         -*) echo "lr: unknown option $1" >&2; exit 2 ;;
         *)
             [ -z "$ARG" ] || { echo "lr: one argument only, got '$ARG' and '$1'" >&2; exit 2; }
@@ -72,7 +75,7 @@ while [ $# -gt 0 ]; do
 done
 
 usage() {
-    sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -324,7 +327,7 @@ EOF
         [ -f "$f" ] && record_pid "retcd-$(basename "$(dirname "$f")")" "$(sed -n 1p "$f" | tr -d '\r ')"
     done
     say "rEtcd up at $CONTROL"
-    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --apps pilot,pilot-a,pilot-b >/dev/null
+    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --apps pilot,pilot-a,pilot-b,admin >/dev/null
     "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs-other" --apps pilot >/dev/null
     say "certificates in $RUN/certs (a second CA in $RUN/certs-other)"
     "$NODE_BIN" --form --dir "$RUN/db" --control "$CONTROL" --log-dir "$RUN/logs" \
@@ -379,6 +382,25 @@ status() {
     "$REPO/scripts/local-cluster.sh" status --dir "$RUN/ctl" 2>/dev/null || true
 }
 
+# Failover is a control-plane action (A-R240), so no node process promotes itself: rdb_dev runs
+# as an app with no copy of its own (--nodes, local=[]) and sends `admin promote N [--drop M]`.
+# The surviving rdb_node processes take the new plan from their control watch. rdb_dev's own
+# answer and exit code are passed through.
+promote() {
+    local dev line
+    dev="$(exe "$TARGET/debug/examples/rdb_dev")"
+    if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$dev" ]; then
+        say "building rdb_dev into $TARGET"
+        (cd "$REPO" && cargo build -p rdb-api --example rdb_dev) >&2
+        dev="$(exe "$TARGET/debug/examples/rdb_dev")"
+    fi
+    [ -f "$dev" ] || die "rdb_dev not found at $dev after building"
+    line="admin promote $ARG${DROP:+ --drop $DROP}"
+    say "$line"
+    printf '%s\nquit\n' "$line" | "$dev" --dir "$RUN/admin" --log-dir "$RUN/logs/admin" \
+        --control "$CONTROL" --nodes "$(peers)" --cert-dir "$RUN/certs" --app admin
+}
+
 case "$COMMAND" in
     up) up ;;
     down) pick_run; down ;;
@@ -405,5 +427,12 @@ case "$COMMAND" in
         fault_add "$FAULT_NODE" "$COMMAND $ARG" ;;
     cut-control) pick_run; check_node_arg "$ARG"; fault_add "$ARG" "cut-control" ;;
     uncut-control) pick_run; check_node_arg "$ARG"; fault_remove "$ARG" "cut-control" ;;
+    promote)
+        pick_run; check_node_arg "$ARG"
+        if [ -n "$DROP" ]; then
+            check_node_arg "$DROP"
+            [ "$DROP" != "$ARG" ] || die "promote $ARG cannot also drop $ARG"
+        fi
+        promote ;;
     *) usage ;;
 esac
