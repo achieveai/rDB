@@ -15,9 +15,14 @@
 //! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
 //! endpoints E instead of three in-process voters. `--dir` is then never removed, so a second
 //! run with the same `--dir` and E reopens it. The `control` verbs reach rdb_dev's own voters
-//! and are refused under `--control`. Without `--control`, a `--dir` that held anything before
-//! this run is never removed either; `Db::open` decides whether it can be opened. An empty
-//! `--dir` made beforehand is removed like one this run created.
+//! and are refused under `--control`, except a bare `control`, which lists E's partitions/
+//! and grants/ records. Each endpoint must be host:port. Without `--control`, a `--dir` that
+//! held anything before this run is never removed either; `Db::open` decides whether it can be
+//! opened. An empty `--dir` made beforehand is removed like one this run created.
+//!
+//! `--keep` keeps `--dir` after the run. rdb_dev's own voters still go at exit, and the
+//! folder's copies need the rEtcd that made them, so a later run cannot open a kept folder
+//! without `--control`: to reopen a folder, run both runs with the same `--control E`.
 //!
 //! `--requests F` appends every write request this run records for `retry` to F, one JSON
 //! line each, synced, after its answer, so a later run with the same `--requests F` resends an
@@ -296,7 +301,8 @@
 //!                                         manifest only and does not see it
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
-//!                                         store. A partitions/ record ends `root={..}`: the
+//!                                         store. Under `--control` it reads E through
+//!                                         rdb_dev's client, as `admin status` does. A partitions/ record ends `root={..}`: the
 //!                                         base, owner boot, instance and run its recovery
 //!                                         wrote, or `root=-` when it carries none
 //! control voters                          `voters leader=N running=[..] bound=N`: the rEtcd
@@ -349,9 +355,10 @@
 //!                                         generation G (was node P); node m dropped`.
 //!                                         A refusal prints `err admin promote: <error>`
 //!                                         and the run exits 1. Known gap: under `--nodes`
-//!                                         (`lr promote`) this build answers INVALID_ARGUMENT
-//!                                         "built without budgets", because the app-only
-//!                                         `Db` opens with none
+//!                                         (`lr promote`) this build answers UNAVAILABLE
+//!                                         "node 2 could not be sent the new plan": the plan
+//!                                         goes as a message that never crosses the wire.
+//!                                         The partition is then left fencing, with no writes
 //! admin rebuild N | admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
@@ -544,6 +551,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 if endpoints.is_empty() {
                     return Err("--control takes host:port[,host:port...]".to_owned());
                 }
+                // Tester paper cut (W1 --control): `--control notanendpoint` was taken, and
+                // the run said only `unavailable` once it tried to open.
+                if let Some(bad) = endpoints.iter().find(|e| !is_host_port(e)) {
+                    return Err(format!(
+                        "--control: {bad:?} is not host:port; --control takes \
+                         host:port[,host:port...]"
+                    ));
+                }
                 parsed.control = Some(endpoints);
             }
             "--put-timeout-ms" => {
@@ -629,6 +644,12 @@ fn app_only_check(args: &Args) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// Whether `text` is `host:port`: a host, a colon, and a port number from 1 to 65535.
+fn is_host_port(text: &str) -> bool {
+    text.rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
 }
 
 fn parse_node(text: &str) -> Result<NodeId, String> {
@@ -1785,7 +1806,9 @@ fn repl<'scope, 'env>(
             ["control", ..] => match control {
                 Some(control) => control_verb(&words, &line, rt, control),
                 None => {
-                    say(&format!("err {line}: {CONTROL_EXTERNAL}"));
+                    external_control_lines(&words, &line, rt, store)
+                        .iter()
+                        .for_each(|l| say(l));
                     Ok(())
                 }
             },
@@ -1968,6 +1991,23 @@ fn exit_code(bad: bool, sent: &Sent) -> ExitCode {
 /// external rEtcd is not rdb_dev's to freeze, stop or fault (M10 R3c).
 const CONTROL_EXTERNAL: &str =
     "refused under --control: the store is an external rEtcd, not rdb_dev's own voters";
+
+/// A `control` verb under `--control`: a bare `control` reads the external rEtcd's
+/// `partitions/` and `grants/` records through `store`, as `admin status` does; the verbs
+/// that change rdb_dev's own voters are refused (tester paper cut, W1 `--control`).
+fn external_control_lines(
+    words: &[&str],
+    line: &str,
+    rt: &tokio::runtime::Runtime,
+    store: &dyn ConfigStore,
+) -> Vec<String> {
+    match words {
+        ["control"] => record_lines(rt, store, "control"),
+        _ => vec![format!(
+            "err {line}: {CONTROL_EXTERNAL}; a bare `control` still lists its records"
+        )],
+    }
+}
 
 /// A `control` verb against rdb_dev's own voters.
 fn control_verb(
@@ -7046,6 +7086,43 @@ mod tests {
         );
     }
 
+    /// Tester paper cut (W1 `--control`): `--control notanendpoint` was taken, and the run
+    /// said only `unavailable` later. Each endpoint must be host:port now, and the refusal
+    /// names the one that is not. Cut: make `is_host_port` answer true and the bad lines go
+    /// red. Unit.
+    #[test]
+    fn control_refuses_an_endpoint_that_is_not_host_port() {
+        let with = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        let args = with(&["--control", "127.0.0.1:2379, localhost:2380"]).expect("parses");
+        assert_eq!(
+            args.control,
+            Some(vec![
+                "127.0.0.1:2379".to_owned(),
+                "localhost:2380".to_owned()
+            ])
+        );
+        for (value, bad) in [
+            ("notanendpoint", "notanendpoint"),
+            ("127.0.0.1:2379,host", "host"),
+            (":2379", ":2379"),
+            ("h:0", "h:0"),
+            ("h:70000", "h:70000"),
+            ("h:x", "h:x"),
+        ] {
+            let Err(refused) = with(&["--control", value]) else {
+                panic!("--control {value} parsed");
+            };
+            assert_eq!(
+                refused,
+                format!(
+                    "--control: {bad:?} is not host:port; --control takes \
+                     host:port[,host:port...]"
+                ),
+                "{value}"
+            );
+        }
+    }
+
     /// A-R245: `--nodes` is app-only mode. It parses `N=host:port` pairs and defaults `--app`
     /// to `admin`; it needs `--cert-dir` and `--control`; and each flag that sets up a node this
     /// process runs is refused by name, as is `--cert-dir` or `--app` without `--nodes`. Cut:
@@ -7237,6 +7314,47 @@ mod tests {
         assert!(
             failed[0].starts_with("err admin status list partitions/: "),
             "{failed:?}"
+        );
+    }
+
+    /// Tester paper cut (W1 `--control`): under `--control` the read-only `control` verb was
+    /// refused with the verbs that change rdb_dev's own voters, though the records are one
+    /// list away. A bare `control` now lists them through the external store; the rest are
+    /// still refused and say so. Cut: refuse the bare `control` too and the first assert goes
+    /// red. Unit.
+    #[test]
+    fn a_bare_control_under_control_lists_the_external_records() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = config_testkit::memstore::MemStore::new();
+        for key in ["partitions/1", "grants/2"] {
+            rt.block_on(store.put(PutRequest {
+                key: Bytes::from(key),
+                value: Bytes::from_static(b"x"),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .expect("put");
+        }
+        assert_eq!(
+            external_control_lines(&["control"], "control", &rt, &store),
+            [
+                "partitions/1 rev=1 <undecodable>",
+                "grants/2 rev=2 <undecodable>"
+            ]
+        );
+        assert_eq!(
+            external_control_lines(
+                &["control", "freeze-grant", "1"],
+                "control freeze-grant 1",
+                &rt,
+                &store
+            ),
+            [format!(
+                "err control freeze-grant 1: {CONTROL_EXTERNAL}; a bare `control` still lists \
+                 its records"
+            )]
         );
     }
 
