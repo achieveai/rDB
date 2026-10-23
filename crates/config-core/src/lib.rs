@@ -79,8 +79,8 @@ pub use schema::{
     FEATURE_RETIRE_NODE,
 };
 pub use state::{
-    dedup_index_key_from_storage, dedup_storage_key, ApplyEffects, DedupIndexKey, DedupRecord,
-    KvState,
+    dedup_index_key_from_storage, dedup_storage_key, key_hex, ApplyEffects, DedupIndexKey,
+    DedupRecord, KvState,
 };
 pub use store::{
     bind_hash, open_token, seal_token, token_fingerprint, ConfigStore, ListPage, PageRequest,
