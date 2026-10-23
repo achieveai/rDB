@@ -4797,13 +4797,76 @@ mod tests {
     /// Integration (~30 s): two opens, each reopen waits out the last run's grant.
     #[config_log::retcd_test]
     fn m10_a_frame_corrupt_value_read_by_the_app_is_an_error_never_absent() {
-        use rdb_core::contracts::storage::Namespace;
         let rt = runtime();
-        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get(b"c07")));
+        match read {
+            Ok(Err(error)) => names_the_fault(&error),
+            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R164, the compile checkpoint: a put whose condition reads a corrupt value is refused
+    /// with the node's fault, never with a conflict decided on a value read as absent. The
+    /// compile answers its caller itself, before anything reaches a T1 step, so only the check
+    /// after the compile sees the fault.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_a_put_whose_condition_reads_a_corrupt_value_is_refused_with_the_fault() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        let put = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.put(b"c07", b"again", Some(2))
+        }));
+        match put {
+            Ok(Err(refused)) => names_the_fault(&refused.error),
+            Ok(Ok(put)) => panic!("a condition read from a corrupt value is no answer: {put:?}"),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R164, the previous-view checkpoint: `get_previous` of a corrupt value reads it through
+    /// the view P1 kept, which no T1 or P1 step reads, so only the check in the object read
+    /// sees the fault. A put of another object first makes a kept view exist.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_a_previous_view_read_of_a_corrupt_value_is_an_error_never_absent() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        db.put(b"z", b"other", None)
+            .expect("a put of another object");
+        let read =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get_previous(b"c07")));
+        match read {
+            Ok(Err(error)) => names_the_fault(&error),
+            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    fn names_the_fault(error: &ApiError) {
+        assert!(
+            error.detail.contains("storage read fault"),
+            "the error names the fault: {error:?}"
+        );
+    }
+
+    /// The A-R164 rows' folder: `c07=hello` written in generation 1, then every user value of
+    /// generation 1, in every copy, cut to 3 bytes (shorter than a frame), then reopened and
+    /// ready.
+    fn reopened_over_a_corrupt_value(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> Db {
+        use rdb_core::contracts::storage::Namespace;
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let open = || {
             rt.block_on(Db::open_with(
-                config(dir.path()),
+                config(dir),
                 Arc::clone(&store),
                 rt.handle().clone(),
                 fast(),
@@ -4816,11 +4879,10 @@ mod tests {
         db.shutdown();
         drop(db);
 
-        // Every user value of generation 1, in every copy, becomes 3 bytes: shorter than a frame.
         let prefix = rdb_storage::keys::encode_key(PARTITION, Generation(1), Namespace::User, &[]);
         let mut corrupted = 0;
         for n in 1..=3 {
-            let path = dir.path().join("nodes").join(n.to_string());
+            let path = dir.join("nodes").join(n.to_string());
             let raw = rocksdb::DB::open_cf(
                 &rocksdb::Options::default(),
                 &path,
@@ -4845,21 +4907,10 @@ mod tests {
             "the value is stored in every copy: {corrupted}"
         );
 
-        let mut db = open();
+        let db = open();
         db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
             .expect("the reopen is ready");
-        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get(b"c07")));
-        match read {
-            Ok(Err(error)) => {
-                assert!(
-                    error.detail.contains("storage read fault"),
-                    "the error names the fault: {error:?}"
-                );
-            }
-            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
-            Err(_) => panic!("a corrupt value is an error, never a panic"),
-        }
-        db.shutdown();
+        db
     }
 
     /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a
