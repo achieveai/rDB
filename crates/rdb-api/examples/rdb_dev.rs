@@ -1141,7 +1141,7 @@ fn repl<'scope, 'env>(
         if args.script.is_some() {
             say(&format!("> {line}"));
         }
-        tracing::info!(command = %line, "repl_command");
+        log_command(&line);
         // A value verb reads its JSON from the raw line (risk R1), so it skips `split_words`.
         if let Some(verb) = line
             .split_whitespace()
@@ -1459,6 +1459,72 @@ fn control_verb(
         )),
         _ => Err(format!("unknown command {line:?}")),
     }
+}
+
+/// The `repl_command` log line for one typed command: its verb, and the object it names as
+/// `key_hex` (at most 32 bytes), never the line. A line carries keys, values, map keys and
+/// paths, and a log never holds their text (ADR-0013, A-R154, D5). A verb the grammar does not
+/// know logs as `unknown`, since a mistyped line can be anything.
+fn log_command(line: &str) {
+    let (verb, object) = command_fields(line);
+    match object {
+        Some(object) => {
+            let key_hex = hex::encode(&object.as_bytes()[..object.len().min(32)]);
+            tracing::info!(verb, key_hex = %key_hex, "repl_command");
+        }
+        None => tracing::info!(verb, "repl_command"),
+    }
+}
+
+/// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
+/// object it writes or reads, when it names one. A line `split_words` refuses names no object.
+fn command_fields(line: &str) -> (&'static str, Option<String>) {
+    const VERBS: [&str; 25] = [
+        "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
+        "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
+        "sleep", "quit", "exit", "blob",
+    ];
+    const SUBVERBS: [&str; 18] = [
+        "blob upload",
+        "blob chunk",
+        "blob publish",
+        "blob gc",
+        "admin clear-grant",
+        "admin damage-chunk",
+        "admin damage",
+        "admin clear",
+        "link hold",
+        "link heal",
+        "link drop",
+        "node restart",
+        "wait recovered",
+        "wait ready",
+        "control lifecycle",
+        "control freeze-grant",
+        "control fail",
+        "control stop",
+    ];
+    let mut first = line.split_whitespace();
+    let Some(verb) = first
+        .next()
+        .and_then(|verb| VERBS.iter().copied().find(|known| *known == verb))
+    else {
+        return ("unknown", None);
+    };
+    let pair = first.next().map(|sub| format!("{verb} {sub}"));
+    let verb = pair
+        .and_then(|pair| SUBVERBS.iter().copied().find(|known| *known == pair))
+        .unwrap_or(verb);
+    let at = match verb {
+        "put" | "put&" | "get" | "read" | "doc" | "map" | "set" | "members" | "list" | "items" => 1,
+        "blob upload" | "blob chunk" | "blob publish" | "blob gc" | "admin damage-chunk"
+        | "admin damage" | "admin clear" => 2,
+        _ => return (verb, None),
+    };
+    let object = split_words(line)
+        .ok()
+        .and_then(|mut words| (words.len() > at).then(|| words.swap_remove(at)));
+    (verb, object)
 }
 
 /// One input line as a command: `None` for a blank or comment-only line. An unreadable line
@@ -4791,5 +4857,76 @@ mod tests {
             matches!(&escaped, Change::Set(ops) if matches!(ops[..], [ElemOp::Add(Value::Map(_))])),
             "{escaped:?}"
         );
+    }
+
+    /// D5 (tester S1-8 at 066ab6e, ADR-0013, A-R154): `repl_command` logged the whole typed
+    /// line, so 27 lines of one walk carried key and value text. Every command of the grammar
+    /// is fed with keys, values, map keys and paths that all start `zq`, a pair this row's name
+    /// and module do not contain: no line of the test's log may hold `zq`. Each command still
+    /// logs one `repl_command` line with its verb, and a command that names an object logs it
+    /// as `key_hex`. Unit (~10 ms).
+    #[config_log::retcd_test]
+    fn d5_a_typed_line_logs_its_verb_and_key_hex_never_its_text() {
+        const METHOD: &str = "d5_a_typed_line_logs_its_verb_and_key_hex_never_its_text";
+        let typed = [
+            ("put zqk1 zqv1", "put", Some("zqk1")),
+            ("put& zqk2 zqv2 --if-version 3", "put&", Some("zqk2")),
+            ("txn zqk3=zqv3 2:zqk4=zqv4@1", "txn", None),
+            (
+                r#"doc zqk5 --absent set /zqpath "zqv5""#,
+                "doc",
+                Some("zqk5"),
+            ),
+            (r#"map zqk6 put "zqmember" "zqv6""#, "map", Some("zqk6")),
+            (r#"members zqk7 --after "zqafter""#, "members", Some("zqk7")),
+            ("get zqk8", "get", Some("zqk8")),
+            ("read zqk9 --offset 0 --len 1", "read", Some("zqk9")),
+            (
+                "blob upload zqk10 --upload 000102030405060708090a0b0c0d0e0f --chunk-size 4 zqv10",
+                "blob upload",
+                Some("zqk10"),
+            ),
+            (
+                r#"admin damage zqk11 --element "zqelem""#,
+                "admin damage",
+                Some("zqk11"),
+            ),
+            ("retry --payload zqv12", "retry", None),
+            ("zqunknown zqk14", "unknown", None),
+            (r#"put "zqk15 spaced" zqv15"#, "put", Some("zqk15 spaced")),
+            (r#"put "zqk16unterminated zqv16"#, "put", None),
+            ("status 4", "status", None),
+            ("wait ready 60", "wait ready", None),
+            // ADR-0013: a key logs its first 32 bytes only.
+            (
+                "get zqk17-6789012345678901234567890123456789",
+                "get",
+                Some("zqk17-6789012345678901234567890123456789"),
+            ),
+        ];
+        for (line, _, _) in typed {
+            log_command(line);
+        }
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let leaked: Vec<String> = lines
+            .iter()
+            .map(ToString::to_string)
+            .filter(|text| text.contains("zq"))
+            .collect();
+        assert!(leaked.is_empty(), "key or value text logged: {leaked:#?}");
+        let logged: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "repl_command")
+            .collect();
+        assert_eq!(
+            logged.len(),
+            typed.len(),
+            "one repl_command line per command"
+        );
+        for (line, (typed, verb, key)) in logged.iter().zip(typed) {
+            assert_eq!(line["verb"], verb, "{typed}");
+            let key_hex = key.map(|key| hex::encode(&key.as_bytes()[..key.len().min(32)]));
+            assert_eq!(line["key_hex"].as_str(), key_hex.as_deref(), "{typed}");
+        }
     }
 }
