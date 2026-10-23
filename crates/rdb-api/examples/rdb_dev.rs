@@ -14,8 +14,9 @@
 //! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
 //! endpoints E instead of three in-process voters. `--dir` is then never removed, so a second
 //! run with the same `--dir` and E reopens it. The `control` verbs reach rdb_dev's own voters
-//! and are refused under `--control`. Without `--control`, a `--dir` this run did not create is
-//! never removed either; `Db::open` decides whether it can be opened.
+//! and are refused under `--control`. Without `--control`, a `--dir` that held anything before
+//! this run is never removed either; `Db::open` decides whether it can be opened. An empty
+//! `--dir` made beforehand is removed like one this run created.
 //!
 //! `--requests F` appends every write request this run records for `retry` to F, one JSON
 //! line each, synced, after its answer, so a later run with the same `--requests F` resends an
@@ -711,8 +712,8 @@ where
 /// End the run once the Db is gone, whether it opened or not (F-006). The direct client holds
 /// the voter's store open: drop every handle on it before the cluster closes its stores, or
 /// their RocksDB files outlive the run. Then `--dir` goes, unless `--keep`, `--control`, or
-/// it held anything before the run (`existed`): a directory this run did not create is the
-/// user's, and under `--control` it is meant to be reopened.
+/// it held anything before the run (`existed`): such a directory is the user's, and under
+/// `--control` it is meant to be reopened. An empty `--dir` made beforehand goes like a new one.
 ///
 /// The store holds the cluster weakly, so the cluster comes back here unless a call is
 /// resolving the leader at this instant; that is waited out for up to 2 s, and past it the
