@@ -775,6 +775,9 @@ struct Seen {
     faults: Vec<String>,
     /// Each node's stall line as last printed, until it clears.
     stalled: std::collections::BTreeMap<u32, String>,
+    /// While `wait ready` runs: its own `reached ready` line says ready, so the poller does not
+    /// (k237, lead ruling on the G4 follow-up: the poller's `ready` printed before it).
+    awaiting_ready: bool,
 }
 
 impl Progress {
@@ -1171,9 +1174,13 @@ fn stopped_owner_step(seen: &mut Seen, restart_note: Option<&str>) -> Option<Str
 }
 
 /// The `ready` or `not ready` line for `admits` and `reason`, given what `seen` holds as
-/// printed, as [`ready_step`] describes.
+/// printed, as [`ready_step`] describes. A bare `ready` waits while `wait ready` runs: that
+/// wait ends with its own line and records it as printed ([`wait_ready_line`]).
 fn step_line(seen: &mut Seen, admits: bool, reason: Option<String>) -> Option<String> {
     if admits == seen.ready && reason == seen.reason {
+        return None;
+    }
+    if seen.awaiting_ready && admits && reason.is_none() {
         return None;
     }
     let line = match (admits, &reason) {
@@ -3854,7 +3861,8 @@ const WAIT_PROGRESS_EVERY: Duration = Duration::from_secs(10);
 /// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
 /// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
 /// gives the next step). The run then exits 1. A timeout is said, and is not an error. A wait
-/// that reached ready records that as printed, so the poller does not say it a second time.
+/// that reached ready records that as printed, so the poller does not say it a second time, and
+/// while it waits the poller holds back a bare `ready`, so it never comes before this line.
 ///
 /// It asks `wait` for at most `every` at a time, and after each slice that ran out it says
 /// `still waiting for ready: recovery phase P` with node 1's phase then: the tester saw ~40 s
@@ -3867,6 +3875,11 @@ fn wait_ready_line(
     mut said: impl FnMut(&str),
 ) -> Result<String, String> {
     use rdb_api::db::ReadyError;
+    progress
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .awaiting_ready = true;
     let started = Instant::now();
     let mut left = within;
     let answer = loop {
@@ -3891,18 +3904,22 @@ fn wait_ready_line(
         }
     };
     let millis = started.elapsed().as_millis();
-    let (outcome, line) = match &answer {
-        Ok(()) => {
-            // Said here, so the poller does not say it again (k237): `ready` with no reason is
-            // now what was printed. A later change, or a reason, is still the poller's to say.
-            let mut seen = progress
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        // Said by the caller, so the poller says it neither before nor after (k237): `ready`
+        // with no reason is now what was printed. A later change, or a reason, is still the
+        // poller's to say.
+        let mut seen = progress
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.awaiting_ready = false;
+        if answer.is_ok() {
             seen.ready = true;
             seen.reason = None;
-            ("reached", Ok(format!("reached ready in {millis}ms")))
         }
+    }
+    let (outcome, line) = match &answer {
+        Ok(()) => ("reached", Ok(format!("reached ready in {millis}ms"))),
         Err(e @ ReadyError::TimedOut { .. }) => (
             "timed_out",
             Ok(format!(
@@ -5840,6 +5857,65 @@ mod tests {
         let line = wait_recovered(&progress, Duration::from_millis(100), || HealState::Running)
             .expect("a timeout is said, as before");
         assert_eq!(line, "timeout waiting for recovered after 0s");
+    }
+
+    /// G4 follow-up (stress run at edd664e, `g4/n2.out`): the poller printed `ready` before
+    /// `wait ready`'s own `reached ready`, when it saw writes admitted before the wait returned.
+    /// While the wait runs the poller holds back a bare `ready`; after it, the wait's line is
+    /// what was printed. A wait that times out leaves `ready` to the poller. Unit.
+    #[test]
+    fn the_poller_never_says_ready_before_wait_ready_does() {
+        use rdb_api::db::ReadyError;
+        let progress = Progress::default();
+        let mut polled = Vec::new();
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(1),
+            WAIT_PROGRESS_EVERY,
+            |_| {
+                // The poller, mid-wait, sees writes admitted.
+                polled.push(step_line(&mut progress.inner.lock().unwrap(), true, None));
+                Ok(())
+            },
+            |_| (),
+        )
+        .expect("ready");
+        assert_eq!(polled, vec![None], "the poller held back its `ready`");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        let mut seen = progress.inner.lock().unwrap();
+        assert!(!seen.awaiting_ready);
+        assert_eq!(
+            step_line(&mut seen, true, None),
+            None,
+            "said once, by the wait"
+        );
+        assert_eq!(
+            step_line(&mut seen, true, Some("why".to_owned())).as_deref(),
+            Some("ready for now; why"),
+            "a reason is still the poller's to say"
+        );
+        drop(seen);
+
+        let progress = Progress::default();
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_millis(10),
+            WAIT_PROGRESS_EVERY,
+            |_| {
+                Err(ReadyError::TimedOut {
+                    within_ms: 10,
+                    phase: "Discovering".to_owned(),
+                })
+            },
+            |_| (),
+        )
+        .expect("a timeout is said");
+        assert!(line.starts_with("timeout waiting for ready"), "{line}");
+        assert_eq!(
+            step_line(&mut progress.inner.lock().unwrap(), true, None).as_deref(),
+            Some("ready"),
+            "after a timeout, ready is the poller's to say"
+        );
     }
 
     /// Tester D8 (aa3b82e): from a folder's second open on, the request floor `(n-1)<<40` puts
