@@ -369,6 +369,11 @@ impl FencingProof {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Revocation {
     /// Spec §7.3 step 2. Counts only because a restart cannot restore that epoch.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225):** its own route. A live owner heals a
+    /// restarted peer this way: the revocation is persisted
+    /// ([`crate::contracts::storage::StoreEffect::PersistEpochRevocation`]) before the drain
+    /// counts. It needs no copy lock, and it is never folded into [`Self::ExpiryProven`].
     DurableDrain {
         /// The revision at which the drain was acknowledged.
         ack_revision: Revision,
@@ -383,6 +388,11 @@ pub enum Revocation {
     /// [`FencingProof::control_revision`] is the partition record's `mod_revision`, read
     /// linearizably after the delete was acknowledged and at a store revision not below it, as
     /// bootstrap's proof does; the delete's revision is logged, not carried.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225): that heal (case A) is sound only when the
+    /// healing process is the prior owner's node and holds that node's copy lock.** With one
+    /// process per node, the lock it holds is its own node's, not every copy's. The frozen-grant
+    /// form (an operator's promote) needs no lock: the freeze already pins `E`.
     ExpiryProven {
         /// `E` from the frozen grant record, read linearizably at
         /// [`FencingProof::control_revision`].
@@ -430,6 +440,10 @@ pub enum Revocation {
     /// `prior_grant_id = GrantId(0)` ("none held"), the prior boot from the partition record,
     /// and as [`FencingProof::control_revision`] the partition record's `mod_revision`, read
     /// linearizably at a store revision not below `absent_revision`.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225): sound only when the healing process is
+    /// the prior owner's node and holds that node's copy lock.** With one process per node, the
+    /// lock it holds is its own node's, not every copy's.
     NoGrantHeld {
         /// The store revision of the linearizable read that found the grant record absent.
         absent_revision: Revision,
