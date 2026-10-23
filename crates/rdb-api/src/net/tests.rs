@@ -114,6 +114,7 @@ fn landed() -> RecoveryResult {
             partition: PartitionId(1),
             seq: zero(),
             digest: zero(),
+            boot: BootId(5),
         }],
         &BTreeSet::from([CopyId(1)]),
         zero(),

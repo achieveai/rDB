@@ -426,6 +426,20 @@ struct Opened {
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
     /// (A-R200). Every refusal reads this instead of asking node 1 again.
     stuck: Mutex<Option<ReadyError>>,
+    /// The control store, runtime and budgets this open runs on, for [`Db::promote`]: every
+    /// open sets it, an app-only one too (A-R261). `None` only in a `Db` a crate test builds by
+    /// hand.
+    control: Option<PromoteStore>,
+}
+
+/// The control store, runtime and budgets [`Db::promote`] runs on.
+#[derive(Clone)]
+struct PromoteStore(Arc<dyn ConfigStore>, Handle, Budgets);
+
+impl std::fmt::Debug for PromoteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromoteStore").finish_non_exhaustive()
+    }
 }
 
 impl Default for Opened {
@@ -435,6 +449,7 @@ impl Default for Opened {
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
             stuck: Mutex::new(None),
+            control: None,
         }
     }
 }
@@ -518,18 +533,21 @@ pub enum HealState {
     Failed(admin::HealError),
 }
 
-/// Why [`Db::wait_ready`] returned without node 1 admitting writes.
+/// Why [`Db::wait_ready`] returned without the owner admitting writes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReadyError {
     /// The reopen's heal failed.
     #[error("the reopen's heal failed: {0}")]
     Heal(admin::HealError),
-    /// Node 1 did not admit writes in time.
-    #[error("{}", timed_out_text(*.within_ms, .phase))]
+    /// The owner did not admit writes in time.
+    #[error("{}", timed_out_text(*.within_ms, *.owner, .phase))]
     TimedOut {
         /// The bound asked for.
         within_ms: u128,
-        /// Node 1's last recovery phase, in words: `unknown` when node 1 answered no status
+        /// The node asked: the owner this `Db` routed to at the time-out, which is not node 1
+        /// after a promote (A-R256).
+        owner: NodeId,
+        /// The owner's last recovery phase, in words: `unknown` when it answered no status
         /// look in the time, `none` when it runs no recovery.
         phase: String,
     },
@@ -738,7 +756,7 @@ impl Db {
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
         if config.local.is_empty() {
-            return Self::open_app(config, store, rt)
+            return Self::open_app(config, store, rt, budgets)
                 .await
                 .map_err(open_refused);
         }
@@ -782,11 +800,13 @@ impl Db {
     /// process runs no node, claims no folder, bootstraps and heals nothing. It reads the owner
     /// from `partitions/1`, counts one open on the instance that record names so its own request
     /// ids start above every earlier open's, and sends every call over `DbConfig::links`. A
-    /// `NOT_PRIMARY` answer makes it read the owner again.
+    /// `NOT_PRIMARY` answer makes it read the owner again. It keeps the store and `budgets`,
+    /// the ones [`Self::open`] gives every open, so it can run [`Self::promote`] (A-R261).
     async fn open_app(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
         rt: Handle,
+        budgets: Budgets,
     ) -> Result<Self, OpenError> {
         let links = config.links.clone().ok_or_else(|| {
             OpenError::Config(
@@ -819,7 +839,10 @@ impl Db {
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
-            opened: Opened::default(),
+            opened: Opened {
+                control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
+                ..Opened::default()
+            },
             route: Route {
                 owner: std::sync::atomic::AtomicU32::new(owner.0),
                 refresh: Some((store, rt)),
@@ -965,6 +988,7 @@ impl Db {
             unwind,
             opened: Opened {
                 base_boot: boot,
+                control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 ..Opened::default()
             },
             route: Route {
@@ -1246,6 +1270,7 @@ impl Db {
             owner: sender,
             within: heal_within(&budgets),
             member_boot: Arc::new(member_boot),
+            owner_node: owner,
         };
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
@@ -1306,6 +1331,7 @@ impl Db {
             if std::time::Instant::now() >= deadline {
                 return Err(ReadyError::TimedOut {
                     within_ms: within.as_millis(),
+                    owner: self.route.owner(),
                     phase,
                 });
             }
@@ -2296,6 +2322,113 @@ impl Db {
         Ok(db)
     }
 
+    /// Make `to` the owner of partition 1 while its owner is dead or cut off (`admin promote`,
+    /// arch-s2, A-R256). The new configuration keeps two members: every member but `drop`,
+    /// which defaults to the prior owner. The prior owner's grant is frozen first and the
+    /// promote waits its expiry out, so it takes up to the grant's length plus the clock bound
+    /// and ten seconds; [`admin::promote`] says each step. Returns once `partitions/1` names
+    /// `to` at a newer generation; this `Db`'s calls go to `to` from then on.
+    ///
+    /// Membership is fixed at three nodes (A-R256 known limit for M10): a dropped node rejoins
+    /// as a secondary at the next reopen heal. An app-only `Db` promotes too, over its links
+    /// (A-R261).
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing changed: `to` or `drop` holds no copy, `to` is a shadow, owns
+    /// the partition already, or is `drop`. `UNAVAILABLE`, nothing changed, from a `Db` a crate
+    /// test built by hand, which has no control store.
+    /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
+    /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
+    /// it again picks up where it stopped.
+    pub fn promote(&self, to: NodeId, drop: Option<NodeId>) -> Result<admin::Promoted, ApiError> {
+        let PromoteStore(store, rt, budgets) =
+            self.opened.control.clone().ok_or_else(|| ApiError {
+                kind: ErrorKind::Unavailable,
+                retry: RetryRule::NotWired,
+                no_mutation: true,
+                detail: "this Db was opened without a control store, so it cannot run admin \
+                         commands such as promote: open it with Db::open, which connects it to \
+                         one"
+                .to_owned(),
+                retry_after: None,
+            })?;
+        let (senders, boots): (
+            BTreeMap<NodeId, mpsc::Sender<Msg>>,
+            BTreeMap<NodeId, BootId>,
+        ) = {
+            let nodes = lock(&self.nodes);
+            (
+                nodes
+                    .iter()
+                    .map(|handle| (handle.node, handle.sender()))
+                    .collect(),
+                nodes
+                    .iter()
+                    .filter(|handle| !handle.start_failed)
+                    .map(|handle| (handle.node, handle.boot))
+                    .collect(),
+            )
+        };
+        let links = Arc::clone(&self.links);
+        let member_boot =
+            move |node: NodeId| boots.get(&node).copied().or_else(|| links.boot_of(node));
+        let links = Arc::clone(&self.links);
+        let send = move |node: NodeId, msg: Msg| match senders.get(&node) {
+            Some(sender) => sender.send(msg).map_err(|_| NodeStopped(node)),
+            None => links.post(node, msg).map_err(|_| NodeStopped(node)),
+        };
+        let within = heal_within(&budgets);
+        let ctx = admin::PromoteCtx {
+            store,
+            budgets,
+            clock: self.clock,
+            to,
+            drop,
+            within,
+            // S2 pins the rf3 members and has no shadow yet; a later slice reads the pinned
+            // configuration from the owner instead.
+            members: admin::members(),
+            member_boot: Arc::new(member_boot),
+            send: Arc::new(send),
+        };
+        let (done, answer) = mpsc::channel();
+        rt.spawn(async move {
+            // The caller may have given up; then nobody needs the answer.
+            let _ = done.send(admin::promote(ctx).await);
+        });
+        let promoted = match answer.recv_timeout(within + Duration::from_secs(5)) {
+            Ok(Ok(promoted)) => promoted,
+            Ok(Err(error)) => {
+                tracing::warn!(to = to.0, %error, "db_promote_failed");
+                return Err(error.into());
+            }
+            Err(_) => {
+                tracing::warn!(to = to.0, "db_promote_unanswered");
+                return Err(ApiError {
+                    kind: ErrorKind::Unavailable,
+                    retry: RetryRule::NotWired,
+                    no_mutation: false,
+                    detail: format!(
+                        "the promote of node {} did not answer in time; it may have written: \
+                         promote again",
+                        to.0
+                    ),
+                    retry_after: None,
+                });
+            }
+        };
+        self.route.owner.store(to.0, Ordering::Relaxed);
+        tracing::info!(
+            owner = to.0,
+            prior = promoted.prior_owner.0,
+            dropped = promoted.dropped.0,
+            generation = promoted.generation.0,
+            "db_promoted"
+        );
+        Ok(promoted)
+    }
+
     /// Send `msg` to node 1. Crate tests only (the spike's heal).
     #[cfg(test)]
     pub(crate) fn send_owner(&self, msg: Msg) -> Result<(), NodeStopped> {
@@ -2745,20 +2878,20 @@ fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
     )
 }
 
-/// [`ReadyError::TimedOut`]'s phase when node 1 answered no status look in the time.
+/// [`ReadyError::TimedOut`]'s phase when the owner answered no status look in the time.
 const NO_ANSWER: &str = "unknown";
-/// [`ReadyError::TimedOut`]'s phase when node 1 runs no recovery.
+/// [`ReadyError::TimedOut`]'s phase when the owner runs no recovery.
 const NO_RECOVERY: &str = "none";
 
 /// [`ReadyError::TimedOut`]'s text (A-R230 Q3, #59): it never says "unknown", which read as a
-/// fault while node 1 was busy syncing, and it ends with the step.
-fn timed_out_text(within_ms: u128, phase: &str) -> String {
+/// fault while node 1 was busy syncing, it names the owner, and it ends with the step.
+fn timed_out_text(within_ms: u128, owner: NodeId, phase: &str) -> String {
     let seen = match phase {
         NO_ANSWER => error::ReadySeen::NoAnswer,
         NO_RECOVERY => error::ReadySeen::NoRecovery,
         phase => error::ReadySeen::Phase(phase),
     };
-    error::ready_timed_out_text(within_ms, seen)
+    error::ready_timed_out_text(within_ms, owner.0, seen)
 }
 
 /// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
@@ -5641,15 +5774,16 @@ mod tests {
     /// #59 (tester-s2), A-R230 Q3: `wait_ready`'s time-out never says "unknown", which read as
     /// a fault while node 1 was busy syncing, and ends with the step. Node 1 first answers no
     /// look in the time, then answers with no recovery. The `phase` field keeps its words, which
-    /// `rdb_dev` prints. Cut: `TimedOut` keeps the old text, "recovery phase unknown".
-    /// Unit (~200 ms): no node thread.
+    /// `rdb_dev` prints. A-R256: the text names the owner it asked, node 2 after a promote, and
+    /// its step is plain words, not an API name. Cut: `TimedOut` keeps the old text, "recovery
+    /// phase unknown"; or names node 1 whatever the owner.
+    /// Unit (~300 ms): no node thread.
     #[test]
-    fn m10_s2_a_wait_that_times_out_says_what_node_1_answered_and_what_to_do_next() {
+    fn m10_s2_a_wait_that_times_out_says_what_the_owner_answered_and_what_to_do_next() {
         let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
         db.timeouts.read = Duration::from_millis(50);
-        let step = "; next: call `wait_ready` again with a longer bound, or shut this Db down \
-                    and open the folder again, once; if that times out too, stop and report it \
-                    with this message";
+        let step = "; next: wait again for longer, or close the database and open its folder \
+                    again, once; if that times out too, stop and report it with this message";
 
         let silent = db.wait_ready(Duration::from_millis(60));
         let Err(error @ ReadyError::TimedOut { .. }) = &silent else {
@@ -5701,8 +5835,103 @@ mod tests {
                 "node 1 did not admit writes within 60 ms; node 1 runs no recovery{step}"
             ))
         );
+
+        // A promote moved the route to node 2, which answers nothing here: the text names it.
+        db.route.owner.store(2, Ordering::Relaxed);
+        let promoted = db.wait_ready(Duration::from_millis(60));
+        assert!(
+            matches!(
+                &promoted,
+                Err(ReadyError::TimedOut {
+                    owner: NodeId(2),
+                    ..
+                })
+            ),
+            "{promoted:?}"
+        );
+        assert_eq!(
+            promoted.map_err(|error| error.to_string()),
+            Err(format!(
+                "node 2 did not admit writes within 60 ms; node 2 answered no status look in \
+                 that time (it may be busy, for example syncing its copies){step}"
+            ))
+        );
         drop(db);
         node_1.join().expect("the stub");
+    }
+
+    /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
+    /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
+    /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
+    /// it. Puts landing on node 2 wait for W6's `CopyAheadOnControl` arm (A-R254): until it merges, node 2's host faults on it.
+    /// Cut: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced.
+    /// Integration (~5 s: the promote waits node 1's grant out).
+    #[config_log::retcd_test]
+    fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        db.put(b"a", b"1", None).expect("before the promote");
+        let status = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let before = status(&db, OWNER)
+            .recovered
+            .expect("node 1 recovered at the open");
+
+        let promoted = db.promote(NodeId(2), None).expect("promote");
+        assert_eq!(
+            (promoted.owner, promoted.prior_owner, promoted.dropped),
+            (NodeId(2), OWNER, OWNER)
+        );
+        assert!(
+            promoted.generation > before,
+            "{promoted:?} after {before:?}"
+        );
+        assert_eq!(db.route.owner(), NodeId(2), "the Db's calls go to node 2");
+        let second = status(&db, NodeId(2));
+        assert_eq!(
+            (second.recovered, second.role),
+            (Some(promoted.generation), "primary"),
+            "{second:?}"
+        );
+
+        let first = status(&db, OWNER);
+        assert_eq!(
+            first.fence,
+            Some(rdb_core::contracts::authority::DenyReason::Frozen),
+            "{first:?}"
+        );
+        db.route.owner.store(OWNER.0, Ordering::Relaxed);
+        let old = db.put(b"c", b"3", None);
+        db.route.owner.store(2, Ordering::Relaxed);
+        assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
+        db.shutdown();
+    }
+
+    /// A-R261: a `Db` with no control store (only one a crate test builds by hand, now that
+    /// every open keeps one) refuses a promote with the real cause and the call that fixes it,
+    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent.
+    /// Unit (~10 ms): no node thread.
+    #[test]
+    fn m10_s2_a_promote_on_a_db_with_no_control_store_names_the_cause_and_the_open_to_use() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let refused = db.promote(NodeId(2), None).expect_err("no control store");
+        assert_eq!(
+            (refused.kind, refused.no_mutation),
+            (ErrorKind::Unavailable, true),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "UNAVAILABLE (this Db was opened without a control store, so it cannot run admin \
+             commands such as promote: open it with Db::open, which connects it to one; next: \
+             retrying will not help: keep this Db's log and report this message)"
+        );
+        assert_eq!(mailbox.try_iter().count(), 0, "nothing was sent");
     }
 
     /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's

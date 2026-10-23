@@ -1247,6 +1247,7 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         owner,
         within: Duration::from_millis(300),
         member_boot: Arc::new(move |_| Some(open)),
+        owner_node: crate::admin::OWNER,
     }));
     let sent: Vec<_> = mailbox.try_iter().collect();
 
@@ -1347,6 +1348,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
         owner,
         within: Duration::from_millis(300),
         member_boot: Arc::new(|_| Some(BootId((1 << 16) + 1))),
+        owner_node: crate::admin::OWNER,
     }));
     let error = healed.expect_err("a grant still in use is not cleared");
     assert!(
@@ -2385,6 +2387,78 @@ fn m10_s2_three_node_processes_on_one_folder_heal_and_serve() {
     );
 }
 
+// ---- S2-3 then a reopen (A-R256 follow-up, W5): the heal after a promote ----
+
+/// A-R256 follow-up, arch-s2 B1/B2: after `admin promote 2`, the folder is closed and opened
+/// again. `partitions/1` names node 2, so the reopen's heal clears node 2's grant alone, plans
+/// node 2 primary and node 2 commits the next generation. Node 1's grant, frozen by the
+/// promote, is left at the revision the promote wrote it: clearing it is refused (frozen), and
+/// before this fix that refusal failed every reopen after a promote with `NotCleared` after
+/// 13 s. The write made before the promote reads back and a new one lands.
+/// Cuts: the heal clears node 1's grant first, as before: the reopen fails `NotCleared`. The plan
+/// keeps node 1 primary: node 2 commits but never admits, and the reopen times out.
+/// Integration (~5 s): a fresh open, a promote (waits out node 1's grant), one reopen.
+#[config_log::retcd_test]
+fn m10_s2_a_reopen_after_a_promote_heals_node_2_and_leaves_node_1s_grant_frozen() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let grant_1 = || {
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Grant(crate::admin::OWNER).encode()),
+            }))
+            .expect("get grants/1")
+            .record
+            .expect("grants/1 is present");
+        let record =
+            rdb_core::authority::grant::GrantRecord::decode(&found.value).expect("a grant record");
+        (found.mod_revision, record.frozen)
+    };
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    db.put(b"a", b"1", None).expect("a put");
+    let promoted = db.promote(NodeId(2), None).expect("promote");
+    let (frozen_at, frozen) = grant_1();
+    assert!(frozen, "the promote froze grants/1");
+    db.shutdown();
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen after a promote is ready");
+    assert!(
+        matches!(db.heal_state(), HealState::Handed(_)),
+        "{:?}",
+        db.heal_state()
+    );
+    assert_eq!(
+        db.route.owner(),
+        NodeId(2),
+        "the reopen's calls go to node 2"
+    );
+    let owner = db
+        .node_status()
+        .into_iter()
+        .find(|status| status.node == NodeId(2))
+        .expect("node 2 answers a status look");
+    assert_eq!(owner.role, "primary", "{owner:?}");
+    assert!(
+        owner
+            .recovered
+            .is_some_and(|generation| generation > promoted.generation),
+        "node 2 committed past the promote's {:?}: {owner:?}",
+        promoted.generation
+    );
+    assert_eq!(
+        grant_1(),
+        (frozen_at, true),
+        "the heal left node 1's frozen grant as the promote wrote it"
+    );
+    reads_back_and_writes(&db, "after the promote and a reopen");
+    db.shutdown();
+}
+
 /// A-R253: a node that `Db::restart_node` starts again opens with the `DbConfig::storage` this
 /// `Db` was opened with, not the engine's default. Each engine open logs the memtable budget it
 /// asked RocksDB for, as `write_buffer_bytes_asked` on its `storage_open` line, so node 3's line
@@ -2438,4 +2512,41 @@ fn m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with() {
         vec![ASKED as u64, ASKED as u64],
         "node 3's restart asks for the budget this Db was opened with, not the 64 MiB default"
     );
+}
+
+/// A-R261 (scenario G, W7's walk `lr kill 1; lr promote 2`): an app-only `Db` promotes. Node 1
+/// of the `Db` that runs the nodes is stopped; the app, which runs no node and reaches nodes 2
+/// and 3 over the links, runs `promote 2`. It is answered: node 2 owns partition 1 at a newer
+/// generation, node 1 is the one dropped, and the app's calls go to node 2.
+/// Cut: `open_app` keeps no control store; the promote is refused before it starts.
+/// Integration (~5 s): one fresh open until ready, a promote that waits node 1's grant out.
+#[config_log::retcd_test]
+fn m10_s2_g_an_app_only_db_promotes_node_2_while_node_1_is_stopped() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut nodes = open(&rt, dir.path(), &store).expect("the fresh open");
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    nodes.put(b"a", b"1", None).expect("a put");
+    lock(&nodes.nodes)
+        .iter_mut()
+        .find(|handle| handle.node == crate::admin::OWNER)
+        .expect("node 1 runs here")
+        .stop();
+
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let promoted = app
+        .promote(NodeId(2), None)
+        .unwrap_or_else(|error| panic!("the app's promote is answered: {error}"));
+    assert_eq!(
+        (promoted.owner, promoted.prior_owner, promoted.dropped),
+        (NodeId(2), crate::admin::OWNER, crate::admin::OWNER),
+        "{promoted:?}"
+    );
+    assert!(promoted.generation > Generation(1), "{promoted:?}");
+    assert_eq!(app.route.owner(), NodeId(2), "the app's calls go to node 2");
+    app.shutdown();
+    nodes.shutdown();
 }

@@ -41,6 +41,8 @@
 //! node this process runs. It waits up to 5 s for every link, then says one line per node,
 //! `link node=N up boot=B` or `link node=N down: <last dial error>`, and goes on either way: a
 //! dead node is what an admin run replaces. `admin status` says the records and those lines.
+//! `node restart`, `link hold` and `link drop` act on a node this process runs, so under
+//! `--nodes` each answers `err <line>: <verb> refused under --nodes: ..` and the run exits 1.
 //!
 //! `--client-id N` is a slice 2 flag this build does not run yet: it is refused with
 //! `not built yet: --client-id N; nothing was started`, and the run exits 2.
@@ -338,7 +340,19 @@
 //!                                         app then holds, with its request, and `status` says
 //!                                         what became of it. A put that did not apply prints
 //!                                         its own answer and leaves the drop armed
-//! admin promote [N] [--drop M] | admin rebuild N | admin damage-copy N --seq S
+//! admin promote <n> [--drop <m>]          make node n own partition 1 while its owner is dead
+//!                                         or cut off. The new configuration keeps every
+//!                                         member but m, by default the prior owner. It
+//!                                         waits out the prior owner's grant first, so it
+//!                                         can take the grant's length and some seconds.
+//!                                         Prints `promoted: node n owns partition 1 at
+//!                                         generation G (was node P); node m dropped`.
+//!                                         A refusal prints `err admin promote: <error>`
+//!                                         and the run exits 1. Known gap: under `--nodes`
+//!                                         (`lr promote`) this build answers INVALID_ARGUMENT
+//!                                         "built without budgets", because the app-only
+//!                                         `Db` opens with none
+//! admin rebuild N | admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
 //!                                         answers `not built yet: <verb>; nothing was done`,
@@ -1582,6 +1596,12 @@ fn repl<'scope, 'env>(
                 continue;
             }
         }
+        if let Some(verb) = app_only_refusal(&words).filter(|_| !args.nodes.is_empty()) {
+            tracing::warn!(verb, "repl_app_only_refused");
+            say(&format!("err {line}: {verb} {APP_ONLY_REFUSED}"));
+            bad = true;
+            continue;
+        }
         if let Some(verb) = not_built(&words) {
             tracing::warn!(verb, "repl_not_built");
             say(&format!("not built yet: {verb}; nothing was done"));
@@ -1741,6 +1761,15 @@ fn repl<'scope, 'env>(
                 );
                 Ok(())
             }
+            ["admin", "promote", rest @ ..] => {
+                parse_promote(rest).map(|(to, drop)| match promote_line(db, to, drop) {
+                    Ok(line) => say(&line),
+                    Err(line) => {
+                        say(&line);
+                        bad = true;
+                    }
+                })
+            }
             ["admin", "status"] => {
                 admin_status_lines(rt, db, store)
                     .iter()
@@ -1748,7 +1777,8 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["admin", ..] => Err(format!(
-                "admin status | admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | \
+                "admin status | {PROMOTE_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                 clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
             )),
@@ -1845,7 +1875,6 @@ fn repl<'scope, 'env>(
 /// command`. Each line leaves this list when its verb is built.
 fn not_built(words: &[&str]) -> Option<&'static str> {
     Some(match words {
-        ["admin", "promote", ..] => "admin promote [N] [--drop M]",
         ["admin", "rebuild", ..] => "admin rebuild N",
         ["admin", "damage-copy", ..] => "admin damage-copy N --seq S",
         ["node", "restart", _, "--wipe"] => "node restart N --wipe",
@@ -1854,6 +1883,77 @@ fn not_built(words: &[&str]) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// `admin promote`'s usage (A-R245).
+const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are 1, 2 or 3; without \
+                             --drop the prior owner is dropped";
+
+/// `admin promote N [--drop M]`'s words after `promote`: the node to own partition 1, and the
+/// node to drop, `None` for `Db::promote`'s default, the prior owner. A node cannot be both.
+fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
+    let (to, drop) = match rest {
+        [to] => (parse_node(to)?, None),
+        [to, "--drop", drop] => (parse_node(to)?, Some(parse_node(drop)?)),
+        _ => return Err(PROMOTE_USAGE.to_owned()),
+    };
+    if drop == Some(to) {
+        return Err(format!(
+            "node {} cannot be promoted and dropped at once; {PROMOTE_USAGE}",
+            to.0
+        ));
+    }
+    Ok((to, drop))
+}
+
+/// `admin promote`'s one line on success (lead, A-R245, A-R256): the new owner, the generation
+/// it committed, the prior owner and the member the new configuration leaves out.
+fn promoted_line(promoted: &admin::Promoted) -> String {
+    format!(
+        "promoted: node {} owns partition 1 at generation {} (was node {}); node {} dropped",
+        promoted.owner.0, promoted.generation.0, promoted.prior_owner.0, promoted.dropped.0
+    )
+}
+
+/// `admin promote <n> [--drop <m>]`'s answer: `promoted: ..`, or `Err` with `err admin promote:
+/// ..` and the error's own text, which names the next step; the run then exits 1.
+fn promote_line(db: &Db, to: NodeId, drop: Option<NodeId>) -> Result<String, String> {
+    say(&format!(
+        "promote: node {} takes partition 1; this first waits out the prior owner's grant",
+        to.0
+    ));
+    match db.promote(to, drop) {
+        Ok(promoted) => {
+            tracing::info!(
+                owner = promoted.owner.0,
+                prior_owner = promoted.prior_owner.0,
+                dropped = promoted.dropped.0,
+                generation = promoted.generation.0,
+                "repl_promoted"
+            );
+            Ok(promoted_line(&promoted))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "repl_promote_refused");
+            Err(format!("err admin promote: {error}"))
+        }
+    }
+}
+
+/// The verb a command names when it acts on a node this process runs, refused under `--nodes`
+/// (A-R245), or `None`. Under `--nodes` no node runs here, so such a verb would act on nothing.
+/// The line answers `err <line>: <verb> refused under --nodes: ..` and the run exits 1.
+fn app_only_refusal(words: &[&str]) -> Option<&'static str> {
+    Some(match words {
+        ["node", "restart", ..] => "node restart",
+        ["link", "hold", ..] => "link hold",
+        ["link", "drop", ..] => "link drop",
+        _ => return None,
+    })
+}
+
+/// Why [`app_only_refusal`]'s verbs are refused, after the verb's name.
+const APP_ONLY_REFUSED: &str = "refused under --nodes: it acts on a node this process runs, and \
+                                this process runs none";
 
 /// How a REPL run ends: 1 when a line was bad or an append to `--requests F` failed (k214).
 fn exit_code(bad: bool, sent: &Sent) -> ExitCode {
@@ -4397,16 +4497,19 @@ fn wait_recovered(
 }
 
 /// `wait ready`'s line after a slice that ran out, from [`ReadyError::TimedOut`]'s documented
-/// `phase`: "unknown" is node 1 answering no status look in that slice, which the line says in
-/// words rather than as a fault (A-R245, #59); "none" is node 1 running no recovery.
+/// `owner` and `phase`: "unknown" is the owner answering no status look in that slice, which the
+/// line says in words rather than as a fault (A-R245, #59); "none" is the owner running no
+/// recovery. The owner is the node `wait_ready` asked: node 2 after a promote (A-R256).
 ///
 /// [`ReadyError::TimedOut`]: rdb_api::db::ReadyError::TimedOut
-fn still_waiting_line(phase: &str) -> String {
+fn still_waiting_line(owner: NodeId, phase: &str) -> String {
+    let owner = owner.0;
     match phase {
-        "unknown" => "still waiting for ready: node 1 answered no status look in that time (it \
-                      may be busy, for example syncing its copies, or down)"
-            .to_owned(),
-        "none" => "still waiting for ready: node 1 runs no recovery".to_owned(),
+        "unknown" => format!(
+            "still waiting for ready: node {owner} answered no status look in that time (it may \
+             be busy, for example syncing its copies, or down)"
+        ),
+        "none" => format!("still waiting for ready: node {owner} runs no recovery"),
         phase => format!("still waiting for ready: recovery phase {phase}"),
     }
 }
@@ -4442,18 +4545,19 @@ fn wait_ready_line(
     let answer = loop {
         let slice = left.min(every);
         match wait(slice) {
-            Err(ReadyError::TimedOut { phase, .. }) if slice < left => {
+            Err(ReadyError::TimedOut { owner, phase, .. }) if slice < left => {
                 left -= slice;
                 tracing::info!(
                     phase = phase.as_str(),
                     waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "repl_wait_progress"
                 );
-                said(&still_waiting_line(&phase));
+                said(&still_waiting_line(owner, &phase));
             }
-            Err(ReadyError::TimedOut { phase, .. }) => {
+            Err(ReadyError::TimedOut { owner, phase, .. }) => {
                 break Err(ReadyError::TimedOut {
                     within_ms: within.as_millis(),
+                    owner,
                     phase,
                 })
             }
@@ -6403,7 +6507,7 @@ mod tests {
         let progress = Progress::default();
         let started = Instant::now();
         let recovered = wait_recovered(&progress, Duration::from_secs(2), || {
-            HealState::Failed(admin::HealError::NodeStopped)
+            HealState::Failed(admin::HealError::NodeStopped { node: NodeId(1) })
         })
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
         assert!(
@@ -6416,7 +6520,11 @@ mod tests {
             &progress,
             Duration::from_secs(2),
             WAIT_PROGRESS_EVERY,
-            |_| Err(ReadyError::Heal(admin::HealError::NodeStopped)),
+            |_| {
+                Err(ReadyError::Heal(admin::HealError::NodeStopped {
+                    node: NodeId(1),
+                }))
+            },
             |_| (),
         )
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
@@ -6479,6 +6587,7 @@ mod tests {
             |_| {
                 Err(ReadyError::TimedOut {
                     within_ms: 10,
+                    owner: NodeId(1),
                     phase: "Discovering".to_owned(),
                 })
             },
@@ -6595,8 +6704,6 @@ mod tests {
     #[test]
     fn slice_2_verbs_and_flags_answer_not_built_yet_by_name() {
         for (line, verb) in [
-            ("admin promote", "admin promote [N] [--drop M]"),
-            ("admin promote 2 --drop 3", "admin promote [N] [--drop M]"),
             ("admin rebuild 1", "admin rebuild N"),
             ("admin damage-copy 2 --seq 4", "admin damage-copy N --seq S"),
             ("node restart 1 --wipe", "node restart N --wipe"),
@@ -6608,6 +6715,7 @@ mod tests {
         }
         for line in [
             "node restart 1",
+            "admin promote 2 --drop 3",
             "admin clear x",
             "control",
             "link drop 1-2",
@@ -6849,6 +6957,7 @@ mod tests {
         use rdb_api::db::ReadyError;
         let timed_out = |slice: Duration| ReadyError::TimedOut {
             within_ms: slice.as_millis(),
+            owner: NodeId(1),
             phase: "ProposalUnresolved".to_owned(),
         };
         let progress = Progress::default();
@@ -6872,9 +6981,9 @@ mod tests {
         assert_eq!(
             line,
             "timeout waiting for ready after 25s: node 1 did not admit writes within 25000 ms; \
-             node 1's recovery phase is ProposalUnresolved; next: call `wait_ready` again with \
-             a longer bound, or shut this Db down and open the folder again, once; if that \
-             times out too, stop and report it with this message"
+             node 1's recovery phase is ProposalUnresolved; next: wait again for longer, or \
+             close the database and open its folder again, once; if that times out too, stop \
+             and report it with this message"
         );
 
         // Ready in the second slice: one line said, then the reached line.
@@ -6899,11 +7008,12 @@ mod tests {
     }
 
     /// A-R245: a slice in which node 1 gave no status answer said `recovery phase unknown`,
-    /// which read as a fault. Each slice now says what node 1 answered: nothing, no recovery,
-    /// or its phase. Cut: print `recovery phase {phase}` for every phase and the first two
-    /// lines go red. Unit.
+    /// which read as a fault. Each slice now says what the owner answered: nothing, no
+    /// recovery, or its phase. A-R256: the owner is named, node 2 here as after a promote.
+    /// Cut: print `recovery phase {phase}` for every phase, or name node 1 always, and the
+    /// first two lines go red. Unit.
     #[test]
-    fn still_waiting_says_what_node_1_answered() {
+    fn still_waiting_says_what_the_owner_answered() {
         use rdb_api::db::ReadyError;
         let phases = ["unknown", "none", "ProposalUnresolved"];
         let (mut slices, mut said) = (0, Vec::new());
@@ -6916,6 +7026,7 @@ mod tests {
                 match phases.get(slices - 1) {
                     Some(phase) => Err(ReadyError::TimedOut {
                         within_ms: slice.as_millis(),
+                        owner: NodeId(2),
                         phase: (*phase).to_owned(),
                     }),
                     None => Ok(()),
@@ -6927,9 +7038,9 @@ mod tests {
         assert_eq!(
             said,
             [
-                "still waiting for ready: node 1 answered no status look in that time (it may be \
+                "still waiting for ready: node 2 answered no status look in that time (it may be \
                  busy, for example syncing its copies, or down)",
-                "still waiting for ready: node 1 runs no recovery",
+                "still waiting for ready: node 2 runs no recovery",
                 "still waiting for ready: recovery phase ProposalUnresolved",
             ]
         );
@@ -7030,6 +7141,69 @@ mod tests {
         assert_eq!(link_lines(&never), ["link node=1 down: not reached yet"]);
     }
 
+    /// A-R245 (lead, on 22dd78d): under `--nodes`, the verbs that act on a node this process
+    /// runs are refused by name; the verbs beside them are not. Cut: drop the `link drop` arm
+    /// and its line goes red. Unit.
+    #[test]
+    fn app_only_refuses_the_verbs_that_act_on_a_local_node() {
+        for (line, verb) in [
+            ("node restart 1", "node restart"),
+            ("node restart 2 --wipe", "node restart"),
+            ("link hold 1-2", "link hold"),
+            ("link drop 2-3", "link drop"),
+        ] {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(app_only_refusal(&words), Some(verb), "{line}");
+        }
+        for line in [
+            "link heal 1-2",
+            "links",
+            "admin status",
+            "nodes",
+            "wait ready 5",
+        ] {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(app_only_refusal(&words), None, "{line} still runs");
+        }
+    }
+
+    /// A-R245: `admin promote N [--drop M]` reads the node to promote and the one to drop,
+    /// `None` leaving `Db::promote` to drop the prior owner; one node cannot be both, and the
+    /// success line names the new owner, generation, prior owner and dropped node (A-R256).
+    /// Cut: drop the `drop == to` check and the `2 --drop 2` line goes red. Unit.
+    #[test]
+    fn admin_promote_reads_its_nodes_and_says_one_line() {
+        fn words(line: &str) -> Vec<&str> {
+            line.split_whitespace().collect()
+        }
+        assert_eq!(parse_promote(&words("2")), Ok((NodeId(2), None)));
+        assert_eq!(
+            parse_promote(&words("2 --drop 3")),
+            Ok((NodeId(2), Some(NodeId(3))))
+        );
+        assert_eq!(
+            parse_promote(&words("2 --drop 2")),
+            Err(format!(
+                "node 2 cannot be promoted and dropped at once; {PROMOTE_USAGE}"
+            ))
+        );
+        for bad in ["", "4", "2 --drop", "2 3", "2 --drop 3 x"] {
+            assert!(parse_promote(&words(bad)).is_err(), "{bad:?}");
+        }
+        let promoted = admin::Promoted {
+            owner: NodeId(2),
+            prior_owner: NodeId(1),
+            dropped: NodeId(3),
+            generation: Generation(3),
+            frozen_grant: rdb_core::contracts::ids::GrantId(1),
+            control_revision: rdb_core::contracts::ids::Revision(40),
+        };
+        assert_eq!(
+            promoted_line(&promoted),
+            "promoted: node 2 owns partition 1 at generation 3 (was node 1); node 3 dropped"
+        );
+    }
+
     /// A-R245: `admin status` lists both prefixes through the store it is given, the Db's own,
     /// with the revision, and says `<undecodable>` for a body it cannot read. Cut: list only
     /// `partitions/` and the grants line goes red. Unit.
@@ -7073,7 +7247,7 @@ mod tests {
     fn wait_ready_ends_on_the_first_final_answer_without_another_slice() {
         use rdb_api::db::ReadyError;
         let finals = [
-            ReadyError::Heal(admin::HealError::NodeStopped),
+            ReadyError::Heal(admin::HealError::NodeStopped { node: NodeId(1) }),
             ReadyError::Stopped {
                 note: "node 1 restarted".to_owned(),
             },

@@ -359,6 +359,11 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
 - **A restarted node stays out until the folder is opened again.** See section 5.
+- **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
+  `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
+  It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
+  can promote too. **A dropped node rejoins as a secondary at the next reopen heal; membership
+  is fixed at three nodes.**
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry
@@ -372,8 +377,8 @@ them. Nothing below removes data from the folder.
 A refused call (`put`, `get`, `read`, `write`, `status`) returns `ApiError`. Its text, `{}`, is
 `NAME (detail; next: step)`: the step is what to do now. `ApiError::next_step()` gives the step
 alone, and `ApiError::explain()` gives the detail with it. For example, a refusal while the
-database is not serving says `UNAVAILABLE (...; next: call `wait_ready` or `node_status` for
-the reason)`.
+database is not serving says `UNAVAILABLE (...; next: the database is not serving right now:
+wait a few seconds and try again; ...)`.
 
 **Refused for good.** No open of this folder, against this rEtcd, will ever succeed. Retrying
 does not help; the "what to do" column does.
@@ -425,7 +430,7 @@ column says what to change before the next open.
 | `OpenError::InUse` | Another open, in this process or another, holds the folder | Shut that one down first |
 | `OpenError::Control` | rEtcd did not answer, or failed, a read or the open count the open needs (a leader change, say) | Open again once rEtcd is up |
 | `OpenError::Bootstrap` | A new folder's first open could not set it up in rEtcd | Check that rEtcd is running and reachable, then open again |
-| `ReadyError::TimedOut` | Node 1 did not admit writes in time; the message names the recovery phase | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
+| `ReadyError::TimedOut` | The node that owns partition 1 did not admit writes in time. The message names that node (its `owner` field: node 1 normally, node 2 after `lr promote 2`) and what it last answered | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
 failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked` and

@@ -2625,6 +2625,57 @@ fn a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for() {
     );
 }
 
+/// Regression, #50 40-run check runs 16 and 22 (2026-10-23): a copy whose cursor asked for a
+/// snapshot, and which then took the head from the keepalive rather than from the cursor, is
+/// still reported caught up. C at 100 holds only the root and its head; B at 99 meets
+/// `NotRetained`, so the cursor asks for a snapshot and sends nothing. The consumer restores C's
+/// ladder from its engine. Before B asks again, the keepalive sends it 100, which B takes. B's
+/// ACK at 100 must end the catch-up with `CopyCaughtUp{B, 100, d100}`: F1's rebuild waits on
+/// it, and without it db's `m10_d7_below_the_base_a_copy_catches_up` stayed `Rebuilding` for
+/// 90 s whenever the keepalive beat B's second `NeedPrefix`.
+#[retcd_test]
+fn a_copy_that_asked_a_snapshot_and_took_the_head_from_the_keepalive_is_caught_up() {
+    let mut history = DigestLadder::new();
+    history.insert(Seq::ZERO, Digest::ROOT);
+    history.insert(Seq(100), d(100));
+    let tracker = ProgressTracker::new(TrackerInit {
+        config: takeover_config(),
+        own: CopyId(2),
+        lineage: authority(Generation(5), NEW_EPOCH),
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(100),
+            buffered_applied: AppliedSeq(100),
+            durable: DurableSeq(100),
+        },
+    })
+    .expect("C's tracker");
+    let mut primary = Primary::new(tracker);
+    assert_eq!(b_needs(&mut primary, 99), [snapshot_b()]);
+    assert_eq!(primary.restore_history(&engine_rungs(100)), Ok(()));
+
+    let round = primary.on_admission(false, Tick(4));
+    assert!(
+        round.contains(&sends_b(100)),
+        "the keepalive sends B the head: {round:?}"
+    );
+    let caught_up = EffectKind::Kernel(KernelEffect::CopyCaughtUp {
+        copy: CopyId(1),
+        head: Seq(100),
+        digest: d(100),
+    });
+    let effects = b_acks(&mut primary, 100);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| **effect == caught_up)
+            .count(),
+        1,
+        "{effects:?}"
+    );
+    assert!(primary.cursor(CopyId(1)).is_none(), "the cursor is done");
+}
+
 // --- RecoveryAppend (§3.2a) ---------------------------------------------------------------
 
 /// `module()` after a takeover that re-anchored at `(10, d10)` at revision `REVISION`.
