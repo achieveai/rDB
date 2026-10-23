@@ -370,9 +370,10 @@ pub enum OpenError {
     #[error("{0} is in use by another open")]
     InUse(PathBuf),
     /// A copy is missing or holds no database while another copy holds data. Nothing was started
-    /// and nothing was removed.
+    /// and nothing was removed. This build does not rebuild a copy (slice 2's S2-4 will).
     #[error(
-        "{0} is missing or empty while another copy holds data; this directory cannot be opened"
+        "{0} is missing or empty while another copy holds data; this directory cannot be opened. \
+         Restore that copy from a backup of this directory, then open it again"
     )]
     CopyMissing(PathBuf),
     /// The copies hold data but name no rDB instance: an M9 directory, which this build does not
@@ -385,8 +386,12 @@ pub enum OpenError {
     /// instances, or the store's `partitions/1` or open counter does not name this one.
     #[error("this directory and the control store do not belong together: {0}")]
     Mismatch(String),
-    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward.
-    #[error("no copy holds generation {generation} that partitions/1 names: {detail}")]
+    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward: this
+    /// directory is an older copy of the database, which is history.
+    #[error(
+        "no copy holds generation {generation} that partitions/1 names: {detail}. This directory \
+         is an older copy of the database: open the folder that holds the current copies instead"
+    )]
     Stale {
         /// The record's generation.
         generation: u64,
@@ -570,7 +575,7 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
-        let limits = limits(config.dedup_cap)?;
+        let limits = limits(config.dedup_cap).map_err(open_refused)?;
         let budgets = Budgets {
             dedup_retention_millis: config
                 .dedup_retention
@@ -598,7 +603,8 @@ impl Db {
                 host::spawn_on(node, engine, links, control, clock, budgets, limits, boot)
             },
         )
-        .await?;
+        .await
+        .map_err(open_refused)?;
         db.respawn = Some(respawn);
         Ok(db)
     }
@@ -1949,6 +1955,27 @@ struct Found {
     fresh: bool,
 }
 
+/// Log a refused open as `db_open_refused`, with its kind and its text, and hand it back. An
+/// open reads no app object, so the text holds paths, generations and instance ids, never key
+/// or value text.
+fn open_refused(error: OpenError) -> OpenError {
+    let kind = match &error {
+        OpenError::InUse(_) => "InUse",
+        OpenError::CopyMissing(_) => "CopyMissing",
+        OpenError::Unbound(_) => "Unbound",
+        OpenError::Mismatch(_) => "Mismatch",
+        OpenError::Stale { .. } => "Stale",
+        OpenError::Counter(_) => "Counter",
+        OpenError::Control(_) => "Control",
+        OpenError::Node(_) => "Node",
+        OpenError::Bootstrap(_) => "Bootstrap",
+        OpenError::DedupCap { .. } => "DedupCap",
+        OpenError::Io(_) => "Io",
+    };
+    tracing::warn!(kind, error = %error, "db_open_refused");
+    error
+}
+
 /// The words for a new folder against a store that serves another database (tester D1): both
 /// databases, and what to do instead.
 fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
@@ -2286,6 +2313,9 @@ fn send_wait(deadline: Duration) -> Duration {
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod open_refusal_tests;
 
 #[cfg(test)]
 mod tests {
