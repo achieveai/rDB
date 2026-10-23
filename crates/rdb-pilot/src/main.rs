@@ -1,26 +1,31 @@
 //! `pilot_kv`: a small app that keeps its data in rDB (M10 slice 1, arch-m10 R3c).
 //!
 //! ```text
-//! pilot_kv --dir D --control E [--log-dir L] [--ready-secs S] [--write N] [--verify] [--bench]
+//! pilot_kv --dir D --control E [--log-dir L] [--ready-secs S] [--write N] [--reopens K]
+//!          [--verify] [--bench]
 //! ```
 //!
 //! It opens the rDB folder `D` against the rEtcd at `E` (`host:port[,host:port...]`, plain
-//! gRPC), waits until it is ready, then does what its flags ask, in this order:
+//! gRPC), new or already holding data, waits until it is ready (`Db::wait_ready`), then does
+//! what its flags ask, in this order:
 //!
 //! * `--write N` puts N new keys, one at a time. After each acknowledged put it appends one line
 //!   to the ack journal `D/pilot_kv.journal` (`key request seq generation`), written straight to
 //!   the file before the next put, so a killed process loses no line it acknowledged. Keys are
 //!   `pilot/00000000`, `pilot/00000001`, ...; each run continues after the highest journalled
 //!   key. A key's value is derived from it, so the journal never stores values.
+//! * `--reopens K` shuts the database down and opens it again, K times, printing each
+//!   reopen's open-to-ready. `--verify` and `--bench` run after the last one.
 //! * `--verify` reads every journalled key back and checks its exact value: journal ⊆ present.
 //!   It prints `verified J/J ...` and exits 0, or names how many are missing or wrong and
 //!   exits 4. The one key after the highest journalled is the put a kill may have caught in
 //!   flight; finding it is allowed, and it is reported apart as `unjournalled_present`.
 //! * `--bench` reads every journalled key once and prints the get latency, p50 and p99.
 //!
-//! Every run prints `ready ms=<open-to-ready>`. Exits: 0 done; 1 a write or read failed; 2 bad
-//! arguments or setup; 3 `Db::open` refused the folder (`open refused: <Variant>: ...`);
-//! 4 `--verify` found a journalled key missing or wrong; 5 not ready in time.
+//! Every open prints `ready ms=<open-to-ready> heal=<HealState>` (`reopen i ready ...` for a
+//! reopen). Exits: 0 done; 1 a write or read failed; 2 bad arguments or setup; 3 the folder was
+//! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`); 4 `--verify`
+//! found a journalled key missing or wrong; 5 not ready in time.
 //!
 //! Logs go to `L/pilot_kv.jsonl` (default `D` with `.logs` appended) and never carry key or
 //! value text (ADR-0013, A-R154): the pilot logs counts and indices only.
@@ -33,7 +38,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use config_core::ConfigStore;
-use rdb_api::{Db, DbConfig, OpenError, Timeouts};
+use rdb_api::db::ReadyError;
+use rdb_api::{Db, DbConfig, Timeouts};
 
 /// The ack journal's file name, inside the rDB folder.
 const JOURNAL: &str = "pilot_kv.journal";
@@ -45,12 +51,13 @@ struct Args {
     log_dir: PathBuf,
     ready: Duration,
     write: Option<u64>,
+    reopens: u64,
     verify: bool,
     bench: bool,
 }
 
 const USAGE: &str = "usage: pilot_kv --dir D --control host:port[,host:port...] [--log-dir L] \
-                     [--ready-secs S] [--write N] [--verify] [--bench]";
+                     [--ready-secs S] [--write N] [--reopens K] [--verify] [--bench]";
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut dir = None;
@@ -58,6 +65,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut log_dir = None;
     let mut ready = Duration::from_secs(60);
     let mut write = None;
+    let mut reopens = 0;
     let mut verify = false;
     let mut bench = false;
     while let Some(arg) = args.next() {
@@ -87,6 +95,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .map_err(|_| format!("--write takes a count, got {text}"))?;
                 write = Some(n);
             }
+            "--reopens" => {
+                let text = value("--reopens")?;
+                reopens = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--reopens takes a count, got {text}"))?;
+            }
             "--verify" => verify = true,
             "--bench" => bench = true,
             other => return Err(format!("unknown argument {other}")),
@@ -107,6 +121,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         log_dir,
         ready,
         write,
+        reopens,
         verify,
         bench,
     })
@@ -310,35 +325,84 @@ fn run(args: &Args) -> ExitCode {
         dedup_cap: None,
         dedup_retention: None,
     };
-    let started = Instant::now();
-    tracing::info!(write = args.write, verify = args.verify, "pilot_open");
-    let opened = rt.block_on(Db::open(config, store, rt.handle().clone()));
-    let mut db = match opened {
+    tracing::info!(
+        write = args.write,
+        reopens = args.reopens,
+        verify = args.verify,
+        "pilot_open"
+    );
+    let mut db = match open_ready(&rt, &store, &config, args.ready, "ready") {
         Ok(db) => db,
-        Err(error) => {
-            let variant = open_variant(&error);
-            tracing::error!(variant, %error, "pilot_open_refused");
-            println!("open refused: {variant}: {error}");
-            return ExitCode::from(3);
-        }
+        Err(code) => return code,
     };
-    if let Err(waited) = wait_ready(&db, args.ready) {
-        println!("not ready after {waited:?}");
-        tracing::error!(millis = millis(waited), "pilot_not_ready");
+    let code = write_phase(&db, args);
+    if code != ExitCode::SUCCESS {
         db.shutdown();
-        return ExitCode::from(5);
+        return code;
     }
-    let ready = started.elapsed();
-    println!("ready ms={}", millis(ready));
-    tracing::info!(millis = millis(ready), "pilot_ready");
-    let code = act(&db, args);
+    for reopen in 1..=args.reopens {
+        db.shutdown();
+        let label = format!("reopen {reopen} ready");
+        db = match open_ready(&rt, &store, &config, args.ready, &label) {
+            Ok(db) => db,
+            Err(code) => return code,
+        };
+    }
+    let code = check_phase(&db, args);
     db.shutdown();
     code
 }
 
-/// The variant of an open refusal, for the line a script greps.
-fn open_variant(error: &OpenError) -> String {
-    let debug = format!("{error:?}");
+/// Open the folder and wait until node 1 admits writes. Prints `<label> ms=<open-to-ready>
+/// heal=<state>`. Exit 3 when the open is refused or a reopen's heal fails, 5 when it is not
+/// ready within `within`.
+fn open_ready(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    config: &DbConfig,
+    within: Duration,
+    label: &str,
+) -> Result<Db, ExitCode> {
+    let started = Instant::now();
+    let opened = rt.block_on(Db::open(
+        config.clone(),
+        Arc::clone(store),
+        rt.handle().clone(),
+    ));
+    let mut db = match opened {
+        Ok(db) => db,
+        Err(error) => {
+            let variant = variant(&error);
+            tracing::error!(variant, %error, "pilot_open_refused");
+            println!("open refused: {variant}: {error}");
+            return Err(ExitCode::from(3));
+        }
+    };
+    match db.wait_ready(within) {
+        Ok(()) => {}
+        Err(error @ ReadyError::Heal(_)) => {
+            tracing::error!(%error, "pilot_heal_failed");
+            println!("open refused: Heal: {error}");
+            db.shutdown();
+            return Err(ExitCode::from(3));
+        }
+        Err(error @ ReadyError::TimedOut { .. }) => {
+            tracing::error!(%error, "pilot_not_ready");
+            println!("not ready: {error}");
+            db.shutdown();
+            return Err(ExitCode::from(5));
+        }
+    }
+    let ready = started.elapsed();
+    let heal = variant(&db.heal_state());
+    println!("{label} ms={} heal={heal}", millis(ready));
+    tracing::info!(label, millis = millis(ready), heal, "pilot_ready");
+    Ok(db)
+}
+
+/// The variant name of an enum value, for the line a script greps.
+fn variant(value: &impl std::fmt::Debug) -> String {
+    let debug = format!("{value:?}");
     debug
         .split(|c: char| !c.is_alphanumeric())
         .next()
@@ -350,26 +414,8 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Wait until node 1, the owner, admits writes, polling `Db::node_status`. Err with the time
-/// waited when `within` passes first.
-fn wait_ready(db: &Db, within: Duration) -> Result<(), Duration> {
-    let started = Instant::now();
-    loop {
-        let admits = db
-            .node_status()
-            .iter()
-            .any(|status| status.node.0 == 1 && status.admits == Some(true));
-        if admits {
-            return Ok(());
-        }
-        if started.elapsed() >= within {
-            return Err(started.elapsed());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn act(db: &Db, args: &Args) -> ExitCode {
+/// `--write`: put new keys after the highest journalled one.
+fn write_phase(db: &Db, args: &Args) -> ExitCode {
     let path = args.dir.join(JOURNAL);
     let journal = match read_journal(&path) {
         Ok(journal) => journal,
@@ -386,6 +432,12 @@ fn act(db: &Db, args: &Args) -> ExitCode {
             return code;
         }
     }
+    ExitCode::SUCCESS
+}
+
+/// `--verify`, then `--bench`, over the journal as it stands.
+fn check_phase(db: &Db, args: &Args) -> ExitCode {
+    let path = args.dir.join(JOURNAL);
     let journal = match read_journal(&path) {
         Ok(journal) => journal,
         Err(error) => {
@@ -629,13 +681,16 @@ mod tests {
             "--write",
             "5",
             "--verify",
+            "--reopens",
+            "3",
         ])
         .expect("parses");
         assert_eq!(args.control, ["127.0.0.1:1", "127.0.0.1:2"]);
         assert_eq!(
-            (args.write, args.verify, args.bench),
-            (Some(5), true, false)
+            (args.write, args.reopens, args.verify, args.bench),
+            (Some(5), 3, true, false)
         );
+        assert!(parsed(&["--dir", "D", "--control", "c:1", "--reopens", "x"]).is_err());
         assert_eq!(args.log_dir, PathBuf::from("D.logs"));
     }
 }
