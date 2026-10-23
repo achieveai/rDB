@@ -289,6 +289,8 @@ fn put(request: u64, k: &[u8], value: &'static [u8]) -> TxnRequest {
             value: Bytes::from_static(value),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 

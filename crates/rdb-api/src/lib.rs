@@ -7,12 +7,14 @@
 //!
 //! * [`host`] — one thread per rDB node. It solely owns that node's `RocksEngine`, the six
 //!   modules and the adopted triple, and runs the duties no kernel emits (§4).
-//! * [`transport`] — [`transport::Links`], the in-process peer links, with a per-link hold.
+//! * [`transport`] — [`transport::Links`], the peer links, with a per-link hold.
+//! * [`net`] — [`net::Net`], links to nodes in other processes: tonic under mutual TLS (M10 S2).
 //! * [`control`] — [`control::ControlAdapter`], `ControlEffect` onto a `config_core::ConfigStore`.
 //! * [`admin`] — bootstrap of partition 1 through F1. It never injects `Recovered`.
 //! * [`db`] — [`Db`]: identities, deadlines, compiles and the §5.4 error mapping.
 //!
-//! All M9 nodes run in one process (Decision 1).
+//! All M9 nodes run in one process (Decision 1). From M10 S2 a node may run in its own process
+//! (`rdb_node`), reached through [`net`].
 //!
 //! # Values
 //!
@@ -36,22 +38,23 @@ pub mod clock;
 pub mod control;
 pub mod db;
 pub mod host;
+pub mod net;
 pub mod transport;
 
 #[cfg(test)]
 mod test_store;
 
 pub use db::{
-    app_request_id, ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, ReadOk, Timeouts,
-    TxnPut, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE,
+    app_request_id, ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, ReadOk,
+    StorageOptions, Timeouts, TxnPut, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE,
 };
 pub use host::{Change, ListEdit, Look, Seen};
 // The rdb-core types `Db`'s calls take and answer with, so an app depends on rdb-api alone
 // (A-R190): request ids, generations, the status answer and the error kinds.
 pub use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 pub use rdb_core::contracts::ids::{
-    AffinityId, BootId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity,
-    Seq,
+    AffinityId, BootId, ClientId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId,
+    RequestIdentity, Seq,
 };
 pub use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnResult, TxnStatus};
 // The value types an app builds a change from, by name only (S4 A-8): no `rdb_value` internals.

@@ -51,6 +51,29 @@ use crate::keys::{
 /// The `tracing` target of every event this crate emits.
 pub(crate) const LOG_TARGET: &str = "rdb_storage";
 
+/// RocksDB 0.23's own memtable budget per column family, which an engine keeps when
+/// [`StorageOptions::write_buffer_bytes`] is `None` (64 MiB).
+pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 << 20;
+
+/// Engine options a caller may set at open (ruling A-R248). The default is the engine as
+/// pinned in code: every option `None` leaves RocksDB's own value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageOptions {
+    /// The memtable budget of each column family, in bytes (RocksDB's `write_buffer_size`):
+    /// a column family whose memtable reaches it switches to a new one and flushes the full
+    /// one to an SST. `None` keeps [`DEFAULT_WRITE_BUFFER_BYTES`].
+    pub write_buffer_bytes: Option<usize>,
+}
+
+impl StorageOptions {
+    /// The memtable budget each column family opens with.
+    #[must_use]
+    pub fn effective_write_buffer_bytes(&self) -> usize {
+        self.write_buffer_bytes
+            .unwrap_or(DEFAULT_WRITE_BUFFER_BYTES)
+    }
+}
+
 /// Why [`RocksEngine::open`] or [`dump`] refused a directory.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -330,7 +353,19 @@ impl RocksEngine {
     ///
     /// [`OpenError::NoDatabase`] when `path` holds no database, else as [`Self::open`].
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf(), true).map_err(refused)
+        Self::open_existing_with(path, StorageOptions::default())
+    }
+
+    /// [`Self::open_existing`] with `options` (ruling A-R248).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_existing`].
+    pub fn open_existing_with(
+        path: impl AsRef<Path>,
+        options: StorageOptions,
+    ) -> Result<Self, OpenError> {
+        Self::open_inner(path.as_ref().to_path_buf(), true, options).map_err(refused)
     }
 
     /// Open, or create, the engine at `path`.
@@ -346,14 +381,27 @@ impl RocksEngine {
     ///
     /// An [`OpenError`] naming the refusal.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf(), false).map_err(refused)
+        Self::open_with(path, StorageOptions::default())
+    }
+
+    /// [`Self::open`] with `options` (ruling A-R248).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`].
+    pub fn open_with(path: impl AsRef<Path>, options: StorageOptions) -> Result<Self, OpenError> {
+        Self::open_inner(path.as_ref().to_path_buf(), false, options).map_err(refused)
     }
 
     /// The claim comes first, before any read of the directory (lead ruling A-R168). Without it
     /// a racing loser's read-only checks met the winner's `LOG`, or a copy it had not finished
     /// creating, and the loser was told `Backend` instead of `Locked`. RocksDB's `LOCK` stays as
     /// the second line.
-    fn open_inner(path: PathBuf, must_exist: bool) -> Result<Self, OpenError> {
+    fn open_inner(
+        path: PathBuf,
+        must_exist: bool,
+        storage: StorageOptions,
+    ) -> Result<Self, OpenError> {
         if must_exist && !path.is_dir() {
             return Err(OpenError::NoDatabase { path });
         }
@@ -369,7 +417,7 @@ impl RocksEngine {
             read_only(&path)?;
         }
         let options = db_options(!existed);
-        let db = DB::open_cf_descriptors(&options, &path, descriptors())
+        let db = DB::open_cf_descriptors(&options, &path, descriptors(storage))
             .map_err(|e| backend(&path, &e))?;
         let (created, format) = ensure_format(&db, &path, existed)?;
         let instance = read_instance(&db, &path)?;
@@ -396,6 +444,8 @@ impl RocksEngine {
             created,
             lineages = lineages.len(),
             instance_hex = instance.map(|id| hex(&id)),
+            // What the caller asked RocksDB for, not a size RocksDB reports back (A-R253).
+            write_buffer_bytes_asked = storage.effective_write_buffer_bytes(),
             "storage_open"
         );
         Ok(Self {
@@ -462,6 +512,31 @@ impl RocksEngine {
     #[must_use]
     pub fn wal_synced_through_latest(&self) -> bool {
         self.synced_seq == Some(self.db.latest_sequence_number())
+    }
+
+    /// What column family `cf`'s active memtable holds, as `(bytes, entries)`: RocksDB's
+    /// `rocksdb.cur-size-active-mem-table` and `rocksdb.num-entries-active-mem-table`. A
+    /// memtable that reached [`StorageOptions::write_buffer_bytes`] was switched out for a
+    /// flush, so its entries no longer count here (A-R248).
+    ///
+    /// # Errors
+    ///
+    /// When `cf` is not one of [`COLUMN_FAMILIES`], or RocksDB cannot answer.
+    pub fn active_memtable(&self, cf: &str) -> Result<(u64, u64), String> {
+        let handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| format!("no column family {cf}"))?;
+        let read = |property: &str| {
+            self.db
+                .property_int_value_cf(handle, property)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("RocksDB has no {property} for {cf}"))
+        };
+        Ok((
+            read("rocksdb.cur-size-active-mem-table")?,
+            read("rocksdb.num-entries-active-mem-table")?,
+        ))
     }
 
     /// The directory this engine is open on.
@@ -1489,10 +1564,20 @@ fn db_options(create: bool) -> Options {
     opts
 }
 
-fn descriptors() -> Vec<ColumnFamilyDescriptor> {
+/// Each of [`COLUMN_FAMILIES`]' options, RocksDB's own but for what `storage` sets (A-R248).
+/// RocksDB's `default` column family holds nothing of ours and keeps its own.
+fn cf_options(storage: StorageOptions) -> Options {
+    let mut opts = Options::default();
+    if let Some(bytes) = storage.write_buffer_bytes {
+        opts.set_write_buffer_size(bytes);
+    }
+    opts
+}
+
+fn descriptors(storage: StorageOptions) -> Vec<ColumnFamilyDescriptor> {
     COLUMN_FAMILIES
         .iter()
-        .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+        .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(storage)))
         .collect()
 }
 

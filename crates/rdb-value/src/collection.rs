@@ -459,6 +459,18 @@ fn element_value(
     }
 }
 
+/// `error` met at element `key`: a [`Corrupt`] fault is named by the key (#59, ruling A-R230), so
+/// the caller learns which entry to write over. Any other error passes as it is.
+fn at_element(key: &Value, error: ValueError) -> ValueError {
+    match error {
+        ValueError::Corrupt(corrupt) => ValueError::Corrupt(Corrupt::Element {
+            key: key.clone(),
+            error: Box::new(corrupt),
+        }),
+        other => other,
+    }
+}
+
 /// Check one element record under `root` as [`members`] checks it: its key, version and bytes
 /// (M9 S6, a clear's classification).
 pub(crate) fn check_element(
@@ -488,7 +500,7 @@ pub fn member(
         .map(|(version, bytes)| {
             Ok(Member {
                 key: key.clone(),
-                value: element_value(&found, version, &bytes)?,
+                value: element_value(&found, version, &bytes).map_err(|e| at_element(key, e))?,
                 version,
             })
         })
@@ -550,7 +562,13 @@ pub fn members(
         // A newer build's entry is named before its key is decoded (M9 S7).
         if found.kind == CollectionKind::Map {
             if let Some(error) = newer_build(&bytes) {
-                return Err(ValueError::Corrupt(Corrupt::Envelope(error)));
+                let error = ValueError::Corrupt(Corrupt::Envelope(error));
+                // Named by its key when the key decodes; a key this build cannot decode is
+                // the newer build's too, and is answered as before.
+                return Err(match decode_element_key(root, &key) {
+                    Ok(element) => at_element(&element, error),
+                    Err(_) => error,
+                });
             }
         }
         let element =
@@ -558,9 +576,10 @@ pub fn members(
         let version = snapshot
             .version(Namespace::User, &key)
             .ok_or(ValueError::Corrupt(Corrupt::VersionWithoutValue))?;
+        let value = element_value(&found, version, &bytes).map_err(|e| at_element(&element, e))?;
         out.push(Member {
             key: element,
-            value: element_value(&found, version, &bytes)?,
+            value,
             version,
         });
     }

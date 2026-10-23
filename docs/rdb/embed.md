@@ -119,6 +119,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         local: rdb_api::db::ALL_NODES.to_vec(),
         links: None,
         client: rdb_api::db::DEFAULT_CLIENT,
+        boot: None,
+        storage: rdb_api::StorageOptions::default(),
     };
     // The same call opens a new folder or one that already holds data.
     let mut db = rt.block_on(Db::open(config, store, rt.handle().clone()))?;
@@ -323,6 +325,10 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
 
 ### Known limits in this release
 
+- **A three-process database runs on one machine only, for now.** It is formed once, in one
+  process, on one machine. Each node process then opens its own `nodes/<n>` in that shared
+  folder. Forming a new database over the network is not supported yet. A node process started
+  on a folder that was never formed is refused with "form the database first (lr up)".
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
@@ -332,7 +338,9 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   - a map: `put` the key again (or `del` it);
   - a set: `del` the member, or `del` then `add` it in one write.
 
-  That repairs the one entry and keeps every healthy one (ADR-rdb-0013).
+  That repairs the one entry and keeps every healthy one (ADR-rdb-0013). In `rdb_dev`,
+  `admin repair-element map|set <object> <K>` does this: it deletes key `K` only if it is there,
+  and answers `CONDITION_FAILED` if it is not.
 - **Finding the bad key.** The error does not name it; a later release will. Until then, read
   one entry at a time, `db.read(object, Look::Members { after, limit: 1 })`, with `after` set to
   the key you read last (`None` to start). The read that fails is the entry right after the last
@@ -360,6 +368,12 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
 
 `Db::open` returns `OpenError`; `wait_ready` returns `ReadyError` (in `rdb_api::db`). Match on
 them. Nothing below removes data from the folder.
+
+A refused call (`put`, `get`, `read`, `write`, `status`) returns `ApiError`. Its text, `{}`, is
+`NAME (detail; next: step)`: the step is what to do now. `ApiError::next_step()` gives the step
+alone, and `ApiError::explain()` gives the detail with it. For example, a refusal while the
+database is not serving says `UNAVAILABLE (...; next: the database is not serving right now:
+wait a few seconds and try again; ...)`.
 
 **Refused for good.** No open of this folder, against this rEtcd, will ever succeed. Retrying
 does not help; the "what to do" column does.
@@ -411,7 +425,7 @@ column says what to change before the next open.
 | `OpenError::InUse` | Another open, in this process or another, holds the folder | Shut that one down first |
 | `OpenError::Control` | rEtcd did not answer, or failed, a read or the open count the open needs (a leader change, say) | Open again once rEtcd is up |
 | `OpenError::Bootstrap` | A new folder's first open could not set it up in rEtcd | Check that rEtcd is running and reachable, then open again |
-| `ReadyError::TimedOut` | Node 1 did not admit writes in time; the message names the recovery phase | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
+| `ReadyError::TimedOut` | The node that owns partition 1 did not admit writes in time. The message names that node (its `owner` field: node 1 normally, node 2 after `lr promote 2`) and what it last answered | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
 failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked` and

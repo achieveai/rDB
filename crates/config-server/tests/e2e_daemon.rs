@@ -2445,6 +2445,22 @@ async fn wait_on_policy_state(process: &DaemonProcess, state: serde_json::Value)
     }
 }
 
+/// The `reason` of every `policy_rejected` line in `log`, in order, consecutive repeats collapsed:
+/// the poller logs one per tick while a file stays bad, so the count is timing (#58).
+fn e46_rejection_reasons(log: &std::path::Path) -> Vec<String> {
+    let mut reasons = support::log_lines(log)
+        .iter()
+        .filter(|l| support::log_field(l, "@m") == Some("policy_rejected"))
+        .map(|l| {
+            support::log_field(l, "reason")
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    reasons.dedup();
+    reasons
+}
+
 /// Wait until `log` holds at least `want` lines carrying `@m == message`, or fail loudly.
 async fn wait_for_log_message(log: &std::path::Path, message: &str, want: usize) {
     let started = tokio::time::Instant::now();
@@ -2540,27 +2556,34 @@ async fn e2e_46_daemon_break_glass_rollback_is_audited() {
     for &index in &ordinary {
         fixtures[index].write(5, &E46_V5_PREFIXES, &[]);
     }
+    // The write is two renames. A tick between them sees the v5 signature beside the v9
+    // document and refuses it as `version_binding` before any `rollback` line, and every later
+    // tick logs `rollback` again (#58). So the row waits for the reason, not for a line count,
+    // and allows exactly that one earlier reason.
     for &index in &ordinary {
-        let log = support::log_file(&harness.nodes[index]);
-        wait_for_log_message(&log, "policy_rejected", 1).await;
+        let log = &support::log_file(&harness.nodes[index]);
+        let reasons = poll_until_async(deadline(10), Duration::from_millis(50), || async move {
+            let reasons = e46_rejection_reasons(log);
+            (reasons.last().map(String::as_str) == Some("rollback")).then_some(reasons)
+        })
+        .await
+        .unwrap_or_else(|Timeout { elapsed, .. }| {
+            panic!(
+                "node {}: no rollback refusal within {elapsed:?}: {:?}",
+                harness.nodes[index].node_id,
+                e46_rejection_reasons(log)
+            )
+        });
+        assert!(
+            reasons == ["rollback"] || reasons == ["version_binding", "rollback"],
+            "node {}: {reasons:?}",
+            harness.nodes[index].node_id
+        );
         let health = support::health(processes[index].health_endpoint()).await;
         assert_eq!(
             health.policy_version,
             Some(9),
             "a refused rollback must not move node {}'s active version: {health:#?}",
-            harness.nodes[index].node_id
-        );
-        let rejected: Vec<serde_json::Value> = support::log_lines(&log)
-            .into_iter()
-            .filter(|l| support::log_field(l, "@m") == Some("policy_rejected"))
-            .collect();
-        assert_eq!(
-            rejected
-                .last()
-                .and_then(|l| l.get("reason"))
-                .and_then(serde_json::Value::as_str),
-            Some("rollback"),
-            "node {}: {rejected:#?}",
             harness.nodes[index].node_id
         );
     }
@@ -2732,9 +2755,9 @@ fn e40_write_policy(dir: &std::path::Path, version: u64, grants: &[(&str, &str)]
     }
     .encode()
     .expect("an envelope encodes");
-    // Signature written first, exactly as `PolicyFixture::write` orders it: the poller reads
-    // the document then the signature, and the reverse order would hand it a `hash_mismatch` on
-    // every rotation for one tick.
+    // Signature written first, as `PolicyFixture::write` orders a rotation. Neither order hides
+    // a rotation: a tick between the two renames sees a mixed pair and refuses it (#58). This
+    // row counts no refusals, so that one tick is harmless here.
     write_staged(&dir.join("policy.json.sig"), &envelope);
     write_staged(&dir.join("policy.json"), &bytes);
 }

@@ -34,8 +34,8 @@ use bytes::Bytes;
 use rdb_core::authority::partition::INSTANCE_LEN;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
-    PartitionMode, Verdict,
+    AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, Boundary, DenyReason,
+    FenceCredential, FenceScope, FencingProof, Lineage, PartitionMode, Revocation, Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -51,7 +51,7 @@ use rdb_core::contracts::ids::{
     RequestIdentity, Revision, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
-use rdb_core::contracts::membership::{CopyId, PartitionConfig};
+use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
     DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
@@ -73,7 +73,9 @@ use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-use rdb_storage::{Inherited, PublishMark, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
+use rdb_storage::{
+    Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions, MAX_CHAIN_DEPTH,
+};
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
@@ -377,6 +379,16 @@ pub enum Msg {
         partition: PartitionId,
         /// Where the answer goes.
         reply: Sender<NodeStatus>,
+    },
+    /// Peer `node` started again as `boot` (#42, A-R249). Local only: the net handshake posts
+    /// it when it sees a new boot for a known peer, and [`crate::db::Db::restart_node`] does in
+    /// process. The record owner re-plans each partition whose pinned config holds a member at an
+    /// older boot than its link now reports; any other node logs `peer_booted_ignored`.
+    PeerBooted {
+        /// The peer that restarted.
+        node: NodeId,
+        /// Its new boot.
+        boot: BootId,
     },
     /// Stop the thread.
     Stop,
@@ -888,6 +900,7 @@ pub fn spawn(
         Budgets::SPEC_DEFAULTS,
         Limits::default(),
         BOOT,
+        StorageOptions::default(),
     )
 }
 
@@ -905,8 +918,10 @@ pub(crate) fn spawn_with(
     budgets: Budgets,
     limits: Limits,
     boot: BootId,
+    storage: StorageOptions,
 ) -> Result<NodeHandle, String> {
-    let engine = RocksEngine::open(&dir)
+    // The open's storage options, on a restart too (A-R253).
+    let engine = RocksEngine::open_with(&dir, storage)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
     spawn_on(node, engine, links, control, clock, budgets, limits, boot)
 }
@@ -926,7 +941,7 @@ pub(crate) fn spawn_on(
     boot: BootId,
 ) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
-    links.register(node, tx.clone());
+    links.register(node, tx.clone(), boot);
     let mut host = Host::new(node, engine, links, control, clock);
     host.boot = boot;
     host.budgets = budgets;
@@ -951,6 +966,20 @@ pub(crate) fn spawn_on(
         join: Some(join),
     })
 }
+
+/// The owner's re-plan of a partition after a member restarted (#42, A-R249; arch-s2 "Restart
+/// heal and drain"). A restarted copy is linked again only by a commit that pins its new boot,
+/// so the owner drains its own epoch and plans the next generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejoin {
+    /// `RevokeEpochRequested` for this epoch is with A1; the plan follows its `DrainProof`.
+    Revoking(OwnerEpoch),
+    /// The plan and its fence went to F1 for this generation; the commit ends the re-plan.
+    Planned(Generation),
+}
+
+/// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
+const REJOIN: CorrelationId = CorrelationId(3);
 
 /// A partition's activation marks on one node (ruling A-R184).
 #[derive(Debug, Default, Clone, Copy)]
@@ -1343,6 +1372,8 @@ struct Host {
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    /// Per partition, the restart re-plan this owner is running (#42, A-R249).
+    rejoins: BTreeMap<PartitionId, Rejoin>,
     /// The instance this node's engine is bound to when it started, whose open counter holds
     /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
     /// is marked, and nothing waits on a mark.
@@ -1445,6 +1476,7 @@ impl Host {
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
+            rejoins: BTreeMap::new(),
             instance: engine_instance,
             activation: BTreeMap::new(),
             after_commit,
@@ -1776,6 +1808,10 @@ impl Host {
             Msg::Client(client) => self.client(client),
             Msg::Inspect { partition, reply } => {
                 let _ = reply.send(self.status(partition));
+                Ok(())
+            }
+            Msg::PeerBooted { node, boot } => {
+                self.peer_booted(node, boot);
                 Ok(())
             }
             Msg::Stop => Ok(()),
@@ -3021,6 +3057,9 @@ impl Host {
             }
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 tracing::info!(node, ?fact, "authority_fact");
+                if *fact == AuthorityFact::DrainProof {
+                    self.drained(site)?;
+                }
             }
             KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
                 self.report_view(view);
@@ -3244,7 +3283,239 @@ impl Host {
         }
         self.schedule_acquire(result, site);
         self.watch_rebuild(result, partition);
+        self.rejoin_committed(partition, result.new_generation);
         Ok(())
+    }
+
+    /// #42 (A-R249): peer `node` started again as `boot`. Each partition with a commit here is
+    /// checked; only its pinned primary acts (arch-s2: the record owner always heals).
+    fn peer_booted(&mut self, node: NodeId, boot: BootId) {
+        let link_boot = self.links.boot_of(node).map(|boot| boot.0);
+        tracing::info!(
+            node = self.node.0,
+            peer = node.0,
+            boot = boot.0,
+            link_boot = ?link_boot,
+            "peer_booted"
+        );
+        if self.committed.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                peer = node.0,
+                boot = boot.0,
+                why = "no recovery has committed on this node",
+                "peer_booted_ignored"
+            );
+            return;
+        }
+        let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
+        for partition in partitions {
+            if let Some(why) = self.rejoin_if_stale(partition) {
+                tracing::info!(
+                    node = self.node.0,
+                    peer = node.0,
+                    boot = boot.0,
+                    partition = partition.0,
+                    why,
+                    "peer_booted_ignored"
+                );
+            }
+        }
+    }
+
+    /// Start the restart re-plan when this node is `partition`'s pinned primary and a member's
+    /// link reports a newer boot than the commit pinned: ask A1 to revoke the committed epoch,
+    /// whose `DrainProof` [`Self::drained`] plans from. `Some(why)` when nothing was started.
+    /// A re-plan already running is left alone: one still revoking plans at the live boots,
+    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]).
+    fn rejoin_if_stale(&mut self, partition: PartitionId) -> Option<&'static str> {
+        let Some(committed) = self.committed.get(&partition) else {
+            return Some("no commit for this partition");
+        };
+        let config = &committed.committed.pinned_config;
+        let owner = config
+            .members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if !owner {
+            return Some("not the partition's pinned primary");
+        }
+        let stale: Vec<(u32, u64, u64)> = config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .filter_map(|member| {
+                let live = self.links.boot_of(member.node)?;
+                (live > member.boot).then_some((member.node.0, member.boot.0, live.0))
+            })
+            .collect();
+        if stale.is_empty() {
+            return Some("every member's pinned boot is current");
+        }
+        if let Some(rejoin) = self.rejoins.get(&partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                rejoin = ?rejoin,
+                stale = ?stale,
+                "rejoin_pending"
+            );
+            return None;
+        }
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = committed.new_generation.0,
+            epoch = epoch.0,
+            stale = ?stale,
+            "rejoin_revoke"
+        );
+        self.rejoins.insert(partition, Rejoin::Revoking(epoch));
+        let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
+        self.push(
+            Site {
+                partition,
+                correlation: REJOIN,
+            },
+            EventKind::Kernel(KernelEvent::Authority(revoke)),
+            false,
+            None,
+        );
+        None
+    }
+
+    /// A1's `DrainProof`: the epoch the re-plan revoked is durable, so no write is admitted
+    /// under it again. Plan the next generation with every member at the boot its link reports
+    /// now, fenced by the drain at the commit's revision (#42; the sim's `reinspect_now`).
+    fn drained(&mut self, site: Site) -> Result<(), Fault> {
+        let partition = site.partition;
+        let Some(Rejoin::Revoking(epoch)) = self.rejoins.get(&partition).copied() else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                rejoin = ?self.rejoins.get(&partition),
+                "drain_proof_unasked"
+            );
+            return Ok(());
+        };
+        let committed = self.committed.get(&partition).ok_or_else(|| {
+            Fault::from(format!(
+                "drain proof for partition {} with no commit to plan from",
+                partition.0
+            ))
+        })?;
+        let root = committed.selected.root;
+        if root.owner_epoch != epoch {
+            return Err(Fault::from(format!(
+                "drain proof for partition {}: epoch {} was revoked but the commit now serves \
+                 epoch {}",
+                partition.0, epoch.0, root.owner_epoch.0
+            )));
+        }
+        let anchor = LineageAnchor {
+            lineage: root,
+            base_seq: committed.selected.cutoff_seq,
+            base_digest: committed.selected.cutoff_digest,
+        };
+        let pinned = &committed.committed.pinned_config;
+        let members: Vec<Member> = pinned
+            .members
+            .iter()
+            .map(|member| {
+                let boot = if member.node == self.node {
+                    self.boot
+                } else {
+                    // A member with no link keeps the boot it was pinned at: F1 then cannot
+                    // reach it, which its barrier names.
+                    self.links.boot_of(member.node).unwrap_or(member.boot)
+                };
+                Member { boot, ..*member }
+            })
+            .collect();
+        // A1's own view when it published one; the plan's otherwise. A1 replaces it at the
+        // install after commit either way (as `admin::heal`).
+        let (view, view_source) = match self.authority_views.get(&partition) {
+            Some(view) => (view, "published"),
+            None => (&committed.committed.authority_view, "committed"),
+        };
+        let revision = committed.committed.revision;
+        let version = ConfigVersion(pinned.config_version.0 + 1);
+        let generation = root.generation.next();
+        let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
+        let plan = crate::admin::recovery_plan(
+            anchor,
+            version,
+            members,
+            self.boot,
+            view.grant_id,
+            view.authority_generation,
+        );
+        let fence = FencingProof {
+            partition,
+            prior_generation: root.generation,
+            prior_owner_epoch: root.owner_epoch,
+            prior_grant_id: view.grant_id,
+            prior_boot_id: self.boot,
+            revocation: Revocation::DurableDrain {
+                ack_revision: revision,
+            },
+            control_revision: revision,
+            decision_tick: self.clock.now(),
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            config_version = version.0,
+            control_revision = revision.0,
+            view_source,
+            boots = ?boots,
+            "rejoin_plan"
+        );
+        self.rejoins.insert(partition, Rejoin::Planned(generation));
+        for event in [
+            RecoveryEvent::Plan(Box::new(plan)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ] {
+            self.push(
+                Site {
+                    partition,
+                    correlation: REJOIN,
+                },
+                EventKind::Kernel(KernelEvent::Recovery(event)),
+                false,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// The commit that ends a restart re-plan. A peer that restarted again while it ran was
+    /// pinned at its older boot, so the partition is checked once more: a newer boot supersedes
+    /// (arch-s2).
+    fn rejoin_committed(&mut self, partition: PartitionId, generation: Generation) {
+        let Some(Rejoin::Planned(planned)) = self.rejoins.get(&partition).copied() else {
+            return;
+        };
+        if generation < planned {
+            return;
+        }
+        self.rejoins.remove(&partition);
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            "rejoin_committed"
+        );
+        if let Some(why) = self.rejoin_if_stale(partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                why,
+                "rejoin_current"
+            );
+        }
     }
 
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
@@ -5470,9 +5741,33 @@ impl Host {
         puts: &[PutOp],
         remaining_millis: u64,
     ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
+        // A node that knows it is a secondary (it receives this partition's appends and is not
+        // its primary) sends the caller to the owner: `NOT_PRIMARY`, before the guard below,
+        // which would otherwise answer a retryable `UNAVAILABLE` and keep an app routed here
+        // (ruling A-R233). Never sent, so nothing mutated.
+        if self.replication.primary(self.node, partition).is_none()
+            && self.replication.receiver(self.node, partition).is_some()
+        {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                "client_compile_not_primary"
+            );
+            let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+                partition,
+                hint: None,
+            });
+            error.no_mutation = true;
+            error.detail = format!(
+                "node {} is a secondary of partition {}, not its owner; nothing was sent",
+                self.node.0, partition.0
+            );
+            return Ok(Err(error));
+        }
         let generation = self.adopted(partition).generation;
         // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
-        // Refused here and never sent (lead ruling on D1, 2026-10-07).
+        // Refused here and never sent (lead ruling on D1, 2026-10-07). The owner before it is
+        // ready keeps this answer (A-R233).
         if generation.0 == 0 {
             return Ok(Err(ApiError::not_adopted(self.node, partition)));
         }
@@ -5508,9 +5803,8 @@ impl Host {
             // The damaged chunk a Chunk or Publish arm met, with its upload, for the log (A-R132).
             let mut chunk = None;
             let compiled = match &put.change {
-                Change::Doc(delta) => {
-                    rdb_value::compile(view, &root, expected, delta).map_err(|e| compile_error(&e))
-                }
+                Change::Doc(delta) => rdb_value::compile(view, &root, expected, delta)
+                    .map_err(|e| compile_error(&root, &e)),
                 Change::Map(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
@@ -5518,7 +5812,7 @@ impl Host {
                     expected,
                     ops,
                 )
-                .map_err(|e| compile_error(&e)),
+                .map_err(|e| compile_error(&root, &e)),
                 Change::Set(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
@@ -5526,7 +5820,7 @@ impl Host {
                     expected,
                     ops,
                 )
-                .map_err(|e| compile_error(&e)),
+                .map_err(|e| compile_error(&root, &e)),
                 Change::List(edits) => list_compile(view, &root, expected, edits),
                 Change::Chunk { .. } | Change::Gc { .. } | Change::Clear
                     if put.expect.is_some() =>
@@ -5537,7 +5831,7 @@ impl Host {
                     )))
                 }
                 Change::Gc { floor } => rdb_value::blob::collect_garbage(view, &root, *floor)
-                    .map_err(|e| compile_error(&e)),
+                    .map_err(|e| compile_error(&root, &e)),
                 Change::Clear => self.clear(partition, identity, &root, view, published),
                 Change::Chunk {
                     upload,
@@ -5545,7 +5839,7 @@ impl Host {
                     bytes,
                 } => rdb_value::blob::put_chunk(view, &root, upload, *index, bytes).map_err(|e| {
                     chunk = damaged_chunk(&e).map(|index| (*upload, index));
-                    compile_error(&e)
+                    compile_error(&root, &e)
                 }),
                 // `serving` is the adopted generation the request will be fenced with
                 // (ADR-rdb-0014 §6 check 0).
@@ -5566,7 +5860,7 @@ impl Host {
                 )
                 .map_err(|e| {
                     chunk = damaged_chunk(&e).map(|index| (*upload, index));
-                    compile_error(&e)
+                    compile_error(&root, &e)
                 })
                 .and_then(|compiled| {
                     if compiled.mutations.is_empty() {
@@ -5601,6 +5895,8 @@ impl Host {
             remaining_millis,
             conditions,
             mutations,
+            acked_below: None,
+            pinned: Vec::new(),
         })))
     }
 
@@ -5670,14 +5966,14 @@ impl Host {
                     "not damaged",
                     "a write applied since may still be lost; clear again once it is published",
                 )?;
-                Err(compile_error(&error))
+                Err(compile_error(root, &error))
             }
             // No read gate (A-R139): none of these says the object is healthy or that nothing
             // is stored, and no_mutation=true holds on any view: INCOMPATIBLE_VERSION, a chunk
             // record at the root key (`KindMismatch`), a batch over the size limit, or
             // CORRUPT_HISTORY for a stored version with no value (`VersionWithoutValue`).
             Err(error) => {
-                let mut refused = compile_error(&error);
+                let mut refused = compile_error(root, &error);
                 if refused.kind == ErrorKind::IncompatibleVersion {
                     refused.detail.push_str("; not cleared");
                 }
@@ -6107,8 +6403,9 @@ fn fail_waiter(reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
     fault
 }
 
-/// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
-fn compile_error(error: &ValueError) -> ApiError {
+/// A value compile's refusal for the object at `root`, as the caller's error (§5.4 for documents,
+/// S0's subset).
+fn compile_error(root: &RootKey, error: &ValueError) -> ApiError {
     match error {
         // M9 S6: a clear of an object that reads back cleanly.
         ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks) => {
@@ -6140,7 +6437,11 @@ fn compile_error(error: &ValueError) -> ApiError {
             | Corrupt::ChunkMismatch { .. }
             | Corrupt::ChunkMissing { .. },
         ) => ApiError::new(ErrorKind::CorruptBlob, error.to_string()),
-        ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
+        // The caller's own object and element key, never a log's (#59, A-R230).
+        ValueError::Corrupt(corrupt) => match rdb_value::keys::parse(root.as_bytes()) {
+            Ok(parsed) => crate::db::error::corrupt_history(&parsed.object_id, corrupt),
+            Err(_) => crate::db::error::corrupt_history(root.as_bytes(), corrupt),
+        },
     }
 }
 
@@ -6207,8 +6508,10 @@ fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
 /// D9b: the code a damage line names stored damage by, never its `Display`, which for a map
 /// entry quotes the app's key (`Corrupt::Entry`). Exhaustive on purpose: a new variant is a
 /// compile error here, not a line that quietly falls back to the text.
-const fn damage_code(corrupt: &Corrupt) -> &'static str {
+fn damage_code(corrupt: &Corrupt) -> &'static str {
     match corrupt {
+        // The element's own fault; its key never reaches a log (#59, A-R230).
+        Corrupt::Element { error, .. } => damage_code(error),
         Corrupt::Envelope(_) => "envelope",
         Corrupt::Codec(_) => "codec",
         Corrupt::VersionWithoutValue => "version_without_value",
@@ -6351,7 +6654,7 @@ fn list_compile(
             }
         }
         .map(|compiled| compiled.compiled().clone())
-        .map_err(|e| compile_error(&e))
+        .map_err(|e| compile_error(root, &e))
     };
     let count = match expected {
         Expected::Absent => Ok(0),
@@ -6359,7 +6662,7 @@ fn list_compile(
         // because that refusal comes first.
         Expected::Version(_) => rdb_value::list::list(view, root)
             .map(|found| found.map_or(0, |list| list.count))
-            .map_err(|e| compile_error(&e)),
+            .map_err(|e| compile_error(root, &e)),
     };
     match count.and_then(|count| resolve_edits(edits, count)) {
         Ok(ops) => compile(&ops),
@@ -6453,6 +6756,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",
         Msg::Inspect { .. } => "inspect",
+        Msg::PeerBooted { .. } => "peer_booted",
         Msg::Stop => "stop",
     }
 }
@@ -6567,7 +6871,7 @@ fn object_answer_unchecked(
                 ValueError::Corrupt(corrupt) => Some(damage_code(corrupt)),
                 ValueError::Apply(_) => None,
             };
-            let error = compile_error(&error);
+            let error = compile_error(root, &error);
             log_stored_damage(node, root, &error, damage, chunk);
             Answer::Error {
                 error,

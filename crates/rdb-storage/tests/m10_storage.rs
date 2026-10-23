@@ -22,7 +22,10 @@ use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnResult};
 use rdb_core::transaction::dedup::{DedupIndex, SeedPending};
 use rdb_sim::storage::history::canonical_history;
-use rdb_storage::{dump, BindError, OpenError, PublishMark, RocksEngine, INSTANCE_LEN};
+use rdb_storage::{
+    dump, BindError, OpenError, PublishMark, RocksEngine, StorageOptions,
+    DEFAULT_WRITE_BUFFER_BYTES, INSTANCE_LEN,
+};
 
 const X: [u8; INSTANCE_LEN] = [0x11; INSTANCE_LEN];
 const Y: [u8; INSTANCE_LEN] = [0x22; INSTANCE_LEN];
@@ -757,4 +760,130 @@ fn stored_history(engine: &RocksEngine) -> Vec<Option<bytes::Bytes>> {
                 .map(|(record, _)| record)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// M10 S2 W9, ruling A-R248: the memtable budget is a storage option. Its default is RocksDB
+// 0.23's own, 64 MiB, so an engine opened without it is the engine as it was.
+// ---------------------------------------------------------------------------------------------
+
+/// The smallest budget RocksDB keeps as given; it raises anything smaller to this.
+const SMALL_BUFFER: usize = 64 << 10;
+
+/// `write_buffer_size` of each column family in the newest `OPTIONS-*` file RocksDB wrote at
+/// open, by column family name.
+fn write_buffer_sizes(dir: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let newest = std::fs::read_dir(dir)
+        .expect("read the database directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("OPTIONS-") && !name.ends_with(".dbtmp"))
+        })
+        .max()
+        .expect("RocksDB writes an OPTIONS file at open");
+    let text = std::fs::read_to_string(&newest).expect("read the OPTIONS file");
+    let mut sizes = std::collections::BTreeMap::new();
+    let mut cf = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line
+            .strip_prefix("[CFOptions \"")
+            .and_then(|rest| rest.strip_suffix("\"]"))
+        {
+            cf = Some(name.to_owned());
+        } else if line.starts_with('[') {
+            cf = None;
+        } else if let (Some(name), Some(value)) = (&cf, line.strip_prefix("write_buffer_size=")) {
+            sizes.insert(name.clone(), value.parse().expect("a byte count"));
+        }
+    }
+    sizes
+}
+
+/// The budget is applied to each of our column families as given; an open without it keeps
+/// 64 MiB. RocksDB's `default` column family holds nothing of ours and keeps its own 64 MiB.
+/// RocksDB's own `OPTIONS` file is the witness, and each open logs the value it asked for
+/// once, as `write_buffer_bytes_asked` on its `storage_open` line.
+#[retcd_test]
+fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
+    let every = |bytes: usize| {
+        let mut all: std::collections::BTreeMap<String, usize> = rdb_storage::keys::COLUMN_FAMILIES
+            .iter()
+            .map(|name| ((*name).to_owned(), bytes))
+            .collect();
+        all.insert("default".to_owned(), DEFAULT_WRITE_BUFFER_BYTES);
+        all
+    };
+    let small = data_dir("write-buffer-small");
+    drop(
+        RocksEngine::open_with(
+            &small,
+            StorageOptions {
+                write_buffer_bytes: Some(SMALL_BUFFER),
+            },
+        )
+        .expect("open with a small budget"),
+    );
+    assert_eq!(write_buffer_sizes(&small), every(SMALL_BUFFER));
+
+    let plain = data_dir("write-buffer-default");
+    drop(RocksEngine::open(&plain).expect("open"));
+    assert_eq!(DEFAULT_WRITE_BUFFER_BYTES, 64 << 20);
+    assert_eq!(
+        write_buffer_sizes(&plain),
+        every(DEFAULT_WRITE_BUFFER_BYTES),
+        "no option is RocksDB's own 64 MiB"
+    );
+
+    let logged: Vec<u64> = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged",
+    )
+    .iter()
+    .filter(|line| line["@m"] == "storage_open")
+    .map(|line| line["write_buffer_bytes_asked"].as_u64().expect("a number"))
+    .collect();
+    assert_eq!(
+        logged,
+        vec![SMALL_BUFFER as u64, DEFAULT_WRITE_BUFFER_BYTES as u64]
+    );
+}
+
+/// The same writes on two engines: under a 64 KiB budget the history column family's memtable
+/// filled, was switched out and flushed, so the active one holds less than a budget's worth
+/// and fewer entries than were written. Under the default every entry is still in memory.
+#[retcd_test]
+fn m10_s2_a_small_write_buffer_flushes_where_the_default_keeps_everything_in_memory() {
+    let cf = rdb_storage::keys::CF_HISTORY;
+    let active = |options: StorageOptions, name: &str| {
+        let dir = data_dir(name);
+        let mut engine = RocksEngine::open_with(&dir, options).expect("open");
+        write(&mut engine, 600);
+        assert!(
+            engine.active_memtable("no-such-cf").is_err(),
+            "an unknown name is an error"
+        );
+        engine.active_memtable(cf).expect("memtable properties")
+    };
+    let (held_bytes, held_entries) = active(StorageOptions::default(), "flush-default");
+    assert!(
+        held_bytes > 4 * SMALL_BUFFER as u64,
+        "the writes are several small budgets' worth: {held_bytes} bytes"
+    );
+    let (small_bytes, small_entries) = active(
+        StorageOptions {
+            write_buffer_bytes: Some(SMALL_BUFFER),
+        },
+        "flush-small",
+    );
+    assert!(
+        small_bytes <= 2 * SMALL_BUFFER as u64,
+        "the small budget switched its memtable out: {small_bytes} bytes active"
+    );
+    assert!(
+        small_entries < held_entries,
+        "entries left memory: {small_entries} active of {held_entries}"
+    );
 }

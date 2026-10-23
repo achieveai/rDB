@@ -30,7 +30,7 @@ use rdb_core::contracts::storage::{Namespace, Write};
 use rdb_core::contracts::trace::BudgetName;
 use rdb_core::contracts::txn::{
     key_scope, scoped_key, Condition, ConditionOutcome, Mutation, Outcome, TxnRequest,
-    KEY_SCOPE_LEN,
+    KEY_SCOPE_LEN, MAX_PINS,
 };
 use rdb_core::contracts::version::{VersionedArtifact, API_VERSION, ENVELOPE_VERSION};
 
@@ -94,6 +94,8 @@ fn request(remaining_millis: u64) -> TxnRequest {
             value: Bytes::from_static(b"v"),
             expected_version: Some(4),
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 
@@ -321,6 +323,124 @@ fn m7f_02_request_digest_covers_the_semantic_fields_only() {
     let mut other_api = request(1_000);
     other_api.api_version = 9;
     assert_ne!(base, other_api.request_digest(), "api_version is covered");
+}
+
+/// Ruling A-R252: the ack floor and its pins say what the client has been answered, which moves
+/// between a first send and its resend, so neither is in the request digest; a resend with a
+/// later floor is the same payload, not `REQUEST_ID_REUSE`. A request with no floor keeps the
+/// digest it had before the fields existed (pinned below as a golden). Ruling A-R259: the
+/// request crosses the peer wire in postcard, which is not self-describing, so it must
+/// round-trip whole with and without a floor; and JSON written before the fields still reads,
+/// as no floor and no pins.
+#[retcd_test]
+fn m10_s2_the_ack_floor_is_not_the_payload_and_crosses_postcard_whole() {
+    assert_eq!(MAX_PINS, 8);
+    let first = request(1_000);
+    let mut resend = request(1_000);
+    resend.acked_below = Some(3);
+    resend.pinned = vec![1, 2];
+    assert_eq!(
+        first.request_digest(),
+        resend.request_digest(),
+        "the floor and pins are not the payload"
+    );
+    assert_eq!(
+        first.request_digest().to_hex(),
+        "be896f14c9b2711f1b67c24883a849f6966ab421560fa666fa95e159eb3e3c98",
+        "a request with no floor keeps its digest"
+    );
+
+    for sent in [&first, &resend] {
+        let bytes = postcard::to_stdvec(sent).expect("postcard encode");
+        let got: TxnRequest = postcard::from_bytes(&bytes).expect("postcard decode");
+        assert_eq!(&got, sent, "the request crosses postcard whole");
+    }
+
+    let mut old = serde_json::to_value(&first).expect("serialise");
+    let keys = old.as_object_mut().expect("an object");
+    keys.remove("acked_below").expect("acked_below is written");
+    keys.remove("pinned").expect("pinned is written");
+    let read: TxnRequest = serde_json::from_value(old).expect("JSON without the fields reads");
+    assert_eq!(
+        read, first,
+        "JSON without the fields reads as no floor and no pins"
+    );
+}
+
+/// Ruling A-R255: an applied candidate carries the ack floor only when its envelope records
+/// one. Ruling A-R259: a candidate crosses the peer wire in postcard inside
+/// `KernelEvent::AppliedCandidate`, so with no floor and with a floor and two of its eight pin
+/// slots it round-trips whole; and JSON written before the field still reads, as `None`.
+#[retcd_test]
+fn m10_s2_a_candidate_ack_floor_crosses_postcard_whole() {
+    use rdb_core::contracts::authority::{AuthorityDecision, Checkpoint, Lineage, Verdict};
+    use rdb_core::contracts::ids::{
+        AuthorityGeneration, BootId, CorrelationId, GrantId, NodeId, OwnerEpoch, PartitionId,
+    };
+    use rdb_core::contracts::publication::{AckFloor, AppliedCandidate};
+    use rdb_core::contracts::time::Tick;
+    use rdb_core::contracts::txn::{Durability, TxnResult};
+
+    let lineage = Lineage {
+        partition: PartitionId(4),
+        generation: Generation(3),
+        owner_epoch: OwnerEpoch(5),
+    };
+    let plain = AppliedCandidate {
+        lineage,
+        config_version: ConfigVersion(7),
+        seq: Seq(12),
+        prev_digest: Digest::of(Domain::Record, &[b"11"]),
+        record_digest: Digest::of(Domain::Record, &[b"12"]),
+        request: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(2),
+            request: RequestId(12),
+        },
+        request_digest: request(1_000).request_digest(),
+        pending_result: TxnResult {
+            partition: PartitionId(4),
+            owner_epoch: OwnerEpoch(5),
+            generation: Generation(3),
+            seq: Seq(12),
+            outcome: Outcome::Published,
+            durability: Durability::BufferedOnTwo,
+        },
+        authority: AuthorityDecision {
+            owner: NodeId(1),
+            boot: BootId(1),
+            grant: GrantId(1),
+            authority_generation: AuthorityGeneration(1),
+            lineage,
+            expiry_utc_ms: 0,
+            decided_at: Tick::ZERO,
+            authority_seq: 1,
+            checkpoint: Checkpoint::StorageDispatch,
+            correlation: CorrelationId(12),
+            verdict: Verdict::Admit,
+        },
+        ack_floor: None,
+    };
+    let mut pinned = [None; MAX_PINS];
+    pinned[0] = Some(5);
+    pinned[1] = Some(9);
+    let floored = AppliedCandidate {
+        ack_floor: Some(AckFloor { below: 11, pinned }),
+        ..plain
+    };
+    for sent in [plain, floored] {
+        let bytes = postcard::to_stdvec(&sent).expect("postcard encode");
+        let got: AppliedCandidate = postcard::from_bytes(&bytes).expect("postcard decode");
+        assert_eq!(got, sent, "the candidate crosses postcard whole");
+    }
+
+    let mut old = serde_json::to_value(plain).expect("serialise");
+    old.as_object_mut()
+        .expect("an object")
+        .remove("ack_floor")
+        .expect("ack_floor is written");
+    let read: AppliedCandidate = serde_json::from_value(old).expect("JSON without it reads");
+    assert_eq!(read, plain, "JSON without the field reads as no floor");
 }
 
 /// Domain separation: the same bytes in two domains are two digests.

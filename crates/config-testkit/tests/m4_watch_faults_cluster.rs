@@ -20,16 +20,17 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::{
-    ConfigError, Limits, MutationEvent, MutationEventKind, NodeId, Principal, PrincipalKind,
-    WatchItem, WatchLimits, WatchRequest, WatchRetention,
+    ConfigError, ConfigStore, Limits, MutationEvent, MutationEventKind, NodeId, Principal,
+    PrincipalKind, WatchItem, WatchLimits, WatchRequest, WatchRetention,
 };
 use config_engine::watch::testing::GateHook;
 use config_engine::watch::TerminationReason;
 use config_engine::ManualClock;
 use config_storage::fault::Boundary;
 use config_testkit::cluster::{AuthzKind, Cluster, RocksSpec, StorageKind};
+use config_testkit::poll::poll_until_async;
 use futures::StreamExt;
-use support::{put_req, rocks_cluster_with_scripts};
+use support::{get_req, put_req, rocks_cluster_with_scripts};
 
 /// A failure bound, never a success bound.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -90,17 +91,53 @@ fn progress_watch_req(start_after_revision: u64, every: Duration) -> WatchReques
 /// Apply `n` puts under `prefix` through `id` and return the allocated revisions. Copied from
 /// `m4_watch_cluster.rs`'s helper of the same shape (test binaries cannot share code across
 /// files except via `mod support`).
+///
+/// A put that ends `DeadlineExceededUnknownOutcome` may still commit (ADR-0015), so it is
+/// resolved by reading the key back until it lands, and the revision is the record's. Each key
+/// is fresh, so a record under it can only be this put's. Issue #31: under host load one put of
+/// m4_64's took 2572 ms against the unscaled 2 s write budget, with no election, and failed the
+/// row although apply was never blocked. A put that never lands still fails the row.
 async fn put_n(cluster: &Cluster, id: NodeId, n: u64, prefix: &str) -> Vec<u64> {
     let client = cluster.client_as(id, Principal::development());
     let mut revisions = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let resp = client
-            .put(put_req(&format!("{prefix}{i}"), "v"))
-            .await
-            .unwrap_or_else(|e| panic!("put {prefix}{i}: {e}"));
-        revisions.push(resp.revision);
+        let key = format!("{prefix}{i}");
+        let revision = match client.put(put_req(&key, "v")).await {
+            Ok(resp) => resp.revision,
+            Err(ConfigError::DeadlineExceededUnknownOutcome) => {
+                landed_revision(cluster, client.as_ref(), &key).await
+            }
+            Err(e) => panic!("put {key}: {e}"),
+        };
+        revisions.push(revision);
     }
     revisions
+}
+
+/// The `mod_revision` of `key` once a read finds it: how [`put_n`] resolves an unknown outcome.
+async fn landed_revision(cluster: &Cluster, client: &dyn ConfigStore, key: &str) -> u64 {
+    tracing::info!(key, "m4_put_unknown_outcome_read_back");
+    let last = std::sync::Mutex::new(None);
+    let last = &last;
+    let found = poll_until_async(
+        cluster.deadline(10),
+        cluster.poll_interval(),
+        || async move {
+            match client.get(get_req(key)).await {
+                Ok(got) => got.record.map(|r| r.mod_revision),
+                Err(e) => {
+                    *last
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                    None
+                }
+            }
+        },
+    )
+    .await;
+    found.unwrap_or_else(|t| {
+        panic!("put {key} had an unknown outcome and never landed: {t}; last read error {last:?}")
+    })
 }
 
 /// Collect `WatchItem::Event`s until one's revision equals `last` (inclusive), ignoring
@@ -1047,22 +1084,39 @@ async fn m4_69_queue_cap_does_not_leak_between_streams() {
     // they all complete — `put_n`'s sequential awaits alone would leave `draining` unpolled for
     // the whole seeding phase, exactly like the deliberately-unpolled `stalled` stream, and it
     // would overflow its own queue instead of proving the caps stay independent.
-    let put_fut = put_n(&cluster, leader, 2000, "m4/69/");
+    //
+    // The bound is on delivery, not on writing: it starts when the last put returns. Before,
+    // one deadline covered all 2,000 sequential puts as well, and under host load the writer
+    // was still writing when it fired. Run 11 of 20 on 2026-10-23: 1777 puts issued in the
+    // 135 s window, and 1777 events delivered, so the stream was never behind.
+    let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+    let put_fut = async {
+        let written = put_n(&cluster, leader, 2000, "m4/69/").await;
+        let _ = written_tx.send(());
+        written
+    };
     let drain_fut = async {
         let mut delivered = Vec::with_capacity(2000);
-        let outcome = tokio::time::timeout(cluster.deadline(30), async {
-            while delivered.len() < 2000 {
-                match draining.next().await {
-                    Some(Ok(WatchItem::Event(e))) => delivered.push(e),
-                    Some(Ok(WatchItem::Progress { .. })) => {}
-                    other => panic!("unexpected watch item while draining to 2000: {other:?}"),
+        let after_writes = cluster.deadline(10);
+        let arrived = tokio::select! {
+            () = async {
+                while delivered.len() < 2000 {
+                    match draining.next().await {
+                        Some(Ok(WatchItem::Event(e))) => delivered.push(e),
+                        Some(Ok(WatchItem::Progress { .. })) => {}
+                        other => panic!("unexpected watch item while draining to 2000: {other:?}"),
+                    }
                 }
-            }
-        })
-        .await;
+            } => true,
+            () = async {
+                written_rx.await.expect("the writer finished");
+                tokio::time::sleep(after_writes).await;
+            } => false,
+        };
         assert!(
-            outcome.is_ok(),
-            "only {} of 2000 events arrived on the draining stream before the deadline",
+            arrived,
+            "only {} of 2000 events arrived on the draining stream within {after_writes:?} of \
+             the last put",
             delivered.len()
         );
         delivered
@@ -1832,6 +1886,14 @@ async fn m4_88_leader_change_mid_compaction_apply_recovers() {
         .expect("every node applies the seed puts");
 
     scripts[&leader].crash_on_nth(Boundary::BeforeStateBatch, 1);
+    // #31 (m4_88 run 10): a survivor that had not applied the `Compact` when the leader
+    // crashed took office 17 ms before it applied it. Each survivor's apply of it waits past
+    // the next election here, so every run starts the new term in that state.
+    for id in cluster.ids() {
+        if id != leader {
+            scripts[&id].delay_on_nth(Boundary::BeforeStateBatch, 1, Duration::from_secs(5));
+        }
+    }
     // Outcome deliberately unobserved (ADR-0015): the Compact may or may not have crossed the
     // boundary by the time the client sees the crash.
     let crash_leader = leader;
@@ -1852,6 +1914,18 @@ async fn m4_88_leader_change_mid_compaction_apply_recovers() {
         .wait_for_leader(cluster.deadline(20))
         .await
         .expect("a leader is serving while the crashed node is down");
+    // The schema gate judges a `Compact` by the leader's own applied state, and reads the
+    // stopped node as schema 1 (ADR-0030 A7). Until the new leader applies the crashed
+    // `Compact` it refuses with `feature_not_activated`, so wait for that apply, not only for
+    // the election. The crash was at the old leader's apply, so that `Compact` committed.
+    cluster
+        .wait_for(
+            &format!("{serving} to apply the crashed Compact"),
+            cluster.deadline(20),
+            || (cluster.compact_revision(serving) > 0).then_some(()),
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{serving} never applied the crashed Compact: {t}"));
     let effective = cluster
         .compact_now(100)
         .await
@@ -1896,6 +1970,45 @@ async fn m4_88_leader_change_mid_compaction_apply_recovers() {
 
     cluster.assert_journal_invariants();
     let _ = serving;
+
+    cluster.shutdown().await;
+}
+
+/// Issue #31: [`put_n`] resolves a put whose outcome is unknown instead of failing the row. The
+/// leader's first apply is held past the engine's write budget, so the first put ends
+/// `DeadlineExceededUnknownOutcome` while its entry is committed; the helper reads the key back
+/// and returns the record's revision.
+/// Cut: `put_n` panics on the unknown outcome — this row fails with "put issue31/0: deadline
+/// exceeded".
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_31_put_n_resolves_an_unknown_outcome() {
+    let (cluster, scripts) = rocks_cluster_with_scripts(3).await;
+    let leader = cluster.leader().await;
+    let stall = cluster.config().write_timeout + Duration::from_secs(1);
+    scripts[&leader].delay_on_nth(Boundary::AfterStateBatch, 1, stall);
+
+    let revisions = put_n(&cluster, leader, 2, "issue31/").await;
+
+    let read_backs = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "issue_31_put_n_resolves_an_unknown_outcome",
+    )
+    .into_iter()
+    .filter(|line| line["@m"] == "m4_put_unknown_outcome_read_back")
+    .count();
+    assert_eq!(
+        read_backs, 1,
+        "the stalled put, and only it, had an unknown outcome"
+    );
+    let client = cluster.client(leader);
+    for (i, revision) in revisions.iter().enumerate() {
+        let got = client
+            .get(get_req(&format!("issue31/{i}")))
+            .await
+            .unwrap_or_else(|e| panic!("read issue31/{i}: {e}"));
+        assert_eq!(got.record.map(|r| r.mod_revision), Some(*revision));
+    }
+    assert!(revisions[0] < revisions[1], "{revisions:?}");
 
     cluster.shutdown().await;
 }

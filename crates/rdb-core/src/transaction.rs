@@ -824,6 +824,8 @@ impl TxnKernel {
             remaining_millis: START_RECORD_DEADLINE_MILLIS,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         tracing::info!(
             partition = self.lineage.partition.0,
@@ -1303,6 +1305,7 @@ impl TxnKernel {
                     request_digest: admitted.request_digest,
                     pending_result: published_result(self.lineage, seq),
                     authority: *authority,
+                    ack_floor: None,
                 };
                 (
                     FreezeCause::UnresolvedTransaction,
@@ -2181,6 +2184,8 @@ mod tests {
             remaining_millis: 1_000,
             conditions,
             mutations,
+            acked_below: None,
+            pinned: Vec::new(),
         }
     }
 

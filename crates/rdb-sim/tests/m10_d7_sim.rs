@@ -144,6 +144,8 @@ fn submit() -> SeedEvent {
                 value: Bytes::from_static(b"1"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         }),
     )
 }

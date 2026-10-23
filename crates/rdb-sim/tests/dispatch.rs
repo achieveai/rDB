@@ -6291,6 +6291,8 @@ fn canonical_history_writes_what_t1_commits() {
             value: Bytes::copy_from_slice(&1u64.to_be_bytes()),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     };
     let effects = step(EventKind::Client(ClientEvent::Submit(request)));
     let [EffectKind::Kernel(KernelEffect::AuthorityCheck {

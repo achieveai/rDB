@@ -1490,6 +1490,8 @@ fn stack_txn(request: u64) -> TxnRequest {
             value: bytes::Bytes::copy_from_slice(&request.to_be_bytes()),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 

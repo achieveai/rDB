@@ -1745,6 +1745,8 @@ fn crash_a_run_goes_on_through_a_crash_and_a_restart_step_brings_the_node_back()
                 value: Bytes::from_static(b"v"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         })),
     ));
     plan.limits = RunLimits {
