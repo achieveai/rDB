@@ -803,8 +803,9 @@ fn write_buffer_sizes(dir: &std::path::Path) -> std::collections::BTreeMap<Strin
 }
 
 /// The budget is applied to each of our column families as given; an open without it keeps
-/// 64 MiB. RocksDB's `default` column family holds nothing of ours and keeps its own 64 MiB. RocksDB's own `OPTIONS` file is the witness, and each open logs
-/// the value it applied once, on its `storage_open` line.
+/// 64 MiB. RocksDB's `default` column family holds nothing of ours and keeps its own 64 MiB.
+/// RocksDB's own `OPTIONS` file is the witness, and each open logs the value it asked for
+/// once, as `write_buffer_bytes_asked` on its `storage_open` line.
 #[retcd_test]
 fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
     let every = |bytes: usize| {
@@ -842,7 +843,7 @@ fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
     )
     .iter()
     .filter(|line| line["@m"] == "storage_open")
-    .map(|line| line["write_buffer_bytes"].as_u64().expect("a number"))
+    .map(|line| line["write_buffer_bytes_asked"].as_u64().expect("a number"))
     .collect();
     assert_eq!(
         logged,

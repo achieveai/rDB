@@ -600,6 +600,7 @@ where
         },
         dedup_cap: args.dedup_cap,
         dedup_retention: args.dedup_retention,
+        storage: rdb_api::StorageOptions::default(),
     };
     // Before the voters start (PC-2): a refused option starts nothing.
     if let Err(e) = config.check() {
@@ -6420,6 +6421,7 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            storage: rdb_api::StorageOptions::default(),
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -6464,6 +6466,7 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            storage: rdb_api::StorageOptions::default(),
         };
         let db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -6519,6 +6522,7 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            storage: rdb_api::StorageOptions::default(),
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))

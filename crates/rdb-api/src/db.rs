@@ -34,6 +34,8 @@ use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
 use rdb_storage::RocksEngine;
+/// The storage engine's options, set per open through [`DbConfig::storage`] (ruling A-R248).
+pub use rdb_storage::StorageOptions;
 use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
 use rdb_value::value::Value;
@@ -306,6 +308,10 @@ pub struct DbConfig {
     /// A plain `put` compiles a version condition, so its retry fails `CONDITION_FAILED` once
     /// the first send applied, rather than applying twice.
     pub dedup_retention: Option<Duration>,
+    /// The storage engine's options for every node's copy (rulings A-R248, A-R253): today the
+    /// memtable budget per column family. `StorageOptions::default()` is RocksDB's own, 64 MiB.
+    /// A node restarted by [`Db::restart_node`] opens with the same options.
+    pub storage: StorageOptions,
 }
 
 impl DbConfig {
@@ -661,6 +667,8 @@ struct Respawn {
     nodes_dir: PathBuf,
     budgets: Budgets,
     limits: Limits,
+    /// The open's storage options, so a restarted node keeps them (A-R253).
+    storage: StorageOptions,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -729,6 +737,7 @@ impl Db {
             nodes_dir: config.dir.join("nodes"),
             budgets,
             limits,
+            storage: config.storage,
         };
         let mut db = Self::open_spawning(
             config,
@@ -771,7 +780,7 @@ impl Db {
         // Opening the engines takes their `LOCK`s, so of two opens racing on one directory one
         // is refused `InUse` here (F-001). Only an open that created `nodes/` and holds node 1's
         // `LOCK` may remove it.
-        let engines = match open_engines(&nodes_dir) {
+        let engines = match open_engines(&nodes_dir, config.storage) {
             Ok(engines) => engines,
             Err((error, held_owner)) => {
                 if created && held_owner {
@@ -2008,6 +2017,7 @@ impl Db {
                 nodes_dir,
                 budgets,
                 limits: Limits::default(),
+                storage: StorageOptions::default(),
             }),
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.clone(), links),
@@ -2041,6 +2051,7 @@ impl Db {
                 nodes_dir: nodes_dir.clone(),
                 budgets,
                 limits,
+                storage: config.storage,
             }),
             links,
             control,
@@ -2061,6 +2072,7 @@ impl Db {
                 budgets,
                 limits,
                 boot,
+                config.storage,
             )
             .map_err(OpenError::Node)?;
             lock(&db.nodes).push(handle);
@@ -2155,6 +2167,7 @@ impl Db {
             respawn.budgets,
             respawn.limits,
             boot,
+            respawn.storage,
         );
         match started {
             Ok(started) => {
@@ -2522,7 +2535,10 @@ fn heal_within(budgets: &Budgets) -> Duration {
 /// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
 /// missing copy is created only while no copy holds data. On error, says whether node 1's
 /// `LOCK` was held, which is what lets a claim be removed; every engine is closed by then.
-fn open_engines(nodes_dir: &Path) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
+fn open_engines(
+    nodes_dir: &Path,
+    storage: StorageOptions,
+) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
         rdb_storage::OpenError::Locked { .. } => OpenError::InUse(dir.to_path_buf()),
         rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(dir.to_path_buf()),
@@ -2536,7 +2552,7 @@ fn open_engines(nodes_dir: &Path) -> Result<BTreeMap<NodeId, RocksEngine>, (Open
             missing.push((NodeId(n), dir));
             continue;
         }
-        match RocksEngine::open_existing(&dir) {
+        match RocksEngine::open_existing_with(&dir, storage) {
             Ok(engine) => {
                 engines.insert(NodeId(n), engine);
             }
@@ -2553,7 +2569,7 @@ fn open_engines(nodes_dir: &Path) -> Result<BTreeMap<NodeId, RocksEngine>, (Open
         }
     }
     for (node, dir) in missing {
-        match RocksEngine::open(&dir) {
+        match RocksEngine::open_with(&dir, storage) {
             Ok(engine) => {
                 engines.insert(node, engine);
             }
@@ -2899,6 +2915,7 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            storage: crate::StorageOptions::default(),
         }
     }
 
@@ -2937,6 +2954,7 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            storage: crate::StorageOptions::default(),
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3023,6 +3041,7 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            storage: crate::StorageOptions::default(),
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3146,6 +3165,7 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            storage: crate::StorageOptions::default(),
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))

@@ -566,6 +566,7 @@ fn run_host(steps: &[Step]) -> (Vec<Reply>, (Generation, Seq)) {
         },
         dedup_cap: None,
         dedup_retention: None,
+        storage: rdb_api::StorageOptions::default(),
     };
     let mut db = rt
         .block_on(Db::open(

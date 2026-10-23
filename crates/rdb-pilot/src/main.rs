@@ -324,6 +324,7 @@ fn run(args: &Args) -> ExitCode {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        storage: rdb_api::StorageOptions::default(),
     };
     tracing::info!(
         write = args.write,

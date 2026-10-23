@@ -42,8 +42,8 @@ pub mod transport;
 mod test_store;
 
 pub use db::{
-    app_request_id, ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, ReadOk, Timeouts,
-    TxnPut, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE,
+    app_request_id, ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, ReadOk,
+    StorageOptions, Timeouts, TxnPut, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE,
 };
 pub use host::{Change, ListEdit, Look, Seen};
 // The rdb-core types `Db`'s calls take and answer with, so an app depends on rdb-api alone

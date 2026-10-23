@@ -444,7 +444,8 @@ impl RocksEngine {
             created,
             lineages = lineages.len(),
             instance_hex = instance.map(|id| hex(&id)),
-            write_buffer_bytes = storage.effective_write_buffer_bytes(),
+            // What the caller asked RocksDB for, not a size RocksDB reports back (A-R253).
+            write_buffer_bytes_asked = storage.effective_write_buffer_bytes(),
             "storage_open"
         );
         Ok(Self {

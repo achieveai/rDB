@@ -73,7 +73,9 @@ use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-use rdb_storage::{Inherited, PublishMark, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
+use rdb_storage::{
+    Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions, MAX_CHAIN_DEPTH,
+};
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
@@ -888,6 +890,7 @@ pub fn spawn(
         Budgets::SPEC_DEFAULTS,
         Limits::default(),
         BOOT,
+        StorageOptions::default(),
     )
 }
 
@@ -905,8 +908,10 @@ pub(crate) fn spawn_with(
     budgets: Budgets,
     limits: Limits,
     boot: BootId,
+    storage: StorageOptions,
 ) -> Result<NodeHandle, String> {
-    let engine = RocksEngine::open(&dir)
+    // The open's storage options, on a restart too (A-R253).
+    let engine = RocksEngine::open_with(&dir, storage)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
     spawn_on(node, engine, links, control, clock, budgets, limits, boot)
 }
