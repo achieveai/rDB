@@ -2513,3 +2513,40 @@ fn m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with() {
         "node 3's restart asks for the budget this Db was opened with, not the 64 MiB default"
     );
 }
+
+/// A-R261 (scenario G, W7's walk `lr kill 1; lr promote 2`): an app-only `Db` promotes. Node 1
+/// of the `Db` that runs the nodes is stopped; the app, which runs no node and reaches nodes 2
+/// and 3 over the links, runs `promote 2`. It is answered: node 2 owns partition 1 at a newer
+/// generation, node 1 is the one dropped, and the app's calls go to node 2.
+/// Cut: `open_app` keeps no control store; the promote is refused before it starts.
+/// Integration (~5 s): one fresh open until ready, a promote that waits node 1's grant out.
+#[config_log::retcd_test]
+fn m10_s2_g_an_app_only_db_promotes_node_2_while_node_1_is_stopped() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut nodes = open(&rt, dir.path(), &store).expect("the fresh open");
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    nodes.put(b"a", b"1", None).expect("a put");
+    lock(&nodes.nodes)
+        .iter_mut()
+        .find(|handle| handle.node == crate::admin::OWNER)
+        .expect("node 1 runs here")
+        .stop();
+
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let promoted = app
+        .promote(NodeId(2), None)
+        .unwrap_or_else(|error| panic!("the app's promote is answered: {error}"));
+    assert_eq!(
+        (promoted.owner, promoted.prior_owner, promoted.dropped),
+        (NodeId(2), crate::admin::OWNER, crate::admin::OWNER),
+        "{promoted:?}"
+    );
+    assert!(promoted.generation > Generation(1), "{promoted:?}");
+    assert_eq!(app.route.owner(), NodeId(2), "the app's calls go to node 2");
+    app.shutdown();
+    nodes.shutdown();
+}

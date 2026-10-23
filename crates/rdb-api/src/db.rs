@@ -426,14 +426,15 @@ struct Opened {
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
     /// (A-R200). Every refusal reads this instead of asking node 1 again.
     stuck: Mutex<Option<ReadyError>>,
-    /// The control store and runtime this open runs on, for [`Db::promote`]. `None` in a `Db`
-    /// a crate test builds by hand.
+    /// The control store, runtime and budgets this open runs on, for [`Db::promote`]: every
+    /// open sets it, an app-only one too (A-R261). `None` only in a `Db` a crate test builds by
+    /// hand.
     control: Option<PromoteStore>,
 }
 
-/// The control store and runtime [`Db::promote`] runs on.
+/// The control store, runtime and budgets [`Db::promote`] runs on.
 #[derive(Clone)]
-struct PromoteStore(Arc<dyn ConfigStore>, Handle);
+struct PromoteStore(Arc<dyn ConfigStore>, Handle, Budgets);
 
 impl std::fmt::Debug for PromoteStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -755,7 +756,7 @@ impl Db {
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
         if config.local.is_empty() {
-            return Self::open_app(config, store, rt)
+            return Self::open_app(config, store, rt, budgets)
                 .await
                 .map_err(open_refused);
         }
@@ -799,11 +800,13 @@ impl Db {
     /// process runs no node, claims no folder, bootstraps and heals nothing. It reads the owner
     /// from `partitions/1`, counts one open on the instance that record names so its own request
     /// ids start above every earlier open's, and sends every call over `DbConfig::links`. A
-    /// `NOT_PRIMARY` answer makes it read the owner again.
+    /// `NOT_PRIMARY` answer makes it read the owner again. It keeps the store and `budgets`,
+    /// the ones [`Self::open`] gives every open, so it can run [`Self::promote`] (A-R261).
     async fn open_app(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
         rt: Handle,
+        budgets: Budgets,
     ) -> Result<Self, OpenError> {
         let links = config.links.clone().ok_or_else(|| {
             OpenError::Config(
@@ -836,7 +839,10 @@ impl Db {
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
-            opened: Opened::default(),
+            opened: Opened {
+                control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
+                ..Opened::default()
+            },
             route: Route {
                 owner: std::sync::atomic::AtomicU32::new(owner.0),
                 refresh: Some((store, rt)),
@@ -982,7 +988,7 @@ impl Db {
             unwind,
             opened: Opened {
                 base_boot: boot,
-                control: Some(PromoteStore(Arc::clone(&store), rt.clone())),
+                control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 ..Opened::default()
             },
             route: Route {
@@ -2323,20 +2329,30 @@ impl Db {
     /// and ten seconds; [`admin::promote`] says each step. Returns once `partitions/1` names
     /// `to` at a newer generation; this `Db`'s calls go to `to` from then on.
     ///
+    /// Membership is fixed at three nodes (A-R256 known limit for M10): a dropped node rejoins
+    /// as a secondary at the next reopen heal. An app-only `Db` promotes too, over its links
+    /// (A-R261).
+    ///
     /// # Errors
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `to` or `drop` holds no copy, `to` is a shadow, owns
-    /// the partition already, or is `drop`; or this `Db` was built without budgets or a store.
+    /// the partition already, or is `drop`. `UNAVAILABLE`, nothing changed, from a `Db` a crate
+    /// test built by hand, which has no control store.
     /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
     /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
     /// it again picks up where it stopped.
     pub fn promote(&self, to: NodeId, drop: Option<NodeId>) -> Result<admin::Promoted, ApiError> {
-        let budgets = self.budgets().ok_or_else(|| {
-            ApiError::invalid("this Db was built without budgets, so it cannot promote")
-        })?;
-        let PromoteStore(store, rt) = self.opened.control.clone().ok_or_else(|| {
-            ApiError::invalid("this Db was built without a control store, so it cannot promote")
-        })?;
+        let PromoteStore(store, rt, budgets) =
+            self.opened.control.clone().ok_or_else(|| ApiError {
+                kind: ErrorKind::Unavailable,
+                retry: RetryRule::NotWired,
+                no_mutation: true,
+                detail: "this Db was opened without a control store, so it cannot run admin \
+                         commands such as promote: open it with Db::open, which connects it to \
+                         one"
+                .to_owned(),
+                retry_after: None,
+            })?;
         let (senders, boots): (
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
@@ -5853,6 +5869,28 @@ mod tests {
         db.route.owner.store(2, Ordering::Relaxed);
         assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
         db.shutdown();
+    }
+
+    /// A-R261: a `Db` with no control store (only one a crate test builds by hand, now that
+    /// every open keeps one) refuses a promote with the real cause and the call that fixes it,
+    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent.
+    /// Unit (~10 ms): no node thread.
+    #[test]
+    fn m10_s2_a_promote_on_a_db_with_no_control_store_names_the_cause_and_the_open_to_use() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let refused = db.promote(NodeId(2), None).expect_err("no control store");
+        assert_eq!(
+            (refused.kind, refused.no_mutation),
+            (ErrorKind::Unavailable, true),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "UNAVAILABLE (this Db was opened without a control store, so it cannot run admin \
+             commands such as promote: open it with Db::open, which connects it to one; next: \
+             retrying will not help: keep this Db's log and report this message)"
+        );
+        assert_eq!(mailbox.try_iter().count(), 0, "nothing was sent");
     }
 
     /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
