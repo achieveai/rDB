@@ -303,6 +303,15 @@ The transaction and lag modules are unchanged. Rows: `m9_d3_00` (sim) and `m9_d3
 for the kept view, `a_re_emit_while_the_start_record_is_pending_keeps_the_previous_view` in
 `rdb-api`'s host tests.
 
+**Amended 2026-10-22 (lead ruling A-R197, M10; amends K-B-02, B-R47a and B-R67f for this case
+only).** The tracker still rebuilt every other copy at zero and moved its anchor to the head, so the
+activation re-emit reported qualification `Lost` and lag protection paused writes for its hold
+(M10 D12). A re-emit that restates the generation served now keeps each copy's progress, its
+`received` clamped to its applied head, and the anchor; only the proved floors are restated from
+the new barrier. All five guards must hold: the tracker is not retired; the same generation; the
+cutoff equals its base; the same root; and the pin equals its only predicate. If any fails, the
+rebuild is as before. Rows: `m10_r197_c1`..`c4` in `rdb-core`'s `replication_tracker`.
+
 `RecoveryBarrier` still cannot be built from a sequence number — only from `DurableProof` values,
 which only the storage seam mints (ADR-0005 §4). Spec §8.1's "buffered complete entries from a live
 survivor may be retained, but must be fsynced before the recovery barrier is committed" is the type;

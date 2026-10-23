@@ -5690,25 +5690,57 @@ fn b_walked_to_the_cutoff() -> Replication {
 }
 
 /// A second `Recovered` in the same generation at the same cutoff 3, its barrier naming
-/// `copies`: F1's rebuild re-announcing once B is proved durable there.
+/// `copies`: F1's rebuild re-announcing once B is proved durable there. It pins what
+/// `built_at(3)` pinned, so it is a restatement (lead ruling A-R197).
 fn recovered_again(copies: &[CopyId]) -> EventKind {
-    recovered_event(&requiring(recovery(3, d(3), pin_with_b()), copies))
+    recovered_pinning(pin_with_b(), copies)
+}
+
+/// `recovered_again` pinning `pin` instead.
+fn recovered_pinning(pin: PartitionConfig, copies: &[CopyId]) -> EventKind {
+    recovered_event(&requiring(recovery(3, d(3), pin), copies))
+}
+
+/// `pin_with_b` with D added as a shadow, at the same version: a pin that differs from the one
+/// the primary holds, so a `Recovered` carrying it is not a restatement (A-R197 guard G5).
+fn pin_with_b_and_shadow_d() -> PartitionConfig {
+    config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, Primary),
+            member(COPY_B, B, RegularSecondary),
+            member(COPY_C, C, RegularSecondary),
+            member(COPY_D, D, Shadow),
+        ],
+    )
 }
 
 /// M7B-205 (lead rulings B-R67e and B-R67f; rdb-sim S4b and the k=7 run of
 /// `rebuild_two_slow_replies_end_as_the_control`). A second `Recovered`, whose barrier proves B
-/// durable at 3, drops B's cursor and starts B's watermarks at zero. A duplicate of B's ACK at 1
-/// from before it then arrives. That ACK is below B's proved floor, so it is a repeat: exactly
-/// `Recorded`, with no snapshot request and no change. The same holds once B's `NeedPrefix` has
-/// made a new cursor that has taken no ACK yet (the k=7 shape): with no mark, the floor still
-/// judges. Near-misses: an ACK at the floor with another digest is divergence, not a repeat; and
-/// a later `Recovered` whose barrier does not name B replaces the floor, so the duplicate gets
-/// today's answer again.
+/// durable at 3 and whose pin adds D, drops B's cursor and starts B's watermarks at zero: the
+/// changed pin makes it a rebuild, not a restatement (lead ruling A-R197, guard G5). A duplicate
+/// of B's ACK at 1 from before it then arrives. That ACK is below B's proved floor, so it is a
+/// repeat: exactly `Recorded`, with no snapshot request and no change. The same holds once B's
+/// `NeedPrefix` has made a new cursor that has taken no ACK yet (the k=7 shape): with no mark,
+/// the floor still judges. Near-misses: an ACK at the floor with another digest is divergence,
+/// not a repeat; and a later `Recovered` whose barrier does not name B, and whose pin changes
+/// again, replaces the floor, so the duplicate gets today's answer again.
 #[retcd_test]
 fn m7b_205_a_duplicate_ack_right_after_a_recovered_rebuild_is_not_escalated() {
     let mut module = b_walked_to_the_cutoff();
-    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    route(
+        &mut module,
+        recovered_pinning(pin_with_b_and_shadow_d(), &[COPY_A, COPY_B, COPY_C]),
+    );
     assert!(primary_side(&module).cursor(COPY_B).is_none());
+    assert_eq!(
+        primary_side(&module)
+            .tracker()
+            .peer(COPY_B)
+            .map(|peer| peer.progress),
+        Some(progress(0, 0, 0)),
+        "a rebuild starts B's watermarks at zero"
+    );
     let before = primary_side(&module).clone();
     for late in [b(1, 1, 1), b(2, 2, 2), b(1, 1, 0)] {
         assert_eq!(
@@ -5737,10 +5769,14 @@ fn m7b_205_a_duplicate_ack_right_after_a_recovered_rebuild_is_not_escalated() {
         "{effects:?}"
     );
 
-    // A later `Recovered` restates what is proved, replacing the floor, not raising it: its
-    // barrier does not name B, so B knows nothing and the same duplicate gets today's answer.
+    // A later `Recovered` that is a rebuild again (its pin drops D, so it fails G5) states what
+    // is proved, replacing the floor, not raising it: its barrier does not name B, so B knows
+    // nothing and the same duplicate gets today's answer.
     let mut module = b_walked_to_the_cutoff();
-    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    route(
+        &mut module,
+        recovered_pinning(pin_with_b_and_shadow_d(), &[COPY_A, COPY_B, COPY_C]),
+    );
     route(&mut module, recovered_again(&[COPY_A, COPY_C]));
     assert_eq!(
         route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
@@ -5773,15 +5809,33 @@ fn m7b_206_an_ack_at_the_proved_floor_takes_the_ladder() {
 /// rebuilt by the same second `Recovered`, except that one barrier proves B durable at 3 and
 /// the other does not. They answer the `Recovered` alike, hold B's watermarks at zero alike,
 /// and answer the same stream of ACKs that are not repeats alike, every `PeerProgress`,
-/// qualification edge and durable view included. The floor moves no watermark and no view.
+/// qualification edge and durable view included. The floor moves no watermark and no view. Both
+/// pins add D, so both are rebuilds; a restatement would keep B's watermarks at 3 on both sides
+/// (lead ruling A-R197) and say nothing about the floor.
 #[retcd_test]
 fn m7b_207_the_proved_floor_moves_no_watermark_and_no_view() {
     let mut proved = b_walked_to_the_cutoff();
     let mut unproved = b_walked_to_the_cutoff();
     assert_eq!(
-        route(&mut proved, recovered_again(&[COPY_A, COPY_B, COPY_C])),
-        route(&mut unproved, recovered_again(&[COPY_A, COPY_C]))
+        route(
+            &mut proved,
+            recovered_pinning(pin_with_b_and_shadow_d(), &[COPY_A, COPY_B, COPY_C])
+        ),
+        route(
+            &mut unproved,
+            recovered_pinning(pin_with_b_and_shadow_d(), &[COPY_A, COPY_C])
+        )
     );
+    for (name, module) in [("proved", &proved), ("unproved", &unproved)] {
+        assert_eq!(
+            primary_side(module)
+                .tracker()
+                .peer(COPY_B)
+                .map(|peer| peer.progress),
+            Some(progress(0, 0, 0)),
+            "{name}"
+        );
+    }
     for ack in [
         in_new_root(c(3, 3, 3)),
         in_new_root(b(3, 3, 3)),
@@ -7170,9 +7224,11 @@ fn written_past_the_cutoff() -> (ProgressTracker, RecoveryResult) {
 /// M9 S0 D3 (lead ruling "S0 D3" rule 3). F1 re-emits the result this primary was rebuilt from,
 /// once its rebuild finishes. The primary wrote `HEAD + 2` in this generation since: the rebuild
 /// keeps it, so R1's head still agrees with T1's next sequence and the keepalive has a record to
-/// send. The base stays at the cutoff; the anchor is the seed head, as for every rebuild
-/// (B-R47a), so a copy re-proves through `HEAD + 2` to qualify. Before the fix the head fell back
-/// to the cutoff and the primary sent nothing again (`s0-probe.md` D3).
+/// send. The base stays at the cutoff. The re-emit is a restatement (lead ruling A-R197), so the
+/// anchor stays where the first rebuild put it, at the cutoff: a copy does not have to re-prove
+/// `HEAD + 2` to stay qualified. Before A-R197 the anchor moved to the seed head (B-R47a). Before
+/// the D3 fix the head fell back to the cutoff and the primary sent nothing again
+/// (`s0-probe.md` D3).
 #[retcd_test]
 fn m9_d3_07_tracker_a_re_emit_of_its_generation_keeps_its_own_head() {
     let (mut tracker, result) = written_past_the_cutoff();
@@ -7185,7 +7241,7 @@ fn m9_d3_07_tracker_a_re_emit_of_its_generation_keeps_its_own_head() {
     );
     assert_eq!(
         (tracker.base_seq(), tracker.anchor(), tracker.retired()),
-        (Seq(HEAD + 1), Seq(HEAD + 2), false)
+        (Seq(HEAD + 1), Seq(HEAD + 1), false)
     );
 }
 
@@ -7274,4 +7330,244 @@ fn m9_f1_a_tracker_the_proved_floor_never_rises_above_the_selected_cutoff() {
     );
     assert_eq!(tracker.peer(COPY_C).expect("C").progress, progress(0, 0, 0));
     assert_eq!(tracker.known(COPY_D), Some(progress(0, 0, 0)));
+}
+
+// --- Lead ruling A-R197: a guarded re-emit of the generation served is a restatement -------
+
+/// The root `recovery` recovers into.
+fn new_root() -> Lineage {
+    Lineage {
+        partition: P,
+        generation: NEW_GEN,
+        owner_epoch: NEW_EPOCH,
+    }
+}
+
+/// F1's first result for this primary: `NEW_GEN` at cutoff `HEAD`, pinning `pin_with_b`, in
+/// `DegradedRf2`, its barrier naming A and C.
+fn activating() -> RecoveryResult {
+    let mut result = requiring(recovery(HEAD, d(HEAD), pin_with_b()), &[COPY_A, COPY_C]);
+    result.mode = PartitionMode::DegradedRf2;
+    result
+}
+
+/// F1's activation re-emit of [`activating`] once B is proved durable at the cutoff: the same
+/// generation, cutoff, root and pin; a newer revision, `Active`, and a barrier naming A, B and C.
+/// The D12 shape.
+fn activated() -> RecoveryResult {
+    let mut result = requiring(
+        recovery(HEAD, d(HEAD), pin_with_b()),
+        &[COPY_A, COPY_B, COPY_C],
+    );
+    result.committed.revision = Revision(3);
+    result
+}
+
+/// A primary [`activating`] rebuilt, then B and C ACKed at the cutoff: the anchor qualifies.
+fn qualified_at_the_cutoff() -> ProgressTracker {
+    let mut tracker = tracker();
+    tracker.on_recovered(&activating(), T);
+    for ack in [
+        in_new_root(b(HEAD, HEAD, HEAD)),
+        in_new_root(c(HEAD, HEAD, HEAD)),
+    ] {
+        deliver(&mut tracker, &ack);
+    }
+    assert_eq!(
+        (tracker.anchor(), tracker.qualifies_now(Seq(HEAD))),
+        (Seq(HEAD), true)
+    );
+    tracker
+}
+
+/// Every copy's progress, in copy order.
+fn all_progress(tracker: &ProgressTracker) -> Vec<(CopyId, ReplicaProgress)> {
+    tracker
+        .peers()
+        .map(|(copy, peer)| (copy, peer.progress))
+        .collect()
+}
+
+/// A-R197 C1 (critic D12, M3). F1's activation re-emit reaches a primary whose anchor
+/// qualifies: B and C ACKed at the cutoff. It restates the generation served, so it answers
+/// exactly `Recorded`. No `QualificationChanged`, so L1 does not pause; no `DurableAdvanced`;
+/// every copy keeps its progress, and B and C know the cutoff.
+/// Before the ruling the rebuild zeroed B and C and reported `Lost` (D12).
+#[retcd_test]
+fn m10_r197_c1_an_activation_re_emit_keeps_every_copy_s_progress() {
+    let mut tracker = qualified_at_the_cutoff();
+    let before = all_progress(&tracker);
+    assert_eq!(
+        tracker.on_recovered(&activated(), T),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(all_progress(&tracker), before);
+    for copy in [COPY_B, COPY_C] {
+        assert_eq!(
+            tracker.known(copy),
+            Some(progress(HEAD, HEAD, HEAD)),
+            "{copy:?}"
+        );
+    }
+    assert_eq!(
+        (tracker.base_seq(), tracker.anchor(), tracker.lineage()),
+        (Seq(HEAD), Seq(HEAD), new_root())
+    );
+}
+
+/// A-R197 C2 (critic D12, M1). As C1, with one write the primary applied and no copy has ACKed
+/// yet: head `HEAD + 1`. The re-emit keeps the anchor at the cutoff, so it reports no `Lost`
+/// though the head does not qualify. B's ACK for the write then reports the head's `Gained`.
+/// With the anchor at the head, the re-emit would have paused L1 on every activation with a
+/// write in flight.
+#[retcd_test]
+fn m10_r197_c2_a_re_emit_with_a_write_in_flight_keeps_the_anchor_at_the_cutoff() {
+    let mut tracker = qualified_at_the_cutoff();
+    local_applied(&mut tracker, HEAD + 1);
+    assert_eq!(
+        tracker.on_recovered(&activated(), T),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        (tracker.anchor(), tracker.head()),
+        (Seq(HEAD), Seq(HEAD + 1))
+    );
+    let effects = deliver(&mut tracker, &in_new_root(b(HEAD + 1, HEAD + 1, HEAD)));
+    assert!(
+        effects.contains(&edge(
+            new_root(),
+            NEW_CONFIG,
+            HEAD + 1,
+            QualificationDirection::Gained,
+            &[COPY_B],
+            QualificationCause::AckAdvanced,
+        )),
+        "{effects:?}"
+    );
+}
+
+/// One way a `Recovered` differs from the generation served, applied to the tracker or to the
+/// result before it is delivered.
+type Near = dyn Fn(&mut ProgressTracker, &mut RecoveryResult);
+
+/// A-R197 C3 (critic D12, M2). One near-miss per guard: each `Recovered` differs from the
+/// generation served in one input, so it is a rebuild exactly as before the ruling, and B and C
+/// start again at zero. G2 is moved alone, the root left as it was, so that G2 and not G4 is
+/// what refuses it. The two predicates come from a `ConfigChanged` that kept every boot, and the
+/// result pins that newer configuration, so the pin equals the tracker's newest predicate and
+/// only the predicate count refuses it.
+#[retcd_test]
+fn m10_r197_c3_a_re_emit_that_fails_any_guard_is_a_rebuild() {
+    let reboot_b = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, Primary),
+            Member {
+                boot: BootId(99),
+                ..member(COPY_B, B, RegularSecondary)
+            },
+            member(COPY_C, C, RegularSecondary),
+        ],
+    );
+    let elsewhere = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, RegularSecondary),
+            member(COPY_B, B, Primary),
+            member(COPY_C, C, RegularSecondary),
+        ],
+    );
+    let next_version = config_with(ConfigVersion(NEW_CONFIG.0 + 1), pin_with_b().members);
+    let cases: Vec<(&str, Box<Near>)> = vec![
+        (
+            "G1 retired",
+            Box::new(move |tracker, result| {
+                let mut moved = result.clone();
+                moved.committed.pinned_config = elsewhere.clone();
+                tracker.on_recovered(&moved, T);
+                assert!(tracker.retired());
+            }),
+        ),
+        (
+            "G2 next generation",
+            Box::new(|_, result| result.new_generation = Generation(NEW_GEN.0 + 1)),
+        ),
+        (
+            "G3 another cutoff",
+            Box::new(|_, result| {
+                *result = requiring(
+                    recovery(HEAD - 1, d(HEAD - 1), pin_with_b()),
+                    &[COPY_A, COPY_B, COPY_C],
+                );
+            }),
+        ),
+        (
+            "G4 another root epoch",
+            Box::new(|_, result| result.selected.root.owner_epoch = OwnerEpoch(NEW_EPOCH.0 + 1)),
+        ),
+        (
+            "G5 B's boot changed in the pin",
+            Box::new(move |_, result| result.committed.pinned_config = reboot_b.clone()),
+        ),
+        (
+            "G5 two predicates",
+            Box::new(move |tracker, result| {
+                tracker.on_config_changed(&next_version, T);
+                assert_eq!(tracker.predicates().len(), 2);
+                result.committed.authority_view.config_version = next_version.config_version;
+                result.committed.pinned_config = next_version.clone();
+                assert_eq!(&result.committed.pinned_config, tracker.config());
+            }),
+        ),
+    ];
+    for (case, change) in cases {
+        let mut tracker = qualified_at_the_cutoff();
+        let mut result = activated();
+        change(&mut tracker, &mut result);
+        tracker.on_recovered(&result, T);
+        for copy in [COPY_B, COPY_C] {
+            assert_eq!(
+                tracker.peer(copy).map(|peer| peer.progress),
+                Some(progress(0, 0, 0)),
+                "{case}: {copy:?}"
+            );
+        }
+        assert_eq!(tracker.base_seq(), result.selected.cutoff_seq, "{case}");
+    }
+
+    // G3's other side: a primary that `Recovered` installs from nothing is seeded and rebuilt in
+    // the same step, so a cutoff above 0 fails G3 and the base is the cutoff.
+    let module = built_at(10);
+    assert_eq!(primary_side(&module).tracker().base_seq(), Seq(10));
+}
+
+/// A-R197 C4 (critic D12, A1). B's last ACK before the re-emit had staged a record: `received`
+/// one above its applied head. B's own restatement drops what it staged, so its next ACK says
+/// `received == applied`. The kept progress is clamped to the applied head, so that ACK is
+/// admitted and moves B's durable mark, instead of being dropped as a regress.
+#[retcd_test]
+fn m10_r197_c4_a_kept_copy_s_received_is_clamped_to_its_applied_head() {
+    let mut tracker = tracker();
+    tracker.on_recovered(&activating(), T);
+    deliver(&mut tracker, &in_new_root(c(HEAD, HEAD, HEAD)));
+    local_applied(&mut tracker, HEAD + 1);
+    deliver(&mut tracker, &in_new_root(b(HEAD + 1, HEAD, HEAD - 1)));
+    assert_eq!(
+        tracker.peer(COPY_B).map(|peer| peer.progress),
+        Some(progress(HEAD + 1, HEAD, HEAD - 1))
+    );
+    tracker.on_recovered(&activated(), T);
+    assert_eq!(
+        tracker.peer(COPY_B).map(|peer| peer.progress),
+        Some(progress(HEAD, HEAD, HEAD - 1))
+    );
+    let effects = deliver(&mut tracker, &in_new_root(b(HEAD, HEAD, HEAD)));
+    assert!(
+        !effects.contains(&rejected(AckRejectReason::RegressedProgress)),
+        "{effects:?}"
+    );
+    assert_eq!(
+        tracker.peer(COPY_B).map(|peer| peer.progress),
+        Some(progress(HEAD, HEAD, HEAD))
+    );
 }

@@ -58,8 +58,9 @@ pub struct CopyProgress {
     ///
     /// Read **only** by the repeat judgment ([`ProgressTracker::known`]). No watermark, view,
     /// predicate, qualification, lag or `PeerProgress` ever reads it: those move only on an
-    /// admitted ACK. It exists because a `Recovered` drops the cursor and zeroes the watermarks
-    /// that would have recognised a duplicate ACK from before it.
+    /// admitted ACK. It exists because a `Recovered` drops the cursor and, unless it restates the
+    /// generation served (lead ruling A-R197, [`ProgressTracker::on_recovered`]), zeroes the
+    /// watermarks that would have recognised a duplicate ACK from before it.
     ///
     /// Why recording an ACK below it is safe: the proof already establishes that the copy holds
     /// the cutoff durably, on this history, so an ACK at or below it claims nothing the proof has
@@ -116,7 +117,8 @@ pub struct ProgressTracker {
     /// edge is `qualifies_now(anchor)` (lead ruling B-R47a), so it means "`min_regular_acks`
     /// regular copies are on our history from the cutoff". A `LocalApplied` never moves it:
     /// evaluated at the moving head the predicate would go false on every write. The head has
-    /// its own `Gained`, never `Lost` (lead ruling B-R47b).
+    /// its own `Gained`, never `Lost` (lead ruling B-R47b). A restatement of the generation
+    /// served keeps it (lead ruling A-R197).
     anchor: Seq,
     /// The `authority_seq` of the newest A1 view installed (design §2.2); 0 before any.
     authority_seq: u64,
@@ -691,6 +693,15 @@ impl ProgressTracker {
     /// its prefix; `diverged` clears here and only here, and only in a new generation (M9 S0
     /// ruling 2026-10-07, item 3).
     ///
+    /// Lead ruling A-R197 (2026-10-22, amending K-B-02, B-R47a and B-R67f for this case only): a
+    /// `Recovered` that restates the generation served, under every guard of
+    /// [`Self::restates`], is a restatement, not a rebuild. F1's activation re-emit is the one in
+    /// product: it changes only the mode, the revision and the barrier, and the tracker reads none
+    /// of the inputs an ACK was admitted under from those. Each copy keeps the progress it proved,
+    /// its `received` clamped to its applied head, and the anchor stays at the cutoff, so the
+    /// qualification edge does not move and L1 does not pause. Only the proved floors are
+    /// restated from the new barrier. If any guard fails, the rebuild is exactly as above.
+    ///
     /// A pin for this partition that names this node anything but the primary retires the
     /// tracker (lead ruling on the kept primary, B-R58a): routing treats it as absent until a
     /// `Recovered` pins it primary again, and that rebuild starts it unretired.
@@ -738,8 +749,30 @@ impl ProgressTracker {
         }
     }
 
+    /// Lead ruling A-R197: whether `result` restates the generation this tracker serves, so the
+    /// rebuild keeps each copy's progress and the anchor. All five guards must hold:
+    ///
+    /// - G1: not retired. A retired tracker is rebuilt at the cutoff (M9 S0 D3).
+    /// - G2: the same generation.
+    /// - G3: the same cutoff as the base. The `fresh_primary` install, then its rebuild in the
+    ///   same step, fails it at any cutoff above 0, so that path still takes the cutoff as its
+    ///   base.
+    /// - G4: the same root: partition, generation and owner epoch.
+    /// - G5: the pinned configuration unchanged, and it is the only predicate. Every kept copy
+    ///   then has the node, boot, role and configuration version its ACKs were admitted under.
+    fn restates(&self, result: &RecoveryResult) -> bool {
+        !self.retired
+            && result.new_generation == self.lineage.generation
+            && result.selected.cutoff_seq == self.base_seq
+            && result.selected.root == self.lineage
+            && self.predicates.len() == 1
+            && result.committed.pinned_config == *self.config()
+    }
+
     /// The tracker an accepted `result` installs: this copy's own ladder and watermarks cut at
     /// the cutoff, every other copy at zero, one predicate, nothing diverged in a new generation.
+    /// A result that [`Self::restates`] the generation served keeps each other copy's progress,
+    /// `received` clamped to its applied head, and the anchor (lead ruling A-R197).
     /// A re-emit of the generation already served keeps each diverged copy it still names: its
     /// quarantine is sticky there (M9 S0 ruling 2026-10-07, item 3). Each other copy the
     /// barrier requires gets its proved floor at the selected cutoff, even when the barrier
@@ -802,6 +835,22 @@ impl ProgressTracker {
         for copy in result.barrier.required() {
             if let Some(peer) = rebuilt.peers.get_mut(copy).filter(|_| *copy != self.own) {
                 peer.proved = floor;
+            }
+        }
+        if self.restates(result) {
+            // A-R197. The anchor is the cutoff by B-R47a; at the head, a write applied and not
+            // yet acknowledged would report `Lost` here and pause L1 (critic M1).
+            rebuilt.anchor = self.anchor;
+            for (copy, kept) in &self.peers {
+                if let Some(peer) = rebuilt.peers.get_mut(copy).filter(|_| *copy != self.own) {
+                    // A1: the copy's own restatement drops what it staged, so its next ACK says
+                    // `received == applied`. Lowering the belief is always safe; rule 8 would
+                    // otherwise drop that ACK as a regress.
+                    let mut progress = kept.progress;
+                    progress.received =
+                        ReceivedSeq(progress.received.0.min(progress.buffered_applied.0));
+                    peer.progress = progress;
+                }
             }
         }
         rebuilt
