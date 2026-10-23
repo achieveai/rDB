@@ -300,6 +300,13 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
   missing value instead. Moving to a clean copy comes with a later release (rejoin and recovery).
+- **Clearing a damaged object removes all of it.** `db.write(object, Change::Clear, None)`
+  (rdb_dev `admin clear`) deletes the whole map or set, not only the bad entry. One bad entry
+  costs every healthy entry too. Repairing one entry comes with a later release.
+  **If you need the healthy entries, copy them out first**, then clear. Read the object a page
+  at a time with `db.read(object, Look::Members { after, limit })`. A page that reaches the bad
+  entry fails with `CORRUPT_HISTORY`, and the error does not name the entry. Read with a small
+  `limit` up to it; if you know the bad key, set `after` to it to read the rest.
 - **A restarted node stays out until the folder is opened again.** See section 5.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. An automatic
