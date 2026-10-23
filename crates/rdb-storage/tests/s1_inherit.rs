@@ -1369,3 +1369,50 @@ fn m10_w2_delete_dedup_trimmed_drops_what_t1_trimmed_and_nothing_else() {
     );
     assert_eq!(dedup_and_rest(&engine, G1).0, before, "nothing deleted");
 }
+
+/// M10 S2 W9 (arch-s2 triage "`delete_dedup_trimmed` without `synced_seq`"): the trim's write is
+/// synced, so once it returns every write so far counts as synced and the flush duty may skip
+/// its next fsync (A-R214), as after any other synced write. RocksDB's own WAL-sync count sees
+/// exactly one sync. Cut: drop the `synced_seq` line from `delete_dedup_trimmed`; the trim
+/// still syncs, but the engine does not count it, and the row is red. Debug builds only, as the
+/// count is. Unit, under a second.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_a_dedup_trim_counts_as_synced() {
+    let dir = data_dir("m10-dedup-trim-synced");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = linked_g2(&mut engine);
+    write_after(&mut engine, G2, (10, &g1), 14);
+    assert!(!engine.wal_synced_through_latest(), "commits are unsynced");
+    let before = engine.wal_syncs();
+    assert_eq!(engine.delete_dedup_trimmed(P, G2, Seq(13)), Ok(2));
+    assert_eq!(
+        engine.wal_syncs(),
+        before + 1,
+        "the trim synced the WAL once"
+    );
+    assert!(
+        engine.wal_synced_through_latest(),
+        "the trim counts as synced"
+    );
+}
+
+/// A trim that deletes nothing writes an empty batch. It is not counted, since nothing says
+/// RocksDB must sync one (on 2026-10-23 its ticker did count one sync here; the log line
+/// `empty_trim_wal_syncs` records it). So the commits before it stay unsynced and the flush duty
+/// still syncs them: at worst one extra fsync. Cut: count every trim; the row is red.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_an_empty_dedup_trim_does_not_count_as_synced() {
+    let dir = data_dir("m10-dedup-trim-empty");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = linked_g2(&mut engine);
+    write_after(&mut engine, G2, (10, &g1), 14);
+    let before = engine.wal_syncs();
+    assert_eq!(engine.delete_dedup_trimmed(P, G2, Seq(0)), Ok(0));
+    tracing::info!(syncs = engine.wal_syncs() - before, "empty_trim_wal_syncs");
+    assert!(
+        !engine.wal_synced_through_latest(),
+        "an empty trim is not counted"
+    );
+}

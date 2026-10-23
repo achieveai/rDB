@@ -922,6 +922,11 @@ impl RocksEngine {
             );
             return Err(StorageFault::WriteFailed);
         }
+        // A synced write that deleted something synced the WAL through it, as
+        // `put_metadata_synced` does (A-R214). An empty batch is not counted: it may not sync.
+        if deleted > 0 {
+            self.synced_seq = Some(self.db.latest_sequence_number());
+        }
         tracing::info!(
             target: LOG_TARGET,
             partition = partition.0,
