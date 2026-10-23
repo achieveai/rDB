@@ -121,6 +121,24 @@ pub enum OpenError {
     },
 }
 
+/// Why `RocksEngine::damage_record` (debug builds only, a dev tool) refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DamageRefused {
+    /// No value is stored at that key of that lineage: absent, a tombstone, or no bytes.
+    /// Nothing was written.
+    #[error("no stored value at key {key_hex} to damage")]
+    NoValue {
+        /// The physical key, hex.
+        key_hex: String,
+    },
+    /// RocksDB refused the read or the write.
+    #[error("damage write failed: {detail}")]
+    WriteFailed {
+        /// RocksDB's message.
+        detail: String,
+    },
+}
+
 /// Why [`RocksEngine::bind_instance`] refused. Nothing was written in either case.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
@@ -669,6 +687,65 @@ impl RocksEngine {
             })?;
         raw.map(|raw| Self::decode_epochs(partition, &raw))
             .transpose()
+    }
+
+    /// **Dev tool only** (M10 S2, ruling A-R230; `rdb_dev admin damage-copy`). Flip every bit of
+    /// the last byte of the value stored at `key` in `ns` of lineage `(partition, generation)`,
+    /// in **this copy only**, with a synced write, so the next read of it fails its own check:
+    /// a `History` record (key: the seq, u64 BE) fails [`crate::verify_lineage`] at that seq, and
+    /// a sealed value fails its envelope digest (`CORRUPT_HISTORY`). The frame and version stay,
+    /// so the record still reads as a value. Nothing is replicated: the other copies keep the
+    /// good record. Reads only this lineage's own key, never through the chain. Debug builds
+    /// only, like [`Self::inject_fault`]; the product never calls it.
+    ///
+    /// # Errors
+    ///
+    /// [`DamageRefused::NoValue`] when no value is stored there (absent, a tombstone, or a
+    /// value with no bytes): nothing is written. [`DamageRefused::WriteFailed`] when RocksDB
+    /// refuses the write.
+    #[cfg(debug_assertions)]
+    pub fn damage_record(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: &[u8],
+    ) -> Result<(), DamageRefused> {
+        let raw = encode_key(partition, generation, ns, key);
+        let cf = self.cf(keys::cf_for(ns));
+        let found = self
+            .db
+            .get_cf(cf, &raw)
+            .map_err(|e| DamageRefused::WriteFailed {
+                detail: e.to_string(),
+            })?;
+        // Absent reads as empty, which does not unframe: one guard for all three cases.
+        let mut value = found.unwrap_or_default();
+        if !matches!(unframe(&value), Some(Frame::Value(_, bytes)) if !bytes.is_empty()) {
+            return Err(DamageRefused::NoValue { key_hex: hex(&raw) });
+        }
+        let last = value.len() - 1;
+        value[last] ^= 0xFF;
+        let mut write = WriteBatch::default();
+        write.put_cf(cf, &raw, &value);
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(write, &opts)
+            .map_err(|e| DamageRefused::WriteFailed {
+                detail: e.to_string(),
+            })?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        tracing::warn!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            ns = ?ns,
+            key_hex = %hex(&raw),
+            offset = last,
+            "record_damaged"
+        );
+        Ok(())
     }
 
     fn decode_epochs(

@@ -645,3 +645,74 @@ fn m10_s2_an_epoch_revocation_is_one_synced_write_or_nothing() {
     assert_eq!(marker(&db), 2);
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
+
+/// Ruling A-R230 (`rdb_dev admin damage-copy`): the dev hook flips one stored object of one
+/// copy, and the next read of it fails its own check, naming it. Here the object is history
+/// record 2: the lineage check fails at seq 2 and nowhere else, records 1 and 3 read as before,
+/// and the damage survives a reopen (a synced write). A key holding no value is refused and
+/// nothing is written. Cuts: flip no byte (the check passes, red); skip the stored-value check
+/// (the missing key gets a record, red). Debug builds only, as the hook is. Unit, under a
+/// second.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_a_damaged_record_fails_its_check_on_one_copy_naming_it() {
+    use rdb_storage::{verify_lineage, DamageRefused, LineageFault};
+    let dir = data_dir("damage-record");
+    let db = dir.join("db");
+    let (p, g) = (PartitionId(1), Generation(1));
+    let record = |engine: &RocksEngine, seq: u64| {
+        engine
+            .history_at(p, g, Seq(seq))
+            .expect("read")
+            .expect("stored")
+            .0
+    };
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 3);
+        assert!(verify_lineage(&engine, p, g).is_ok(), "whole before");
+        let before: Vec<_> = (1..=3).map(|seq| record(&engine, seq)).collect();
+        engine
+            .damage_record(p, g, Namespace::History, &2_u64.to_be_bytes())
+            .expect("damage record 2");
+        assert!(engine.wal_synced_through_latest(), "a synced write");
+        assert_eq!(
+            verify_lineage(&engine, p, g),
+            Err(LineageFault::DigestMismatch(Seq(2))),
+            "the check fails at the damaged record"
+        );
+        assert_eq!(record(&engine, 1), before[0]);
+        assert_eq!(record(&engine, 3), before[2]);
+        let (old, new) = (before[1].to_vec(), record(&engine, 2).to_vec());
+        let differ: Vec<usize> = (0..old.len()).filter(|&i| old[i] != new[i]).collect();
+        assert_eq!(differ, vec![old.len() - 1], "one byte, the last");
+
+        let records = stored_history(&engine);
+        assert!(matches!(
+            engine.damage_record(p, g, Namespace::History, &9_u64.to_be_bytes()),
+            Err(DamageRefused::NoValue { .. })
+        ));
+        assert_eq!(stored_history(&engine), records, "nothing written");
+    }
+    let engine = RocksEngine::open(&db).expect("reopen");
+    assert_eq!(
+        verify_lineage(&engine, p, g),
+        Err(LineageFault::DigestMismatch(Seq(2))),
+        "durable"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Every History record of lineage (1, 1), for a nothing-written check.
+#[cfg(debug_assertions)]
+fn stored_history(engine: &RocksEngine) -> Vec<Option<bytes::Bytes>> {
+    (1..=10)
+        .map(|seq| {
+            engine
+                .history_at(PartitionId(1), Generation(1), Seq(seq))
+                .expect("read")
+                .map(|(record, _)| record)
+        })
+        .collect()
+}
