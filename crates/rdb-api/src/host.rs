@@ -1870,6 +1870,13 @@ impl Host {
                 .or_insert_with(|| Recovery::bound_to(self.engine.instance()))
                 .step(&ctx, event),
         };
+        // A step that read a faulted view decided on reads that were not whole (A-R164): its
+        // effects are dropped and the node fails.
+        if reads_storage {
+            if let Some((_, view)) = self.views.get(&partition) {
+                view_whole(view, &format!("{module:?} step")).map_err(StepError::Host)?;
+            }
+        }
         answer.map_err(StepError::Module)
     }
 
@@ -3436,8 +3443,24 @@ impl Host {
     /// Compile writes as one transaction against the step view. The outer error
     /// faults the node (the step view could not be built); the inner one is the caller's: the
     /// first put that does not compile refuses them all, named by its index, never its key.
-    /// `None` is a compile with nothing to write, which is never sent.
+    /// `None` is a compile with nothing to write, which is never sent. A compile that read a
+    /// faulted view faults the node too (A-R164): its conditions were read from a view that was
+    /// not whole.
     fn compile(
+        &mut self,
+        partition: PartitionId,
+        identity: RequestIdentity,
+        puts: &[PutOp],
+        remaining_millis: u64,
+    ) -> Result<Result<Option<TxnRequest>, ApiError>, String> {
+        let compiled = self.compile_unchecked(partition, identity, puts, remaining_millis);
+        if let Some((_, view)) = self.views.get(&partition) {
+            view_whole(view, "compile")?;
+        }
+        compiled
+    }
+
+    fn compile_unchecked(
         &mut self,
         partition: PartitionId,
         identity: RequestIdentity,
@@ -3861,6 +3884,7 @@ impl Host {
             && stored
                 .as_ref()
                 .is_some_and(|bytes| Digest::of(Domain::ReadValue, &[key, bytes]) == digest);
+        view_whole(view, "read reply check")?;
         if !matches {
             return Err(format!(
                 "read reply v{version} does not match the step view it came from"
@@ -4359,6 +4383,32 @@ fn margin_ms(horizon: Tick, at: Tick) -> i64 {
 /// another kind's look (`KindMismatch`), is the caller's error. The outer error faults the
 /// node: the view cannot back the answer P1 gave.
 fn object_answer(
+    node: NodeId,
+    view: &RocksSnapshot,
+    root: &RootKey,
+    look: &Look,
+    outcome: ReadServiceOutcome,
+) -> Result<Answer, String> {
+    let answer = object_answer_unchecked(node, view, root, look, outcome);
+    view_whole(view, "read")?;
+    answer
+}
+
+/// A view read that met a storage fault answered `None` or a short page, which is never an
+/// answer (A-R164): checked after every read through a view and before anything the read
+/// produced is sent. A fault fails the node through its `Err` path; what the read produced is
+/// dropped, and every waiter is answered with the error.
+fn view_whole(view: &RocksSnapshot, what: &str) -> Result<(), String> {
+    view.fault().map_or(Ok(()), |fault| {
+        Err(format!(
+            "{what}: storage read fault {fault:?} in the view of generation {} at seq {}",
+            view.generation().0,
+            view.at().0
+        ))
+    })
+}
+
+fn object_answer_unchecked(
     node: NodeId,
     view: &RocksSnapshot,
     root: &RootKey,

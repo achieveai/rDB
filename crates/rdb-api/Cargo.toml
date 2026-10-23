@@ -40,6 +40,8 @@ serde_json = { workspace = true, features = ["float_roundtrip"] }
 hex = { workspace = true }
 # `rdb_dev blob upload` hashes the whole blob and prints `--sha256` for a resumed publish (S4b).
 sha2 = { workspace = true }
+# A host row writes an unframed value straight into a closed copy (M10, A-R164).
+rocksdb = { workspace = true }
 
 [[example]]
 name = "rdb_dev"

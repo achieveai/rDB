@@ -4790,10 +4790,83 @@ mod tests {
         first.shutdown();
     }
 
+    /// A-R164: a value whose stored frame does not decode, read by the app after a reopen, is
+    /// an error and stops the node. Never `None`, never a panic. The view's get answers `None`
+    /// and records the fault; the host's check after the step turns that into the node's fault,
+    /// which answers the waiter.
+    /// Integration (~30 s): two opens, each reopen waits out the last run's grant.
+    #[config_log::retcd_test]
+    fn m10_a_frame_corrupt_value_read_by_the_app_is_an_error_never_absent() {
+        use rdb_core::contracts::storage::Namespace;
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "first open");
+        db.put(b"c07", b"hello", None).expect("put");
+        db.shutdown();
+        drop(db);
+
+        // Every user value of generation 1, in every copy, becomes 3 bytes: shorter than a frame.
+        let prefix = rdb_storage::keys::encode_key(PARTITION, Generation(1), Namespace::User, &[]);
+        let mut corrupted = 0;
+        for n in 1..=3 {
+            let path = dir.path().join("nodes").join(n.to_string());
+            let raw = rocksdb::DB::open_cf(
+                &rocksdb::Options::default(),
+                &path,
+                rdb_storage::keys::COLUMN_FAMILIES,
+            )
+            .expect("raw open");
+            let cf = raw
+                .cf_handle(rdb_storage::keys::cf_for(Namespace::User))
+                .expect("cf");
+            let keys: Vec<Box<[u8]>> = raw
+                .prefix_iterator_cf(cf, &prefix)
+                .map(|item| item.expect("raw read").0)
+                .take_while(|key| key.starts_with(&prefix))
+                .collect();
+            for key in keys {
+                raw.put_cf(cf, &key, [0, 0, 0]).expect("raw put");
+                corrupted += 1;
+            }
+        }
+        assert!(
+            corrupted >= 3,
+            "the value is stored in every copy: {corrupted}"
+        );
+
+        let mut db = open();
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the reopen is ready");
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get(b"c07")));
+        match read {
+            Ok(Err(error)) => {
+                assert!(
+                    error.detail.contains("storage read fault"),
+                    "the error names the fault: {error:?}"
+                );
+            }
+            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
     /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a
     /// row, and a folder that was opened and closed empty reopens empty. Each reopen heals
     /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again.
-    /// Integration (~10 s): each reopen waits out the last run's grant on wall-clock time.
+    /// Integration (~30 s today): four reopens, each waiting out the last run's grant on
+    /// wall-clock time and a full discovery window. Re-timed after the A-R165 timers land.
     #[config_log::retcd_test]
     fn m10_s1_1_a_reopen_reads_back_every_acknowledged_write() {
         let rt = runtime();
