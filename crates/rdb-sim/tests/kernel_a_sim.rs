@@ -930,6 +930,12 @@ fn recover_gen3_at(
         partition: PART,
         seq: DurableSeq(cutoff.0),
         digest,
+        boot: later
+            .committed
+            .pinned_config
+            .member(copy)
+            .expect("the source is a member")
+            .boot,
     };
     later.barrier = RecoveryBarrier::try_new(&[proof], &BTreeSet::from([copy]), cutoff, digest)
         .expect("barrier");

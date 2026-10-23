@@ -2530,6 +2530,7 @@ fn provider_a_survivor_that_adopted_a_newer_generation_answers_from_it() {
                 partition: PartitionId(1),
                 seq: DurableSeq(3),
                 digest: after.digest(3),
+                boot: PEER_BOOT,
             })
         ))),
         "the pre-commit sync proves seq 3 of generation 2, not the placed generation-1 record"
@@ -2572,6 +2573,7 @@ fn provider_a_survivor_that_landed_a_newer_generation_in_the_barrier_answers_fro
                 partition: PartitionId(1),
                 seq: DurableSeq(2),
                 digest: prior.digest(2),
+                boot: PEER_BOOT,
             };
             result.barrier = RecoveryBarrier::try_new(
                 &[proof],
@@ -2690,6 +2692,7 @@ fn provider_sync_wal_through_proves_only_what_the_engine_made_durable() {
                 partition: PartitionId(1),
                 seq: DurableSeq(seq),
                 digest: digest(seq),
+                boot: PEER_BOOT,
             },
         )))
     };

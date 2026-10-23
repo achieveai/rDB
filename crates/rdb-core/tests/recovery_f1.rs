@@ -285,6 +285,7 @@ fn proven(copy: CopyId, seq: u64, digest: Digest) -> DurableProof {
         partition: PARTITION,
         seq: DurableSeq(seq),
         digest,
+        boot: BootId(1),
     }
 }
 
