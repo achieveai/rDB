@@ -1332,6 +1332,14 @@ struct Host {
     /// Partitions whose dormant receiver holds its full ladder (A-R173, critic-d7 F2): built
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
+    /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
+    /// once by the first `SnapshotCatchupRequired` served at that generation.
+    primary_ladders: BTreeSet<(PartitionId, Generation)>,
+    /// H2 (A-R254): each `(partition, copy, barrier)` already served, so a repeat is dropped
+    /// (B-R48: R1 keeps no memory of its asks; the consumer dedups).
+    snapshots_served: BTreeSet<(PartitionId, CopyId, Seq)>,
+    /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root.
+    committed_correlation: BTreeMap<PartitionId, CorrelationId>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
@@ -1432,6 +1440,9 @@ impl Host {
             deferred_syncs: BTreeMap::new(),
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
+            primary_ladders: BTreeSet::new(),
+            snapshots_served: BTreeSet::new(),
+            committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
             instance: engine_instance,
@@ -3043,6 +3054,14 @@ impl Host {
             }
             KernelEffect::Recovery(effect) => return self.recovery_effect(effect, site),
             KernelEffect::Recovered(result) => self.recovered(result, site)?,
+            KernelEffect::SnapshotCatchupRequired { copy, barrier } => {
+                self.snapshot_catchup(site.partition, *copy, *barrier);
+                return Ok(());
+            }
+            KernelEffect::CopyAheadOnControl { copy } => {
+                self.copy_ahead(site.partition, *copy);
+                return Ok(());
+            }
             KernelEffect::Publication(effect) => {
                 return match effect {
                     PublicationEffect::Snapshot { identity, handle } => {
@@ -3181,6 +3200,7 @@ impl Host {
         );
         self.inherit(partition, result)?;
         self.committed.insert(partition, Box::new(result.clone()));
+        self.committed_correlation.insert(partition, site.correlation);
         if self.landed.insert((partition, result.new_generation)) {
             self.stamp_retirement(partition, result.new_generation);
         }
@@ -3457,6 +3477,7 @@ impl Host {
         self.answer_deferred_syncs(partition, result.new_generation);
         self.schedule_acquire(&result, site);
         self.committed.insert(partition, result.clone());
+        self.committed_correlation.insert(partition, site.correlation);
         self.push(
             site,
             EventKind::Kernel(KernelEvent::Recovered(result)),
@@ -4538,6 +4559,139 @@ impl Host {
             rungs.push((Seq(seq), digest));
         }
         Ok(rungs)
+    }
+
+    /// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired`. The primary here met a record it
+    /// does not retain; this engine still holds every record, so the primary is given its
+    /// engine's ladder ([`Replication::restore_primary_history`], K3), once per generation, and
+    /// the copy's next `NeedPrefix` walks it record by record. The sim's twin is
+    /// `snapshot_catchup` in `rdb-sim`'s dispatch.
+    ///
+    /// Never faults the node. A repeat `(copy, barrier)` is dropped (B-R48). An ask after the
+    /// ladder was restored cannot be served by re-sending, so it is logged
+    /// `snapshot_catchup_unservable` (warn) and the copy stays behind, named. No primary here, an
+    /// unreadable ladder or a refused one is logged `snapshot_catchup_unserved{reason}` (warn).
+    fn snapshot_catchup(&mut self, partition: PartitionId, copy: CopyId, barrier: Seq) {
+        let node = self.node;
+        let started = Instant::now();
+        let unserved = |reason: &str| {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                reason,
+                "snapshot_catchup_unserved"
+            );
+        };
+        let Some(primary) = self.replication.primary(node, partition) else {
+            return unserved("no_primary");
+        };
+        let generation = primary.tracker().lineage().generation;
+        if !self.snapshots_served.insert((partition, copy, barrier)) {
+            return;
+        }
+        if self.primary_ladders.contains(&(partition, generation)) {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                generation = generation.0,
+                "snapshot_catchup_unservable"
+            );
+            return;
+        }
+        let read = match self.dormant_rungs(partition, generation) {
+            Ok(read) => read,
+            Err(reason) => return unserved(reason),
+        };
+        if self
+            .replication
+            .restore_primary_history(node, partition, &read)
+            .is_err()
+        {
+            return unserved("ladder_refused");
+        }
+        self.primary_ladders.insert((partition, generation));
+        tracing::info!(
+            node = node.0,
+            partition = partition.0,
+            copy = copy.0,
+            barrier = barrier.0,
+            generation = generation.0,
+            rungs = read.len(),
+            millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "snapshot_catchup_served"
+        );
+    }
+
+    /// H3 (I1, A-R254): R1's `CopyAheadOnControl`. `copy` answered `NeedLineage`, `NeedConfig`
+    /// or `UnknownEpoch`, so it has not landed the root this node holds. Re-post that root to
+    /// the copy's node as a landing, through [`Links::send`], which honours a hold or a drop
+    /// exactly as any peer message does, so a held copy is not reached early. Logged
+    /// `copy_ahead_reposted`. The cursor that emitted it stopped; the keepalive starts a new one
+    /// once the copy has landed. The sim's twin is `copy_ahead` in `rdb-sim`'s dispatch.
+    ///
+    /// Never faults the node: no committed root here (a recovery source's cursor, whose answer
+    /// is F1's) is logged `copy_ahead_unrouted`, a root whose pin has no such copy
+    /// `copy_ahead_unknown_copy`, and an unreachable node `copy_ahead_unreachable` (all warn).
+    fn copy_ahead(&mut self, partition: PartitionId, copy: CopyId) {
+        let node = self.node.0;
+        let (Some(result), Some(&correlation)) = (
+            self.committed.get(&partition),
+            self.committed_correlation.get(&partition),
+        ) else {
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                "copy_ahead_unrouted"
+            );
+            return;
+        };
+        let Some(member) = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.copy == copy)
+            .map(|member| member.node)
+        else {
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                "copy_ahead_unknown_copy"
+            );
+            return;
+        };
+        let generation = result.new_generation.0;
+        let msg = Msg::Landed {
+            result: result.clone(),
+            partition,
+            correlation,
+            emitter: self.node,
+            not_before: self.clock.now().plus_millis(CONTROL_WATCH_MILLIS),
+        };
+        match self.links.send(self.node, member, msg) {
+            Ok(()) => tracing::info!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                member = member.0,
+                generation,
+                "copy_ahead_reposted"
+            ),
+            Err(fault) => tracing::warn!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                member = member.0,
+                ?fault,
+                "copy_ahead_unreachable"
+            ),
+        }
     }
 
     /// R1 answered under a catch-up's correlation and runs no source for its copy: it refused
