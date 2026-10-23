@@ -58,7 +58,7 @@ use rdb_core::contracts::recovery::{
     SurvivorInventory,
 };
 use rdb_core::contracts::storage::{
-    CapturedPrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
+    CapturedPrefix, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
 };
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -1933,32 +1933,59 @@ impl Host {
     }
 
     /// The host flusher: every lineage the engine holds, through its applied prefix.
+    ///
+    /// A-R192b: when every lineage is already durable through its applied prefix, the sync
+    /// would move nothing, so the fsync is skipped. `Flushed` still goes out, carrying the
+    /// durable marks the engine holds, which are what that sync would have returned: every
+    /// durability proof sees the same event either way. Only this duty skips; a
+    /// `StoreEffect::Flush`, a barrier `SyncWalThrough` and a holder's sync always sync.
+    ///
+    /// A-R214: it also syncs while any write since the last sync is unsynced, as a dedup delete
+    /// or an inherit at base 0 is: those raise no applied mark, so durable == applied misses
+    /// them ([`RocksEngine::wal_synced_through_latest`]).
     fn flush_duty(&mut self) -> Result<(), Fault> {
-        let captured: Vec<CapturedPrefix> = self
-            .engine
-            .lineages()
-            .into_iter()
-            .map(|(partition, generation)| CapturedPrefix {
-                partition,
-                generation,
-                through: self.engine.buffered_applied(partition, generation),
-            })
-            .collect();
-        if captured.is_empty() {
+        let lineages = self.engine.lineages();
+        if lineages.is_empty() {
             return Ok(());
         }
+        let synced = !self.engine.wal_synced_through_latest()
+            || lineages.iter().any(|&(partition, generation)| {
+                self.engine.durable(partition, generation).0
+                    < self.engine.buffered_applied(partition, generation).0
+            });
         let ticket = FlushTicket(self.next_ticket);
         self.next_ticket += 1;
         let started = Instant::now();
-        let kind = match self.engine.sync_wal_through(captured) {
-            Ok(durable) => StorageEvent::Flushed { ticket, durable },
-            Err(fault) => StorageEvent::FlushFailed { ticket, fault },
+        let kind = if synced {
+            let captured = lineages
+                .into_iter()
+                .map(|(partition, generation)| CapturedPrefix {
+                    partition,
+                    generation,
+                    through: self.engine.buffered_applied(partition, generation),
+                })
+                .collect();
+            match self.engine.sync_wal_through(captured) {
+                Ok(durable) => StorageEvent::Flushed { ticket, durable },
+                Err(fault) => StorageEvent::FlushFailed { ticket, fault },
+            }
+        } else {
+            let durable = lineages
+                .into_iter()
+                .map(|(partition, generation)| DurablePrefix {
+                    partition,
+                    generation,
+                    through: self.engine.durable(partition, generation),
+                })
+                .collect();
+            StorageEvent::Flushed { ticket, durable }
         };
         if self.flushed_once {
             tracing::debug!(
                 node = self.node.0,
                 kind = "flush",
                 ticket = ticket.0,
+                synced,
                 millis = millis(started),
                 "host_duty"
             );
@@ -1968,6 +1995,7 @@ impl Host {
                 node = self.node.0,
                 kind = "flush",
                 ticket = ticket.0,
+                synced,
                 period_ms = HOST_FLUSH_EVERY_MILLIS,
                 "host_duty"
             );
@@ -3465,19 +3493,34 @@ impl Host {
         partition: PartitionId,
         result: &RecoveryResult,
     ) -> Option<RecoveryEvent> {
-        let generation = result.new_generation;
+        // The new generation's lineage, spelled once (review-r185 ADV1).
+        let lineage = result.selected.root;
+        let generation = lineage.generation;
         let cutoff = result.selected.cutoff_seq;
         let digest = result.selected.cutoff_digest;
         let node = self.node.0;
+        // A copy that holds no older generation has nothing to link: expected, so info, not
+        // warn (review-r185 ADV3). Every other reason is a copy that cannot catch up here.
         let refused = |reason: &str| {
-            tracing::warn!(
-                node,
-                partition = partition.0,
-                generation = generation.0,
-                cutoff = cutoff.0,
-                reason,
-                "land_link_refused"
-            );
+            if reason == "anchor_generation_absent" {
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            } else {
+                tracing::warn!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            }
             None
         };
         let Some(copy) = result
@@ -3501,13 +3544,8 @@ impl Host {
         // R1 builds a copy outside the barrier a receiver at the root, which only a catch-up
         // fills; linked here, the copy holds the cutoff, so it gets a receiver at the cutoff, as a
         // barrier copy gets (`proved_head`; ruling A-R185a).
-        let lineage = Lineage {
-            partition: result.committed.pinned_config.partition,
-            generation,
-            owner_epoch: result.committed.authority_view.lineage.owner_epoch,
-        };
         let anchor = LineageAnchor {
-            lineage: result.selected.root,
+            lineage,
             base_seq: cutoff,
             base_digest: digest,
         };
@@ -6605,6 +6643,171 @@ mod tests {
         assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
     }
 
+    /// A-R192b: the flush duty syncs only while some lineage is applied past its durable mark.
+    /// Once all are durable through applied, it pushes the same `Flushed` with no fsync: a
+    /// WAL-flush fault armed then stays armed. The next commit makes the duty sync again, and
+    /// the fault fires there. Cut (never skip): the fault fires early. Cut (always skip): the
+    /// first duty leaves seq 1 not durable.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_flush_duty_syncs_only_while_a_lineage_is_applied_past_durable() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let (partition, generation) = (PartitionId(1), Generation(1));
+        let commit = |host: &mut Host, seq: u64| {
+            host.engine
+                .commit(rdb_core::contracts::storage::Batch {
+                    id: rdb_core::contracts::ids::BatchId(seq),
+                    partition,
+                    generation,
+                    seq: Seq(seq),
+                    writes: Vec::new(),
+                })
+                .expect("commit");
+        };
+        let last = |host: &mut Host| {
+            host.queue
+                .pop_back()
+                .map(|queued| queued.event.kind)
+                .expect("the duty pushed an event")
+        };
+        let durable_through = |seq: u64| {
+            EventKind::Storage(StorageEvent::Flushed {
+                ticket: FlushTicket(0),
+                durable: vec![DurablePrefix {
+                    partition,
+                    generation,
+                    through: DurableSeq(seq),
+                }],
+            })
+        };
+        let without_ticket = |kind: EventKind| match kind {
+            EventKind::Storage(StorageEvent::Flushed { durable, .. }) => {
+                EventKind::Storage(StorageEvent::Flushed {
+                    ticket: FlushTicket(0),
+                    durable,
+                })
+            }
+            other => other,
+        };
+
+        commit(&mut host, 1);
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+        // A-R214: that sync wrote the durable mark unsynced, so one more duty syncs it.
+        host.flush_duty().expect("flush");
+        assert!(host.engine.wal_synced_through_latest());
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+
+        host.engine
+            .inject_fault(rdb_storage::InjectedFault::WalFlush);
+        host.flush_duty().expect("flush");
+        assert_eq!(
+            host.engine.armed_fault(),
+            Some(rdb_storage::InjectedFault::WalFlush),
+            "nothing to sync: no fsync"
+        );
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+
+        commit(&mut host, 2);
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.armed_fault(), None, "seq 2 needed a sync");
+        assert!(
+            matches!(
+                last(&mut host),
+                EventKind::Storage(StorageEvent::FlushFailed { .. })
+            ),
+            "the armed fault failed that sync"
+        );
+        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+    }
+
+    /// A-R214: a host over a fresh engine whose one lineage is synced and quiet: a WAL-flush
+    /// fault armed then survives a duty. Every lineage is durable through applied after it.
+    #[cfg(debug_assertions)]
+    fn quiet_host_with_wal_flush_armed(
+        path: &std::path::Path,
+        rt: &tokio::runtime::Runtime,
+    ) -> Host {
+        let mut host = host_over(path, rt);
+        host.engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition: PartitionId(2),
+                generation: Generation(1),
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit");
+        host.flush_duty().expect("flush");
+        host.flush_duty().expect("flush");
+        host.engine
+            .inject_fault(rdb_storage::InjectedFault::WalFlush);
+        host.flush_duty().expect("flush");
+        assert_eq!(
+            host.engine.armed_fault(),
+            Some(rdb_storage::InjectedFault::WalFlush),
+            "a quiet duty does not sync"
+        );
+        host
+    }
+
+    /// A-R214: with every lineage still durable through applied, the next duty syncs anyway,
+    /// and the armed fault fails that sync.
+    #[cfg(debug_assertions)]
+    fn assert_next_duty_syncs(host: &mut Host, what: &str) {
+        let durable_at_applied = host
+            .engine
+            .lineages()
+            .into_iter()
+            .all(|(p, g)| host.engine.durable(p, g).0 == host.engine.buffered_applied(p, g).0);
+        assert!(durable_at_applied, "{what}: no applied mark moved");
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.armed_fault(), None, "{what}: the duty synced");
+        assert!(
+            matches!(
+                host.queue.pop_back().map(|queued| queued.event.kind),
+                Some(EventKind::Storage(StorageEvent::FlushFailed { .. }))
+            ),
+            "{what}: the armed fault failed that sync"
+        );
+    }
+
+    /// A-R214 row 1: the retire duty's dedup delete raises no applied mark, so durable ==
+    /// applied alone would skip the next duty and leave the delete in the OS cache. The
+    /// duty syncs it. Cut (durable == applied alone): the fault stays armed, red.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_dedup_delete_alone_still_makes_the_flush_duty_sync() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
+        host.engine
+            .delete_dedup_below(PartitionId(2), Generation(1), &2_u64.to_be_bytes())
+            .expect("dedup delete");
+        assert_next_duty_syncs(&mut host, "a dedup delete");
+    }
+
+    /// A-R214 row 2: an inherit at base 0 (a landing at cutoff 0) writes the link and the
+    /// seal, and leaves both lineages applied and durable at 0. The duty syncs it. Cut
+    /// (durable == applied alone): the fault stays armed, red.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_inherit_at_base_zero_still_makes_the_flush_duty_sync() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
+        let inherited = host
+            .engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq::ZERO)
+            .expect("inherit");
+        assert_eq!(inherited, Inherited::Linked);
+        assert_next_duty_syncs(&mut host, "an inherit at base 0");
+    }
+
     /// Defect D2 (2026-10-07, `rdb_dev --hold 1-2,1-3`, walk A10): with both secondaries
     /// unreachable F1 commits `ReadOnly` at cutoff 0, and the partition stayed read-only in
     /// silence. Since the D2 kernel step, F1 pins that rebuild at the commit and, at each
@@ -8045,6 +8248,63 @@ mod tests {
         assert_eq!(
             reasons,
             ["held_past_base", "base_digest_differs"].map(serde_json::Value::from)
+        );
+    }
+
+    /// review-r185 ADV2 and ADV3: the refusals no row reached, each by name and at its level.
+    /// A copy holding no older generation has nothing to link, which is expected on a first
+    /// landing, so it logs at info. One already holding the new generation, or one the pin
+    /// does not name, logs at warn. None links, installs a receiver or faults the host. Cut
+    /// (every reason at warn): red. Unit.
+    #[config_log::retcd_test]
+    fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
+        const METHOD: &str = "a_landing_with_nothing_to_link_is_refused_by_name_at_its_level";
+        let result = landing_at(0, Digest::ROOT);
+        let mut outside = result.clone();
+        outside
+            .committed
+            .pinned_config
+            .members
+            .retain(|member| member.node != NodeId(2));
+        let rt = current_thread();
+        let empty = config_testkit::fs::temp_dir();
+        let mut fresh = host_over(&empty.path().join("node"), &rt);
+        let ahead = config_testkit::fs::temp_dir();
+        let path = ahead.path().join("node");
+        write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(2),
+            1,
+        );
+        let mut holding = host_over(&path, &rt);
+        let refuses = |host: &mut Host, result: &RecoveryResult| {
+            let held = host.engine.lineages();
+            assert_eq!(host.land_link(PartitionId(1), result), None);
+            assert_eq!(host.engine.lineages(), held, "nothing linked");
+            assert!(host
+                .replication
+                .receiver(NodeId(2), PartitionId(1))
+                .is_none());
+            assert_eq!(host.fault, None);
+        };
+        refuses(&mut fresh, &result);
+        refuses(&mut holding, &result);
+        refuses(&mut fresh, &outside);
+        let refused: Vec<_> = logged!(METHOD, "land_link_refused")
+            .into_iter()
+            .map(|line| (line["reason"].clone(), line["@l"].clone()))
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                ("anchor_generation_absent", "Information"),
+                ("held_at_or_above_generation", "Warning"),
+                ("not_a_member", "Warning"),
+            ]
+            .map(|(reason, level)| (
+                serde_json::Value::from(reason),
+                serde_json::Value::from(level)
+            ))
         );
     }
 
