@@ -203,7 +203,9 @@ const MAIL_BEFORE_DUTIES: usize = 256;
 /// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
 /// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
 /// window. That CAS takes 5-20 ms here, and up to ~80 ms with the suite running in parallel;
-/// past the deadline F1 blocks for good with `BlockPromotion { reason: ControlUnknown }`, and
+/// past the deadline an unbound F1, as every `Trio` host's is, blocks for good with
+/// `BlockPromotion { reason: ControlUnknown }` (a bound one, as every `Db`'s is, reads
+/// `partitions/{p}` and resolves instead, ruling A-R182), and
 /// the row waits out its patience for a commit that cannot come (G2 at 20 ms; at 100 ms on a
 /// host also running a coverage build, 2026-10-07). So it stretches with the scale, as the
 /// waits do. Even scaled it is short of a loaded host's stalls (~470 ms, 2026-10-08), so only
@@ -3868,9 +3870,29 @@ impl Host {
             RecoveryEffect::RecordSourceUnavailable { .. }
             | RecoveryEffect::CloseWindow
             | RecoveryEffect::Selected(_)
-            | RecoveryEffect::Quarantine(_)
-            | RecoveryEffect::BlockPromotion { .. } => {
+            | RecoveryEffect::Quarantine(_) => {
                 tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
+                Ok(())
+            }
+            // Whether the block lasts is F1's phase after the step that reported it, which is
+            // the step just taken: its effects are delivered before anything else steps. The
+            // reason alone cannot say: a control-store outage on the activation CAS resolves
+            // (A-R102), on a bound F1's recovery CAS too (A-R182), and a held fence may re-enter
+            // at once. `Blocked` lasts until a fresh fence, `Quarantined` for good.
+            RecoveryEffect::BlockPromotion { .. } => {
+                let terminal = self.recoveries.get(&site.partition).is_some_and(|f1| {
+                    matches!(
+                        f1.phase(),
+                        RecoveryPhase::Blocked(_) | RecoveryPhase::Quarantined
+                    )
+                });
+                tracing::info!(
+                    node,
+                    partition = site.partition.0,
+                    ?effect,
+                    terminal,
+                    "recovery_fact"
+                );
                 Ok(())
             }
             RecoveryEffect::RebuildStalled { copy } => {
@@ -6584,6 +6606,118 @@ mod tests {
         trio.mem.stop_failing();
         trio.ready();
         assert_eq!(trio.status(0).recovery.as_deref(), Some("Committed"));
+    }
+
+    /// Node 1's `recovery_fact` lines for `BlockPromotion`, as `(effect, terminal)`.
+    fn block_facts(method: &str) -> Vec<(String, Option<bool>)> {
+        logged!(method, "recovery_fact")
+            .into_iter()
+            .filter(|line| line["node"] == 1)
+            .filter_map(|line| {
+                let effect = line["effect"].as_str()?.to_owned();
+                effect
+                    .starts_with("BlockPromotion")
+                    .then(|| (effect, line["terminal"].as_bool()))
+            })
+            .collect()
+    }
+
+    /// BlockPromotion item (lead, 2026-10-23): a block a control-store outage resolves is
+    /// logged `terminal=false`. The activation row's start: F1 commits `ReadOnly` with its
+    /// peers held, the store goes down, and the activation CAS answers `Unavailable`. F1 reports
+    /// `BlockPromotion { reason: ControlUnavailable }` and resolves in `ActivationUnresolved`
+    /// (A-R102), so the block does not last. Cut: `terminal` from the reason and the binding (a
+    /// control outage terminal when unbound, as every `Trio` host is) logs `true` here.
+    /// Integration (~3 s): bootstrap's discovery window, then the activation's own deadline.
+    #[config_log::retcd_test]
+    fn m10_a_block_a_store_outage_resolves_is_logged_not_terminal() {
+        const METHOD: &str = "m10_a_block_a_store_outage_resolves_is_logged_not_terminal";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        trio.until("F1 rebuilding on node 1", |trio| {
+            (trio.status(0).recovery.as_deref() == Some("Rebuilding")).then_some(())
+        });
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.links.heal_all();
+        trio.until("F1 resolving on node 1", |trio| {
+            (trio.status(0).recovery.as_deref() == Some("ActivationUnresolved")).then_some(())
+        });
+
+        let facts = block_facts(METHOD);
+        assert!(!facts.is_empty(), "the outage was reported as a block");
+        for (effect, terminal) in &facts {
+            assert!(
+                effect.starts_with("BlockPromotion { reason: Control"),
+                "only the outage blocked: {facts:?}"
+            );
+            assert_eq!(*terminal, Some(false), "F1 resolves this one: {facts:?}");
+        }
+        trio.mem.stop_failing();
+        trio.ready();
+    }
+
+    /// BlockPromotion item (lead, 2026-10-23): a block that lasts is logged `terminal=true`.
+    /// Node 1 starts with its peers held, and the control store goes down while F1 collects, so
+    /// the recovery CAS answers `Unavailable`. Unbound, as every `Trio` host is, F1 stays
+    /// `Blocked(ControlUnavailable)` until a fresh fence, and no fence comes while the store is
+    /// down. Cut: `terminal` from the reason alone (a control outage never terminal) logs
+    /// `false` here. Integration (~2 s): bootstrap's discovery window.
+    #[config_log::retcd_test]
+    fn m10_a_block_that_lasts_is_logged_terminal() {
+        const METHOD: &str = "m10_a_block_that_lasts_is_logged_terminal";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        trio.until("F1 collecting on node 1", |trio| {
+            matches!(
+                trio.status(0).recovery.as_deref(),
+                Some("Fenced" | "Collecting")
+            )
+            .then_some(())
+        });
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        // `Trio::step` fails a row on a block, which is what this row waits for: step by hand.
+        let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+        let phase = loop {
+            for (host, _, rx) in &mut trio.nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+            if let Some(phase) = trio
+                .status(0)
+                .recovery
+                .filter(|phase| phase.starts_with("Blocked("))
+            {
+                break phase;
+            }
+            assert!(Instant::now() < deadline, "F1 never blocked on node 1");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(phase, "Blocked(ControlUnavailable)");
+
+        assert_eq!(
+            block_facts(METHOD),
+            vec![(
+                "BlockPromotion { reason: ControlUnavailable }".to_owned(),
+                Some(true)
+            )]
+        );
+        trio.mem.stop_failing();
     }
 
     /// Tester gap G2 (2026-10-07, mutant M4): once F1 sends its post-commit sync, the rebuild
