@@ -932,10 +932,12 @@ impl Db {
             .map_err(|error| {
                 // Nothing was written, so opening again is safe; say so when the store was
                 // simply not reachable (M10 D14). `config-client` names each endpoint it tried.
+                // One step fits both an rEtcd nobody reached and one that answered without a
+                // leader because most of its nodes are down (A-R210).
                 let step = match error {
                     config_core::ConfigError::Unavailable { .. } => {
-                        ". Check that rEtcd is running and reachable from this process, then \
-                         open again"
+                        ". Check that rEtcd is running and reachable from this process, and \
+                         that a majority of its nodes is up, then open again"
                     }
                     _ => "",
                 };
@@ -5341,8 +5343,8 @@ mod tests {
         assert!(
             text.starts_with("control store: get partitions/1: ")
                 && text.ends_with(
-                    ". Check that rEtcd is running and reachable from this process, then open \
-                     again"
+                    ". Check that rEtcd is running and reachable from this process, and that a \
+                     majority of its nodes is up, then open again"
                 ),
             "{text}"
         );
@@ -5357,6 +5359,42 @@ mod tests {
             .expect("opening the same folder again, with the store back, succeeds");
         admits(&db, "after the second open");
         db.shutdown();
+    }
+
+    /// A-R210: rEtcd answered, but with no leader, because most of its nodes are down (the
+    /// tester's control-follower run, as `config-client` reports it after A-R208). The open's
+    /// error keeps that answer, and its step also says to bring a majority of the nodes up.
+    /// Cut: the D14 step without the majority clause, and this row and the D14 row fail.
+    /// Unit (~1 s): `MemStore` failing every call.
+    #[test]
+    fn m10_r210_an_open_whose_control_store_has_no_leader_says_to_bring_a_majority_up() {
+        const ANSWER: &str = "leader unknown (answered by 127.0.0.1:18922; could not reach: \
+                              cannot connect to 127.0.0.1:18902: transport error; cannot connect \
+                              to 127.0.0.1:18912: transport error)";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let store = config_testkit::MemStore::new();
+        store.failing_with(config_core::ConfigError::Unavailable {
+            reason: ANSWER.to_owned(),
+        });
+        let error = match rt.block_on(Db::open(
+            config(dir.path()),
+            Arc::new(store),
+            rt.handle().clone(),
+        )) {
+            Err(error @ OpenError::Control(_)) => error,
+            Err(other) => panic!("the open fails with Control, not: {other}"),
+            Ok(_) => panic!("the open fails while rEtcd has no leader"),
+        };
+        let text = error.to_string();
+        assert_eq!(
+            text,
+            format!(
+                "control store: get partitions/1: unavailable: {ANSWER}. Check that rEtcd is \
+                 running and reachable from this process, and that a majority of its nodes is \
+                 up, then open again"
+            )
+        );
     }
 
     /// M9 S5-2 (G3, G4). A change of any op-carrying kind with 256 ops, and a txn of 256 puts,
