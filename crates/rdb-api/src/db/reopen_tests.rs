@@ -32,11 +32,19 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// L1's waits cut short, as `tests::fast` does, so a fresh open is ready quickly.
+///
+/// Window kind: claims what is reported (A-R244, the A-R237 rule). Every row here claims an
+/// outcome (what an open refuses, keeps or reads back), never how long F1's discovery window
+/// is, so the window is the spec's 2 s times `deadline_scale()`. Unscaled, one 3.2 s mail step
+/// on node 2 under gate load closed it and a reopen went `Blocked` (k435). The product default
+/// stays the spec's.
 fn fast() -> Budgets {
     Budgets {
         resume_hold_millis: 50,
         warn_age_millis: 200,
         pause_age_millis: 400,
+        discovery_window_millis: Budgets::SPEC_DEFAULTS.discovery_window_millis
+            * u64::from(config_testkit::poll::deadline_scale()),
         ..Budgets::SPEC_DEFAULTS
     }
 }
@@ -440,7 +448,7 @@ fn m10_a_reopen_whose_recovery_cas_answers_unknown_settles_by_read_then_cas() {
 /// S1-5 (#45), the store keeps answering "unknown": F1 cannot settle, and says so. `wait_ready`
 /// times out naming `ProposalUnresolved`, never a block. Once the store answers again, the next
 /// read-then-CAS lands and a retried `wait_ready` succeeds, with nothing reopened.
-/// Integration (~6 s): one fresh open, a reopen held ~2 s, then one discovery window.
+/// Integration (~6 s at scale 1): one fresh open, a reopen held ~2 s, then one discovery window.
 #[config_log::retcd_test]
 fn m10_a_reopen_whose_store_keeps_answering_unknown_is_ready_once_it_answers() {
     let rt = runtime();
@@ -478,7 +486,10 @@ fn m10_a_reopen_whose_store_keeps_answering_unknown_is_ready_once_it_answers() {
         "F1 is resolving, not blocked"
     );
     let puts = faulty.partition_puts();
-    match db.wait_ready(Duration::from_secs(3)) {
+    // F1 retries once per discovery window, so the wait outlasts one window by 1 s (A-R244:
+    // `fast()` scales the window, and a fixed 3 s saw no retry at scale 3).
+    let one_window = Duration::from_millis(fast().discovery_window_millis);
+    match db.wait_ready(one_window + Duration::from_secs(1)) {
         Err(ReadyError::TimedOut { phase, .. }) => {
             assert_eq!(phase, "ProposalUnresolved", "F1 is still resolving");
         }
