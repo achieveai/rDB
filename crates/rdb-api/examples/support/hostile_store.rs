@@ -5,8 +5,10 @@
 //! the first leader's client loses its control plane the moment leadership moves. This store
 //! follows the leader instead:
 //!
-//! * a call answered `NotLeader`, or `Unavailable` because its voter stopped, is returned as it
-//!   came, and the next call goes to the voter that is leader now (`control_store_rebind`);
+//! * a call answered `NotLeader` moves the store to the voter that is leader now
+//!   (`control_store_rebind`) and is sent once more there (`control_store_retry_at_leader`,
+//!   A-R230): a follower did nothing with it. A call answered `Unavailable` because its voter
+//!   stopped is returned as it came, and the next call goes to the leader;
 //! * `control stop` of the voter the store is bound to moves the store first, and the voter is
 //!   never bound to again while it is being stopped ([`HostileStore::stopping`]). Dropping the
 //!   old client is also what lets `control start` reopen that voter's RocksDB.
@@ -202,17 +204,17 @@ impl HostileStore {
     /// `voter` answered `error`. When that says it cannot serve, bind to the leader now, if
     /// there is one this store may use; otherwise keep the binding, and the next such answer
     /// tries again. Only the voter still bound is moved away from, so a late answer from a
-    /// voter already left behind changes nothing.
-    fn after(&self, voter: VoterId, error: &ConfigError) {
+    /// voter already left behind changes nothing. Returns whether the store moved.
+    fn after(&self, voter: VoterId, error: &ConfigError) -> bool {
         if !moves(error) {
-            return;
+            return false;
         }
         let Some(cluster) = self.cluster.upgrade() else {
-            return;
+            return false;
         };
         let mut binding = self.lock();
         if binding.voter != voter {
-            return;
+            return false;
         }
         let leader = cluster.leader_now();
         let usable = leader.filter(|l| {
@@ -224,13 +226,17 @@ impl HostileStore {
                 binding.client = cluster.client(to);
                 binding.voter = to;
                 tracing::info!(from = voter.0, to = to.0, %error, "control_store_rebind");
+                true
             }
-            None => tracing::debug!(
-                from = voter.0,
-                leader = leader.map(|l| l.0),
-                %error,
-                "control_store_rebind_waiting"
-            ),
+            None => {
+                tracing::debug!(
+                    from = voter.0,
+                    leader = leader.map(|l| l.0),
+                    %error,
+                    "control_store_rebind_waiting"
+                );
+                false
+            }
         }
     }
 
@@ -336,19 +342,35 @@ impl HostileStore {
     }
 
     /// Run `call` on the bound voter's client, and follow the leader on its answer.
+    ///
+    /// A voter that answers `NotLeader` did nothing with the call, so when that moves the store
+    /// to the leader, `call` runs once more there (A-R230): an open that meets a leader change
+    /// follows it, as a remote client follows a hint. Only that case: a stopped voter's
+    /// `Unavailable` is answered as it came, and the faults this store injects never reach a
+    /// voter, so none of them is retried.
     fn through<'a, 'b, T, F>(&'a self, call: F) -> Reply<'b, T>
     where
         'a: 'b,
         T: Send + 'b,
-        F: for<'c> FnOnce(&'c dyn ConfigStore) -> Reply<'c, T> + Send + 'b,
+        F: for<'c> Fn(&'c dyn ConfigStore) -> Reply<'c, T> + Send + 'b,
     {
         Box::pin(async move {
             let (voter, client) = self.current();
             let answer = call(&*client).await;
-            if let Err(error) = &answer {
-                self.after(voter, error);
+            let Err(error) = &answer else {
+                return answer;
+            };
+            let moved = self.after(voter, error);
+            if !(moved && matches!(error, ConfigError::NotLeader { .. })) {
+                return answer;
             }
-            answer
+            let (to, client) = self.current();
+            tracing::info!(from = voter.0, to = to.0, %error, "control_store_retry_at_leader");
+            let again = call(&*client).await;
+            if let Err(error) = &again {
+                self.after(to, error);
+            }
+            again
         })
     }
 }
@@ -359,7 +381,7 @@ impl ConfigStore for HostileStore {
         'a: 'b,
         Self: 'b,
     {
-        self.through(move |store| store.get(request))
+        self.through(move |store| store.get(request.clone()))
     }
 
     fn list<'a, 'b>(&'a self, request: ListRequest) -> Reply<'b, ListResponse>
@@ -376,7 +398,7 @@ impl ConfigStore for HostileStore {
             tracing::info!(fault = ?fault, %error, "control_store_list_failed");
             return Box::pin(std::future::ready(Err(error)));
         }
-        self.through(move |store| store.list(request))
+        self.through(move |store| store.list(request.clone()))
     }
 
     fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, MutationResponse>
@@ -385,12 +407,12 @@ impl ConfigStore for HostileStore {
         Self: 'b,
     {
         let Some(fault) = self.put_fault(&request.key) else {
-            return self.through(move |store| store.put(request));
+            return self.through(move |store| store.put(request.clone()));
         };
         let key = String::from_utf8_lossy(&request.key).into_owned();
         let expected = request.expected_mod_revision;
         let sent = match fault {
-            PutFault::LoseReply => Some(self.through(move |store| store.put(request))),
+            PutFault::LoseReply => Some(self.through(move |store| store.put(request.clone()))),
             PutFault::Drop => None,
         };
         Box::pin(async move {
@@ -419,7 +441,7 @@ impl ConfigStore for HostileStore {
         'a: 'b,
         Self: 'b,
     {
-        self.through(move |store| store.delete(request))
+        self.through(move |store| store.delete(request.clone()))
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -431,8 +453,23 @@ impl ConfigStore for HostileStore {
         'a: 'b,
         Self: 'b,
     {
+        self.droppable(self.through(move |store| store.watch(request.clone())))
+    }
+
+    /// Forwarded, as the trait asks of a wrapper (#57): the inner client's own `watch_leader`.
+    fn watch_leader<'a, 'b>(&'a self, request: WatchRequest) -> Reply<'b, WatchStream>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.droppable(self.through(move |store| store.watch_leader(request.clone())))
+    }
+}
+
+impl HostileStore {
+    /// `opened`, as a stream that [`Self::drop_watches`] ends.
+    fn droppable<'b>(&self, opened: Reply<'b, WatchStream>) -> Reply<'b, WatchStream> {
         let mut ended = self.ends.subscribe();
-        let opened = self.through(move |store| store.watch(request));
         Box::pin(async move {
             let stream = opened.await?;
             let until = async move {
@@ -479,14 +516,14 @@ mod tests {
             .collect();
         let store = HostileStore::new(&cluster, followers[0]);
 
+        // A-R230 (tester-s2, open under load: "get partitions/1: not leader"): the follower's
+        // `NotLeader` moves the store, and the same get is answered by the leader. Cut: return
+        // the first answer, and this is `NotLeader`.
         let answer = rt.block_on(store.get(GetRequest {
             key: Bytes::from_static(b"partitions/1"),
         }));
-        assert!(
-            matches!(answer, Err(ConfigError::NotLeader { .. })),
-            "a follower answers NotLeader: {answer:?}"
-        );
-        assert_eq!(store.bound(), leader, "the next call goes to the leader");
+        assert!(answer.is_ok(), "the leader answers the same get: {answer:?}");
+        assert_eq!(store.bound(), leader, "the store is bound to the leader");
 
         assert_eq!(
             store.stopping(followers[0]),
