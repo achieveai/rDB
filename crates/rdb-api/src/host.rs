@@ -201,6 +201,9 @@ const IDLE_WAIT: Duration = Duration::from_millis(1_000);
 /// D10: the most letters `Host::run` takes from its mailbox before it runs the due duties.
 const MAIL_BEFORE_DUTIES: usize = 256;
 
+/// A-R192a: a step of a node's thread longer than this is logged at info (`host_slow_step`).
+const SLOW_STEP_MILLIS: u64 = 250;
+
 /// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
 /// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
 /// window. That CAS takes 5-20 ms here, and up to ~80 ms with the suite running in parallel;
@@ -1107,6 +1110,18 @@ enum Delayed {
     },
 }
 
+impl Delayed {
+    /// The kind, for `host_slow_step` (A-R192a).
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Event(_) => "event",
+            Self::Landing { .. } => "landing",
+            Self::RebuildCheck { .. } => "rebuild_check",
+            Self::TxnExpiry { .. } => "txn_expiry",
+        }
+    }
+}
+
 /// A recovery this node's F1 committed below `Active`, watched until it activates (D2).
 #[derive(Debug)]
 struct RebuildWatch {
@@ -1584,7 +1599,30 @@ impl Host {
         );
     }
 
+    /// One letter, timed (A-R192a).
     fn handle(&mut self, msg: Msg) {
+        let (name, started) = (msg_name(&msg), Instant::now());
+        self.handle_msg(msg);
+        self.slow_step("mail", || name.to_owned(), started);
+    }
+
+    /// A-R192a: a step of this node's thread that took longer than [`SLOW_STEP_MILLIS`] is
+    /// logged at info, naming the step, so a silence in the log names what the thread was doing.
+    /// `what` is built only then; it names a kind, never a key or a value.
+    fn slow_step(&self, step: &'static str, what: impl FnOnce() -> String, started: Instant) {
+        let took = millis(started);
+        if took > SLOW_STEP_MILLIS {
+            tracing::info!(
+                node = self.node.0,
+                step,
+                what = what(),
+                millis = took,
+                "host_slow_step"
+            );
+        }
+    }
+
+    fn handle_msg(&mut self, msg: Msg) {
         if let Some(fault) = self.fault.clone() {
             self.answer_faulted(msg, &fault);
             return;
@@ -1845,14 +1883,20 @@ impl Host {
         }
         if self.next_flush <= now {
             self.next_flush = now.plus_millis(HOST_FLUSH_EVERY_MILLIS);
-            if let Err(fault) = self.flush_duty() {
+            let started = Instant::now();
+            let flushed = self.flush_duty();
+            self.slow_step("duty", || "flush".to_owned(), started);
+            if let Err(fault) = flushed {
                 self.set_fault(fault);
                 return;
             }
         }
         if self.next_trim <= now {
             self.next_trim = now.plus_millis(self.trim_every_millis);
-            if let Err(fault) = self.trim_duty(now) {
+            let started = Instant::now();
+            let trimmed = self.trim_duty(now);
+            self.slow_step("duty", || "trim".to_owned(), started);
+            if let Err(fault) = trimmed {
                 self.set_fault(fault);
                 return;
             }
@@ -1860,6 +1904,7 @@ impl Host {
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
         for (_, item) in due {
+            let (name, started) = (item.name(), Instant::now());
             let outcome = match item {
                 Delayed::Event(queued) => {
                     self.queue.push_back(queued);
@@ -1879,6 +1924,7 @@ impl Host {
                 }
                 Delayed::TxnExpiry { identity, event } => self.expire_txn(identity, event, now),
             };
+            self.slow_step("delayed", || name.to_owned(), started);
             if let Err(fault) = outcome {
                 self.set_fault(fault);
                 return;
@@ -2591,10 +2637,17 @@ impl Host {
         };
         self.answering = self.statuses.remove(&event.id);
         for module in offers {
+            let started = Instant::now();
             match self.offer(module, &event) {
                 Ok(effects) => {
                     tracing::trace!(node = self.node.0, module = ?module, event = event_name(&event.kind), effects = effects.len(), "step");
-                    self.deliver(&effects)?;
+                    let delivered = self.deliver(&effects);
+                    self.slow_step(
+                        "module",
+                        || format!("{module:?} on {}", event_name(&event.kind)),
+                        started,
+                    );
+                    delivered?;
                 }
                 Err(StepError::Module(error @ RdbError::Unavailable { .. })) => {
                     if (routed && route::edge(arm, module) == Edge::Named) || addressed.is_some() {
@@ -6090,6 +6143,25 @@ fn resolve_position(at: i64, count: u64) -> Option<u64> {
 
 fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A letter's kind, for [`Host::slow_step`]: never its contents.
+const fn msg_name(msg: &Msg) -> &'static str {
+    match msg {
+        Msg::Control { .. } => "control",
+        Msg::Fault { .. } => "fault",
+        Msg::Activated { .. } => "activated",
+        Msg::Inject { .. } => "inject",
+        Msg::Frame { .. } => "frame",
+        Msg::PeerAsk { .. } => "peer_ask",
+        Msg::CatchUp { .. } => "catch_up",
+        Msg::Restore { .. } => "restore",
+        Msg::Routed { .. } => "routed",
+        Msg::Landed { .. } => "landed",
+        Msg::Client(_) => "client",
+        Msg::Inspect { .. } => "inspect",
+        Msg::Stop => "stop",
+    }
 }
 
 /// Milliseconds from `at` to `horizon`: positive while it is ahead, 0 at the last tick a view

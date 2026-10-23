@@ -7192,6 +7192,17 @@ mod tests {
                 .any(|line| line["@m"] == "test_sync_paused" && line["node"] == 1),
             "node 1's own barrier sync slept"
         );
+        // A-R192a: the sleep is inside a module step, and the host names that step.
+        let slow: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "host_slow_step" && line["node"] == 1)
+            .collect();
+        assert!(
+            slow.iter()
+                .any(|line| line["step"] == "module"
+                    && line["millis"].as_u64() >= Some(window + 1_000)),
+            "node 1 logged the slow module step that held its sync: {slow:?}"
+        );
         // The reopen's barrier is the last three pre-commit proofs: node 1's comes last, after
         // the peers it asked first.
         let proven: Vec<_> = lines
