@@ -5,6 +5,7 @@
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
 //!                                           [--control host:port[,host:port...]] [--requests F]
+//!                                           [--abort-after-commit]
 //! ```
 //!
 //! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
@@ -26,6 +27,11 @@
 //! A line of F that does not read, such as a last line a kill cut short, is skipped with a
 //! `warn` naming its line; the other requests still retry. An append to F that fails is said
 //! with `err`, and the run exits 1.
+//!
+//! `--abort-after-commit` is a dev and test hook (A-R184): the process aborts as soon as a
+//! recovery commits, before the new generation is linked or marked activated. With `--control`
+//! and the same `--dir`, the next run must roll that commit forward. Nothing is printed when it
+//! fires; the abort may lose the last log lines.
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
@@ -353,6 +359,9 @@ struct Args {
     control: Option<Vec<String>>,
     /// `--requests F`: where each recorded write request is appended, for a later run's `retry`.
     requests: Option<PathBuf>,
+    /// `--abort-after-commit`: abort the whole process once a recovery commits, before it is
+    /// linked or marked activated (A-R184). The next open must roll it forward.
+    abort_after_commit: bool,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -368,6 +377,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         dedup_retention: None,
         control: None,
         requests: None,
+        abort_after_commit: false,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -376,6 +386,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--abort-after-commit" => parsed.abort_after_commit = true,
             "--requests" => parsed.requests = Some(PathBuf::from(value("--requests")?)),
             "--control" => {
                 let endpoints: Vec<String> = value("--control")?
@@ -507,6 +518,12 @@ where
     // Whether --dir held anything before this run: such a directory is never removed (M10
     // S1-1), whatever `open` decides about it.
     let existed = std::fs::read_dir(&args.dir).is_ok_and(|mut d| d.next().is_some());
+    // Before the open, with `--dir` spelled as `DbConfig::dir` is: the hook matches on it.
+    if args.abort_after_commit {
+        rdb_api::host::abort_after_commit(&args.dir);
+        tracing::warn!(dir = %args.dir.display(), "abort_after_commit_armed");
+        say("abort-after-commit: this process aborts once a recovery commits");
+    }
     let (store, local) = match &args.control {
         Some(endpoints) => {
             match config_client::GrpcClient::connect(
@@ -3748,7 +3765,7 @@ mod tests {
     #[test]
     fn a_stall_that_clears_prints_a_cleared_line_and_a_new_stall_prints_again() {
         let stall =
-            "recovery_rebuild_stalled ... its writes stay paused until the absent copy returns";
+            "recovery_rebuild_stalled ... its writes stay paused until the database is opened again";
         let mut printed: Option<String> = None;
         let mut lines = Vec::new();
         for node in [
@@ -4861,6 +4878,7 @@ mod tests {
             dedup_retention: None,
             control: None,
             requests: None,
+            abort_after_commit: false,
         };
         let code = run(&args, |_, _, _| async {
             Err(OpenError::Node("node 2: injected".to_owned()))
@@ -5000,6 +5018,7 @@ mod tests {
             dedup_retention: None,
             control: None,
             requests: None,
+            abort_after_commit: false,
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {
@@ -5573,6 +5592,7 @@ mod tests {
             dedup_retention: None,
             control: None,
             requests: None,
+            abort_after_commit: false,
         };
         let code = run(&args, Db::open);
         let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
@@ -5607,5 +5627,121 @@ mod tests {
             Some("not ready: writes not admitted"),
             "a later change is still said"
         );
+    }
+
+    /// The child of [`abort_after_commit_aborts_and_the_next_open_rolls_forward`]: one rdb_dev
+    /// run with `--abort-after-commit`, against the parent's voters. Passes at once unless the
+    /// parent started it.
+    #[test]
+    fn zz_abort_after_commit_child() {
+        let (Ok(dir), Ok(control)) = (
+            std::env::var(ABORT_CHILD_DIR),
+            std::env::var(ABORT_CHILD_CONTROL),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let script = dir.with_extension("child-script.txt");
+        std::fs::write(&script, "wait ready 60\n").expect("write the child's script");
+        let args = Args {
+            log_dir: dir.with_extension("child-logs"),
+            script: Some(script),
+            control: Some(control.split(',').map(str::to_owned).collect()),
+            abort_after_commit: true,
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let args = Args { dir, ..args };
+        run(&args, Db::open);
+    }
+
+    const ABORT_CHILD_DIR: &str = "RDB_DEV_ABORT_CHILD_DIR";
+    const ABORT_CHILD_CONTROL: &str = "RDB_DEV_ABORT_CHILD_CONTROL";
+
+    /// A-R184: `--abort-after-commit` is how the tester reaches a commit that no copy links.
+    /// Run 1 writes and quits; run 2 reopens with the flag and dies by abort once its recovery
+    /// commits; open 3 rolls that commit forward, becomes ready, and reads run 1's write back.
+    /// Integration (~10 s): three real rEtcd voters this test hosts, so all three opens meet
+    /// the same control store, and a child process for the run that aborts.
+    #[test]
+    fn abort_after_commit_aborts_and_the_next_open_rolls_forward() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        std::env::set_var("RETCD_TEST_DATA_DIR", root.path().join("control"));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let cluster = rt.block_on(
+            Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS)
+                .start(),
+        );
+        rt.block_on(cluster.leader());
+        let control = cluster.client_endpoints();
+        let dir = root.path().join("run");
+
+        let script = root.path().join("run1.txt");
+        std::fs::write(&script, "wait ready 60\nput zqk zqv1\n").expect("write run 1's script");
+        let run1 = Args {
+            log_dir: root.path().join("run1-logs"),
+            script: Some(script),
+            control: Some(control.clone()),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let run1 = Args {
+            dir: dir.clone(),
+            ..run1
+        };
+        assert_eq!(run(&run1, Db::open), ExitCode::SUCCESS, "run 1 writes");
+
+        let child = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args([
+                "tests::zz_abort_after_commit_child",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(ABORT_CHILD_DIR, &dir)
+            .env(ABORT_CHILD_CONTROL, control.join(","))
+            .output()
+            .expect("spawn run 2");
+        assert!(
+            !child.status.success()
+                && !String::from_utf8_lossy(&child.stdout).contains("test result"),
+            "run 2 must die by abort, not end or panic; got {:?}: {}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout)
+        );
+
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                control,
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            dir,
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+        };
+        let mut db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("open 3 rolls the commit forward");
+        db.wait_ready(Duration::from_secs(60))
+            .expect("open 3 becomes ready");
+        let got = db.get(b"zqk").expect("read back");
+        assert_eq!(
+            got.value.map(|(_, bytes)| bytes.to_vec()),
+            Some(b"zqv1".to_vec()),
+            "run 1's write"
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
     }
 }
