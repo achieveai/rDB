@@ -1,6 +1,8 @@
-//! M10 S1-8 (tester k151, A-R177): a refused reopen tells the app or operator the next step, and
-//! the `Db` logs the refusal as `db_open_refused` with its kind. dev-w2's rows; `db.rs`'s own
-//! `tests` module is dev-w1's.
+//! dev-w2's reopen rows (`db.rs`'s own `tests` module is dev-w1's):
+//! - M10 S1-8 (tester k151, A-R177): a refused reopen tells the app or operator the next step, and
+//!   the `Db` logs the refusal as `db_open_refused` with its kind.
+//! - M10 R3a case B (A-R171): a reopen whose grant record is gone heals with `NoGrantHeld` and
+//!   serves what was written.
 
 use super::*;
 
@@ -149,4 +151,61 @@ fn m10_a_reopen_of_an_older_copy_says_to_open_the_current_one_and_logs_the_refus
         vec![("Warning".to_owned(), "Stale".to_owned())],
         "one db_open_refused naming the kind"
     );
+}
+
+/// M10 R3a case B (A-R171), end to end through `Db`: node 1's grant record is gone when the
+/// folder is reopened (an operator cleared it, or an earlier heal deleted it and stopped). The
+/// heal reads it absent and hands node 1 a `NoGrantHeld` takeover, with nothing to wait out;
+/// F1 commits the new generation `Active`, the write made before reads back, and a new one lands.
+/// Integration (~2 s): one fresh open until ready, a store delete, one reopen until ready.
+#[config_log::retcd_test]
+fn m10_a_reopen_with_no_grant_record_heals_no_grant_held_and_reads_back() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let deleted = rt
+        .block_on(store.delete(config_core::DeleteRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("delete grants/1");
+    assert_eq!(
+        deleted.outcome,
+        config_core::MutationOutcome::Applied,
+        "the first open left a grant record"
+    );
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    match db.heal_state() {
+        HealState::Handed(admin::Healed {
+            cleared: admin::GrantCleared::Absent(absent),
+            ..
+        }) => assert!(
+            absent.0 >= deleted.revision,
+            "absent read at {absent:?}, before the delete at {}",
+            deleted.revision
+        ),
+        other => panic!("case B hands a NoGrantHeld takeover, not {other:?}"),
+    }
+    let got = db.get(b"a").expect("read a back");
+    assert_eq!(got.value.map(|(_, v)| v), Some(Bytes::from_static(b"1")));
+    let served = got.generation;
+    assert!(served > Generation(1), "{served:?}");
+    db.put(b"b", b"2", None).expect("a put after the heal");
+    let got = db.get(b"b").expect("read b");
+    assert_eq!(got.value.map(|(_, v)| v), Some(Bytes::from_static(b"2")));
+    // F1 committed the reopen's generation fully protected (`PartitionMode::Active`: every copy
+    // answered), not below it and rebuilding.
+    let owner = db.node_status().into_iter().next().expect("node 1");
+    assert_eq!(
+        (owner.recovery.as_deref(), owner.recovered),
+        (Some("Committed"), Some(served)),
+        "{owner:?}"
+    );
+    db.shutdown();
 }

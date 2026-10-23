@@ -2315,7 +2315,7 @@ fn millis(duration: Duration) -> u64 {
 }
 
 #[cfg(test)]
-mod open_refusal_tests;
+mod reopen_tests;
 
 #[cfg(test)]
 mod tests {
