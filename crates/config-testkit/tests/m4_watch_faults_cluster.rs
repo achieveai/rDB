@@ -1110,7 +1110,7 @@ async fn m4_69_queue_cap_does_not_leak_between_streams() {
             } => true,
             () = async {
                 written_rx.await.expect("the writer finished");
-                tokio::time::sleep(after_writes).await;
+                tokio::time::sleep(after_writes).await; // testkit:allow-sleep: the deadline arm of the select, not a synchronization sleep
             } => false,
         };
         assert!(
