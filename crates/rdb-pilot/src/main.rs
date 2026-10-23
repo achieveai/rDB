@@ -597,6 +597,15 @@ mod tests {
 
         let failed = verify(&journal, |_: &[u8]| Err("UNAVAILABLE".to_owned()));
         assert!(failed.is_err());
+        // One journalled read fails while every other read answers: still an error.
+        let one_failed = verify(&journal, |asked: &[u8]| {
+            if asked == key(1).as_bytes() {
+                Err("UNAVAILABLE".to_owned())
+            } else {
+                Ok(None)
+            }
+        });
+        assert!(one_failed.is_err(), "{one_failed:?}");
     }
 
     #[test]
