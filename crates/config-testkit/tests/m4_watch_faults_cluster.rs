@@ -1886,6 +1886,14 @@ async fn m4_88_leader_change_mid_compaction_apply_recovers() {
         .expect("every node applies the seed puts");
 
     scripts[&leader].crash_on_nth(Boundary::BeforeStateBatch, 1);
+    // #31 (m4_88 run 10): a survivor that had not applied the `Compact` when the leader
+    // crashed took office 17 ms before it applied it. Each survivor's apply of it waits past
+    // the next election here, so every run starts the new term in that state.
+    for id in cluster.ids() {
+        if id != leader {
+            scripts[&id].delay_on_nth(Boundary::BeforeStateBatch, 1, Duration::from_secs(5));
+        }
+    }
     // Outcome deliberately unobserved (ADR-0015): the Compact may or may not have crossed the
     // boundary by the time the client sees the crash.
     let crash_leader = leader;
@@ -1906,6 +1914,18 @@ async fn m4_88_leader_change_mid_compaction_apply_recovers() {
         .wait_for_leader(cluster.deadline(20))
         .await
         .expect("a leader is serving while the crashed node is down");
+    // The schema gate judges a `Compact` by the leader's own applied state, and reads the
+    // stopped node as schema 1 (ADR-0030 A7). Until the new leader applies the crashed
+    // `Compact` it refuses with `feature_not_activated`, so wait for that apply, not only for
+    // the election. The crash was at the old leader's apply, so that `Compact` committed.
+    cluster
+        .wait_for(
+            &format!("{serving} to apply the crashed Compact"),
+            cluster.deadline(20),
+            || (cluster.compact_revision(serving) > 0).then_some(()),
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{serving} never applied the crashed Compact: {t}"));
     let effective = cluster
         .compact_now(100)
         .await
