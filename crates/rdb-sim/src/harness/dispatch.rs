@@ -3238,12 +3238,17 @@ impl Dispatcher {
             self.notes.push(withheld(SyncWithheldReason::NoDigest));
             return Ok(());
         };
+        // The holder's current boot, the process that synced (A-R239a).
+        let boot = self.boot(holder).ok_or(SimError::Config {
+            field: "holder boot",
+        })?;
         let kind = EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::DurableAt(
             DurableProof {
                 copy,
                 partition,
                 seq,
                 digest,
+                boot,
             },
         )));
         let now = scheduler.now();

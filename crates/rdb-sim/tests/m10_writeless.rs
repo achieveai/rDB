@@ -263,6 +263,11 @@ fn reopen(runner: &mut Runner, root: &RecoveryResult, behind: Option<NodeId>) ->
             partition: PARTITION,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: members
+                .iter()
+                .find(|member| member.copy == *copy)
+                .expect("a member")
+                .boot,
         })
         .collect();
     let source = members

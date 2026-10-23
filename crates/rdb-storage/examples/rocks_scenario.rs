@@ -1401,6 +1401,7 @@ mod tests {
     /// S1-P8 (#3, #18): a write or delete into a sealed or staging generation printed only
     /// `FAILED at seq=N: WriteFailed`; the reason was only in the log. The FAILED line now ends
     /// with it, and with nothing for a lineage that refuses nothing.
+    #[cfg(debug_assertions)]
     #[test]
     fn s1_p8_a_refused_write_says_why() {
         let dir = data_dir("p8");

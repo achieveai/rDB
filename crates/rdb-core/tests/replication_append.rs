@@ -3667,6 +3667,16 @@ fn m7b_160_a_view_naming_a_config_without_this_copy_keeps_its_ack_out_of_every_c
 
 // --- Recovered builds R1's side (lead ruling B-R54) --------------------------------------------
 
+/// The boot `result`'s plan names for `copy`: F1 counts a proof only from it (A-R239a).
+fn named_boot(result: &RecoveryResult, copy: CopyId) -> BootId {
+    result
+        .committed
+        .pinned_config
+        .member(copy)
+        .expect("a required copy is a member")
+        .boot
+}
+
 /// `ev`, a `Recovered`, with a barrier over copies `copies`, each proved durable at the cutoff,
 /// stepped on `node`.
 fn requiring(mut ev: Event, copies: &[u8], node: NodeId) -> Event {
@@ -3681,6 +3691,7 @@ fn requiring(mut ev: Event, copies: &[u8], node: NodeId) -> Event {
             partition: P,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: named_boot(result, CopyId(copy)),
         })
         .collect();
     let required = copies.iter().map(|&copy| CopyId(copy)).collect();
