@@ -2826,7 +2826,11 @@ mod tests {
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
-            timeouts: Timeouts::default(),
+            // The answerer is a thread: under a loaded gate it can take over a second to run.
+            timeouts: Timeouts {
+                read: crate::host::test_patience(Duration::from_secs(1)),
+                ..Timeouts::default()
+            },
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -5371,9 +5375,11 @@ mod tests {
     /// A-R174: a put's compile reads only P1's published position, so its cost does not grow
     /// with the status index. Generation 1 gets one more record on every copy, written straight
     /// to disk, whose batch holds 50,000 dedup rows; the reopen seeds them into node 1's status
-    /// index (M7A-194). Then 100 compiles take under 50 ms in all (times the deadline scale). A
+    /// index (M7A-194). Then 100 compiles take under 1 s in all (times the deadline scale). A
     /// compile that copies P1's whole view copies that index each time: 7.6 s for the 100 in a
-    /// debug build, against 19 ms reading the kernel's position (2026-10-23).
+    /// debug build, against 19 ms reading the kernel's position (2026-10-23). The bar sits
+    /// between the two, far from both: a 50 ms bar failed at 285 ms on a loaded gate. A count of
+    /// clones would be exact, but the clone is inside rdb-core's `Publication::view`.
     /// Integration (~5 s): two real opens, and the seed needs a recovery to land.
     #[config_log::retcd_test]
     fn a_compile_beside_a_50k_status_index_does_not_copy_it() {
@@ -5496,7 +5502,7 @@ mod tests {
             Some(Answer::Compiled(_)) => {}
             other => panic!("the warm-up compile: {other:?}"),
         }
-        let bar = crate::host::test_patience(Duration::from_millis(50));
+        let bar = crate::host::test_patience(Duration::from_secs(1));
         let started = std::time::Instant::now();
         for request in 2..=101 {
             match db.call(compile(request), wait) {
