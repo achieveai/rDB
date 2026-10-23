@@ -841,7 +841,8 @@ fn m10_cut_copies_naming_two_instances_are_refused_and_left_as_they_were() {
         refused.to_string(),
         format!(
             "this directory and the control store do not belong together: the copies name \
-             different instances: {}",
+             different instances: {}; next: the copies come from different folders, so restore \
+             this folder's copies from one backup, then open it again",
             named.join(", ")
         )
     );
@@ -882,7 +883,8 @@ fn m10_cut_a_reopen_whose_open_counter_is_gone_is_a_mismatch_and_counts_nothing(
         refused.to_string(),
         format!(
             "this directory and the control store do not belong together: the copies name \
-             instance {}, but {key} is absent",
+             instance {}, but {key} is absent; next: point `Db::open` at the rEtcd this folder \
+             was made with; for a new database, start a separate rEtcd",
             admin::instance_hex(&instance)
         )
     );
@@ -1109,7 +1111,10 @@ fn m10_cut_the_open_after_max_opens_is_refused_and_counts_nothing() {
     );
     assert_eq!(
         refused.expect_err("refused").to_string(),
-        format!("{key} has counted 8388608 opens, the most one directory may have")
+        format!(
+            "{key} has counted 8388608 opens, the most one directory may have; next: start a \
+             new folder"
+        )
     );
     let after = read();
     assert_eq!(
@@ -2069,6 +2074,71 @@ fn m10_s2_an_undecodable_partition_record_is_refused_by_its_key_and_changes_noth
             ("Warning".to_owned(), "Undecodable".to_owned())
         ],
         "one db_open_refused per refused open, naming the kind"
+    );
+}
+
+/// #59 (tester-s2), A-R230 Q3: a folder opened against a store that does not hold its records
+/// is refused with what was found and the step: point the open at the rEtcd it was made with.
+/// Folder A against an empty store finds no `partitions/1`; against folder B's store it finds
+/// B's instance. Both leave every store as it was. Cut: `check` keeps the old texts, which end
+/// at what was found. Integration (~3 s): two fresh opens until ready, two refused opens.
+#[test]
+fn m10_s2_a_folder_opened_against_another_store_says_to_open_it_against_its_own() {
+    let rt = runtime();
+    let ours: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let theirs: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let empty: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let a = config_testkit::fs::temp_dir();
+    let b = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, a.path(), &ours);
+    written_and_closed(&rt, b.path(), &theirs);
+    let instance_a = marker(a.path(), 1).expect("folder A names its instance");
+    let instance_b = marker(b.path(), 1).expect("folder B names its instance");
+    let step = "; next: point `Db::open` at the rEtcd this folder was made with; for a new \
+                database, start a separate rEtcd";
+    let prefix = "this directory and the control store do not belong together: ";
+
+    for (store, found) in [
+        (
+            &empty,
+            "the copies hold data, but the store has no partitions/1".to_owned(),
+        ),
+        (
+            &theirs,
+            format!(
+                "the copies name instance {}, partitions/1 names {}",
+                admin::instance_hex(&instance_a),
+                admin::instance_hex(&instance_b)
+            ),
+        ),
+    ] {
+        let revision = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("read partitions/1")
+            .read_revision;
+        match open(&rt, a.path(), store) {
+            Err(error @ OpenError::Mismatch(_)) => {
+                assert_eq!(error.to_string(), format!("{prefix}{found}{step}"));
+            }
+            other => panic!("Mismatch, not {:?}", other.map(|_| "Db")),
+        }
+        let after = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("read partitions/1 again")
+            .read_revision;
+        assert_eq!(
+            after, revision,
+            "the refused open wrote nothing to the store: {found}"
+        );
+    }
+    assert_eq!(
+        marker(a.path(), 1),
+        Some(instance_a),
+        "folder A is as it was"
     );
 }
 

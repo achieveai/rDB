@@ -267,10 +267,9 @@ pub(super) fn wire_name(kind: ErrorKind) -> String {
 
 // Texts for the open and the wait (ruling A-R230 Q3): W7 owns the words, W5 the call sites in
 // `db.rs`. Each ends with the step embed.md section 6 gives for it, after `; next: `.
-// Unused outside tests until W5 swaps those sites, hence the `allow`s; W5 removes them.
+// W5 wired every one of them (host.rs for `corrupt_history`).
 
 /// What `wait_ready` last saw of node 1, for [`ready_timed_out_text`].
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadySeen<'a> {
     /// Node 1 answered no status look in the time: it may be busy, for example syncing its
@@ -283,7 +282,6 @@ pub(crate) enum ReadySeen<'a> {
 }
 
 /// `ReadyError::TimedOut`'s text.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ready_timed_out_text(within_ms: u128, seen: ReadySeen<'_>) -> String {
     let state = match seen {
         ReadySeen::NoAnswer => {
@@ -302,21 +300,18 @@ pub(crate) fn ready_timed_out_text(within_ms: u128, seen: ReadySeen<'_>) -> Stri
 }
 
 /// The step after the control store does not hold this folder's records.
-#[cfg_attr(not(test), allow(dead_code))]
 const NOT_THIS_STORE_STEP: &str = "point `Db::open` at the rEtcd this folder was made with; for a \
                                    new database, start a separate rEtcd";
 
 /// `OpenError::Mismatch`'s detail when the store does not hold this folder's records: its
 /// `partitions/1` is absent, names no instance or another one, or its open counter is absent.
 /// `what` says which, without a step.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn not_this_store_text(what: &str) -> String {
     format!("{what}; next: {NOT_THIS_STORE_STEP}")
 }
 
 /// `OpenError::Mismatch`'s detail when the copies name different instances: they come from
 /// different folders. `named` lists the instances.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn copies_disagree_text(named: &str) -> String {
     format!(
         "the copies name different instances: {named}; next: the copies come from different \
@@ -327,7 +322,6 @@ pub(crate) fn copies_disagree_text(named: &str) -> String {
 /// `CORRUPT_HISTORY` for a read of `object` that met `corrupt` (#59, A-R230): it names the object,
 /// and an element's key when [`rdb_value::Corrupt::Element`] carries one, for the caller only.
 /// A log line names neither; `host.rs` logs the damage code and `key_hex`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn corrupt_history(object: &[u8], corrupt: &rdb_value::Corrupt) -> ApiError {
     ApiError::new(
         ErrorKind::CorruptHistory,
@@ -336,7 +330,6 @@ pub(crate) fn corrupt_history(object: &[u8], corrupt: &rdb_value::Corrupt) -> Ap
 }
 
 /// The open counter's refusal for good, for `admin::CounterError::Exhausted`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn counter_exhausted_text(key: &str, max: u64) -> String {
     format!(
         "{key} has counted {max} opens, the most one directory may have; next: start a new \
@@ -345,7 +338,6 @@ pub(crate) fn counter_exhausted_text(key: &str, max: u64) -> String {
 }
 
 /// The open counter's refusal for good, for `admin::CounterError::Unreadable`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn counter_unreadable_text(key: &str, revision: u64) -> String {
     format!(
         "{key} at revision {revision} is not an open counter; next: do not delete this \
