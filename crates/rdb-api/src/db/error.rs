@@ -287,20 +287,24 @@ pub(crate) enum ReadySeen<'a> {
 pub(crate) fn ready_timed_out_text(within_ms: u128, seen: ReadySeen<'_>) -> String {
     let state = match seen {
         ReadySeen::NoAnswer => {
-            "node 1 answered no status look in that time (it may be busy, for example syncing \n             its copies)"
+            "node 1 answered no status look in that time (it may be busy, for example syncing \
+             its copies)"
                 .to_owned()
         }
         ReadySeen::NoRecovery => "node 1 runs no recovery".to_owned(),
         ReadySeen::Phase(phase) => format!("node 1's recovery phase is {phase}"),
     };
     format!(
-        "node 1 did not admit writes within {within_ms} ms; {state}; next: call `wait_ready` \n         again with a longer bound, or shut this Db down and open the folder again, once; if \n         that times out too, stop and report it with this message"
+        "node 1 did not admit writes within {within_ms} ms; {state}; next: call `wait_ready` \
+         again with a longer bound, or shut this Db down and open the folder again, once; if \
+         that times out too, stop and report it with this message"
     )
 }
 
 /// The step after the control store does not hold this folder's records.
 #[cfg_attr(not(test), allow(dead_code))]
-const NOT_THIS_STORE_STEP: &str = "point `Db::open` at the rEtcd this folder was made with; for a \n                                   new database, start a separate rEtcd";
+const NOT_THIS_STORE_STEP: &str = "point `Db::open` at the rEtcd this folder was made with; for a \
+                                   new database, start a separate rEtcd";
 
 /// `OpenError::Mismatch`'s detail when the store does not hold this folder's records: its
 /// `partitions/1` is absent, names no instance or another one, or its open counter is absent.
@@ -315,7 +319,8 @@ pub(crate) fn not_this_store_text(what: &str) -> String {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn copies_disagree_text(named: &str) -> String {
     format!(
-        "the copies name different instances: {named}; next: the copies come from different \n         folders, so restore this folder's copies from one backup, then open it again"
+        "the copies name different instances: {named}; next: the copies come from different \
+         folders, so restore this folder's copies from one backup, then open it again"
     )
 }
 
@@ -323,7 +328,8 @@ pub(crate) fn copies_disagree_text(named: &str) -> String {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn counter_exhausted_text(key: &str, max: u64) -> String {
     format!(
-        "{key} has counted {max} opens, the most one directory may have; next: start a new \n         folder"
+        "{key} has counted {max} opens, the most one directory may have; next: start a new \
+         folder"
     )
 }
 
@@ -331,7 +337,8 @@ pub(crate) fn counter_exhausted_text(key: &str, max: u64) -> String {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn counter_unreadable_text(key: &str, revision: u64) -> String {
     format!(
-        "{key} at revision {revision} is not an open counter; next: do not delete this \n         folder, its acknowledged writes are intact; stop and report it with this message"
+        "{key} at revision {revision} is not an open counter; next: do not delete this \
+         folder, its acknowledged writes are intact; stop and report it with this message"
     )
 }
 
@@ -472,6 +479,9 @@ mod tests {
                 "no next step: {text}"
             );
             assert!(!text.contains("unknown"), "{text}");
+            // One line, single spaces: a broken string continuation once left "\n" and a run
+            // of indent inside these texts.
+            assert!(!text.contains('\n') && !text.contains("  "), "{text:?}");
         }
         assert!(texts[0].contains("may be busy"), "{}", texts[0]);
         assert!(texts[2].contains("phase is Fencing"), "{}", texts[2]);
