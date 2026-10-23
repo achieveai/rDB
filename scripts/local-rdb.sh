@@ -213,11 +213,13 @@ start_node() { # n
     say "node $n started: pid $os, $(head -n1 "$out")"
 }
 
-await_ready() { # n
-    local n="$1" os
+await_ready() { # n: 0 only on `rdb_node ready`; a `not-ready` line, an exit or a timeout is 1
+    local n="$1" os line
     os="$(pid_of "node-$n")"
     if wait_line "$RUN/out/node-$n.out" "^rdb_node \(ready\|not-ready\)" "$TIMEOUT_SEC" "$os"; then
-        say "node $n: $(grep "^rdb_node \(ready\|not-ready\)" "$RUN/out/node-$n.out" | tail -n1)"
+        line="$(grep "^rdb_node \(ready\|not-ready\)" "$RUN/out/node-$n.out" | tail -n1)"
+        say "node $n: $line"
+        case "$line" in "rdb_node ready"*) return 0 ;; *) return 1 ;; esac
     else
         tail -n 5 "$RUN/out/node-$n.err" >&2 || true
         say "node $n: no ready line within ${TIMEOUT_SEC}s (see $RUN/out/node-$n.err)"
@@ -339,7 +341,11 @@ EOF
     local ok=1
     for n in 1 2 3; do await_ready "$n" || ok=0; done
     UP_DONE=1
-    [ "$ok" = 1 ] || say "some node is not ready; 'lr status' shows each, 'lr down' stops them"
+    if [ "$ok" != 1 ]; then
+        # Left running so it can be looked at; the exit says it is not up.
+        echo "lr: up failed: some node is not ready; 'lr status' shows each, 'lr down' stops them" >&2
+        exit 1
+    fi
     say "up. control=$CONTROL nodes=$(peers)"
     say "pilot: $PILOT_BIN --dir $RUN/pilot --control $CONTROL --nodes $(peers) --cert-dir $RUN/certs --put k=v --get k"
 }
