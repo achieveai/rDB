@@ -14,8 +14,13 @@ one (linked), or gets a copy of it as of `base` (copied). Format 1
   parent, base, flags bit0 `copied`); `sealed` on a parent (8 B: the child); `copying` on a
   child mid full copy (16 B: parent, base).
 - Instance marker (M10): `metadata` key `instance`, 16 B, the instance id this copy is bound to
-  (`bind_instance`, synced, never rebound). Absent means unbound. Short like `format`, so an
-  older format-1 build skips it: no format bump. `dump` shows `instance_marker=<hex>`.
+  (`bind_instance`, synced, never rebound). Absent means unbound. Short like `format`, so a
+  format-1 build from before M10 skips it, and it needed no format bump. `dump` shows
+  `instance_marker=<hex>`.
+- Publish marks (M10 S1-6): `metadata` key `publish` + partition u32 BE, the partition's
+  marks (24 B each), synced. Short too, so it needed no format bump either.
+- A new key needs a `FORMAT_VERSION` bump. This build refuses a short `metadata` key it
+  does not define (A-R184), so a copy holding a newer build's key would not open here.
 - A stored `Meta` record is refused at open; a `Meta` write is refused at commit.
 
 ## Read through the chain

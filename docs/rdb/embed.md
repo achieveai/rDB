@@ -85,7 +85,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-// Print an error with `{}`, not `{:?}`: its text ends with the next step to take.
+// Print an error with `{}`, not `{:?}`: its text says what failed, and most end with the next step.
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -138,9 +138,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 - `Db::open` is async; run it on your runtime. `wait_ready`, `put` and `get` are plain blocking
   calls; do not call them from inside an async task.
-- Every error here returns from `run`. `main` prints its text, which ends with the next step
-  (`InUse`, for one, says to close the other open), and exits with code 1. A `Db` that is
-  dropped on the way out shuts itself down. In a real app, match on the error instead (section 6).
+- Every error here returns from `run`. `main` prints its text, which says what failed and, for
+  most errors, the next step (`InUse`, for one, says to close the other open), and exits with
+  code 1. A `Db` that is dropped on the way out shuts itself down. In a real app, match on the
+  error instead: section 6 gives the step for every refused open.
 - On success it prints `read back hello at version N`. Run it a second time: the same code
   reopens the folder (section 5), the `put` writes a new version over the old one, and the line
   shows a higher `N`. `got.value` is `Some((version, bytes))`, or `None` for an absent object.
@@ -348,8 +349,9 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   (`repair_element`) comes with a later release.
 - **A restarted node stays out until the folder is opened again.** See section 5.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
-  (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. An automatic
-  retry is planned.
+  (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
+  blocked too, it is not the machine: stop and report it with the message. An automatic retry
+  is planned.
 
 ## 6. When an open is refused
 
@@ -365,13 +367,16 @@ does not help; the "what to do" column does.
 | `OpenError::Stale` | The folder is an old copy: the rEtcd records a newer generation than any copy here holds | Do not delete this directory: its acknowledged writes are intact. Open the folder, or restore the backup, that holds the generation the message names |
 | `OpenError::Unbound` | The folder was made before M10 (M9's `rdb_dev --keep`) and never bound to an rEtcd | Start a new folder; M9 dev data is not migrated |
 | `OpenError::CopyMissing` | One of the folder's `nodes/<n>` directories is missing or empty while another holds data | Restore that directory from where it came from |
-| `OpenError::Counter` | The folder's open counter is used up (2^24 opens), unreadable, or absent from this rEtcd | Start a new folder; `Absent` means the wrong rEtcd, as for `Mismatch` |
+| `OpenError::Counter` | The folder's open counter is used up (2^24 opens), or holds a value this build does not write | Start a new folder |
 
 A `Stale` whose message says "the open counter marks generation N activated" means a later
 open already served that generation, so this copy cannot catch up to it. A crash during the
 commit of a reopen is not that case: the next open finishes the commit and serves, with
-nothing to do. One exception: if a crash happened during the reopen that followed a crash, the
-reopen refuses with `Stale` and changes nothing. Open it again.
+nothing to do. Neither is a power loss right after a reopen's commit: node 1 makes the new
+generation durable before the counter can mark it. One exception remains: two crashes in a
+row, the second during the reopen that followed the first, can leave a `Stale` on a folder
+that lost nothing. Opening again gives the same refusal. Do not delete the folder: stop and
+report it with the message.
 
 **Not in this open.** Retrying in the same `Db` does not help; a new open may.
 
@@ -379,7 +384,7 @@ reopen refuses with `Stale` and changes nothing. Open it again.
 |---|---|---|
 | `ReadyError::Heal` | The reopen's repair failed. The message says why: for example, the last run's grant is still held by another open of this folder's data | Do what the message says (often: shut that other open down), then open again |
 | `ReadyError::Stopped` | Node 1 restarted in this open | Shut this `Db` down and open the folder again |
-| `ReadyError::Blocked` | The open's recovery stopped before node 1 took writes; the message names why (often a copy answered too late) | Shut this `Db` down and open the folder again |
+| `ReadyError::Blocked` | The open's recovery stopped before node 1 took writes; the message names why (often a copy answered too late) | Shut this `Db` down and open the folder again, once. If that open is blocked too, stop and report it with the message; do not retry in a loop |
 
 **Not fixed by opening again.**
 
@@ -392,7 +397,11 @@ reopen refuses with `Stale` and changes nothing. Open it again.
 | Error | When | What to do |
 |---|---|---|
 | `OpenError::InUse` | Another open, in this process or another, holds the folder | Shut that one down first |
-| `OpenError::Control` | rEtcd did not answer a read the open needs | Open again once rEtcd is up |
+| `OpenError::Control` | rEtcd did not answer, or failed, a read or the open count the open needs (a leader change, say) | Open again once rEtcd is up |
+| `OpenError::Bootstrap` | A new folder's first open could not set it up in rEtcd | Check that rEtcd is running and reachable, then open again |
+| `OpenError::Io` | The filesystem refused: a wrong path, no permission, or a full disk | Fix what the message names, then open again |
+| `OpenError::DedupCap` | `DbConfig::dedup_cap` is above the most allowed; nothing was started | Set it to at most the number the message names, or leave it unset |
+| `OpenError::Node` | A node did not start: a copy's storage refused to open, or a copy could not be bound or linked. Nothing was removed | A newer format: open the folder with the build that wrote it. A disk or permission error: fix it, then open again. Anything else, or the same error again: stop and report it with the message |
 | `ReadyError::TimedOut` | Node 1 did not admit writes in time; the message names the recovery phase | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
