@@ -2771,7 +2771,7 @@ fn open_engines(
 ) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
         rdb_storage::OpenError::Locked { .. } => OpenError::InUse(one_separator(dir)),
-        rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(dir.to_path_buf()),
+        rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(one_separator(dir)),
         other => OpenError::Node(format!("open {}: {other}", dir.display())),
     };
     let mut engines = BTreeMap::new();
@@ -2795,7 +2795,7 @@ fn open_engines(
     if let Some((_, dir)) = missing.first() {
         if engines.values().any(|engine| !engine.lineages().is_empty()) {
             let held = engines.contains_key(&OWNER);
-            return Err((OpenError::CopyMissing(dir.clone()), held));
+            return Err((OpenError::CopyMissing(one_separator(dir)), held));
         }
     }
     for (node, dir) in missing {

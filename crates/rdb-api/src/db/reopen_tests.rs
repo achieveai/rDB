@@ -103,6 +103,10 @@ fn m10_a_reopen_missing_a_copy_says_to_restore_it_and_logs_the_refusal() {
         ),
         "the text names the next step: {text}"
     );
+    assert!(
+        !(text.contains('/') && text.contains('\\')),
+        "one separator style (A-R230): {text}"
+    );
     assert_eq!(
         refusals(METHOD),
         vec![("Warning".to_owned(), "CopyMissing".to_owned())],
