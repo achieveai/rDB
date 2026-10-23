@@ -3966,6 +3966,7 @@ fn p1_candidate(seq: u64) -> AppliedCandidate {
             correlation: CorrelationId(seq),
             verdict: Verdict::Admit,
         },
+        ack_floor: None,
     }
 }
 
