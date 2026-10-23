@@ -107,9 +107,12 @@ fn m10_a_reopen_missing_a_copy_says_to_restore_it_and_logs_the_refusal() {
 }
 
 /// `partitions/1` names a generation no copy holds (this folder is an older copy): the reopen
-/// is `Stale`, its text says to open the current folder, and the `Db` logs one
-/// `db_open_refused` naming the kind.
-/// Integration (~1 s): one fresh open until ready, a store edit, then one refused reopen.
+/// is `Stale`, and its text says the acknowledged writes are intact, not to delete the folder,
+/// and to open the folder or restore the backup that holds that generation (A-R184). The `Db`
+/// logs one `db_open_refused` naming the kind. With the record put back, a reopen reads the
+/// write made before: the refusal changed no data.
+/// Integration (~2 s): one fresh open until ready, a store edit, one refused reopen, the edit
+/// undone, one reopen until ready.
 #[config_log::retcd_test]
 fn m10_a_reopen_of_an_older_copy_says_to_open_the_current_one_and_logs_the_refusal() {
     const METHOD: &str =
@@ -142,13 +145,40 @@ fn m10_a_reopen_of_an_older_copy_says_to_open_the_current_one_and_logs_the_refus
         other => panic!("an older copy is Stale, not {:?}", other.map(|_| "Db")),
     };
     let text = refused.to_string();
+    let generation = record.generation.0;
     assert!(
-        text.ends_with(
-            ". This directory is an older copy of the database: open the folder that holds the \
-             current copies instead"
-        ),
-        "the text names the next step: {text}"
+        text.ends_with(&format!(
+            ". This open changed no data, and the acknowledged writes these copies hold are \
+             intact: do not delete this directory. If another folder, or a newer backup of this \
+             one, holds generation {generation}, open that folder or restore those copies here"
+        )),
+        "the text says the data is intact, not to delete, and the next step: {text}"
     );
+    // The refusal changed no data: the write made before still reads back once partitions/1
+    // names the copies' generation again.
+    let key = Bytes::from(ControlKey::Partition(PARTITION).encode());
+    let moved = rt
+        .block_on(store.get(config_core::GetRequest { key: key.clone() }))
+        .expect("read partitions/1 again")
+        .record
+        .expect("partitions/1 still exists");
+    rt.block_on(store.put(config_core::PutRequest {
+        key,
+        value: found.value.clone(),
+        expected_mod_revision: Some(moved.mod_revision),
+        dedup: None,
+    }))
+    .expect("put partitions/1 back");
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen after the record is back");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    let got = db.get(b"a").expect("read a back");
+    assert_eq!(
+        got.value.map(|(_, v)| v),
+        Some(Bytes::from_static(b"1")),
+        "the acknowledged write is intact after the refusal"
+    );
+    db.shutdown();
     assert_eq!(
         refusals(METHOD),
         vec![("Warning".to_owned(), "Stale".to_owned())],
@@ -637,8 +667,10 @@ fn m10_s1_8_a_dedup_cap_refused_by_check_logs_db_open_refused() {
     assert_eq!(
         refused.to_string(),
         format!(
-            "dedup_cap {} is above the most P1's status index holds ({}); nothing was started",
+            "dedup_cap {} is above the most P1's status index holds ({}); nothing was started. \
+             Set DbConfig::dedup_cap to at most {}, or leave it unset for the default",
             RETENTION_CAP_ENTRIES + 1,
+            RETENTION_CAP_ENTRIES,
             RETENTION_CAP_ENTRIES
         )
     );
@@ -651,5 +683,34 @@ fn m10_s1_8_a_dedup_cap_refused_by_check_logs_db_open_refused() {
     assert!(
         lines.iter().all(|line| line["@m"] != "dedup_cap_refused"),
         "the old event name is gone: {lines:?}"
+    );
+}
+
+/// M10 S1-6 (A-R183, critic-d6b candidate 3): a "not before" hint rides on the error as
+/// `retry_after` and in its text, the seconds rounded up so the words never promise sooner than
+/// the hint. The kind, the retry rule and the mutation proof are untouched, and an error built
+/// without a hint carries none. Unit (~1 ms).
+#[test]
+fn m10_s1_6_an_api_error_carries_a_not_before_hint_in_its_field_and_its_text() {
+    let plain = ApiError::new(ErrorKind::Overloaded, "dedup index full");
+    assert_eq!(
+        plain.retry_after(),
+        None,
+        "no hint unless the host sets one"
+    );
+    let hinted = plain.clone().with_retry_after(Duration::from_millis(1_500));
+    assert_eq!(hinted.retry_after(), Some(Duration::from_millis(1_500)));
+    assert_eq!(hinted.detail, "dedup index full; not before ~2s");
+    assert_eq!(
+        (hinted.kind, hinted.retry, hinted.no_mutation),
+        (plain.kind, plain.retry, plain.no_mutation),
+        "the hint changes nothing else"
+    );
+    assert_eq!(
+        ApiError::new(ErrorKind::Overloaded, "x")
+            .with_retry_after(Duration::from_secs(3))
+            .detail,
+        "x; not before ~3s",
+        "a whole second is not rounded up past itself"
     );
 }
