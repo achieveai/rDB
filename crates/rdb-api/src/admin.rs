@@ -816,8 +816,12 @@ pub(crate) struct HealCtx {
     pub(crate) boot: BootId,
     pub(crate) budgets: Budgets,
     pub(crate) clock: HostClock,
-    /// Node 1's mailbox.
+    /// The owner's mailbox.
     pub(crate) owner: std::sync::mpsc::Sender<Msg>,
+    /// The node `partitions/1` named owner when the open read it, and that this process runs
+    /// (arch-s2 B1, B2). The heal clears its grant alone and plans it primary; after a promote
+    /// it is not node 1, and node 1's frozen grant stays as the promote left it.
+    pub(crate) owner_node: NodeId,
     /// How long clearing the old grants may take.
     pub(crate) within: Duration,
     /// The boot each member runs at: this open's for a node this process runs, the one its
@@ -829,10 +833,11 @@ pub(crate) struct HealCtx {
 /// The correlation a heal's two events carry.
 const HEAL: CorrelationId = CorrelationId(2);
 
-/// Heal partition 1 after a reopen (M10, arch R3a, rulings A-R159, A-R163): clear the three old
-/// grants, node 1's first; only after node 1's grant is known gone, read `partitions/1`; then
-/// hand node 1's F1 a `Plan` from the record's root at config version + 1 with this open's
-/// boots, and a takeover authorization whose `control_revision` is the record's `mod_revision`.
+/// Heal partition 1 after a reopen (M10, arch R3a, rulings A-R159, A-R163): clear the old grant
+/// of the owner `partitions/1` names, and no other (arch-s2 B1); only after it is known gone,
+/// read `partitions/1` and check it still names that owner (B2); then hand the owner's F1 a
+/// `Plan` from the record's root at config version + 1 with this open's boots, the owner
+/// primary, and a takeover authorization whose `control_revision` is the record's `mod_revision`.
 /// The same proof `bootstrap` and the simulator's `reinspect_now` already use: a CAS at that
 /// revision lands only if nothing wrote `partitions/1` after the read.
 ///
@@ -858,11 +863,10 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
     // fence's reads and decision tick as fresh as they were.
     let members = member_boots(&ctx, deadline).await?;
-    let gone = clear_until(&ctx, OWNER, deadline).await?;
-    for node in [NodeId(2), NodeId(3)] {
-        clear_until(&ctx, node, deadline).await?;
-    }
-    // Only now, after node 1's delete was acknowledged or its absence read (A-R163).
+    // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
+    // promote that moved the partition off it, which only that promote may settle.
+    let gone = clear_until(&ctx, ctx.owner_node, deadline).await?;
+    // Only now, after the owner's delete was acknowledged or its absence read (A-R163).
     let read = ctx
         .store
         .get(GetRequest {
@@ -898,6 +902,14 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
             found.mod_revision
         )));
     };
+    // B2: the grant cleared above must be the owner's this record names.
+    if record.owner != ctx.owner_node {
+        return Err(HealError::Record(format!(
+            "the record at revision {} names owner node {}, but this open found node {}: open \
+             again",
+            found.mod_revision, record.owner.0, ctx.owner_node.0
+        )));
+    }
     let healed = Healed {
         cleared,
         read_revision: Revision(read.read_revision),
@@ -1012,6 +1024,14 @@ async fn member_boots(
     loop {
         let found: Vec<(Member, Option<BootId>)> = members()
             .into_iter()
+            .map(|member| Member {
+                role: if member.node == ctx.owner_node {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::RegularSecondary
+                },
+                ..member
+            })
             .map(|member| (member, (ctx.member_boot)(member.node)))
             .collect();
         let missing: Vec<u32> = found
@@ -2463,6 +2483,7 @@ mod tests {
             owner,
             within: Duration::from_millis(500),
             member_boot: Arc::new(|_| Some(OPEN_2)),
+            owner_node: OWNER,
         };
         let healed = rt.block_on(heal(ctx));
         (healed, mailbox.try_iter().collect())
@@ -2883,6 +2904,7 @@ mod tests {
             owner,
             within: Duration::from_millis(100),
             member_boot: Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2)),
+            owner_node: OWNER,
         };
         let refused = rt
             .block_on(heal(ctx))

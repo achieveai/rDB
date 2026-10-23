@@ -1255,6 +1255,7 @@ impl Db {
             owner: sender,
             within: heal_within(&budgets),
             member_boot: Arc::new(member_boot),
+            owner_node: owner,
         };
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
