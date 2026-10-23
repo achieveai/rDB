@@ -4003,6 +4003,10 @@ fn wait_ready_line(
             "quarantined",
             Err(format!("stopped waiting for ready: {e}")),
         ),
+        // PR #60 review F3: its text names the fault and says to open the folder again once.
+        Err(e @ ReadyError::Faulted { .. }) => {
+            ("faulted", Err(format!("stopped waiting for ready: {e}")))
+        }
     };
     let error = answer.err().map(|e| e.to_string());
     tracing::info!(
@@ -6250,6 +6254,9 @@ mod tests {
                 reason: "BarrierIncomplete".to_owned(),
             },
             ReadyError::Quarantined,
+            ReadyError::Faulted {
+                fault: "after-commit hook".to_owned(),
+            },
         ];
         let progress = Progress::default();
         for answer in finals {

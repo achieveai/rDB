@@ -597,6 +597,17 @@ pub enum ReadyError {
          membership comes in a later build)"
     )]
     Quarantined,
+    /// Node 1 faulted before it took writes. A faulted node takes no writes again in this open,
+    /// so no wait helps (PR #60 review F3). The text carries the fault as node 1 recorded it.
+    #[error(
+        "node 1 stopped on a fault before it took writes, and it takes none in this open: \
+         {fault}. Shut this Db down and open the folder again, once; if that open stops the \
+         same way, stop and report it with this message, and do not delete the folder"
+    )]
+    Faulted {
+        /// Node 1's fault, as its status records it.
+        fault: String,
+    },
 }
 
 /// The next step once node 1 has restarted: nothing it served comes back in this open
@@ -1096,7 +1107,8 @@ impl Db {
     /// or its restart failed, answers at once: it does not rejoin in this open (#42). So does a
     /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
     /// one fence only (ruling F-a, A-R196). So does a quarantined one, which nothing in an open
-    /// leaves (A-R196(2a)).
+    /// leaves (A-R196(2a)). So does a node 1 that faulted before it took writes: a faulted node
+    /// takes none again in this open (PR #60 review F3).
     ///
     /// # Errors
     ///
@@ -1104,6 +1116,7 @@ impl Db {
     /// [`ReadyError::Blocked`] once its recovery is blocked, whose texts say to shut this `Db`
     /// down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
     /// recovery is quarantined, whose text says a reopen will not help (A-R196(2a), A-R196(2b)).
+    /// [`ReadyError::Faulted`] once node 1 has faulted, whose text carries the fault.
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from("unknown");
@@ -1129,6 +1142,11 @@ impl Db {
                         return Err(stuck);
                     }
                     None => {}
+                }
+                // PR #60 review F3: a faulted node takes no writes again in this open.
+                if let Some(fault) = owner.fault {
+                    tracing::warn!(fault, "ready_faulted");
+                    return Err(ReadyError::Faulted { fault });
                 }
                 phase = owner.recovery.unwrap_or_else(|| "none".to_owned());
             }
@@ -8077,6 +8095,42 @@ mod tests {
                 std::fs::copy(entry.path(), target).expect("copy");
             }
         }
+    }
+
+    /// PR #60 review F3: a node that faulted takes no writes again in this open, so once node 1
+    /// has faulted `wait_ready` answers at once, `Faulted`, with the fault in its text. Before,
+    /// it waited out `within` and answered `TimedOut`, naming only a recovery phase, and the
+    /// cause was in the log alone. Here the reopen's commit faults node 1
+    /// (`AfterCommit::Fault`). Cut: `wait_ready` does not read node 1's fault, and the row waits
+    /// out the whole bound. Integration (~5 s): a fresh open, a reopen that faults.
+    #[config_log::retcd_test]
+    fn m10_wait_ready_answers_a_fault_of_node_1_at_once_and_names_it() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        let within = crate::host::test_patience(Duration::from_secs(20));
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(within);
+        let took = started.elapsed();
+        crate::host::set_after_commit(dir.path(), None);
+        let Err(error @ ReadyError::Faulted { .. }) = answer else {
+            panic!("node 1 faulted, so wait_ready says so: {answer:?}");
+        };
+        assert!(took < within / 2, "answered at once, not after {took:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains("after-commit hook: generation 2 committed and not linked"),
+            "the text carries the fault: {text}"
+        );
+        assert!(
+            text.contains("open the folder again"),
+            "and the step: {text}"
+        );
+        db.shutdown();
     }
 
     /// Ruling A-R184: a node acquires under a generation, and admits writes, only once the open

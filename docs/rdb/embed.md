@@ -385,6 +385,7 @@ report it with the message.
 | `ReadyError::Heal` | The reopen's repair failed. The message says why: for example, the last run's grant is still held by another open of this folder's data | Do what the message says (often: shut that other open down), then open again |
 | `ReadyError::Stopped` | Node 1 restarted in this open | Shut this `Db` down and open the folder again |
 | `ReadyError::Blocked` | The open's recovery stopped before node 1 took writes; the message names why (often a copy answered too late) | Shut this `Db` down and open the folder again, once. If that open is blocked too, stop and report it with the message; do not retry in a loop |
+| `ReadyError::Faulted` | Node 1 stopped on a fault before it took writes; the message carries the fault (a storage or link step that failed, say) | Shut this `Db` down and open the folder again, once. If that open stops the same way, stop and report it with the message; do not delete the folder |
 
 **Not fixed by opening again.**
 
@@ -411,8 +412,8 @@ column says what to change before the next open.
 | `ReadyError::TimedOut` | Node 1 did not admit writes in time; the message names the recovery phase | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
-failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked` and
-`Quarantined`.
+failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked`,
+`Quarantined` and `Faulted`.
 
 ## 7. The pilot, `pilot_kv`
 
