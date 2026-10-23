@@ -47,7 +47,8 @@ use rdb_core::publication::POST_APPLY_DEADLINE_MILLIS;
 use rdb_core::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
 use rdb_core::transaction::admission::{MAX_CONDITIONS, MAX_REQUEST_MUTATIONS};
 use rdb_core::transaction::dedup::{
-    dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, SEED_PAGE,
+    dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, APP_ID_MIN, MAX_PINS, OPEN_BITS,
+    OPEN_MASK, SEED_PAGE,
 };
 use rdb_core::transaction::{
     deny_error, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode, StartRecord,
@@ -5993,6 +5994,45 @@ fn m9_s0_07_admission_refuses_the_start_record_identity() {
     );
     assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
     let _ = h.admit(put(1, b"a", b"1"));
+}
+
+/// A-R252 A2, A-R255 (3). Admission check 10 refuses an ack floor outside its scope
+/// `INVALID_ARGUMENT`, naming the field, and queues nothing: the floor record's reserved id, a
+/// floor on an app-chosen id, above the request's own id or in another open, pins with no floor,
+/// more than `MAX_PINS` pins, and a pin at the floor. Twin: the same request in scope, with
+/// `MAX_PINS` pins, is admitted.
+#[retcd_test]
+fn m10_s2_admission_refuses_an_ack_floor_outside_its_scope() {
+    let mut h = H::non_empty();
+    let floor = |request: u64, below: Option<u64>, pinned: Vec<u64>| {
+        let mut req = put(request, b"a", b"1");
+        req.acked_below = below;
+        req.pinned = pinned;
+        req
+    };
+    let nine = (1..=MAX_PINS as u64 + 1).collect::<Vec<_>>();
+    let cases = [
+        (floor(OPEN_MASK, None, vec![]), "request"),
+        (floor(APP_ID_MIN, Some(1), vec![]), "acked_below"),
+        (floor(5, Some(6), vec![]), "acked_below"),
+        (floor((1 << OPEN_BITS) | 5, Some(3), vec![]), "acked_below"),
+        (floor(5, None, vec![1]), "pinned"),
+        (floor(20, Some(10), nine.clone()), "pinned"),
+        (floor(20, Some(10), vec![10]), "pinned"),
+    ];
+    for (req, field) in cases {
+        let identity = req.identity;
+        assert_eq!(
+            h.step(submit(req)),
+            vec![EffectKind::Reply(ReplyEffect::Failed {
+                identity,
+                error: RdbError::InvalidArgument { field },
+            })],
+            "{identity:?}"
+        );
+        assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
+    }
+    let _ = h.admit(floor(20, Some(10), nine[..MAX_PINS].to_vec()));
 }
 
 /// M9 S0 rule 1, "T1 `Open`". An empty partition recovered read-only owes the start record but
