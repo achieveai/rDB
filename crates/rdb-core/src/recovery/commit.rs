@@ -17,7 +17,9 @@
 //! `Unknown` or `Unavailable` it is resolved by a read, then the same CAS at the revision the read found our own bytes at
 //! ([`Cas::ours_at`], [`Cas::repropose`]). Nothing lands on a read; only that CAS's `Committed`
 //! does. Any other record on that read still goes through [`Cas::on_read`]. The recovery CAS
-//! stays terminal: its record binds no run id, so our bytes cannot be told from a peer's (F-g).
+//! resolves the same way when it carries a layout-3 root (M10 S1-5, achieveai/rDB#45, ruling
+//! A-R182): the root binds the run id and the cutoff, so [`Cas::ours_at`] tells our bytes from a
+//! peer's. Without a root it stays terminal: a layout-2 record binds no run id (F-g).
 //!
 //! Every request carries a fresh [`ControlRequestId`] from [`Requests`], and only an answer
 //! echoing the outstanding one is this proposal's (lead ledger L-R177hs): a re-run's CAS and an

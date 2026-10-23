@@ -17,7 +17,11 @@
 //! Quarantined: terminal.   Blocked: terminal until a fresh fence.
 //! Committed, Rebuilding --FenceProven, newer root--> Fenced/Collecting
 //! ActivationProposed --FenceProven, newer root--> held; re-enters once the activation CAS ends
-//! Proposing --Unknown, or deadline with no answer--> Blocked(ControlUnknown)
+//! Proposing --Unknown, or deadline with no answer--> Blocked(ControlUnknown)   (unbound F1)
+//! Proposing --Unknown, Unavailable, or deadline with no answer--> ProposalUnresolved   (bound)
+//! ProposalUnresolved --read our bytes at r, or the fenced record at the fence revision;
+//!   the same CAS there, Committed--> Committed
+//! ProposalUnresolved --another record on the read--> Blocked(OvertakenByPeer | CasContention)
 //! ActivationProposed --Unknown, Unavailable, or deadline with no answer--> ActivationUnresolved
 //!   (a held fence re-enters instead when it can; refused, F1 resolves)
 //! ActivationUnresolved --read our bytes at r, same CAS at r, Committed--> Committed(Active)
@@ -68,10 +72,14 @@
 //! non-Serving record (A-R51), which changes the bytes, and P1 and T1 keep any `AuthorityLost`
 //! freeze over a re-emit (A-R99).
 //!
-//! The recovery CAS stays out (ruling F-g): `PartitionRecord` binds neither the run nor the
-//! cutoff, so our bytes on a read cannot be told from a peer's identical decision on another
-//! cutoff. Resolving it needs a run id in `partitions/{p}` (M10, achieveai/rDB#45). In M9 it runs
-//! only on the first open's bootstrap, before any write is admitted.
+//! Unbound, the recovery CAS stays out (ruling F-g): a layout-2 `PartitionRecord` binds neither
+//! the run nor the cutoff, so our bytes on a read cannot be told from a peer's identical decision
+//! on another cutoff. Bound to an rDB instance it resolves too (M10 S1-5, achieveai/rDB#45, lead
+//! ruling A-R182): layout 3's root carries the run id (the fence's `control_revision`) and the
+//! cutoff, so `Cas::ours_at` tells this run's bytes from anyone else's. A reopen runs this CAS
+//! every time, so a store outage there must not block the partition for good. The rules are the
+//! activation's, with one more record the read may find: the fenced record, still at the fence
+//! revision, says the CAS never applied, and F1 sends it again at that revision.
 //!
 //! `Idle` leaves only on a `FencingProof` (§2.1). After commit, `select_prefix` is unreachable:
 //! a returning stale owner is quarantined without its length ever being read (§5.7).
@@ -169,6 +177,14 @@ pub enum RecoveryPhase {
     Barrier,
     /// The recovery CAS is in flight.
     Proposing,
+    /// The recovery CAS ended `Unknown`, `Unavailable`, or unanswered at its deadline, and F1 is
+    /// bound to an rDB instance (M10 S1-5, achieveai/rDB#45, lead ruling A-R182). Not a block: F1
+    /// resolves it as it resolves an activation (A-R102), by a read of `partitions/{p}` and then
+    /// the same CAS at the revision the read found this run's own bytes at, or at the fence
+    /// revision when the fenced record is still there. Only that CAS's `Committed` commits; any
+    /// other record blocks through the conflict re-read's rule. One request at a time, re-read on
+    /// each timer fire.
+    ProposalUnresolved,
     /// Committed, fully protected.
     Committed,
     /// Committed below full protection; rebuilding.
@@ -185,7 +201,8 @@ pub enum RecoveryPhase {
     /// Divergence found. Terminal in M7.
     Quarantined,
     /// Automatic recovery stopped. Terminal until a fresh fence. An `Unknown` or `Unavailable`
-    /// recovery CAS lands here; the activation CAS's do not (`ActivationUnresolved`).
+    /// recovery CAS lands here when F1 is unbound; bound, it resolves (`ProposalUnresolved`), as
+    /// the activation CAS always does (`ActivationUnresolved`).
     Blocked(BlockReason),
 }
 
@@ -265,6 +282,8 @@ enum Phase {
     Synchronizing(Box<Decided>, BTreeSet<CopyId>),
     Barrier(Box<Decided>, BTreeMap<CopyId, DurableProof>),
     Proposing(Box<Decided>, RecoveryBarrier, Box<Cas>),
+    /// The recovery CAS is being resolved (M10 S1-5, A-R182): bound F1 only.
+    Unresolved(Box<Decided>, RecoveryBarrier, Box<Cas>, Resolving),
     Committed(Box<Committed>),
     Quarantined,
     /// The reason, and the floor when a peer's decision blocked the run: the revision it was read
@@ -350,6 +369,7 @@ impl Recovery {
             Phase::Synchronizing(..) => RecoveryPhase::Synchronizing,
             Phase::Barrier(..) => RecoveryPhase::Barrier,
             Phase::Proposing(..) => RecoveryPhase::Proposing,
+            Phase::Unresolved(..) => RecoveryPhase::ProposalUnresolved,
             Phase::Committed(c) if c.resolving.is_some() => RecoveryPhase::ActivationUnresolved,
             Phase::Committed(c) if c.activation.is_some() => RecoveryPhase::ActivationProposed,
             Phase::Committed(c) if c.rebuild.is_some() => RecoveryPhase::Rebuilding,
@@ -368,11 +388,13 @@ impl Recovery {
         }
     }
 
-    /// The CAS F1 is waiting on an answer for, if any. A resolving activation with nothing
-    /// outstanding waits on none: an answer then is a late one (ruling A-R102).
+    /// The CAS F1 is waiting on an answer for, if any. A resolving activation or recovery CAS
+    /// with nothing outstanding waits on none: an answer then is a late one (rulings A-R102,
+    /// A-R182).
     fn pending_cas(&self) -> Option<&Cas> {
         match &self.phase {
             Phase::Proposing(_, _, cas) => Some(cas.as_ref()),
+            Phase::Unresolved(_, _, cas, resolving) => resolving.awaiting.then_some(cas.as_ref()),
             Phase::Committed(committed)
                 if committed
                     .resolving
@@ -438,8 +460,12 @@ impl Recovery {
             Phase::Barrier(decided, proofs) => self.barrier(ctx, decided, proofs, input, &mut emit),
             Phase::Proposing(decided, barrier, cas) => {
                 let input = self.lost_answer(ctx, &cas, input);
+                let phase = self.proposing(ctx, decided, barrier, cas, input, &mut emit);
+                self.pin_at_commit(ctx, phase, &mut emit)
+            }
+            Phase::Unresolved(decided, barrier, cas, resolving) => {
                 let phase =
-                    Self::proposing(decided, barrier, cas, &mut self.requests, input, &mut emit);
+                    self.resolve_proposal(ctx, decided, barrier, cas, resolving, input, &mut emit);
                 self.pin_at_commit(ctx, phase, &mut emit)
             }
             Phase::Committed(committed) => self.committed(ctx, committed, input, &mut emit),
@@ -783,24 +809,125 @@ impl Recovery {
     }
 
     fn proposing(
+        &mut self,
+        ctx: &StepCtx<'_>,
         decided: Box<Decided>,
         barrier: RecoveryBarrier,
         mut cas: Box<Cas>,
-        requests: &mut Requests,
         input: Input<'_>,
         emit: &mut Emit<'_>,
     ) -> Phase {
         match follow_cas(
             &mut cas,
             decided.proof.control_revision,
-            requests,
+            &mut self.requests,
             input,
             emit,
         ) {
             Some(Ok(revision)) => commit(*decided, barrier, revision, emit),
+            // M10 S1-5 (achieveai/rDB#45, ruling A-R182): bound to an instance, the record carries
+            // this run's id, so our bytes can be told from a peer's and an outage resolves as the
+            // activation's does (A-R102) instead of blocking for good. The fact is reported all
+            // the same. `Unknown` reads at once; `Unavailable` waits for the exchange's own fire.
+            Some(Err(Phase::Blocked(
+                reason @ (BlockReason::ControlUnknown | BlockReason::ControlUnavailable),
+                _,
+            ))) if decided.root.is_some() => {
+                let mut resolving = Resolving { awaiting: false };
+                if reason == BlockReason::ControlUnknown {
+                    self.read_proposal(ctx, &mut cas, &mut resolving, emit);
+                }
+                Phase::Unresolved(decided, barrier, cas, resolving)
+            }
             Some(Err(blocked)) => blocked,
             None => Phase::Proposing(decided, barrier, cas),
         }
+    }
+
+    /// One resolving attempt for the recovery CAS (ruling A-R182): a fresh read of
+    /// `partitions/{p}` under a fresh id, bounded by a fresh window. Whatever was outstanding is
+    /// abandoned, and its late answer is `UnmatchedCompletion`.
+    fn read_proposal(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        cas: &mut Cas,
+        resolving: &mut Resolving,
+        emit: &mut Emit<'_>,
+    ) {
+        let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
+        cas.retime(deadline);
+        emit.kind(EffectKind::Control(cas.resolve_read(self.requests.mint())));
+        resolving.awaiting = true;
+        self.arm(deadline, emit);
+    }
+
+    /// A resolving recovery CAS (M10 S1-5, achieveai/rDB#45, ruling A-R182). It may have landed,
+    /// or not; only a read tells. The same rules as a resolving activation (A-R102), with one
+    /// more record the read can find:
+    ///
+    /// * this run's own bytes at `r`, above the fence revision: the CAS landed, or an operator
+    ///   rewrote it unchanged. The same CAS at `r`;
+    /// * the record still at the fence revision: the CAS never applied. The same CAS at the fence
+    ///   revision, which is the CAS this run first sent;
+    /// * anything else goes through `Cas::on_read`: `OvertakenByPeer` or `CasContention`, both
+    ///   blocks.
+    ///
+    /// Only a CAS's `Committed` commits; nothing commits on a read alone. `Conflict` reads again
+    /// at once; `Unavailable` and `Unknown`, read or CAS, wait for the next fire. A fence or a
+    /// plan is out of phase here, as it is while proposing.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_proposal(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        decided: Box<Decided>,
+        barrier: RecoveryBarrier,
+        mut cas: Box<Cas>,
+        mut resolving: Resolving,
+        input: Input<'_>,
+        emit: &mut Emit<'_>,
+    ) -> Phase {
+        let fence = decided.proof.control_revision;
+        match input {
+            Input::Timer(fired) if self.due(ctx, fired, cas.deadline()) => {
+                self.read_proposal(ctx, &mut cas, &mut resolving, emit);
+            }
+            Input::Read(ReadOutcome::Unavailable)
+            | Input::Cas(CasOutcome::Unavailable | CasOutcome::Unknown) => {
+                resolving.awaiting = false;
+                emit.ignored(ReplicaIgnoreReason::Outstanding);
+            }
+            Input::Read(outcome) => {
+                let at = cas.ours_at(outcome, fence).or(match outcome {
+                    ReadOutcome::Found { revision, .. } if *revision == fence => Some(fence),
+                    _ => None,
+                });
+                if let Some(revision) = at {
+                    emit.kind(EffectKind::Control(
+                        cas.repropose(self.requests.mint(), revision),
+                    ));
+                } else {
+                    return match cas.on_read(outcome) {
+                        CasStep::Overtaken(seen) => {
+                            block_seen(BlockReason::OvertakenByPeer, Some(seen.max(fence)), emit)
+                        }
+                        CasStep::Blocked(reason) => block(reason, emit),
+                        // `on_read` never lands or asks to read again; were it to, contention
+                        // is the conservative answer: no commit without a `Committed`.
+                        CasStep::Landed(_) | CasStep::Reread => {
+                            block(BlockReason::CasContention, emit)
+                        }
+                    };
+                }
+            }
+            Input::Cas(CasOutcome::Conflict { .. }) => {
+                emit.kind(EffectKind::Control(cas.resolve_read(self.requests.mint())));
+            }
+            Input::Cas(CasOutcome::Committed(revision)) => {
+                return commit(*decided, barrier, revision, emit);
+            }
+            other => ignore_elsewhere(other, emit),
+        }
+        Phase::Unresolved(decided, barrier, cas, resolving)
     }
 
     /// A commit at cutoff 0 that rebuilds pins its rebuild at `(0, ROOT)` and asks every
