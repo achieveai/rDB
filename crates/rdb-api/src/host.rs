@@ -3200,7 +3200,8 @@ impl Host {
         );
         self.inherit(partition, result)?;
         self.committed.insert(partition, Box::new(result.clone()));
-        self.committed_correlation.insert(partition, site.correlation);
+        self.committed_correlation
+            .insert(partition, site.correlation);
         if self.landed.insert((partition, result.new_generation)) {
             self.stamp_retirement(partition, result.new_generation);
         }
@@ -3477,7 +3478,8 @@ impl Host {
         self.answer_deferred_syncs(partition, result.new_generation);
         self.schedule_acquire(&result, site);
         self.committed.insert(partition, result.clone());
-        self.committed_correlation.insert(partition, site.correlation);
+        self.committed_correlation
+            .insert(partition, site.correlation);
         self.push(
             site,
             EventKind::Kernel(KernelEvent::Recovered(result)),

@@ -730,8 +730,20 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
     assert_eq!(
         lines,
         [
-            ("snapshot_catchup_served".to_owned(), Some(1), Some(2), Some(head + 1), None),
-            ("snapshot_catchup_unservable".to_owned(), Some(1), Some(3), None, None),
+            (
+                "snapshot_catchup_served".to_owned(),
+                Some(1),
+                Some(2),
+                Some(head + 1),
+                None
+            ),
+            (
+                "snapshot_catchup_unservable".to_owned(),
+                Some(1),
+                Some(3),
+                None,
+                None
+            ),
             (
                 "snapshot_catchup_unserved".to_owned(),
                 Some(2),
