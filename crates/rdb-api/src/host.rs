@@ -5246,9 +5246,33 @@ impl Host {
         puts: &[PutOp],
         remaining_millis: u64,
     ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
+        // A node that knows it is a secondary (it receives this partition's appends and is not
+        // its primary) sends the caller to the owner: `NOT_PRIMARY`, before the guard below,
+        // which would otherwise answer a retryable `UNAVAILABLE` and keep an app routed here
+        // (ruling A-R233). Never sent, so nothing mutated.
+        if self.replication.primary(self.node, partition).is_none()
+            && self.replication.receiver(self.node, partition).is_some()
+        {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                "client_compile_not_primary"
+            );
+            let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+                partition,
+                hint: None,
+            });
+            error.no_mutation = true;
+            error.detail = format!(
+                "node {} is a secondary of partition {}, not its owner; nothing was sent",
+                self.node.0, partition.0
+            );
+            return Ok(Err(error));
+        }
         let generation = self.adopted(partition).generation;
         // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
-        // Refused here and never sent (lead ruling on D1, 2026-10-07).
+        // Refused here and never sent (lead ruling on D1, 2026-10-07). The owner before it is
+        // ready keeps this answer (A-R233).
         if generation.0 == 0 {
             return Ok(Err(ApiError::not_adopted(self.node, partition)));
         }
@@ -5983,8 +6007,10 @@ fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
 /// D9b: the code a damage line names stored damage by, never its `Display`, which for a map
 /// entry quotes the app's key (`Corrupt::Entry`). Exhaustive on purpose: a new variant is a
 /// compile error here, not a line that quietly falls back to the text.
-const fn damage_code(corrupt: &Corrupt) -> &'static str {
+fn damage_code(corrupt: &Corrupt) -> &'static str {
     match corrupt {
+        // The element's own fault; its key never reaches a log (#59, A-R230).
+        Corrupt::Element { error, .. } => damage_code(error),
         Corrupt::Envelope(_) => "envelope",
         Corrupt::Codec(_) => "codec",
         Corrupt::VersionWithoutValue => "version_without_value",

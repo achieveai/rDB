@@ -1937,63 +1937,50 @@ fn m10_s2_h2_an_app_reopened_under_the_same_client_writes_with_fresh_ids() {
     nodes.shutdown();
 }
 
-/// A-R226 h2: an app `Db` whose route names a node that answers `NOT_PRIMARY` re-reads the
-/// owner from `partitions/1`; the refusal goes back to the app with its `RefreshRoute` rule,
-/// so the app retries, not the `Db`. Node 2 is a stand-in that answers every call
-/// `NOT_PRIMARY` the way admission check 4 does: in this host a real secondary refuses a put
-/// earlier, as not adopted (see the report). Integration (~1 s): one fresh open until ready.
+/// A-R226 h2, A-R233: an app `Db` routed to node 2, a live secondary of the trio, is refused
+/// `NOT_PRIMARY` (rule `RefreshRoute`, nothing sent), re-reads the owner from `partitions/1`,
+/// and its retry lands on node 1. The `Db` does not retry by itself: the app does.
+/// Integration (~1 s): one fresh open until ready.
 #[config_log::retcd_test]
 fn m10_s2_h2_not_primary_refreshes_the_app_route() {
     const METHOD: &str = "m10_s2_h2_not_primary_refreshes_the_app_route";
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    written_and_closed(&rt, dir.path(), &store);
+    let mut nodes = open(&rt, dir.path(), &store).expect("the fresh open");
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
 
-    let links = Arc::new(Links::default());
-    let (stand_in, calls) = std::sync::mpsc::channel();
-    links.register(NodeId(2), stand_in, crate::host::BOOT);
-    let answering = std::thread::spawn(move || {
-        let mut answered = 0;
-        while let Ok(msg) = calls.recv() {
-            if let Msg::Client(Client { reply, .. }) = msg {
-                let error = ApiError::from_kernel(&RdbError::NotPrimary {
-                    partition: PARTITION,
-                    hint: None,
-                });
-                let _ = reply.send(Answer::Error {
-                    error,
-                    request: None,
-                });
-                answered += 1;
-            }
-        }
-        answered
-    });
-    let mut app = open_app(&rt, &store, &links, ClientId(2));
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
     app.route.owner.store(2, Ordering::Relaxed);
     let refused = app
         .put(b"a", b"1", None)
         .expect_err("node 2 is not the owner");
     assert_eq!(
-        (refused.error.kind, refused.error.retry),
-        (ErrorKind::NotPrimary, RetryRule::RefreshRoute),
+        (
+            refused.error.kind,
+            refused.error.retry,
+            refused.error.no_mutation
+        ),
+        (ErrorKind::NotPrimary, RetryRule::RefreshRoute, true),
         "{refused}"
     );
     assert_eq!(app.route.owner(), NodeId(1), "the route was refreshed");
-    app.shutdown();
-    drop(app);
-    drop(links);
+    let landed = app
+        .put(b"a", b"1", None)
+        .expect("the retry lands on node 1");
     assert_eq!(
-        answering.join().expect("the stand-in"),
-        1,
-        "one call reached node 2"
+        nodes.get(b"a").expect("get a").value,
+        Some((landed.seq.0, Bytes::from_static(b"1"))),
+        "{landed:?}"
     );
+    app.shutdown();
+    nodes.shutdown();
     let logged = messages(METHOD);
-    assert!(
-        logged.iter().any(|m| m == "db_owner_refreshed"),
-        "{logged:?}"
-    );
+    for event in ["client_compile_not_primary", "db_owner_refreshed"] {
+        assert!(logged.iter().any(|m| m == event), "{event}: {logged:?}");
+    }
 }
 
 /// Defect tester-s2: `partitions/1` holding bytes this build cannot decode is its own

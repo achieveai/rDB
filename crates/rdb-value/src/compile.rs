@@ -101,6 +101,17 @@ pub enum Corrupt {
         /// Why it does not open.
         error: EnvelopeError,
     },
+    /// An element of a map or set that a read reached does not read back (#59, ruling A-R230):
+    /// its key, as the caller writes it, and why. The key is for the caller's error only; a log
+    /// line names the damage by code and the key by `key_hex`, never by this text (ADR-0013,
+    /// A-R154).
+    #[error("element {}: {error}", key_text(.key))]
+    Element {
+        /// The element's key.
+        key: Value,
+        /// Why it does not read back.
+        error: Box<Corrupt>,
+    },
     /// A map entry's envelope is not a document.
     #[error("map entry envelope is a {found:?}, not a Document")]
     EntryNotDocument {
@@ -200,6 +211,7 @@ impl Corrupt {
     #[must_use]
     pub fn is_newer_build(&self) -> bool {
         match self {
+            Self::Element { error, .. } => error.is_newer_build(),
             Self::Envelope(error)
             | Self::Entry { error, .. }
             | Self::Chunk { error, .. }

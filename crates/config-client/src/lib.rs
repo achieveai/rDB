@@ -417,7 +417,8 @@ impl GrpcClient {
     /// see. ADR-0015's no-automatic-replay rule applies to streams as well: a `NotLeader`
     /// hint, a resumable `ResourceExhausted`, and a `RevisionCompacted` are all surfaced to
     /// the caller, and [`ClientStats::watch_opens`] counts exactly the calls the caller made
-    /// (test plan M4-106, M4-107, M4-108).
+    /// (test plan M4-106, M4-107, M4-108). A caller that wants the leader found for it at open
+    /// uses [`GrpcClient::watch_leader_tracked`] instead.
     ///
     /// No per-request deadline is set on the RPC: the connect phase is bounded by the
     /// client's budget, but a watch that delivers nothing for an hour on an idle prefix is
@@ -464,6 +465,40 @@ impl GrpcClient {
                 Err(classify(&status, false))
             }
         }
+    }
+
+    /// Open a watch stream at the leader (issue #57, [`ConfigStore::watch_leader`]).
+    ///
+    /// The open is found the way a unary call is: it starts at the endpoint later operations
+    /// start at, moves to the next configured endpoint on a connect failure, and follows a
+    /// `NotLeader` hint at most [`GrpcClientOptions::max_hint_follows`] times. Any other answer
+    /// ends the call as it is. The budget bounds the open only, on this side: the RPC carries
+    /// no deadline, for the reason [`GrpcClient::watch_tracked`] gives.
+    ///
+    /// What follows the open is [`GrpcClient::watch_tracked`]'s contract: the stream is the
+    /// caller's, and nothing re-opens it after a delivery or a termination (M4-106, M4-107).
+    /// [`ClientStats::watch_opens`] counts this call once, however many endpoints it tried.
+    pub async fn watch_leader_tracked(
+        &self,
+        request: WatchRequest,
+    ) -> Result<TrackedWatch, ConfigError> {
+        let ctx = TraceContext::current_or_root().child();
+        let span = ctx.span("watch_leader");
+        self.counters.watch_opens.fetch_add(1, Ordering::Relaxed);
+        // `is_mutation: false`: opening a watch writes nothing, so an interrupted attempt has
+        // no outcome to be unsure about.
+        let inner = self
+            .attempts(
+                "watch_leader",
+                false,
+                WireDeadline::Omit,
+                pb::WatchRequest::from(&request),
+                |mut c, r| async move { c.watch(r).await },
+                &ctx,
+            )
+            .instrument(span)
+            .await?;
+        Ok(TrackedWatch::new(Box::pin(WatchItems { inner })))
     }
 
     /// Send, hint-follow and reconnect counters since construction.
@@ -702,7 +737,7 @@ impl GrpcClient {
         // `.instrument`, never `span.enter()`: this future yields at every await, and a guard
         // held across a yield attributes whatever the runtime schedules next to this
         // operation's span (ADR-0013).
-        self.attempts(op, is_mutation, request, call, &ctx)
+        self.attempts(op, is_mutation, WireDeadline::Send, request, call, &ctx)
             .instrument(span)
             .await
     }
@@ -711,6 +746,7 @@ impl GrpcClient {
         &self,
         op: &'static str,
         is_mutation: bool,
+        wire_deadline: WireDeadline,
         request: Req,
         call: Call,
         ctx: &TraceContext,
@@ -828,8 +864,12 @@ impl GrpcClient {
                 }
             }
             // The server gets the same budget we are holding ourselves to, so it can stop
-            // working on a call whose answer can no longer be delivered (ADR-0015).
-            wire.set_timeout(remaining);
+            // working on a call whose answer can no longer be delivered (ADR-0015). Not a
+            // watch: the budget bounds its open, here, and the server would end the stream at
+            // it (issue #57).
+            if wire_deadline == WireDeadline::Send {
+                wire.set_timeout(remaining);
+            }
 
             let cap = config_grpc::client_plane_message_limit(&self.opts.limits);
             let client = ConfigServiceClient::new(channel)
@@ -977,6 +1017,15 @@ impl PageWalk<'_> {
         }
         Ok(out)
     }
+}
+
+/// Whether an attempt tells the server its remaining budget as `grpc-timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireDeadline {
+    /// A unary call: the server may stop work whose answer can no longer be delivered.
+    Send,
+    /// A watch: the budget bounds the open, and on the wire it would end the stream.
+    Omit,
 }
 
 /// The endpoints one operation has dialled, and the connect failures among them (M10 D14,
@@ -1312,6 +1361,12 @@ impl ConfigStore for GrpcClient {
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
         self.watch_tracked(request)
+            .await
+            .map(|tracked| Box::pin(tracked) as WatchStream)
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.watch_leader_tracked(request)
             .await
             .map(|tracked| Box::pin(tracked) as WatchStream)
     }
