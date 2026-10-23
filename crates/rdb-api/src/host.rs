@@ -920,9 +920,17 @@ pub(crate) fn spawn_on(
     host.boot = boot;
     host.budgets = budgets;
     host.transaction = Transaction::with_limits(limits);
+    // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
+    // reads its own nodes' lines from its own file rather than the shared untagged one.
+    #[cfg(test)]
+    let span = tracing::Span::current();
     let join = std::thread::Builder::new()
         .name(format!("rdb-node-{}", node.0))
-        .spawn(move || host.run(&rx))
+        .spawn(move || {
+            #[cfg(test)]
+            let _span = span.enter();
+            host.run(&rx);
+        })
         .map_err(|e| format!("node {}: spawn: {e}", node.0))?;
     Ok(NodeHandle {
         node,
@@ -976,6 +984,21 @@ pub(crate) fn set_after_commit(dir: &std::path::Path, what: Option<AfterCommit>)
     if let Some(what) = what {
         hooks.push((dir.to_path_buf(), what));
     }
+}
+
+/// Test-only: node directories whose host sleeps once, for the time given, before it answers
+/// its next inventory ask, so F1's discovery window closes without it (A-R185, answer-first).
+#[cfg(test)]
+static PAUSE_BEFORE_INVENTORY: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+/// Test-only: the host on the copy at `node_dir` sleeps `pause` before it answers its next
+/// inventory ask, once.
+#[cfg(test)]
+pub(crate) fn pause_before_inventory(node_dir: &std::path::Path, pause: Duration) {
+    PAUSE_BEFORE_INVENTORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), pause));
 }
 
 fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
@@ -1243,6 +1266,8 @@ struct Host {
     /// Partitions whose dormant receiver holds its full ladder (A-R173, critic-d7 F2): built
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
+    /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
+    land_linked: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
     /// The instance this node's engine is bound to when it started, whose open counter holds
     /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
@@ -1338,6 +1363,7 @@ impl Host {
             deferred_syncs: BTreeMap::new(),
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
+            land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
             instance: engine_instance,
             activation: BTreeMap::new(),
@@ -3105,7 +3131,9 @@ impl Host {
     fn stall_effect(&self, partition: PartitionId, mode: &PartitionMode) -> String {
         match mode {
             PartitionMode::DegradedRf2 if self.admits(partition) == Some(false) => {
-                format!("stays {mode:?}, and its writes stay paused until the absent copy returns")
+                format!(
+                    "stays {mode:?}, and its writes stay paused until the database is opened again"
+                )
             }
             _ => format!("stays {mode:?} and does not activate"),
         }
@@ -3133,6 +3161,14 @@ impl Host {
         if first && barrier {
             self.inherit(partition, &result)?;
         }
+        // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
+        // generation now, before `Recovered` re-anchors its receiver, so it never carries an
+        // unlinked generation into the next open.
+        let caught_up = if first && !barrier {
+            self.land_link(partition, &result)
+        } else {
+            None
+        };
         if first {
             self.stamp_retirement(partition, result.new_generation);
         }
@@ -3146,7 +3182,158 @@ impl Host {
             true,
             None,
         );
+        // Then it reports itself caught up at the cutoff to the F1 that committed, in B-R59's
+        // shape; F1's `Committed` arm pins it and syncs it like any required copy.
+        if let Some(event) = caught_up {
+            let msg = Msg::Routed {
+                partition,
+                correlation: site.correlation,
+                kind: KernelEvent::Recovery(event),
+            };
+            if let Err(fault) = self.links.send(self.node, emitter, msg) {
+                tracing::warn!(
+                    node = self.node.0,
+                    emitter = emitter.0,
+                    ?fault,
+                    "peer_answer_unreachable"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Ruling A-R185 (critic-d7fix (c), C2, C3, C6): this copy landed `result` outside its
+    /// barrier, so it does not hold the new generation. When it holds its newest older
+    /// generation exactly through the cutoff, with the cutoff digest there, it links the new
+    /// generation onto it at the cutoff with [`Self::inherit_missed_link`]'s guards, and answers
+    /// the `CopyCaughtUp` to send: caught up at the cutoff, nothing to copy. Otherwise it writes
+    /// nothing, sends nothing and logs `land_link_refused{reason}`; the partition's writes then
+    /// stay paused until the database is opened again. Called once per (partition, generation):
+    /// `landed` dedups the landing.
+    fn land_link(
+        &mut self,
+        partition: PartitionId,
+        result: &RecoveryResult,
+    ) -> Option<RecoveryEvent> {
+        let generation = result.new_generation;
+        let cutoff = result.selected.cutoff_seq;
+        let digest = result.selected.cutoff_digest;
+        let node = self.node.0;
+        let refused = |reason: &str| {
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                generation = generation.0,
+                cutoff = cutoff.0,
+                reason,
+                "land_link_refused"
+            );
+            None
+        };
+        let Some(copy) = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == self.node)
+            .map(|member| member.copy)
+        else {
+            return refused("not_a_member");
+        };
+        if self
+            .engine
+            .lineages()
+            .iter()
+            .any(|(p, g)| *p == partition && *g >= generation)
+        {
+            return refused("held_at_or_above_generation");
+        }
+        // R1 builds a copy outside the barrier a receiver at the root, which only a catch-up
+        // fills; linked here, the copy holds the cutoff, so it gets a receiver at the cutoff, as a
+        // barrier copy gets (`proved_head`; ruling A-R185a).
+        let lineage = Lineage {
+            partition: result.committed.pinned_config.partition,
+            generation,
+            owner_epoch: result.committed.authority_view.lineage.owner_epoch,
+        };
+        let anchor = LineageAnchor {
+            lineage: result.selected.root,
+            base_seq: cutoff,
+            base_digest: digest,
+        };
+        match self.inherit_missed_link(partition, anchor) {
+            Ok(from) => {
+                self.land_linked.insert((partition, generation));
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    from = from.0,
+                    to = generation.0,
+                    base = cutoff.0,
+                    "land_link_inherited"
+                );
+                // No frame of the new generation reaches R1 before `Recovered` (pushed after
+                // this), so the receiver installed here sees nothing before it re-anchors.
+                let held = self.replication.receiver(self.node, partition);
+                if let Some(kept) = held.filter(|held| !held.is_dormant()) {
+                    // A live receiver re-anchors itself on `Recovered` from its own ladder, and a
+                    // quarantined one must stay quarantined: neither is replaced. A live one
+                    // still at the root is kept too; that needs two commits in one boot, which
+                    // slice 1 never has (critic-d7fix follow-up A2).
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        generation = generation.0,
+                        kept_generation = kept.lineage().generation.0,
+                        quarantined = kept.quarantine().is_some(),
+                        "land_receiver_kept"
+                    );
+                } else {
+                    // Claims nothing durable, as a dormant receiver does: F1's sync proves the
+                    // cutoff, and the next flush raises it (critic-d7fix follow-up A1).
+                    let durable = 0;
+                    let receiver = AppendReceiver::new(ReceiverInit {
+                        config: result.committed.pinned_config.clone(),
+                        own: copy,
+                        lineage,
+                        head: Head {
+                            seq: cutoff,
+                            digest,
+                        },
+                        durable: DurableSeq(durable),
+                    });
+                    match receiver {
+                        Ok(receiver) => {
+                            self.replication.install_receiver(receiver);
+                            tracing::info!(
+                                node,
+                                partition = partition.0,
+                                generation = generation.0,
+                                head = cutoff.0,
+                                durable,
+                                "land_receiver_installed"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                node,
+                                partition = partition.0,
+                                generation = generation.0,
+                                ?error,
+                                "land_link_receiver_refused"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(RecoveryEvent::CopyCaughtUp {
+                    copy,
+                    head: cutoff,
+                    digest,
+                })
+            }
+            Err(reason) => refused(reason.trim_start_matches("missed_generation_")),
+        }
     }
 
     /// D7: `generation` just landed, so the sync deferred for it is answered now, and one
@@ -3304,7 +3491,8 @@ impl Host {
             retry: rdb_core::RetryRule::BoundedJitter,
             no_mutation: true,
             detail: format!(
-                "generation {} of partition {} on node {} is not yet marked activated in the                  open counter; nothing was sent",
+                "generation {} of partition {} on node {} is not yet marked activated in the \
+                 open counter; nothing was sent",
                 generation.0, partition.0, self.node.0
             ),
             retry_after: None,
@@ -4062,6 +4250,26 @@ impl Host {
         correlation: CorrelationId,
         ask: &PeerAsk,
     ) {
+        #[cfg(test)]
+        if let PeerAsk::Inventory { .. } = ask {
+            let pause = {
+                let mut pauses = PAUSE_BEFORE_INVENTORY
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = pauses
+                    .iter()
+                    .position(|(dir, _)| self.engine.path().starts_with(dir));
+                at.map(|at| pauses.remove(at).1)
+            };
+            if let Some(pause) = pause {
+                tracing::info!(
+                    node = self.node.0,
+                    millis = pause.as_millis(),
+                    "test_inventory_paused"
+                );
+                std::thread::sleep(pause);
+            }
+        }
         if let PeerAsk::Sync {
             copy,
             generation,
@@ -4147,6 +4355,24 @@ impl Host {
                     );
                     RecoveryEvent::InventoryReported(Box::new(inventory))
                 }
+                // C4 (A-R185): an ask that arrives after this copy linked a newer generation at
+                // its landing is late, not a failure of the copy.
+                Err("copy_ahead_of_anchor")
+                    if self
+                        .land_linked
+                        .iter()
+                        .any(|(p, g)| *p == partition && *g > anchor.lineage.generation) =>
+                {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        "inventory_late"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
                 Err(reason) => {
                     tracing::error!(
                         node = self.node.0,
@@ -4214,7 +4440,15 @@ impl Host {
             return Err("copy_ahead_of_anchor");
         }
         if !lineages.contains(&(partition, generation)) {
-            self.inherit_missed_link(partition, anchor)?;
+            let from = self.inherit_missed_link(partition, anchor)?;
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = generation.0,
+                base = anchor.base_seq.0,
+                "inventory_link_inherited"
+            );
         }
         let link = self
             .engine
@@ -4266,7 +4500,7 @@ impl Host {
         &mut self,
         partition: PartitionId,
         anchor: LineageAnchor,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Generation, &'static str> {
         let to = anchor.lineage.generation;
         let base = anchor.base_seq;
         let from = self
@@ -4299,17 +4533,7 @@ impl Host {
         match self.engine.inherit(partition, from, to, base) {
             // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
             // generation is held, so `survivor` never calls here. Kept as success (A-R179).
-            Ok(Inherited::Linked | Inherited::AlreadyInherited) => {
-                tracing::info!(
-                    node = self.node.0,
-                    partition = partition.0,
-                    from = from.0,
-                    to = to.0,
-                    base = base.0,
-                    "inventory_link_inherited"
-                );
-                Ok(())
-            }
+            Ok(Inherited::Linked | Inherited::AlreadyInherited) => Ok(from),
             Ok(Inherited::Copied { .. }) => Err("missed_generation_copied"),
             Err(_) => Err("missed_generation_link_refused"),
         }
@@ -6605,8 +6829,8 @@ mod tests {
             "recovery_rebuild_stalled partition=1 gen=1 mode=DegradedRf2 cutoff=0 \
              required=[0, 1, 2] unproven=[",
             "2] phase=Rebuilding: F1 pinned its rebuild, but these copies have not proved it, so \
-             the partition stays DegradedRf2, and its writes stay paused until the absent copy \
-             returns",
+             the partition stays DegradedRf2, and its writes stay paused until the database is \
+             opened again",
         ] {
             assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
         }
@@ -6627,7 +6851,7 @@ mod tests {
         assert!(
             never.ends_with(
                 "F1 never pinned its rebuild, so the partition stays DegradedRf2, and its writes \
-                 stay paused until the absent copy returns"
+                 stay paused until the database is opened again"
             ),
             "{never}"
         );
@@ -7196,6 +7420,119 @@ mod tests {
                 base: Seq(2),
                 copied: false,
             })
+        );
+    }
+
+    /// A commit into generation 2 at `(cutoff, digest)`, as node 2 hears it: a trio's
+    /// bootstrap commit, moved on a generation. Its pin names node 2 a secondary.
+    fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.until("node 1 committed", |trio| {
+            trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+        });
+        let mut result = (*trio.nodes[0].0.committed[&PartitionId(1)]).clone();
+        result.new_generation = Generation(2);
+        result.selected.root.generation = Generation(2);
+        result.selected.cutoff_seq = Seq(cutoff);
+        result.selected.cutoff_digest = digest;
+        result.retained_status_map.predecessor_generation = Generation(1);
+        result
+    }
+
+    /// Ruling A-R185 (critic-d7fix (c)): a copy that lands a commit outside its barrier while it
+    /// holds its older generation exactly through the cutoff, with the cutoff digest there,
+    /// links the new generation at the cutoff, gets the receiver a barrier copy gets (A-R185a),
+    /// and answers the `CopyCaughtUp` that `land` sends to F1. Cut: the receiver install is
+    /// dropped, and R1 holds none. Unit, about 2.5 s (the trio's bootstrap window).
+    #[config_log::retcd_test]
+    fn a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_up() {
+        const METHOD: &str =
+            "a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_up";
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        let result = landing_at(2, digests[1]);
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let copy = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(2))
+            .expect("node 2 is pinned")
+            .copy;
+        assert_eq!(
+            host.land_link(PartitionId(1), &result),
+            Some(RecoveryEvent::CopyCaughtUp {
+                copy,
+                head: Seq(2),
+                digest: digests[1],
+            })
+        );
+        assert_eq!(
+            host.engine.link(PartitionId(1), Generation(2)),
+            Some(rdb_storage::Link {
+                parent: Generation(1),
+                base: Seq(2),
+                copied: false,
+            })
+        );
+        let receiver = host
+            .replication
+            .receiver(NodeId(2), PartitionId(1))
+            .expect("a receiver at the cutoff");
+        assert_eq!(
+            (receiver.lineage().generation, receiver.applied_head().seq),
+            (Generation(2), Seq(2))
+        );
+        assert_eq!(logged!(METHOD, "land_link_inherited").len(), 1);
+        assert_eq!(logged!(METHOD, "land_receiver_installed").len(), 1);
+    }
+
+    /// Ruling A-R185 rows 3 and 4 (critic-d7fix C2): a copy holding past the cutoff (data an
+    /// ask must not truncate), or holding a different digest at it, links nothing, installs no
+    /// receiver, answers nothing to send, and logs `land_link_refused` with the reason; the
+    /// host does not fault. Unit, about 2.5 s.
+    #[config_log::retcd_test]
+    fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links_nothing() {
+        const METHOD: &str =
+            "a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links_nothing";
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            3,
+        );
+        let past = landing_at(2, digests[1]);
+        let mut off = past.clone();
+        off.selected.cutoff_seq = Seq(3);
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let held = host.engine.lineages();
+        for result in [&past, &off] {
+            assert_eq!(host.land_link(PartitionId(1), result), None);
+            assert_eq!(host.engine.lineages(), held, "nothing linked");
+            assert!(host
+                .replication
+                .receiver(NodeId(2), PartitionId(1))
+                .is_none());
+            assert_eq!(host.fault, None);
+        }
+        let reasons: Vec<_> = logged!(METHOD, "land_link_refused")
+            .into_iter()
+            .map(|line| line["reason"].clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["held_past_base", "base_digest_differs"].map(serde_json::Value::from)
         );
     }
 
@@ -11224,6 +11561,16 @@ mod tests {
             trio.status(0)
         );
         assert_eq!(trio.status(0).admits, Some(false), "{:?}", trio.status(0));
+        // review-r184 A1: the refusal reads as one sentence, no run of spaces from a wrap.
+        let refusal = trio.nodes[0]
+            .0
+            .unactivated(PartitionId(1))
+            .expect("the refusal");
+        assert_eq!(
+            refusal.detail,
+            "generation 1 of partition 1 on node 1 is not yet marked activated in the open \
+             counter; nothing was sent"
+        );
         let head = trio.head();
         assert_eq!(
             trio.write(compile_change(2, b"s", add(2), None)),

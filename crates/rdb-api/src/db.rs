@@ -5482,6 +5482,386 @@ mod tests {
         db.shutdown();
     }
 
+    // ---- A-R185: a copy outside the barrier links the new generation at its landing ----
+
+    /// Open `dir` on `store` with [`fast`] budgets and the peer links in `hold` held.
+    fn open_held(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+        hold: Vec<(NodeId, NodeId)>,
+    ) -> Db {
+        rt.block_on(Db::open_with(
+            DbConfig {
+                hold,
+                ..config(dir)
+            },
+            Arc::clone(store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("open")
+    }
+
+    /// The first two opens of the D7 shape: a=1 lands on every copy, then a reopen with node
+    /// 2's links held commits generation 2 on nodes 1 and 3 alone and holds a grant, so the
+    /// next open heals case A. Node 2 lands generation 2 from the control watch and links it at
+    /// the cutoff (A-R185), but its `CopyCaughtUp` waits on the held link and is lost at the
+    /// shutdown, so generation 2 never activates.
+    fn d7_node_2_behind(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+    ) {
+        let mut db = open_held(rt, dir, store, Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+        let mut db = open_held(
+            rt,
+            dir,
+            store,
+            vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))],
+        );
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let owner = db.node_status().into_iter().next().expect("node 1");
+            if owner.recovered == Some(Generation(2)) && owner.authority.starts_with("held(") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation 2 never committed and held: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+    }
+
+    /// Generation 3 is committed fully protected (F1 `Committed`, the mode `Active`), not a
+    /// generation 4, with nothing stalled; node 1 admits within patience; a=1 reads back; b=2
+    /// lands; and every copy then holds the same applied seq, durable. No fault, no failed heal.
+    fn d7_active_at_3(db: &Db, case: &str) {
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            if let HealState::Failed(error) = db.heal_state() {
+                panic!("{case}: the heal failed: {error}");
+            }
+            let nodes = db.node_status();
+            for node in &nodes {
+                assert_eq!(node.fault, None, "{case}: node {} faulted", node.node.0);
+            }
+            let owner = nodes.first().expect("node 1");
+            if owner.recovery.as_deref() == Some("Committed")
+                && owner.recovered == Some(Generation(3))
+                && owner.admits == Some(true)
+            {
+                assert_eq!(owner.stalled, None, "{case}: {owner:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: generation 3 is not mode Active and admitting within {patience:?}: \
+                 {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(
+            read.value.map(|(_, bytes)| bytes),
+            Some(Bytes::from_static(b"1")),
+            "{case}: a=1 reads back"
+        );
+        let put = db.put(b"b", b"2", None).expect("put b=2");
+        loop {
+            let holds: Vec<_> = db
+                .node_status()
+                .into_iter()
+                .map(|node| node.holds.map(|h| (h.generation, h.applied, h.durable)))
+                .collect();
+            if holds.len() == 3
+                && holds
+                    .iter()
+                    .all(|h| *h == Some((Generation(3), put.seq.0, put.seq.0)))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: not every copy holds b=2 durably at generation 3: {holds:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Node 2's lines, in order, among `inventory_reported` for generation 2, its first
+    /// `recovered_landed` for generation 3, and `land_link_inherited` to generation 3.
+    fn node_2_landing(method: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["node"] == 2)
+            .filter(|line| {
+                (line["@m"] == "inventory_reported" && line["generation"] == 2)
+                    || (line["@m"] == "recovered_landed"
+                        && line["generation"] == 3
+                        && line["first"] == true)
+                    || (line["@m"] == "land_link_inherited" && line["to"] == 3)
+            })
+            .collect()
+    }
+
+    /// Critic-d7fix follow-up M1: F1 logged generation 3 `recovered mode=Active`, and once F1
+    /// pinned node 2 (its post-commit `sync_proven` for generation 3) node 1 never logged node 2
+    /// as not advancing: the receiver installed at the landing took the appends.
+    fn node_2_followed_after_the_pin(method: &str) {
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+        assert!(
+            lines.iter().any(|line| line["@m"] == "recovered"
+                && line["generation"] == 3
+                && line["mode"] == "Active"),
+            "F1 activated generation 3"
+        );
+        let pinned = lines
+            .iter()
+            .position(|line| {
+                line["@m"] == "sync_proven"
+                    && line["node"] == 2
+                    && line["generation"] == 3
+                    && line["post_commit"] == true
+            })
+            .expect("F1 pinned node 2 and it proved the cutoff");
+        let stuck: Vec<_> = lines[pinned..]
+            .iter()
+            .filter(|line| line["@m"] == "replication_copy_not_advancing" && line["copy_node"] == 2)
+            .collect();
+        assert!(stuck.is_empty(), "node 2 follows after the pin: {stuck:?}");
+    }
+
+    /// Ruling A-R185 row 1 (critic-d7fix (c), answer-first): node 2 answers the third open's
+    /// inventory ask only after F1's discovery window closed (its thread sleeps past it), so
+    /// generation 3 commits without it, `DegradedRf2`. Its mailbox is FIFO, so it answers the ask
+    /// first, linking generation 2 (A-R177), then lands generation 3 outside the barrier and
+    /// links it at the cutoff, and reports `CopyCaughtUp`; F1 pins it, syncs every copy and
+    /// activates. Cut: the `CopyCaughtUp` send is dropped, and generation 3 never goes Active.
+    /// Integration (~12 s): three opens, a 4 s pause.
+    #[config_log::retcd_test]
+    fn m10_d7_a_copy_that_answers_after_the_window_links_at_landing_and_the_reopen_is_active() {
+        const METHOD: &str =
+            "m10_d7_a_copy_that_answers_after_the_window_links_at_landing_and_the_reopen_is_active";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        d7_node_2_behind(&rt, dir.path(), &store);
+
+        let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+        crate::host::pause_before_inventory(
+            &dir.path().join("nodes").join("2"),
+            Duration::from_millis(2 * window),
+        );
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        d7_active_at_3(&db, "answer-first");
+        db.shutdown();
+        node_2_followed_after_the_pin(METHOD);
+
+        let order: Vec<_> = node_2_landing(METHOD)
+            .iter()
+            .map(|line| {
+                let mut said = line["@m"].as_str().unwrap_or_default().to_owned();
+                if said == "recovered_landed" {
+                    said = format!("{said} in_barrier={}", line["in_barrier"]);
+                }
+                if said == "land_link_inherited" {
+                    said = format!("{said} {}->{}", line["from"], line["to"]);
+                }
+                said
+            })
+            .collect();
+        assert_eq!(
+            order.first().map(String::as_str),
+            Some("inventory_reported"),
+            "{order:?}"
+        );
+        assert_eq!(
+            order[1..],
+            [
+                "recovered_landed in_barrier=false".to_owned(),
+                "land_link_inherited 2->3".to_owned()
+            ],
+            "node 2 answers late, then lands outside the barrier and links: {order:?}"
+        );
+    }
+
+    /// Ruling A-R185 row 2 (critic-d7fix (c), land-first): the third open holds link 1-2, so
+    /// node 2 never hears the inventory ask, and lands generation 3 from the control watch
+    /// outside the barrier. It holds generation 2 through the cutoff exactly (linked at its
+    /// landing in the reopen before), so it links generation 3 onto generation 2 there. Its
+    /// `CopyCaughtUp` is buffered until the heal; then F1 pins it and activates, and the late
+    /// ask is logged `inventory_late`, not `inventory_failed`. Cut: as row 1.
+    /// Integration (~12 s): three opens, a held link.
+    #[config_log::retcd_test]
+    fn m10_d7_a_copy_that_lands_before_it_is_asked_links_at_landing_and_the_reopen_is_active() {
+        const METHOD: &str =
+            "m10_d7_a_copy_that_lands_before_it_is_asked_links_at_landing_and_the_reopen_is_active";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        d7_node_2_behind(&rt, dir.path(), &store);
+
+        let mut db = open_held(&rt, dir.path(), &store, vec![(NodeId(1), NodeId(2))]);
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let landed = node_2_landing(METHOD)
+                .iter()
+                .any(|line| line["@m"] == "recovered_landed" && line["in_barrier"] == false);
+            if landed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 never landed generation 3 outside the barrier"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        db.links().heal(NodeId(1), NodeId(2));
+        d7_active_at_3(&db, "land-first");
+        db.shutdown();
+        node_2_followed_after_the_pin(METHOD);
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let linked: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "land_link_inherited")
+            .map(|line| {
+                (
+                    line["node"].clone(),
+                    line["from"].clone(),
+                    line["to"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            [
+                (2.into(), 1.into(), 2.into()),
+                (2.into(), 2.into(), 3.into())
+            ],
+            "node 2 links once per landing outside the barrier: 1->2, then 2->3"
+        );
+        let failed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "inventory_failed")
+            .collect();
+        assert!(failed.is_empty(), "a late ask is not a failure: {failed:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["@m"] == "inventory_late" && line["node"] == 2),
+            "the ask held by the link reaches node 2 after the heal and is logged late"
+        );
+    }
+
+    /// Ruling A-R185 row 7 (the tester's o1-o4 walk, the variant seen at 0cab613): the third
+    /// open holds link 1-2, so node 2 lands generation 3 outside the barrier and links it; while
+    /// its `CopyCaughtUp` waits on the held link, node 1's grant renewals are dropped until the
+    /// grant expires (`fenced(Expired)`), and then node 1 acquires a new grant. After the heal
+    /// generation 3 activates and is writable; a fourth open is writable too, with no missed
+    /// link to make (`inventory_link_inherited`) and nothing stalled. Cut: as row 1.
+    /// Integration (~20 s): four opens, a held link, an expired grant.
+    #[config_log::retcd_test]
+    fn m10_d7_a_grant_that_expires_while_a_copy_waits_on_its_link_still_activates_and_reopens() {
+        const METHOD: &str =
+            "m10_d7_a_grant_that_expires_while_a_copy_waits_on_its_link_still_activates_and_reopens";
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        d7_node_2_behind(&rt, dir.path(), &store);
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let until = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| {
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                let owner = db.node_status().into_iter().next().expect("node 1");
+                if done(&owner) {
+                    return owner;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: not within {patience:?}: {owner:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let mut db = open_held(&rt, dir.path(), &store, vec![(NodeId(1), NodeId(2))]);
+        let deadline = std::time::Instant::now() + patience;
+        while !node_2_landing(METHOD)
+            .iter()
+            .any(|line| line["@m"] == "land_link_inherited")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 never linked generation 3 at its landing"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let held = until(&db, "node 1 holds a grant under generation 3", &|owner| {
+            owner.recovered == Some(Generation(3)) && owner.authority.starts_with("held(")
+        });
+        scripted.rescript(Script {
+            only_prefix: Some(ControlKey::Grant(OWNER).encode().into_bytes()),
+            drop_puts: u32::MAX,
+            ..Script::default()
+        });
+        until(&db, "the grant expires", &|owner| {
+            owner.fence == Some(rdb_core::contracts::authority::DenyReason::Expired)
+        });
+        scripted.rescript(Script::default());
+        until(&db, "node 1 acquires a new grant", &|owner| {
+            owner.authority.starts_with("held(") && owner.authority != held.authority
+        });
+        db.links().heal(NodeId(1), NodeId(2));
+        d7_active_at_3(&db, "after the grant came back and the heal");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        let fourth = until(&db, "the fourth open admits", &|owner| {
+            owner.admits == Some(true)
+        });
+        assert_eq!(fourth.stalled, None, "{fourth:?}");
+        for (key, value) in [(&b"a"[..], &b"1"[..]), (b"b", b"2")] {
+            let read = db.get(key).expect("get");
+            assert_eq!(
+                read.value.map(|(_, bytes)| bytes),
+                Some(Bytes::copy_from_slice(value)),
+                "the fourth open reads back every acknowledged write"
+            );
+        }
+        db.put(b"c", b"3", None)
+            .expect("the fourth open is writable");
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let fourth_open = lines
+            .iter()
+            .rposition(|line| line["@m"] == "db_open")
+            .expect("the fourth open");
+        let missed: Vec<_> = lines[fourth_open..]
+            .iter()
+            .filter(|line| {
+                line["@m"] == "inventory_link_inherited" || line["@m"] == "recovery_rebuild_stalled"
+            })
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "no missed link, nothing stalled: {missed:?}"
+        );
+    }
+
     /// A-R177 row 9 (critic-f5 residual): a copy below the base in its own generation. Node 2
     /// misses `b` while 1-2 is held, so it stops at seq 1 of generation 1 while nodes 1 and 3
     /// hold 2; the next reopen runs without node 2 and commits generation 2 at base 2. The
