@@ -1394,7 +1394,7 @@ fn repl<'scope, 'env>(
                     Ok(secs) => {
                         let within = Duration::from_secs(secs);
                         let waited = if *what == "ready" {
-                            wait_ready_line(within, |within| db.wait_ready(within))
+                            wait_ready_line(progress, within, |within| db.wait_ready(within))
                         } else {
                             wait_recovered(progress, within, || db.heal_state())
                         };
@@ -3617,8 +3617,10 @@ fn wait_recovered(
 /// `wait ready`: the line it ends with, from `Db::wait_ready`, which answers the present rather
 /// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
 /// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
-/// gives the next step). The run then exits 1. A timeout is said, and is not an error.
+/// gives the next step). The run then exits 1. A timeout is said, and is not an error. A wait
+/// that reached ready records that as printed, so the poller does not say it a second time.
 fn wait_ready_line(
+    progress: &Progress,
     within: Duration,
     wait: impl FnOnce(Duration) -> Result<(), rdb_api::db::ReadyError>,
 ) -> Result<String, String> {
@@ -3627,7 +3629,17 @@ fn wait_ready_line(
     let answer = wait(within);
     let millis = started.elapsed().as_millis();
     let (outcome, line) = match &answer {
-        Ok(()) => ("reached", Ok(format!("reached ready in {millis}ms"))),
+        Ok(()) => {
+            // Said here, so the poller does not say it again (k237): `ready` with no reason is
+            // now what was printed. A later change, or a reason, is still the poller's to say.
+            let mut seen = progress
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.ready = true;
+            seen.reason = None;
+            ("reached", Ok(format!("reached ready in {millis}ms")))
+        }
         Err(e @ ReadyError::TimedOut { .. }) => (
             "timed_out",
             Ok(format!(
@@ -5471,7 +5483,7 @@ mod tests {
             started.elapsed()
         );
         // `wait ready` asks Db::wait_ready, which ends at once on a failed heal itself.
-        let ready = wait_ready_line(Duration::from_secs(2), |_| {
+        let ready = wait_ready_line(&progress, Duration::from_secs(2), |_| {
             Err(ReadyError::Heal(admin::HealError::NodeStopped))
         })
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
@@ -5576,5 +5588,24 @@ mod tests {
             "{said}"
         );
         assert_eq!(code, ExitCode::from(1), "a stopped wait exits 1");
+    }
+
+    /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
+    /// second bare `ready` line inside the next command's output. One transition is said once:
+    /// a wait that reached ready records it as printed, so the poller says nothing more until
+    /// the state changes again. Unit.
+    #[test]
+    fn a_reached_wait_ready_is_not_said_again_by_the_poller() {
+        let progress = Progress::default();
+        let line = wait_ready_line(&progress, Duration::from_secs(1), |_| Ok(()))
+            .expect("ready is not an error");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        let mut seen = progress.seen();
+        assert_eq!(step_line(&mut seen, true, None), None, "said once");
+        assert_eq!(
+            step_line(&mut seen, false, None).as_deref(),
+            Some("not ready: writes not admitted"),
+            "a later change is still said"
+        );
     }
 }
