@@ -4864,19 +4864,20 @@ mod tests {
 
     /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a
     /// row, and a folder that was opened and closed empty reopens empty. Each reopen heals
-    /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again.
+    /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again. D3
+    /// (k141): an app that reopens and only reads, four times running, still becomes ready.
     /// Integration (~30 s today): four reopens, each waiting out the last run's grant on
     /// wall-clock time and a full discovery window. Re-timed after the A-R165 timers land.
     #[config_log::retcd_test]
     fn m10_s1_1_a_reopen_reads_back_every_acknowledged_write() {
         let rt = runtime();
         let patience = crate::host::test_patience(Duration::from_secs(30));
-        for (case, writes) in [
-            ("empty", &[][..]),
-            (
-                "written",
-                &[(&b"a"[..], &b"hello"[..]), (b"b", b"world")][..],
-            ),
+        let written: &[(&[u8], &[u8])] = &[(b"a", b"hello"), (b"b", b"world")];
+        // (case, writes, reopens, whether each reopen writes before it closes)
+        for (case, writes, reopens, writes_again) in [
+            ("empty", &[][..], 2, true),
+            ("written", written, 2, true),
+            ("read-only reopens", written, 4, false),
         ] {
             let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
             let dir = config_testkit::fs::temp_dir();
@@ -4897,7 +4898,7 @@ mod tests {
             db.shutdown();
             drop(db);
 
-            for round in 1..=2 {
+            for round in 1..=reopens {
                 let mut db = open().unwrap_or_else(|e| panic!("{case}: reopen {round}: {e}"));
                 db.wait_ready(patience)
                     .unwrap_or_else(|e| panic!("{case}: reopen {round} ready: {e}"));
@@ -4921,8 +4922,10 @@ mod tests {
                         "{case}: reopen {round} of an empty folder is empty"
                     );
                 }
-                db.put(b"after", b"x", None)
-                    .unwrap_or_else(|e| panic!("{case}: reopen {round} takes writes: {e}"));
+                if writes_again {
+                    db.put(b"after", b"x", None)
+                        .unwrap_or_else(|e| panic!("{case}: reopen {round} takes writes: {e}"));
+                }
                 db.shutdown();
             }
         }
