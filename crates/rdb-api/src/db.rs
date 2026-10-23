@@ -426,6 +426,19 @@ struct Opened {
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
     /// (A-R200). Every refusal reads this instead of asking node 1 again.
     stuck: Mutex<Option<ReadyError>>,
+    /// The control store and runtime this open runs on, for [`Db::promote`]. `None` in a `Db`
+    /// a crate test builds by hand.
+    control: Option<PromoteStore>,
+}
+
+/// The control store and runtime [`Db::promote`] runs on.
+#[derive(Clone)]
+struct PromoteStore(Arc<dyn ConfigStore>, Handle);
+
+impl std::fmt::Debug for PromoteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromoteStore").finish_non_exhaustive()
+    }
 }
 
 impl Default for Opened {
@@ -435,6 +448,7 @@ impl Default for Opened {
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
             stuck: Mutex::new(None),
+            control: None,
         }
     }
 }
@@ -968,6 +982,7 @@ impl Db {
             unwind,
             opened: Opened {
                 base_boot: boot,
+                control: Some(PromoteStore(Arc::clone(&store), rt.clone())),
                 ..Opened::default()
             },
             route: Route {
@@ -2298,6 +2313,103 @@ impl Db {
             lock(&db.nodes).push(handle);
         }
         Ok(db)
+    }
+
+    /// Make `to` the owner of partition 1 while its owner is dead or cut off (`admin promote`,
+    /// arch-s2, A-R256). The new configuration keeps two members: every member but `drop`,
+    /// which defaults to the prior owner. The prior owner's grant is frozen first and the
+    /// promote waits its expiry out, so it takes up to the grant's length plus the clock bound
+    /// and ten seconds; [`admin::promote`] says each step. Returns once `partitions/1` names
+    /// `to` at a newer generation; this `Db`'s calls go to `to` from then on.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing changed: `to` or `drop` holds no copy, `to` is a shadow, owns
+    /// the partition already, or is `drop`; or this `Db` was built without budgets or a store.
+    /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
+    /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
+    /// it again picks up where it stopped.
+    pub fn promote(&self, to: NodeId, drop: Option<NodeId>) -> Result<admin::Promoted, ApiError> {
+        let budgets = self.budgets().ok_or_else(|| {
+            ApiError::invalid("this Db was built without budgets, so it cannot promote")
+        })?;
+        let PromoteStore(store, rt) = self.opened.control.clone().ok_or_else(|| {
+            ApiError::invalid("this Db was built without a control store, so it cannot promote")
+        })?;
+        let (senders, boots): (
+            BTreeMap<NodeId, mpsc::Sender<Msg>>,
+            BTreeMap<NodeId, BootId>,
+        ) = {
+            let nodes = lock(&self.nodes);
+            (
+                nodes
+                    .iter()
+                    .map(|handle| (handle.node, handle.sender()))
+                    .collect(),
+                nodes
+                    .iter()
+                    .filter(|handle| !handle.start_failed)
+                    .map(|handle| (handle.node, handle.boot))
+                    .collect(),
+            )
+        };
+        let links = Arc::clone(&self.links);
+        let member_boot =
+            move |node: NodeId| boots.get(&node).copied().or_else(|| links.boot_of(node));
+        let links = Arc::clone(&self.links);
+        let send = move |node: NodeId, msg: Msg| match senders.get(&node) {
+            Some(sender) => sender.send(msg).map_err(|_| NodeStopped(node)),
+            None => links.post(node, msg).map_err(|_| NodeStopped(node)),
+        };
+        let within = heal_within(&budgets);
+        let ctx = admin::PromoteCtx {
+            store,
+            budgets,
+            clock: self.clock,
+            to,
+            drop,
+            within,
+            // S2 pins the rf3 members and has no shadow yet; a later slice reads the pinned
+            // configuration from the owner instead.
+            members: admin::members(),
+            member_boot: Arc::new(member_boot),
+            send: Arc::new(send),
+        };
+        let (done, answer) = mpsc::channel();
+        rt.spawn(async move {
+            // The caller may have given up; then nobody needs the answer.
+            let _ = done.send(admin::promote(ctx).await);
+        });
+        let promoted = match answer.recv_timeout(within + Duration::from_secs(5)) {
+            Ok(Ok(promoted)) => promoted,
+            Ok(Err(error)) => {
+                tracing::warn!(to = to.0, %error, "db_promote_failed");
+                return Err(error.into());
+            }
+            Err(_) => {
+                tracing::warn!(to = to.0, "db_promote_unanswered");
+                return Err(ApiError {
+                    kind: ErrorKind::Unavailable,
+                    retry: RetryRule::NotWired,
+                    no_mutation: false,
+                    detail: format!(
+                        "the promote of node {} did not answer in time; it may have written: \
+                         promote again",
+                        to.0
+                    ),
+                    retry_after: None,
+                });
+            }
+        };
+        self.route.owner.store(to.0, Ordering::Relaxed);
+        tracing::info!(
+            owner = to.0,
+            prior = promoted.prior_owner.0,
+            dropped = promoted.dropped.0,
+            generation = promoted.generation.0,
+            "db_promoted"
+        );
+        Ok(promoted)
     }
 
     /// Send `msg` to node 1. Crate tests only (the spike's heal).
@@ -5688,6 +5800,58 @@ mod tests {
         );
         drop(db);
         node_1.join().expect("the stub");
+    }
+
+    /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
+    /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
+    /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
+    /// it. Puts landing on node 2 wait for W6's `CopyAheadOnControl` arm (A-R254): until it merges, node 2's host faults on it.
+    /// Cut: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced.
+    /// Integration (~5 s: the promote waits node 1's grant out).
+    #[config_log::retcd_test]
+    fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        db.put(b"a", b"1", None).expect("before the promote");
+        let status = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let before = status(&db, OWNER)
+            .recovered
+            .expect("node 1 recovered at the open");
+
+        let promoted = db.promote(NodeId(2), None).expect("promote");
+        assert_eq!(
+            (promoted.owner, promoted.prior_owner, promoted.dropped),
+            (NodeId(2), OWNER, OWNER)
+        );
+        assert!(
+            promoted.generation > before,
+            "{promoted:?} after {before:?}"
+        );
+        assert_eq!(db.route.owner(), NodeId(2), "the Db's calls go to node 2");
+        let second = status(&db, NodeId(2));
+        assert_eq!(
+            (second.recovered, second.role),
+            (Some(promoted.generation), "primary"),
+            "{second:?}"
+        );
+
+        let first = status(&db, OWNER);
+        assert_eq!(
+            first.fence,
+            Some(rdb_core::contracts::authority::DenyReason::Frozen),
+            "{first:?}"
+        );
+        db.route.owner.store(OWNER.0, Ordering::Relaxed);
+        let old = db.put(b"c", b"3", None);
+        db.route.owner.store(2, Ordering::Relaxed);
+        assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
+        db.shutdown();
     }
 
     /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
