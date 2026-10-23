@@ -66,6 +66,25 @@ and the full-copy fallback (scope ruling 2026-10-02).
      (`inherit_lineage_conflict`); this copy holds less than `base` (`inherit_behind_cutoff`); a full
      copy that `History` cannot rebuild as of `base` (`inherit_history_missing`).
    - A crash mid full copy leaves keys in `g` and no lineage record. A re-run clears `g`'s prefix and copies again.
+   - **Amended 2026-10-22 (M10, lead ruling A-R177; critic-f5 C1–C5): a second caller, the
+     inventory.** Until now only landing called `inherit`, after F1 committed the root. A reopen's
+     inventory now calls it too, for a copy that missed a generation which wrote nothing: the copy's
+     newest held generation `Gs` is older than the anchor generation `G` that `partitions/1` names.
+     The anchor is committed history, read from the fenced record, so "only after rDB commits the
+     new root" still holds. These are checked in this order, and nothing is written unless all hold:
+     - no held generation is newer than `G`, and `Gs` is the newest held, below `G`;
+     - `applied(Gs)` equals the anchor's `base` exactly. A tail above `base` is uncertain data,
+       and an inventory does not truncate it;
+     - the verified digest at `base` equals the anchor's `base_digest` (`ROOT` at seq 0);
+     - the inherit links, never copies: the parent reads through fewer than `MAX_CHAIN_DEPTH`
+       levels. A full copy is multi-batch staging inside the discovery window, and a crash
+       mid-copy would leave a child that selection reads as unlinked.
+
+     Otherwise the inventory fails by name and writes nothing. It is the same atomic batch, with
+     the same side effects as landing. A repeat is the no-op success above, so an F1 retry or a
+     crash after the link answers normally. It is logged `inventory_link_inherited{from, to, base}`.
+     A copy **below** `base` in its own generation is not covered by this caller (critic-f5's
+     residual).
 9. **Spec sentence amended.** §7.2: "Revalidate at IO dispatch and isolate physical effects in an
    epoch/generation namespace." New reading: the namespace isolates **writes**; a read of `g` also sees
    older generations' keys at `base`. §4.1 is unchanged.
