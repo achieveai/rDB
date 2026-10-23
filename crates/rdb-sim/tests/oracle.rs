@@ -2604,6 +2604,56 @@ fn m7v_37_lag_resume_with_lag_above_250ms_inside_the_hold_violates() {
     );
 }
 
+/// A pause at barrier 40 in generation 2, after n3 made generation 1 durable at
+/// `prior_durable`; every pinned copy then makes generation 2 durable at `durable`.
+fn new_generation_cycle(case: &str, prior_durable: Seq, durable: Seq) -> Trace {
+    let pinned = |phase, age, since| {
+        protection(
+            phase,
+            age,
+            &[N1, N2, N3],
+            CONFIG_V1,
+            Seq(40),
+            Seq(40),
+            since,
+        )
+    };
+    let mut b = base(case)
+        .at(1_000)
+        .flush(N3, prior_durable)
+        .in_generation(Generation(2))
+        .at(2_000)
+        .push(pinned(ProtectionPhase::Paused, 1_800, None));
+    for node in [N1, N2, N3] {
+        b = b.flush(node, durable);
+    }
+    b.at(3_000)
+        .push(pinned(ProtectionPhase::Resuming, 240, Some(3_000)))
+        .at(8_000)
+        .push(pinned(ProtectionPhase::Healthy, 0, Some(3_000)))
+        .build()
+}
+
+#[retcd_test]
+fn m10_c7_lag_a_prior_generation_durable_past_the_barrier_is_not_an_overshoot() {
+    support::preamble();
+    // A-R185d. A late copy still holds the prior generation past the new one's cutoff
+    // (`m10_land_link`). That mark is a position in generation 1; the barrier is one in
+    // generation 2, where n3 is exactly at it.
+    proven(
+        &judge(&new_generation_cycle("m10-c7-a", Seq(41), Seq(40))),
+        Invariant::Lag,
+    );
+
+    // The comparison is by generation, not dropped: past the barrier in generation 2 still
+    // overshoots.
+    violated(
+        &judge(&new_generation_cycle("m10-c7-b", Seq(41), Seq(41))),
+        Invariant::Lag,
+        "resume_barrier_not_exact",
+    );
+}
+
 /// `trace` with its last `Healthy` line naming `lost` as the copies L1 holds lost.
 fn lost_at_resume(mut trace: Trace, lost: &[NodeId]) -> Trace {
     let healthy = trace

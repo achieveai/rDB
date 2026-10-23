@@ -818,7 +818,10 @@ fn written(replies: &[ReplyEffect]) -> Vec<(RequestId, Seq)> {
 }
 
 /// F1, step 2 (P > C): B and C hold 20 records and commit `DegradedRf2` at cutoff 20 while A is
-/// cut. A returns at t4000 and catches the new generation up one record per 100 ms round trip.
+/// cut. A holds 19: it lands outside the barrier below the cutoff, so it links nothing (A-R185
+/// C2), returns at t4000 and catches the new generation up one record per 100 ms round trip. A
+/// copy that held all 20 would link at the cutoff when it lands and copy nothing
+/// (`m10_land_link`), so it would never exercise the catch-up this row is about.
 const F1_HEAD: u64 = 20;
 const F1_BACK: u64 = 4_000;
 const F1_WRITES: [u64; 5] = [F1_BACK + 1_300, F1_BACK + 1_500, 9_000, 11_000, 14_000];
@@ -829,10 +832,10 @@ fn f1_slow_catch_up() -> RunPlan {
     let from_b: Vec<_> = plan
         .preloads
         .iter()
-        .filter(|(node, _)| *node == B_NODE)
+        .filter(|(node, batch)| *node == B_NODE && batch.seq.0 < F1_HEAD)
         .map(|(_, batch)| batch.clone())
         .collect();
-    let (_, _, generation, durable) = *plan
+    let (_, _, generation, _) = *plan
         .preload_durable
         .iter()
         .find(|(node, ..)| *node == B_NODE)
@@ -840,7 +843,7 @@ fn f1_slow_catch_up() -> RunPlan {
     plan.preloads
         .extend(from_b.into_iter().map(|batch| (A_NODE, batch)));
     plan.preload_durable
-        .push((A_NODE, PARTITION, generation, durable));
+        .push((A_NODE, PARTITION, generation, DurableSeq(F1_HEAD - 1)));
     for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
         plan.network_ops.push(NetworkOp::SetLink {
             a,
@@ -883,6 +886,10 @@ fn f1_slow_catch_up() -> RunPlan {
 /// catches up, and the catch-up's last ACK both pins the rebuild at the cutoff and first makes
 /// the copy heard. At cutoff 0 the start record bypasses `admit` and P = 1 > C = 0; that is
 /// `m9_f1_01`.
+///
+/// A-R185b: A holds 19 records, one below the cutoff, on purpose. A copy holding 20 links at
+/// landing and never catches up (`m10_land_link`), so this row would no longer test the pin.
+/// Do not restore 20.
 #[retcd_test]
 fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_for_it() {
     let (replies, trace, violations) = run_judged(&f1_slow_catch_up());

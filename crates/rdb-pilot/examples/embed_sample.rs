@@ -6,10 +6,22 @@
 // embed.md begin
 use rdb_api::{Db, DbConfig, Timeouts};
 use std::error::Error;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn main() -> Result<(), Box<dyn Error>> {
+// Print an error with `{}`, not `{:?}`: its text ends with the next step to take.
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

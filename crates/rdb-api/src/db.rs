@@ -553,6 +553,31 @@ pub enum ReadyError {
         /// [`Db::restart_note`].
         note: String,
     },
+    /// Node 1's recovery ended `Blocked` before it took writes. It does not try again in this
+    /// open (ruling F-a), so no wait helps (A-R196).
+    #[error(
+        "the open's recovery stopped before node 1 took writes ({reason}), and it does not try \
+         again in this open: shut this Db down and open the folder again"
+    )]
+    Blocked {
+        /// The block's reason, as node 1's recovery phase names it.
+        reason: String,
+    },
+    /// Node 1's recovery found copies whose histories diverged and quarantined them. That is
+    /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
+    /// wait nor a reopen helps (A-R196(2a)).
+    ///
+    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator removes the
+    /// diverged copies from membership and fences again. This build has no command for that, so
+    /// the text does not tell the reader to do it (A-R196(2b)); node 1's `recovery_fact` log
+    /// line names the copies.
+    #[error(
+        "the open's recovery found copies whose histories disagree, so node 1 takes no writes; \
+         the acknowledged data is kept. Opening the folder again will not help, and do not \
+         delete the folder: this build has no repair command yet (removing a copy from \
+         membership comes in a later build)"
+    )]
+    Quarantined,
 }
 
 /// The next step once node 1 has restarted: nothing it served comes back in this open
@@ -884,7 +909,18 @@ impl Db {
                 key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
             })
             .await
-            .map_err(|error| OpenError::Control(format!("get partitions/1: {error}")))?;
+            .map_err(|error| {
+                // Nothing was written, so opening again is safe; say so when the store was
+                // simply not reachable (M10 D14). `config-client` names each endpoint it tried.
+                let step = match error {
+                    config_core::ConfigError::Unavailable { .. } => {
+                        ". Check that rEtcd is running and reachable from this process, then \
+                         open again"
+                    }
+                    _ => "",
+                };
+                OpenError::Control(format!("get partitions/1: {error}{step}"))
+            })?;
         let root = read
             .record
             .as_ref()
@@ -1034,12 +1070,17 @@ impl Db {
 
     /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at
     /// node 1 itself each time, never at what an earlier look saw. Once node 1 has restarted,
-    /// or its restart failed, answers at once: it does not rejoin in this open (#42).
+    /// or its restart failed, answers at once: it does not rejoin in this open (#42). So does a
+    /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
+    /// one fence only (ruling F-a, A-R196). So does a quarantined one, which nothing in an open
+    /// leaves (A-R196(2a)).
     ///
     /// # Errors
     ///
-    /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, whose text says to shut
-    /// this `Db` down and open the folder again (A-R188).
+    /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, and
+    /// [`ReadyError::Blocked`] once its recovery is blocked, whose texts say to shut this `Db`
+    /// down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
+    /// recovery is quarantined, whose text says a reopen will not help (A-R196(2a), A-R196(2b)).
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from("unknown");
@@ -1056,6 +1097,19 @@ impl Db {
                     return Ok(());
                 }
                 phase = owner.recovery.unwrap_or_else(|| "none".to_owned());
+                if let Some(reason) = phase
+                    .strip_prefix("Blocked(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                {
+                    tracing::warn!(reason, "ready_blocked");
+                    return Err(ReadyError::Blocked {
+                        reason: reason.to_owned(),
+                    });
+                }
+                if phase == "Quarantined" {
+                    tracing::warn!("ready_quarantined");
+                    return Err(ReadyError::Quarantined);
+                }
             }
             if std::time::Instant::now() >= deadline {
                 return Err(ReadyError::TimedOut {
@@ -2735,6 +2789,27 @@ mod tests {
         }
     }
 
+    /// Wait until node 1 has published `seq` and holds nothing applied unpublished (D13).
+    ///
+    /// Not [`admits`]: that is L1 and A1 only, and stays true while T1 is still frozen on an
+    /// unpublished txn and refuses new writes `PROTECTION_PAUSED`. `Msg::Inspect` is answered
+    /// between drains, so once `published` shows `seq`, the publish's thaw has run too.
+    fn publishes(db: &Db, seq: Seq, phase: &str) {
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while !db.node_status().first().is_some_and(|node| {
+            node.published.map(|(_, at)| at) == Some(seq) && node.in_flight.is_none()
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase}: node 1 has not published {seq:?} with nothing in flight within \
+                 {patience:?}: {:?}",
+                db.node_status().first()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The spec's budgets with L1's waits cut short, so a fresh partition admits writes within
     /// [`admits`]'s patience (the spec holds a resume for 5 s).
     fn fast() -> Budgets {
@@ -3795,7 +3870,9 @@ mod tests {
         let second = paused.request.expect("a kernel refusal keeps its request");
 
         db.links().heal_all();
-        admits(&db, "after the heal");
+        // D13: wait for the publish this row is named after, not for `admits`, which is true
+        // through the whole hold.
+        publishes(&db, Seq(3), "after the heal");
         let first = db.resend(*first).expect("the first publishes");
         assert_eq!((first.request, first.seq), (RequestId(2), Seq(3)));
         let second = db.resend(*second).expect("3b: admitted after the publish");
@@ -3820,7 +3897,7 @@ mod tests {
             "the host's expiry answers a resend, not the put timeout: {unknown:?}"
         );
         db.links().heal_all();
-        admits(&db, "after the second heal");
+        publishes(&db, Seq(5), "after the second heal");
         assert_eq!(
             db.resend(late).expect("published after the heal").seq,
             Seq(5)
@@ -4926,6 +5003,174 @@ mod tests {
         assert_eq!(app_request_id(5), Some(RequestId((1 << 63) | 5)));
         assert_eq!(app_request_id((1 << 63) - 1), Some(RequestId(u64::MAX)));
         assert_eq!(app_request_id(1 << 63), None);
+        db.shutdown();
+    }
+
+    /// Ruling A-R196 (D10 part 2): node 1's recovery ended `Blocked` (here `BarrierIncomplete`,
+    /// final in an open by ruling F-a), so `wait_ready` answers at once, well inside 1 s of a
+    /// 90 s bound, with `Blocked` naming the reason and saying to open the folder again. Node 1
+    /// is a stub that answers every look with that phase, spelled as the host spells it. Cut:
+    /// `wait_ready` does not stop on `Blocked`, and it polls out its bound to `TimedOut`.
+    /// Unit (~50 ms): no node thread.
+    #[test]
+    fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_blocked() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let blocked = format!(
+            "{:?}",
+            rdb_core::recovery::RecoveryPhase::Blocked(
+                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                    missing: vec![
+                        rdb_core::contracts::membership::CopyId(1),
+                        rdb_core::contracts::membership::CopyId(2),
+                    ],
+                }
+            )
+        );
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: Some(blocked),
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        let node_1 = std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                if let Msg::Inspect { reply, .. } = msg {
+                    let _ = reply.send(status.clone());
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_secs(3));
+        let took = started.elapsed();
+        assert_eq!(
+            answer,
+            Err(ReadyError::Blocked {
+                reason: "BarrierIncomplete { missing: [CopyId(1), CopyId(2)] }".to_owned()
+            })
+        );
+        assert!(took < Duration::from_secs(1), "answered after {took:?}");
+        assert_eq!(
+            answer.expect_err("blocked").to_string(),
+            "the open's recovery stopped before node 1 took writes (BarrierIncomplete { missing: \
+             [CopyId(1), CopyId(2)] }), and it does not try again in this open: shut this Db down \
+             and open the folder again"
+        );
+        drop(db);
+        node_1.join().expect("the stub");
+    }
+
+    /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
+    /// open leaves, so `wait_ready` answers at once with `Quarantined`, whose text says the data
+    /// is kept and that neither a reopen nor a repair command helps yet (A-R196(2b)). Node 1 is a
+    /// stub that answers every look with that phase, spelled as the host spells it. Cut: `wait_ready` does not stop on `Quarantined`,
+    /// and it polls out its bound to `TimedOut`.
+    /// Unit (~50 ms): no node thread.
+    #[test]
+    fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_quarantined() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: Some(format!(
+                "{:?}",
+                rdb_core::recovery::RecoveryPhase::Quarantined
+            )),
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        let node_1 = std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                if let Msg::Inspect { reply, .. } = msg {
+                    let _ = reply.send(status.clone());
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_secs(3));
+        let took = started.elapsed();
+        assert_eq!(answer, Err(ReadyError::Quarantined));
+        assert!(took < Duration::from_secs(1), "answered after {took:?}");
+        assert_eq!(
+            answer.expect_err("quarantined").to_string(),
+            "the open's recovery found copies whose histories disagree, so node 1 takes no \
+             writes; the acknowledged data is kept. Opening the folder again will not help, and \
+             do not delete the folder: this build has no repair command yet (removing a copy \
+             from membership comes in a later build)"
+        );
+        drop(db);
+        node_1.join().expect("the stub");
+    }
+
+    /// M10 D14: the open's control read finds the store unreachable. The error says to check
+    /// that rEtcd is running and to open again, and opening the same folder again with the
+    /// store back does succeed, so the step it names is one this build can run. Cut: drop the
+    /// step from the text, and the first assertion fails.
+    /// Integration (~3 s): real node threads and RocksDB on the second open.
+    #[test]
+    fn m10_d14_an_open_whose_control_read_is_unavailable_says_to_check_retcd_and_open_again() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_gets: 1,
+            ..Script::default()
+        }));
+        let error = match rt.block_on(Db::open(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+        )) {
+            Err(error @ OpenError::Control(_)) => error,
+            Err(other) => panic!("the open fails with Control, not: {other}"),
+            Ok(_) => panic!("the open fails while the store is unreachable"),
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("control store: get partitions/1: ")
+                && text.ends_with(
+                    ". Check that rEtcd is running and reachable from this process, then open \
+                     again"
+                ),
+            "{text}"
+        );
+
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("opening the same folder again, with the store back, succeeds");
+        admits(&db, "after the second open");
         db.shutdown();
     }
 
