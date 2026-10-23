@@ -1394,7 +1394,7 @@ fn repl<'scope, 'env>(
                     Ok(secs) => {
                         let within = Duration::from_secs(secs);
                         let waited = if *what == "ready" {
-                            wait_ready_line(within, |within| db.wait_ready(within))
+                            wait_ready_line(progress, within, |within| db.wait_ready(within))
                         } else {
                             wait_recovered(progress, within, || db.heal_state())
                         };
@@ -2775,6 +2775,20 @@ struct Sent {
     file: Option<PathBuf>,
     /// An append to `--requests F` failed: the run exits 1 (k214).
     save_failed: std::cell::Cell<bool>,
+    /// The lines of F already warned about: each is said once per run, not on every retry.
+    warned: std::collections::BTreeSet<usize>,
+}
+
+/// `true` when `file` is not empty and its last byte is not a newline.
+fn ends_mid_line(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// What `retry <rest>` names, its `--payload V` or `--deadline-ms N` aside.
@@ -2896,6 +2910,9 @@ impl Sent {
                 // line holds keys and values.
                 Err(e) => {
                     let line = at + 1;
+                    if !self.warned.insert(line) {
+                        continue;
+                    }
                     let torn = line == last && !text.ends_with('\n') && e.is_eof();
                     tracing::warn!(line, torn, class = ?e.classify(), "requests_file_line_skipped");
                     warnings.push(if torn {
@@ -2937,10 +2954,14 @@ impl Sent {
             .and_then(|line| {
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)
+                    .read(true)
                     .append(true)
                     .open(path)
                     .map_err(|e| e.to_string())?;
-                writeln!(file, "{line}")
+                // A kill during an append leaves F ending mid-line. Start a line of our own, or
+                // this request would be glued onto that tail and lost to a later run.
+                let torn = ends_mid_line(&mut file).map_err(|e| e.to_string())?;
+                writeln!(file, "{}{line}", if torn { "\n" } else { "" })
                     .and_then(|()| file.sync_data())
                     .map_err(|e| e.to_string())
             });
@@ -3596,8 +3617,10 @@ fn wait_recovered(
 /// `wait ready`: the line it ends with, from `Db::wait_ready`, which answers the present rather
 /// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
 /// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
-/// gives the next step). The run then exits 1. A timeout is said, and is not an error.
+/// gives the next step). The run then exits 1. A timeout is said, and is not an error. A wait
+/// that reached ready records that as printed, so the poller does not say it a second time.
 fn wait_ready_line(
+    progress: &Progress,
     within: Duration,
     wait: impl FnOnce(Duration) -> Result<(), rdb_api::db::ReadyError>,
 ) -> Result<String, String> {
@@ -3606,7 +3629,17 @@ fn wait_ready_line(
     let answer = wait(within);
     let millis = started.elapsed().as_millis();
     let (outcome, line) = match &answer {
-        Ok(()) => ("reached", Ok(format!("reached ready in {millis}ms"))),
+        Ok(()) => {
+            // Said here, so the poller does not say it again (k237): `ready` with no reason is
+            // now what was printed. A later change, or a reason, is still the poller's to say.
+            let mut seen = progress
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.ready = true;
+            seen.reason = None;
+            ("reached", Ok(format!("reached ready in {millis}ms")))
+        }
         Err(e @ ReadyError::TimedOut { .. }) => (
             "timed_out",
             Ok(format!(
@@ -5338,7 +5371,8 @@ mod tests {
     /// Tester k214 (A-R189). A damaged line in `--requests F` blocked every retry, and a failed
     /// append to F printed `err` yet exited 0. Now a line that does not read is skipped with a
     /// warning that names its line, never its text, and the other ids still retry; a last line
-    /// a kill cut short is said as such. A failed append makes the run exit 1. Unit (~5 ms).
+    /// a kill cut short is said as such, once per run. A failed append makes the run exit 1. Unit
+    /// (~5 ms).
     #[test]
     fn a_damaged_or_torn_line_in_requests_file_is_skipped_and_a_failed_append_exits_1() {
         use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
@@ -5398,9 +5432,27 @@ mod tests {
             adopted.request_digest(),
             request(7, b"zqseven").request_digest()
         );
-        later.adopt(&["6"]).expect("6 too");
+        // Tester w360c: each retry re-read F and printed the same warnings again. Once per run.
+        assert_eq!(
+            later.adopt(&["6"]),
+            Ok(Vec::new()),
+            "6 too, warned once per run"
+        );
         assert!(later.pick(&["6"]).is_ok());
         assert_eq!(exit_code(false, &later), ExitCode::SUCCESS);
+
+        // F ends in a torn line: this run's next save starts a line of its own, so a later run
+        // still retries it (an append glued onto the torn tail would lose it).
+        later.record(Some(request(9, b"zqnine")), Kind::Txn);
+        let mut after = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        after.adopt(&["9"]).expect("F reads");
+        assert!(
+            after.pick(&["9"]).is_ok(),
+            "request 9 saved after a torn line"
+        );
 
         // F is a folder: the append fails, and the run exits 1 though every line was fine.
         let mut unwritable = Sent {
@@ -5431,7 +5483,7 @@ mod tests {
             started.elapsed()
         );
         // `wait ready` asks Db::wait_ready, which ends at once on a failed heal itself.
-        let ready = wait_ready_line(Duration::from_secs(2), |_| {
+        let ready = wait_ready_line(&progress, Duration::from_secs(2), |_| {
             Err(ReadyError::Heal(admin::HealError::NodeStopped))
         })
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
@@ -5536,5 +5588,24 @@ mod tests {
             "{said}"
         );
         assert_eq!(code, ExitCode::from(1), "a stopped wait exits 1");
+    }
+
+    /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
+    /// second bare `ready` line inside the next command's output. One transition is said once:
+    /// a wait that reached ready records it as printed, so the poller says nothing more until
+    /// the state changes again. Unit.
+    #[test]
+    fn a_reached_wait_ready_is_not_said_again_by_the_poller() {
+        let progress = Progress::default();
+        let line = wait_ready_line(&progress, Duration::from_secs(1), |_| Ok(()))
+            .expect("ready is not an error");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        let mut seen = progress.seen();
+        assert_eq!(step_line(&mut seen, true, None), None, "said once");
+        assert_eq!(
+            step_line(&mut seen, false, None).as_deref(),
+            Some("not ready: writes not admitted"),
+            "a later change is still said"
+        );
     }
 }
