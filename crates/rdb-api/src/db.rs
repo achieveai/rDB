@@ -518,18 +518,21 @@ pub enum HealState {
     Failed(admin::HealError),
 }
 
-/// Why [`Db::wait_ready`] returned without node 1 admitting writes.
+/// Why [`Db::wait_ready`] returned without the owner admitting writes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReadyError {
     /// The reopen's heal failed.
     #[error("the reopen's heal failed: {0}")]
     Heal(admin::HealError),
-    /// Node 1 did not admit writes in time.
-    #[error("{}", timed_out_text(*.within_ms, .phase))]
+    /// The owner did not admit writes in time.
+    #[error("{}", timed_out_text(*.within_ms, *.owner, .phase))]
     TimedOut {
         /// The bound asked for.
         within_ms: u128,
-        /// Node 1's last recovery phase, in words: `unknown` when node 1 answered no status
+        /// The node asked: the owner this `Db` routed to at the time-out, which is not node 1
+        /// after a promote (A-R256).
+        owner: NodeId,
+        /// The owner's last recovery phase, in words: `unknown` when it answered no status
         /// look in the time, `none` when it runs no recovery.
         phase: String,
     },
@@ -1306,6 +1309,7 @@ impl Db {
             if std::time::Instant::now() >= deadline {
                 return Err(ReadyError::TimedOut {
                     within_ms: within.as_millis(),
+                    owner: self.route.owner(),
                     phase,
                 });
             }
@@ -2745,20 +2749,20 @@ fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
     )
 }
 
-/// [`ReadyError::TimedOut`]'s phase when node 1 answered no status look in the time.
+/// [`ReadyError::TimedOut`]'s phase when the owner answered no status look in the time.
 const NO_ANSWER: &str = "unknown";
-/// [`ReadyError::TimedOut`]'s phase when node 1 runs no recovery.
+/// [`ReadyError::TimedOut`]'s phase when the owner runs no recovery.
 const NO_RECOVERY: &str = "none";
 
 /// [`ReadyError::TimedOut`]'s text (A-R230 Q3, #59): it never says "unknown", which read as a
-/// fault while node 1 was busy syncing, and it ends with the step.
-fn timed_out_text(within_ms: u128, phase: &str) -> String {
+/// fault while node 1 was busy syncing, it names the owner, and it ends with the step.
+fn timed_out_text(within_ms: u128, owner: NodeId, phase: &str) -> String {
     let seen = match phase {
         NO_ANSWER => error::ReadySeen::NoAnswer,
         NO_RECOVERY => error::ReadySeen::NoRecovery,
         phase => error::ReadySeen::Phase(phase),
     };
-    error::ready_timed_out_text(within_ms, seen)
+    error::ready_timed_out_text(within_ms, owner.0, seen)
 }
 
 /// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
@@ -5600,15 +5604,16 @@ mod tests {
     /// #59 (tester-s2), A-R230 Q3: `wait_ready`'s time-out never says "unknown", which read as
     /// a fault while node 1 was busy syncing, and ends with the step. Node 1 first answers no
     /// look in the time, then answers with no recovery. The `phase` field keeps its words, which
-    /// `rdb_dev` prints. Cut: `TimedOut` keeps the old text, "recovery phase unknown".
-    /// Unit (~200 ms): no node thread.
+    /// `rdb_dev` prints. A-R256: the text names the owner it asked, node 2 after a promote, and
+    /// its step is plain words, not an API name. Cut: `TimedOut` keeps the old text, "recovery
+    /// phase unknown"; or names node 1 whatever the owner.
+    /// Unit (~300 ms): no node thread.
     #[test]
-    fn m10_s2_a_wait_that_times_out_says_what_node_1_answered_and_what_to_do_next() {
+    fn m10_s2_a_wait_that_times_out_says_what_the_owner_answered_and_what_to_do_next() {
         let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
         db.timeouts.read = Duration::from_millis(50);
-        let step = "; next: call `wait_ready` again with a longer bound, or shut this Db down \
-                    and open the folder again, once; if that times out too, stop and report it \
-                    with this message";
+        let step = "; next: wait again for longer, or close the database and open its folder \
+                    again, once; if that times out too, stop and report it with this message";
 
         let silent = db.wait_ready(Duration::from_millis(60));
         let Err(error @ ReadyError::TimedOut { .. }) = &silent else {
@@ -5658,6 +5663,27 @@ mod tests {
             idle.map_err(|error| error.to_string()),
             Err(format!(
                 "node 1 did not admit writes within 60 ms; node 1 runs no recovery{step}"
+            ))
+        );
+
+        // A promote moved the route to node 2, which answers nothing here: the text names it.
+        db.route.owner.store(2, Ordering::Relaxed);
+        let promoted = db.wait_ready(Duration::from_millis(60));
+        assert!(
+            matches!(
+                &promoted,
+                Err(ReadyError::TimedOut {
+                    owner: NodeId(2),
+                    ..
+                })
+            ),
+            "{promoted:?}"
+        );
+        assert_eq!(
+            promoted.map_err(|error| error.to_string()),
+            Err(format!(
+                "node 2 did not admit writes within 60 ms; node 2 answered no status look in \
+                 that time (it may be busy, for example syncing its copies){step}"
             ))
         );
         drop(db);
