@@ -112,6 +112,11 @@ impl Trio {
     pub(super) const PATIENCE: Duration = Duration::from_secs(8);
     /// [`Self::fast_pause`]'s L1 pause age: the spec's 2,000 ms, shortened.
     pub(super) const PAUSE_AGE_MILLIS: u64 = 400;
+    /// The most one reading of the trio's clock moves past the last (#50, [`HostClock::capped`]).
+    /// Below every budget a row tunes (the shortest is [`Self::fast`]'s 50 ms resume hold) and
+    /// far below the 600-680 ms stalls of this thread that failed rows (diag-d16), so a stall
+    /// costs the hosts 20 ms of their time instead of all of it.
+    pub(super) const CLOCK_STEP_CAP_MILLIS: u64 = 20;
 
     /// Three hosts on `dir`, each tuned by `tune`, not yet bootstrapped.
     pub(super) fn new(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> Self {
@@ -125,7 +130,7 @@ impl Trio {
         let store: Arc<dyn config_core::ConfigStore> = Arc::clone(&mem) as _;
         let control =
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
-        let clock = HostClock::start();
+        let clock = HostClock::capped(Self::CLOCK_STEP_CAP_MILLIS);
         let nodes = (1..=3u32)
             .map(|n| {
                 let engine = RocksEngine::open(dir.join(n.to_string())).expect("open engine");
@@ -280,4 +285,58 @@ impl Trio {
         let answer = self.call(call);
         self.answer(&answer)
     }
+}
+
+/// #50, the d16 probe as a row: a stall of the one thread that steps all three hosts, right
+/// after two puts, leaves the puts undurable everywhere for as long as it lasts. On the real
+/// clock that is 600 ms, past [`Trio::fast_pause`]'s 400 ms pause age, and L1 pauses at the
+/// first eval after the wake (diag-d16: red 4/4). On the trio's capped clock it costs the
+/// hosts [`Trio::CLOCK_STEP_CAP_MILLIS`], so L1 stays healthy and admitting for twice the
+/// pause age of host time after it.
+/// Cut: `Trio::new` on `HostClock::start()`, red (L1 paused).
+/// Integration (~1.5 s): bootstrap's discovery window, the stall, then the watch.
+#[test]
+fn a_stall_of_the_trio_thread_after_two_puts_costs_one_clock_step_and_no_pause() {
+    use rdb_core::contracts::ids::{ClientId, TenantId};
+    use rdb_value::delta::Op;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast_pause);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    for (request, object) in [(1, b"a"), (2, b"b")] {
+        let put = ClientCall::Put {
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(request),
+            },
+            object: Bytes::from_static(object),
+            change: Change::Doc(Delta(vec![Op::Replace(Value::Bytes(b"v".to_vec()))])),
+            expect: None,
+            remaining_millis: 5_000,
+        };
+        match trio.ask(put) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request}: {other:?}"),
+        }
+    }
+    let before = trio.clock.now();
+    std::thread::sleep(Duration::from_millis(3 * Trio::PAUSE_AGE_MILLIS / 2));
+    let woke = trio.clock.now();
+    let watch_until = woke.plus_millis(2 * Trio::PAUSE_AGE_MILLIS);
+    trio.until("twice the pause age of host time", |trio| {
+        let status = trio.status(0);
+        assert_ne!(
+            status.protection.as_deref(),
+            Some("paused"),
+            "L1 paused after a stall of the trio thread: {status:?}"
+        );
+        (trio.clock.now() >= watch_until && status.admits == Some(true)).then_some(())
+    });
+    // Last, so the cut fails on L1, not on this.
+    assert!(
+        woke.0 - before.0 <= Trio::CLOCK_STEP_CAP_MILLIS,
+        "the stall counted {} ms",
+        woke.0 - before.0
+    );
 }
