@@ -239,6 +239,15 @@
 //!                                         earlier clear sent deletes, ask its `status`. While
 //!                                         reads are refused, as after a fence, it answers as
 //!                                         `read` does. `retry` resends it unchanged
+//! admin repair-element map|set <o> <K>    repair one bad map entry or set member and keep the
+//!                                         rest: one `del` of K, which deletes it and writes
+//!                                         the root at its count less one in the same write
+//!                                         (ADR-rdb-0013 decision 11). K is JSON, as `map`
+//!                                         takes it. `repair ok ...`; a K not stored answers
+//!                                         `CONDITION_FAILED` (`op 0: the element is absent`)
+//!                                         and writes nothing. A newer build's entry is
+//!                                         refused `INCOMPATIBLE_VERSION` and kept. A damaged
+//!                                         root, or a list item, still takes `admin clear`
 //! admin damage <o> [--element K | --item P] [--as digest|kind0|newer] [--api-version N]
 //!                                         dev only: overwrite the object's stored root, or
 //!                                         with --element its stored map entry or set member
@@ -1381,6 +1390,31 @@ fn repl<'scope, 'env>(
             }
             continue;
         }
+        // Its K is JSON, read from the raw line as a value verb reads it.
+        if line
+            .split_whitespace()
+            .take(2)
+            .eq(["admin", "repair-element"])
+        {
+            match parse_repair(&line) {
+                Ok((object, change)) => {
+                    let answer = db.write(object.as_bytes(), change, None);
+                    kind_write_line(
+                        db,
+                        "repair ",
+                        REPAIR_NOTHING,
+                        answer,
+                        &mut sent,
+                        Kind::Value,
+                    );
+                }
+                Err(e) => {
+                    say(&format!("usage: {e}; {REPAIR_USAGE}"));
+                    bad = true;
+                }
+            }
+            continue;
+        }
         let words = match split_words(&line) {
             Ok(words) => words,
             Err(e) => {
@@ -1561,7 +1595,7 @@ fn repl<'scope, 'env>(
             }
             ["admin", ..] => Err(format!(
                 "admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | {DAMAGE_USAGE} | \
-                 {DAMAGE_RECORD_USAGE}"
+                 {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
             )),
             ["control", ..] => match control {
                 Some(control) => control_verb(&words, &line, rt, control),
@@ -1783,7 +1817,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
         "sleep", "quit", "exit", "blob", "client", "put-loop",
     ];
-    const SUBVERBS: [&str; 25] = [
+    const SUBVERBS: [&str; 26] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -1809,6 +1843,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "node stop",
         "control cut",
         "client drop-reply",
+        "admin repair-element",
     ];
     let mut first = line.split_whitespace();
     let Some(verb) = first
@@ -1825,7 +1860,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "put" | "put&" | "get" | "read" | "doc" | "map" | "set" | "members" | "list" | "items" => 1,
         "blob upload" | "blob chunk" | "blob publish" | "blob gc" | "admin damage-chunk"
         | "admin damage" | "admin clear" => 2,
-        "put --as" | "put-loop" => 3,
+        "put --as" | "put-loop" | "admin repair-element" => 3,
         _ => return (verb, None),
     };
     let object = split_words(line)
@@ -2034,6 +2069,39 @@ fn parse_change(line: &str) -> Result<(String, Option<Expected>, Change), String
         other => return Err(format!("{other:?} is not a write")),
     };
     Ok((object, expect, change))
+}
+
+const REPAIR_USAGE: &str = "admin repair-element map|set <object> <K>";
+
+/// What `admin repair-element` would say had it compiled to nothing; its `need K present` means
+/// it never does.
+const REPAIR_NOTHING: &str = "nothing to repair";
+
+/// `admin repair-element map|set <object> <K>`: ADR-rdb-0013 decision 11's `repair_element`,
+/// built over the write path's own repair (A-R137 Q1, M10 S2): one write, `need K present` then
+/// `del K`, which deletes the bad entry or member and writes the root at its count less one,
+/// and keeps every other entry. So one bad entry no longer costs the whole object (`admin
+/// clear`). A K not stored fails the `need`: `CONDITION_FAILED`, nothing written. A newer
+/// build's entry is refused `INCOMPATIBLE_VERSION`, as a `del` is, and nothing is deleted.
+fn parse_repair(line: &str) -> Result<(String, Change), String> {
+    let mut words = Words::new(line);
+    words.take("admin")?;
+    words.take("repair-element")?;
+    let kind = words.take("map or set")?;
+    let object = words.take("<object>")?.to_owned();
+    let key = words.key("K")?;
+    // `need K present` first: a `del` of a key that is not stored still writes the root, so
+    // without it a mistyped K would answer `ok` and repair nothing (walk, W7).
+    let ops = vec![ElemOp::NeedPresent(key.clone()), ElemOp::Remove(key)];
+    if let Some(extra) = words.next() {
+        return Err(format!("unexpected {extra:?} after K"));
+    }
+    let change = match kind {
+        "map" => Change::Map(ops),
+        "set" => Change::Set(ops),
+        other => return Err(format!("{other:?} is not map or set")),
+    };
+    Ok((object, change))
 }
 
 /// A `doc` line's ops; at least one.
@@ -6303,6 +6371,47 @@ mod tests {
             assert_eq!(args(&words).expect_err("refused").as_str(), said);
         }
         assert!(usage().contains("not built yet: <verb>; nothing was done"));
+    }
+
+    /// M10 S2 triage, `repair_element` (A-R137 Q1): `admin repair-element map|set <o> <K>` is
+    /// one write, `need K present` then `del K`. Walk W7 (repair.txt): with the `del` alone, a K
+    /// that is not stored still answered `repair ok` and wrote the root, repairing nothing; the
+    /// `need` makes it `CONDITION_FAILED`, nothing written. A byte key reads as `map` reads it.
+    /// Cut: drop the `need` and the first assert is red. Unit.
+    #[test]
+    fn repair_element_needs_k_present_then_deletes_it() {
+        let key = Value::Text("b".into());
+        assert_eq!(
+            parse_repair(r#"admin repair-element map m "b""#).expect("parses"),
+            (
+                "m".to_owned(),
+                Change::Map(vec![ElemOp::NeedPresent(key.clone()), ElemOp::Remove(key)])
+            )
+        );
+        let bytes = Value::Bytes(vec![0, 0xff]);
+        assert_eq!(
+            parse_repair(r#"admin repair-element set s {"$bytes":"00ff"}"#).expect("parses"),
+            (
+                "s".to_owned(),
+                Change::Set(vec![
+                    ElemOp::NeedPresent(bytes.clone()),
+                    ElemOp::Remove(bytes)
+                ])
+            )
+        );
+        for (line, said) in [
+            (
+                r#"admin repair-element list m "a""#,
+                r#""list" is not map or set"#,
+            ),
+            ("admin repair-element map m", "missing K (a JSON value)"),
+            (
+                r#"admin repair-element map m "a" "b""#,
+                r#"unexpected "\"b\"" after K"#,
+            ),
+        ] {
+            assert_eq!(parse_repair(line).expect_err(line), said, "{line}");
+        }
     }
 
     /// M10 S2 triage, "`control` prints the root": a layout-3 `partitions/` body carries a
