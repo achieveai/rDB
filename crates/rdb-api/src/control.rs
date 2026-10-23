@@ -1915,7 +1915,7 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch::new(script));
         let links = Links::new();
         let (tx, _rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
@@ -1961,7 +1961,7 @@ mod tests {
         };
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
