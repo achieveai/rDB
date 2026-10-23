@@ -4790,20 +4790,145 @@ mod tests {
         first.shutdown();
     }
 
+    /// A-R164: a value whose stored frame does not decode, read by the app after a reopen, is
+    /// an error and stops the node. Never `None`, never a panic. The view's get answers `None`
+    /// and records the fault; the host's check after the step turns that into the node's fault,
+    /// which answers the waiter.
+    /// Integration (~30 s): two opens, each reopen waits out the last run's grant.
+    #[config_log::retcd_test]
+    fn m10_a_frame_corrupt_value_read_by_the_app_is_an_error_never_absent() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get(b"c07")));
+        match read {
+            Ok(Err(error)) => names_the_fault(&error),
+            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R164, the compile checkpoint: a put whose condition reads a corrupt value is refused
+    /// with the node's fault, never with a conflict decided on a value read as absent. The
+    /// compile answers its caller itself, before anything reaches a T1 step, so only the check
+    /// after the compile sees the fault.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_a_put_whose_condition_reads_a_corrupt_value_is_refused_with_the_fault() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        let put = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.put(b"c07", b"again", Some(2))
+        }));
+        match put {
+            Ok(Err(refused)) => names_the_fault(&refused.error),
+            Ok(Ok(put)) => panic!("a condition read from a corrupt value is no answer: {put:?}"),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R164, the previous-view checkpoint: `get_previous` of a corrupt value reads it through
+    /// the view P1 kept, which no T1 or P1 step reads, so only the check in the object read
+    /// sees the fault. A put of another object first makes a kept view exist.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_a_previous_view_read_of_a_corrupt_value_is_an_error_never_absent() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        db.put(b"z", b"other", None)
+            .expect("a put of another object");
+        let read =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get_previous(b"c07")));
+        match read {
+            Ok(Err(error)) => names_the_fault(&error),
+            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    fn names_the_fault(error: &ApiError) {
+        assert!(
+            error.detail.contains("storage read fault"),
+            "the error names the fault: {error:?}"
+        );
+    }
+
+    /// The A-R164 rows' folder: `c07=hello` written in generation 1, then every user value of
+    /// generation 1, in every copy, cut to 3 bytes (shorter than a frame), then reopened and
+    /// ready.
+    fn reopened_over_a_corrupt_value(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> Db {
+        use rdb_core::contracts::storage::Namespace;
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "first open");
+        db.put(b"c07", b"hello", None).expect("put");
+        db.shutdown();
+        drop(db);
+
+        let prefix = rdb_storage::keys::encode_key(PARTITION, Generation(1), Namespace::User, &[]);
+        let mut corrupted = 0;
+        for n in 1..=3 {
+            let path = dir.join("nodes").join(n.to_string());
+            let raw = rocksdb::DB::open_cf(
+                &rocksdb::Options::default(),
+                &path,
+                rdb_storage::keys::COLUMN_FAMILIES,
+            )
+            .expect("raw open");
+            let cf = raw
+                .cf_handle(rdb_storage::keys::cf_for(Namespace::User))
+                .expect("cf");
+            let keys: Vec<Box<[u8]>> = raw
+                .prefix_iterator_cf(cf, &prefix)
+                .map(|item| item.expect("raw read").0)
+                .take_while(|key| key.starts_with(&prefix))
+                .collect();
+            for key in keys {
+                raw.put_cf(cf, &key, [0, 0, 0]).expect("raw put");
+                corrupted += 1;
+            }
+        }
+        assert!(
+            corrupted >= 3,
+            "the value is stored in every copy: {corrupted}"
+        );
+
+        let db = open();
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the reopen is ready");
+        db
+    }
+
     /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a
     /// row, and a folder that was opened and closed empty reopens empty. Each reopen heals
-    /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again.
-    /// Integration (~10 s): each reopen waits out the last run's grant on wall-clock time.
+    /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again. D3
+    /// (k141): an app that reopens and only reads, four times running, still becomes ready.
+    /// Integration (~30 s today): four reopens, each waiting out the last run's grant on
+    /// wall-clock time and a full discovery window. Re-timed after the A-R165 timers land.
     #[config_log::retcd_test]
     fn m10_s1_1_a_reopen_reads_back_every_acknowledged_write() {
         let rt = runtime();
         let patience = crate::host::test_patience(Duration::from_secs(30));
-        for (case, writes) in [
-            ("empty", &[][..]),
-            (
-                "written",
-                &[(&b"a"[..], &b"hello"[..]), (b"b", b"world")][..],
-            ),
+        let written: &[(&[u8], &[u8])] = &[(b"a", b"hello"), (b"b", b"world")];
+        // (case, writes, reopens, whether each reopen writes before it closes)
+        for (case, writes, reopens, writes_again) in [
+            ("empty", &[][..], 2, true),
+            ("written", written, 2, true),
+            ("read-only reopens", written, 4, false),
         ] {
             let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
             let dir = config_testkit::fs::temp_dir();
@@ -4824,7 +4949,7 @@ mod tests {
             db.shutdown();
             drop(db);
 
-            for round in 1..=2 {
+            for round in 1..=reopens {
                 let mut db = open().unwrap_or_else(|e| panic!("{case}: reopen {round}: {e}"));
                 db.wait_ready(patience)
                     .unwrap_or_else(|e| panic!("{case}: reopen {round} ready: {e}"));
@@ -4848,8 +4973,10 @@ mod tests {
                         "{case}: reopen {round} of an empty folder is empty"
                     );
                 }
-                db.put(b"after", b"x", None)
-                    .unwrap_or_else(|e| panic!("{case}: reopen {round} takes writes: {e}"));
+                if writes_again {
+                    db.put(b"after", b"x", None)
+                        .unwrap_or_else(|e| panic!("{case}: reopen {round} takes writes: {e}"));
+                }
                 db.shutdown();
             }
         }

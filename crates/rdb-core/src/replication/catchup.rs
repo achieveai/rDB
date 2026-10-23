@@ -50,7 +50,10 @@
 //! same-generation `Recovered`, so the limit fires only on a node that stays primary across a
 //! generation change. With `None` it does not fire, and a recovery source always passes `None`.
 //! The primary's own `base_seq` is not read here: every record at or below the prior base is
-//! below it too.
+//! below it too. One exception on the receiver, which this step does not use: an older record
+//! the copy already holds at or below its floor is answered as a repeat (`AlreadyHave` and an
+//! ACK, nothing stored), so a keepalive of a head sealed before an empty generation still draws
+//! an ACK (D3, lead ruling A-R169).
 
 use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendAck, AppendOutcome, AppendReject, ReplicaProgress};
