@@ -16,9 +16,7 @@ use rdb_core::contracts::ids::{
     BootId, ClientId, Generation, NodeId, PartitionId, RequestId, RequestIdentity,
 };
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
-use rdb_core::contracts::recovery::{
-    CommittedRoot, DurableProof, RecoveryBarrier, RecoveryResult,
-};
+use rdb_core::contracts::recovery::{CommittedRoot, DurableProof, RecoveryBarrier, RecoveryResult};
 use rdb_value::blob::{Blob, Manifest};
 use rdb_value::collection::{Collection, CollectionKind, ElemOp, Member, Members};
 use rdb_value::delta::{Delta, Op};
@@ -469,7 +467,15 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             reply,
         });
         match across(to, msg) {
-            (Inbound::Client { to: at, call, reply, .. }, kind) => {
+            (
+                Inbound::Client {
+                    to: at,
+                    call,
+                    reply,
+                    ..
+                },
+                kind,
+            ) => {
                 assert_eq!((at, reply), (to, 7));
                 assert_eq!(format!("{call:?}"), before);
                 covered.insert(kind);
@@ -486,7 +492,14 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             reply,
         },
     ) {
-        (Inbound::Inspect { to: at, partition, reply }, kind) => {
+        (
+            Inbound::Inspect {
+                to: at,
+                partition,
+                reply,
+            },
+            kind,
+        ) => {
             assert_eq!((at, partition, reply), (to, PartitionId(4), 8));
             covered.insert(kind);
         }
@@ -528,7 +541,10 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         format!("{status:?}")
     );
     odd.role = "leader".to_owned();
-    assert!(NodeStatus::try_from(odd).is_err(), "an unknown role is refused");
+    assert!(
+        NodeStatus::try_from(odd).is_err(),
+        "an unknown role is refused"
+    );
 
     for local in [
         Msg::Stop,
@@ -597,7 +613,7 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
     let tls = certs::load(spec.certs, spec.cert_of.as_ref().unwrap_or(&own)).expect("certs");
     let links = Links::new();
     let (tx, mail) = mpsc::channel();
-    links.register(NodeId(spec.node), tx);
+    links.register(NodeId(spec.node), tx, BootId(u64::from(spec.node) * 11));
     let listener = if listen {
         Some(config_testkit::ports::ephemeral_listener().await.0)
     } else {
@@ -649,11 +665,26 @@ async fn a_peer_message_crosses_processes_and_a_call_is_answered_on_its_link() {
     let one = side(Spec::node(1, dir.path(), &[2]), true).await;
     let addr = one.net.addr().expect("listening");
     let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
-    two.net.wait_up(&[NodeId(1)], PATIENCE).await.expect("2 -> 1 up");
-    one.net.wait_up(&[NodeId(2)], PATIENCE).await.expect("1 sees 2");
+    two.net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("2 -> 1 up");
+    one.net
+        .wait_up(&[NodeId(2)], PATIENCE)
+        .await
+        .expect("1 sees 2");
     assert_eq!(one.links.boot_of(NodeId(2)), Some(BootId(22)));
     assert_eq!(two.links.boot_of(NodeId(1)), Some(BootId(11)));
-    assert_eq!(one.links.boot_of(NodeId(1)), None, "a local node has no handshake");
+    assert_eq!(
+        one.links.boot_of(NodeId(1)),
+        Some(BootId(11)),
+        "a local node answers with the boot it registered (A-R232)"
+    );
+    assert_eq!(
+        one.links.boot_of(NodeId(3)),
+        None,
+        "never registered, never linked"
+    );
 
     let routed = |n: u32| Msg::Restore {
         partition: PartitionId(n),
@@ -668,7 +699,11 @@ async fn a_peer_message_crosses_processes_and_a_call_is_answered_on_its_link() {
         .send(NodeId(1), NodeId(2), routed(2))
         .expect("sent back");
     let (got, _mail_two) = next(two.mail).await;
-    assert_eq!(format!("{got:?}"), format!("{:?}", routed(2)), "1 -> 2 on the accepted link");
+    assert_eq!(
+        format!("{got:?}"),
+        format!("{:?}", routed(2)),
+        "1 -> 2 on the accepted link"
+    );
 
     // Node 1 answers one client call and one Inspect, as its host would.
     let answered = Answer::Read {
@@ -736,12 +771,26 @@ async fn a_peer_message_crosses_processes_and_a_call_is_answered_on_its_link() {
     );
     let calls: Vec<_> = lines
         .iter()
-        .filter(|line| line["@m"].as_str().is_some_and(|m| m.contains("net_client_request")))
-        .map(|line| (line["n"].clone(), line["client"].clone(), line["request"].clone()))
+        .filter(|line| {
+            line["@m"]
+                .as_str()
+                .is_some_and(|m| m.contains("net_client_request"))
+        })
+        .map(|line| {
+            (
+                line["n"].clone(),
+                line["client"].clone(),
+                line["request"].clone(),
+            )
+        })
         .collect();
     assert_eq!(
         calls,
-        [(serde_json::json!(1), serde_json::json!(42), serde_json::json!(7))],
+        [(
+            serde_json::json!(1),
+            serde_json::json!(42),
+            serde_json::json!(7)
+        )],
         "call 1 maps to (client 42, request 7)"
     );
 }

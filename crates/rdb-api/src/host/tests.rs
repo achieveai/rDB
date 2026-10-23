@@ -42,7 +42,7 @@ fn a_grant_read_from_the_previous_boot_never_starts_an_acquire() {
         .expect("runtime");
     let links = Links::new();
     let (tx, _completions) = mpsc::channel();
-    links.register(NodeId(1), tx);
+    links.register(NodeId(1), tx, crate::host::BOOT);
     let store = Arc::new(config_testkit::MemStore::new());
     let control = ControlAdapter::new(
         Arc::clone(&store) as Arc<dyn ConfigStore>,
@@ -447,7 +447,7 @@ fn a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled() {
         .expect("runtime");
     let links = Links::new();
     let (tx, rx) = mpsc::channel();
-    links.register(NodeId(1), tx.clone());
+    links.register(NodeId(1), tx.clone(), crate::host::BOOT);
     links.hold(NodeId(1), NodeId(2));
     links.hold(NodeId(1), NodeId(3));
     let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -758,7 +758,7 @@ fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
         .expect("runtime");
     let links = Links::new();
     let (tx, rx) = mpsc::channel();
-    links.register(NodeId(1), tx.clone());
+    links.register(NodeId(1), tx.clone(), crate::host::BOOT);
     links.hold(NodeId(1), NodeId(2));
     links.hold(NodeId(1), NodeId(3));
     let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());

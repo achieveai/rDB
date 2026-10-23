@@ -979,7 +979,7 @@ mod tests {
     fn a_watch_that_ends_names_why_to_its_node() {
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let cases = [
             (
                 ConfigError::RevisionCompacted {
@@ -1148,7 +1148,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
         adapter.submit(
             NodeId(1),
@@ -1256,7 +1256,7 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as _;
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
         let reload = || {
             adapter.submit(
@@ -1317,7 +1317,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1383,7 +1383,7 @@ mod tests {
         });
         let links = Links::new();
         let (tx, _rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1462,8 +1462,8 @@ mod tests {
         let links = Links::new();
         let (tx1, rx1) = std::sync::mpsc::channel();
         let (tx2, rx2) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx1);
-        links.register(NodeId(2), tx2);
+        links.register(NodeId(1), tx1, crate::host::BOOT);
+        links.register(NodeId(2), tx2, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1567,7 +1567,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1682,7 +1682,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1908,7 +1908,7 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch::new(script));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
@@ -2003,7 +2003,7 @@ mod tests {
         )])));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),

@@ -130,7 +130,6 @@ impl Trio {
             .map(|n| {
                 let engine = RocksEngine::open(dir.join(n.to_string())).expect("open engine");
                 let (tx, rx) = mpsc::channel();
-                links.register(NodeId(n), tx.clone());
                 let mut host = Host::new(
                     NodeId(n),
                     engine,
@@ -139,6 +138,7 @@ impl Trio {
                     clock,
                 );
                 tune(&mut host);
+                links.register(NodeId(n), tx.clone(), host.boot);
                 (host, tx, rx)
             })
             .collect();
