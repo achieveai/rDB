@@ -5680,6 +5680,31 @@ fn view_published(
     }
 }
 
+/// ADR-0013: the most bytes of a key a log line shows, as [`key_hex`].
+const KEY_HEX_MAX_BYTES: usize = 32;
+
+/// D9: a key as a log line carries it (ADR-0013): lowercase hex of its first
+/// [`KEY_HEX_MAX_BYTES`] bytes, never its text. The same rule as `config-core`'s and
+/// `config-engine`'s private copies.
+fn key_hex(key: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
+    for byte in key.iter().take(KEY_HEX_MAX_BYTES) {
+        // Writing to a String cannot fail.
+        write!(out, "{byte:02x}").expect("write to String");
+    }
+    out
+}
+
+/// D9: the `key_hex` a damage line names the object by: its id's, or the whole root key's
+/// when the root does not parse, with the parse fault, which names no bytes.
+fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
+    match rdb_value::keys::parse(root.as_bytes()) {
+        Ok(parsed) => (key_hex(&parsed.object_id), None),
+        Err(fault) => (key_hex(root.as_bytes()), Some(fault.to_string())),
+    }
+}
+
 /// One warn line per clear batch compiled (M9 S6): what it deletes and the damage that proved
 /// it. `root` is `deleted` in the batch that empties the object, `guarded` while it is kept,
 /// and `absent` when there is none. No record bytes are logged.
@@ -5700,14 +5725,13 @@ fn log_clear(node: NodeId, identity: RequestIdentity, root: &RootKey, cleared: &
     } else {
         "guarded"
     };
+    let (key_hex, root_unparsed) = object_key_hex(root);
     tracing::warn!(
         node = node.0,
         client = identity.client.0,
         request = identity.request.0,
-        object = %match rdb_value::keys::parse(root.as_bytes()) {
-            Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
-            Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
-        },
+        key_hex = %key_hex,
+        root_unparsed = root_unparsed.as_deref(),
         deletes = compiled.mutations.len(),
         faulting = cleared.faulting,
         root = root_word,
@@ -6026,14 +6050,13 @@ fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Opti
     ) {
         return;
     }
-    let object = match rdb_value::keys::parse(root.as_bytes()) {
-        Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
-        Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
-    };
+    let (key_hex, root_unparsed) = object_key_hex(root);
+    let root_unparsed = root_unparsed.as_deref();
     match chunk {
         Some((upload, index)) => tracing::warn!(
             node = node.0,
-            %object,
+            %key_hex,
+            root_unparsed,
             kind = %error.name(),
             upload = %format!("{:032x}", u128::from_be_bytes(upload)),
             index,
@@ -6042,7 +6065,8 @@ fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Opti
         ),
         None => tracing::warn!(
             node = node.0,
-            %object,
+            %key_hex,
+            root_unparsed,
             kind = %error.name(),
             detail = %error.detail,
             "stored_damage"
@@ -11454,7 +11478,7 @@ mod tests {
                     line["root"].clone(),
                     line["deletes"].clone(),
                     line["faulting"].clone(),
-                    line["object"].clone(),
+                    line["key_hex"].clone(),
                 )
             })
             .collect();
@@ -11464,7 +11488,7 @@ mod tests {
                 root.into(),
                 deletes.into(),
                 faulting.into(),
-                "o".into(),
+                "6f".into(),
             )
         };
         assert_eq!(
@@ -11476,6 +11500,58 @@ mod tests {
             ],
             "{lines:?}"
         );
+    }
+
+    /// D9 (ADR-0013): the damage lines name the object by `key_hex`, its id's first 32 bytes
+    /// as lowercase hex, and never by its text. `stored_damage`, with and without a chunk, and
+    /// `clear_compiled` for the tester's `zqa` and for a 40-byte id cut to 32 bytes.
+    /// Unit (~10 ms): the two log functions called by hand.
+    #[config_log::retcd_test]
+    fn d9_damage_lines_carry_the_object_as_key_hex_capped_at_32_bytes() {
+        const METHOD: &str = "d9_damage_lines_carry_the_object_as_key_hex_capped_at_32_bytes";
+        let long = [b'z'; 40];
+        let error = ApiError::new(ErrorKind::CorruptHistory, "damaged".to_owned());
+        for (request, object) in [(1, &b"zqa"[..]), (2, &long[..])] {
+            let root = root_key(TenantId(1), AFFINITY, object);
+            log_stored_damage(NodeId(1), &root, &error, None);
+            log_stored_damage(NodeId(1), &root, &error, Some(([7; 16], 2)));
+            let cleared = Cleared {
+                compiled: Compiled {
+                    mutations: vec![Mutation::Delete {
+                        key: root.to_bytes(),
+                        expected_version: Some(3),
+                    }],
+                    conditions: Vec::new(),
+                },
+                damage: Corrupt::VersionWithoutValue,
+                faulting: 1,
+            };
+            log_clear(NodeId(1), identity(request), &root, &cleared);
+        }
+
+        let short = "7a7161".to_owned();
+        let capped = "7a".repeat(32);
+        for (message, want) in [
+            ("stored_damage", vec![&short, &short, &capped, &capped]),
+            ("clear_compiled", vec![&short, &capped]),
+        ] {
+            let lines = logged!(METHOD, message);
+            let named: Vec<_> = lines.iter().map(|line| line["key_hex"].clone()).collect();
+            let want: Vec<serde_json::Value> =
+                want.into_iter().map(|hex| hex.as_str().into()).collect();
+            assert_eq!(named, want, "{message}: {lines:?}");
+            for line in &lines {
+                let text = line.to_string();
+                assert!(
+                    line.get("object").is_none() && line.get("root_unparsed").is_none(),
+                    "{message} names the object only by key_hex: {text}"
+                );
+                assert!(
+                    !text.contains("zqa") && !text.contains("zzzz"),
+                    "{message} carries the object's text: {text}"
+                );
+            }
+        }
     }
 
     /// M9 S6 review Q-1: "nothing to clear" is answered only for a view P1 has published in the
