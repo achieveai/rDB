@@ -7759,6 +7759,44 @@ mod tests {
         assert_eq!(status.admits, Some(false), "{status:?}");
     }
 
+    /// A-R178, the pending loop: a put already dispatched, waiting on its copies, when the
+    /// node faults on stored damage, is answered with that damage: `CORRUPT_HISTORY`, retry
+    /// `Quarantine`, its request named, and `no_mutation` false as before, since it was sent.
+    /// Only node 1 steps, so no copy acks and the put stays pending.
+    #[test]
+    fn a_dispatched_put_is_refused_with_the_damage_its_node_faulted_on() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let answer = trio.call(put(1, b"a", b"1", None));
+        let (host, _, rx) = &mut trio.nodes[0];
+        let deadline = Instant::now() + test_patience(Duration::from_secs(5));
+        while host.pending.is_empty() {
+            assert!(Instant::now() < deadline, "the put was never dispatched");
+            while let Ok(msg) = rx.try_recv() {
+                host.handle(msg);
+            }
+            host.drain();
+        }
+        assert!(answer.try_recv().is_err(), "the put is still waiting");
+        host.set_fault(Fault {
+            damage: Some(ErrorKind::CorruptHistory),
+            detail: "a damaged read".to_owned(),
+        });
+        match answer.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: Some(_),
+            }) => assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, false),
+                "{error:?}"
+            ),
+            other => panic!("the pending put is answered with the damage: {other:?}"),
+        }
+    }
+
     /// F-001 (S0 review): a reply whose kind does not answer the waiting call faults the node,
     /// and that call is told so at once. The same for P1's previous-view answer, to a call that
     /// did not ask for one or under a handle storage never bound. The replies are forged: no
