@@ -507,6 +507,9 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Node 1's recovery as the latest look at it found it, when stuck for this open
+    /// (A-R200). Every refusal reads this instead of asking node 1 again.
+    stuck: Mutex<Option<ReadyError>>,
 }
 
 impl Default for Opened {
@@ -515,6 +518,7 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            stuck: Mutex::new(None),
         }
     }
 }
@@ -584,6 +588,22 @@ pub enum ReadyError {
 /// (M10 A-R188). Rides on [`ReadyError::Stopped`] and on every put or get refusal after it.
 const REOPEN_STEP: &str = "nothing is served again in this open: to read or write again, shut \
                            this Db down and open the folder again";
+
+/// Node 1's recovery when nothing in this open moves it on: `Blocked` (ruling F-a, A-R196) or
+/// `Quarantined` (A-R196(2a)), read from the phase as the host spells it. [`Db::wait_ready`]
+/// and every refusal read it here, so the two never disagree (A-R200).
+fn stuck_recovery(owner: &NodeStatus) -> Option<ReadyError> {
+    let phase = owner.recovery.as_deref()?;
+    if let Some(reason) = phase
+        .strip_prefix("Blocked(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return Some(ReadyError::Blocked {
+            reason: reason.to_owned(),
+        });
+    }
+    (phase == "Quarantined").then_some(ReadyError::Quarantined)
+}
 
 /// The largest restart count one open gives a node, so it never reaches the next open's boots.
 const MAX_RESTARTS: u64 = 65_534;
@@ -1096,20 +1116,18 @@ impl Db {
                     self.ready_seen.store(true, Ordering::Relaxed);
                     return Ok(());
                 }
+                match stuck_recovery(&owner) {
+                    Some(ReadyError::Blocked { reason }) => {
+                        tracing::warn!(reason, "ready_blocked");
+                        return Err(ReadyError::Blocked { reason });
+                    }
+                    Some(stuck) => {
+                        tracing::warn!("ready_quarantined");
+                        return Err(stuck);
+                    }
+                    None => {}
+                }
                 phase = owner.recovery.unwrap_or_else(|| "none".to_owned());
-                if let Some(reason) = phase
-                    .strip_prefix("Blocked(")
-                    .and_then(|rest| rest.strip_suffix(')'))
-                {
-                    tracing::warn!(reason, "ready_blocked");
-                    return Err(ReadyError::Blocked {
-                        reason: reason.to_owned(),
-                    });
-                }
-                if phase == "Quarantined" {
-                    tracing::warn!("ready_quarantined");
-                    return Err(ReadyError::Quarantined);
-                }
             }
             if std::time::Instant::now() >= deadline {
                 return Err(ReadyError::TimedOut {
@@ -1834,7 +1852,17 @@ impl Db {
     /// that no node becomes again in this open (tester W3-D1). Once node 1 has restarted, the
     /// next step follows: shut this `Db` down and open the folder again (A-R188). The kind,
     /// retry rule and mutation proof are unchanged.
+    ///
+    /// An `UNAVAILABLE` answered while node 1's recovery is stuck for this open, `Blocked` or
+    /// `Quarantined`, also names that state and the one step that helps, as the latest look at
+    /// node 1 found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
+    /// proof stay; it only cannot succeed in this open.
     fn explained(&self, mut error: ApiError) -> ApiError {
+        if error.kind == ErrorKind::Unavailable {
+            if let Some(step) = self.stuck_step() {
+                error.detail = format!("{}; {step}", error.detail);
+            }
+        }
         let Some(mut note) = self.restart_note() else {
             return error;
         };
@@ -1854,6 +1882,21 @@ impl Db {
             _ => {}
         }
         error
+    }
+
+    /// What a refusal adds while node 1's recovery is stuck for this open (A-R200), or `None`.
+    /// It reads what the latest look at node 1 found ([`Self::wait_ready`], [`Self::node_status`])
+    /// and sends nothing: `Blocked` and `Quarantined` are final within an open, so a look that
+    /// found either still holds. A refusal before any look carries no step.
+    fn stuck_step(&self) -> Option<String> {
+        let stuck = lock(&self.opened.stuck).clone();
+        match stuck? {
+            ReadyError::Blocked { reason } => Some(format!(
+                "node 1 is blocked for this open ({reason}); retrying will not help: shut this \
+                 Db down and open the folder again"
+            )),
+            stuck => Some(stuck.to_string()),
+        }
     }
 
     /// Whether node 1 has restarted, or its restart failed: it then holds nothing and does not
@@ -1891,7 +1934,11 @@ impl Db {
             },
         )
         .ok()?;
-        answer.recv_timeout(self.timeouts.read).ok()
+        let status = answer.recv_timeout(self.timeouts.read).ok()?;
+        if node == OWNER {
+            *lock(&self.opened.stuck) = stuck_recovery(&status);
+        }
+        Some(status)
     }
 
     /// A resend's or retry's answer under `request`: whatever refused it, the request may have
@@ -5134,6 +5181,107 @@ mod tests {
         );
         drop(db);
         node_1.join().expect("the stub");
+    }
+
+    /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
+    /// `UNAVAILABLE` keep their kind, retry rule and proof, and their detail adds the state and
+    /// the one step that helps: the reopen step for `Blocked`, the A-R196(2b) text for
+    /// `Quarantined`. A healthy node 1's refusal is unchanged. Node 1 is a stub that answers
+    /// every look with the phase and holds every call unanswered, so each call times out. The
+    /// row looks once with `wait_ready` first, as an app does after an open.
+    /// Cut: `explained` adds nothing, and the stuck cases equal the healthy one.
+    /// Unit (~2 s): no node thread.
+    #[test]
+    fn m10_r200_a_stuck_recovery_names_its_state_and_step_on_each_refusal() {
+        let refusals = |recovery: Option<String>| {
+            let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(200));
+            db.timeouts.read = Duration::from_millis(200);
+            let status = NodeStatus {
+                node: OWNER,
+                boot: host::BOOT,
+                fault: None,
+                holds: None,
+                authority: "held(grant 1)".to_owned(),
+                fence: None,
+                fence_polling: false,
+                replace_stopped: false,
+                recovery,
+                recovered: None,
+                role: "primary",
+                protection: None,
+                admits: Some(false),
+                published: None,
+                in_flight: None,
+                waits_on: None,
+                stalled: None,
+                reload_pending: None,
+            };
+            let node_1 = std::thread::spawn(move || {
+                // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
+                let mut held = Vec::new();
+                while let Ok(msg) = mailbox.recv() {
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            let _ = reply.send(status.clone());
+                        }
+                        other => held.push(other),
+                    }
+                }
+            });
+            // The look the app makes after an open; the refusals read what it found.
+            let _ = db.wait_ready(Duration::from_millis(50));
+            let put = db
+                .put(b"a", b"1", None)
+                .expect_err("nothing answers the compile")
+                .error;
+            let get = db.get(b"a").expect_err("nothing answers the read");
+            drop(db);
+            node_1.join().expect("the stub");
+            (put, get)
+        };
+        let (healthy_put, healthy_get) = refusals(None);
+        for refused in [&healthy_put, &healthy_get] {
+            assert_eq!(
+                (refused.kind, refused.retry),
+                (ErrorKind::Unavailable, RetryRule::BoundedJitter),
+                "{refused:?}"
+            );
+        }
+        assert!(healthy_put.no_mutation, "a compile sends nothing");
+
+        let blocked = format!(
+            "{:?}",
+            rdb_core::recovery::RecoveryPhase::Blocked(
+                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                    missing: vec![rdb_core::contracts::membership::CopyId(1)],
+                }
+            )
+        );
+        let quarantined = format!("{:?}", rdb_core::recovery::RecoveryPhase::Quarantined);
+        let cases = [
+            (
+                blocked,
+                "node 1 is blocked for this open (BarrierIncomplete { missing: [CopyId(1)] }); \
+                 retrying will not help: shut this Db down and open the folder again"
+                    .to_owned(),
+            ),
+            (quarantined, ReadyError::Quarantined.to_string()),
+        ];
+        for (phase, step) in cases {
+            let (put, get) = refusals(Some(phase.clone()));
+            for (stuck, healthy) in [(&put, &healthy_put), (&get, &healthy_get)] {
+                assert_eq!(
+                    (stuck.kind, stuck.retry, stuck.no_mutation),
+                    (healthy.kind, healthy.retry, healthy.no_mutation),
+                    "{phase}: kind, retry and proof stay: {stuck:?}"
+                );
+                assert_eq!(
+                    stuck.detail,
+                    format!("{}; {step}", healthy.detail),
+                    "{phase}"
+                );
+            }
+        }
     }
 
     /// M10 D14: the open's control read finds the store unreachable. The error says to check
