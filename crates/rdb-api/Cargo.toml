@@ -19,10 +19,14 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 # Facade only; `rdb_dev` installs the JSONL subscriber through `config-log` (ADR-0013).
 tracing = { workspace = true }
+# A fresh open names its rDB instance with a v4 uuid (M10, arch R3b).
+uuid = { workspace = true }
 
 [dev-dependencies]
 # `rdb_dev` starts three in-process rEtcd voters on RocksDB.
 config-testkit = { workspace = true }
+# `rdb_dev --control` talks to an external rEtcd over gRPC (M10 S1-1).
+config-client = { workspace = true }
 config-log = { workspace = true }
 config-log-macros = { workspace = true }
 # Paused time (`start_paused`), so a row can assert the exact wait between reload retries

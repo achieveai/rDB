@@ -302,6 +302,49 @@ fn s0_d1_second_open_is_locked() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
+/// Two opens racing on one node directory leave one owner, and the loser is told `Locked`
+/// (lead ruling A-R168). Found by dev-w1 on 2026-10-22: the loser got `Backend` 19 runs in 20,
+/// because the read-only checks ran before RocksDB's `LOCK` was taken. On Windows those checks
+/// hit the winner's `LOG` (a sharing violation), or a copy the winner had not finished creating.
+/// Every round races two threads on one existing database, so one run is 20 races.
+#[retcd_test]
+fn m10_w2_two_opens_racing_on_one_node_dir_leave_one_owner_and_the_loser_locked() {
+    let dir = data_dir("race");
+    let db = dir.join("node");
+    {
+        let mut engine = RocksEngine::open(&db).expect("create");
+        commit_all(&mut engine, &history(1, 1, 1, 3));
+    }
+    for round in 0..20 {
+        let barrier = std::sync::Barrier::new(2);
+        let (a, b) = std::thread::scope(|s| {
+            let open = || {
+                barrier.wait();
+                RocksEngine::open_existing(&db)
+            };
+            let a = s.spawn(open);
+            let b = s.spawn(open);
+            (a.join().expect("thread a"), b.join().expect("thread b"))
+        });
+        let (owner, loser) = match (a, b) {
+            (Ok(owner), Err(loser)) | (Err(loser), Ok(owner)) => (owner, loser),
+            (Ok(_), Ok(_)) => panic!("round {round}: both opens won one directory"),
+            (Err(a), Err(b)) => panic!("round {round}: both opens lost: {a:?} / {b:?}"),
+        };
+        assert!(
+            matches!(loser, OpenError::Locked { .. }),
+            "round {round}: the loser must be told Locked, got {loser:?}"
+        );
+        assert_eq!(
+            owner.lineages().len(),
+            1,
+            "round {round}: the owner's lineage"
+        );
+        drop(owner);
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
 /// Opening an existing database refuses a directory that has none. Found by hand on 2026-10-02:
 /// `verify --dir <typo>` created an empty database and reported `lineages=0 OK`, exit 0. A check
 /// that passes on the wrong directory is a false pass.

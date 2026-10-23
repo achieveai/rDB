@@ -18,7 +18,9 @@
 //!   (parent and base, 16 bytes). A lineage with no parent has no
 //!   `parent` record, never "parent 0": generation 0 is legal (ADR-rdb-0010 decision 11). The
 //!   engine-wide format marker is the key `format`, which is shorter than the 13-byte lineage
-//!   prefix and so can never be mistaken for a lineage key.
+//!   prefix and so can never be mistaken for a lineage key. The engine-wide instance marker
+//!   (M10) is the key `instance`, 16 bytes, written once by `bind_instance`; absent means
+//!   unbound. It is short for the same reason, so it needs no format bump.
 
 use rdb_core::contracts::ids::{Generation, PartitionId, Seq};
 use rdb_core::contracts::storage::Namespace;
@@ -78,6 +80,12 @@ pub(crate) fn decode_copying(raw: &[u8]) -> Option<(Generation, Seq)> {
 }
 /// The engine-wide format marker key in `metadata`. Shorter than [`PREFIX_LEN`] on purpose.
 pub(crate) const FORMAT_KEY: &[u8] = b"format";
+/// The engine-wide instance marker key in `metadata` (M10, arch R3b): the 16-byte instance id
+/// this copy is bound to. Shorter than [`PREFIX_LEN`], like [`FORMAT_KEY`], so a format-1 build
+/// that predates it skips it as it skips the format marker: no format bump. Absent means unbound.
+pub(crate) const INSTANCE_KEY: &[u8] = b"instance";
+/// Length of a stored instance id.
+pub const INSTANCE_LEN: usize = 16;
 /// The value frame's kind byte for a value.
 pub(crate) const FRAME_VALUE: u8 = 0;
 /// The value frame's kind byte for a tombstone (no bytes follow the version).

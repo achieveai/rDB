@@ -812,16 +812,24 @@ fn snapshot(dir: &Path, partition: PartitionId, generation: Generation) -> u8 {
     }
     match engine.snapshot(partition, generation, SnapshotHandle(1)) {
         Ok(view) => {
-            for (ns, key, value, version, from) in view.entries() {
+            let entries = match view.entries() {
+                Ok(entries) => entries,
+                Err(fault) => {
+                    println!("{line} FAILED {fault:?}");
+                    return exit::STORAGE_FAULT;
+                }
+            };
+            let records = entries.len();
+            for (ns, key, value, version, from) in entries {
                 println!(
                     "{} key={} version={version} from={} value={}",
                     ns_name(ns),
-                    hex(key),
+                    hex(&key),
                     from.0,
-                    hex(value)
+                    hex(&value)
                 );
             }
-            println!("{line} at={} records={}", view.at().0, view.len());
+            println!("{line} at={} records={records}", view.at().0);
             exit::OK
         }
         Err(fault) => {

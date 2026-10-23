@@ -4,7 +4,14 @@
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
+//!                                           [--control host:port[,host:port...]]
 //! ```
+//!
+//! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
+//! endpoints E instead of three in-process voters. `--dir` is then never removed, so a second
+//! run with the same `--dir` and E reopens it. The `control` verbs reach rdb_dev's own voters
+//! and are refused under `--control`. Without `--control`, a `--dir` this run did not create is
+//! never removed either; `Db::open` decides whether it can be opened.
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
@@ -320,6 +327,9 @@ struct Args {
     dedup_cap: Option<usize>,
     /// How long a published write's answer is retained, shortened as a dev budget.
     dedup_retention: Option<Duration>,
+    /// `--control E`: an external rEtcd's client endpoints. The run then starts no voters and
+    /// never removes `--dir`, so a later run can reopen it.
+    control: Option<Vec<String>>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -333,6 +343,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         put_timeout: None,
         dedup_cap: None,
         dedup_retention: None,
+        control: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -341,6 +352,18 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--control" => {
+                let endpoints: Vec<String> = value("--control")?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if endpoints.is_empty() {
+                    return Err("--control takes host:port[,host:port...]".to_owned());
+                }
+                parsed.control = Some(endpoints);
+            }
             "--put-timeout-ms" => {
                 let text = value("--put-timeout-ms")?;
                 let millis = text
@@ -399,13 +422,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if args.dir.exists() && std::fs::read_dir(&args.dir).is_ok_and(|mut d| d.next().is_some()) {
-        eprintln!(
-            "rdb_dev: {} is not empty; pass a new --dir",
-            args.dir.display()
-        );
-        return ExitCode::from(2);
-    }
+    // An existing --dir goes to `Db::open`, which decides whether it can be reopened (M10
+    // S1-1); rdb_dev refuses nothing about it itself.
     let mut config = config_log::LogConfig::for_application("rdb_dev");
     config.dir.clone_from(&args.log_dir);
     config.file_name = "rdb_dev.jsonl".to_string();
@@ -461,86 +479,132 @@ where
         eprintln!("rdb_dev: open: {e}");
         return ExitCode::from(1);
     }
-    let cluster = Arc::new(
-        rt.block_on(
-            Cluster::builder()
-                .nodes(3)
-                .storage(StorageKind::ROCKS)
-                .timers(CONTROL_TIMERS)
-                .start(),
-        ),
+    // Whether --dir held anything before this run: such a directory is never removed (M10
+    // S1-1), whatever `open` decides about it.
+    let existed = std::fs::read_dir(&args.dir).is_ok_and(|mut d| d.next().is_some());
+    let (store, local) = match &args.control {
+        Some(endpoints) => {
+            match config_client::GrpcClient::connect(
+                endpoints.clone(),
+                config_client::GrpcClientOptions::default(),
+            ) {
+                Ok(client) => {
+                    say(&format!(
+                        "control: external rEtcd at {}",
+                        endpoints.join(",")
+                    ));
+                    (Arc::new(client) as Arc<dyn ConfigStore>, None)
+                }
+                Err(e) => {
+                    eprintln!("rdb_dev: --control: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => {
+            let cluster = Arc::new(
+                rt.block_on(
+                    Cluster::builder()
+                        .nodes(3)
+                        .storage(StorageKind::ROCKS)
+                        .timers(CONTROL_TIMERS)
+                        .start(),
+                ),
+            );
+            let leader = rt.block_on(cluster.leader());
+            let hostile = Arc::new(HostileStore::new(&cluster, leader));
+            say(&format!("control up: 3 voters, leader {leader:?}"));
+            (
+                Arc::clone(&hostile) as Arc<dyn ConfigStore>,
+                Some((cluster, hostile)),
+            )
+        }
+    };
+    tracing::info!(
+        dir = %args.dir.display(),
+        existed,
+        external_control = args.control.is_some(),
+        holds = ?args.hold,
+        "rdb_dev_start"
     );
-    let leader = rt.block_on(cluster.leader());
-    let hostile = Arc::new(HostileStore::new(&cluster, leader));
-    let store: Arc<dyn ConfigStore> = Arc::clone(&hostile) as Arc<dyn ConfigStore>;
-    say(&format!("control up: 3 voters, leader {leader:?}"));
-    tracing::info!(dir = %args.dir.display(), holds = ?args.hold, "rdb_dev_start");
     let mut db = match rt.block_on(open(config, Arc::clone(&store), rt.handle().clone())) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("rdb_dev: open: {e}");
-            drop(hostile);
-            close(store, cluster, rt, args);
+            close(store, local, rt, args, existed);
             return ExitCode::from(1);
         }
     };
-    say("bootstrap: partition 1 recovery started");
+    // A fresh folder bootstraps; a folder with data takes over from its last run (M10 S1-1).
+    if db.heal_state() == rdb_api::db::HealState::NotNeeded {
+        say("bootstrap: partition 1 recovery started");
+    } else {
+        say("reopen: partition 1 takes over from the last run (heal started)");
+    }
     let progress = Progress::default();
     let stop = AtomicBool::new(false);
-    let control = Control {
-        cluster: &cluster,
-        store: &hostile,
-    };
+    let control = local.as_ref().map(|(cluster, hostile)| Control {
+        cluster,
+        store: hostile,
+    });
     let code = std::thread::scope(|scope| {
         scope.spawn(|| poll(&db, &progress, &stop));
-        let code = repl(scope, args, &db, &rt, &control, &progress);
+        let code = repl(scope, args, &db, &rt, &*store, control.as_ref(), &progress);
         stop.store(true, Ordering::Relaxed);
         code
     });
     db.shutdown();
     drop(db);
-    drop(hostile);
-    close(store, cluster, rt, args);
+    close(store, local, rt, args, existed);
     code
 }
 
 /// End the run once the Db is gone, whether it opened or not (F-006). The direct client holds
 /// the voter's store open: drop every handle on it before the cluster closes its stores, or
-/// their RocksDB files outlive the run. Then `--dir` goes, unless `--keep`.
+/// their RocksDB files outlive the run. Then `--dir` goes, unless `--keep`, `--control`, or
+/// it held anything before the run (`existed`): a directory this run did not create is the
+/// user's, and under `--control` it is meant to be reopened.
 ///
 /// The store holds the cluster weakly, so the cluster comes back here unless a call is
 /// resolving the leader at this instant; that is waited out for up to 2 s, and past it the
 /// voters are not shut down and the run says so.
 fn close(
     store: Arc<dyn ConfigStore>,
-    cluster: Arc<Cluster>,
+    local: Option<(Arc<Cluster>, Arc<HostileStore>)>,
     rt: tokio::runtime::Runtime,
     args: &Args,
+    existed: bool,
 ) {
     drop(store);
-    let started = Instant::now();
-    let mut shared = cluster;
-    let cluster = loop {
-        match Arc::try_unwrap(shared) {
-            Ok(cluster) => break Some(cluster),
-            Err(still) if started.elapsed() >= Duration::from_secs(2) => {
-                eprintln!(
-                    "rdb_dev: the cluster is still shared ({} handles); voters not shut down",
-                    Arc::strong_count(&still)
-                );
-                break None;
+    if let Some((cluster, hostile)) = local {
+        drop(hostile);
+        let started = Instant::now();
+        let mut shared = cluster;
+        let cluster = loop {
+            match Arc::try_unwrap(shared) {
+                Ok(cluster) => break Some(cluster),
+                Err(still) if started.elapsed() >= Duration::from_secs(2) => {
+                    eprintln!(
+                        "rdb_dev: the cluster is still shared ({} handles); voters not shut down",
+                        Arc::strong_count(&still)
+                    );
+                    break None;
+                }
+                Err(still) => {
+                    shared = still;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
-            Err(still) => {
-                shared = still;
-                std::thread::sleep(Duration::from_millis(50));
-            }
+        };
+        if let Some(cluster) = cluster {
+            rt.block_on(cluster.shutdown());
         }
-    };
-    if let Some(cluster) = cluster {
-        rt.block_on(cluster.shutdown());
     }
     drop(rt);
-    if !args.keep {
+    if args.keep || args.control.is_some() {
+        return;
+    }
+    if !existed {
         remove(&args.dir);
     }
 }
@@ -1047,7 +1111,8 @@ fn repl<'scope, 'env>(
     args: &Args,
     db: &'env Db,
     rt: &tokio::runtime::Runtime,
-    control: &Control<'_>,
+    store: &dyn ConfigStore,
+    control: Option<&Control<'_>>,
     progress: &Progress,
 ) -> ExitCode {
     let input: Box<dyn BufRead> = match &args.script {
@@ -1216,12 +1281,10 @@ fn repl<'scope, 'env>(
             }),
             ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
             ["admin", "clear-grant", node] => parse_node(node).map(|node| {
-                say(
-                    &match rt.block_on(admin::clear_grant(db, control.store, node)) {
-                        Ok(clearance) => clearance_line(clearance, node, db),
-                        Err(e) => admin_error_line(node, &e),
-                    },
-                );
+                say(&match rt.block_on(admin::clear_grant(db, store, node)) {
+                    Ok(clearance) => clearance_line(clearance, node, db),
+                    Err(e) => admin_error_line(node, &e),
+                });
             }),
             ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
             ["admin", "damage", _, ..] => damage_record(db, &line),
@@ -1241,73 +1304,13 @@ fn repl<'scope, 'env>(
                 "admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE}"
             )),
-            ["control", "lifecycle", partition, word] => {
-                parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
-                    say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
-                })
-            }
-            ["control", "lifecycle", ..] => Err(format!(
-                "control lifecycle <p> <{}>",
-                LIFECYCLE_WORDS.join("|")
-            )),
-            ["control", "freeze-grant", node] => parse_node(node).map(|node| {
-                say(&freeze_grant(rt, control.cluster, node));
-            }),
-            ["control", "freeze-grant", ..] => Err("control freeze-grant <n>".to_owned()),
-            ["control"] => {
-                control_lines(rt, control.cluster);
-                Ok(())
-            }
-            ["control", "voters"] => {
-                say(&voters_line(control));
-                Ok(())
-            }
-            ["control", "gap"] => {
-                say(&gap(rt, control));
-                Ok(())
-            }
-            ["control", "drop-watches"] => {
-                say(&format!("dropped {} watches", control.store.drop_watches()));
-                Ok(())
-            }
-            ["control", verb @ ("gap" | "drop-watches"), ..] => {
-                Err(format!("control {verb}: takes no arguments"))
-            }
-            ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
-                control.store.fail_lists(fault);
-                say(&format!("fail list {word}"));
-            }),
-            ["control", "fail", "put", prefix, word, rest @ ..] => {
-                parse_put_fault(word, rest).map(|(fault, count)| {
-                    control.store.fail_puts(prefix, fault, count);
-                    say(&match fault {
-                        Some(_) => format!("fail put {prefix} {word} {count}"),
-                        None => format!("fail put {prefix} off"),
-                    });
-                })
-            }
-            ["control", "fail", ..] => Err(format!(
-                "control fail list <{}> | control fail put <prefix> <{}> [n]",
-                ListFault::WORDS,
-                PutFault::WORDS
-            )),
-            ["control", verb @ ("stop" | "start"), voter] => parse_voter(control.cluster, voter)
-                .map(|voter| {
-                    say(&if *verb == "stop" {
-                        stop_voter(rt, control, voter)
-                    } else {
-                        start_voter(rt, control.cluster, voter)
-                    });
-                }),
-            ["control", "stop" | "start", ..] => Err(format!(
-                "control stop|start <voter>: exactly one voter, one of {:?}",
-                control
-                    .cluster
-                    .ids()
-                    .iter()
-                    .map(|id| id.0)
-                    .collect::<Vec<_>>()
-            )),
+            ["control", ..] => match control {
+                Some(control) => control_verb(&words, &line, rt, control),
+                None => {
+                    say(&format!("err {line}: {CONTROL_EXTERNAL}"));
+                    Ok(())
+                }
+            },
             ["links"] => {
                 let names = |pairs: Vec<(NodeId, NodeId)>| {
                     pairs
@@ -1370,6 +1373,91 @@ fn repl<'scope, 'env>(
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Why a `control` verb is refused under `--control`: they reach rdb_dev's own voters, and an
+/// external rEtcd is not rdb_dev's to freeze, stop or fault (M10 R3c).
+const CONTROL_EXTERNAL: &str =
+    "refused under --control: the store is an external rEtcd, not rdb_dev's own voters";
+
+/// A `control` verb against rdb_dev's own voters.
+fn control_verb(
+    words: &[&str],
+    line: &str,
+    rt: &tokio::runtime::Runtime,
+    control: &Control<'_>,
+) -> Result<(), String> {
+    match words {
+        ["control", "lifecycle", partition, word] => {
+            parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
+                say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
+            })
+        }
+        ["control", "lifecycle", ..] => Err(format!(
+            "control lifecycle <p> <{}>",
+            LIFECYCLE_WORDS.join("|")
+        )),
+        ["control", "freeze-grant", node] => parse_node(node).map(|node| {
+            say(&freeze_grant(rt, control.cluster, node));
+        }),
+        ["control", "freeze-grant", ..] => Err("control freeze-grant <n>".to_owned()),
+        ["control"] => {
+            control_lines(rt, control.cluster);
+            Ok(())
+        }
+        ["control", "voters"] => {
+            say(&voters_line(control));
+            Ok(())
+        }
+        ["control", "gap"] => {
+            say(&gap(rt, control));
+            Ok(())
+        }
+        ["control", "drop-watches"] => {
+            say(&format!("dropped {} watches", control.store.drop_watches()));
+            Ok(())
+        }
+        ["control", verb @ ("gap" | "drop-watches"), ..] => {
+            Err(format!("control {verb}: takes no arguments"))
+        }
+        ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
+            control.store.fail_lists(fault);
+            say(&format!("fail list {word}"));
+        }),
+        ["control", "fail", "put", prefix, word, rest @ ..] => {
+            parse_put_fault(word, rest).map(|(fault, count)| {
+                control.store.fail_puts(prefix, fault, count);
+                say(&match fault {
+                    Some(_) => format!("fail put {prefix} {word} {count}"),
+                    None => format!("fail put {prefix} off"),
+                });
+            })
+        }
+        ["control", "fail", ..] => Err(format!(
+            "control fail list <{}> | control fail put <prefix> <{}> [n]",
+            ListFault::WORDS,
+            PutFault::WORDS
+        )),
+        ["control", verb @ ("stop" | "start"), voter] => {
+            parse_voter(control.cluster, voter).map(|voter| {
+                say(&if *verb == "stop" {
+                    stop_voter(rt, control, voter)
+                } else {
+                    start_voter(rt, control.cluster, voter)
+                });
+            })
+        }
+        ["control", "stop" | "start", ..] => Err(format!(
+            "control stop|start <voter>: exactly one voter, one of {:?}",
+            control
+                .cluster
+                .ids()
+                .iter()
+                .map(|id| id.0)
+                .collect::<Vec<_>>()
+        )),
+        _ => Err(format!("unknown command {line:?}")),
     }
 }
 
@@ -4372,6 +4460,7 @@ mod tests {
             put_timeout: None,
             dedup_cap: None,
             dedup_retention: None,
+            control: None,
         };
         let code = run(&args, |_, _, _| async {
             Err(OpenError::Node("node 2: injected".to_owned()))
@@ -4509,6 +4598,7 @@ mod tests {
             put_timeout: None,
             dedup_cap: Some(65_537),
             dedup_retention: None,
+            control: None,
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {

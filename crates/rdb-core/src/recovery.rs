@@ -92,7 +92,9 @@ mod rebuild;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 
-use crate::authority::partition::{PartitionLifecycle, PartitionRecord};
+use crate::authority::partition::{
+    PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMode, INSTANCE_LEN,
+};
 use crate::contracts::authority::{BlockReason, FencingProof, Lineage, PartitionMode};
 use crate::contracts::control::{CasOutcome, ControlEvent, ReadOutcome};
 use crate::contracts::digest::Digest;
@@ -202,6 +204,8 @@ struct Decided {
     inventories: Vec<InventoryOutcome>,
     selected: SelectedLineage,
     record: PartitionRecord,
+    /// The record's layout-3 root, when F1 is bound to an rDB instance.
+    root: Option<PartitionRoot>,
     /// The eligible regular copies: the barrier's `required` set.
     required: BTreeSet<CopyId>,
     loss: LossRecord,
@@ -232,6 +236,8 @@ impl Decided {
 struct Committed {
     result: RecoveryResult,
     record: PartitionRecord,
+    /// The root the recovery CAS wrote, if any. The activation CAS writes it again as `Active`.
+    root: Option<PartitionRoot>,
     anchor: LineageAnchor,
     retention_millis: u64,
     rebuild: Option<Rebuild>,
@@ -258,7 +264,7 @@ enum Phase {
     Collecting(Box<Run>),
     Synchronizing(Box<Decided>, BTreeSet<CopyId>),
     Barrier(Box<Decided>, BTreeMap<CopyId, DurableProof>),
-    Proposing(Box<Decided>, RecoveryBarrier, Cas),
+    Proposing(Box<Decided>, RecoveryBarrier, Box<Cas>),
     Committed(Box<Committed>),
     Quarantined,
     /// The reason, and the floor when a peer's decision blocked the run: the revision it was read
@@ -294,6 +300,9 @@ pub struct Recovery {
     requests: Requests,
     /// Counts selection runs and length reads for tests; nothing here reads it.
     spy: SelectionSpy,
+    /// The rDB instance whose `partitions/{p}` this module writes. Bound, its CASes write layout 3
+    /// with the root; unbound (the simulator), layout 2 as before (M10, arch R3b).
+    instance: Option<[u8; INSTANCE_LEN]>,
 }
 
 impl Default for Recovery {
@@ -312,7 +321,16 @@ impl Recovery {
             timer_version: TimerVersion(0),
             requests: Requests::new(),
             spy: SelectionSpy::new(),
+            instance: None,
         }
+    }
+
+    /// An idle module with no plan whose CASes write layout 3 for `instance` when it is `Some`.
+    #[must_use]
+    pub const fn bound_to(instance: Option<[u8; INSTANCE_LEN]>) -> Self {
+        let mut module = Self::new();
+        module.instance = instance;
+        module
     }
 
     /// How often this module has run selection, and how often length chose between survivors
@@ -354,7 +372,7 @@ impl Recovery {
     /// outstanding waits on none: an answer then is a late one (ruling A-R102).
     fn pending_cas(&self) -> Option<&Cas> {
         match &self.phase {
-            Phase::Proposing(_, _, cas) => Some(cas),
+            Phase::Proposing(_, _, cas) => Some(cas.as_ref()),
             Phase::Committed(committed)
                 if committed
                     .resolving
@@ -605,7 +623,7 @@ impl Recovery {
                 Phase::Collecting(run)
             }
             SelectionOutcome::Selected(selected) => {
-                let phase = select(*run, selected, deadline, emit);
+                let phase = select(*run, selected, self.instance, deadline, emit);
                 if matches!(phase, Phase::Synchronizing(..) | Phase::Barrier(..)) {
                     self.arm(deadline, emit);
                 }
@@ -741,6 +759,7 @@ impl Recovery {
                 let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
                 let cas = Cas::new(
                     decided.record,
+                    decided.root,
                     decided.proof.prior_owner_epoch,
                     self.requests.mint(),
                     deadline,
@@ -749,7 +768,7 @@ impl Recovery {
                     cas.effect(decided.proof.control_revision),
                 ));
                 self.arm(deadline, emit);
-                Phase::Proposing(decided, barrier, cas)
+                Phase::Proposing(decided, barrier, Box::new(cas))
             }
             Err(_) => {
                 emit.ignored(ReplicaIgnoreReason::BarrierNotDurable);
@@ -761,7 +780,7 @@ impl Recovery {
     fn proposing(
         decided: Box<Decided>,
         barrier: RecoveryBarrier,
-        mut cas: Cas,
+        mut cas: Box<Cas>,
         requests: &mut Requests,
         input: Input<'_>,
         emit: &mut Emit<'_>,
@@ -934,6 +953,10 @@ impl Recovery {
                     let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
                     let cas = Cas::new(
                         committed.record,
+                        committed.root.map(|root| PartitionRoot {
+                            mode: RecordMode::Active,
+                            ..root
+                        }),
                         committed.record.owner_epoch,
                         self.requests.mint(),
                         deadline,
@@ -1145,7 +1168,13 @@ fn is_regular(config: &PartitionConfig, copy: CopyId) -> bool {
 
 /// A selection was made: pick the leader, then send the prefix to every regular that lacks it
 /// (`design.md` §5.4, §5.6). The leader's transfer is `CatchUpBeforeGrant` (spec §8.3).
-fn select(run: Run, selected: SelectedLineage, deadline: Tick, emit: &mut Emit<'_>) -> Phase {
+fn select(
+    run: Run,
+    selected: SelectedLineage,
+    instance: Option<[u8; INSTANCE_LEN]>,
+    deadline: Tick,
+    emit: &mut Emit<'_>,
+) -> Phase {
     emit.recovery(RecoveryEffect::Selected(selected));
     let Run { plan, collect } = run;
     let required: BTreeSet<CopyId> = collect
@@ -1194,6 +1223,18 @@ fn select(run: Run, selected: SelectedLineage, deadline: Tick, emit: &mut Emit<'
         config_version: plan.config.config_version,
         lifecycle: PartitionLifecycle::Serving,
     };
+    // Bound to an rDB instance, the record carries its root as layout 3 (M10, arch R3b); the
+    // recovery CAS writes it `Committed`, the activation CAS `Active`.
+    let root = instance.map(|instance| PartitionRoot {
+        mode: RecordMode::Committed,
+        owner_boot: leader.boot,
+        base_seq: selected.cutoff_seq,
+        base_digest: selected.cutoff_digest,
+        predecessor_generation: proof.prior_generation,
+        predecessor_cutoff: selected.cutoff_seq,
+        instance,
+        run: proof.control_revision,
+    });
     let decided = Decided {
         loss: loss_record(&collect, &selected),
         inventories: collect.outcomes(),
@@ -1201,6 +1242,7 @@ fn select(run: Run, selected: SelectedLineage, deadline: Tick, emit: &mut Emit<'
         proof,
         selected,
         record,
+        root,
         required,
         deadline,
     };
@@ -1272,6 +1314,7 @@ fn commit(
         inventories,
         selected,
         record,
+        root,
         required,
         loss,
         deadline: _,
@@ -1320,6 +1363,7 @@ fn commit(
         retention_millis: plan.retention_millis,
         result,
         record,
+        root,
         rebuild,
         activation: None,
         held: None,

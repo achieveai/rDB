@@ -23,7 +23,9 @@
 //! read-only and does not flush.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
@@ -39,7 +41,8 @@ use rdb_core::contracts::trace::Version;
 use crate::keys::{
     self, decode_copying, decode_key, decode_mark, encode_key, frame, ns_byte, ns_from_byte,
     private_key, tombstone, unframe, Frame, Link, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
-    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY,
+    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, PARENT_KEY,
+    PRIVATE_NS, SEALED_KEY,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -115,6 +118,29 @@ pub enum OpenError {
     },
 }
 
+/// Why [`RocksEngine::bind_instance`] refused. Nothing was written in either case.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BindError {
+    /// The copy is already bound to another instance id. A copy is never rebound.
+    #[error(
+        "copy is bound to instance {}, refusing to bind {}",
+        hex(found),
+        hex(wanted)
+    )]
+    OtherInstance {
+        /// The id the copy holds.
+        found: [u8; INSTANCE_LEN],
+        /// The id the caller asked to bind.
+        wanted: [u8; INSTANCE_LEN],
+    },
+    /// RocksDB refused the synced write; the copy stays unbound.
+    #[error("instance marker write failed: {detail}")]
+    WriteFailed {
+        /// RocksDB's message.
+        detail: String,
+    },
+}
+
 /// One lineage's engine-private records as the engine holds them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Marks {
@@ -133,12 +159,22 @@ pub(crate) struct Marks {
 /// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). The write-order mutex is `&mut self`:
 /// a capture and its sync cannot interleave with a commit. When M9 adds IO workers it becomes a
 /// real `Mutex`.
+///
+/// A [`crate::RocksSnapshot`] shares the database (M10 decision 2): dropping the engine closes
+/// RocksDB and releases its `LOCK` and its directory claim only once every view taken from it
+/// has been dropped too.
 pub struct RocksEngine {
-    pub(crate) db: DB,
+    /// Shared with every live [`crate::RocksSnapshot`], which pins a RocksDB snapshot on it.
+    pub(crate) db: Arc<DB>,
     path: PathBuf,
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
+    /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
+    instance: Option<[u8; INSTANCE_LEN]>,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
+    /// The lock on the directory's [`CLAIM_FILE`] (lead ruling A-R168); `None` on a read-only
+    /// open. Every view holds a clone, so the claim outlives the last handle on `db`.
+    pub(crate) claim: Option<Arc<File>>,
 }
 
 /// A storage fault the engine reports at the next matching call instead of calling RocksDB, so
@@ -182,6 +218,7 @@ impl std::fmt::Debug for RocksEngine {
         f.debug_struct("RocksEngine")
             .field("path", &self.path)
             .field("lineages", &self.lineages)
+            .field("instance", &self.instance.map(|id| hex(&id)))
             .finish_non_exhaustive()
     }
 }
@@ -223,16 +260,13 @@ impl RocksEngine {
     ///
     /// [`OpenError::NoDatabase`] when `path` holds no database, else as [`Self::open`].
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        let path = path.as_ref();
-        if !path.join("CURRENT").exists() {
-            return Err(refused(OpenError::NoDatabase {
-                path: path.to_path_buf(),
-            }));
-        }
-        Self::open(path)
+        Self::open_inner(path.as_ref().to_path_buf(), true).map_err(refused)
     }
 
     /// Open, or create, the engine at `path`.
+    ///
+    /// Takes the directory's claim first (lead ruling A-R168): an OS lock on its `CLAIM` file,
+    /// held for the engine's life and released by the OS on exit or crash.
     ///
     /// Refuses a directory whose column families are not exactly [`COLUMN_FAMILIES`], whose
     /// format marker is missing or not [`FORMAT_VERSION`], or in which any lineage has
@@ -242,11 +276,22 @@ impl RocksEngine {
     ///
     /// An [`OpenError`] naming the refusal.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf()).map_err(refused)
+        Self::open_inner(path.as_ref().to_path_buf(), false).map_err(refused)
     }
 
-    fn open_inner(path: PathBuf) -> Result<Self, OpenError> {
+    /// The claim comes first, before any read of the directory (lead ruling A-R168). Without it
+    /// a racing loser's read-only checks met the winner's `LOG`, or a copy it had not finished
+    /// creating, and the loser was told `Backend` instead of `Locked`. RocksDB's `LOCK` stays as
+    /// the second line.
+    fn open_inner(path: PathBuf, must_exist: bool) -> Result<Self, OpenError> {
+        if must_exist && !path.is_dir() {
+            return Err(OpenError::NoDatabase { path });
+        }
+        let claim = claim(&path)?;
         let existed = path.join("CURRENT").exists();
+        if must_exist && !existed {
+            return Err(OpenError::NoDatabase { path });
+        }
         if existed {
             verify_column_families(&path)?;
             // S1-P1: decide every refusal on a read-only open, which writes no file. A writable
@@ -256,6 +301,7 @@ impl RocksEngine {
         let db = DB::open_cf_descriptors(&db_options(!existed), &path, descriptors())
             .map_err(|e| backend(&path, &e))?;
         let created = ensure_format(&db, &path, existed)?;
+        let instance = read_instance(&db, &path)?;
         let lineages = restore_lineages(&db, &path)?;
         for (&(partition, generation), marks) in &lineages {
             tracing::info!(
@@ -277,13 +323,16 @@ impl RocksEngine {
             format_version = FORMAT_VERSION,
             created,
             lineages = lineages.len(),
+            instance_hex = instance.map(|id| hex(&id)),
             "storage_open"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
+            instance,
             injected: None,
+            claim: Some(Arc::new(claim)),
         })
     }
 
@@ -305,18 +354,22 @@ impl RocksEngine {
             Err(OpenError::NoDatabase { path: path.clone() })
         };
         let (db, lineages) = opened.map_err(refused)?;
+        let instance = read_instance(&db, &path).map_err(refused)?;
         tracing::info!(
             target: LOG_TARGET,
             path = %path.display(),
             format_version = FORMAT_VERSION,
             lineages = lineages.len(),
+            instance_hex = instance.map(|id| hex(&id)),
             "storage_open_read_only"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
+            instance,
             injected: None,
+            claim: None,
         })
     }
 
@@ -330,6 +383,53 @@ impl RocksEngine {
     #[must_use]
     pub fn lineages(&self) -> Vec<(PartitionId, Generation)> {
         self.lineages.keys().copied().collect()
+    }
+
+    /// The instance id this copy is bound to (M10, arch R3b), or `None` when it is unbound.
+    /// Read at open; a marker of the wrong length was refused there.
+    #[must_use]
+    pub const fn instance(&self) -> Option<[u8; INSTANCE_LEN]> {
+        self.instance
+    }
+
+    /// Bind this copy to instance `id`, with a synced write, before this returns `Ok`.
+    ///
+    /// Binding the id the copy already holds is a no-op that writes nothing, so an open that
+    /// died part way through binding its copies can bind them all again (arch R3b fresh step 2).
+    /// Never rebinds: a copy bound to another id is refused, and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// [`BindError::OtherInstance`] when the copy is bound to another id;
+    /// [`BindError::WriteFailed`] when RocksDB refuses the write (the copy stays unbound).
+    pub fn bind_instance(&mut self, id: [u8; INSTANCE_LEN]) -> Result<(), BindError> {
+        match self.instance {
+            Some(found) if found == id => return Ok(()),
+            Some(found) => {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    found_hex = hex(&found),
+                    wanted_hex = hex(&id),
+                    "instance_bind_refused"
+                );
+                return Err(BindError::OtherInstance { found, wanted: id });
+            }
+            None => {}
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        if let Err(e) = self
+            .db
+            .put_cf_opt(self.cf(CF_METADATA), INSTANCE_KEY, id, &opts)
+        {
+            tracing::error!(target: LOG_TARGET, error = %e, "instance_bind_failed");
+            return Err(BindError::WriteFailed {
+                detail: e.to_string(),
+            });
+        }
+        self.instance = Some(id);
+        tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
+        Ok(())
     }
 
     /// Apply a batch atomically and advance `buffered_applied`. **Buffered, not durable.**
@@ -737,6 +837,9 @@ impl std::fmt::Display for RawRecord {
                     );
                 return write!(f, "format_marker={format}");
             }
+            if self.key.as_ref() == INSTANCE_KEY {
+                return write!(f, "instance_marker={}", hex(&self.value));
+            }
             return write!(
                 f,
                 "unknown key={} value={}",
@@ -878,9 +981,32 @@ fn read_only(path: &Path) -> Result<(DB, Lineages), OpenError> {
     let db = DB::open_cf_for_read_only(&db_options(false), path, COLUMN_FAMILIES, false)
         .map_err(|e| backend(path, &e))?;
     check_format(&db, path, true)?;
+    read_instance(&db, path)?;
     let lineages = restore_lineages(&db, path)?;
     check_marks(&lineages)?;
     Ok((db, lineages))
+}
+
+/// The instance marker, `None` when absent. A marker that is not [`INSTANCE_LEN`] bytes is a
+/// corrupt record: refused at open, never read as unbound.
+fn read_instance(db: &DB, path: &Path) -> Result<Option<[u8; INSTANCE_LEN]>, OpenError> {
+    let meta = handle(db, path, CF_METADATA)?;
+    let Some(raw) = db
+        .get_cf(meta, INSTANCE_KEY)
+        .map_err(|e| backend(path, &e))?
+    else {
+        return Ok(None);
+    };
+    <[u8; INSTANCE_LEN]>::try_from(raw.as_slice())
+        .map(Some)
+        .map_err(|_| OpenError::CorruptRecord {
+            path: path.to_path_buf(),
+            key_hex: hex(INSTANCE_KEY),
+            problem: format!(
+                "the instance marker is {} bytes, not {INSTANCE_LEN}",
+                raw.len()
+            ),
+        })
 }
 
 /// Refuse a lineage with `durable > applied`.
@@ -1074,6 +1200,36 @@ fn handle<'a>(db: &'a DB, path: &Path, name: &str) -> Result<&'a ColumnFamily, O
         path: path.to_path_buf(),
         detail: format!("column family {name} has no handle after open"),
     })
+}
+
+/// The file in a node directory whose OS lock is that directory's claim (lead ruling A-R168).
+/// Never deleted: the OS releases the lock when the holder closes it, exits or crashes, so a
+/// file left behind is not a stale claim.
+pub(crate) const CLAIM_FILE: &str = "CLAIM";
+
+/// Take the claim on `path`, creating the directory and [`CLAIM_FILE`] if missing.
+/// `Locked` when another open, in this process or another, holds it.
+fn claim(path: &Path) -> Result<File, OpenError> {
+    let failed = |what: &str, e: std::io::Error| OpenError::Backend {
+        path: path.to_path_buf(),
+        detail: format!("{what} {CLAIM_FILE}: {e}"),
+    };
+    std::fs::create_dir_all(path).map_err(|e| failed("create the directory for", e))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.join(CLAIM_FILE))
+        .map_err(|e| failed("open", e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(OpenError::Locked {
+            path: path.to_path_buf(),
+            detail: format!("{CLAIM_FILE} is held by another open"),
+        }),
+        Err(TryLockError::Error(e)) => Err(failed("lock", e)),
+    }
 }
 
 /// Classify a RocksDB failure. `Locked` only for the IO errors RocksDB raises on the `LOCK`

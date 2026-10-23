@@ -708,6 +708,11 @@ impl NodeHandle {
         self.tx.send(msg).map_err(|_| NodeStopped(self.node))
     }
 
+    /// The node's mailbox, for a task that outlives this borrow (the reopen's heal).
+    pub(crate) fn sender(&self) -> Sender<Msg> {
+        self.tx.clone()
+    }
+
     /// A node with no thread: what is sent to it queues in the returned mailbox and is never
     /// answered. Crate tests only.
     #[cfg(test)]
@@ -777,6 +782,23 @@ pub(crate) fn spawn_with(
 ) -> Result<NodeHandle, String> {
     let engine = RocksEngine::open(&dir)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
+    spawn_on(node, engine, links, control, clock, budgets, limits, boot)
+}
+
+/// [`spawn_with`] on an engine the caller already opened (M10, arch R3b): `Db::open` opens all
+/// three first, which takes their `LOCK`s and reads their instance, and only then knows the
+/// boot to start them at.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_on(
+    node: NodeId,
+    engine: RocksEngine,
+    links: Arc<Links>,
+    control: Arc<ControlAdapter>,
+    clock: HostClock,
+    budgets: Budgets,
+    limits: Limits,
+    boot: BootId,
+) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone());
     let mut host = Host::new(node, engine, links, control, clock);
@@ -1841,10 +1863,11 @@ impl Host {
                 None => self.publication.step(&ctx, event),
             },
             ModuleName::Protection => step_l1(&mut self.l1, &ctx, event),
+            // F1 writes layout 3 for the instance this copy is bound to (M10, arch R3b).
             ModuleName::Recovery => self
                 .recoveries
                 .entry(partition)
-                .or_default()
+                .or_insert_with(|| Recovery::bound_to(self.engine.instance()))
                 .step(&ctx, event),
         };
         answer.map_err(StepError::Module)
@@ -1888,7 +1911,7 @@ impl Host {
             partition = partition.0,
             generation = generation.0,
             applied = applied.0,
-            records = view.len(),
+            // No record count: a lazy view's `len` reads the whole lineage (dev-w2, 9531f6a).
             millis = millis(started),
             "step_view"
         );
@@ -2969,15 +2992,49 @@ impl Host {
         }
     }
 
-    /// What this copy reports. M9 serves only an empty copy: it reports the plan's anchor at
-    /// the root. A copy holding anything answers `InventoryFailed`: reading a real survivor's
-    /// ladder is M10's (`host_unsupported`), and an invented inventory is never an answer.
+    /// What this copy reports for a plan anchored at `anchor`.
+    ///
+    /// * An anchor at generation 0 (the first open's bootstrap): an empty copy reports the
+    ///   anchor at the root, and a copy holding anything answers `InventoryFailed`, since an
+    ///   invented empty inventory would drop what it holds.
+    /// * An anchor at a later generation (a reopen, M10): the copy reports from its own engine
+    ///   ([`Self::survivor`]): the anchor, its applied head and every stored record digest from
+    ///   the base through the head. Anything it cannot prove from what it stores answers
+    ///   `InventoryFailed`, logged as `inventory_failed{reason}`, never an invented ladder.
     fn inventory(
         &self,
         partition: PartitionId,
         copy: CopyId,
         anchor: LineageAnchor,
     ) -> RecoveryEvent {
+        if anchor.lineage.generation > Generation(0) {
+            return match self.survivor(partition, copy, anchor) {
+                Ok(inventory) => {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        head = inventory.head.0 .0,
+                        "inventory_reported"
+                    );
+                    RecoveryEvent::InventoryReported(Box::new(inventory))
+                }
+                Err(reason) => {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        reason,
+                        "inventory_failed"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
+            };
+        }
         let holds =
             self.engine.lineages().into_iter().any(|(p, g)| {
                 p == partition && (g.0 > 0 || self.engine.buffered_applied(p, g).0 > 0)
@@ -3006,6 +3063,65 @@ impl Host {
             ladder: vec![(Seq::ZERO, Digest::ROOT)],
             quarantined: None,
         }))
+    }
+
+    /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
+    /// `Dispatcher::current_inventory` reports, read from this engine alone.
+    ///
+    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at
+    /// `anchor.base_seq` (its stored link), and the digest it stores at the base is
+    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). A copy holding a newer generation of the
+    /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
+    /// plan is made, never here.
+    fn survivor(
+        &self,
+        partition: PartitionId,
+        copy: CopyId,
+        anchor: LineageAnchor,
+    ) -> Result<SurvivorInventory, &'static str> {
+        let generation = anchor.lineage.generation;
+        let lineages = self.engine.lineages();
+        if lineages
+            .iter()
+            .any(|(p, g)| *p == partition && *g > generation)
+        {
+            return Err("copy_ahead_of_anchor");
+        }
+        if !lineages.contains(&(partition, generation)) {
+            return Err("anchor_generation_absent");
+        }
+        let link = self
+            .engine
+            .link(partition, generation)
+            .ok_or("anchor_generation_unlinked")?;
+        if link.base != anchor.base_seq {
+            return Err("base_differs");
+        }
+        let digest_at = |seq: Seq| -> Result<Digest, &'static str> {
+            if seq == Seq::ZERO {
+                return Ok(Digest::ROOT);
+            }
+            self.checked(partition, generation, seq)
+                .map(|(_, digest)| digest)
+        };
+        if digest_at(anchor.base_seq)? != anchor.base_digest {
+            return Err("base_digest_differs");
+        }
+        let head = Seq(self.engine.buffered_applied(partition, generation).0);
+        if head < anchor.base_seq {
+            return Err("head_below_base");
+        }
+        let ladder = (anchor.base_seq.0..=head.0)
+            .map(|seq| digest_at(Seq(seq)).map(|digest| (Seq(seq), digest)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let head_digest = ladder.last().map_or(anchor.base_digest, |(_, d)| *d);
+        Ok(SurvivorInventory {
+            copy,
+            anchor_seen: anchor,
+            head: (head, head_digest),
+            ladder,
+            quarantined: None,
+        })
     }
 
     /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`). `None` is a
@@ -5619,7 +5735,9 @@ mod tests {
     /// M9 serves only an empty copy, so a copy that holds anything must answer
     /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
     /// drops what the copy holds. Two ways to hold something: an anchor past the root, and a
-    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root.
+    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root of the
+    /// bootstrap's generation-0 anchor. M10: a later generation is a reopen's, answered only
+    /// from what the copy stores, so an empty copy asked for one answers `InventoryFailed`.
     #[test]
     fn a_copy_that_holds_anything_never_reports_an_empty_inventory() {
         let dir = config_testkit::fs::temp_dir();
@@ -5637,24 +5755,57 @@ mod tests {
             base_seq: Seq(1),
             ..root
         };
+        let bootstrap = LineageAnchor {
+            lineage: Lineage {
+                generation: Generation(0),
+                owner_epoch: OwnerEpoch(0),
+                ..root.lineage
+            },
+            ..root
+        };
         let report =
             |trio: &Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
 
         assert!(
-            matches!(report(&trio, root), RecoveryEvent::InventoryReported(_)),
+            matches!(
+                report(&trio, bootstrap),
+                RecoveryEvent::InventoryReported(_)
+            ),
             "an empty copy reports the root"
         );
         assert_eq!(
-            report(&trio, past_root),
+            report(
+                &trio,
+                LineageAnchor {
+                    base_seq: Seq(1),
+                    ..bootstrap
+                }
+            ),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
             "an anchor past the root"
+        );
+        assert_eq!(
+            report(&trio, root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "an empty copy asked for a reopen's generation 1"
         );
         trio.bootstrap();
         trio.ready();
         assert_eq!(
-            report(&trio, root),
+            report(&trio, bootstrap),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "a copy holding generation 1"
+            "a copy holding generation 1, asked for the bootstrap's empty anchor"
+        );
+        // M10 (reopen): a copy holding the anchor's generation reports from its engine, and
+        // one whose stored base is not the anchor's answers nothing.
+        assert!(
+            matches!(report(&trio, root), RecoveryEvent::InventoryReported(_)),
+            "a copy holding generation 1 at its anchor"
+        );
+        assert_eq!(
+            report(&trio, past_root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "a copy whose generation 1 starts elsewhere"
         );
     }
 
