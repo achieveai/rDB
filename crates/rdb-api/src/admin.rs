@@ -377,13 +377,13 @@ pub enum CounterError {
         key: String,
     },
     /// The directory has been opened [`MAX_OPENS`] times.
-    #[error("{key} has counted {MAX_OPENS} opens, the most one directory may have")]
+    #[error("{}", crate::db::error::counter_exhausted_text(.key, MAX_OPENS))]
     Exhausted {
         /// The counter's key.
         key: String,
     },
     /// The counter's value is not one this build writes.
-    #[error("{key} at revision {revision} is not an open counter")]
+    #[error("{}", crate::db::error::counter_unreadable_text(.key, *.revision))]
     Unreadable {
         /// The counter's key.
         key: String,

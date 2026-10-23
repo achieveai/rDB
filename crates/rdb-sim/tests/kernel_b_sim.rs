@@ -598,6 +598,7 @@ fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::K
         partition: PARTITION,
         seq: DurableSeq(BARRIER),
         digest,
+        boot: BOOT,
     };
     KernelEvent::Recovered(Box::new(RecoveryResult {
         fenced_prior: FencingProof {

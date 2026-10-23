@@ -5305,7 +5305,14 @@ fn m9_s6_a_clear_that_finds_an_unpublished_repair_is_an_unknown_outcome() {
         limit: 10,
     };
     match trio.look(10, b"m", members) {
-        Err(error) => assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}"),
+        Err(error) => {
+            assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}");
+            // #59, A-R230: the caller's text names its object and the damaged entry's key.
+            assert!(
+                error.detail.starts_with("object \"m\": ") && error.detail.contains("\"a\""),
+                "{error:?}"
+            );
+        }
         other => panic!("members of a damaged map: {other:?}"),
     }
     let repair = trio.compiled(compile_change(3, b"m", put(2), None));

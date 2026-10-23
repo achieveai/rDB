@@ -31,7 +31,8 @@
 //! pinned primary. An `RDBF` frame's sender is its credential's lineage, and the credential's
 //! 5R/6R/6R' checks stand in for the pinned-primary check (B-R59). Only then do the record rows
 //! run: row 4 plus the historical rule, then rows 5 and 6 as "at or below the frame's sender"
-//! (F1). Row 8 still decides records at or below the floor.
+//! (F1). Row 8 still decides records at or below the floor, whatever older generation sealed
+//! them (A-R223).
 
 mod complete;
 
@@ -103,7 +104,9 @@ pub struct HistoryRoot {
     pub floor: Seq,
     /// The digest the root pins at `floor`.
     pub base_digest: Digest,
-    /// The generation historical records were written under.
+    /// The generation recovery moved on from. The historical rule reads only that it is set:
+    /// a record below the floor is historical under any generation older than the adopted one,
+    /// not only this one (A-R223).
     pub predecessor: Option<Generation>,
 }
 
@@ -536,11 +539,6 @@ impl AppendReceiver {
         if !historical {
             let sender = fence.is_none().then_some(frame);
             if let Some(reject) = self.record_rows(&header, sender) {
-                if matches!(reject, AppendReject::StaleGeneration { .. })
-                    && self.already_holds(&envelope)
-                {
-                    return Verdict::Duplicate;
-                }
                 return refuse(reject);
             }
         }
@@ -553,26 +551,21 @@ impl AppendReceiver {
         self.sequence_row(envelope, body, historical)
     }
 
-    /// A record sealed under a generation older than the predecessor, at or below both the
-    /// history floor and the applied head, with the digest the ladder holds at that sequence
-    /// (D3, lead ruling A-R169): a repeat, answered as one (`AlreadyHave` and an ACK) and never
-    /// stored. After a generation that wrote nothing, the head was sealed two generations back,
-    /// and the keepalive that sends it must still draw an ACK. Above the floor the current
-    /// generation owns every sequence, so an older record there is never a plain repeat.
-    fn already_holds(&self, envelope: &ReplicationEnvelope) -> bool {
-        let seq = envelope.header.seq;
-        seq <= self.root.floor
-            && seq <= self.applied_head.seq
-            && envelope
-                .compute_record_digest()
-                .is_ok_and(|digest| digest == envelope.record_digest)
-            && self.history.lookup(seq, envelope.record_digest) == DigestLookup::Match
-    }
-
-    /// K-B-37: a record at or below the history floor, written under the predecessor
-    /// generation. Inert until a `Recovered` has set both.
+    /// K-B-37: a record at or below the history floor, sealed under any generation older than
+    /// the one this receiver adopted. Inert until a `Recovered` has set the root.
+    ///
+    /// Any older generation, not just the predecessor (M10 D3, lead ruling A-R223): after
+    /// writeless reopens the records below the floor were sealed two or more generations back,
+    /// and a copy that missed those reopens must still take them. The floor bounds it — above
+    /// the floor the adopted generation owns every sequence, so an older record there stays
+    /// `StaleGeneration`. Below it the record is judged by row 8 alone: the root pins the digest
+    /// at the floor and every other record must chain on the one beneath it, so a forged record
+    /// is proof, never data. This also answers a held head sealed generations back as a repeat
+    /// (`AlreadyHave` and an ACK), which A-R169 had needed a separate rule for.
     fn is_historical(&self, header: &EnvelopeHeader) -> bool {
-        header.seq <= self.root.floor && Some(header.generation) == self.root.predecessor
+        header.seq <= self.root.floor
+            && self.root.predecessor.is_some()
+            && header.generation < self.lineage.generation
     }
 
     /// The frame fence (lead ruling B-R58a), on the lineage the sender holds as it sends — never

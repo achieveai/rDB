@@ -128,15 +128,6 @@ pub struct ProgressTracker {
     /// Where this lineage's history begins: the cutoff of the `Recovered` that last rebuilt the
     /// tracker, 0 for one [`Self::new`] built and nothing rebuilt (lead rulings B-R71, B-R71a).
     base_seq: Seq,
-    /// The base the lineage before this one began at, when this tracker saw it: a rebuild into a
-    /// new generation takes its own `base_seq`, and one in the same generation keeps this. A
-    /// tracker built fresh has none. A record at or below it is older than the predecessor, which
-    /// the receiver's historical rule does not admit (catch-up step 1a).
-    /// It is the base this tracker last served, not checked against the recovery's
-    /// `predecessor_generation`: after generations this node did not serve it can sit below the
-    /// predecessor's base. Step 1a then under-fires: a record older than the predecessor can still
-    /// go out, and draws `StaleGeneration`. It never refuses a record the receiver would admit.
-    prior_base: Option<Seq>,
 }
 
 /// The two views a step compares before and after itself. Every edge the tracker reports is a
@@ -213,7 +204,6 @@ impl ProgressTracker {
             authority_seq: 0,
             retired: false,
             base_seq: Seq::ZERO,
-            prior_base: None,
         }
     }
 
@@ -282,6 +272,45 @@ impl ProgressTracker {
     #[must_use]
     pub const fn history(&self) -> &DigestLadder {
         &self.history
+    }
+
+    /// Fill the ladder from the primary's own engine, on demand (K3, lead ruling A-R223): a
+    /// tracker rebuilt by `Recovered` keeps only the rungs it held, so after writeless reopens
+    /// or a restart a copy far behind meets `NotRetained` for records the engine still holds.
+    /// The consumer of `SnapshotCatchupRequired` reads them and gives them here, and the next
+    /// `NeedPrefix` walks the copy record by record.
+    ///
+    /// `rungs` must be dense from 0 through the head, `(Seq(0), Digest::ROOT)` first, and agree
+    /// with every rung the ladder holds. A record past the head was never applied here.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `retired` for a retired tracker, which serves
+    /// nothing, and `rungs` when they are not dense through the head or contradict a held rung.
+    /// Nothing is inserted on an error.
+    pub fn restore_history(&mut self, rungs: &[(Seq, Digest)]) -> Result<(), RdbError> {
+        let invalid = |field| Err(RdbError::InvalidArgument { field });
+        if self.retired {
+            return invalid("retired");
+        }
+        let head = self.head().0;
+        let dense = rungs.len() as u64 == head + 1
+            && rungs
+                .iter()
+                .enumerate()
+                .all(|(at, (seq, _))| seq.0 == at as u64);
+        let disagrees = rungs.iter().any(|&(seq, digest)| {
+            self.history
+                .digest_at(seq)
+                .is_some_and(|held| held != digest)
+        });
+        if !dense || disagrees {
+            return invalid("rungs");
+        }
+        for &(seq, digest) in rungs {
+            self.history.insert(seq, digest);
+        }
+        Ok(())
     }
 
     /// `LocalApplied` on the primary (lead ruling B-R47): the primary applied `seq`, whose
@@ -807,14 +836,7 @@ impl ProgressTracker {
             owner_epoch: self.lineage.owner_epoch,
         };
         let mut rebuilt = Self::seeded(config.clone(), self.own, lineage, history, local);
-        // Lead ruling B-R71a. A `Recovered` in the generation already served re-announces it (a
-        // mode change, or F1's rebuild proving a copy durable): the lineage before it is the same.
         rebuilt.base_seq = cutoff;
-        rebuilt.prior_base = if result.new_generation == self.lineage.generation {
-            self.prior_base
-        } else {
-            Some(self.base_seq)
-        };
         rebuilt.adopt_view(&result.committed.authority_view);
         if !self.retired && result.new_generation == self.lineage.generation {
             rebuilt.diverged = self
@@ -895,12 +917,6 @@ impl ProgressTracker {
     #[must_use]
     pub const fn base_seq(&self) -> Seq {
         self.base_seq
-    }
-
-    /// Where the lineage before this one began, when this tracker saw it (lead ruling B-R71a).
-    #[must_use]
-    pub const fn prior_base(&self) -> Option<Seq> {
-        self.prior_base
     }
 
     /// Take a view's epoch and `authority_seq`: the one write `View` and `Recovered` share. The
