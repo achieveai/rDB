@@ -3141,7 +3141,7 @@ mod tests {
 
     /// Node 1's next answer to `node_status`, waited for within the scaled 5 s; see
     /// [`owner_of`]. For a row that asserts on one look rather than waits for a state.
-    fn owner_status(db: &Db, what: &str) -> NodeStatus {
+    pub(super) fn owner_status(db: &Db, what: &str) -> NodeStatus {
         owner_when(
             db,
             what,
@@ -6626,7 +6626,7 @@ mod tests {
     }
 
     /// Node 1's status once `done` holds for it, polled within `patience`; see [`owner_of`].
-    fn owner_when(
+    pub(super) fn owner_when(
         db: &Db,
         what: &str,
         patience: Duration,
@@ -8069,17 +8069,15 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut phase = None;
         let owner = loop {
-            let owner = db
-                .node_status()
-                .into_iter()
-                .find(|s| s.node == OWNER)
-                .expect("node 1 status");
-            if owner.recovery != phase {
-                tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
-                phase.clone_from(&owner.recovery);
-            }
-            if owner.admits == Some(true) {
-                break owner;
+            // Node 1 missing from a look is "not yet" (A-R257); see [`owner_of`].
+            if let Some(owner) = owner_of(&db, db.node_status()) {
+                if owner.recovery != phase {
+                    tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
+                    phase.clone_from(&owner.recovery);
+                }
+                if owner.admits == Some(true) {
+                    break owner;
+                }
             }
             assert!(
                 std::time::Instant::now() < deadline,

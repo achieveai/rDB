@@ -7,6 +7,7 @@
 //!   read-then-CAS, and a reopened `Db` takes a fresh grant in the same boot after a control store
 //!   outage (A-R96).
 
+use super::tests::{owner_status, owner_when};
 use super::*;
 
 fn config(dir: &Path) -> DbConfig {
@@ -250,7 +251,7 @@ fn m10_a_reopen_with_no_grant_record_heals_no_grant_held_and_reads_back() {
     assert_eq!(got.value.map(|(_, v)| v), Some(Bytes::from_static(b"2")));
     // F1 committed the reopen's generation fully protected (`PartitionMode::Active`: every copy
     // answered), not below it and rebuilding.
-    let owner = db.node_status().into_iter().next().expect("node 1");
+    let owner = owner_status(&db, "node 1 after the heal");
     assert_eq!(
         (owner.recovery.as_deref(), owner.recovered),
         (Some("Committed"), Some(served)),
@@ -541,24 +542,12 @@ fn m10_a_reopened_db_after_a_control_store_outage_takes_a_fresh_grant_in_the_sam
     let mut db = open_short().expect("the reopen");
     db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
         .expect("the reopen is ready");
-    let owner = |db: &Db| db.node_status().into_iter().next().expect("node 1 answers");
-    let before = owner(&db);
+    let before = owner_status(&db, "node 1 after the reopen");
     assert_eq!(before.admits, Some(true), "{before:?}");
 
     let patience = crate::host::test_patience(Duration::from_secs(30));
     let until = |what: &str, done: &dyn Fn(&crate::host::NodeStatus) -> bool| {
-        let deadline = std::time::Instant::now() + patience;
-        loop {
-            let status = owner(&db);
-            if done(&status) {
-                return status;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{what}: last status {status:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        owner_when(&db, what, patience, done)
     };
 
     mem.failing_with(config_core::ConfigError::Unavailable {
