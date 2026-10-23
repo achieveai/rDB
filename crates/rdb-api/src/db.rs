@@ -1125,6 +1125,34 @@ impl Db {
         let holds = engines
             .values()
             .any(|engine| engine.lineages().contains(&(PARTITION, record.generation)));
+        // arch-s2 B1 case 2 (the lr up race): a node process whose copy is only behind the
+        // record joins. The live owner's heal links it again; refusing it Stale here left a node
+        // started after the owner's reopen out for good. A copy ahead of the record still falls
+        // through to the refusal below, as does the owner's own copy.
+        let behind: Vec<u64> = engines
+            .values()
+            .flat_map(RocksEngine::lineages)
+            .filter(|(partition, _)| *partition == PARTITION)
+            .map(|(_, held)| held.0)
+            .collect();
+        if !holds
+            && partial
+            && !engines.contains_key(&record.owner)
+            && behind.iter().all(|held| *held < record.generation.0)
+        {
+            tracing::info!(
+                generation = record.generation.0,
+                owner = record.owner.0,
+                copies = ?behind,
+                "db_open_joining"
+            );
+            return Ok(Found {
+                instance,
+                fresh: false,
+                owner: record.owner,
+                roll: None,
+            });
+        }
         if !holds {
             // Ruling A-R184: roll forward only what the open counter proves no host activated.
             let (count, revision) = admin::read_count(&**store, &instance)
