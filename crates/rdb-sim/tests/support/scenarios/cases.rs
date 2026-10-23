@@ -21,6 +21,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
 use rdb_core::contracts::trace::{KeyId, Provenance};
+use rdb_core::recovery::MAX_WINDOW_EXTENSIONS;
 use rdb_sim::harness::run::RunPlan;
 
 use super::grammar::{
@@ -50,19 +51,49 @@ pub const F1_R1_MAX_TICKS: u64 = 12_000;
 /// The F1/R1 case: the tick discovery closes and L1 pauses. The fence lands at `PLAN_AT + 1` and
 /// C's transfer extends the 2 s window once, so the close is fence + 4 s.
 pub const F1_R1_PAUSED_AT: u64 = PLAN_AT + 1 + 4_000;
-/// The F1/R1 case: pops that are not the steady rate, measured 2026-09-26 on joint-b60b (B-R60 on)
-/// as `events_consumed - rate x (deadline - F1_R1_PAUSED_AT)`, 634.4 from both a 12 000- and a
-/// 24 000-tick run. About 13 pops before the close and ~620 at close + 10, where R1 walks C and A
-/// up from the root (one record per ACK below the cutoff, B-R58c) and F1 rebuilds and activates.
-pub const F1_R1_BASE_POPS: u64 = 635;
-/// The window [`F1_R1_STEADY_POPS_PER_WINDOW`] is counted over.
+/// The F1/R1 case: the tick of the host's first flush round, derived. The lowering starts the
+/// flusher at the **latest** cutoff F1 can choose, fence + window x (1 + `MAX_WINDOW_EXTENSIONS`)
+/// = 3 + 2_000 x 4 = 8_003, and A1's first `AcquireDue` 500 ms after that. The window really
+/// closes at [`F1_R1_PAUSED_AT`], after one extension, so L1 is paused for 4_000 ticks, exactly
+/// two rate windows, before the first round: one window is the walk (window 0), one is paused.
+pub const F1_R1_FIRST_HOST_ROUND_AT: u64 = PLAN_AT
+    + 1
+    + Budgets::SPEC_DEFAULTS.discovery_window_millis * (1 + MAX_WINDOW_EXTENSIONS as u64);
+const _: () = assert!(
+    (F1_R1_FIRST_HOST_ROUND_AT - F1_R1_PAUSED_AT).is_multiple_of(F1_R1_RATE_WINDOW),
+    "the first host round starts a rate window, so no window is part paused and part resumed"
+);
+/// The F1/R1 case: pops that are neither a rate nor the first host round (ruling A-R201), from
+/// the census of 2026-10-23 (int f5b3306, after A-R197): 1_249 pops in a 12_000-tick run, less
+/// the paused rate over `[F1_R1_PAUSED_AT, F1_R1_FIRST_HOST_ROUND_AT)` (181 x 2 = 362), the first
+/// host round (19) and the resumed rate over the rest (116 x 3_997 / 2_000 = 231.8): 636.2,
+/// rounded up. Most of it is at close + 10, where R1 walks C and A up from the root (one record
+/// per ACK below the cutoff, B-R58c) and F1 rebuilds and activates; 7 pops are before the close.
+/// The 2026-09-26 measurement on joint-b60b, against the old single rate, was 634.4.
+pub const F1_R1_BASE_POPS: u64 = 637;
+/// The window the F1/R1 rates are counted over.
 pub const F1_R1_RATE_WINDOW: u64 = 2_000;
-/// The F1/R1 case: R1's keepalive (one round per 100 ms, B-R60) plus H1's health cadence (every
-/// 50 ms), per [`F1_R1_RATE_WINDOW`], the most any window held in both measured runs (260 in all
-/// but one, 261 in one). Re-measured 2026-09-27 on sim-publish: 180 while the barrier is not
-/// durable, 260 once it is (L1 then records each keepalive ACK's durable progress and holds its
-/// resume), so 261 still bounds both.
-pub const F1_R1_KEEPALIVE_HEALTH_POPS_PER_WINDOW: u64 = 261;
+/// The F1/R1 case: pops per [`F1_R1_RATE_WINDOW`] while L1 is paused, derived by pop kind from
+/// the census of 2026-10-23 (ruling A-R201):
+///
+/// ```text
+///   L1's evaluation timer, every 50 ms                      2_000 / 50            =  40
+///   R1's B-R60 keepalive, 2_000 / 100 (KEEPALIVE_MS) = 20 rounds x 7              = 140
+///     B's timer 1, its frame to C and to A 2, and their replies on B 4
+///     (an Ack and an AlreadyHave from each)
+///   F1's last deadline, armed for one discovery window at the rebuild (close + 10),
+///     firing once at 6_013 with nothing left to bound                                 1
+///                                                                                  = 181
+/// ```
+///
+/// Measured 181 in `[6_003, 8_003)`. No host flush and no A1 renewal: both start at the latest
+/// cutoff, [`F1_R1_FIRST_HOST_ROUND_AT`]. The last term is a one-off, kept in the rate because the
+/// row checks exactly one paused window, `[F1_R1_PAUSED_AT + W, F1_R1_FIRST_HOST_ROUND_AT)`, and
+/// the deadline falls in it. Before A-R197 the keepalive never stopped and this term was 261.
+/// The 100 is written out, not read from `KEEPALIVE_MS`: a keepalive that speeds up must fail
+/// here by name, not carry the bound up with it.
+pub const F1_R1_PAUSED_POPS_PER_WINDOW: u64 =
+    F1_R1_RATE_WINDOW / 50 + (F1_R1_RATE_WINDOW / 100) * 7 + 1;
 /// The F1/R1 case: the host's flush cadence per [`F1_R1_RATE_WINDOW`] (ruling V-R30), derived and
 /// not measured:
 ///
@@ -73,9 +104,10 @@ pub const F1_R1_KEEPALIVE_HEALTH_POPS_PER_WINDOW: u64 = 261;
 ///
 /// One pop per flush because `Dispatcher::run_due_flushes` queues exactly one `Storage` event per
 /// flush that completes (a stalled one queues none). A flush over a prefix that is already durable
-/// makes no ACK: the copies answer it `NothingOutstanding`. Cross-checked, not fitted, against a
-/// run with only the first round. The window holding that round differs by 57 = 60 less the
-/// first round's own 3 `Flushed`, which both runs hold (see [`F1_R1_FIRST_HOST_ROUND_POPS`]).
+/// makes no ACK: the copies answer it `NothingOutstanding`. Cross-checked, not fitted, on
+/// 2026-09-27 against a run with only the first round: the window holding that round differed by
+/// 57 = 60 less the first round's own 3 `Flushed`, which both runs held. On 2026-10-23 (A-R201)
+/// every resumed round holds exactly 3 `Flushed`, one per node.
 /// The first round is a one-off on top, [`F1_R1_FIRST_HOST_ROUND_POPS`], and is not in this term.
 pub const F1_R1_HOST_FLUSH_POPS_PER_WINDOW: u64 =
     3 * (F1_R1_RATE_WINDOW / super::run::HOST_FLUSH_EVERY_MILLIS);
@@ -91,72 +123,93 @@ pub const F1_R1_HOST_FLUSH_POPS_PER_WINDOW: u64 =
 /// view, which is one more pop. The acquisition costs the same four and replaces a renewal.
 pub const F1_R1_A1_RENEWAL_POPS_PER_WINDOW: u64 =
     (F1_R1_RATE_WINDOW / Budgets::SPEC_DEFAULTS.renew_millis) * 4;
-/// The F1/R1 case: pops per [`F1_R1_RATE_WINDOW`] ticks once the walk has settled. L1 stays
-/// `Paused` for good here (C stops, A is dead), so the keepalive and health cadences run forever,
-/// and since ruling V-R30 so do the host's flushes and A1's renewals: ruling B-R65 bounds the
-/// rate, not the time.
-pub const F1_R1_STEADY_POPS_PER_WINDOW: u64 = F1_R1_KEEPALIVE_HEALTH_POPS_PER_WINDOW
-    + F1_R1_HOST_FLUSH_POPS_PER_WINDOW
-    + F1_R1_A1_RENEWAL_POPS_PER_WINDOW;
-/// The F1/R1 case: what the host's **first** flush round adds on B, once, over a steady round
-/// (ruling V-R31). That round is the first time the copies' prefix is durable, so R1 and L1 see
-/// the barrier go durable exactly once.
-///
-/// Derived by pop kind from the trace. B's pops over the first host round `[8003, 8103)` are
-/// compared with the round after it. The kinds come from the runner's Debug `runner pop` line
-/// (`RETCD_TEST_LOG=info,rdb_sim::harness::run=debug`), queried with DuckDB. Measured on
-/// 2026-09-27 at verif-pub-gate (bddc475 + overlay):
+/// The F1/R1 case: pops per [`F1_R1_RATE_WINDOW`] once L1 has resumed (ruling A-R201), derived:
 ///
 /// ```text
-///   kind                                                 first   next  extra
-///   Transport: C's and A's durable ACK, sent on their         2      0      2
-///     first synced flush (a later flush over the same
-///     prefix answers NothingOutstanding and sends none)
-///   Kernel, R1 -> L1: PeerProgress 4/2,                       6      2      4
-///     QualificationChanged (Gained) 1/0, DurableAdvanced 1/0
-///   Timer: L1's (Protection's) timer                          7      4      3
-///   Timer: R1's keepalive 1/1; Storage: B's own Flushed 1/1;  6      6      0
-///     Transport: the keepalive ACK deliveries 4/4
-///   total                                                    21     12      9
+///   L1's evaluation timer, every 50 ms     2_000 / 50 =  40
+///   the host's flushes                     F1_R1_HOST_FLUSH_POPS_PER_WINDOW =  60
+///   A1's renewals                          F1_R1_A1_RENEWAL_POPS_PER_WINDOW =  16
+///                                                                         = 116
 /// ```
 ///
-/// The absolute counts move with the tree; an earlier tree measured 20 against 11. The
-/// difference did not move. M7V-47 therefore asserts the difference, measured from its own
-/// run, against this constant.
+/// Measured 116 in `[10_003, 12_000)`, matching by kind. R1's keepalive is not in it: it runs only
+/// while L1 is paused (B-R60), and since A-R197 the `Active` re-emit restates R1's tracker instead
+/// of pausing L1 again, so L1 resumes once and stays resumed. Before A-R197 it never resumed here,
+/// and that was defect D12, not this case's design. The cadences run to the deadline: ruling B-R65
+/// bounds the rate, not the time.
+pub const F1_R1_RESUMED_POPS_PER_WINDOW: u64 =
+    F1_R1_RATE_WINDOW / 50 + F1_R1_HOST_FLUSH_POPS_PER_WINDOW + F1_R1_A1_RENEWAL_POPS_PER_WINDOW;
+/// The F1/R1 case: what the host's **first** flush round adds, once, on all three nodes, over the
+/// resumed round after it (rulings V-R31, A-R201). It is the first time the copies' prefix is
+/// durable: R1 and L1 see the barrier go durable, and L1 resumes inside the round.
 ///
-/// Control, not fitted: a run with the host's **first round only**.
-/// - B's first round still holds 21 pops. So the first round's pops do not depend on the rounds
-///   after it.
-/// - The next round holds 11: the 12 above, less B's `Flushed`, because that round has no flush.
-/// - The checked window holding the first round holds 284, against 341 with the full cadence.
-///   The gap is 57: the 60 host-flush pops of that window, less the first round's 3 `Flushed`,
-///   which both runs hold.
+/// Derived by pop kind from the trace, over `[8_003, 8_103)` against `[8_103, 8_203)`. The kinds
+/// come from the runner's Debug `runner pop` line
+/// (`RETCD_TEST_LOG=info,rdb_sim::harness::run=debug`), queried with DuckDB. Measured on
+/// 2026-10-23 at int f5b3306 (after A-R197):
+///
+/// ```text
+///   kind                                                       first   next  extra
+///   R1's last keepalive round: it fires at the round's tick,        7      0      7
+///     before L1 resumes (B's timer 1, the frames to C and A 2,
+///     their replies on B 4)
+///   Transport: C's and A's durable ACK, sent on their first         2      0      2
+///     synced flush (a later flush answers NothingOutstanding)
+///   Kernel, R1 -> L1 on B: PeerProgress 4, DurableAdvanced 1        5      0      5
+///   Timer: L1's evaluation on B, one per R1 -> L1 event at the      6      2      4
+///     round's tick (5) where a resumed round has 1, plus +50
+///   Kernel: L1's resume, SetAdmission{allow: true}                  1      0      1
+///   Storage: Flushed, one per node                                  3      3      0
+///   total                                                          24      5     19
+/// ```
+///
+/// Counted on all three nodes, where the V-R31 table counted B alone: before A-R197 C's and A's
+/// rounds were alike (a keepalive frame and a flush each), and now the first holds the last
+/// keepalive frame and the next does not. B alone is 20 against 3.
 ///
 /// It is counted once, in the one window that holds the first round ([`f1_r1_window_bound`]),
 /// never per window: added to every window it would loosen windows it is not in.
-pub const F1_R1_FIRST_HOST_ROUND_POPS: u64 = 2 + 4 + 3;
+pub const F1_R1_FIRST_HOST_ROUND_POPS: u64 = 7 + 2 + 5 + 4 + 1;
 
-/// The F1/R1 case: the most pops the rate window starting at `start` may hold. The steady rate,
-/// plus [`F1_R1_FIRST_HOST_ROUND_POPS`] only when this window holds `first_host_round` (the tick
-/// of the lowered plan's first host flush).
+/// The F1/R1 case: the rate of the window starting at `start`. Paused until the host's first
+/// round (the tick of the lowered plan's first host flush), resumed from it. With no host round L1
+/// never resumes.
+#[must_use]
+pub const fn f1_r1_window_rate(start: u64, first_host_round: Option<u64>) -> u64 {
+    match first_host_round {
+        Some(at) if start + F1_R1_RATE_WINDOW > at => F1_R1_RESUMED_POPS_PER_WINDOW,
+        _ => F1_R1_PAUSED_POPS_PER_WINDOW,
+    }
+}
+
+/// The F1/R1 case: the most pops the rate window starting at `start` may hold. Its rate, plus
+/// [`F1_R1_FIRST_HOST_ROUND_POPS`] only when this window holds `first_host_round`.
 #[must_use]
 pub const fn f1_r1_window_bound(start: u64, first_host_round: Option<u64>) -> u64 {
+    let rate = f1_r1_window_rate(start, first_host_round);
     match first_host_round {
         Some(at) if start <= at && at < start + F1_R1_RATE_WINDOW => {
-            F1_R1_STEADY_POPS_PER_WINDOW + F1_R1_FIRST_HOST_ROUND_POPS
+            rate + F1_R1_FIRST_HOST_ROUND_POPS
         }
-        _ => F1_R1_STEADY_POPS_PER_WINDOW,
+        _ => rate,
     }
 }
 
 /// The F1/R1 case's event budget for a deadline of `max_ticks`: base (with the host's first round,
-/// a one-off) plus the steady rate over the paused span, times 1.5, rounded up (ruling B-R65: a
-/// function of the deadline, never flat).
+/// a one-off) plus the paused rate up to the first round and the resumed rate after it, times 1.5,
+/// rounded up (ruling B-R65: a function of the deadline, never flat).
 #[must_use]
 pub const fn f1_r1_max_events(max_ticks: u64) -> u32 {
-    let paused = max_ticks.saturating_sub(F1_R1_PAUSED_AT);
+    let paused_until = if max_ticks < F1_R1_FIRST_HOST_ROUND_AT {
+        max_ticks
+    } else {
+        F1_R1_FIRST_HOST_ROUND_AT
+    };
+    let paused = paused_until.saturating_sub(F1_R1_PAUSED_AT);
+    let resumed = max_ticks.saturating_sub(F1_R1_FIRST_HOST_ROUND_AT);
     let scaled = (F1_R1_BASE_POPS + F1_R1_FIRST_HOST_ROUND_POPS) * F1_R1_RATE_WINDOW
-        + F1_R1_STEADY_POPS_PER_WINDOW * paused;
+        + F1_R1_PAUSED_POPS_PER_WINDOW * paused
+        + F1_R1_RESUMED_POPS_PER_WINDOW * resumed;
     let budget = (scaled * 3).div_ceil(2 * F1_R1_RATE_WINDOW);
     assert!(budget <= u32::MAX as u64, "an F1/R1 budget fits a u32");
     budget as u32

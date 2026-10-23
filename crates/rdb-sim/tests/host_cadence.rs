@@ -157,7 +157,13 @@ fn committed_cas(trace: &Trace, key: ControlKey) -> Vec<(usize, u64)> {
 
 /// M7V-93: a recovered scenario's lowering schedules the host's flusher on every node, after
 /// the cutoff and through the deadline, and with it L1 resumes on the primary once the barrier is
-/// durable — `SetAdmission{allow: true}`, no earlier than the first flush plus the resume hold.
+/// durable. The claim (ruling A-R205): L1's first resume in a generation comes only after a host
+/// flush at or after the cutoff has made the barrier durable — a `SetAdmission{allow: true}` at a
+/// host flush tick, no earlier than the first flush, after the pause L1 starts in.
+///
+/// The 5 s resume hold is not this row's: per A-R165(2) a generation's first resume skips it,
+/// and it applies to a resume after a later pause, which M7B-141 owns. Before A-R197 this row
+/// asserted the hold, because the `Active` re-emit paused L1 a second time (D12).
 ///
 /// Red before the cadence (L-R177gf): `plan.flushes` was empty, copy 2 reported durable 0 for
 /// ever, and every L1 evaluation answered `Ignored(BarrierNotDurable)`.
@@ -209,11 +215,21 @@ fn m7v_93_a_recovered_scenario_flushes_after_the_cutoff_and_l1_resumes() {
     let resumed = resumed.unwrap_or_else(|| {
         panic!("L1 on B never published SetAdmission{{allow: true}}: {admitted:?}")
     });
-    let hold = Budgets::SPEC_DEFAULTS.resume_hold_millis;
+    // A new generation's L1 starts paused, and its first resume skips the hold (A-R165(2)).
+    assert_eq!(
+        admitted.first().map(|(_, allow)| *allow),
+        Some(false),
+        "L1 on B starts paused: {admitted:?}"
+    );
     assert!(
-        resumed >= first_flush + hold,
-        "resumed at {resumed}, before the first flush ({first_flush}) plus the resume hold \
-         ({hold}): something other than the host flush made the barrier durable"
+        resumed >= first_flush,
+        "resumed at {resumed}, before the first host flush ({first_flush}): something other than \
+         the host flush made the barrier durable"
+    );
+    assert!(
+        plan.flushes.iter().any(|(at, _)| at.0 == resumed),
+        "resumed at {resumed}, which is no host flush tick: the resume does not follow the flush \
+         that made the barrier durable"
     );
     assert_eq!(
         admitted.last().map(|(_, allow)| *allow),
