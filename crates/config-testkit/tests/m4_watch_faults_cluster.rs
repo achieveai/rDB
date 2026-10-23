@@ -1084,22 +1084,39 @@ async fn m4_69_queue_cap_does_not_leak_between_streams() {
     // they all complete — `put_n`'s sequential awaits alone would leave `draining` unpolled for
     // the whole seeding phase, exactly like the deliberately-unpolled `stalled` stream, and it
     // would overflow its own queue instead of proving the caps stay independent.
-    let put_fut = put_n(&cluster, leader, 2000, "m4/69/");
+    //
+    // The bound is on delivery, not on writing: it starts when the last put returns. Before,
+    // one deadline covered all 2,000 sequential puts as well, and under host load the writer
+    // was still writing when it fired. Run 11 of 20 on 2026-10-23: 1777 puts issued in the
+    // 135 s window, and 1777 events delivered, so the stream was never behind.
+    let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+    let put_fut = async {
+        let written = put_n(&cluster, leader, 2000, "m4/69/").await;
+        let _ = written_tx.send(());
+        written
+    };
     let drain_fut = async {
         let mut delivered = Vec::with_capacity(2000);
-        let outcome = tokio::time::timeout(cluster.deadline(30), async {
-            while delivered.len() < 2000 {
-                match draining.next().await {
-                    Some(Ok(WatchItem::Event(e))) => delivered.push(e),
-                    Some(Ok(WatchItem::Progress { .. })) => {}
-                    other => panic!("unexpected watch item while draining to 2000: {other:?}"),
+        let after_writes = cluster.deadline(10);
+        let arrived = tokio::select! {
+            () = async {
+                while delivered.len() < 2000 {
+                    match draining.next().await {
+                        Some(Ok(WatchItem::Event(e))) => delivered.push(e),
+                        Some(Ok(WatchItem::Progress { .. })) => {}
+                        other => panic!("unexpected watch item while draining to 2000: {other:?}"),
+                    }
                 }
-            }
-        })
-        .await;
+            } => true,
+            () = async {
+                written_rx.await.expect("the writer finished");
+                tokio::time::sleep(after_writes).await;
+            } => false,
+        };
         assert!(
-            outcome.is_ok(),
-            "only {} of 2000 events arrived on the draining stream before the deadline",
+            arrived,
+            "only {} of 2000 events arrived on the draining stream within {after_writes:?} of \
+             the last put",
             delivered.len()
         );
         delivered
