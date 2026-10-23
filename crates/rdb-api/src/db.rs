@@ -2540,6 +2540,13 @@ impl Db {
                     boot = boot.0,
                     "node_restarted"
                 );
+                // #42 (A-R249): the other nodes hear the new boot as a net handshake tells a
+                // node process; the record owner then re-plans to link this copy again.
+                for other in nodes.iter().filter(|other| other.node != node) {
+                    if other.send(Msg::PeerBooted { node, boot }).is_err() {
+                        tracing::warn!(node = node.0, peer = other.node.0, "peer_booted_unsent");
+                    }
+                }
                 Ok(boot)
             }
             Err(detail) => {
@@ -4609,11 +4616,88 @@ mod tests {
         db.shutdown();
     }
 
-    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts, L1 pauses
-    /// writes; a put refused then was refused at admission and never queued, so a retry of it
-    /// must not promise that `status` will show its outcome: status stays `Unknown` for good. A
-    /// retry of the published put keeps the promise, since status shows it (review F-023).
-    /// Integration (~1 s): three node threads, one restart, a 400 ms pause budget.
+    /// #42 (A-R249), S2-2: node 3 restarts under a live owner. Node 1 hears the new boot, drains
+    /// its epoch and commits the next generation pinning it, so writes resume on RF3 with no
+    /// restart of node 1: a put lands and node 3 holds it durably at node 1's generation. Cut:
+    /// no re-plan, and node 1 logs `replication_copy_not_advancing` while node 3 never gets the
+    /// put. Integration (~3 s): three node threads, one restart.
+    #[config_log::retcd_test]
+    fn m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let of = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let before = of(&db, OWNER)
+            .recovered
+            .expect("node 1 recovered at the open");
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            let owner = of(&db, OWNER);
+            if owner.recovered > Some(before) && owner.admits == Some(true) {
+                match db.put(b"b", b"2", None) {
+                    Ok(put) => break put,
+                    Err(refused) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no put landed within {patience:?} of the restart: {refused:?}"
+                    ),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 did not re-plan past generation {} and admit within {patience:?}: \
+                 {owner:?}",
+                before.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let owner = of(&db, OWNER);
+        let generation = owner.recovered.expect("node 1 recovered");
+        let target = owner.holds.expect("node 1 holds the partition").durable;
+        loop {
+            let third = of(&db, NodeId(3));
+            let held = third.holds.map(|holds| (holds.generation, holds.durable));
+            if third.boot == BootId(2)
+                && held.is_some_and(|(at, durable)| at == generation && durable >= target)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 holds {held:?}, not generation {} through {target}, within {patience:?} \
+                 (put {put:?})",
+                generation.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+    }
+
+    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts and stops
+    /// advancing, L1 pauses writes; a put refused then was refused at admission and never
+    /// queued, so a retry of it must not promise that `status` will show its outcome: status
+    /// stays `Unknown` for good. A retry of the published put keeps the promise, since status
+    /// shows it (review F-023). Since A-R256(2) node 1 re-plans after the restart and writes
+    /// resume once node 3 syncs, so the published put is made at the re-planned generation and
+    /// node 3's link is then held to bring the pause, and the refusals still name the restart.
+    /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
     #[test]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
         let dir = config_testkit::fs::temp_dir();
@@ -4628,14 +4712,28 @@ mod tests {
             ))
             .expect("open");
         admits(&db, "after the open");
-        let first = db.put(b"a", b"1", None).expect("before the restart");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let before = owner_status(&db, "node 1 before the restart").recovered;
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
-        owner_when(
-            &db,
-            "L1 pauses",
-            crate::host::test_patience(Duration::from_secs(5)),
-            &|node| node.admits == Some(false),
-        );
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        let first = loop {
+            let owner = owner_status(&db, "node 1 re-planning");
+            if owner.recovered > before && owner.admits == Some(true) {
+                if let Ok(put) = db.put(b"a", b"2", None) {
+                    break put;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed after node 1's re-plan within {patience:?}: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        db.links().hold(OWNER, NodeId(3));
+        owner_when(&db, "L1 pauses", patience, &|node| {
+            node.admits == Some(false)
+        });
         let refused = db.put(b"a", b"9", None).expect_err("paused");
         assert_eq!(
             refused.error.kind,
