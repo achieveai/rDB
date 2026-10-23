@@ -2452,6 +2452,8 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
             value,
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     };
     // PB-5: no request id is printed. This write is under damage-chunk's own client, so
     // `status` and `retry` would look up another write under the same number.
@@ -2624,6 +2626,8 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         // Only a stored record is damaged; a missing one is refused, never written.
         conditions: vec![Condition::Present { key }],
         mutations,
+        acked_below: None,
+        pinned: Vec::new(),
     };
     // No request id is printed, as for damage-chunk (PB-5): another client's number.
     say(&match db.resend(request) {
@@ -5266,6 +5270,8 @@ mod tests {
             remaining_millis,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let mut sent = Sent::default();
         sent.record(Some(request(0)), Kind::Txn);
@@ -5317,6 +5323,8 @@ mod tests {
             remaining_millis,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let mut sent = Sent::default();
         sent.record(Some(request(1, 0)), Kind::Txn);
@@ -5714,6 +5722,8 @@ mod tests {
             remaining_millis: 0,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         sent.record(Some(request), Kind::Txn);
         assert_eq!(sent.nothing_to_retry(&[]), None);
@@ -5748,6 +5758,8 @@ mod tests {
                 value: Bytes::from_static(value),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let root = {
             let _env = ENV
@@ -5808,6 +5820,8 @@ mod tests {
                 value: Bytes::from_static(value),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let root = {
             let _env = ENV

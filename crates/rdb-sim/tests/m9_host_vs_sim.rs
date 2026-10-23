@@ -122,6 +122,8 @@ fn write(label: &'static str, request: u64, mutations: Vec<Mutation>) -> Step {
             remaining_millis: DEADLINE_MILLIS,
             conditions: Vec::new(),
             mutations,
+            acked_below: None,
+            pinned: Vec::new(),
         }),
     }
 }

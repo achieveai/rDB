@@ -122,6 +122,8 @@ fn submit_at(at: u64, correlation: u64, request: RequestId) -> SeedEvent {
                 value: Bytes::from_static(b"hello"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         })),
     }
 }

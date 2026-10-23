@@ -5385,6 +5385,8 @@ impl Host {
             remaining_millis,
             conditions,
             mutations,
+            acked_below: None,
+            pinned: Vec::new(),
         })))
     }
 
@@ -10030,6 +10032,8 @@ mod tests {
             remaining_millis,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let send = |host: &mut Host, remaining_millis| {
             let (reply, answer) = mpsc::channel();
@@ -11125,6 +11129,8 @@ mod tests {
                     .expect("seven bytes fit an envelope"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         match trio.ask(ClientCall::Resend { request: damage }) {
             Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(5)),
@@ -11157,6 +11163,8 @@ mod tests {
                 value: Bytes::from_static(b"not an envelope"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         match trio.ask(ClientCall::Resend { request: damage }) {
             Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(6)),
@@ -12084,6 +12092,8 @@ mod tests {
                 value,
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         }
     }
 
@@ -12701,6 +12711,8 @@ mod tests {
                     expected_version: None,
                 },
             ],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         assert_eq!(trio.sent(damage), Ok(3));
         let members = Look::Members {

@@ -824,6 +824,8 @@ impl TxnKernel {
             remaining_millis: START_RECORD_DEADLINE_MILLIS,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         tracing::info!(
             partition = self.lineage.partition.0,
@@ -2181,6 +2183,8 @@ mod tests {
             remaining_millis: 1_000,
             conditions,
             mutations,
+            acked_below: None,
+            pinned: Vec::new(),
         }
     }
 

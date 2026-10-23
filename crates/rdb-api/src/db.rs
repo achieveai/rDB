@@ -4565,6 +4565,8 @@ mod tests {
             remaining_millis: 0,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let refused = db
             .resend_within(request.clone(), past)
@@ -5741,6 +5743,8 @@ mod tests {
                 value: Bytes::from(newer),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         db.resend(raw).expect("write the newer build's record");
 

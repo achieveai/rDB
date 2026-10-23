@@ -141,6 +141,8 @@ fn submit(at: u64, request: u64) -> SeedEvent {
                 value: Bytes::copy_from_slice(&request.to_be_bytes()),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         })),
     }
 }
