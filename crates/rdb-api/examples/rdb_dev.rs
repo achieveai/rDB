@@ -496,8 +496,9 @@ fn main() -> ExitCode {
         }
     };
     eprintln!("log={}", args.log_dir.join("rdb_dev.jsonl").display());
-    // The gate's port range keeps the voters' port-0 binds out of the host's busy dynamic pool,
-    // and the voters' data goes under --dir, never %TEMP%.
+    // The gate's port range keeps the voters' port-0 binds out of the host's busy dynamic pool.
+    // `run` names the voters' stores under --dir itself; this keeps the harness's own scratch
+    // folder there too, never %TEMP%. Only `main` sets it: it is this process's, not a row's.
     if std::env::var_os("RETCD_TEST_PORT_RANGE").is_none() {
         std::env::set_var("RETCD_TEST_PORT_RANGE", "20000-26999");
     }
@@ -579,21 +580,28 @@ where
             }
         }
         None => {
-            let cluster = Arc::new(
-                rt.block_on(
-                    Cluster::builder()
-                        .nodes(3)
-                        .storage(StorageKind::ROCKS)
-                        .timers(CONTROL_TIMERS)
-                        .start(),
-                ),
-            );
+            // The voters' data goes under --dir by name, not through RETCD_TEST_DATA_DIR: the
+            // environment is the process's, and the rows that call `run` share one process.
+            let voters = voters_dir(&args.dir);
+            let mut builder = Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS);
+            for id in 1..=3 {
+                let node = voters.join(format!("node-{id}"));
+                if let Err(e) = std::fs::create_dir_all(&node) {
+                    eprintln!("rdb_dev: create {}: {e}", node.display());
+                    return ExitCode::from(1);
+                }
+                builder = builder.data_dir(VoterId(id), node);
+            }
+            let cluster = Arc::new(rt.block_on(builder.start()));
             let leader = rt.block_on(cluster.leader());
             let hostile = Arc::new(HostileStore::new(&cluster, leader));
             say(&format!("control up: 3 voters, leader {leader:?}"));
             (
                 Arc::clone(&hostile) as Arc<dyn ConfigStore>,
-                Some((cluster, hostile)),
+                Some((cluster, hostile, voters)),
             )
         }
     };
@@ -620,7 +628,7 @@ where
     }
     let progress = Progress::default();
     let stop = AtomicBool::new(false);
-    let control = local.as_ref().map(|(cluster, hostile)| Control {
+    let control = local.as_ref().map(|(cluster, hostile, _)| Control {
         cluster,
         store: hostile,
     });
@@ -647,13 +655,13 @@ where
 /// voters are not shut down and the run says so.
 fn close(
     store: Arc<dyn ConfigStore>,
-    local: Option<(Arc<Cluster>, Arc<HostileStore>)>,
+    local: Option<(Arc<Cluster>, Arc<HostileStore>, PathBuf)>,
     rt: tokio::runtime::Runtime,
     args: &Args,
     existed: bool,
 ) {
     drop(store);
-    if let Some((cluster, hostile)) = local {
+    if let Some((cluster, hostile, voters)) = local {
         drop(hostile);
         let started = Instant::now();
         let mut shared = cluster;
@@ -675,6 +683,9 @@ fn close(
         };
         if let Some(cluster) = cluster {
             rt.block_on(cluster.shutdown());
+            // The cluster leaves a directory it was handed to its caller; with the stores
+            // closed, it goes, `--keep` or not, as the cluster's own data root did.
+            remove(&voters);
         }
     }
     drop(rt);
@@ -690,6 +701,15 @@ fn close(
 struct Control<'a> {
     cluster: &'a Arc<Cluster>,
     store: &'a HostileStore,
+}
+
+/// A folder for this run's voters under `<dir>/control` that no earlier run left behind.
+fn voters_dir(dir: &std::path::Path) -> PathBuf {
+    let control = dir.join("control");
+    (0_u32..)
+        .map(|n| control.join(format!("voters-{}-{n}", std::process::id())))
+        .find(|path| !path.exists())
+        .expect("a free voters folder")
 }
 
 /// Remove `dir`, retrying for up to 2 s while Windows still holds a file the voters closed.
@@ -3752,9 +3772,18 @@ mod tests {
             - budgets.renew_millis) as u128
     }
 
-    /// The rows that set `RETCD_TEST_DATA_DIR`, as `main` does, hold this: the variable is the
-    /// process's, and these rows run in parallel.
+    /// The rows that start voters hold this, so their runs do not overlap. No row sets
+    /// `RETCD_TEST_DATA_DIR`: `run` names the voters' folder under `--dir` itself.
     static ENV: Mutex<()> = Mutex::new(());
+
+    /// Whether `dir`'s `control` folder holds a voter store: a folder with a `node-1` in it.
+    fn holds_voters(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir.join("control")).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().join("node-1").is_dir())
+        })
+    }
 
     fn owner(stalled: Option<&str>, admits: bool) -> NodeStatus {
         NodeStatus {
@@ -4898,7 +4927,7 @@ mod tests {
     }
 
     /// F-005, F-006: an open that fails tears the run down as a clean quit does, and without
-    /// `--keep` leaves no directory. The voters' data goes under `--dir`, as `main` puts it, so
+    /// `--keep` leaves no directory. The voters' data goes under `--dir`, as `run` names it, so
     /// the row also proves the order: a store handle still open when the voters close keeps
     /// their RocksDB files, and on Windows `--dir` then cannot be removed.
     /// Integration (~2 s): three real rEtcd voters; the Db open is the injected failure.
@@ -4909,8 +4938,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
-        // As `main` does.
-        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
+        let env_before = std::env::var_os("RETCD_TEST_DATA_DIR");
         let args = Args {
             dir: dir.clone(),
             log_dir: root.path().join("logs"),
@@ -4925,10 +4953,24 @@ mod tests {
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
         };
-        let code = run(&args, |_, _, _| async {
-            Err(OpenError::Node("node 2: injected".to_owned()))
+        let voters_under_dir = AtomicBool::new(false);
+        let code = run(&args, |config, _, _| {
+            voters_under_dir.store(holds_voters(&config.dir), Ordering::Relaxed);
+            async { Err(OpenError::Node("node 2: injected".to_owned())) }
         });
         assert_eq!(code, ExitCode::from(1), "a failed open exits 1");
+        assert!(
+            voters_under_dir.load(Ordering::Relaxed),
+            "the voters' data was not under {}",
+            dir.display()
+        );
+        // Found by W1: a row that leaves this changed nests every later row's
+        // folders one level deeper, and the fifth level passed MAX_PATH inside RocksDB.
+        assert_eq!(
+            std::env::var_os("RETCD_TEST_DATA_DIR"),
+            env_before,
+            "the row left RETCD_TEST_DATA_DIR changed"
+        );
         assert!(
             !dir.exists(),
             "the failed open left {} behind",
@@ -5051,7 +5093,6 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
-        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
         let args = Args {
             dir: dir.clone(),
             log_dir: root.path().join("logs"),
@@ -5398,7 +5439,6 @@ mod tests {
                 expected_version: None,
             }],
         };
-        // `temp_dir` reads RETCD_TEST_DATA_DIR, which the run rows point at their own `--dir`.
         let root = {
             let _env = ENV
                 .lock()
@@ -5623,7 +5663,6 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
-        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
         let script = root.path().join("script.txt");
         std::fs::write(&script, "wait ready 60\nnode restart 1\nwait ready 10\n")
             .expect("write the script");
@@ -5797,7 +5836,6 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
-        std::env::set_var("RETCD_TEST_DATA_DIR", root.path().join("control"));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
