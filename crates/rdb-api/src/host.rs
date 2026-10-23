@@ -26,11 +26,12 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rdb_core::authority::partition::INSTANCE_LEN;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
     AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
@@ -268,6 +269,16 @@ pub enum Msg {
         kind: &'static str,
         /// Its detail.
         detail: String,
+    },
+    /// Ruling A-R184: the open counter marks `generation` activated, so this node may acquire
+    /// under it and admit writes. Dropped unless `boot` is the node's own, as [`Msg::Control`].
+    Activated {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// The generation now marked.
+        generation: Generation,
     },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
@@ -922,6 +933,60 @@ pub(crate) fn spawn_on(
     })
 }
 
+/// A partition's activation marks on one node (ruling A-R184).
+#[derive(Debug, Default, Clone, Copy)]
+struct Activation {
+    /// The newest generation this process asked the open counter to mark.
+    asked: Generation,
+    /// The newest generation the open counter is known to mark.
+    marked: Generation,
+    /// The first acquire, waiting on the mark of its generation: when it is due.
+    acquire: Option<(Generation, Site, Tick)>,
+}
+
+/// What a node does when F1 reports a commit, set by [`after_commit`] for its data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterCommit {
+    /// Abort the process: the commit is in the control store and nothing after it ran.
+    Abort,
+    /// Fault the node instead, so a crate row can go on in the same process.
+    #[cfg(test)]
+    Fault,
+}
+
+/// The data directories whose nodes act on a commit report, and how.
+static AFTER_COMMIT: Mutex<Vec<(PathBuf, AfterCommit)>> = Mutex::new(Vec::new());
+
+/// The `--abort-after-commit` hook (ruling A-R184): every node started afterwards on a copy
+/// under `dir`, spelled as the `DbConfig::dir` the open is given, aborts the whole process as
+/// soon as F1 reports a recovery committed, before the node links the new generation or marks
+/// it activated. So the reopen finds `partitions/1` at a generation no copy holds. A dev and
+/// test hook; never call it in an app.
+#[doc(hidden)]
+pub fn abort_after_commit(dir: &std::path::Path) {
+    set_after_commit(dir, Some(AfterCommit::Abort));
+}
+
+/// Set or clear what nodes under `dir` do on a commit report.
+pub(crate) fn set_after_commit(dir: &std::path::Path, what: Option<AfterCommit>) {
+    let mut hooks = AFTER_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hooks.retain(|(at, _)| at != dir);
+    if let Some(what) = what {
+        hooks.push((dir.to_path_buf(), what));
+    }
+}
+
+fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
+    AFTER_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(dir, _)| path.starts_with(dir))
+        .map(|(_, what)| *what)
+}
+
 /// The triple the next step for a partition carries.
 #[derive(Debug, Default, Clone, Copy)]
 struct Adopted {
@@ -1179,6 +1244,14 @@ struct Host {
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    /// The instance this node's engine is bound to when it started, whose open counter holds
+    /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
+    /// is marked, and nothing waits on a mark.
+    instance: Option<[u8; INSTANCE_LEN]>,
+    /// Per partition, the activation marks this node asked for and has (ruling A-R184).
+    activation: BTreeMap<PartitionId, Activation>,
+    /// Set by [`after_commit`] for this node's data directory: what to do on a commit report.
+    after_commit: Option<AfterCommit>,
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
     /// The stall line, per partition, once reported, up to its effect, with the mode it names;
     /// cleared when the partition activates. [`Self::status`] adds the effect as it reads the
@@ -1217,6 +1290,8 @@ impl Host {
         clock: HostClock,
     ) -> Self {
         let now = clock.now();
+        let engine_instance = engine.instance();
+        let after_commit = after_commit_for(engine.path());
         Self {
             node,
             boot: BOOT,
@@ -1264,6 +1339,9 @@ impl Host {
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
+            instance: engine_instance,
+            activation: BTreeMap::new(),
+            after_commit,
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
             rebuild_pin_wait_millis: REBUILD_PIN_WAIT_MILLIS,
@@ -1341,6 +1419,7 @@ impl Host {
         let what = match msg {
             Msg::Control { event, .. } => format!("control/{}", head(&format!("{event:?}"))),
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
+            Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
             _ => "other".to_owned(),
         };
         tracing::info!(
@@ -1358,7 +1437,9 @@ impl Host {
             return;
         }
         let outcome = match msg {
-            Msg::Control { boot, .. } | Msg::Fault { boot, .. } if boot != self.boot => {
+            Msg::Control { boot, .. } | Msg::Fault { boot, .. } | Msg::Activated { boot, .. }
+                if boot != self.boot =>
+            {
                 self.drop_stale(&msg, boot);
                 Ok(())
             }
@@ -1377,6 +1458,14 @@ impl Host {
             }
             Msg::Fault { kind, detail, .. } => {
                 Err(format!("control adapter: {kind}: {detail}").into())
+            }
+            Msg::Activated {
+                partition,
+                generation,
+                ..
+            } => {
+                self.activated(partition, generation);
+                Ok(())
             }
             Msg::Inject {
                 partition,
@@ -2757,6 +2846,27 @@ impl Host {
     /// F1 committed a recovery here: inherit, tell the other members, wake A1 if primary.
     fn recovered(&mut self, result: &RecoveryResult, site: Site) -> Result<(), Fault> {
         let partition = site.partition;
+        if let Some(what) = self.after_commit {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = result.new_generation.0,
+                what = ?what,
+                "after_commit_hook"
+            );
+            match what {
+                AfterCommit::Abort => {
+                    std::process::abort();
+                }
+                #[cfg(test)]
+                AfterCommit::Fault => {
+                    return Err(Fault::from(format!(
+                        "after-commit hook: generation {} committed and not linked",
+                        result.new_generation.0
+                    )))
+                }
+            }
+        }
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -3097,6 +3207,11 @@ impl Host {
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
     /// prior owner acquiring would put its fenced identity back). Sooner after an `Active`
     /// commit: [`ACQUIRE_AFTER_ACTIVE_MILLIS`], else [`ACQUIRE_AFTER_RECOVERED_MILLIS`].
+    ///
+    /// Ruling A-R184: first the primary marks each newly committed generation activated in the
+    /// open counter, every one this process hears, not only the first; the first acquire waits
+    /// for its mark ([`Msg::Activated`]), and [`Self::unactivated`] refuses writes under a
+    /// generation not yet marked, so a second recovery in one open is gated too.
     fn schedule_acquire(&mut self, result: &RecoveryResult, site: Site) {
         let primary = result
             .committed
@@ -3104,7 +3219,27 @@ impl Host {
             .members
             .iter()
             .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
-        if !primary || !self.acquire_scheduled.insert(site.partition) {
+        if !primary {
+            return;
+        }
+        let generation = result.new_generation;
+        if let Some(instance) = self.instance {
+            let activation = self.activation.entry(site.partition).or_default();
+            if activation.asked < generation {
+                activation.asked = generation;
+                tracing::info!(
+                    node = self.node.0,
+                    partition = site.partition.0,
+                    kind = "activate",
+                    generation = generation.0,
+                    marked = activation.marked.0,
+                    "host_duty"
+                );
+                self.control
+                    .activate(self.node, self.boot, site.partition, instance, generation);
+            }
+        }
+        if !self.acquire_scheduled.insert(site.partition) {
             return;
         }
         let wait = if result.mode == PartitionMode::Active {
@@ -3113,6 +3248,71 @@ impl Host {
             ACQUIRE_AFTER_RECOVERED_MILLIS
         };
         let at = self.clock.now().plus_millis(wait);
+        if self.instance.is_some() {
+            let activation = self.activation.entry(site.partition).or_default();
+            if activation.marked < generation {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = site.partition.0,
+                    generation = generation.0,
+                    "acquire_waits_on_activation"
+                );
+                activation.acquire = Some((generation, site, at));
+                return;
+            }
+        }
+        self.acquire_at(site, at, wait);
+    }
+
+    /// Ruling A-R184: the open counter marks `generation` activated for `partition`. Starts the
+    /// acquire that waited on it.
+    fn activated(&mut self, partition: PartitionId, generation: Generation) {
+        let activation = self.activation.entry(partition).or_default();
+        activation.marked = activation.marked.max(generation);
+        let marked = activation.marked;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            marked = marked.0,
+            "host_activated"
+        );
+        let due = match activation.acquire {
+            Some((waits_for, _, _)) if waits_for <= marked => activation.acquire.take(),
+            _ => None,
+        };
+        if let Some((_, site, at)) = due {
+            let now = self.clock.now();
+            self.acquire_at(site, at.max(now), HostClock::millis_until(now, at));
+        }
+    }
+
+    /// Ruling A-R184: why a write to `partition` is refused here, when this primary has not yet
+    /// heard that the open counter marks its adopted generation activated. `None` on an
+    /// unbound engine, and on a node that is not the partition's primary, whose writes the
+    /// kernel refuses on its own.
+    fn unactivated(&self, partition: PartitionId) -> Option<ApiError> {
+        self.instance?;
+        self.replication.primary(self.node, partition)?;
+        let generation = self.adopted(partition).generation;
+        let marked = self
+            .activation
+            .get(&partition)
+            .map_or(Generation(0), |activation| activation.marked);
+        (generation.0 != 0 && marked < generation).then(|| ApiError {
+            kind: ErrorKind::Unavailable,
+            retry: rdb_core::RetryRule::BoundedJitter,
+            no_mutation: true,
+            detail: format!(
+                "generation {} of partition {} on node {} is not yet marked activated in the                  open counter; nothing was sent",
+                generation.0, partition.0, self.node.0
+            ),
+            retry_after: None,
+        })
+    }
+
+    /// A1's first `AcquireDue` at `at`, `wait` from when it was asked for.
+    fn acquire_at(&mut self, site: Site, at: Tick, wait: u64) {
         tracing::info!(
             node = self.node.0,
             partition = site.partition.0,
@@ -4254,6 +4454,7 @@ impl Host {
             call,
             reply,
         } = client;
+        let was_resend = matches!(call, ClientCall::Resend { .. });
         let (identity, kind, pending) = match call {
             ClientCall::Put {
                 identity,
@@ -4369,6 +4570,22 @@ impl Host {
                 None,
             ),
         };
+        // Ruling A-R184: no write goes out under a generation not yet marked activated.
+        if let EventKind::Client(ClientEvent::Submit(request)) = &kind {
+            if let Some(error) = self.unactivated(partition) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    request = identity.request.0,
+                    "client_call_refused_unactivated"
+                );
+                let _ = reply.send(Answer::Error {
+                    error,
+                    request: was_resend.then(|| request.clone()),
+                });
+                return Ok(());
+            }
+        }
         // The fence every sent put carries, so a log can show none goes out unfenced.
         let expected_generation = match &kind {
             EventKind::Client(ClientEvent::Submit(request)) => {
@@ -4959,9 +5176,12 @@ impl Host {
                 .and_then(Protection::mode)
                 .map(|mode| mode_name(mode).to_owned()),
             // A faulted node answers every call with its fault, so it admits nothing (S1-8).
-            admits: l1
-                .and_then(|l1| l1.admission_state(now))
-                .map(|state| state.allow && granted && self.fault.is_none()),
+            admits: l1.and_then(|l1| l1.admission_state(now)).map(|state| {
+                state.allow
+                    && granted
+                    && self.fault.is_none()
+                    && self.unactivated(partition).is_none()
+            }),
             published: self
                 .publication
                 .kernel(self.node, partition)
@@ -10960,5 +11180,56 @@ mod tests {
             ),
             "once the repair is published the map is not damaged"
         );
+    }
+    /// Ruling A-R184, the write gate: the lead asked that a second recovery in one open go
+    /// through the gate too, so a write is refused, and nothing is sent, while the primary has
+    /// not heard that the open counter marks its adopted generation activated, even with a grant
+    /// held. `admits` says false meanwhile, so `wait_ready` waits for the mark. Here the mark
+    /// is taken back by hand, which is what a second recovery's commit leaves until its own mark
+    /// lands. Cut: `unactivated` answers `None`, and the put publishes. Trio, about 1 s.
+    #[test]
+    fn a_write_under_a_generation_not_marked_activated_is_refused_and_sends_nothing() {
+        let dir = config_testkit::fs::temp_dir();
+        let instance = [7_u8; INSTANCE_LEN];
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.instance = Some(instance);
+        });
+        trio.rt
+            .block_on(crate::admin::count_open(
+                &*trio.store,
+                &instance,
+                true,
+                crate::admin::COUNT_WITHIN,
+            ))
+            .expect("the open counter");
+        trio.bootstrap();
+        trio.ready();
+        let add = |n| Change::Set(vec![ElemOp::Add(int(n))]);
+        assert_eq!(
+            trio.write(compile_change(1, b"s", add(1), Some(Expected::Absent))),
+            Ok(2),
+            "a write once the mark is heard"
+        );
+        let marked = trio.nodes[0]
+            .0
+            .activation
+            .get_mut(&PartitionId(1))
+            .expect("node 1 asked for a mark");
+        assert_eq!(marked.marked, Generation(1), "{marked:?}");
+        marked.marked = Generation(0);
+        assert!(
+            trio.status(0).authority.starts_with("held"),
+            "{:?}",
+            trio.status(0)
+        );
+        assert_eq!(trio.status(0).admits, Some(false), "{:?}", trio.status(0));
+        let head = trio.head();
+        assert_eq!(
+            trio.write(compile_change(2, b"s", add(2), None)),
+            Err(Refused::ByKernel(ErrorKind::Unavailable)),
+            "refused before it is sent"
+        );
+        assert_eq!(trio.head(), head, "nothing was sent");
     }
 }
