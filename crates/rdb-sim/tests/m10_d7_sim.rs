@@ -28,18 +28,24 @@ mod support;
 use bytes::Bytes;
 use config_log::retcd_test;
 use rdb_core::contracts::authority::Lineage;
-use rdb_core::contracts::event::{ClientEvent, EventKind, ReplyEffect};
+use rdb_core::contracts::event::{ClientEvent, EventKind, KernelEvent, ReplyEffect};
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, ConfigVersion, CorrelationId, DurableSeq, Generation, NodeId,
+    AffinityId, BootId, ClientId, ConfigVersion, CorrelationId, DurableSeq, Generation, NodeId,
     PartitionId, RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::recovery::RecoveryEvent;
+use rdb_core::contracts::storage::StorageFault;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{ReadServiceOutcome, TraceKind};
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
 use rdb_core::contracts::version::API_VERSION;
-use rdb_sim::harness::run::{RunLimits, RunPlan, RunReport, Runner, SeedEvent, StopReason};
+use rdb_sim::harness::run::{
+    RunLimits, RunPlan, RunReport, Runner, ScenarioStep, SeedEvent, StepAction, StopReason,
+};
+use rdb_sim::sim::network::{Delivery, NetworkOp};
 use rdb_sim::storage::history::canonical_history;
+use rdb_sim::storage::StorageOp;
 
 use support::scenarios::cases::{self, A_NODE, B_NODE, C_NODE, PARTITION};
 use support::scenarios::run as scenario_run;
@@ -69,24 +75,34 @@ fn copy_of(node: NodeId) -> CopyId {
 /// [`cases::m9_s0_held`] with every node but `lagging` at [`HEAD`], and `lagging` holding the
 /// same canonical history through `HEAD - 1`, its survivor inventory saying so.
 fn plan(lagging: NodeId) -> RunPlan {
-    let full: Vec<NodeId> = NODES.into_iter().filter(|node| *node != lagging).collect();
-    let mut plan = scenario_run::lower(&cases::m9_s0_held(&full, HEAD, MAX_TICKS)).expect("lowers");
+    plan_at(HEAD, &[(lagging, HEAD.0 - 1)])
+}
+
+/// [`cases::m9_s0_held`] at `head`, except that each `(node, through)` in `lagging` holds the
+/// same canonical history only through `through`, its survivor inventory saying so.
+fn plan_at(head: Seq, lagging: &[(NodeId, u64)]) -> RunPlan {
+    let full: Vec<NodeId> = NODES
+        .into_iter()
+        .filter(|node| lagging.iter().all(|(behind, _)| behind != node))
+        .collect();
+    let mut plan = scenario_run::lower(&cases::m9_s0_held(&full, head, MAX_TICKS)).expect("lowers");
     let (_, _, sample) = plan.survivors.first().cloned().expect("placed");
     let prior = sample.anchor_seen.lineage;
     assert_eq!(prior.generation, PRIOR);
-    let behind = HEAD.0 - 1;
-    let history = canonical_history(prior, ConfigVersion(1), behind).expect("history");
-    plan.preloads
-        .extend(history.batches.iter().map(|batch| (lagging, batch.clone())));
-    plan.preload_durable
-        .push((lagging, PARTITION, PRIOR, DurableSeq(behind)));
-    let mut inventory = sample;
-    inventory.copy = copy_of(lagging);
-    inventory.head = (Seq(behind), history.digest(behind));
-    inventory.ladder = (0..=behind)
-        .map(|seq| (Seq(seq), history.digest(seq)))
-        .collect();
-    plan.survivors.push((lagging, PARTITION, inventory));
+    for &(node, through) in lagging {
+        let history = canonical_history(prior, ConfigVersion(1), through).expect("history");
+        plan.preloads
+            .extend(history.batches.iter().map(|batch| (node, batch.clone())));
+        plan.preload_durable
+            .push((node, PARTITION, PRIOR, DurableSeq(through)));
+        let mut inventory = sample.clone();
+        inventory.copy = copy_of(node);
+        inventory.head = (Seq(through), history.digest(through));
+        inventory.ladder = (0..=through)
+            .map(|seq| (Seq(seq), history.digest(seq)))
+            .collect();
+        plan.survivors.push((node, PARTITION, inventory));
+    }
     plan
 }
 
@@ -145,10 +161,10 @@ fn read_back() -> SeedEvent {
     )
 }
 
-/// Run the world with `lagging` behind, then the write and its read.
-fn run(lagging: NodeId) -> (Runner, RunReport) {
+/// Run the world `plan`, then the write and its read.
+fn run(plan: &RunPlan) -> (Runner, RunReport) {
     support::preamble();
-    let mut runner = Runner::new(&plan(lagging)).expect("plan");
+    let mut runner = Runner::new(plan).expect("plan");
     runner.queue(&submit()).expect("queue");
     runner.queue(&read_back()).expect("queue");
     let report = runner
@@ -158,7 +174,6 @@ fn run(lagging: NodeId) -> (Runner, RunReport) {
         })
         .expect("runs");
     tracing::info!(
-        lagging = lagging.0,
         stop = ?report.stop,
         replies = report.replies.len(),
         "d7 run"
@@ -181,10 +196,16 @@ fn nodes_logging(method: &str, message: &str) -> Vec<u64> {
 }
 
 /// What every row holds, write or not: the run never stopped on a refusal; no R1 refused the
-/// catch-up and F1 never blocked (D7's two symptoms), and F1 committed; the target's node and the
-/// source's restored a dormant receiver, and only the source built a ladder; nothing was refused,
-/// nothing faulted; and every copy holds generation 1 through [`HEAD`].
-fn caught_up(method: &str, runner: &Runner, report: &RunReport, lagging: NodeId, source: NodeId) {
+/// catch-up and F1 never blocked (D7's two symptoms), and F1 committed; each target's node and the
+/// source's restored a dormant receiver once, and only the source built a ladder, once; nothing
+/// was refused, nothing faulted; and every copy holds generation 1 through [`HEAD`].
+fn caught_up(
+    method: &str,
+    runner: &Runner,
+    report: &RunReport,
+    lagging: &[NodeId],
+    source: NodeId,
+) {
     assert!(
         matches!(report.stop, StopReason::DeadlineReached { .. }),
         "ran to the deadline: {:?}",
@@ -215,7 +236,8 @@ fn caught_up(method: &str, runner: &Runner, report: &RunReport, lagging: NodeId,
 
     let mut restored = nodes_logging(method, "dormant_restored");
     restored.sort_unstable();
-    let mut expected = vec![u64::from(lagging.0), u64::from(source.0)];
+    let mut expected: Vec<u64> = lagging.iter().map(|node| u64::from(node.0)).collect();
+    expected.push(u64::from(source.0));
     expected.sort_unstable();
     assert_eq!(
         restored, expected,
@@ -250,11 +272,11 @@ fn caught_up(method: &str, runner: &Runner, report: &RunReport, lagging: NodeId,
     );
 }
 
-/// A lagging copy, caught up from `source`, and then the write and its read: the write answered
-/// in generation 2 right after the cutoff and applied on every copy, and the read, sent to the
-/// same node after the answer, finds the acknowledged write.
-fn lags_then_writes(method: &str, lagging: NodeId, source: NodeId) {
-    let (runner, report) = run(lagging);
+/// The lagging copies of `plan`, caught up from `source`, and then the write and its read: the
+/// write answered in generation 2 right after the cutoff and applied on every copy, and the read,
+/// sent to the same node after the answer, finds the acknowledged write.
+fn lags_then_writes(method: &str, plan: &RunPlan, lagging: &[NodeId], source: NodeId) -> Runner {
+    let (runner, report) = run(plan);
     caught_up(method, &runner, &report, lagging, source);
     let mut answers: Vec<(Generation, Seq)> = Vec::new();
     let mut reads: Vec<(ReadServiceOutcome, Option<u64>)> = Vec::new();
@@ -288,6 +310,7 @@ fn lags_then_writes(method: &str, lagging: NodeId, source: NodeId) {
             .0
     });
     assert_eq!(applied, [HEAD.next().0; 3], "every copy applies the write");
+    runner
 }
 
 /// A-R173 row 1, source = old primary: A lags, B sources, and the write publishes.
@@ -295,7 +318,8 @@ fn lags_then_writes(method: &str, lagging: NodeId, source: NodeId) {
 fn m10_d7_restart_all_three_a_lags_b_catches_it_up_and_the_write_publishes() {
     lags_then_writes(
         "m10_d7_restart_all_three_a_lags_b_catches_it_up_and_the_write_publishes",
-        A_NODE,
+        &plan(A_NODE),
+        &[A_NODE],
         B_NODE,
     );
 }
@@ -305,7 +329,8 @@ fn m10_d7_restart_all_three_a_lags_b_catches_it_up_and_the_write_publishes() {
 fn m10_d7_restart_all_three_c_lags_b_catches_it_up_and_the_write_publishes() {
     lags_then_writes(
         "m10_d7_restart_all_three_c_lags_b_catches_it_up_and_the_write_publishes",
-        C_NODE,
+        &plan(C_NODE),
+        &[C_NODE],
         B_NODE,
     );
 }
@@ -316,8 +341,95 @@ fn m10_d7_restart_all_three_c_lags_b_catches_it_up_and_the_write_publishes() {
 fn m10_d7_restart_all_three_b_lags_c_catches_it_up_and_the_write_publishes() {
     lags_then_writes(
         "m10_d7_restart_all_three_b_lags_c_catches_it_up_and_the_write_publishes",
-        B_NODE,
+        &plan(B_NODE),
+        &[B_NODE],
         C_NODE,
+    );
+}
+
+/// A-R173 row 6 (critic k157): two laggers, one source. Only B holds the cutoff; A holds
+/// generation 1 through 1 and C through 2, so each catch-up starts from its own head. B restores
+/// once and builds its ladder once, both targets catch up from it, and the write publishes.
+#[retcd_test]
+fn m10_d7_restart_all_three_a_and_c_lag_b_catches_both_up_and_the_write_publishes() {
+    const METHOD: &str =
+        "m10_d7_restart_all_three_a_and_c_lag_b_catches_both_up_and_the_write_publishes";
+    lags_then_writes(
+        METHOD,
+        &plan_at(HEAD, &[(A_NODE, 1), (C_NODE, 2)]),
+        &[A_NODE, C_NODE],
+        B_NODE,
+    );
+    let mut heads: Vec<(u64, Option<u64>)> = logged(METHOD, "dormant_restored")
+        .iter()
+        .filter_map(|line| Some((line["node"].as_u64()?, line["head"].as_u64())))
+        .collect();
+    heads.sort_unstable();
+    let mut expected = vec![
+        (u64::from(A_NODE.0), Some(1)),
+        (u64::from(B_NODE.0), Some(HEAD.0)),
+        (u64::from(C_NODE.0), Some(2)),
+    ];
+    expected.sort_unstable();
+    assert_eq!(heads, expected, "each node restores once, at its own head");
+}
+
+/// When B's own A1 acquires, in the view-first row: after the catch-up restored B's dormant
+/// receiver at the fence, and before C's delayed frame lands.
+const VIEW_AT: u64 = 20;
+/// How long C's first frame to B is held, so that it lands after [`VIEW_AT`].
+const FRAME_DELAY: u64 = 50;
+
+/// A-R173 row 3 (critic-d7 F4): View, then RecoveryAppend, then staged. B lags and is the
+/// catch-up's target. Its own A1 acquires at [`VIEW_AT`] and publishes its install view, which
+/// B's dormant receiver adopts; only then does C's frame land, and B stages and applies it. The
+/// receiver's epoch and revision came from F1's credential, so the view leaves them where the
+/// frame expects them. The rest is row 1.
+#[retcd_test]
+fn m10_d7_b_lags_its_a1_view_lands_before_c_s_frame_and_the_frame_is_staged() {
+    const METHOD: &str = "m10_d7_b_lags_its_a1_view_lands_before_c_s_frame_and_the_frame_is_staged";
+    let mut plan = plan(B_NODE);
+    plan.network_ops.push(NetworkOp::PlanNext {
+        from: C_NODE,
+        to: B_NODE,
+        delivery: Delivery::Deliver {
+            delay_millis: FRAME_DELAY,
+        },
+    });
+    let acquire = plan
+        .seed
+        .iter_mut()
+        .find(|seed| seed.node == B_NODE && matches!(seed.kind, EventKind::Timer(_)))
+        .expect("B's A1 acquire timer");
+    acquire.at = Tick(VIEW_AT);
+    let runner = lags_then_writes(METHOD, &plan, &[B_NODE], C_NODE);
+
+    let on_b: Vec<(u64, String)> = runner
+        .recorded()
+        .iter()
+        .filter(|event| event.node == B_NODE)
+        .map(|event| (event.logical_tick, format!("{:?}", event.kind)))
+        .collect();
+    let first =
+        |what: &dyn Fn(&str) -> bool| on_b.iter().find(|(_, text)| what(text)).map(|(at, _)| *at);
+    let loaded = first(&|text| text.contains("LineageLoaded"));
+    let viewed =
+        first(&|text| text.contains("module: Replication") && text.contains("Replica(Recorded)"));
+    let staged = first(&|text| {
+        text.starts_with("BatchApply")
+            && text.contains("generation: Generation(1)")
+            && text.contains("seq: Seq(3)")
+    });
+    assert_eq!(loaded, Some(VIEW_AT), "B's A1 installs at {VIEW_AT}");
+    assert_eq!(
+        viewed,
+        Some(VIEW_AT),
+        "B's dormant receiver records A1's view, at once"
+    );
+    assert_eq!(
+        staged,
+        Some(cases::PLAN_AT + 1 + FRAME_DELAY),
+        "then C's frame lands and B applies the cutoff record"
     );
 }
 
@@ -417,4 +529,186 @@ fn m10_d7_a_copy_ahead_of_the_seed_is_refused_its_restore() {
         &plan_store_ahead(),
         "copy_ahead_of_seed",
     );
+}
+
+/// The crash row's head: A, at 1, is owed four records.
+const CRASH_HEAD: Seq = Seq(5);
+/// When A's crash is planned: taken at its next storage effect.
+const CRASH_AT: u64 = 50;
+const RESTART_AT: u64 = 200;
+/// How far after the first plan placement sends it again: after F1 blocks at its deadline.
+const REOPEN_AFTER: u64 = 2_300;
+const REBOOT: BootId = BootId(2);
+
+/// [`plan_at`] with A at 1 of [`CRASH_HEAD`]. The B to A link carries the catch-up's first three
+/// frames at once and holds the next two 100 ms, so A lands records 2 and 3, and the crash
+/// planned at [`CRASH_AT`] is taken at record 4's commit. A restarts at [`RESTART_AT`]. B and C
+/// run on: F1 blocks at its deadline, and placement sends its plan and fence again
+/// [`REOPEN_AFTER`] later, naming A under its new boot.
+fn crash_plan() -> RunPlan {
+    let mut plan = plan_at(CRASH_HEAD, &[(A_NODE, 1)]);
+    for delay_millis in [0, 0, 0, 100, 100] {
+        plan.network_ops.push(NetworkOp::PlanNext {
+            from: B_NODE,
+            to: A_NODE,
+            delivery: Delivery::Deliver { delay_millis },
+        });
+    }
+    let step = |at: u64, action: StepAction| ScenarioStep {
+        at: Tick(at),
+        node: A_NODE,
+        partition: PARTITION,
+        action,
+        line: None,
+        taken: None,
+    };
+    plan.steps = vec![
+        step(
+            CRASH_AT,
+            StepAction::Storage(StorageOp::Crash {
+                node: A_NODE,
+                fault: StorageFault::ProcessCrash,
+            }),
+        ),
+        step(RESTART_AT, StepAction::Restart(REBOOT)),
+    ];
+    let mut again: Vec<SeedEvent> = plan.seed[..2].to_vec();
+    for (seed, correlation) in again.iter_mut().zip(9_200..) {
+        seed.at = Tick(REOPEN_AFTER + seed.at.0);
+        seed.correlation = CorrelationId(correlation);
+        if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(recovery))) =
+            &mut seed.kind
+        {
+            for member in &mut recovery.config.members {
+                if member.node == A_NODE {
+                    member.boot = REBOOT;
+                }
+            }
+        }
+    }
+    assert!(
+        matches!(
+            again[0].kind,
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(_)))
+        ),
+        "the lowering's first seed is placement's plan"
+    );
+    plan.seed.extend(again);
+    plan
+}
+
+/// A-R173 (Q6): A, owed four records, crashes after landing two. That recovery blocks, named,
+/// with nothing of the third landed. On the reopen A's receiver is restored at its new head, it
+/// takes only the last two, F1 commits, and the write publishes and reads back.
+#[retcd_test]
+fn m10_d7_a_crashes_mid_catch_up_and_the_reopen_resumes_from_its_new_head() {
+    const METHOD: &str = "m10_d7_a_crashes_mid_catch_up_and_the_reopen_resumes_from_its_new_head";
+    support::preamble();
+    let mut runner = Runner::new(&crash_plan()).expect("plan");
+    runner.queue(&submit()).expect("queue");
+    runner.queue(&read_back()).expect("queue");
+    // The trace is read before the run's result. Without a restore, A stores
+    // nothing to crash on and the restart step is refused; the row must then
+    // fail on what A applied, not on the harness.
+    let ran = runner.run(RunLimits {
+        max_events: 200_000,
+        deadline: Tick(MAX_TICKS),
+    });
+
+    let reopen = REOPEN_AFTER + cases::PLAN_AT;
+    let applied: Vec<(bool, u64)> = runner
+        .recorded()
+        .iter()
+        .filter(|event| event.node == A_NODE)
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply {
+                generation, seq, ..
+            } if *generation == PRIOR => Some((event.logical_tick >= reopen, seq.0)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        applied,
+        vec![(false, 1), (false, 2), (false, 3), (true, 4), (true, 5)],
+        "A lands 2 and 3, crashes at 4, and the reopen sends only 4 and 5"
+    );
+    let heads: Vec<Option<u64>> = logged(METHOD, "dormant_restored")
+        .iter()
+        .filter(|line| line["node"].as_u64() == Some(u64::from(A_NODE.0)))
+        .map(|line| line["head"].as_u64())
+        .collect();
+    assert_eq!(
+        heads,
+        vec![Some(1), Some(3)],
+        "A is restored at 1, then at its new head"
+    );
+    assert!(
+        logged(METHOD, "dormant_restore_refused").is_empty(),
+        "no restore refused"
+    );
+    let report = ran.expect("runs");
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "ran to the deadline: {:?}",
+        report.stop
+    );
+    let notes: Vec<(u64, String)> = runner
+        .recorded()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted { note, .. } => Some((event.logical_tick, format!("{note:?}"))),
+            _ => None,
+        })
+        .collect();
+    let blocked: Vec<&(u64, String)> = notes
+        .iter()
+        .filter(|(_, note)| note.contains("BlockPromotion"))
+        .collect();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the first recovery blocks once: {blocked:?}"
+    );
+    assert!(
+        blocked[0].0 < reopen
+            && blocked[0]
+                .1
+                .contains("BarrierIncomplete { missing: [CopyId(2)] }"),
+        "named, before the reopen: {blocked:?}"
+    );
+    let committed: Vec<u64> = notes
+        .iter()
+        .filter(|(_, note)| note.starts_with("RecoveredFact"))
+        .map(|(at, _)| *at)
+        .collect();
+    assert!(
+        committed.len() == 1 && committed[0] >= reopen,
+        "the reopen commits: {committed:?}"
+    );
+
+    let mut answers = Vec::new();
+    let mut reads = Vec::new();
+    for (_, reply) in &report.replies {
+        match reply {
+            ReplyEffect::Transaction { result, .. } => {
+                answers.push((result.generation, result.seq))
+            }
+            ReplyEffect::Read { outcome, value, .. } => {
+                reads.push((*outcome, value.map(|(version, _)| version)));
+            }
+            other => panic!("the write is answered and the read served: {other:?}"),
+        }
+    }
+    let written = CRASH_HEAD.next();
+    assert_eq!(answers, vec![(NEW, written)], "one answer, in generation 2");
+    assert_eq!(
+        reads,
+        vec![(ReadServiceOutcome::Served, Some(written.0))],
+        "the read finds the acknowledged write"
+    );
+    let landed = NODES.map(|node| {
+        let engine = runner.dispatcher().engine(node).expect("engine");
+        engine.buffered_applied(PARTITION, NEW).0
+    });
+    assert_eq!(landed, [written.0; 3], "every copy applies the write");
 }
