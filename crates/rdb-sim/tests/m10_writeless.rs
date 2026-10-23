@@ -73,6 +73,12 @@ const CUT_MILLIS: u64 = 50;
 /// back at [`BACK_AT`], so generation 2 commits degraded and goes `Active` once A links it at
 /// the cutoff (A-R185 C7). The client's writes are queued by the row.
 fn plan() -> RunPlan {
+    plan_with(CUTOFF)
+}
+
+/// [`plan`] with A preloaded only through `a_head` of generation 1: below [`CUTOFF`], A lands
+/// generation 2 behind its base.
+fn plan_with(a_head: Seq) -> RunPlan {
     let mut plan = scenario_run::lower(&cases::m9_s0_held(&[B_NODE, C_NODE], CUTOFF, MAX_TICKS))
         .expect("lowers");
     let prior = plan
@@ -81,13 +87,13 @@ fn plan() -> RunPlan {
         .map(|(_, _, inventory)| inventory.anchor_seen.lineage)
         .expect("B and C are placed");
     assert_eq!(prior.generation, PRIOR, "the lowering's prior lineage");
-    let batches: Vec<Batch> = canonical_history(prior, ConfigVersion(1), CUTOFF.0)
+    let batches: Vec<Batch> = canonical_history(prior, ConfigVersion(1), a_head.0)
         .expect("a canonical history")
         .batches;
     plan.preloads
         .extend(batches.into_iter().map(|batch| (A_NODE, batch)));
     plan.preload_durable
-        .push((A_NODE, PARTITION, PRIOR, DurableSeq(CUTOFF.0)));
+        .push((A_NODE, PARTITION, PRIOR, DurableSeq(a_head.0)));
     for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
         plan.network_ops.push(NetworkOp::SetLink {
             a,
@@ -141,6 +147,8 @@ fn submit(at: u64, request: u64) -> SeedEvent {
                 value: Bytes::copy_from_slice(&request.to_be_bytes()),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         })),
     }
 }
@@ -257,6 +265,11 @@ fn reopen(runner: &mut Runner, root: &RecoveryResult, behind: Option<NodeId>) ->
             partition: PARTITION,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: members
+                .iter()
+                .find(|member| member.copy == *copy)
+                .expect("a member")
+                .boot,
         })
         .collect();
     let source = members
@@ -481,48 +494,53 @@ fn m10_d3_a_write_after_three_writeless_reopens_publishes() {
     assert_eq!(answer, Ok((Generation(6), Seq(CUTOFF.0 + 2))));
 }
 
-/// A-R169 probe (3), kept as the slice-1 guard (A-R212, like A-R179's row 9). C is cut off before
-/// the first write, so it misses it, and stays unheard through two reopens that write nothing,
-/// each leaving it out of the barrier. When it is back it lands both generations below their
-/// base (`land_link_refused`, `held_below_base`), and B's R1 asks for a snapshot
-/// (`SnapshotCatchupRequired`), which nothing consumes yet. Catching up across generations is
-/// owed to slice 2. The slice-1 bar: nothing faults, the stall is named, writes stay paused, and
-/// the acked write is still held by A and B. When slice 2 lands the catch-up, this row goes red
-/// and becomes the catch-up row.
+/// A-R169 probe (3), the slice-1 guard (A-R212) turned catch-up row (M10 slice 2, A-R223/A-R224).
+/// C is cut off before the first write, so it misses it, and stays unheard through two reopens
+/// that write nothing, each leaving it out of the barrier. When it is back it is behind both
+/// generations' base: it links each at its own head (`land_link_behind`, arm 3), its `Recovered`
+/// re-anchors it under the root, and B's R1 sends it the write, sealed in generation 2, which C
+/// admits as historical (K1) without a snapshot ask (K2). Nothing is refused, nothing faults,
+/// nothing goes unconsumed; C applies and makes durable the write in generation 4; L1 on B admits
+/// again; and the next write publishes in generation 4 and lands on C.
+///
+/// Until slice 2 this row asserted the stall: both landings refused `held_below_base`, B's one
+/// `SnapshotCatchupRequired` unconsumed, writes paused (A-R212). K1 + K2 alone turned it red on
+/// the snapshot ask; arm 3 then on the refusals.
 #[retcd_test]
-fn m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_loses_nothing() {
-    let method =
-        "m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_loses_nothing";
-    let (mut runner, root, at) = opened(1, Some(C_NODE), true);
-    assert_eq!(root.new_generation, Generation(4));
+fn m10_d3_a_copy_behind_two_writeless_reopens_catches_up() {
+    let method = "m10_d3_a_copy_behind_two_writeless_reopens_catches_up";
+    let (mut runner, root, back) = opened(1, Some(C_NODE), true);
+    let newest = root.new_generation;
+    assert_eq!(newest, Generation(4));
     isolate(&mut runner, C_NODE, LinkState::Up);
-    let quiet = run_to(&mut runner, at + SETTLE_MILLIS);
+    let at = back + SETTLE_MILLIS;
+    let quiet = run_to(&mut runner, at);
     assert!(quiet.is_empty(), "nothing is answered: {quiet:?}");
 
-    let below: Vec<(u64, u64)> = logged(method, "land_link_refused")
+    let written = CUTOFF.0 + 1;
+    let behind: Vec<(u64, u64, u64, u64)> = logged(method, "land_link_behind")
         .iter()
-        .filter(|line| line["reason"] == "held_below_base")
+        .filter(|line| line["node"].as_u64() == Some(u64::from(C_NODE.0)))
         .map(|line| {
-            // A copy that cannot link warns; only `anchor_generation_absent` is info (ADV3).
-            assert_eq!(line["@l"], "Warning", "held_below_base warns: {line}");
             (
-                line["node"].as_u64().unwrap_or(0),
-                line["generation"].as_u64().unwrap_or(0),
+                line["from"].as_u64().unwrap_or(0),
+                line["to"].as_u64().unwrap_or(0),
+                line["head"].as_u64().unwrap_or(0),
+                line["base"].as_u64().unwrap_or(0),
             )
         })
         .collect();
     assert_eq!(
-        below,
-        vec![(u64::from(C_NODE.0), 3), (u64::from(C_NODE.0), 4)],
-        "C lands both writeless generations below their base, named"
+        behind,
+        vec![(2, 3, CUTOFF.0, written), (3, 4, CUTOFF.0, written)],
+        "C links both writeless generations at its own head, below their base"
     );
-    let unconsumed: Vec<String> = logged(method, "kernel effect refused: no consumer")
-        .iter()
-        .filter_map(|line| line["kernel"].as_str().map(str::to_owned))
-        .collect();
+    let refused = logged(method, "land_link_refused");
+    assert!(refused.is_empty(), "no landing is refused: {refused:?}");
+    let unconsumed = logged(method, "kernel effect refused: no consumer");
     assert!(
-        unconsumed.len() == 1 && unconsumed[0].starts_with("SnapshotCatchupRequired"),
-        "the stall is B's ask for a snapshot, and nothing else: {unconsumed:?}"
+        unconsumed.is_empty(),
+        "every effect is consumed: {unconsumed:?}"
     );
     let faults: Vec<serde_json::Value> =
         config_testkit::logs::lines_for_current_test("m10_writeless", method)
@@ -536,29 +554,132 @@ fn m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_lose
             .collect();
     assert!(faults.is_empty(), "nothing faults: {faults:?}");
 
-    let admitted = admissions_since(&runner, FIRST_AT + 1_000);
-    assert!(
-        admitted.iter().all(|(_, allow)| !allow),
-        "writes stay paused from the first reopen on: {admitted:?}"
+    let engine = runner.dispatcher().engine(C_NODE).expect("C's engine");
+    assert_eq!(
+        (
+            engine.buffered_applied(PARTITION, newest).0,
+            engine.durable(PARTITION, newest).0
+        ),
+        (written, written),
+        "C applies the write it missed in generation 4, and makes it durable"
     );
-    // Review F-009 (A-R219): `all` holds on an empty list, so the row also needs B to have
-    // said, last, that writes are paused.
+    let admitted = admissions_since(&runner, back);
     assert_eq!(
         admitted.last().map(|(_, allow)| *allow),
-        Some(false),
-        "B's last admission change pauses writes: {admitted:?}"
+        Some(true),
+        "L1 on B admits once C has caught up: {admitted:?}"
     );
-    let durable = [A_NODE, B_NODE, C_NODE].map(|node| {
-        runner
-            .dispatcher()
-            .engine(node)
-            .map_or(0, |engine| engine.durable(PARTITION, Generation(2)).0)
-    });
+
+    runner.queue(&submit(at, 2)).expect("queue");
+    let next = run_to(&mut runner, at + 1_000);
     assert_eq!(
-        durable,
-        [CUTOFF.0 + 1, CUTOFF.0 + 1, CUTOFF.0],
-        "A and B still hold the acked write; C holds what it had"
+        next,
+        vec![(2, Ok((newest, Seq(written + 1))))],
+        "the next write publishes in generation 4"
     );
+    let on_c = runner
+        .dispatcher()
+        .engine(C_NODE)
+        .expect("C's engine")
+        .buffered_applied(PARTITION, newest)
+        .0;
+    assert_eq!(on_c, written + 1, "C applies the next write");
+}
+
+/// The H2 twin (M10 slice 2, K3): A holds generation 1 only through 1, below generation 2's
+/// cutoff, and is not heard while generation 2 commits. When it is back it lands generation 2
+/// behind its base and links at its own head (arm 3). B's primary was built by `Recovered`, so
+/// its ladder holds only the root and the cutoff: A's `NeedPrefix{1}` meets `NotRetained`, and
+/// R1 asks for a snapshot. The dispatcher serves it once from B's engine (`snapshot_catchup_
+/// served`, three rungs), the keepalive draws A's next `NeedPrefix`, and B sends record 2,
+/// sealed in generation 1, which A admits as historical. Nothing is refused, unconsumed or
+/// faulted; A holds 2 in generation 2; and the first write publishes there and lands on A.
+#[retcd_test]
+fn m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine() {
+    let method = "m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine";
+    support::preamble();
+    let mut runner =
+        Runner::new(&plan_with(Seq(CUTOFF.0 - 1))).expect("the harness takes the plan");
+    let quiet = run_to(&mut runner, FIRST_AT - 100);
+    assert!(
+        quiet.is_empty(),
+        "nothing is written before the first write"
+    );
+
+    let a = u64::from(A_NODE.0);
+    let behind: Vec<(u64, u64, u64, u64)> = logged(method, "land_link_behind")
+        .iter()
+        .filter(|line| line["node"].as_u64() == Some(a))
+        .map(|line| {
+            (
+                line["from"].as_u64().unwrap_or(0),
+                line["to"].as_u64().unwrap_or(0),
+                line["head"].as_u64().unwrap_or(0),
+                line["base"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert_eq!(
+        behind,
+        vec![(PRIOR.0, 2, CUTOFF.0 - 1, CUTOFF.0)],
+        "A links generation 2 at its own head, below the base"
+    );
+    let served: Vec<(u64, u64, u64)> = logged(method, "snapshot_catchup_served")
+        .iter()
+        .map(|line| {
+            (
+                line["node"].as_u64().unwrap_or(0),
+                line["barrier"].as_u64().unwrap_or(0),
+                line["rungs"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert_eq!(
+        served,
+        vec![(u64::from(B_NODE.0), CUTOFF.0, CUTOFF.0 + 1)],
+        "B's ask is served once, from its engine: rungs 0 through the cutoff"
+    );
+    for message in [
+        "land_link_refused",
+        "kernel effect refused: no consumer",
+        "snapshot_catchup_unserved",
+        "snapshot_catchup_unservable",
+    ] {
+        let lines = logged(method, message);
+        assert!(lines.is_empty(), "no {message}: {lines:?}");
+    }
+    let faults: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test("m10_writeless", method)
+            .into_iter()
+            .filter(|line| {
+                line["@l"] == "Error"
+                    || line["kernel"]
+                        .as_str()
+                        .is_some_and(|kernel| kernel.contains("Quarantined"))
+            })
+            .collect();
+    assert!(faults.is_empty(), "nothing faults: {faults:?}");
+    let engine = runner.dispatcher().engine(A_NODE).expect("A's engine");
+    assert_eq!(
+        engine.buffered_applied(PARTITION, Generation(2)).0,
+        CUTOFF.0,
+        "A holds the cutoff in generation 2"
+    );
+
+    runner.queue(&submit(FIRST_AT, 1)).expect("queue");
+    let first = run_to(&mut runner, FIRST_AT + 1_000);
+    assert_eq!(
+        first,
+        vec![(1, Ok((Generation(2), Seq(CUTOFF.0 + 1))))],
+        "the first write publishes in generation 2"
+    );
+    let on_a = runner
+        .dispatcher()
+        .engine(A_NODE)
+        .expect("A's engine")
+        .buffered_applied(PARTITION, Generation(2))
+        .0;
+    assert_eq!(on_a, CUTOFF.0 + 1, "A applies the write");
 }
 
 /// The client's read of the written key from the primary B at `at`.

@@ -248,6 +248,7 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         links: None,
         client: DEFAULT_CLIENT,
         boot: None,
+        storage: rdb_api::StorageOptions::default(),
     };
     let mut db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))
@@ -316,6 +317,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         links: Some(Arc::clone(&links)),
         client: DEFAULT_CLIENT,
         boot: Some(boot),
+        storage: rdb_api::StorageOptions::default(),
     };
     let mut db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))

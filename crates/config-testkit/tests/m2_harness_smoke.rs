@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use config_core::{
-    ClusterId, ClusterIdentity, Durability, GetRequest, MutationOutcome, NodeId, PutRequest,
+    ClusterId, ClusterIdentity, ConfigError, Durability, GetRequest, GetResponse, MutationOutcome,
+    NodeId, PutRequest,
 };
 use config_storage::{
     Boundary, FaultAction, FaultInjector, NoFaults, RocksStore, StorageOpenError,
 };
 use config_testkit::cluster::{Cluster, ClusterConfig, NodeStartError, RocksSpec, StorageKind};
+use config_testkit::poll_until_async;
 
 fn put_req(k: &str, v: &str) -> PutRequest {
     PutRequest {
@@ -277,15 +279,99 @@ async fn stop_all_then_start_all_recovers_from_disk() {
         "a new membership entry was written, so the cluster re-formed instead of recovering"
     );
 
-    let got = cluster
-        .client(leader)
-        .get(get_req("/cold"))
-        .await
-        .expect("read after the cold restart");
+    let got = read_at_leader(&cluster, leader, "/cold").await;
     assert_eq!(
         got.record.as_ref().map(|r| r.mod_revision),
         Some(written.revision),
         "the acknowledged mutation did not survive a cold restart"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Read `key` at `leader`, and after a `NotLeader` at whichever node leads by then.
+///
+/// Issue #31. After `start_all`, node 1 leads again at once: it restores its own committed vote
+/// when its store reopens, with no election. In 20 kept runs on 2026-10-23 every node stayed
+/// in term 1, and under host load nodes 2 and 3 reported in 2-27 s after node 1. So the leader
+/// the row first sees can be one the others have not yet heard from, and if one of them times
+/// out first it wins a new term. The issue's failure was that: a read at the first leader
+/// answered `NotLeader` with a hint to node 2. Not reproduced in those 20 runs; inferred from
+/// the error and the restart order. Any other error still fails the row.
+async fn read_at_leader(cluster: &Cluster, leader: NodeId, key: &str) -> GetResponse {
+    let refused = std::sync::Mutex::new(Vec::new());
+    let refused = &refused;
+    let got = poll_until_async(cluster.deadline(20), cluster.poll_interval(), || {
+        let target = if lock(refused).is_empty() {
+            Some(leader)
+        } else {
+            cluster.leader_now()
+        };
+        async move {
+            let target = target?;
+            match cluster.client(target).get(get_req(key)).await {
+                Ok(got) => Some(got),
+                Err(e @ ConfigError::NotLeader { .. }) => {
+                    tracing::info!(node = target.0, error = %e, "m2_read_not_leader");
+                    lock(refused).push(target);
+                    None
+                }
+                Err(e) => panic!("read {key} at {target}: {e}"),
+            }
+        }
+    })
+    .await;
+    got.unwrap_or_else(|t| {
+        panic!(
+            "no leader answered the read of {key}: {t}; refused by {:?}",
+            lock(refused)
+        )
+    })
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Issue #31: a read sent to a leader that has since stepped down is re-asked of the new one.
+/// The leader is isolated until the others elect a successor, then healed, so it learns the
+/// new term and answers `NotLeader`, the cold-restart row's failure.
+/// Cut: `read_at_leader` fails on `NotLeader` — this row fails with "not leader".
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_at_a_deposed_leader_is_re_asked_of_the_new_one() {
+    let cluster = Cluster::start(3, StorageKind::ROCKS).await;
+    let old = cluster.leader().await;
+    let written = cluster
+        .client(old)
+        .put(put_req("/moved", "v1"))
+        .await
+        .expect("write before the leader moves");
+    cluster
+        .wait_revision_all(written.revision, cluster.deadline(10))
+        .await
+        .expect("every node applies the write");
+
+    cluster.isolate(old);
+    let new = cluster
+        .wait_for(
+            "a leader other than the isolated one",
+            cluster.deadline(20),
+            || cluster.leaders_now().into_iter().find(|id| *id != old),
+        )
+        .await
+        .unwrap_or_else(|t| panic!("the majority never elected a successor: {t}"));
+    cluster.heal();
+    cluster
+        .wait_for("the old leader to step down", cluster.deadline(20), || {
+            (!cluster.leaders_now().contains(&old)).then_some(())
+        })
+        .await
+        .unwrap_or_else(|t| panic!("{old} never learned of {new}'s term: {t}"));
+
+    let got = read_at_leader(&cluster, old, "/moved").await;
+    assert_eq!(
+        got.record.as_ref().map(|r| r.mod_revision),
+        Some(written.revision)
     );
 
     cluster.shutdown().await;

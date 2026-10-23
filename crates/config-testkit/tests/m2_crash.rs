@@ -202,18 +202,34 @@ async fn assert_never_landed(cluster: &Cluster, key: &str, before: u64) {
 /// or it landed at exactly `before + 1`. This is the table's own "may or may not be present"
 /// for the unsynced append/flush boundaries on the leader's own coordinating path — genuinely
 /// nondeterministic, so this only rules out double-counting or a revision jump of more than 1.
+///
+/// The revision is the read's own `read_revision`, taken at the same linearizable point as
+/// the record (issue #31). The leader's metrics are its *applied* revision at an earlier
+/// moment: a leader elected after the crash commits the crashed entry, when it survived,
+/// together with its first entry of the new term, and its first linearizable read waits for
+/// that commit. Metrics read before it said "never advanced" while the read found the key.
 async fn assert_landed_at_most_once(cluster: &Cluster, key: &str, before: u64) {
     let leader = cluster.leader().await;
-    let revision = cluster.metrics(leader).cluster_revision;
-    assert!(
-        revision == before || revision == before + 1,
-        "revision jumped by more than one crashed write: before={before} after={revision}"
-    );
+    let metrics_revision = cluster.metrics(leader).cluster_revision;
     let got = cluster
         .client(leader)
         .get(get_req(key))
         .await
         .unwrap_or_else(|e| panic!("read {key} after the crash: {e}"));
+    let revision = got.read_revision;
+    // Kept so a log query can count how often the two disagreed; nothing asserts on it.
+    tracing::info!(
+        leader = leader.0,
+        before,
+        metrics_revision,
+        read_revision = revision,
+        landed = got.record.is_some(),
+        "m2_landed_at_most_once"
+    );
+    assert!(
+        revision == before || revision == before + 1,
+        "revision jumped by more than one crashed write: before={before} after={revision}"
+    );
     match (revision == before + 1, got.record) {
         (true, Some(record)) => assert_eq!(
             record.mod_revision,
@@ -501,6 +517,43 @@ async fn m2_24_crash_after_log_flush() {
     cluster.shutdown().await;
 }
 
+/// Issue #31: [`assert_landed_at_most_once`] takes its revision from the read, not from the
+/// leader's metrics. Here the write is committed (a follower applied it) while the leader's own
+/// apply is held, so the leader's metrics still say `before` when the check starts, and the
+/// linearizable read waits for that apply and finds the key: the shape m2_24 failed in.
+/// Cut: take the revision from `metrics(leader)` — this row fails with "exists even though
+/// the revision never advanced".
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_31_landed_check_does_not_trust_lagging_metrics() {
+    let (cluster, scripts) = rocks_cluster_with_scripts(3).await;
+    let leader = cluster.leader().await;
+    let follower = cluster.followers()[0];
+    let before = cluster.metrics(leader).cluster_revision;
+    // Shorter than the engine's read budget, so the read can outwait it.
+    let hold = cluster.config().read_timeout / 2;
+    scripts[&leader].delay_on_nth(Boundary::BeforeStateBatch, 1, hold);
+
+    let client = cluster.client(leader);
+    let put = tokio::spawn(async move { client.put(put_req("/issue31/k", "v")).await });
+    cluster
+        .wait_revision_on(&[follower], before + 1, cluster.deadline(10))
+        .await
+        .unwrap_or_else(|t| panic!("the write never committed: {t}"));
+    assert_eq!(
+        cluster.metrics(leader).cluster_revision,
+        before,
+        "the leader's apply was meant to still be held here"
+    );
+
+    assert_landed_at_most_once(&cluster, "/issue31/k", before).await;
+    let put = put
+        .await
+        .expect("put task")
+        .expect("the held put still succeeds");
+    assert_eq!(put.revision, before + 1);
+
+    cluster.shutdown().await;
+}
 // =====================================================================================
 // State-batch boundaries (M2-25, M2-26)
 // =====================================================================================

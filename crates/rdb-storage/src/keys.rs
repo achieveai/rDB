@@ -1,7 +1,8 @@
 //! Physical layout: column families, key prefix, value framing and the format marker.
 //!
-//! [`FORMAT_VERSION`] `1`, settled by ADR-rdb-0010 decision 11. S0's provisional `0` is refused
-//! at open, so no S0 data directory is read as format 1.
+//! [`FORMAT_VERSION`] `2` (M10 S2): format `1`, settled by ADR-rdb-0010 decision 11, plus the
+//! epoch revocations. A format-1 directory still opens; see [`OLDEST_FORMAT_VERSION`]. S0's
+//! provisional `0` is refused at open, so no S0 data directory is read.
 //!
 //! - **Key:** `partition u32 BE | generation u64 BE | ns u8 | key`. Fixed-width, so a key is
 //!   unambiguous, and partition- and generation-contiguous, so a prefix export or a
@@ -25,16 +26,27 @@
 //!   key `publish` then the partition id (u32 BE), 11 bytes, also short: see [`PublishMark`].
 //!   That no longer holds for the next key: this build refuses a short `metadata` key it does
 //!   not define (A-R184), so a key added after these needs a [`FORMAT_VERSION`] bump
-//!   (review-s1 F-010).
+//!   (review-s1 F-010). The first was the epoch revocations, key `revoked` then the partition
+//!   id (u32 BE), 11 bytes: format 2.
 
-use rdb_core::contracts::ids::{Generation, PartitionId, Seq};
+use std::collections::BTreeSet;
+
+use rdb_core::contracts::ids::{Generation, OwnerEpoch, PartitionId, Seq};
 use rdb_core::contracts::storage::Namespace;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::Version;
 
-/// The on-disk format this build writes and accepts (ADR-rdb-0010 decision 11). `0` was S0's
-/// provisional layout and is refused.
-pub const FORMAT_VERSION: u32 = 1;
+/// The on-disk format this build writes (ADR-rdb-0010 decision 11). `0` was S0's provisional
+/// layout and is refused. Format 2 (M10 S2) adds one record, the epoch revocations
+/// ([`REVOKED_PREFIX`]); a key added after it needs another bump.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The oldest format this build opens. Format 2 only adds a record, so a format-1 directory is a
+/// format-2 one that holds no revocation. Its marker stays `1`, and a format-1 build can still
+/// open it, until its first revocation: that synced write moves the marker to `2` in the same
+/// batch, so no directory a format-1 build accepts ever holds a record it cannot read (gate
+/// V12: a format-1 build refuses marker `2`, because it accepts only its own).
+pub const OLDEST_FORMAT_VERSION: u32 = 1;
 
 /// Column family for [`Namespace::User`].
 pub const CF_DATA: &str = "data";
@@ -158,6 +170,41 @@ pub(crate) fn decode_publish_marks(raw: &[u8]) -> Option<Vec<PublishMark>> {
                 tick: Tick(decode_mark(&mark[16..24])?),
             })
         })
+        .collect()
+}
+
+/// The epoch-revocation key in `metadata` starts with these bytes; the partition id (u32 BE)
+/// follows, 11 bytes in all, shorter than [`PREFIX_LEN`] like the publish marks. Format 2 (M10
+/// S2, spec §7.3 step 2): its value is every revoked [`OwnerEpoch`] of the partition, u64 BE
+/// each, ascending, never empty.
+pub(crate) const REVOKED_PREFIX: &[u8] = b"revoked";
+
+/// The epoch-revocation key of `partition`.
+pub(crate) fn revoked_key(partition: PartitionId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(REVOKED_PREFIX.len() + 4);
+    out.extend_from_slice(REVOKED_PREFIX);
+    out.extend_from_slice(&partition.0.to_be_bytes());
+    out
+}
+
+/// The partition an epoch-revocation key names, or `None` when `raw` is not one.
+pub(crate) fn decode_revoked_key(raw: &[u8]) -> Option<PartitionId> {
+    let id = raw.strip_prefix(REVOKED_PREFIX)?;
+    Some(PartitionId(u32::from_be_bytes(id.try_into().ok()?)))
+}
+
+/// Encode a partition's revoked epochs, ascending.
+pub(crate) fn encode_revoked(epochs: &BTreeSet<OwnerEpoch>) -> Vec<u8> {
+    epochs.iter().flat_map(|e| e.0.to_be_bytes()).collect()
+}
+
+/// Decode a partition's revoked epochs; `None` when the value is empty or not whole epochs.
+pub(crate) fn decode_revoked(raw: &[u8]) -> Option<BTreeSet<OwnerEpoch>> {
+    if raw.is_empty() || !raw.len().is_multiple_of(8) {
+        return None;
+    }
+    raw.chunks_exact(8)
+        .map(|epoch| decode_mark(epoch).map(OwnerEpoch))
         .collect()
 }
 /// The value frame's kind byte for a value.

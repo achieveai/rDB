@@ -811,6 +811,8 @@ fn txn_request(submit: &ClientOp, digest_id: u64) -> TxnRequest {
                 expected_version: None,
             })
             .collect(),
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 

@@ -223,6 +223,8 @@ fn submit(request: u64) -> EventKind {
             value: Bytes::from_static(b"demo"),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }))
 }
 

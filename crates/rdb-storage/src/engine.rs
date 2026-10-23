@@ -22,13 +22,13 @@
 //! experiment must copy the directory **before** any reopen (critic F3). [`dump`] opens
 //! read-only and does not flush.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
+use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, OwnerEpoch, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, DurablePrefix, Namespace, StorageFault};
 use rdb_core::replication::append::PROGRESS_KEY;
 use rdb_core::transaction::dedup::parse_dedup_value;
@@ -41,14 +41,38 @@ use rdb_core::contracts::trace::Version;
 
 use crate::keys::{
     self, decode_copying, decode_key, decode_mark, decode_publish_marks, decode_publish_marks_key,
-    encode_key, encode_publish_marks, frame, ns_byte, ns_from_byte, private_key, publish_marks_key,
-    tombstone, unframe, Frame, Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
-    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, PARENT_KEY,
+    decode_revoked, decode_revoked_key, encode_key, encode_publish_marks, encode_revoked, frame,
+    ns_byte, ns_from_byte, private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame,
+    Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES, COPYING_KEY, DURABLE_KEY,
+    FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY,
     PRIVATE_NS, SEALED_KEY,
 };
 
 /// The `tracing` target of every event this crate emits.
 pub(crate) const LOG_TARGET: &str = "rdb_storage";
+
+/// RocksDB 0.23's own memtable budget per column family, which an engine keeps when
+/// [`StorageOptions::write_buffer_bytes`] is `None` (64 MiB).
+pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 << 20;
+
+/// Engine options a caller may set at open (ruling A-R248). The default is the engine as
+/// pinned in code: every option `None` leaves RocksDB's own value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageOptions {
+    /// The memtable budget of each column family, in bytes (RocksDB's `write_buffer_size`):
+    /// a column family whose memtable reaches it switches to a new one and flushes the full
+    /// one to an SST. `None` keeps [`DEFAULT_WRITE_BUFFER_BYTES`].
+    pub write_buffer_bytes: Option<usize>,
+}
+
+impl StorageOptions {
+    /// The memtable budget each column family opens with.
+    #[must_use]
+    pub fn effective_write_buffer_bytes(&self) -> usize {
+        self.write_buffer_bytes
+            .unwrap_or(DEFAULT_WRITE_BUFFER_BYTES)
+    }
+}
 
 /// Why [`RocksEngine::open`] or [`dump`] refused a directory.
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +144,24 @@ pub enum OpenError {
     },
 }
 
+/// Why `RocksEngine::damage_record` (debug builds only, a dev tool) refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DamageRefused {
+    /// No value is stored at that key of that lineage: absent, a tombstone, or no bytes.
+    /// Nothing was written.
+    #[error("no stored value at key {key_hex} to damage")]
+    NoValue {
+        /// The physical key, hex.
+        key_hex: String,
+    },
+    /// RocksDB refused the read or the write.
+    #[error("damage write failed: {detail}")]
+    WriteFailed {
+        /// RocksDB's message.
+        detail: String,
+    },
+}
+
 /// Why [`RocksEngine::bind_instance`] refused. Nothing was written in either case.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
@@ -172,6 +214,9 @@ pub struct RocksEngine {
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
     /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
     instance: Option<[u8; INSTANCE_LEN]>,
+    /// The format marker on disk: [`FORMAT_VERSION`], or [`OLDEST_FORMAT_VERSION`] until the
+    /// first epoch revocation moves it.
+    format: u32,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
     /// The lock on the directory's [`CLAIM_FILE`] (lead ruling A-R168); `None` on a read-only
@@ -208,8 +253,8 @@ pub enum InjectedFault {
     /// switch or a copy with no keys.
     CopyBatch,
     /// The next synced metadata put ([`RocksEngine::bind_instance`],
-    /// [`RocksEngine::put_publish_marks`]): nothing is written and nothing counts as synced
-    /// (review-s1 F-008). Not reached by a bind of the id the copy already holds.
+    /// [`RocksEngine::put_publish_marks`], [`RocksEngine::persist_epoch_revocation`]): nothing is
+    /// written and nothing counts as synced (review-s1 F-008). Not reached by a bind of the id the copy already holds.
     SyncedPut,
 }
 
@@ -271,12 +316,19 @@ impl RocksEngine {
     /// only once it returns `Ok` does [`Self::wal_synced_through_latest`] count it, so the
     /// flush duty may skip its next fsync. Fault point [`InjectedFault::SyncedPut`].
     fn put_metadata_synced(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.put_metadata_synced_all(&[(key, value)])
+    }
+
+    /// [`Self::put_metadata_synced`] for several keys in one atomic batch: all land or none.
+    fn put_metadata_synced_all(&mut self, puts: &[(&[u8], &[u8])]) -> Result<(), String> {
         self.fire(InjectedFault::SyncedPut)?;
         let mut opts = WriteOptions::default();
         opts.set_sync(true);
-        self.db
-            .put_cf_opt(self.cf(CF_METADATA), key, value, &opts)
-            .map_err(|e| e.to_string())?;
+        let mut write = WriteBatch::default();
+        for (key, value) in puts {
+            write.put_cf(self.cf(CF_METADATA), key, value);
+        }
+        self.db.write_opt(write, &opts).map_err(|e| e.to_string())?;
         self.synced_seq = Some(self.db.latest_sequence_number());
         Ok(())
     }
@@ -301,7 +353,19 @@ impl RocksEngine {
     ///
     /// [`OpenError::NoDatabase`] when `path` holds no database, else as [`Self::open`].
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf(), true).map_err(refused)
+        Self::open_existing_with(path, StorageOptions::default())
+    }
+
+    /// [`Self::open_existing`] with `options` (ruling A-R248).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_existing`].
+    pub fn open_existing_with(
+        path: impl AsRef<Path>,
+        options: StorageOptions,
+    ) -> Result<Self, OpenError> {
+        Self::open_inner(path.as_ref().to_path_buf(), true, options).map_err(refused)
     }
 
     /// Open, or create, the engine at `path`.
@@ -317,14 +381,27 @@ impl RocksEngine {
     ///
     /// An [`OpenError`] naming the refusal.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf(), false).map_err(refused)
+        Self::open_with(path, StorageOptions::default())
+    }
+
+    /// [`Self::open`] with `options` (ruling A-R248).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`].
+    pub fn open_with(path: impl AsRef<Path>, options: StorageOptions) -> Result<Self, OpenError> {
+        Self::open_inner(path.as_ref().to_path_buf(), false, options).map_err(refused)
     }
 
     /// The claim comes first, before any read of the directory (lead ruling A-R168). Without it
     /// a racing loser's read-only checks met the winner's `LOG`, or a copy it had not finished
     /// creating, and the loser was told `Backend` instead of `Locked`. RocksDB's `LOCK` stays as
     /// the second line.
-    fn open_inner(path: PathBuf, must_exist: bool) -> Result<Self, OpenError> {
+    fn open_inner(
+        path: PathBuf,
+        must_exist: bool,
+        storage: StorageOptions,
+    ) -> Result<Self, OpenError> {
         if must_exist && !path.is_dir() {
             return Err(OpenError::NoDatabase { path });
         }
@@ -340,9 +417,9 @@ impl RocksEngine {
             read_only(&path)?;
         }
         let options = db_options(!existed);
-        let db = DB::open_cf_descriptors(&options, &path, descriptors())
+        let db = DB::open_cf_descriptors(&options, &path, descriptors(storage))
             .map_err(|e| backend(&path, &e))?;
-        let created = ensure_format(&db, &path, existed)?;
+        let (created, format) = ensure_format(&db, &path, existed)?;
         let instance = read_instance(&db, &path)?;
         let lineages = restore_lineages(&db, &path)?;
         for (&(partition, generation), marks) in &lineages {
@@ -363,9 +440,12 @@ impl RocksEngine {
             target: LOG_TARGET,
             path = %path.display(),
             format_version = FORMAT_VERSION,
+            format,
             created,
             lineages = lineages.len(),
             instance_hex = instance.map(|id| hex(&id)),
+            // What the caller asked RocksDB for, not a size RocksDB reports back (A-R253).
+            write_buffer_bytes_asked = storage.effective_write_buffer_bytes(),
             "storage_open"
         );
         Ok(Self {
@@ -373,6 +453,7 @@ impl RocksEngine {
             path,
             lineages,
             instance,
+            format,
             injected: None,
             claim: Some(Arc::new(claim)),
             synced_seq: None,
@@ -398,12 +479,13 @@ impl RocksEngine {
         } else {
             Err(OpenError::NoDatabase { path: path.clone() })
         };
-        let (db, lineages) = opened.map_err(refused)?;
+        let (db, lineages, format) = opened.map_err(refused)?;
         let instance = read_instance(&db, &path).map_err(refused)?;
         tracing::info!(
             target: LOG_TARGET,
             path = %path.display(),
             format_version = FORMAT_VERSION,
+            format,
             lineages = lineages.len(),
             instance_hex = instance.map(|id| hex(&id)),
             "storage_open_read_only"
@@ -413,6 +495,7 @@ impl RocksEngine {
             path,
             lineages,
             instance,
+            format,
             injected: None,
             claim: None,
             synced_seq: None,
@@ -429,6 +512,31 @@ impl RocksEngine {
     #[must_use]
     pub fn wal_synced_through_latest(&self) -> bool {
         self.synced_seq == Some(self.db.latest_sequence_number())
+    }
+
+    /// What column family `cf`'s active memtable holds, as `(bytes, entries)`: RocksDB's
+    /// `rocksdb.cur-size-active-mem-table` and `rocksdb.num-entries-active-mem-table`. A
+    /// memtable that reached [`StorageOptions::write_buffer_bytes`] was switched out for a
+    /// flush, so its entries no longer count here (A-R248).
+    ///
+    /// # Errors
+    ///
+    /// When `cf` is not one of [`COLUMN_FAMILIES`], or RocksDB cannot answer.
+    pub fn active_memtable(&self, cf: &str) -> Result<(u64, u64), String> {
+        let handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| format!("no column family {cf}"))?;
+        let read = |property: &str| {
+            self.db
+                .property_int_value_cf(handle, property)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("RocksDB has no {property} for {cf}"))
+        };
+        Ok((
+            read("rocksdb.cur-size-active-mem-table")?,
+            read("rocksdb.num-entries-active-mem-table")?,
+        ))
     }
 
     /// The directory this engine is open on.
@@ -546,6 +654,191 @@ impl RocksEngine {
                 partition = partition.0,
                 len = raw.len(),
                 "publish_marks_undecodable"
+            );
+            StorageFault::Corrupt
+        })
+    }
+
+    /// Record that this node never serves `epoch` of `partition` again, with a synced write,
+    /// before this returns `Ok` (spec §7.3 step 2; A1's `StoreEffect::PersistEpochRevocation`).
+    /// Adds to the epochs already revoked; revoking one again writes the same set. On a
+    /// format-1 copy the same batch moves the marker to [`FORMAT_VERSION`], so a format-1 build
+    /// refuses the copy from then on instead of opening it blind to the revocation.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when the epochs already stored cannot be read;
+    /// [`StorageFault::WriteFailed`] when RocksDB refuses the write. Either way nothing is
+    /// written and the revocation does not count.
+    pub fn persist_epoch_revocation(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+    ) -> Result<(), StorageFault> {
+        let mut epochs = self.revoked(partition)?.unwrap_or_default();
+        epochs.insert(epoch);
+        let key = revoked_key(partition);
+        let value = encode_revoked(&epochs);
+        let marker = FORMAT_VERSION.to_be_bytes();
+        let mut puts: Vec<(&[u8], &[u8])> = vec![(&key, &value)];
+        if self.format < FORMAT_VERSION {
+            puts.push((FORMAT_KEY, &marker));
+        }
+        if let Err(e) = self.put_metadata_synced_all(&puts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                epoch = epoch.0,
+                error = %e,
+                "epoch_revocation_write_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let from_format = self.format;
+        self.format = FORMAT_VERSION;
+        tracing::info!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            epoch = epoch.0,
+            revoked = epochs.len(),
+            from_format,
+            format = self.format,
+            "epoch_revocation_persisted"
+        );
+        Ok(())
+    }
+
+    /// Every epoch revocation this copy holds, by partition then epoch, for the host to replay
+    /// to A1 at start (`AuthorityEvent::EpochRevocationRestored`). Empty on a copy that holds
+    /// none, as on any format-1 copy.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when a read fails or a stored value is not whole epochs. Never
+    /// a shorter list in its place: a revocation that cannot be read is not "not revoked".
+    pub fn epoch_revocations(&self) -> Result<Vec<(PartitionId, OwnerEpoch)>, StorageFault> {
+        let mut out = Vec::new();
+        let start = IteratorMode::From(keys::REVOKED_PREFIX, Direction::Forward);
+        for item in self.db.iterator_cf(self.cf(CF_METADATA), start) {
+            let (key, value) = item.map_err(|e| {
+                tracing::error!(target: LOG_TARGET, error = %e, "epoch_revocations_read_failed");
+                StorageFault::Corrupt
+            })?;
+            if !key.starts_with(keys::REVOKED_PREFIX) {
+                break;
+            }
+            // A lineage-scoped key can start with these bytes too (partition "revo", a
+            // generation starting "ked"). It is that lineage's, not a revocation: open reads it
+            // as a lineage key first, and so does this scan.
+            if decode_key(&key).is_some() {
+                continue;
+            }
+            let Some(partition) = decode_revoked_key(&key) else {
+                // Open refuses an undefined short key, so this is not reached on a copy open
+                // accepted. Kept: a short key that is not a revocation is never read as none.
+                tracing::error!(
+                    target: LOG_TARGET,
+                    key_hex = hex(&key),
+                    "epoch_revocation_key_undecodable"
+                );
+                return Err(StorageFault::Corrupt);
+            };
+            let epochs = Self::decode_epochs(partition, &value)?;
+            out.extend(epochs.into_iter().map(|epoch| (partition, epoch)));
+        }
+        Ok(out)
+    }
+
+    /// `partition`'s revoked epochs; `None` when it has none.
+    fn revoked(
+        &self,
+        partition: PartitionId,
+    ) -> Result<Option<BTreeSet<OwnerEpoch>>, StorageFault> {
+        let raw = self
+            .db
+            .get_cf(self.cf(CF_METADATA), revoked_key(partition))
+            .map_err(|e| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    error = %e,
+                    "epoch_revocations_read_failed"
+                );
+                StorageFault::Corrupt
+            })?;
+        raw.map(|raw| Self::decode_epochs(partition, &raw))
+            .transpose()
+    }
+
+    /// **Dev tool only** (M10 S2, ruling A-R230; `rdb_dev admin damage-copy`). Flip every bit of
+    /// the last byte of the value stored at `key` in `ns` of lineage `(partition, generation)`,
+    /// in **this copy only**, with a synced write, so the next read of it fails its own check:
+    /// a `History` record (key: the seq, u64 BE) fails [`crate::verify_lineage`] at that seq, and
+    /// a sealed value fails its envelope digest (`CORRUPT_HISTORY`). The frame and version stay,
+    /// so the record still reads as a value. Nothing is replicated: the other copies keep the
+    /// good record. Reads only this lineage's own key, never through the chain. Debug builds
+    /// only, like [`Self::inject_fault`]; the product never calls it.
+    ///
+    /// # Errors
+    ///
+    /// [`DamageRefused::NoValue`] when no value is stored there (absent, a tombstone, or a
+    /// value with no bytes): nothing is written. [`DamageRefused::WriteFailed`] when RocksDB
+    /// refuses the write.
+    #[cfg(debug_assertions)]
+    pub fn damage_record(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: &[u8],
+    ) -> Result<(), DamageRefused> {
+        let raw = encode_key(partition, generation, ns, key);
+        let cf = self.cf(keys::cf_for(ns));
+        let found = self
+            .db
+            .get_cf(cf, &raw)
+            .map_err(|e| DamageRefused::WriteFailed {
+                detail: e.to_string(),
+            })?;
+        // Absent reads as empty, which does not unframe: one guard for all three cases.
+        let mut value = found.unwrap_or_default();
+        if !matches!(unframe(&value), Some(Frame::Value(_, bytes)) if !bytes.is_empty()) {
+            return Err(DamageRefused::NoValue { key_hex: hex(&raw) });
+        }
+        let last = value.len() - 1;
+        value[last] ^= 0xFF;
+        let mut write = WriteBatch::default();
+        write.put_cf(cf, &raw, &value);
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(write, &opts)
+            .map_err(|e| DamageRefused::WriteFailed {
+                detail: e.to_string(),
+            })?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        tracing::warn!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            ns = ?ns,
+            key_hex = %hex(&raw),
+            offset = last,
+            "record_damaged"
+        );
+        Ok(())
+    }
+
+    fn decode_epochs(
+        partition: PartitionId,
+        raw: &[u8],
+    ) -> Result<BTreeSet<OwnerEpoch>, StorageFault> {
+        decode_revoked(raw).ok_or_else(|| {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                len = raw.len(),
+                "epoch_revocations_undecodable"
             );
             StorageFault::Corrupt
         })
@@ -922,6 +1215,11 @@ impl RocksEngine {
             );
             return Err(StorageFault::WriteFailed);
         }
+        // A synced write that deleted something synced the WAL through it, as
+        // `put_metadata_synced` does (A-R214). An empty batch is not counted: it may not sync.
+        if deleted > 0 {
+            self.synced_seq = Some(self.db.latest_sequence_number());
+        }
         tracing::info!(
             target: LOG_TARGET,
             partition = partition.0,
@@ -1142,6 +1440,16 @@ impl std::fmt::Display for RawRecord {
                 );
                 return write!(f, "publish_marks p={} {marks}", partition.0);
             }
+            if let Some(partition) = decode_revoked_key(&self.key) {
+                let epochs = decode_revoked(&self.value).map_or_else(
+                    || format!("<undecodable {}>", hex(&self.value)),
+                    |epochs| {
+                        let shown: Vec<String> = epochs.iter().map(|e| e.0.to_string()).collect();
+                        format!("[{}]", shown.join(" "))
+                    },
+                );
+                return write!(f, "revoked_epochs p={} {epochs}", partition.0);
+            }
             return write!(
                 f,
                 "unknown key={} value={}",
@@ -1256,10 +1564,20 @@ fn db_options(create: bool) -> Options {
     opts
 }
 
-fn descriptors() -> Vec<ColumnFamilyDescriptor> {
+/// Each of [`COLUMN_FAMILIES`]' options, RocksDB's own but for what `storage` sets (A-R248).
+/// RocksDB's `default` column family holds nothing of ours and keeps its own.
+fn cf_options(storage: StorageOptions) -> Options {
+    let mut opts = Options::default();
+    if let Some(bytes) = storage.write_buffer_bytes {
+        opts.set_write_buffer_size(bytes);
+    }
+    opts
+}
+
+fn descriptors(storage: StorageOptions) -> Vec<ColumnFamilyDescriptor> {
     COLUMN_FAMILIES
         .iter()
-        .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+        .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(storage)))
         .collect()
 }
 
@@ -1286,14 +1604,15 @@ type Lineages = BTreeMap<(PartitionId, Generation), Marks>;
 
 /// Open `path` read-only and make every check `open` makes. A directory with no marker that
 /// holds nothing passes: `open` would stamp it, and a reader finds nothing in it either way.
-fn read_only(path: &Path) -> Result<(DB, Lineages), OpenError> {
+fn read_only(path: &Path) -> Result<(DB, Lineages, u32), OpenError> {
     let db = DB::open_cf_for_read_only(&db_options(false), path, COLUMN_FAMILIES, false)
         .map_err(|e| backend(path, &e))?;
-    check_format(&db, path, true)?;
+    // `None` only for a directory that holds nothing, which `open` would stamp.
+    let format = check_format(&db, path, true)?.unwrap_or(FORMAT_VERSION);
     read_instance(&db, path)?;
     let lineages = restore_lineages(&db, path)?;
     check_marks(&lineages)?;
-    Ok((db, lineages))
+    Ok((db, lineages, format))
 }
 
 /// The instance marker, `None` when absent. A marker that is not [`INSTANCE_LEN`] bytes is a
@@ -1335,22 +1654,24 @@ fn check_marks(lineages: &Lineages) -> Result<(), OpenError> {
 }
 
 /// Check the format marker, writing it (synced) into a directory that holds nothing yet.
-/// Returns whether it wrote the marker.
-fn ensure_format(db: &DB, path: &Path, existed: bool) -> Result<bool, OpenError> {
-    let stamp = check_format(db, path, existed)?;
-    if stamp {
+/// Returns whether it wrote the marker, and the marker now on disk.
+fn ensure_format(db: &DB, path: &Path, existed: bool) -> Result<(bool, u32), OpenError> {
+    let found = check_format(db, path, existed)?;
+    if found.is_none() {
         let meta = handle(db, path, CF_METADATA)?;
         let mut opts = WriteOptions::default();
         opts.set_sync(true);
         db.put_cf_opt(meta, FORMAT_KEY, FORMAT_VERSION.to_be_bytes(), &opts)
             .map_err(|e| backend(path, &e))?;
     }
-    Ok(stamp)
+    Ok((found.is_none(), found.unwrap_or(FORMAT_VERSION)))
 }
 
-/// Refuse a missing or foreign format marker. `Ok(true)`: no marker, and the directory holds
-/// nothing, so it is safe to stamp. Writes nothing, so a read-only open can run it.
-fn check_format(db: &DB, path: &Path, existed: bool) -> Result<bool, OpenError> {
+/// Refuse a missing or foreign format marker. `Ok(Some(version))`: a marker this build opens,
+/// [`OLDEST_FORMAT_VERSION`] through [`FORMAT_VERSION`]. `Ok(None)`: no marker, and the
+/// directory holds nothing, so it is safe to stamp. Writes nothing, so a read-only open can run
+/// it.
+fn check_format(db: &DB, path: &Path, existed: bool) -> Result<Option<u32>, OpenError> {
     let meta = handle(db, path, CF_METADATA)?;
     let found = db.get_cf(meta, FORMAT_KEY).map_err(|e| backend(path, &e))?;
     let refuse = |found: Option<u32>| OpenError::Format {
@@ -1366,15 +1687,15 @@ fn check_format(db: &DB, path: &Path, existed: bool) -> Result<bool, OpenError> 
                     key_hex: hex(FORMAT_KEY),
                     problem: "the format marker is not 4 bytes".to_string(),
                 })?;
-            if version == FORMAT_VERSION {
-                Ok(false)
+            if (OLDEST_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
+                Ok(Some(version))
             } else {
                 Err(refuse(Some(version)))
             }
         }
         // A directory that crashed between creation and the marker write holds nothing, so it
         // is still safe to stamp. One holding any record is not.
-        None if !existed || is_empty(db, path)? => Ok(true),
+        None if !existed || is_empty(db, path)? => Ok(None),
         None => Err(refuse(None)),
     }
 }
@@ -1411,6 +1732,7 @@ fn restore_lineages(
             if key.as_ref() == FORMAT_KEY
                 || key.as_ref() == INSTANCE_KEY
                 || decode_publish_marks_key(&key).is_some()
+                || decode_revoked_key(&key).is_some()
             {
                 continue;
             }

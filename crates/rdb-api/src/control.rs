@@ -743,8 +743,10 @@ async fn watch(
     let opened_at = tokio::time::Instant::now();
     let mut served = false;
     let started = Instant::now();
+    // Watches are leader-served: open at the leader wherever it is, not at one endpoint
+    // (#57, A-R229).
     let opened = store
-        .watch(WatchRequest {
+        .watch_leader(WatchRequest {
             prefix: Bytes::from_static(name.as_bytes()),
             start_after_revision: from.0,
             progress_interval: None,
@@ -771,7 +773,7 @@ async fn watch(
                     Err((kind, detail)) => return fault(&links, site, kind, detail),
                 };
                 cursor = Revision(event.revision);
-                tracing::debug!(
+                tracing::info!(
                     node = site.node.0,
                     prefix = name,
                     revision = event.revision,
@@ -1779,6 +1781,9 @@ mod tests {
     struct ScriptedWatch {
         streams: Mutex<BTreeMap<String, std::collections::VecDeque<Stream>>>,
         arrivals: Mutex<Vec<tokio::time::Instant>>,
+        /// Refuse every `watch` and serve the script on `watch_leader` only, as a store whose
+        /// first endpoint is a follower does (#57).
+        leader_only: bool,
     }
 
     impl ScriptedWatch {
@@ -1791,6 +1796,7 @@ mod tests {
                         .collect(),
                 ),
                 arrivals: Mutex::new(Vec::new()),
+                leader_only: false,
             }
         }
     }
@@ -1843,6 +1849,29 @@ mod tests {
             'a: 'b,
             Self: 'b,
         {
+            if self.leader_only {
+                return Box::pin(std::future::ready(Err(ConfigError::NotLeader {
+                    hint: None,
+                })));
+            }
+            self.open(request)
+        }
+
+        fn watch_leader<'a, 'b>(
+            &'a self,
+            request: WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.open(request)
+        }
+    }
+
+    impl ScriptedWatch {
+        /// The next scripted stream for `request`'s prefix.
+        fn open(&self, request: WatchRequest) -> Reply<'_, config_core::WatchStream> {
             lock(&self.arrivals).push(tokio::time::Instant::now());
             let prefix = String::from_utf8_lossy(&request.prefix).into_owned();
             let next = lock(&self.streams)
@@ -1865,6 +1894,102 @@ mod tests {
                 Box::pin(futures::stream::iter(items).chain(quiet));
             Box::pin(std::future::ready(Ok(stream)))
         }
+    }
+
+    /// M10 S2 (#57 walk, lead to W7): each rEtcd event a watch delivers is logged
+    /// `control_watch_event` at info, so a walk at rdb_dev's default level sees a change reach a
+    /// node. It was debug, below what a walk reads. Cut: back to debug, and `@l` reads `Debug`.
+    /// Unit.
+    #[config_log::retcd_test]
+    fn a_delivered_watch_event_is_logged_at_info() {
+        let script = BTreeMap::from([(
+            ControlPrefix::Partitions.encode().to_owned(),
+            vec![Stream::of(vec![Ok(WatchItem::Event(
+                config_core::MutationEvent {
+                    revision: 4,
+                    key: Bytes::from_static(b"partitions/1"),
+                    kind: config_core::MutationEventKind::Delete,
+                },
+            ))])],
+        )]);
+        let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch::new(script));
+        let links = Links::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx, crate::host::BOOT);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(watch(
+            store,
+            links,
+            SITE,
+            ControlPrefix::Partitions,
+            Revision(2),
+            Arc::new(AtomicU32::new(0)),
+        ));
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            "a_delivered_watch_event_is_logged_at_info",
+        )
+        .into_iter()
+        .filter(|line| line["@m"] == "control_watch_event")
+        .collect();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0]["@l"], "Information", "{}", lines[0]);
+        assert_eq!(lines[0]["revision"], 4, "{}", lines[0]);
+    }
+
+    /// #57 (A-R229): a node's control watch opens at the leader. Through a store whose `watch`
+    /// is refused `NotLeader` (its first endpoint a follower) and whose `watch_leader` serves,
+    /// the node still gets the change. Cut: open with `watch` again, and the node gets a
+    /// `NotLeader` termination instead. Unit.
+    #[test]
+    fn a_control_watch_opens_at_the_leader() {
+        let script = BTreeMap::from([(
+            ControlPrefix::Partitions.encode().to_owned(),
+            vec![Stream::of(vec![Ok(WatchItem::Event(
+                config_core::MutationEvent {
+                    revision: 4,
+                    key: Bytes::from_static(b"partitions/1"),
+                    kind: config_core::MutationEventKind::Delete,
+                },
+            ))])],
+        )]);
+        let store = ScriptedWatch {
+            leader_only: true,
+            ..ScriptedWatch::new(script)
+        };
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx, crate::host::BOOT);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(watch(
+            Arc::new(store),
+            links,
+            SITE,
+            ControlPrefix::Partitions,
+            Revision(2),
+            Arc::new(AtomicU32::new(0)),
+        ));
+        let first = rx.try_iter().find_map(|msg| match msg {
+            Msg::Control { event, .. } => Some(event),
+            _ => None,
+        });
+        assert_eq!(
+            first,
+            Some(ControlEvent::Watched {
+                prefix: ControlPrefix::Partitions,
+                cursor: WatchCursor {
+                    revision: Revision(4)
+                },
+                changes: vec![ControlChange {
+                    key: ControlKey::Partition(PartitionId(1)),
+                    revision: Revision(4),
+                }],
+            })
+        );
     }
 
     /// A resume point is only right if it is the furthest revision the node was told about:

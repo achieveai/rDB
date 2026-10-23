@@ -30,6 +30,9 @@
 //!   amendment 2026-09-26, lead ruling B-R60). **Answered even when no primary serves**:
 //!   `SetAdmission` with `NotRequired` and the timer with `StaleTimer`, because R1 is a named
 //!   consumer of both, and neither writes anything;
+//! * this partition's shadow-probe timer ([`primary::shadow_timer`]), to a serving primary,
+//!   which probes each shadow by it and re-arms it while the configuration names one (lead
+//!   ruling A-R228); **answered even when no primary serves**, with `StaleTimer`;
 //! * this partition's retransmit timer ([`catchup::retransmit_timer`]), **always answered**:
 //!   the version armed now re-sends, on this node, each catch-up record — a primary's cursor's
 //!   or a recovery source's — that was sent, is not ACKed, and saw no progress since the last
@@ -74,7 +77,7 @@ use crate::contracts::transport::{PeerLabel, TransportEvent};
 
 use append::{AppendReceiver, Head, ReceiverInit};
 use catchup::{retransmit_timer, RETRANSMIT_MS};
-use primary::{keepalive_timer, Primary};
+use primary::{keepalive_timer, shadow_timer, Primary};
 use progress::{DigestLadder, ProgressTracker, TrackerInit};
 use source::Source;
 use wire::R1Frame;
@@ -140,6 +143,27 @@ impl Replication {
         self.receivers
             .get_mut(&(node, partition))
             .ok_or(RdbError::InvalidArgument { field: "receiver" })?
+            .restore_history(rungs)
+    }
+
+    /// Give the primary for `(node, partition)` the digests its own engine holds, on demand
+    /// (K3, lead ruling A-R223): the consumer of `SnapshotCatchupRequired` calls this once per
+    /// copy and barrier, and the copy's next `NeedPrefix` walks it record by record instead of
+    /// waiting on a snapshot. See [`ProgressTracker::restore_history`].
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `primary` when none is installed there, or what
+    /// [`ProgressTracker::restore_history`] refuses (`retired`, `rungs`).
+    pub fn restore_primary_history(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        rungs: &[(Seq, Digest)],
+    ) -> Result<(), RdbError> {
+        self.primaries
+            .get_mut(&(node, partition))
+            .ok_or(RdbError::InvalidArgument { field: "primary" })?
             .restore_history(rungs)
     }
 
@@ -283,6 +307,12 @@ impl Module for Replication {
                 Some(primary.map_or_else(
                     || replica(ReplicaIgnoreReason::StaleTimer),
                     |primary| primary.on_keepalive(fired, ctx.now),
+                ))
+            }
+            EventKind::Timer(fired) if fired.id == shadow_timer(event.partition) => {
+                Some(primary.map_or_else(
+                    || replica(ReplicaIgnoreReason::StaleTimer),
+                    |primary| primary.on_shadow_tick(fired, ctx.now),
                 ))
             }
             EventKind::Kernel(kernel) => {

@@ -22,7 +22,10 @@ use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnResult};
 use rdb_core::transaction::dedup::{DedupIndex, SeedPending};
 use rdb_sim::storage::history::canonical_history;
-use rdb_storage::{dump, BindError, OpenError, PublishMark, RocksEngine, INSTANCE_LEN};
+use rdb_storage::{
+    dump, BindError, OpenError, PublishMark, RocksEngine, StorageOptions,
+    DEFAULT_WRITE_BUFFER_BYTES, INSTANCE_LEN,
+};
 
 const X: [u8; INSTANCE_LEN] = [0x11; INSTANCE_LEN];
 const Y: [u8; INSTANCE_LEN] = [0x22; INSTANCE_LEN];
@@ -495,4 +498,392 @@ fn m10_a_synced_metadata_write_syncs_the_wal_before_it_counts_as_synced() {
         );
     }
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Put `value` at `key` in the `metadata` column family of the closed copy at `db`.
+fn put_raw(db: &std::path::Path, key: &[u8], value: &[u8]) {
+    let raw = rocksdb::DB::open_cf(
+        &rocksdb::Options::default(),
+        db,
+        rdb_storage::keys::COLUMN_FAMILIES,
+    )
+    .expect("raw open");
+    let meta = raw
+        .cf_handle(rdb_storage::keys::CF_METADATA)
+        .expect("metadata cf");
+    raw.put_cf(meta, key, value).expect("raw put");
+}
+
+/// The format marker of the closed copy at `db`.
+fn marker(db: &std::path::Path) -> u32 {
+    let raw = rocksdb::DB::open_cf_for_read_only(
+        &rocksdb::Options::default(),
+        db,
+        rdb_storage::keys::COLUMN_FAMILIES,
+        false,
+    )
+    .expect("raw read-only open");
+    let meta = raw
+        .cf_handle(rdb_storage::keys::CF_METADATA)
+        .expect("metadata cf");
+    let found = raw
+        .get_cf(meta, b"format")
+        .expect("read")
+        .expect("a marker");
+    u32::from_be_bytes(found.as_slice().try_into().expect("4 bytes"))
+}
+
+/// Format 2 (M10 S2, arch-s2 "Restart heal and drain"): A1's `PersistEpochRevocation` lands
+/// here. A format-1 copy (an S1 directory) still opens and stays format 1, so an S1 build can
+/// still open it, until its first revocation, whose synced batch moves the marker to 2. The
+/// revocations survive a reopen, read-only included, come back by partition then epoch for the
+/// host's replay, and `dump` names them. A stored value that is not whole epochs is `Corrupt`,
+/// never "none revoked", for the read and for the next revocation alike. Cuts: accept only
+/// format 2 (the S1 copy is refused at open); write no marker with the revocation (it reads 1);
+/// drop the `revoked` key from the keys an open accepts (the reopen is refused). Unit, under a
+/// second.
+#[retcd_test]
+fn m10_s2_epoch_revocations_survive_a_reopen_and_move_a_format_1_copy_to_2() {
+    use rdb_storage::keys::{FORMAT_VERSION, OLDEST_FORMAT_VERSION};
+    let dir = data_dir("revocations");
+    let db = dir.join("db");
+    let (p1, p2) = (PartitionId(1), PartitionId(2));
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 2);
+    }
+    assert_eq!(marker(&db), FORMAT_VERSION, "a new copy is format 2");
+    put_raw(&db, b"format", &OLDEST_FORMAT_VERSION.to_be_bytes());
+    {
+        let mut engine = RocksEngine::open(&db).expect("an S1 copy opens");
+        assert_eq!(engine.epoch_revocations(), Ok(Vec::new()), "none held");
+        write(&mut engine, 3);
+    }
+    assert_eq!(marker(&db), 1, "opens and writes leave an S1 copy format 1");
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        for (partition, epoch) in [(p1, 5), (p2, 4), (p1, 3), (p1, 5)] {
+            engine
+                .persist_epoch_revocation(partition, OwnerEpoch(epoch))
+                .expect("revoke");
+        }
+    }
+    assert_eq!(marker(&db), 2, "the first revocation moved the marker");
+    let held = vec![
+        (p1, OwnerEpoch(3)),
+        (p1, OwnerEpoch(5)),
+        (p2, OwnerEpoch(4)),
+    ];
+    {
+        let engine = RocksEngine::open(&db).expect("a reopen");
+        assert_eq!(engine.epoch_revocations(), Ok(held.clone()), "durable");
+    }
+    let reader = RocksEngine::open_read_only(&db).expect("read-only open");
+    assert_eq!(reader.epoch_revocations(), Ok(held));
+    drop(reader);
+    assert!(
+        dump(&db)
+            .expect("dump")
+            .iter()
+            .any(|r| r.to_string() == "metadata revoked_epochs p=1 [3 5]"),
+        "dump names them"
+    );
+
+    let mut key = b"revoked".to_vec();
+    key.extend_from_slice(&1_u32.to_be_bytes());
+    put_raw(&db, &key, &[0; 7]);
+    let mut engine = RocksEngine::open(&db).expect("open with an undecodable list");
+    assert_eq!(engine.epoch_revocations(), Err(StorageFault::Corrupt));
+    assert_eq!(
+        engine.persist_epoch_revocation(p1, OwnerEpoch(6)),
+        Err(StorageFault::Corrupt),
+        "never written over"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Found by the guard-deletion pass, not guessed: a lineage-scoped `metadata` key can start with
+/// the bytes `revoked` (partition `0x7265766f` is "revo", a generation whose first bytes are
+/// "ked"), and the revocation scan read it as an undecodable revocation, so a legal copy's
+/// `epoch_revocations` came back `Corrupt`. The scan now skips a key the lineage layout decodes,
+/// as open does. A lineage of the highest partition id sorts after every revocation and is
+/// never reached. Cut: return `Corrupt` for a lineage-shaped key again (this row reads
+/// `Err(Corrupt)`). Unit, under a second.
+#[retcd_test]
+fn m10_s2_a_lineage_whose_key_starts_like_a_revocation_is_not_one() {
+    let dir = data_dir("revoked-lookalike");
+    let db = dir.join("db");
+    let lookalike = Lineage {
+        partition: PartitionId(u32::from_be_bytes(*b"revo")),
+        generation: Generation(u64::from_be_bytes(*b"ked\0\0\0\0\x01")),
+        owner_epoch: OwnerEpoch(1),
+    };
+    let last = Lineage {
+        partition: PartitionId(u32::MAX),
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+    };
+    let held = vec![(PartitionId(1), OwnerEpoch(2))];
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        for lineage in [lookalike, last] {
+            let history =
+                canonical_history(lineage, ConfigVersion(1), 2).expect("canonical history");
+            for batch in history.batches {
+                engine.commit(batch).expect("commit");
+            }
+        }
+        engine
+            .persist_epoch_revocation(PartitionId(1), OwnerEpoch(2))
+            .expect("revoke");
+        assert_eq!(engine.epoch_revocations(), Ok(held.clone()));
+    }
+    let engine = RocksEngine::open(&db).expect("a reopen");
+    assert_eq!(engine.epoch_revocations(), Ok(held), "after a reopen");
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// A revocation's write is synced and counts as synced (A-R214). An armed `SyncedPut` fails it:
+/// nothing is written, the copy stays format 1, and nothing counts as synced. Debug builds only,
+/// as the fault point and the count are. Unit, under a second.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_an_epoch_revocation_is_one_synced_write_or_nothing() {
+    use rdb_storage::InjectedFault;
+    let dir = data_dir("revocation-synced");
+    let db = dir.join("db");
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 1);
+    }
+    put_raw(&db, b"format", &1_u32.to_be_bytes());
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 2);
+        engine.inject_fault(InjectedFault::SyncedPut);
+        let before = engine.wal_syncs();
+        assert_eq!(
+            engine.persist_epoch_revocation(PartitionId(1), OwnerEpoch(2)),
+            Err(StorageFault::WriteFailed)
+        );
+        assert_eq!(
+            engine.epoch_revocations(),
+            Ok(Vec::new()),
+            "nothing written"
+        );
+        assert_eq!(engine.wal_syncs(), before, "nothing synced");
+        assert!(!engine.wal_synced_through_latest());
+    }
+    assert_eq!(marker(&db), 1, "the failed write left the copy format 1");
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 3);
+        let before = engine.wal_syncs();
+        engine
+            .persist_epoch_revocation(PartitionId(1), OwnerEpoch(2))
+            .expect("revoke");
+        assert_eq!(engine.wal_syncs(), before + 1, "one sync");
+        assert!(engine.wal_synced_through_latest(), "it counts as synced");
+    }
+    assert_eq!(marker(&db), 2);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Ruling A-R230 (`rdb_dev admin damage-copy`): the dev hook flips one stored object of one
+/// copy, and the next read of it fails its own check, naming it. Here the object is history
+/// record 2: the lineage check fails at seq 2 and nowhere else, records 1 and 3 read as before,
+/// and the damage survives a reopen (a synced write). A key holding no value is refused and
+/// nothing is written. Cuts: flip no byte (the check passes, red); skip the stored-value check
+/// (the missing key gets a record, red). Debug builds only, as the hook is. Unit, under a
+/// second.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_a_damaged_record_fails_its_check_on_one_copy_naming_it() {
+    use rdb_storage::{verify_lineage, DamageRefused, LineageFault};
+    let dir = data_dir("damage-record");
+    let db = dir.join("db");
+    let (p, g) = (PartitionId(1), Generation(1));
+    let record = |engine: &RocksEngine, seq: u64| {
+        engine
+            .history_at(p, g, Seq(seq))
+            .expect("read")
+            .expect("stored")
+            .0
+    };
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 3);
+        assert!(verify_lineage(&engine, p, g).is_ok(), "whole before");
+        let before: Vec<_> = (1..=3).map(|seq| record(&engine, seq)).collect();
+        engine
+            .damage_record(p, g, Namespace::History, &2_u64.to_be_bytes())
+            .expect("damage record 2");
+        assert!(engine.wal_synced_through_latest(), "a synced write");
+        assert_eq!(
+            verify_lineage(&engine, p, g),
+            Err(LineageFault::DigestMismatch(Seq(2))),
+            "the check fails at the damaged record"
+        );
+        assert_eq!(record(&engine, 1), before[0]);
+        assert_eq!(record(&engine, 3), before[2]);
+        let (old, new) = (before[1].to_vec(), record(&engine, 2).to_vec());
+        let differ: Vec<usize> = (0..old.len()).filter(|&i| old[i] != new[i]).collect();
+        assert_eq!(differ, vec![old.len() - 1], "one byte, the last");
+
+        let records = stored_history(&engine);
+        assert!(matches!(
+            engine.damage_record(p, g, Namespace::History, &9_u64.to_be_bytes()),
+            Err(DamageRefused::NoValue { .. })
+        ));
+        assert_eq!(stored_history(&engine), records, "nothing written");
+    }
+    let engine = RocksEngine::open(&db).expect("reopen");
+    assert_eq!(
+        verify_lineage(&engine, p, g),
+        Err(LineageFault::DigestMismatch(Seq(2))),
+        "durable"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Every History record of lineage (1, 1), for a nothing-written check.
+#[cfg(debug_assertions)]
+fn stored_history(engine: &RocksEngine) -> Vec<Option<bytes::Bytes>> {
+    (1..=10)
+        .map(|seq| {
+            engine
+                .history_at(PartitionId(1), Generation(1), Seq(seq))
+                .expect("read")
+                .map(|(record, _)| record)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// M10 S2 W9, ruling A-R248: the memtable budget is a storage option. Its default is RocksDB
+// 0.23's own, 64 MiB, so an engine opened without it is the engine as it was.
+// ---------------------------------------------------------------------------------------------
+
+/// The smallest budget RocksDB keeps as given; it raises anything smaller to this.
+const SMALL_BUFFER: usize = 64 << 10;
+
+/// `write_buffer_size` of each column family in the newest `OPTIONS-*` file RocksDB wrote at
+/// open, by column family name.
+fn write_buffer_sizes(dir: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let newest = std::fs::read_dir(dir)
+        .expect("read the database directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("OPTIONS-") && !name.ends_with(".dbtmp"))
+        })
+        .max()
+        .expect("RocksDB writes an OPTIONS file at open");
+    let text = std::fs::read_to_string(&newest).expect("read the OPTIONS file");
+    let mut sizes = std::collections::BTreeMap::new();
+    let mut cf = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line
+            .strip_prefix("[CFOptions \"")
+            .and_then(|rest| rest.strip_suffix("\"]"))
+        {
+            cf = Some(name.to_owned());
+        } else if line.starts_with('[') {
+            cf = None;
+        } else if let (Some(name), Some(value)) = (&cf, line.strip_prefix("write_buffer_size=")) {
+            sizes.insert(name.clone(), value.parse().expect("a byte count"));
+        }
+    }
+    sizes
+}
+
+/// The budget is applied to each of our column families as given; an open without it keeps
+/// 64 MiB. RocksDB's `default` column family holds nothing of ours and keeps its own 64 MiB.
+/// RocksDB's own `OPTIONS` file is the witness, and each open logs the value it asked for
+/// once, as `write_buffer_bytes_asked` on its `storage_open` line.
+#[retcd_test]
+fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
+    let every = |bytes: usize| {
+        let mut all: std::collections::BTreeMap<String, usize> = rdb_storage::keys::COLUMN_FAMILIES
+            .iter()
+            .map(|name| ((*name).to_owned(), bytes))
+            .collect();
+        all.insert("default".to_owned(), DEFAULT_WRITE_BUFFER_BYTES);
+        all
+    };
+    let small = data_dir("write-buffer-small");
+    drop(
+        RocksEngine::open_with(
+            &small,
+            StorageOptions {
+                write_buffer_bytes: Some(SMALL_BUFFER),
+            },
+        )
+        .expect("open with a small budget"),
+    );
+    assert_eq!(write_buffer_sizes(&small), every(SMALL_BUFFER));
+
+    let plain = data_dir("write-buffer-default");
+    drop(RocksEngine::open(&plain).expect("open"));
+    assert_eq!(DEFAULT_WRITE_BUFFER_BYTES, 64 << 20);
+    assert_eq!(
+        write_buffer_sizes(&plain),
+        every(DEFAULT_WRITE_BUFFER_BYTES),
+        "no option is RocksDB's own 64 MiB"
+    );
+
+    let logged: Vec<u64> = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged",
+    )
+    .iter()
+    .filter(|line| line["@m"] == "storage_open")
+    .map(|line| line["write_buffer_bytes_asked"].as_u64().expect("a number"))
+    .collect();
+    assert_eq!(
+        logged,
+        vec![SMALL_BUFFER as u64, DEFAULT_WRITE_BUFFER_BYTES as u64]
+    );
+}
+
+/// The same writes on two engines: under a 64 KiB budget the history column family's memtable
+/// filled, was switched out and flushed, so the active one holds less than a budget's worth
+/// and fewer entries than were written. Under the default every entry is still in memory.
+#[retcd_test]
+fn m10_s2_a_small_write_buffer_flushes_where_the_default_keeps_everything_in_memory() {
+    let cf = rdb_storage::keys::CF_HISTORY;
+    let active = |options: StorageOptions, name: &str| {
+        let dir = data_dir(name);
+        let mut engine = RocksEngine::open_with(&dir, options).expect("open");
+        write(&mut engine, 600);
+        assert!(
+            engine.active_memtable("no-such-cf").is_err(),
+            "an unknown name is an error"
+        );
+        engine.active_memtable(cf).expect("memtable properties")
+    };
+    let (held_bytes, held_entries) = active(StorageOptions::default(), "flush-default");
+    assert!(
+        held_bytes > 4 * SMALL_BUFFER as u64,
+        "the writes are several small budgets' worth: {held_bytes} bytes"
+    );
+    let (small_bytes, small_entries) = active(
+        StorageOptions {
+            write_buffer_bytes: Some(SMALL_BUFFER),
+        },
+        "flush-small",
+    );
+    assert!(
+        small_bytes <= 2 * SMALL_BUFFER as u64,
+        "the small budget switched its memtable out: {small_bytes} bytes active"
+    );
+    assert!(
+        small_entries < held_entries,
+        "entries left memory: {small_entries} active of {held_entries}"
+    );
 }

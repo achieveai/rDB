@@ -113,22 +113,25 @@ pub fn members_at(boot: BootId) -> Vec<Member> {
         .collect()
 }
 
-/// A recovery plan for partition 1 from `anchor`: rf3 at `version`, every node at `boot`, every
-/// copy a candidate and in `rebuild_required`, node 1 primary with `grant` at `generation`.
+/// A recovery plan for the anchor's partition from `anchor`: rf3 at `version` with `members`,
+/// the owner at `boot` in the authority view, every copy a candidate and in `rebuild_required`,
+/// the pinned primary with `grant` at `generation`. The host's restart re-plan uses it too
+/// (#42, A-R249).
 ///
 /// Only the pinned primary is `primary_eligible` (ruling A-R215). The host acquires, tracks and
 /// adopts on that copy alone, so F1 must lead with it even when another copy holds the longer
 /// prefix: the leader then catches up before its grant. Every copy eligible let `select_leader`
 /// name the prefix source, which owned the record while node 1 held the grant, and the open
 /// served nothing.
-fn recovery_plan(
+pub(crate) fn recovery_plan(
     anchor: LineageAnchor,
     version: ConfigVersion,
+    members: Vec<Member>,
     boot: BootId,
     grant: GrantId,
     generation: AuthorityGeneration,
 ) -> RecoveryPlan {
-    let config = PartitionConfig::new(PARTITION, version, members_at(boot));
+    let config = PartitionConfig::new(anchor.lineage.partition, version, members);
     RecoveryPlan {
         anchor,
         candidates: config
@@ -226,6 +229,7 @@ pub async fn bootstrap_at(
     let plan = recovery_plan(
         anchor,
         CONFIG_VERSION,
+        members_at(boot),
         boot,
         GrantId(1),
         AuthorityGeneration(1),
@@ -374,13 +378,13 @@ pub enum CounterError {
         key: String,
     },
     /// The directory has been opened [`MAX_OPENS`] times.
-    #[error("{key} has counted {MAX_OPENS} opens, the most one directory may have")]
+    #[error("{}", crate::db::error::counter_exhausted_text(.key, MAX_OPENS))]
     Exhausted {
         /// The counter's key.
         key: String,
     },
     /// The counter's value is not one this build writes.
-    #[error("{key} at revision {revision} is not an open counter")]
+    #[error("{}", crate::db::error::counter_unreadable_text(.key, *.revision))]
     Unreadable {
         /// The counter's key.
         key: String,
@@ -789,6 +793,19 @@ pub enum HealError {
     /// Node 1's thread is gone.
     #[error("node {} stopped before the heal reached it", OWNER.0)]
     NodeStopped,
+    /// No handshake from these nodes within the heal's time, so the plan cannot pin their boots.
+    #[error(
+        "no link to node {who} came up within {secs} seconds, so the heal cannot pin its \
+         boot: start node {who}, then open again",
+        who = names_in_words(.nodes),
+        secs = seconds_in_words(*.within_ms)
+    )]
+    PeersUnknown {
+        /// The nodes with no boot yet.
+        nodes: Vec<u32>,
+        /// The heal's bound.
+        within_ms: u128,
+    },
 }
 
 /// What a reopen's heal runs with: it runs as a task, after `Db::open` has returned.
@@ -802,6 +819,10 @@ pub(crate) struct HealCtx {
     pub(crate) owner: std::sync::mpsc::Sender<Msg>,
     /// How long clearing the old grants may take.
     pub(crate) within: Duration,
+    /// The boot each member runs at: this open's for a node this process runs, the one its
+    /// last handshake reported for another ([`crate::transport::Links::boot_of`]); `None`
+    /// until that node's link has come up (arch-s2 B1).
+    pub(crate) member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
 }
 
 /// The correlation a heal's two events carry.
@@ -833,6 +854,9 @@ const HEAL: CorrelationId = CorrelationId(2);
 /// [`HealError`]. Nothing is sent to node 1 unless every step held.
 pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
+    // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
+    // fence's reads and decision tick as fresh as they were.
+    let members = member_boots(&ctx, deadline).await?;
     let gone = clear_until(&ctx, OWNER, deadline).await?;
     for node in [NodeId(2), NodeId(3)] {
         clear_until(&ctx, node, deadline).await?;
@@ -925,7 +949,14 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         base_digest: root.base_digest,
     };
     let version = ConfigVersion(record.config_version.0 + 1);
-    let plan = recovery_plan(anchor, version, ctx.boot, view_grant, view_generation);
+    let plan = recovery_plan(
+        anchor,
+        version,
+        members,
+        ctx.boot,
+        view_grant,
+        view_generation,
+    );
     let fence = FencingProof {
         partition: PARTITION,
         prior_generation: record.generation,
@@ -969,6 +1000,64 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
             .map_err(|_| HealError::NodeStopped)?;
     }
     Ok(healed)
+}
+
+/// The rf3 members of [`members`], each at the boot `ctx.member_boot` names for its node, once
+/// every one is known. Polls until `deadline`: a peer's boot arrives with its handshake.
+async fn member_boots(
+    ctx: &HealCtx,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<Member>, HealError> {
+    loop {
+        let found: Vec<(Member, Option<BootId>)> = members()
+            .into_iter()
+            .map(|member| (member, (ctx.member_boot)(member.node)))
+            .collect();
+        let missing: Vec<u32> = found
+            .iter()
+            .filter(|(_, boot)| boot.is_none())
+            .map(|(member, _)| member.node.0)
+            .collect();
+        if missing.is_empty() {
+            let members: Vec<Member> = found
+                .into_iter()
+                .filter_map(|(member, boot)| {
+                    Some(Member {
+                        boot: boot?,
+                        ..member
+                    })
+                })
+                .collect();
+            tracing::info!(
+                boots = ?members.iter().map(|m| (m.node.0, m.boot.0)).collect::<Vec<_>>(),
+                "heal_member_boots"
+            );
+            return Ok(members);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(missing = ?missing, "heal_peers_unknown");
+            return Err(HealError::PeersUnknown {
+                nodes: missing,
+                within_ms: ctx.within.as_millis(),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Node numbers in words: `2`, `2 and 3`, `1, 2 and 3`.
+fn names_in_words(nodes: &[u32]) -> String {
+    match nodes {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!(
+            "{} and {last}",
+            rest.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// How [`clear_until`] found a node's grant gone.
@@ -1836,6 +1925,7 @@ mod tests {
             clock: HostClock::start(),
             owner,
             within: Duration::from_millis(500),
+            member_boot: Arc::new(|_| Some(OPEN_2)),
         };
         let healed = rt.block_on(heal(ctx));
         (healed, mailbox.try_iter().collect())
@@ -2236,5 +2326,39 @@ mod tests {
             "case B: {healed:?}"
         );
         assert!(sent.is_empty(), "case B: {} messages sent", sent.len());
+    }
+
+    /// arch-s2 B1: the owner opens alone (`local=[1]`) and no link to node 2 or 3 comes up. The
+    /// heal cannot pin their boots, so it ends `PeersUnknown` naming both and saying to start
+    /// them. It waits for them first, so a heal that cannot pin them sends node 1 nothing. Unit
+    /// (~150 ms): `MemStore`, a 100 ms budget.
+    #[test]
+    fn m10_s2_a_heal_with_no_link_to_nodes_2_and_3_names_them_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            store: Arc::clone(&store),
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_millis(100),
+            member_boot: Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2)),
+        };
+        let refused = rt
+            .block_on(heal(ctx))
+            .expect_err("nodes 2 and 3 have no link");
+        assert!(
+            matches!(&refused, HealError::PeersUnknown { nodes, .. } if nodes == &[2, 3]),
+            "{refused:?}"
+        );
+        let text = refused.to_string();
+        assert!(
+            text.contains("start node 2 and 3, then open again"),
+            "the text names both nodes and the next step: {text}"
+        );
+        assert_eq!(mailbox.try_iter().count(), 0, "node 1 was sent nothing");
     }
 }

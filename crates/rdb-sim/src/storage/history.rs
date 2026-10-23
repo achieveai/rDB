@@ -145,6 +145,8 @@ pub fn canonical_history_from(
                 value: value.clone(),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let request_digest = request.request_digest();
         // As T1 reserves it: the put as a user write, then the request's dedup row.

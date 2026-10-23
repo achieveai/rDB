@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use config_core::{
-    command_gate, Action, Authorizer, Capabilities, ClusterIdentity, Command, CommandResponse,
-    ConfigError, Decision, Dedup, DeleteRequest, GetRequest, GetResponse, GossipObservationSource,
-    IdentityMismatch, KvState, LeaderHint, Limits, ListRequest, ListResponse, Liveness,
-    MutationResponse, NodeId, ObservedPeerHint, Pagination, Principal, PutRequest, SchemaTriple,
-    WatchRequest, WatchResumption, WatchRetention, WatchStream, CURRENT_SCHEMA,
-    UNAVAILABLE_FEATURE_NOT_ACTIVATED,
+    command_gate, key_hex, Action, Authorizer, Capabilities, ClusterIdentity, Command,
+    CommandResponse, ConfigError, Decision, Dedup, DeleteRequest, GetRequest, GetResponse,
+    GossipObservationSource, IdentityMismatch, KvState, LeaderHint, Limits, ListRequest,
+    ListResponse, Liveness, MutationResponse, NodeId, ObservedPeerHint, Pagination, Principal,
+    PutRequest, SchemaTriple, WatchRequest, WatchResumption, WatchRetention, WatchStream,
+    CURRENT_SCHEMA, UNAVAILABLE_FEATURE_NOT_ACTIVATED,
 };
 use config_log::TraceContext;
 use config_storage::{
@@ -43,24 +43,11 @@ use crate::watch::{retention_target, JournalView, LeaderClock, WatchHub, WatchSt
 /// Small enough to keep test deadlines tight, large enough not to spin (test plan §6 rule 2).
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Maximum key bytes rendered into a `key_hex` log field (ADR-0013).
-const KEY_HEX_MAX_BYTES: usize = 32;
-
 /// Leader-local `(revision, receipt_ms)` samples the retention task keeps.
 ///
 /// One sample per `check_interval`, so 1,024 of them cover the default 24 h policy many
 /// times over at the default 60 s cadence; the oldest are dropped first.
 const MAX_RETENTION_SAMPLES: usize = 1024;
-
-fn key_hex(key: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
-    for byte in key.iter().take(KEY_HEX_MAX_BYTES) {
-        out.push(DIGITS[usize::from(byte >> 4)] as char);
-        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
-    }
-    out
-}
 
 /// What a `CommandResponse::Noop` for a *command* entry is reported as.
 ///

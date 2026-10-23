@@ -2982,6 +2982,8 @@ mod semantic_runs {
                 value: Bytes::from_static(b"v"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let plan = served(vec![seed(
             200,

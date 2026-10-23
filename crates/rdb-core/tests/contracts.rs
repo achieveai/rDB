@@ -30,7 +30,7 @@ use rdb_core::contracts::storage::{Namespace, Write};
 use rdb_core::contracts::trace::BudgetName;
 use rdb_core::contracts::txn::{
     key_scope, scoped_key, Condition, ConditionOutcome, Mutation, Outcome, TxnRequest,
-    KEY_SCOPE_LEN,
+    KEY_SCOPE_LEN, MAX_PINS,
 };
 use rdb_core::contracts::version::{VersionedArtifact, API_VERSION, ENVELOPE_VERSION};
 
@@ -94,6 +94,8 @@ fn request(remaining_millis: u64) -> TxnRequest {
             value: Bytes::from_static(b"v"),
             expected_version: Some(4),
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 
@@ -321,6 +323,40 @@ fn m7f_02_request_digest_covers_the_semantic_fields_only() {
     let mut other_api = request(1_000);
     other_api.api_version = 9;
     assert_ne!(base, other_api.request_digest(), "api_version is covered");
+}
+
+/// Ruling A-R252: the ack floor and its pins say what the client has been answered, which moves
+/// between a first send and its resend, so neither is in the request digest; a resend with a
+/// later floor is the same payload, not `REQUEST_ID_REUSE`. Absent is the shape every request
+/// had before them: a request with neither serialises without either key, and one written
+/// without them reads back as no floor and no pins.
+#[retcd_test]
+fn m10_s2_the_ack_floor_is_not_the_payload_and_absent_is_the_old_shape() {
+    assert_eq!(MAX_PINS, 8);
+    let first = request(1_000);
+    let mut resend = request(1_000);
+    resend.acked_below = Some(3);
+    resend.pinned = vec![1, 2];
+    assert_eq!(
+        first.request_digest(),
+        resend.request_digest(),
+        "the floor and pins are not the payload"
+    );
+
+    let old = serde_json::to_value(&first).expect("serialise");
+    let keys = old.as_object().expect("an object");
+    assert!(
+        !keys.contains_key("acked_below") && !keys.contains_key("pinned"),
+        "no floor and no pins serialise as the old shape: {old}"
+    );
+    let read: TxnRequest = serde_json::from_value(old).expect("the old shape reads");
+    assert_eq!(read, first, "the old shape reads as no floor and no pins");
+
+    let carried = serde_json::to_value(&resend).expect("serialise");
+    assert_eq!(carried["acked_below"], 3);
+    assert_eq!(carried["pinned"], serde_json::json!([1, 2]));
+    let read: TxnRequest = serde_json::from_value(carried).expect("read");
+    assert_eq!(read, resend, "a floor and pins round-trip");
 }
 
 /// Domain separation: the same bytes in two domains are two digests.

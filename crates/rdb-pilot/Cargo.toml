@@ -24,3 +24,7 @@ tracing = "0.1"
 [[bin]]
 name = "pilot_kv"
 path = "src/main.rs"
+
+[dev-dependencies]
+# Temp folders under the gate's test-data root, for the journal rows.
+config-testkit = { path = "../config-testkit" }
