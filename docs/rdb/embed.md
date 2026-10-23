@@ -65,6 +65,9 @@ scripts/local-cluster.sh up --dir C:/my-app/rEtcd --base-port 28400
 - It starts three rEtcd nodes and prints their client ports: `base + 2`, `base + 12`,
   `base + 22` (here 28402, 28412, 28422). Your app passes all three.
 - Give it its own `--dir` and `--base-port`; never share them with another project.
+- **One rEtcd holds one rDB folder.** A new, empty folder opened against an rEtcd that already
+  serves a folder is refused with `Bootstrap(AlreadyExists { .. })`, and nothing is written.
+  For a second folder, start a second rEtcd with another `--dir` and `--base-port`.
 - Stop it with `scripts/local-cluster.sh down --dir C:/my-app/rEtcd`; start it again with `up`
   and the same arguments; rEtcd keeps its data across a `down` and `up`.
 - `clean` deletes the cluster's data. See the warning at the top.
