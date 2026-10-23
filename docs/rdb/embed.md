@@ -367,7 +367,7 @@ does not help; the "what to do" column does.
 | `OpenError::Stale` | The folder is an old copy: the rEtcd records a newer generation than any copy here holds | Do not delete this directory: its acknowledged writes are intact. Open the folder, or restore the backup, that holds the generation the message names |
 | `OpenError::Unbound` | The folder was made before M10 (M9's `rdb_dev --keep`) and never bound to an rEtcd | Start a new folder; M9 dev data is not migrated |
 | `OpenError::CopyMissing` | One of the folder's `nodes/<n>` directories is missing or empty while another holds data | Restore that directory from where it came from |
-| `OpenError::Counter` | The folder's open counter is used up (2^24 opens), or holds a value this build does not write | Start a new folder |
+| `OpenError::Counter` | The folder's open counter is used up (2^24 opens), or holds a value this build does not write | Used up (the message says "the most one directory may have"): start a new folder. A value this build does not write (the message says "is not an open counter"): do not delete the folder, its acknowledged writes are intact; stop and report it with the message |
 
 A `Stale` whose message says "the open counter marks generation N activated" means a later
 open already served that generation, so this copy cannot catch up to it. A crash during the
