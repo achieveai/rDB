@@ -19,6 +19,7 @@ const READY_WITHIN: Duration = Duration::from_secs(60);
 /// After the reopen admits writes, the put lands within a trim tick (1 s) and this margin.
 const MARGIN: Duration = Duration::from_millis(1_500);
 
+/// Integration (~22 s): the spec's budgets through the public `Db`, two opens and one retention.
 #[config_log::retcd_test]
 fn m10_s1_6_a_full_cap_frees_at_the_reopen_once_its_writes_aged_since_their_publish() {
     let rt = tokio::runtime::Builder::new_multi_thread()

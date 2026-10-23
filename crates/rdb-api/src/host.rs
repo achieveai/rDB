@@ -1131,8 +1131,9 @@ struct Host {
     /// D6 (A-R170 D, A-R172): per partition and generation, the newest trim floor `below` not yet
     /// deleted on disk (critic-d6b C6: a restored older floor must not overwrite the newer
     /// generation's), and per partition when the last durable delete ran. One delete per
-    /// [`trim_delete_period`] at most, with the latest floor.
-    trim_floors: BTreeMap<(PartitionId, Generation), Seq>,
+    /// [`trim_delete_period`] at most, with the latest floor. Each floor keeps the publish tick
+    /// of its last seq, so [`Host::mark_duty`] marks the rows it covers until they are deleted.
+    trim_floors: BTreeMap<(PartitionId, Generation), (Seq, Tick)>,
     trim_deleted_at: BTreeMap<PartitionId, Tick>,
     /// How many trims the duty sent and how many durable deletes ran, for the rows.
     trims_sent: u64,
@@ -1717,19 +1718,19 @@ impl Host {
             let Some(&(generation, _, _)) = published.front() else {
                 continue;
             };
-            let mut last = None;
+            let mut last: Option<(Seq, Tick)> = None;
             while let Some(&(g, seq, at)) = published.front() {
                 if g != generation || at.plus_millis(retention) > now {
                     break;
                 }
-                last = Some(seq);
+                last = Some((seq, at));
                 published.pop_front();
             }
-            if let Some(last) = last {
-                trims.push((*partition, generation, Seq(last.0 + 1)));
+            if let Some((last, at)) = last {
+                trims.push((*partition, generation, Seq(last.0 + 1), at));
             }
         }
-        for (partition, generation, below) in trims {
+        for (partition, generation, below, at) in trims {
             tracing::info!(
                 node = self.node.0,
                 kind = "trim",
@@ -1756,7 +1757,8 @@ impl Host {
                 None,
             );
             self.trims_sent += 1;
-            self.trim_floors.insert((partition, generation), below);
+            self.trim_floors
+                .insert((partition, generation), (below, at));
         }
         self.trim_delete_duty(now)?;
         self.mark_duty(now)?;
@@ -1766,7 +1768,9 @@ impl Host {
     /// A-R183 (S1-6, critic-d6b): durable publish marks. A mark `(generation, seq, tick)` is a
     /// `published_at` entry copied verbatim, so every seq of `generation` up to `seq` was
     /// published by `tick` (C1). At most [`PUBLISH_MARKS`] plus the newest of each generation
-    /// ([`sample_marks`]), checked at most once per [`trim_delete_period`] and written, synced,
+    /// ([`sample_marks`]), plus one per floor trimmed but not yet deleted on disk, whose rows
+    /// would otherwise lose their mark until the delete. Checked at most once per
+    /// [`trim_delete_period`] and written, synced,
     /// only when they changed (C2), and only for a partition whose marks this process has
     /// restored. A lost or late write only frees less. Only the owner publishes, so the other
     /// copies write none and keep the landing plus the retention (C7).
@@ -1778,11 +1782,19 @@ impl Host {
             if last.is_some_and(|(at, _)| at.plus_millis(period) > now) {
                 continue;
             }
-            let marks = self
-                .published_at
-                .get(partition)
-                .map(sample_marks)
-                .unwrap_or_default();
+            // Trimmed but not yet deleted rows are still on disk, so they keep a mark: their
+            // floor's last seq, at its publish tick (lead k205).
+            let mut marks: Vec<Mark> = self
+                .trim_floors
+                .range((*partition, Generation(0))..=(*partition, Generation(u64::MAX)))
+                .map(|(&(_, generation), &(below, at))| (generation, Seq(below.0 - 1), at))
+                .collect();
+            marks.extend(
+                self.published_at
+                    .get(partition)
+                    .map(sample_marks)
+                    .unwrap_or_default(),
+            );
             let changed = last.is_none_or(|(_, written)| *written != marks);
             due.push((*partition, marks, changed));
         }
@@ -1864,7 +1876,7 @@ impl Host {
                     .get(partition)
                     .is_none_or(|last| last.plus_millis(period) <= now)
             })
-            .map(|(key, below)| (*key, *below))
+            .map(|(key, &(below, _))| (*key, below))
             .collect();
         for ((partition, generation), below) in due {
             self.trim_floors.remove(&(partition, generation));
@@ -8890,6 +8902,51 @@ mod tests {
             dedup_trims_queued(&next),
             [(1, 6)],
             "generation 1 trimmed at once"
+        );
+    }
+
+    /// A-R183, lead k205: rows trimmed in memory but not yet deleted on disk keep their mark. A
+    /// process trims generation 1 below 6 and quits inside the delete period, so seqs 1-5 are
+    /// still on disk. The next reopen trims them on its first tick, from their publish, not a
+    /// retention after its landing. Marks taken from the in-memory queue alone dropped them.
+    #[test]
+    fn rows_trimmed_but_not_yet_deleted_keep_their_mark_across_a_reopen() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let period = trim_delete_period(retention);
+        let old = Tick(now.0 - 2 * retention);
+        reopened_with_marks(&path, 2, &[(Generation(1), Seq(5), old)]);
+        {
+            let mut first = host_over(&path, &rt);
+            first
+                .restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            // The last delete ran just now, so this process quits before the next one.
+            first
+                .trim_deleted_at
+                .insert(PartitionId(1), now.plus_millis(1_000));
+            first.trim_duty(now).expect("trim");
+            first
+                .trim_duty(now.plus_millis(period + 500))
+                .expect("a mark write");
+            assert_eq!(dedup_trims_queued(&first), [(1, 6)], "trimmed in memory");
+            assert_eq!(first.trim_deletes, 0, "seqs 1-5 are still on disk");
+        }
+        RocksEngine::open(&path)
+            .expect("open engine")
+            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(7))
+            .expect("inherit");
+        let mut next = host_over(&path, &rt);
+        next.restore_marks(PartitionId(1), Generation(3))
+            .expect("restore");
+        next.trim_duty(next.clock.now()).expect("trim");
+        assert_eq!(
+            dedup_trims_queued(&next),
+            [(1, 6)],
+            "generation 1 trimmed on the first tick"
         );
     }
 
