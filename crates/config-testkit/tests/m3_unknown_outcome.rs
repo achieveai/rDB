@@ -533,8 +533,13 @@ async fn m3_63_retry_storm_does_not_multiply_mutations() {
 // M3-64 — Unavailable before submission reconnects boundedly and never logs
 // =====================================================================================
 
-/// M3-64: stopping the pinned node before any request is sent means the connect phase fails —
-/// `Unavailable`, reconnects bounded, and the mutation never enters any log.
+/// M3-64: stopping the only configured node before any request is sent means the connect
+/// phase fails — `Unavailable`, reconnects bounded, and the mutation never enters any log.
+///
+/// The client is configured with the stopped leader's endpoint alone. With every node's
+/// endpoint configured, a connect failure moves on to the next one (D14, ADR-0015 note of
+/// 2026-10-22) and the put is applied there; that claim is the D14 rows' to make, in
+/// `m10_control_failover` and `config-client`'s `m10_endpoint_failover`.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m3_64_unavailable_before_submission_reconnect_bounded() {
     let cluster = Cluster::builder()
@@ -552,7 +557,18 @@ async fn m3_64_unavailable_before_submission_reconnect_bounded() {
         .iter()
         .map(|m| m.raft_log_len)
         .collect();
-    let client = cluster.grpc_client(leader);
+    let pair = cluster.fixture().issue(CertProfile::client("dev"));
+    let client = config_client::GrpcClient::connect(
+        vec![cluster.client_endpoint(leader)],
+        config_client::GrpcClientOptions {
+            request_deadline: cluster.config().read_timeout,
+            tls: config_client::TlsMode::MutualTls(pair.mtls()),
+            limits: cluster.config().limits,
+            ..Default::default()
+        },
+    )
+    .expect("a client over the leader's endpoint alone")
+    .with_cluster_id(cluster.config().cluster_id);
 
     cluster
         .node(leader)
