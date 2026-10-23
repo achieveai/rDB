@@ -374,7 +374,7 @@ status() {
         if os_pid_is "$os" rdb_node; then state="running pid $os"; else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
             "$(tail -n1 "$RUN/out/node-$n.out" 2>/dev/null || echo '-')" \
-            "$(tr '\n' ';' < "$RUN/faults/node-$n.txt" 2>/dev/null || echo none)"
+            "$(tr '\n' ';' 2>/dev/null < "$RUN/faults/node-$n.txt" || echo none)"
     done
     "$REPO/scripts/local-cluster.sh" status --dir "$RUN/ctl" 2>/dev/null || true
 }
