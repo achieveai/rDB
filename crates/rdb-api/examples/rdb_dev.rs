@@ -4,7 +4,7 @@
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
-//!                                           [--control host:port[,host:port...]]
+//!                                           [--control host:port[,host:port...]] [--requests F]
 //! ```
 //!
 //! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
@@ -12,6 +12,17 @@
 //! run with the same `--dir` and E reopens it. The `control` verbs reach rdb_dev's own voters
 //! and are refused under `--control`. Without `--control`, a `--dir` this run did not create is
 //! never removed either; `Db::open` decides whether it can be opened.
+//!
+//! `--requests F` appends every write request this run records for `retry` to F, one JSON
+//! line each, synced, after its answer, so a later run with the same `--requests F` resends an
+//! earlier run's request unchanged: `retry <request>` after a reopen (M10 S1-4). The request
+//! names the generation it was sent in, and a reopen starts a new one, so the resend answers
+//! `GENERATION_CHANGED` and applies nothing (spec §5.3); `status <request>` then says what
+//! became of it. A fresh compile under the same id is no resend: it reads the object's moved
+//! version, so its digest differs and it answers `REQUEST_ID_REUSE`.
+//! F holds keys and values, so it is not a log; use one F per `--dir`. A write still in
+//! flight when the process dies is not in F. Past the dedup retention a request is no longer
+//! recognised (`--dedup-retention-ms`).
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
@@ -57,7 +68,10 @@
 //!                                         queued`, then `bg txn: <answer>`; not remembered
 //! retry [<request>]                       send a write's request again, unchanged: the
 //!                                         latest one's, or the one this session sent as
-//!                                         <request>
+//!                                         <request>, or with `--requests F` the one an
+//!                                         earlier run sent as <request>. With nothing to
+//!                                         send it says `nothing to retry` and fails nothing
+//! retry --id <request>                    the same as `retry <request>`
 //! retry [<request>] --deadline-ms N       the same request with a fresh deadline of N ms
 //! retry [<request>] --payload <value>     the same put and request id with another value,
 //!                                         compiled afresh (REQUEST_ID_REUSE); not remembered.
@@ -330,6 +344,8 @@ struct Args {
     /// `--control E`: an external rEtcd's client endpoints. The run then starts no voters and
     /// never removes `--dir`, so a later run can reopen it.
     control: Option<Vec<String>>,
+    /// `--requests F`: where each recorded write request is appended, for a later run's `retry`.
+    requests: Option<PathBuf>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -344,6 +360,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         dedup_cap: None,
         dedup_retention: None,
         control: None,
+        requests: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -352,6 +369,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--requests" => parsed.requests = Some(PathBuf::from(value("--requests")?)),
             "--control" => {
                 let endpoints: Vec<String> = value("--control")?
                     .split(',')
@@ -1125,7 +1143,10 @@ fn repl<'scope, 'env>(
         },
         None => Box::new(std::io::BufReader::new(std::io::stdin())),
     };
-    let mut sent = Sent::default();
+    let mut sent = Sent {
+        file: args.requests.clone(),
+        ..Sent::default()
+    };
     let mut bad = false;
     let deadline = args.put_timeout.unwrap_or(Timeouts::default().put);
     for line in input.lines() {
@@ -1175,6 +1196,18 @@ fn repl<'scope, 'env>(
             }
         };
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        // Nothing to retry is an answer, not a mistyped line: no `usage:`, and no exit 1.
+        if let ["retry", rest @ ..] = words.as_slice() {
+            if let Err(e) = sent.adopt(rest) {
+                say(&format!("err {e}"));
+                bad = true;
+                continue;
+            }
+            if let Some(nothing) = sent.nothing_to_retry(rest) {
+                say(&nothing);
+                continue;
+            }
+        }
         let outcome = match words.as_slice() {
             ["quit" | "exit"] => break,
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
@@ -2650,8 +2683,8 @@ fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>),
     }
 }
 
-/// What a recorded request was sent as.
-#[derive(Debug, Clone)]
+/// What a recorded request was sent as. Saved beside the request in `--requests F`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Kind {
     /// A put, with the object and condition it was put with, for `retry --payload`.
     Put {
@@ -2674,12 +2707,39 @@ struct Sent {
     /// The request, and what it was sent as.
     by_id: std::collections::BTreeMap<u64, (TxnRequest, Kind)>,
     latest: Option<Option<u64>>,
+    /// `--requests F`: each recorded request is appended here, and an id this run did not send
+    /// is looked up here.
+    file: Option<PathBuf>,
+}
+
+/// What `retry <rest>` names, its `--payload V` or `--deadline-ms N` aside.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryTarget {
+    /// The latest write.
+    Latest,
+    /// Request `id`, as `retry <id>` or `retry --id <id>`.
+    Id(u64),
+    /// Anything else: [`Sent::pick`] answers it with a usage line.
+    Other,
+}
+
+fn retry_target(rest: &[&str]) -> RetryTarget {
+    let target = match rest {
+        [target @ .., "--payload" | "--deadline-ms", _] => target,
+        target => target,
+    };
+    match target {
+        [] => RetryTarget::Latest,
+        [id] | ["--id", id] => id.parse().map_or(RetryTarget::Other, RetryTarget::Id),
+        _ => RetryTarget::Other,
+    }
 }
 
 impl Sent {
     fn record(&mut self, request: Option<TxnRequest>, kind: Kind) {
         let id = request.map(|request| {
             let id = request.identity.request.0;
+            self.save(&request, &kind);
             self.by_id.insert(id, (request, kind));
             id
         });
@@ -2700,6 +2760,9 @@ impl Sent {
                 entry.0 = request.clone();
                 self.latest = Some(Some(id));
             }
+            if let Some((request, kind)) = self.by_id.get(&id) {
+                self.save(request, kind);
+            }
         }
     }
 
@@ -2712,6 +2775,101 @@ impl Sent {
         }
     }
 
+    /// The plain answer when `retry <rest>` has nothing to send: no write yet, a latest write
+    /// that sent no request, or a request id this session never sent. For that last one, the
+    /// way to resend an earlier run's request is `retry --id`. `None` when there is something
+    /// to send, or when `rest` is not a retry of a recorded request at all.
+    fn nothing_to_retry(&self, rest: &[&str]) -> Option<String> {
+        match retry_target(rest) {
+            RetryTarget::Latest => match self.latest {
+                None => Some("nothing to retry: this run has sent no write yet".to_owned()),
+                Some(None) => Some(
+                    "nothing to retry: the latest write was refused before it was sent".to_owned(),
+                ),
+                Some(Some(_)) => None,
+            },
+            RetryTarget::Id(id) if !self.by_id.contains_key(&id) => Some(match &self.file {
+                Some(path) => format!(
+                    "nothing to retry as request {id}: this run did not send it, and {} \
+                         holds no request {id}",
+                    path.display()
+                ),
+                None => format!(
+                    "nothing to retry as request {id}: this run did not send it. To resend \
+                         an earlier run's request, start that run and this one with --requests \
+                         F, then retry {id}"
+                ),
+            }),
+            RetryTarget::Id(_) | RetryTarget::Other => None,
+        }
+    }
+
+    /// Take request `id` from `--requests F` when this run did not send it, so `retry` resends
+    /// an earlier run's request unchanged. F's last line for `id` wins: a retry appends what it
+    /// sent. A missing F holds nothing; an F that cannot be read or parsed is an error.
+    fn adopt(&mut self, rest: &[&str]) -> Result<(), String> {
+        let (Some(path), RetryTarget::Id(id)) = (&self.file, retry_target(rest)) else {
+            return Ok(());
+        };
+        if self.by_id.contains_key(&id) {
+            return Ok(());
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("--requests {}: {e}", path.display())),
+        };
+        let mut found = None;
+        for (at, line) in text.lines().enumerate() {
+            // Where and what class of error, never serde's message: that quotes the text it
+            // met, and a line holds keys and values.
+            let entry: (TxnRequest, Kind) = serde_json::from_str(line).map_err(|e| {
+                format!(
+                    "--requests {} line {}: not a saved request ({:?} error at column {})",
+                    path.display(),
+                    at + 1,
+                    e.classify(),
+                    e.column()
+                )
+            })?;
+            if entry.0.identity.request.0 == id {
+                found = Some(entry);
+            }
+        }
+        if let Some(entry) = found {
+            self.by_id.insert(id, entry);
+        }
+        Ok(())
+    }
+
+    /// Append `request` to `--requests F`, synced, when there is an F. A failed write is said
+    /// on the run's output and logged, never skipped quietly: a later run could not retry it.
+    fn save(&self, request: &TxnRequest, kind: &Kind) {
+        let Some(path) = &self.file else {
+            return;
+        };
+        let saved = serde_json::to_string(&(request, kind))
+            .map_err(|e| e.to_string())
+            .and_then(|line| {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| e.to_string())?;
+                writeln!(file, "{line}")
+                    .and_then(|()| file.sync_data())
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = saved {
+            let request = request.identity.request.0;
+            tracing::error!(error = %e, request, "requests_file_write_failed");
+            say(&format!(
+                "err --requests {}: {e}; a later run cannot retry request {request}",
+                path.display()
+            ));
+        }
+    }
+
     fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Kind), String> {
         let id = match rest {
             [] => match self.latest {
@@ -2721,7 +2879,7 @@ impl Sent {
                 }
                 Some(Some(id)) => id,
             },
-            [id] => id
+            [id] | ["--id", id] => id
                 .parse()
                 .map_err(|_| "retry [<request>]: a request id is a number".to_owned())?,
             _ => return Err("retry [<request>] [--payload <value> | --deadline-ms N]".to_owned()),
@@ -4527,6 +4685,7 @@ mod tests {
             dedup_cap: None,
             dedup_retention: None,
             control: None,
+            requests: None,
         };
         let code = run(&args, |_, _, _| async {
             Err(OpenError::Node("node 2: injected".to_owned()))
@@ -4665,6 +4824,7 @@ mod tests {
             dedup_cap: Some(65_537),
             dedup_retention: None,
             control: None,
+            requests: None,
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {
@@ -4928,5 +5088,117 @@ mod tests {
             let key_hex = key.map(|key| hex::encode(&key.as_bytes()[..key.len().min(32)]));
             assert_eq!(line["key_hex"].as_str(), key_hex.as_deref(), "{typed}");
         }
+    }
+
+    /// Tester paper cut (S1-8 at 066ab6e): `retry` with nothing sent printed a `usage:` line
+    /// and the run exited 1, as if the line were mistyped. Each way of having nothing to send
+    /// is a plain `nothing to retry` answer, and a request id this run never sent points at
+    /// `--requests F`. A recorded request is not nothing. Unit.
+    #[test]
+    fn retry_with_nothing_sent_says_so_plainly_and_names_requests_for_an_old_request() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let mut sent = Sent::default();
+        for rest in [&[][..], &["--deadline-ms", "100"], &["--payload", "v"]] {
+            let said = sent.nothing_to_retry(rest).expect("nothing was sent");
+            assert!(said.starts_with("nothing to retry: "), "{said}");
+        }
+        sent.record(None, Kind::Txn);
+        let said = sent.nothing_to_retry(&[]).expect("the latest sent nothing");
+        assert!(said.starts_with("nothing to retry: "), "{said}");
+        for rest in [&["7"][..], &["--id", "7"], &["7", "--deadline-ms", "100"]] {
+            let said = sent
+                .nothing_to_retry(rest)
+                .expect("request 7 was never sent");
+            assert!(said.contains("--requests F, then retry 7"), "{said}");
+        }
+        let request = TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(7),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 0,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        sent.record(Some(request), Kind::Txn);
+        assert_eq!(sent.nothing_to_retry(&[]), None);
+        assert_eq!(sent.nothing_to_retry(&["--id", "7"]), None);
+        // Not a retry of a recorded request: `pick` answers these, with a usage line.
+        assert_eq!(sent.nothing_to_retry(&["x"]), None);
+    }
+
+    /// Tester S1-4 (A-R171): a same-id resend after a reopen must send the request unchanged,
+    /// and a fresh compile cannot: it reads the object's moved version, so the walk at 57da754
+    /// answered `REQUEST_ID_REUSE` to the same object and value. `--requests F` carries each
+    /// recorded request to a later run: that run adopts request 7 from F with the same digest,
+    /// the last line for an id wins, an id F lacks is a plain `nothing to retry`, and a damaged
+    /// line is an error naming its line, never its text. Unit (~5 ms, one temp file).
+    #[test]
+    fn a_later_run_adopts_an_earlier_runs_request_from_requests_file_unchanged() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        use rdb_core::contracts::txn::Mutation;
+        let request = |id, value: &'static [u8]| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(id),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![Mutation::Put {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(value),
+                expected_version: None,
+            }],
+        };
+        // `temp_dir` reads RETCD_TEST_DATA_DIR, which the run rows point at their own `--dir`.
+        let root = {
+            let _env = ENV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            config_testkit::fs::temp_dir()
+        };
+        let path = root.path().join("requests.json");
+        let mut first = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        first.record(Some(request(6, b"six")), Kind::Txn);
+        first.record(Some(request(7, b"old")), Kind::Txn);
+        first.record(Some(request(7, b"new")), Kind::Value);
+        first.record(None, Kind::Txn);
+
+        let mut later = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        assert_eq!(later.adopt(&["7"]), Ok(()));
+        assert_eq!(later.nothing_to_retry(&["--id", "7"]), None);
+        let (adopted, kind) = later.pick(&["7"]).expect("request 7 adopted");
+        assert_eq!(
+            adopted.request_digest(),
+            request(7, b"new").request_digest(),
+            "the last line for 7 is resent unchanged"
+        );
+        assert!(matches!(kind, Kind::Value), "{kind:?}");
+        assert_eq!(later.adopt(&["9"]), Ok(()));
+        let said = later.nothing_to_retry(&["9"]).expect("F holds no 9");
+        assert!(said.ends_with("holds no request 9"), "{said}");
+
+        std::fs::write(&path, "[\"zqsecret\"\n").expect("damage F");
+        let mut damaged = Sent {
+            file: Some(path),
+            ..Sent::default()
+        };
+        let error = damaged.adopt(&["7"]).expect_err("a damaged F is an error");
+        assert!(error.contains("line 1: "), "{error}");
+        assert!(!error.contains("zq"), "{error}");
     }
 }
