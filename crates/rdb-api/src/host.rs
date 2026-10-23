@@ -1004,15 +1004,17 @@ pub(crate) fn pause_before_inventory(node_dir: &std::path::Path, pause: Duration
         .push((node_dir.to_path_buf(), pause));
 }
 
-/// Test-only: node directories whose host sleeps once, for the time given, before its next
-/// barrier sync (a `SyncWalThrough` before the commit), as a slow fsync would (D10).
-#[cfg(test)]
+/// Node directories whose host sleeps once, for the time given, before its next barrier sync
+/// (a `SyncWalThrough` before the commit), as a slow fsync would (D10). Empty unless
+/// [`pause_before_sync`] armed it.
 static PAUSE_BEFORE_SYNC: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
 
-/// Test-only: the host on the copy at `node_dir` sleeps `pause` before its next barrier sync,
-/// once.
-#[cfg(test)]
-pub(crate) fn pause_before_sync(node_dir: &std::path::Path, pause: Duration) {
+/// The `--pause-before-sync` hook (ruling A-R198): the host on the copy at `node_dir`, spelled
+/// as `DbConfig::dir` joined with `nodes/<n>`, sleeps `pause` before its next barrier sync,
+/// once, and logs `test_sync_paused` when it does. A dev and test hook; never call it in an
+/// app.
+#[doc(hidden)]
+pub fn pause_before_sync(node_dir: &std::path::Path, pause: Duration) {
     PAUSE_BEFORE_SYNC
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4613,7 +4615,6 @@ impl Host {
         post_commit: bool,
     ) -> Option<RecoveryEvent> {
         let node = self.node.0;
-        #[cfg(test)]
         if !post_commit {
             let pause = {
                 let mut pauses = PAUSE_BEFORE_SYNC
@@ -4625,7 +4626,8 @@ impl Host {
                 at.map(|at| pauses.remove(at).1)
             };
             if let Some(pause) = pause {
-                tracing::info!(node, millis = pause.as_millis(), "test_sync_paused");
+                let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+                tracing::info!(node, millis, "test_sync_paused");
                 std::thread::sleep(pause);
             }
         }
