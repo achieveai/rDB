@@ -553,6 +553,16 @@ pub enum ReadyError {
         /// [`Db::restart_note`].
         note: String,
     },
+    /// Node 1's recovery ended `Blocked` before it took writes. It does not try again in this
+    /// open (ruling F-a), so no wait helps (A-R196).
+    #[error(
+        "the open's recovery stopped before node 1 took writes ({reason}), and it does not try \
+         again in this open: shut this Db down and open the folder again"
+    )]
+    Blocked {
+        /// The block's reason, as node 1's recovery phase names it.
+        reason: String,
+    },
 }
 
 /// The next step once node 1 has restarted: nothing it served comes back in this open
@@ -1034,12 +1044,15 @@ impl Db {
 
     /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at
     /// node 1 itself each time, never at what an earlier look saw. Once node 1 has restarted,
-    /// or its restart failed, answers at once: it does not rejoin in this open (#42).
+    /// or its restart failed, answers at once: it does not rejoin in this open (#42). So does a
+    /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
+    /// one fence only (ruling F-a, A-R196).
     ///
     /// # Errors
     ///
-    /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, whose text says to shut
-    /// this `Db` down and open the folder again (A-R188).
+    /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, and
+    /// [`ReadyError::Blocked`] once its recovery is blocked, whose texts say to shut this `Db`
+    /// down and open the folder again (A-R188, A-R196).
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from("unknown");
@@ -1056,6 +1069,15 @@ impl Db {
                     return Ok(());
                 }
                 phase = owner.recovery.unwrap_or_else(|| "none".to_owned());
+                if let Some(reason) = phase
+                    .strip_prefix("Blocked(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                {
+                    tracing::warn!(reason, "ready_blocked");
+                    return Err(ReadyError::Blocked {
+                        reason: reason.to_owned(),
+                    });
+                }
             }
             if std::time::Instant::now() >= deadline {
                 return Err(ReadyError::TimedOut {
@@ -4927,6 +4949,74 @@ mod tests {
         assert_eq!(app_request_id((1 << 63) - 1), Some(RequestId(u64::MAX)));
         assert_eq!(app_request_id(1 << 63), None);
         db.shutdown();
+    }
+
+    /// Ruling A-R196 (D10 part 2): node 1's recovery ended `Blocked` (here `BarrierIncomplete`,
+    /// final in an open by ruling F-a), so `wait_ready` answers at once, well inside 1 s of a
+    /// 90 s bound, with `Blocked` naming the reason and saying to open the folder again. Node 1
+    /// is a stub that answers every look with that phase, spelled as the host spells it. Cut:
+    /// `wait_ready` does not stop on `Blocked`, and it polls out its bound to `TimedOut`.
+    /// Unit (~50 ms): no node thread.
+    #[test]
+    fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_blocked() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let blocked = format!(
+            "{:?}",
+            rdb_core::recovery::RecoveryPhase::Blocked(
+                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                    missing: vec![
+                        rdb_core::contracts::membership::CopyId(1),
+                        rdb_core::contracts::membership::CopyId(2),
+                    ],
+                }
+            )
+        );
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: Some(blocked),
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        let node_1 = std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                if let Msg::Inspect { reply, .. } = msg {
+                    let _ = reply.send(status.clone());
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_secs(3));
+        let took = started.elapsed();
+        assert_eq!(
+            answer,
+            Err(ReadyError::Blocked {
+                reason: "BarrierIncomplete { missing: [CopyId(1), CopyId(2)] }".to_owned()
+            })
+        );
+        assert!(took < Duration::from_secs(1), "answered after {took:?}");
+        assert_eq!(
+            answer.expect_err("blocked").to_string(),
+            "the open's recovery stopped before node 1 took writes (BarrierIncomplete { missing: \
+             [CopyId(1), CopyId(2)] }), and it does not try again in this open: shut this Db down \
+             and open the folder again"
+        );
+        drop(db);
+        node_1.join().expect("the stub");
     }
 
     /// M9 S5-2 (G3, G4). A change of any op-carrying kind with 256 ops, and a txn of 256 puts,
