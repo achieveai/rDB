@@ -4,7 +4,10 @@
 //! - **Linked** (`applied(parent) == base`): one small batch writes the child's [`Link`], the
 //!   child's `applied = base` and the parent's `sealed` record. O(1), no bulk copy. `durable` is
 //!   not inherited (decision 3).
-//! - **Copied** (`applied(parent) > base`, a late write before the switch, decision 6): the
+//! - **Copied** (`applied(parent) > base`, a late write before the switch, decision 6), **or a
+//!   link that would put the child past [`MAX_CHAIN_DEPTH`] levels** (M10 ruling A-R166: the
+//!   child is re-based on a copy of the merged state at `base == applied` and reads at depth 1;
+//!   the parents stay, because `History` still falls through to them): the
 //!   parent's state as of `base` is rebuilt from its `History` and copied into the child's
 //!   prefix. The first batch writes the child's `copying` record, then key batches of
 //!   [`COPY_BATCH_KEYS`], then the switch batch: the link flagged `copied`, `applied = base`, the
@@ -32,6 +35,7 @@ use crate::keys::{
     self, encode_copying, encode_key, frame, private_key, Link, APPLIED_KEY, CF_METADATA,
     COPYING_KEY, PARENT_KEY, SEALED_KEY,
 };
+use crate::snapshot::MAX_CHAIN_DEPTH;
 
 /// Keys per full-copy batch.
 pub const COPY_BATCH_KEYS: usize = 1024;
@@ -225,8 +229,22 @@ impl RocksEngine {
         if held.0 < base.0 {
             return Err(InheritError::BehindCutoff { held, base });
         }
+        // A link would make the child one level deeper than its parent; past the ceiling, copy
+        // the parent's merged state instead, so the child reads at depth 1 (M10 ruling A-R166).
+        let flatten = held.0 == base.0 && self.levels(partition, from).len() >= MAX_CHAIN_DEPTH;
+        if flatten {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                from = from.0,
+                to = to.0,
+                base = base.0,
+                parent_depth = self.levels(partition, from).len(),
+                "inherit_flatten"
+            );
+        }
         // Rebuild before writing anything, so a refusal leaves the directory untouched.
-        let copy = if held.0 > base.0 {
+        let copy = if held.0 > base.0 || flatten {
             Some(self.as_of_base(partition, from, base, held)?)
         } else {
             None
@@ -277,7 +295,9 @@ impl RocksEngine {
             .snapshot(partition, from, SnapshotHandle(0))
             .map_err(InheritError::Storage)?;
         let mut copy: BTreeMap<(Namespace, Bytes), (Version, Bytes)> = BTreeMap::new();
-        for (ns, key, value, version, _) in view.entries() {
+        let entries = view.entries().map_err(InheritError::Storage)?;
+        for (ns, key, value, version, _) in &entries {
+            let (ns, version) = (*ns, *version);
             if ns == Namespace::History || (ns == Namespace::Progress && key == PROGRESS_KEY) {
                 continue;
             }

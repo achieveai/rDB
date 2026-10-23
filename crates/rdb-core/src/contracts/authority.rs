@@ -320,11 +320,14 @@ pub struct FencingProof {
     pub prior_generation: Generation,
     /// The epoch the prior owner held.
     pub prior_owner_epoch: OwnerEpoch,
-    /// The grant the prior owner held.
+    /// The grant the prior owner held. `GrantId(0)` under [`Revocation::NoGrantHeld`] only:
+    /// no grant was held, and A1 never issues 0 (its one minting site counts from 1; M10 arch
+    /// R5 row 9).
     pub prior_grant_id: GrantId,
     /// The prior owner's process lifetime.
     pub prior_boot_id: BootId,
-    /// Which of the three revocation routes completed.
+    /// Which revocation route completed: one of spec §7.3's three, or M10's
+    /// [`Revocation::NoGrantHeld`].
     pub revocation: Revocation,
     /// The rEtcd revision of the linearizable read this proof was derived from (spec §7.2).
     pub control_revision: Revision,
@@ -359,7 +362,8 @@ impl FencingProof {
     }
 }
 
-/// Which of spec §7.3's three routes revoked the prior owner (team kernel-a `design.md` §1.7).
+/// Which of spec §7.3's three routes revoked the prior owner (team kernel-a `design.md` §1.7), or
+/// M10's fourth, [`Self::NoGrantHeld`].
 ///
 /// Kernel-a's to widen: a fourth route is an edit to this enum and to nothing else.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -370,6 +374,15 @@ pub enum Revocation {
         ack_revision: Revision,
     },
     /// Spec §7.3 step 3, under the bounded-clock contract.
+    ///
+    /// **Amended 2026-10-22 (M10, lead rulings A-R155, A-R163): a reopen's heal.** `E` may also
+    /// come from a grant record read linearizably and found not frozen, owned by a boot no live
+    /// process holds — every copy's RocksDB lock is held by the reopening process — and deleted
+    /// by a CAS conditioned on its `mod_revision` at that read. The conditioned delete pins `E`
+    /// the way a freeze does: no renewal can land between the read and the delete. Then
+    /// [`FencingProof::control_revision`] is the partition record's `mod_revision`, read
+    /// linearizably after the delete was acknowledged and at a store revision not below it, as
+    /// bootstrap's proof does; the delete's revision is logged, not carried.
     ExpiryProven {
         /// `E` from the frozen grant record, read linearizably at
         /// [`FencingProof::control_revision`].
@@ -408,6 +421,18 @@ pub enum Revocation {
         control_revision: Revision,
         /// Opaque handle to the external evidence. The one field that is not a binding.
         evidence_ref: EvidenceRef,
+    },
+    /// M10 (lead rulings A-R159, A-R163): a reopen's heal found the prior owner's grant record
+    /// absent. Sound only while every copy's RocksDB lock is held by the reopening process, so
+    /// no older process of the same data runs; the heal is the only clearer of a grant and
+    /// deletes only under [`Self::ExpiryProven`]; and a late acquire from a dead process names a
+    /// boot below the reopen's, so it would be judged by `ExpiryProven`. The proof then carries
+    /// `prior_grant_id = GrantId(0)` ("none held"), the prior boot from the partition record,
+    /// and as [`FencingProof::control_revision`] the partition record's `mod_revision`, read
+    /// linearizably at a store revision not below `absent_revision`.
+    NoGrantHeld {
+        /// The store revision of the linearizable read that found the grant record absent.
+        absent_revision: Revision,
     },
 }
 

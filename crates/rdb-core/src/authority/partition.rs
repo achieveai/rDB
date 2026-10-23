@@ -26,7 +26,10 @@
 use bytes::Bytes;
 
 use crate::contracts::authority::DenyReason;
-use crate::contracts::ids::{ConfigVersion, Generation, NodeId, OwnerEpoch, PartitionId};
+use crate::contracts::digest::Digest;
+use crate::contracts::ids::{
+    BootId, ConfigVersion, Generation, NodeId, OwnerEpoch, PartitionId, Revision, Seq,
+};
 
 /// The version byte every encoded record starts with.
 ///
@@ -38,6 +41,16 @@ const LAYOUT_VERSION: u8 = 2;
 /// Version byte, `PartitionId`, `NodeId`, `Generation`, `OwnerEpoch`, `ConfigVersion`,
 /// lifecycle byte.
 const ENCODED_LEN: usize = 1 + 4 + 4 + 8 + 8 + 8 + 1;
+
+/// The version byte of a record that also carries its [`PartitionRoot`] (M10, arch R3b).
+const ROOTED_LAYOUT_VERSION: u8 = 3;
+
+/// Layout 2's fields, then mode, `owner_boot`, `base_seq`, `base_digest`,
+/// `predecessor_generation`, `predecessor_cutoff`, the instance id and the run.
+const ROOTED_LEN: usize = ENCODED_LEN + 1 + 8 + 8 + 32 + 8 + 8 + INSTANCE_LEN + 8;
+
+/// The length of an instance id: a uuid's 16 bytes.
+pub const INSTANCE_LEN: usize = 16;
 
 /// Where a partition is in spec §7.3's ownership transfer (lead ruling A-R51; ADR-rdb-0008's
 /// "lifecycle state" in `partitions/{id}`).
@@ -76,6 +89,114 @@ impl PartitionLifecycle {
     }
 }
 
+/// Which step of a recovery a layout-3 record was written by (M10, arch R3b).
+///
+/// It names the CAS that wrote the record, not whether the generation serves. A recovery that
+/// commits with every required copy already holding the barrier goes straight to
+/// `PartitionMode::Active` and runs no activation CAS, so its record stays `Committed` while it
+/// serves writes. Only a recovery that rebuilds a copy writes `Active`.
+///
+/// Nothing decides on it today (traced 2026-10-22, M10): a reopen names it only in
+/// `OpenError::Stale`'s detail, the heal reads the root's boot and base but not its mode, and
+/// F1's own re-read of its CAS ignores the mode. A reader that needs "has this generation served
+/// writes" (lead ruling A-R161's roll-forward) cannot get it from this field alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecordMode {
+    /// F1's recovery CAS wrote it: the generation is committed. It may already serve, if the
+    /// commit needed no rebuild.
+    Committed,
+    /// F1's activation CAS wrote it, after a rebuild: the generation serves.
+    Active,
+}
+
+impl RecordMode {
+    const fn to_byte(self) -> u8 {
+        match self {
+            Self::Committed => 0,
+            Self::Active => 1,
+        }
+    }
+
+    const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Committed),
+            1 => Some(Self::Active),
+            _ => None,
+        }
+    }
+}
+
+/// What a layout-3 record adds to [`PartitionRecord`]: where the generation's history starts,
+/// which owner boot and which run wrote it, and which rDB instance it belongs to (M10, arch R3b).
+///
+/// A separate type, not more fields on [`PartitionRecord`], so every M7 fixture that builds a
+/// record literally still compiles and still writes layout 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PartitionRoot {
+    /// Which recovery step wrote the record.
+    pub mode: RecordMode,
+    /// The boot of the owner that wrote it.
+    pub owner_boot: BootId,
+    /// The sequence the generation's history starts after.
+    pub base_seq: Seq,
+    /// The lineage digest at [`Self::base_seq`].
+    pub base_digest: Digest,
+    /// The generation this one succeeds.
+    pub predecessor_generation: Generation,
+    /// The last sequence kept from [`Self::predecessor_generation`].
+    pub predecessor_cutoff: Seq,
+    /// The rDB instance the record belongs to.
+    pub instance: [u8; INSTANCE_LEN],
+    /// The control revision the recovery was proven at: its fence's `control_revision`.
+    pub run: Revision,
+}
+
+impl PartitionRoot {
+    /// The root a layout-3 body carries, or `None` for a layout-2 body or bytes that are not a
+    /// record. A caller that needs the root treats `None` as "this record has no root", never as
+    /// a zero root.
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != ROOTED_LEN || body[0] != ROOTED_LAYOUT_VERSION {
+            return None;
+        }
+        PartitionRecord::decode(body)?;
+        let u64_at = |offset: usize| -> u64 {
+            let mut buf = [0_u8; 8];
+            buf.copy_from_slice(&body[offset..offset + 8]);
+            u64::from_le_bytes(buf)
+        };
+        let mut at = ENCODED_LEN;
+        let mode = RecordMode::from_byte(body[at])?;
+        at += 1;
+        let owner_boot = BootId(u64_at(at));
+        at += 8;
+        let base_seq = Seq(u64_at(at));
+        at += 8;
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&body[at..at + 32]);
+        at += 32;
+        let predecessor_generation = Generation(u64_at(at));
+        at += 8;
+        let predecessor_cutoff = Seq(u64_at(at));
+        at += 8;
+        let mut instance = [0_u8; INSTANCE_LEN];
+        instance.copy_from_slice(&body[at..at + INSTANCE_LEN]);
+        at += INSTANCE_LEN;
+        let run = Revision(u64_at(at));
+        Some(Self {
+            mode,
+            owner_boot,
+            base_seq,
+            base_digest: Digest(digest),
+            predecessor_generation,
+            predecessor_cutoff,
+            instance,
+            run,
+        })
+    }
+}
+
 /// One `partitions/{id}` record: who owns this partition, and under which lineage.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PartitionRecord {
@@ -100,15 +221,37 @@ impl PartitionRecord {
     /// [`crate::contracts::control::ControlRecord`] in a family snapshot.
     #[must_use]
     pub fn encode(&self) -> Bytes {
-        let mut out = Vec::with_capacity(ENCODED_LEN);
-        out.push(LAYOUT_VERSION);
+        Bytes::from(self.head(LAYOUT_VERSION, ENCODED_LEN))
+    }
+
+    /// This record and its root, as layout 3 (M10, arch R3b). [`Self::decode`] reads it back as
+    /// the same record; [`PartitionRoot::decode`] reads the root.
+    #[must_use]
+    pub fn encode_with(&self, root: &PartitionRoot) -> Bytes {
+        let mut out = self.head(ROOTED_LAYOUT_VERSION, ROOTED_LEN);
+        out.push(root.mode.to_byte());
+        out.extend_from_slice(&root.owner_boot.0.to_le_bytes());
+        out.extend_from_slice(&root.base_seq.0.to_le_bytes());
+        out.extend_from_slice(&root.base_digest.0);
+        out.extend_from_slice(&root.predecessor_generation.0.to_le_bytes());
+        out.extend_from_slice(&root.predecessor_cutoff.0.to_le_bytes());
+        out.extend_from_slice(&root.instance);
+        out.extend_from_slice(&root.run.0.to_le_bytes());
+        debug_assert_eq!(out.len(), ROOTED_LEN);
+        Bytes::from(out)
+    }
+
+    /// The fields both layouts share, behind `version`.
+    fn head(&self, version: u8, capacity: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(capacity);
+        out.push(version);
         out.extend_from_slice(&self.partition.0.to_le_bytes());
         out.extend_from_slice(&self.owner.0.to_le_bytes());
         out.extend_from_slice(&self.generation.0.to_le_bytes());
         out.extend_from_slice(&self.owner_epoch.0.to_le_bytes());
         out.extend_from_slice(&self.config_version.0.to_le_bytes());
         out.push(self.lifecycle.to_byte());
-        Bytes::from(out)
+        out
     }
 
     /// Read a record back, or `None` when the bytes are not one.
@@ -118,7 +261,12 @@ impl PartitionRecord {
     /// partial read.
     #[must_use]
     pub fn decode(body: &[u8]) -> Option<Self> {
-        if body.len() != ENCODED_LEN || body[0] != LAYOUT_VERSION {
+        let layout = match body.first() {
+            Some(&LAYOUT_VERSION) => ENCODED_LEN,
+            Some(&ROOTED_LAYOUT_VERSION) => ROOTED_LEN,
+            _ => return None,
+        };
+        if body.len() != layout {
             return None;
         }
         let u32_at = |offset: usize| -> u32 {

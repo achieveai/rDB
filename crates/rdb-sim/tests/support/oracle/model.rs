@@ -360,6 +360,11 @@ pub struct PartitionModel {
     /// `node -> (boot, durable_seq)` from `durability_advance{outcome=Synced}`. The only thing
     /// that grounds a `Durable` label (design §2.5).
     pub durable: BTreeMap<NodeId, (BootId, Seq)>,
+    /// The same flush stream filed by the lineage each flush synced:
+    /// `(node, generation) -> (boot, durable_seq)`. A durable mark is a position in one
+    /// generation, so only a mark of the newest generation can overshoot a resume barrier
+    /// (A-R185d): a prior generation durable past the new one's cutoff is not an overshoot.
+    pub durable_by_generation: BTreeMap<(NodeId, Generation), (BootId, Seq)>,
     /// Admissions, by the correlation that carries the request through the write path.
     pub admissions: BTreeMap<CorrelationId, AdmissionRec>,
     /// Every `protection_state`, in order.
@@ -646,12 +651,20 @@ impl Model {
                 );
             }
             TraceKind::DurabilityAdvance {
+                generation,
                 durable_seq,
                 outcome,
                 ..
             } => {
                 if *outcome == rdb_core::contracts::trace::SyncOutcome::Synced {
                     let slot = part.durable.entry(node).or_insert((boot, Seq::ZERO));
+                    if slot.0 != boot || slot.1 < *durable_seq {
+                        *slot = (boot, *durable_seq);
+                    }
+                    let slot = part
+                        .durable_by_generation
+                        .entry((node, *generation))
+                        .or_insert((boot, Seq::ZERO));
                     if slot.0 != boot || slot.1 < *durable_seq {
                         *slot = (boot, *durable_seq);
                     }

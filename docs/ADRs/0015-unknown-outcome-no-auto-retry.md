@@ -223,3 +223,37 @@ the mutation — the replay is therefore safe by construction, not merely likely
 two conditions — no dedup key, or a replay attempted after the window has closed — this ADR's
 original rule stands without exception: no automatic replay, and the documented recovery is still
 read-back-then-CAS. See ADR-0025 for the full mechanism.
+
+## Note (2026-10-22, M10 D14): a failure to connect moves on to another configured endpoint
+
+The M3 note made connect failures retryable but kept every retry on the same endpoint. So a
+client configured with three nodes, whose first node was down, spent its whole budget dialling
+that node and answered `Unavailable` while two nodes were up (defect D14, ruling A-R199). The
+rule is now:
+
+- **Only the connect phase moves on.** When the connect phase fails, the next retry dials a
+  configured endpoint this operation has not dialled yet. Once every endpoint has been tried,
+  it retries the last one, as before. A failure after a request was sent never moves, so the
+  table above and the no-replay rule are unchanged.
+- **One dead node cannot spend the whole budget.** A dial that is not a hint follow gets the
+  time left divided by the endpoints not yet dialled; the last one gets all of it. A hint
+  dial and the call itself keep the full time left.
+- **Later operations start where a connect failure moved to.** The client keeps one start
+  index, shared by its clones, and moves it only after moving on from a connect failure. A
+  followed leader hint never moves it, so each operation still pays its own hint round trip.
+  `pinned_endpoint()` still reports the configured pin.
+- **When an endpoint answered but no leader did, the error says so.** It reads "no rEtcd
+  leader could be reached" and lists the endpoints that answered (review A4, 2026-10-23).
+- **When a server answers `Unavailable` after a move, the answer stays and says where it came
+  from.** For example "leader unknown (answered by A; could not reach: B ...; C ...)", each
+  endpoint passed over with its reason. Its class and retry rule are the server's (A-R208,
+  2026-10-23).
+- **When nothing answers, the error says so per endpoint.** `Unavailable` names each endpoint
+  with its reason, and those the budget never reached.
+- **A dead node behind a cached channel costs one operation, not two.** A call that got no
+  answer before the client's own timer fired now drops its cached channel too. Before, only a
+  transport-minted status did, so the next operation went down the same dead channel. The
+  timed-out call is classified exactly as before.
+
+M3-64 now configures the stopped leader's endpoint alone; the move-on claim belongs to the
+M10 D14 rows (`config-client` `m10_endpoint_failover`, `config-testkit` `m10_control_failover`).

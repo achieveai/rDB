@@ -375,9 +375,16 @@ impl RdbError {
 
     /// Whether this error proves that **this submission** applied no mutation.
     ///
-    /// Only pre-admission rejection proves it (spec §5.4 takeaway). An oracle that needs to know
+    /// Only a refusal before apply proves it (spec §5.4 takeaway). An oracle that needs to know
     /// "could this submission have had an effect?" asks here rather than matching variants
     /// itself.
+    ///
+    /// `ProtectionPaused` proves it although its retry rule is `RetryAfterRecovery` (M10 D4,
+    /// lead ruling A-R180, ADR-rdb-0004 §5 amendment of 2026-10-22). Every paused refusal is made
+    /// before apply: admission check 8, a freeze, or `LocalStorageFenced` at
+    /// `Boundary::PreApply`, which after apply is `UnknownOutcome` instead. Its classmates do not:
+    /// `LeaseExpired` is also what a deny after apply answers, and `DivergenceRequiresOperator`
+    /// keeps `false` by the same lead ruling.
     ///
     /// `true` says nothing about other sends of the same request identity (#35). Admission checks
     /// 1–10 run before the dedup lookup (ADR-rdb-0004 §3), so a resend of an identity that has
@@ -394,7 +401,7 @@ impl RdbError {
         matches!(
             self.retry_rule(),
             RetryRule::Definitive | RetryRule::BoundedJitter
-        )
+        ) || matches!(self, Self::ProtectionPaused { .. })
     }
 
     /// Which capability an [`Self::Unavailable`] names, or `None` for every other error.

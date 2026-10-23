@@ -124,6 +124,25 @@ impl Replication {
         self.receivers.get(&(node, partition))
     }
 
+    /// Give the dormant receiver for `(node, partition)` its verified digests, for a catch-up
+    /// it is about to source (lead ruling A-R173): see [`AppendReceiver::restore_history`].
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `receiver` when none is installed there, or what
+    /// [`AppendReceiver::restore_history`] refuses.
+    pub fn restore_history(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        rungs: &[(Seq, Digest)],
+    ) -> Result<(), RdbError> {
+        self.receivers
+            .get_mut(&(node, partition))
+            .ok_or(RdbError::InvalidArgument { field: "receiver" })?
+            .restore_history(rungs)
+    }
+
     /// Install (or replace) the primary side for the tracker's own `(node, partition)`, with no
     /// catch-up cursor running.
     pub fn install_primary(&mut self, tracker: ProgressTracker) {
@@ -464,6 +483,15 @@ impl Replication {
         // new root may have moved (lead ruling B-R59a).
         self.sources
             .retain(|&(at, of, _), _| (at, of) != (node, partition));
+        // A dormant receiver was restored from the stored lineage for the catch-up before this
+        // commit; drop it, so today's path builds the side the pin gives (A-R173, F3).
+        if self
+            .receivers
+            .get(&key)
+            .is_some_and(AppendReceiver::is_dormant)
+        {
+            self.receivers.remove(&key);
+        }
         let config = &result.committed.pinned_config;
         let own = config
             .members

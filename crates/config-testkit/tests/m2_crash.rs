@@ -786,15 +786,53 @@ async fn m2_28_repeated_crash_cycles_no_vote_regression() {
         // landed instead of a formula, and only the end-of-run properties the row cares about
         // (term/vote never regress, final state agrees everywhere, no gap or duplicate in the
         // revision space) are asserted.
-        let confirm_leader = cluster
-            .wait_for_leader(cluster.deadline(10))
-            .await
+        //
+        // Leadership can move between finding the leader and the put, and under a loaded gate
+        // it did (cycle 6, "not leader"). `NotLeader` is refused before anything is proposed,
+        // so only that answer finds the leader again and resends, inside the same deadline;
+        // any other error still fails the row.
+        let confirm_until = tokio::time::Instant::now() + cluster.deadline(10);
+        let mut not_leader = 0u32;
+        let mut refused: Option<NodeId> = None;
+        let resp = loop {
+            let left = confirm_until.saturating_duration_since(tokio::time::Instant::now());
+            // After a refusal, wait for a leader other than the node that refused, so the
+            // resend goes where leadership moved rather than straight back to it.
+            let confirm_leader = match refused {
+                None => cluster.wait_for_leader(left).await,
+                Some(stale) => {
+                    cluster
+                        .wait_for(&format!("a leader other than {stale}"), left, || {
+                            cluster.leaders_now().into_iter().find(|id| *id != stale)
+                        })
+                        .await
+                }
+            }
             .unwrap_or_else(|t| panic!("seed={SEED} cycle={cycle}: no leader after restart: {t}"));
-        let resp = cluster
-            .client(confirm_leader)
-            .put(put_req(&format!("/m2/28/confirm{cycle}"), "v"))
-            .await
-            .unwrap_or_else(|e| panic!("seed={SEED} cycle={cycle}: confirm put: {e}"));
+            match cluster
+                .client(confirm_leader)
+                .put(put_req(&format!("/m2/28/confirm{cycle}"), "v"))
+                .await
+            {
+                Ok(resp) => break resp,
+                Err(e @ config_core::ConfigError::NotLeader { .. })
+                    if tokio::time::Instant::now() < confirm_until =>
+                {
+                    not_leader += 1;
+                    tracing::info!(
+                        cycle,
+                        node = %confirm_leader,
+                        not_leader,
+                        error = %e,
+                        "m2_28_confirm_put_not_leader_retry"
+                    );
+                    refused = Some(confirm_leader);
+                }
+                Err(e) => panic!(
+                    "seed={SEED} cycle={cycle}: confirm put: {e} (after {not_leader} not-leader answers)"
+                ),
+            }
+        };
         last_revision = resp.revision;
         cluster
             .wait_revision_all(resp.revision, cluster.deadline(10))

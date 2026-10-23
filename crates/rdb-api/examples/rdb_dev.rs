@@ -4,7 +4,44 @@
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
+//!                                           [--control host:port[,host:port...]] [--requests F]
+//!                                           [--abort-after-commit] [--pause-before-sync N=MS]
+//! cargo run -p rdb-api --example rdb_dev -- --help
 //! ```
+//!
+//! `--help` (or `-h`) prints this text to stdout and exits 0; arguments after it are not read.
+//!
+//! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
+//! endpoints E instead of three in-process voters. `--dir` is then never removed, so a second
+//! run with the same `--dir` and E reopens it. The `control` verbs reach rdb_dev's own voters
+//! and are refused under `--control`. Without `--control`, a `--dir` that held anything before
+//! this run is never removed either; `Db::open` decides whether it can be opened. An empty
+//! `--dir` made beforehand is removed like one this run created.
+//!
+//! `--requests F` appends every write request this run records for `retry` to F, one JSON
+//! line each, synced, after its answer, so a later run with the same `--requests F` resends an
+//! earlier run's request unchanged: `retry <request>` after a reopen (M10 S1-4). The request
+//! names the generation it was sent in, and a reopen starts a new one, so the resend answers
+//! `GENERATION_CHANGED` and applies nothing (spec §5.3); `status <request>` then says what
+//! became of it. A fresh compile under the same id is no resend: it reads the object's moved
+//! version, so its digest differs and it answers `REQUEST_ID_REUSE`.
+//! F holds keys and values, so it is not a log; use one F per `--dir`. A write still in
+//! flight when the process dies is not in F. Past the dedup retention a request is no longer
+//! recognised (`--dedup-retention-ms`).
+//! A line of F that does not read, such as a last line a kill cut short, is skipped with a
+//! `warn` naming its line; the other requests still retry. An append to F that fails is said
+//! with `err`, and the run exits 1.
+//!
+//! `--abort-after-commit` is a dev and test hook (A-R184): the process aborts as soon as a
+//! recovery commits, before the new generation is linked or marked activated. With `--control`
+//! and the same `--dir`, the next run must roll that commit forward. Nothing is printed when it
+//! fires; the abort may lose the last log lines.
+//!
+//! `--pause-before-sync N=MS` is a dev and test hook (A-R198): node N's next barrier sync (the
+//! fsync a recovery waits on before it commits) sleeps MS ms first, once, as a slow disk would.
+//! It is said at start and logged as `pause_before_sync_armed` (warn); the sleep itself is
+//! logged as `test_sync_paused` with `node` and `millis`. N is 1, 2 or 3; repeat the flag for
+//! more nodes. A bootstrap and a reopen both sync before they commit.
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
@@ -35,6 +72,10 @@
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
+//! put --as <n> <object> <value> [--if-version N]
+//!                                         the same put under request id app_request_id(n),
+//!                                         your own number n below 2^63, used once; recorded
+//!                                         for `retry` like any put
 //! put& <object> <value> [--if-version N]  the same put in the background: prints `bg
 //!                                         <object>: queued` and returns at once, and `bg
 //!                                         <object>: <answer>` when it lands; not remembered
@@ -50,11 +91,16 @@
 //!                                         queued`, then `bg txn: <answer>`; not remembered
 //! retry [<request>]                       send a write's request again, unchanged: the
 //!                                         latest one's, or the one this session sent as
-//!                                         <request>
+//!                                         <request>, or with `--requests F` the one an
+//!                                         earlier run sent as <request>. With nothing to
+//!                                         send it says `nothing to retry` and fails nothing
+//! retry --id <request>                    the same as `retry <request>`
 //! retry [<request>] --deadline-ms N       the same request with a fresh deadline of N ms
 //! retry [<request>] --payload <value>     the same put and request id with another value,
 //!                                         compiled afresh (REQUEST_ID_REUSE); not remembered.
-//!                                         A put's only, never a txn's
+//!                                         A `put --as` put's only: under an id this Db
+//!                                         numbered it is refused and nothing is sent
+//!                                         (A-R195), and never a txn's
 //! doc <object> [--absent | --expect V] <op>...
 //!                                         change a JSON document, ops in order, as one write.
 //!                                         An op is `--json J` (the whole document), `set
@@ -122,7 +168,8 @@
 //!                                         Without `--offset`/`--len` it reads the manifest
 //!                                         only, so a damaged chunk shows on a range read only
 //! get <object>                         read at the publication barrier: `value=` for a byte
-//!                                         string, `doc=<json>` for any other document
+//!                                         string, `doc=<json>` for any other document; another
+//!                                         kind is refused, naming `members`, `items` or `read`
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
@@ -130,7 +177,8 @@
 //!                                         running process has
 //! node restart <n>                        stop node n and start it again on its data at its
 //!                                         boot plus one; prints `node n boot b`. The new
-//!                                         process holds no role and stays out until M10. So
+//!                                         process holds no role and stays out until the folder is
+//!                                         opened again (#42). So
 //!                                         any restart stops writes, safely, for the life of
 //!                                         this run: after a secondary's, L1 pauses within
 //!                                         about 2 s of the next write (`PROTECTION_PAUSED`)
@@ -166,7 +214,17 @@
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
 //! admin clear <o>                        clear a damaged object: prove it damaged, then
-//!                                         delete one batch of its records, each at the version
+//!                                         delete all of it, healthy entries too. Its root
+//!                                         or any one entry being damaged is enough. To keep
+//!                                         the rest, write over a bad map entry or set member
+//!                                         first (`map put`/`del` or `set del` of its key);
+//!                                         to keep the rest under a damaged root, copy the
+//!                                         healthy entries out first with `members --after`,
+//!                                         carrying on past a bad key with `--after` that
+//!                                         key. A byte 0/3 or newer
+//!                                         build's record anywhere in the object refuses the
+//!                                         clear: open it with the newer build. It deletes
+//!                                         one batch of its records per call, each at the version
 //!                                         it was read at (`clear ok ...`). Repeat until `clear
 //!                                         unchanged (nothing to clear; nothing sent)`. A
 //!                                         healthy object answers `CONDITION_FAILED`, a newer
@@ -184,9 +242,21 @@
 //!                                         whose digest fails (`digest`, the default), whose
 //!                                         kind is 0x00 (`kind0`), or whose codec is 0x02,
 //!                                         digest correct (`newer`: a newer build's record). A
-//!                                         set member holding any bytes is damage too. A
+//!                                         set member holding any bytes is damage too. A set
+//!                                         member has no envelope, so on a set --element takes
+//!                                         `digest` only; `kind0` and `newer` are refused, and
+//!                                         nothing is written. For a newer build's set, damage
+//!                                         the root with --as newer. With
+//!                                         --element the root's own bytes are written again
+//!                                         in the same write, so a read meets that fault and
+//!                                         a `map put`/`del` of K repairs a `digest` entry. A
 //!                                         missing record is refused, and so is an item kept
-//!                                         inside its block (`no stored record`).
+//!                                         inside its block (`no stored record`). --item does
+//!                                         not write the list's root, so whatever `--as` says,
+//!                                         a read answers `element version V is above its
+//!                                         root's version`; the item digest path is rdb-value's
+//!                                         row d2_a_write_refuses_a_damaged_item_record_as_
+//!                                         the_read_does
 //!                                         --api-version N sends the write as API version N
 //!                                         (default 1): any other is another build's request
 //!                                         (newer or older), refused before apply
@@ -230,6 +300,11 @@
 //!                                         or `link heal all`; the sender is never told. A
 //!                                         hold delays, a drop loses. `links` prints both
 //! wait recovered|ready [<seconds>]        block until the partition gets there
+//!                                         (default 30). `wait ready` asks Db::wait_ready: after
+//!                                         node 1 restarted, or a failed heal, it stops at once,
+//!                                         says the next step, and the run exits 1. Every 10 s
+//!                                         it waits it says `still waiting for ready: recovery
+//!                                         phase P`, node 1's phase then
 //! sleep <millis>
 //! quit
 //! ```
@@ -287,7 +362,7 @@ use rdb_api::{
     Op, OpenError, Path, PutError, ReadOk, Timeouts, Token, TxnPut, Value,
 };
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord, PartitionRoot};
 use rdb_core::contracts::authority::DenyReason;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::RetryRule;
@@ -320,6 +395,38 @@ struct Args {
     dedup_cap: Option<usize>,
     /// How long a published write's answer is retained, shortened as a dev budget.
     dedup_retention: Option<Duration>,
+    /// `--control E`: an external rEtcd's client endpoints. The run then starts no voters and
+    /// never removes `--dir`, so a later run can reopen it.
+    control: Option<Vec<String>>,
+    /// `--requests F`: where each recorded write request is appended, for a later run's `retry`.
+    requests: Option<PathBuf>,
+    /// `--abort-after-commit`: abort the whole process once a recovery commits, before it is
+    /// linked or marked activated (A-R184). The next open must roll it forward.
+    abort_after_commit: bool,
+    /// `--pause-before-sync <node>=<ms>`, repeatable: that node's next barrier sync sleeps
+    /// `ms` before it fsyncs, once (A-R198).
+    pause_before_sync: Vec<(NodeId, Duration)>,
+    /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
+    help: bool,
+}
+
+/// The usage: this file's own `//!` header, so the help and the source comment cannot drift.
+/// The header's code fences are left out; everything else is printed as written.
+fn usage() -> String {
+    include_str!("rdb_dev.rs")
+        .lines()
+        .take_while(|line| line.starts_with("//!"))
+        .map(|line| {
+            line.strip_prefix("//! ")
+                .or_else(|| line.strip_prefix("//!"))
+                .unwrap_or(line)
+        })
+        .filter(|line| !line.starts_with("```"))
+        .fold(String::new(), |mut text, line| {
+            text.push_str(line);
+            text.push('\n');
+            text
+        })
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -333,6 +440,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         put_timeout: None,
         dedup_cap: None,
         dedup_retention: None,
+        control: None,
+        requests: None,
+        abort_after_commit: false,
+        pause_before_sync: Vec::new(),
+        help: false,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -341,6 +453,27 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--help" | "-h" => {
+                parsed.help = true;
+                return Ok(parsed);
+            }
+            "--abort-after-commit" => parsed.abort_after_commit = true,
+            "--pause-before-sync" => parsed
+                .pause_before_sync
+                .push(parse_pause(&value("--pause-before-sync")?)?),
+            "--requests" => parsed.requests = Some(PathBuf::from(value("--requests")?)),
+            "--control" => {
+                let endpoints: Vec<String> = value("--control")?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if endpoints.is_empty() {
+                    return Err("--control takes host:port[,host:port...]".to_owned());
+                }
+                parsed.control = Some(endpoints);
+            }
             "--put-timeout-ms" => {
                 let text = value("--put-timeout-ms")?;
                 let millis = text
@@ -380,6 +513,18 @@ fn parse_node(text: &str) -> Result<NodeId, String> {
     }
 }
 
+/// `--pause-before-sync`'s `<node>=<ms>`; every refusal names the flag.
+fn parse_pause(text: &str) -> Result<(NodeId, Duration), String> {
+    let (node, millis) = text
+        .split_once('=')
+        .ok_or_else(|| format!("--pause-before-sync takes <node>=<ms>, not {text:?}"))?;
+    let node = parse_node(node).map_err(|e| format!("--pause-before-sync: {e}"))?;
+    let millis = millis.trim().parse::<u64>().map_err(|_| {
+        format!("--pause-before-sync: {millis:?} is not a number of ms, in {text:?}")
+    })?;
+    Ok((node, Duration::from_millis(millis)))
+}
+
 fn parse_pair(text: &str) -> Result<(NodeId, NodeId), String> {
     let (a, b) = text
         .split_once('-')
@@ -399,13 +544,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if args.dir.exists() && std::fs::read_dir(&args.dir).is_ok_and(|mut d| d.next().is_some()) {
-        eprintln!(
-            "rdb_dev: {} is not empty; pass a new --dir",
-            args.dir.display()
-        );
-        return ExitCode::from(2);
+    if args.help {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
     }
+    // An existing --dir goes to `Db::open`, which decides whether it can be reopened (M10
+    // S1-1); rdb_dev refuses nothing about it itself.
     let mut config = config_log::LogConfig::for_application("rdb_dev");
     config.dir.clone_from(&args.log_dir);
     config.file_name = "rdb_dev.jsonl".to_string();
@@ -417,8 +561,9 @@ fn main() -> ExitCode {
         }
     };
     eprintln!("log={}", args.log_dir.join("rdb_dev.jsonl").display());
-    // The gate's port range keeps the voters' port-0 binds out of the host's busy dynamic pool,
-    // and the voters' data goes under --dir, never %TEMP%.
+    // The gate's port range keeps the voters' port-0 binds out of the host's busy dynamic pool.
+    // `run` names the voters' stores under --dir itself; this keeps the harness's own scratch
+    // folder there too, never %TEMP%. Only `main` sets it: it is this process's, not a row's.
     if std::env::var_os("RETCD_TEST_PORT_RANGE").is_none() {
         std::env::set_var("RETCD_TEST_PORT_RANGE", "20000-26999");
     }
@@ -461,86 +606,158 @@ where
         eprintln!("rdb_dev: open: {e}");
         return ExitCode::from(1);
     }
-    let cluster = Arc::new(
-        rt.block_on(
-            Cluster::builder()
+    // Whether --dir held anything before this run: such a directory is never removed (M10
+    // S1-1), whatever `open` decides about it.
+    let existed = std::fs::read_dir(&args.dir).is_ok_and(|mut d| d.next().is_some());
+    // Before the open, with `--dir` spelled as `DbConfig::dir` is: the hook matches on it.
+    if args.abort_after_commit {
+        rdb_api::host::abort_after_commit(&args.dir);
+        tracing::warn!(dir = %args.dir.display(), "abort_after_commit_armed");
+        say("abort-after-commit: this process aborts once a recovery commits");
+    }
+    for &(node, pause) in &args.pause_before_sync {
+        let node_dir = args.dir.join("nodes").join(node.0.to_string());
+        rdb_api::host::pause_before_sync(&node_dir, pause);
+        let ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+        tracing::warn!(node = node.0, ms, "pause_before_sync_armed");
+        say(&format!(
+            "pause-before-sync: node {}'s next barrier sync sleeps {ms} ms before it fsyncs",
+            node.0
+        ));
+    }
+    let (store, local) = match &args.control {
+        Some(endpoints) => {
+            match config_client::GrpcClient::connect(
+                endpoints.clone(),
+                config_client::GrpcClientOptions::default(),
+            ) {
+                Ok(client) => {
+                    say(&format!(
+                        "control: external rEtcd at {}",
+                        endpoints.join(",")
+                    ));
+                    (Arc::new(client) as Arc<dyn ConfigStore>, None)
+                }
+                Err(e) => {
+                    eprintln!("rdb_dev: --control: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => {
+            // The voters' data goes under --dir by name, not through RETCD_TEST_DATA_DIR: the
+            // environment is the process's, and the rows that call `run` share one process.
+            let voters = voters_dir(&args.dir);
+            let mut builder = Cluster::builder()
                 .nodes(3)
                 .storage(StorageKind::ROCKS)
-                .timers(CONTROL_TIMERS)
-                .start(),
-        ),
+                .timers(CONTROL_TIMERS);
+            for id in 1..=3 {
+                let node = voters.join(format!("node-{id}"));
+                if let Err(e) = std::fs::create_dir_all(&node) {
+                    eprintln!("rdb_dev: create {}: {e}", node.display());
+                    return ExitCode::from(1);
+                }
+                builder = builder.data_dir(VoterId(id), node);
+            }
+            let cluster = Arc::new(rt.block_on(builder.start()));
+            let leader = rt.block_on(cluster.leader());
+            let hostile = Arc::new(HostileStore::new(&cluster, leader));
+            say(&format!("control up: 3 voters, leader {leader:?}"));
+            (
+                Arc::clone(&hostile) as Arc<dyn ConfigStore>,
+                Some((cluster, hostile, voters)),
+            )
+        }
+    };
+    tracing::info!(
+        dir = %args.dir.display(),
+        existed,
+        external_control = args.control.is_some(),
+        holds = ?args.hold,
+        "rdb_dev_start"
     );
-    let leader = rt.block_on(cluster.leader());
-    let hostile = Arc::new(HostileStore::new(&cluster, leader));
-    let store: Arc<dyn ConfigStore> = Arc::clone(&hostile) as Arc<dyn ConfigStore>;
-    say(&format!("control up: 3 voters, leader {leader:?}"));
-    tracing::info!(dir = %args.dir.display(), holds = ?args.hold, "rdb_dev_start");
     let mut db = match rt.block_on(open(config, Arc::clone(&store), rt.handle().clone())) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("rdb_dev: open: {e}");
-            drop(hostile);
-            close(store, cluster, rt, args);
+            close(store, local, rt, args, existed);
             return ExitCode::from(1);
         }
     };
-    say("bootstrap: partition 1 recovery started");
+    // A fresh folder bootstraps; a folder with data takes over from its last run (M10 S1-1).
+    if db.heal_state() == rdb_api::db::HealState::NotNeeded {
+        say("bootstrap: partition 1 recovery started");
+    } else {
+        say("reopen: partition 1 takes over from the last run (heal started)");
+    }
     let progress = Progress::default();
     let stop = AtomicBool::new(false);
-    let control = Control {
-        cluster: &cluster,
-        store: &hostile,
-    };
+    let control = local.as_ref().map(|(cluster, hostile, _)| Control {
+        cluster,
+        store: hostile,
+    });
     let code = std::thread::scope(|scope| {
         scope.spawn(|| poll(&db, &progress, &stop));
-        let code = repl(scope, args, &db, &rt, &control, &progress);
+        let code = repl(scope, args, &db, &rt, &*store, control.as_ref(), &progress);
         stop.store(true, Ordering::Relaxed);
         code
     });
     db.shutdown();
     drop(db);
-    drop(hostile);
-    close(store, cluster, rt, args);
+    close(store, local, rt, args, existed);
     code
 }
 
 /// End the run once the Db is gone, whether it opened or not (F-006). The direct client holds
 /// the voter's store open: drop every handle on it before the cluster closes its stores, or
-/// their RocksDB files outlive the run. Then `--dir` goes, unless `--keep`.
+/// their RocksDB files outlive the run. Then `--dir` goes, unless `--keep`, `--control`, or
+/// it held anything before the run (`existed`): such a directory is the user's, and under
+/// `--control` it is meant to be reopened. An empty `--dir` made beforehand goes like a new one.
 ///
 /// The store holds the cluster weakly, so the cluster comes back here unless a call is
 /// resolving the leader at this instant; that is waited out for up to 2 s, and past it the
 /// voters are not shut down and the run says so.
 fn close(
     store: Arc<dyn ConfigStore>,
-    cluster: Arc<Cluster>,
+    local: Option<(Arc<Cluster>, Arc<HostileStore>, PathBuf)>,
     rt: tokio::runtime::Runtime,
     args: &Args,
+    existed: bool,
 ) {
     drop(store);
-    let started = Instant::now();
-    let mut shared = cluster;
-    let cluster = loop {
-        match Arc::try_unwrap(shared) {
-            Ok(cluster) => break Some(cluster),
-            Err(still) if started.elapsed() >= Duration::from_secs(2) => {
-                eprintln!(
-                    "rdb_dev: the cluster is still shared ({} handles); voters not shut down",
-                    Arc::strong_count(&still)
-                );
-                break None;
+    if let Some((cluster, hostile, voters)) = local {
+        drop(hostile);
+        let started = Instant::now();
+        let mut shared = cluster;
+        let cluster = loop {
+            match Arc::try_unwrap(shared) {
+                Ok(cluster) => break Some(cluster),
+                Err(still) if started.elapsed() >= Duration::from_secs(2) => {
+                    eprintln!(
+                        "rdb_dev: the cluster is still shared ({} handles); voters not shut down",
+                        Arc::strong_count(&still)
+                    );
+                    break None;
+                }
+                Err(still) => {
+                    shared = still;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
-            Err(still) => {
-                shared = still;
-                std::thread::sleep(Duration::from_millis(50));
-            }
+        };
+        if let Some(cluster) = cluster {
+            rt.block_on(cluster.shutdown());
+            // The cluster leaves a directory it was handed to its caller; with the stores
+            // closed, it goes, `--keep` or not, as the cluster's own data root did.
+            remove(&voters);
         }
-    };
-    if let Some(cluster) = cluster {
-        rt.block_on(cluster.shutdown());
     }
     drop(rt);
-    if !args.keep {
+    if args.keep || args.control.is_some() {
+        return;
+    }
+    if !existed {
         remove(&args.dir);
     }
 }
@@ -549,6 +766,15 @@ fn close(
 struct Control<'a> {
     cluster: &'a Arc<Cluster>,
     store: &'a HostileStore,
+}
+
+/// A folder for this run's voters under `<dir>/control` that no earlier run left behind.
+fn voters_dir(dir: &std::path::Path) -> PathBuf {
+    let control = dir.join("control");
+    (0_u32..)
+        .map(|n| control.join(format!("voters-{}-{n}", std::process::id())))
+        .find(|path| !path.exists())
+        .expect("a free voters folder")
 }
 
 /// Remove `dir`, retrying for up to 2 s while Windows still holds a file the voters closed.
@@ -589,6 +815,9 @@ struct Seen {
     faults: Vec<String>,
     /// Each node's stall line as last printed, until it clears.
     stalled: std::collections::BTreeMap<u32, String>,
+    /// While `wait ready` runs: its own `reached ready` line says ready, so the poller does not
+    /// (k237, lead ruling on the G4 follow-up: the poller's `ready` printed before it).
+    awaiting_ready: bool,
 }
 
 impl Progress {
@@ -603,59 +832,67 @@ impl Progress {
 /// Print the partition's progress lines as it changes, every 100 ms.
 fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
-        let nodes = db.node_status();
-        let mut seen = progress
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for node in &nodes {
-            if let Some(fault) = &node.fault {
-                let line = format!("fault node={} {fault}", node.node.0);
-                if !seen.faults.contains(&line) {
-                    say(&line);
-                    seen.faults.push(line);
-                }
-            }
-            if let Some(line) = stall_change(seen.stalled.get(&node.node.0), node) {
-                say(&line);
-                match &node.stalled {
-                    Some(stalled) => seen.stalled.insert(node.node.0, stalled.clone()),
-                    None => seen.stalled.remove(&node.node.0),
-                };
-            }
-        }
-        if let Some(owner) = nodes.iter().find(|n| n.node == NodeId(1)) {
-            if owner.recovered.is_some() && owner.recovered != seen.recovered {
-                seen.recovered = owner.recovered;
-                say(&format!(
-                    "recovered gen={}",
-                    owner.recovered.map_or(0, |g| g.0)
-                ));
-            }
-            let admits = owner.admits == Some(true);
-            if let Some(line) = ready_step(
-                &mut seen,
-                owner,
-                db.restart_note().as_deref(),
-                &db.links().held(),
-                &db.links().dropped(),
-            ) {
-                say(&line);
-            }
-            if seen.recovered.is_some() && !admits {
-                let why = waiting_line(owner);
-                if seen.waiting.as_ref() != Some(&why) {
-                    say(&why);
-                    seen.waiting = Some(why);
-                }
-            }
-        } else if db.restart_failed(NodeId(1)) {
-            if let Some(line) = stopped_owner_step(&mut seen, db.restart_note().as_deref()) {
-                say(&line);
-            }
-        }
-        drop(seen);
+        poll_once(db, progress);
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Print each progress line that changed since it was last printed. The poller calls it every
+/// 100 ms, and the REPL before each command, so a change the last command made is said before
+/// the next command's output, not inside it. The status is read under the lock, so a line from
+/// an older reading never prints after a newer one (tester G4: a `not ready` line read while
+/// `admin damage` was in flight printed inside the next `members` listing, after it published).
+fn poll_once(db: &Db, progress: &Progress) {
+    let mut seen = progress
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let nodes = db.node_status();
+    for node in &nodes {
+        if let Some(fault) = &node.fault {
+            let line = format!("fault node={} {fault}", node.node.0);
+            if !seen.faults.contains(&line) {
+                say(&line);
+                seen.faults.push(line);
+            }
+        }
+        if let Some(line) = stall_change(seen.stalled.get(&node.node.0), node) {
+            say(&line);
+            match &node.stalled {
+                Some(stalled) => seen.stalled.insert(node.node.0, stalled.clone()),
+                None => seen.stalled.remove(&node.node.0),
+            };
+        }
+    }
+    if let Some(owner) = nodes.iter().find(|n| n.node == NodeId(1)) {
+        if owner.recovered.is_some() && owner.recovered != seen.recovered {
+            seen.recovered = owner.recovered;
+            say(&format!(
+                "recovered gen={}",
+                owner.recovered.map_or(0, |g| g.0)
+            ));
+        }
+        let admits = owner.admits == Some(true);
+        if let Some(line) = ready_step(
+            &mut seen,
+            owner,
+            db.restart_note().as_deref(),
+            &db.links().held(),
+            &db.links().dropped(),
+        ) {
+            say(&line);
+        }
+        if seen.recovered.is_some() && !admits {
+            let why = waiting_line(owner);
+            if seen.waiting.as_ref() != Some(&why) {
+                say(&why);
+                seen.waiting = Some(why);
+            }
+        }
+    } else if db.restart_failed(NodeId(1)) {
+        if let Some(line) = stopped_owner_step(&mut seen, db.restart_note().as_deref()) {
+            say(&line);
+        }
     }
 }
 
@@ -825,7 +1062,7 @@ fn waits_on_line(
             format!("the start record's outcome (seq {})", seq.0)
         }
         // Status does not know an admin damage write: it is another client's (S6 P-3).
-        Some(request) if request.0 >= DAMAGE_REQUEST_BASE => {
+        Some(request) if is_damage_request(request) => {
             format!("an admin damage write's outcome (seq {})", seq.0)
         }
         Some(request) => format!("request {}'s outcome (seq {})", request.0, seq.0),
@@ -977,9 +1214,13 @@ fn stopped_owner_step(seen: &mut Seen, restart_note: Option<&str>) -> Option<Str
 }
 
 /// The `ready` or `not ready` line for `admits` and `reason`, given what `seen` holds as
-/// printed, as [`ready_step`] describes.
+/// printed, as [`ready_step`] describes. A bare `ready` waits while `wait ready` runs: that
+/// wait ends with its own line and records it as printed ([`wait_ready_line`]).
 fn step_line(seen: &mut Seen, admits: bool, reason: Option<String>) -> Option<String> {
     if admits == seen.ready && reason == seen.reason {
+        return None;
+    }
+    if seen.awaiting_ready && admits && reason.is_none() {
         return None;
     }
     let line = match (admits, &reason) {
@@ -1047,7 +1288,8 @@ fn repl<'scope, 'env>(
     args: &Args,
     db: &'env Db,
     rt: &tokio::runtime::Runtime,
-    control: &Control<'_>,
+    store: &dyn ConfigStore,
+    control: Option<&Control<'_>>,
     progress: &Progress,
 ) -> ExitCode {
     let input: Box<dyn BufRead> = match &args.script {
@@ -1060,7 +1302,10 @@ fn repl<'scope, 'env>(
         },
         None => Box::new(std::io::BufReader::new(std::io::stdin())),
     };
-    let mut sent = Sent::default();
+    let mut sent = Sent {
+        file: args.requests.clone(),
+        ..Sent::default()
+    };
     let mut bad = false;
     let deadline = args.put_timeout.unwrap_or(Timeouts::default().put);
     for line in input.lines() {
@@ -1073,10 +1318,12 @@ fn repl<'scope, 'env>(
                 return ExitCode::from(2);
             }
         };
+        // What the last command changed is said before this one's output (tester G4).
+        poll_once(db, progress);
         if args.script.is_some() {
             say(&format!("> {line}"));
         }
-        tracing::info!(command = %line, "repl_command");
+        log_command(&line);
         // A value verb reads its JSON from the raw line (risk R1), so it skips `split_words`.
         if let Some(verb) = line
             .split_whitespace()
@@ -1110,8 +1357,34 @@ fn repl<'scope, 'env>(
             }
         };
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        // Nothing to retry is an answer, not a mistyped line: no `usage:`, and no exit 1.
+        if let ["retry", rest @ ..] = words.as_slice() {
+            match sent.adopt(rest) {
+                Ok(warnings) => warnings.iter().for_each(|w| say(&format!("warn {w}"))),
+                Err(e) => {
+                    say(&format!("err {e}"));
+                    bad = true;
+                    continue;
+                }
+            }
+            if let Some(nothing) = sent.nothing_to_retry(rest) {
+                say(&nothing);
+                continue;
+            }
+        }
         let outcome = match words.as_slice() {
             ["quit" | "exit"] => break,
+            ["put", "--as", n, object, value, rest @ ..] => parse_app_id(n).and_then(|id| {
+                let if_version = parse_if_version(rest)?;
+                let answer = db.put_as(id, object.as_bytes(), value.as_bytes(), if_version);
+                let kind = Kind::Put {
+                    object: object.as_bytes().to_vec(),
+                    if_version,
+                };
+                put_line(db, answer, Some((&mut sent, kind)));
+                Ok(())
+            }),
+            ["put", "--as", ..] => Err("put --as <n> <object> <value> [--if-version N]".to_owned()),
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
                 Ok(if_version) => {
                     let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
@@ -1178,7 +1451,7 @@ fn repl<'scope, 'env>(
                 put_line(db, answer, None);
             }),
             ["get", object] => {
-                read_line(db.read(object.as_bytes(), Look::Doc));
+                read_line(db.read(object.as_bytes(), Look::Doc).map_err(get_hint));
                 Ok(())
             }
             ["blob", "upload", object, rest @ ..] => blob_upload(db, object, rest, &mut sent),
@@ -1216,12 +1489,10 @@ fn repl<'scope, 'env>(
             }),
             ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
             ["admin", "clear-grant", node] => parse_node(node).map(|node| {
-                say(
-                    &match rt.block_on(admin::clear_grant(db, control.store, node)) {
-                        Ok(clearance) => clearance_line(clearance, node, db),
-                        Err(e) => admin_error_line(node, &e),
-                    },
-                );
+                say(&match rt.block_on(admin::clear_grant(db, store, node)) {
+                    Ok(clearance) => clearance_line(clearance, node, db),
+                    Err(e) => admin_error_line(node, &e),
+                });
             }),
             ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
             ["admin", "damage", _, ..] => damage_record(db, &line),
@@ -1241,73 +1512,13 @@ fn repl<'scope, 'env>(
                 "admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE}"
             )),
-            ["control", "lifecycle", partition, word] => {
-                parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
-                    say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
-                })
-            }
-            ["control", "lifecycle", ..] => Err(format!(
-                "control lifecycle <p> <{}>",
-                LIFECYCLE_WORDS.join("|")
-            )),
-            ["control", "freeze-grant", node] => parse_node(node).map(|node| {
-                say(&freeze_grant(rt, control.cluster, node));
-            }),
-            ["control", "freeze-grant", ..] => Err("control freeze-grant <n>".to_owned()),
-            ["control"] => {
-                control_lines(rt, control.cluster);
-                Ok(())
-            }
-            ["control", "voters"] => {
-                say(&voters_line(control));
-                Ok(())
-            }
-            ["control", "gap"] => {
-                say(&gap(rt, control));
-                Ok(())
-            }
-            ["control", "drop-watches"] => {
-                say(&format!("dropped {} watches", control.store.drop_watches()));
-                Ok(())
-            }
-            ["control", verb @ ("gap" | "drop-watches"), ..] => {
-                Err(format!("control {verb}: takes no arguments"))
-            }
-            ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
-                control.store.fail_lists(fault);
-                say(&format!("fail list {word}"));
-            }),
-            ["control", "fail", "put", prefix, word, rest @ ..] => {
-                parse_put_fault(word, rest).map(|(fault, count)| {
-                    control.store.fail_puts(prefix, fault, count);
-                    say(&match fault {
-                        Some(_) => format!("fail put {prefix} {word} {count}"),
-                        None => format!("fail put {prefix} off"),
-                    });
-                })
-            }
-            ["control", "fail", ..] => Err(format!(
-                "control fail list <{}> | control fail put <prefix> <{}> [n]",
-                ListFault::WORDS,
-                PutFault::WORDS
-            )),
-            ["control", verb @ ("stop" | "start"), voter] => parse_voter(control.cluster, voter)
-                .map(|voter| {
-                    say(&if *verb == "stop" {
-                        stop_voter(rt, control, voter)
-                    } else {
-                        start_voter(rt, control.cluster, voter)
-                    });
-                }),
-            ["control", "stop" | "start", ..] => Err(format!(
-                "control stop|start <voter>: exactly one voter, one of {:?}",
-                control
-                    .cluster
-                    .ids()
-                    .iter()
-                    .map(|id| id.0)
-                    .collect::<Vec<_>>()
-            )),
+            ["control", ..] => match control {
+                Some(control) => control_verb(&words, &line, rt, control),
+                None => {
+                    say(&format!("err {line}: {CONTROL_EXTERNAL}"));
+                    Ok(())
+                }
+            },
             ["links"] => {
                 let names = |pairs: Vec<(NodeId, NodeId)>| {
                     pairs
@@ -1346,7 +1557,26 @@ fn repl<'scope, 'env>(
                 let secs = rest.first().map_or(Ok(30), |s| s.parse::<u64>());
                 match secs {
                     Ok(secs) => {
-                        wait_for(progress, what, Duration::from_secs(secs));
+                        let within = Duration::from_secs(secs);
+                        let waited = if *what == "ready" {
+                            wait_ready_line(
+                                progress,
+                                within,
+                                WAIT_PROGRESS_EVERY,
+                                |slice| db.wait_ready(slice),
+                                say,
+                            )
+                        } else {
+                            wait_recovered(progress, within, || db.heal_state())
+                        };
+                        match waited {
+                            Ok(line) => say(&line),
+                            // A script must see that this open will never be ready (A-R191).
+                            Err(line) => {
+                                say(&line);
+                                bad = true;
+                            }
+                        }
                         Ok(())
                     }
                     Err(_) => Err("wait takes whole seconds".to_owned()),
@@ -1366,11 +1596,169 @@ fn repl<'scope, 'env>(
             bad = true;
         }
     }
-    if bad {
+    exit_code(bad, &sent)
+}
+
+/// How a REPL run ends: 1 when a line was bad or an append to `--requests F` failed (k214).
+fn exit_code(bad: bool, sent: &Sent) -> ExitCode {
+    if bad || sent.save_failed.get() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Why a `control` verb is refused under `--control`: they reach rdb_dev's own voters, and an
+/// external rEtcd is not rdb_dev's to freeze, stop or fault (M10 R3c).
+const CONTROL_EXTERNAL: &str =
+    "refused under --control: the store is an external rEtcd, not rdb_dev's own voters";
+
+/// A `control` verb against rdb_dev's own voters.
+fn control_verb(
+    words: &[&str],
+    line: &str,
+    rt: &tokio::runtime::Runtime,
+    control: &Control<'_>,
+) -> Result<(), String> {
+    match words {
+        ["control", "lifecycle", partition, word] => {
+            parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
+                say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
+            })
+        }
+        ["control", "lifecycle", ..] => Err(format!(
+            "control lifecycle <p> <{}>",
+            LIFECYCLE_WORDS.join("|")
+        )),
+        ["control", "freeze-grant", node] => parse_node(node).map(|node| {
+            say(&freeze_grant(rt, control.cluster, node));
+        }),
+        ["control", "freeze-grant", ..] => Err("control freeze-grant <n>".to_owned()),
+        ["control"] => {
+            control_lines(rt, control.cluster);
+            Ok(())
+        }
+        ["control", "voters"] => {
+            say(&voters_line(control));
+            Ok(())
+        }
+        ["control", "gap"] => {
+            say(&gap(rt, control));
+            Ok(())
+        }
+        ["control", "drop-watches"] => {
+            say(&format!("dropped {} watches", control.store.drop_watches()));
+            Ok(())
+        }
+        ["control", verb @ ("gap" | "drop-watches"), ..] => {
+            Err(format!("control {verb}: takes no arguments"))
+        }
+        ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
+            control.store.fail_lists(fault);
+            say(&format!("fail list {word}"));
+        }),
+        ["control", "fail", "put", prefix, word, rest @ ..] => {
+            parse_put_fault(word, rest).map(|(fault, count)| {
+                control.store.fail_puts(prefix, fault, count);
+                say(&match fault {
+                    Some(_) => format!("fail put {prefix} {word} {count}"),
+                    None => format!("fail put {prefix} off"),
+                });
+            })
+        }
+        ["control", "fail", ..] => Err(format!(
+            "control fail list <{}> | control fail put <prefix> <{}> [n]",
+            ListFault::WORDS,
+            PutFault::WORDS
+        )),
+        ["control", verb @ ("stop" | "start"), voter] => {
+            parse_voter(control.cluster, voter).map(|voter| {
+                say(&if *verb == "stop" {
+                    stop_voter(rt, control, voter)
+                } else {
+                    start_voter(rt, control.cluster, voter)
+                });
+            })
+        }
+        ["control", "stop" | "start", ..] => Err(format!(
+            "control stop|start <voter>: exactly one voter, one of {:?}",
+            control
+                .cluster
+                .ids()
+                .iter()
+                .map(|id| id.0)
+                .collect::<Vec<_>>()
+        )),
+        _ => Err(format!("unknown command {line:?}")),
+    }
+}
+
+/// The `repl_command` log line for one typed command: its verb, and the object it names as
+/// `key_hex` (at most 32 bytes), never the line. A line carries keys, values, map keys and
+/// paths, and a log never holds their text (ADR-0013, A-R154, D5). A verb the grammar does not
+/// know logs as `unknown`, since a mistyped line can be anything.
+fn log_command(line: &str) {
+    let (verb, object) = command_fields(line);
+    match object {
+        Some(object) => {
+            let key_hex = hex::encode(&object.as_bytes()[..object.len().min(32)]);
+            tracing::info!(verb, key_hex = %key_hex, "repl_command");
+        }
+        None => tracing::info!(verb, "repl_command"),
+    }
+}
+
+/// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
+/// object it writes or reads, when it names one. A line `split_words` refuses names no object.
+fn command_fields(line: &str) -> (&'static str, Option<String>) {
+    const VERBS: [&str; 25] = [
+        "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
+        "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
+        "sleep", "quit", "exit", "blob",
+    ];
+    const SUBVERBS: [&str; 19] = [
+        "put --as",
+        "blob upload",
+        "blob chunk",
+        "blob publish",
+        "blob gc",
+        "admin clear-grant",
+        "admin damage-chunk",
+        "admin damage",
+        "admin clear",
+        "link hold",
+        "link heal",
+        "link drop",
+        "node restart",
+        "wait recovered",
+        "wait ready",
+        "control lifecycle",
+        "control freeze-grant",
+        "control fail",
+        "control stop",
+    ];
+    let mut first = line.split_whitespace();
+    let Some(verb) = first
+        .next()
+        .and_then(|verb| VERBS.iter().copied().find(|known| *known == verb))
+    else {
+        return ("unknown", None);
+    };
+    let pair = first.next().map(|sub| format!("{verb} {sub}"));
+    let verb = pair
+        .and_then(|pair| SUBVERBS.iter().copied().find(|known| *known == pair))
+        .unwrap_or(verb);
+    let at = match verb {
+        "put" | "put&" | "get" | "read" | "doc" | "map" | "set" | "members" | "list" | "items" => 1,
+        "blob upload" | "blob chunk" | "blob publish" | "blob gc" | "admin damage-chunk"
+        | "admin damage" | "admin clear" => 2,
+        "put --as" => 3,
+        _ => return (verb, None),
+    };
+    let object = split_words(line)
+        .ok()
+        .and_then(|mut words| (words.len() > at).then(|| words.swap_remove(at)));
+    (verb, object)
 }
 
 /// One input line as a command: `None` for a blank or comment-only line. An unreadable line
@@ -1985,14 +2373,49 @@ fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), 
     Ok(())
 }
 
-/// The first request id of `admin damage` and `damage-chunk`. Node status names an in-flight
-/// request by id alone, with no client, so these ids start far above any the `Db` sends, and a
-/// note can tell them apart (S6 P-3).
+/// The lowest request id of `admin damage` and `damage-chunk`. Node status names an in-flight
+/// request by id alone, with no client, so a note tells them apart by the ids this process
+/// issued ([`is_damage_request`], S6 P-3, D8).
 const DAMAGE_REQUEST_BASE: u64 = 1 << 32;
 
-/// Request ids for `admin damage` and `damage-chunk`, under their own client.
-static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(DAMAGE_REQUEST_BASE);
+/// Damage ids one run may issue before it could reach those of a run started a millisecond
+/// later.
+const DAMAGE_IDS_PER_MILLI: u64 = 1 << 12;
+
+/// The first damage id of a run started at `unix_millis`. Every run starts its own range, so a
+/// later run never reuses an earlier run's id: the dedup index still holds that id under the
+/// damage client, and a reuse was refused `GENERATION_CHANGED` with the earlier run's
+/// generation (A-R191 2, tester d8b/d8c).
+fn damage_start(unix_millis: u64) -> u64 {
+    DAMAGE_REQUEST_BASE + unix_millis * DAMAGE_IDS_PER_MILLI
+}
+
+/// This run's first damage id, fixed at its first use.
+fn this_runs_damage_start() -> u64 {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock reads after 1970");
+        damage_start(u64::try_from(now.as_millis()).expect("millis since 1970 fit a u64"))
+    })
+}
+
+/// How many damage ids this run has issued.
+static DAMAGE_ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fresh request id for `admin damage` or `damage-chunk`, under their own client.
+fn damage_request() -> RequestId {
+    RequestId(this_runs_damage_start() + DAMAGE_ISSUED.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Whether this process issued `request` for `admin damage` or `damage-chunk`. By origin, not
+/// by size: from a folder's second open on, the `Db`'s own ids start at `(n-1)<<40`, and an id
+/// alone was then read as a damage write (tester D8).
+fn is_damage_request(request: RequestId) -> bool {
+    let start = this_runs_damage_start();
+    (start..start + DAMAGE_ISSUED.load(Ordering::Relaxed)).contains(&request.0)
+}
 
 /// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
 /// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
@@ -2016,7 +2439,7 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
         identity: RequestIdentity {
             tenant: TenantId(1),
             client: ClientId(2),
-            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+            request: damage_request(),
         },
         affinity: AffinityId(1),
         expected_generation: None,
@@ -2161,24 +2584,45 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         }
         (None, None) => (root.to_bytes(), object.to_owned()),
     };
+    let mut mutations = vec![Mutation::Put {
+        key: key.clone(),
+        value: Bytes::from(bytes),
+        expected_version: None,
+    }];
+    // An element written alone lands at a version above its root's, and a read names that
+    // first (`element version V is above its root's`), never the fault `--as` asked for; a map
+    // write over it is refused too. So the root's own bytes go in the same write, at the
+    // version read: both carry the write's version (lead, on the 8e083a9 walk).
+    if element.is_some() {
+        match root_rewrite(db, object, &root, &what) {
+            // A-R211: a set member has no envelope, so a sealed one there is only bytes, which
+            // reads as damage whatever `--as` says. Refused before anything is written.
+            Ok((_, CollectionKind::Set)) if matches!(how, "newer" | "kind0") => {
+                return Err(format!(
+                    "admin damage: {SET_MEMBER_AS}; not a member with --as {how}"
+                ));
+            }
+            Ok((put, _)) => mutations.push(put),
+            Err(said) => {
+                say(&format!("err admin damage: {said}"));
+                return Ok(());
+            }
+        }
+    }
     let request = TxnRequest {
         // M9 S7: `--api-version N` sends the write as a newer (or older) build's request.
         api_version: api_version.unwrap_or(rdb_core::contracts::version::API_VERSION),
         identity: RequestIdentity {
             tenant: TenantId(1),
             client: ClientId(2),
-            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+            request: damage_request(),
         },
         affinity: AffinityId(1),
         expected_generation: None,
         remaining_millis: 5_000,
         // Only a stored record is damaged; a missing one is refused, never written.
-        conditions: vec![Condition::Present { key: key.clone() }],
-        mutations: vec![Mutation::Put {
-            key,
-            value: Bytes::from(bytes),
-            expected_version: None,
-        }],
+        conditions: vec![Condition::Present { key }],
+        mutations,
     };
     // No request id is printed, as for damage-chunk (PB-5): another client's number.
     say(&match db.resend(request) {
@@ -2199,6 +2643,65 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
     });
     Ok(())
 }
+
+/// The map's or set's root record as it is stored, `{"keys": 1, "count": n}` sealed under its
+/// kind (ADR-rdb-0013), written back at the version a root-only read saw. A read with no
+/// element listed checks no element, so a root over an already damaged entry still reads.
+fn root_rewrite(
+    db: &Db,
+    object: &str,
+    root: &rdb_value::keys::RootKey,
+    what: &str,
+) -> Result<(rdb_core::contracts::txn::Mutation, CollectionKind), String> {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_value::collection::KEY_PROFILE_V1;
+    use rdb_value::value::{Map, MapKey};
+    let not_collection = format!("--element: {object} is not a map or a set");
+    let look = Look::Members {
+        after: None,
+        limit: 0,
+    };
+    let found = match db.read(object.as_bytes(), look) {
+        Ok(ReadOk {
+            seen: rdb_api::Seen::Members(page),
+            ..
+        }) => page.collection,
+        Ok(ReadOk {
+            seen: rdb_api::Seen::Absent,
+            ..
+        }) => return Err(format!("no stored record at {what}")),
+        Ok(_) => return Err(not_collection),
+        Err(error) if error.kind == ErrorKind::InvalidArgument => return Err(not_collection),
+        Err(error) => {
+            return Err(format!(
+                "--element root read {} ({})",
+                error.name(),
+                error.detail
+            ))
+        }
+    };
+    let mut fields = Map::new();
+    fields.insert(
+        MapKey::new("keys"),
+        Value::Integer(Int::new(KEY_PROFILE_V1).expect("1 is an integer")),
+    );
+    fields.insert(MapKey::new("count"), Value::Integer(Int::from(found.count)));
+    let payload = rdb_value::cbor::encode(&Value::Map(fields)).expect("a two-field map encodes");
+    let sealed = rdb_value::envelope::seal(found.kind.kind(), &payload)
+        .expect("a root payload is a few bytes");
+    Ok((
+        rdb_core::contracts::txn::Mutation::Put {
+            key: root.to_bytes(),
+            value: sealed,
+            expected_version: Some(found.version),
+        },
+        found.kind,
+    ))
+}
+
+/// Why `admin damage <set> --element K` takes only `--as digest` (A-R211).
+const SET_MEMBER_AS: &str = "a set member holds no envelope, so any bytes in it are damage; \
+     damage a set member with --as digest, or a newer build's set with the root and --as newer";
 
 const DAMAGE_RECORD_USAGE: &str = "admin damage <object> [--element K | --item P] \
      [--as digest|kind0|newer] [--api-version N]; K is a map key or set member, P a list \
@@ -2224,6 +2727,26 @@ fn parse_range(rest: &[&str]) -> Result<Look, String> {
 
 /// A `Db::read` answer as lines. A byte-string document prints as `get` always has; any other
 /// document as JSON.
+/// `get` reads a document. On another kind the read says only `a Map does not take this op`
+/// (tester, embed.md walk), so the verb that reads that kind is named after it.
+fn get_hint(mut error: ApiError) -> ApiError {
+    let verb = [
+        ("a Map does not take this op", "members <object>"),
+        ("a Set does not take this op", "members <object>"),
+        ("a List does not take this op", "items <object>"),
+        ("a Blob does not take this op", "read <object>"),
+    ]
+    .into_iter()
+    .find_map(|(said, verb)| (error.detail == said).then_some(verb));
+    if let Some(verb) = verb {
+        error.detail = format!(
+            "{}; `get` reads a document, read this one with `{verb}`",
+            error.detail
+        );
+    }
+    error
+}
+
 fn read_line(answer: Result<ReadOk, ApiError>) {
     let ok = match answer {
         Ok(ok) => ok,
@@ -2464,6 +2987,20 @@ fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Whether `request` is an app's id, one `app_request_id` built, which `put_as` takes.
+fn is_app_id(request: RequestId) -> bool {
+    let bit = rdb_api::app_request_id(0).expect("0 is below 2^63").0;
+    request.0 & bit != 0
+}
+
+/// The request id `put --as <n>` sends under: `app_request_id(n)` (A-R195a).
+fn parse_app_id(n: &str) -> Result<RequestId, String> {
+    n.parse::<u64>()
+        .ok()
+        .and_then(rdb_api::app_request_id)
+        .ok_or_else(|| format!("put --as N: N is a number below 2^63, not {n}"))
+}
+
 fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
     match rest {
         [] => Ok(None),
@@ -2477,9 +3014,16 @@ fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
 
 /// What `retry <id> --payload` re-puts: the object and condition of the put `request` was
 /// sent as. A txn has no single object, so it is refused (S1 guard G10).
+/// Only under an app id: `put_as` refuses one this Db numbered (A-R195a).
 fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>), String> {
     match kind {
-        Kind::Put { object, if_version } => Ok((object, if_version)),
+        Kind::Put { object, if_version } if is_app_id(request) => Ok((object, if_version)),
+        Kind::Put { .. } => Err(format!(
+            "retry --payload sends a new value under request {}, an id this Db numbered itself, \
+             and the Db refuses that: nothing was sent. Send the write under an id of your own \
+             instead: put --as <n> <object> <value>, then retry it with --payload",
+            request.0
+        )),
         Kind::Txn => Err(format!(
             "retry --payload changes a put's value; request {} was a txn",
             request.0
@@ -2496,8 +3040,8 @@ fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>),
     }
 }
 
-/// What a recorded request was sent as.
-#[derive(Debug, Clone)]
+/// What a recorded request was sent as. Saved beside the request in `--requests F`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Kind {
     /// A put, with the object and condition it was put with, for `retry --payload`.
     Put {
@@ -2520,12 +3064,55 @@ struct Sent {
     /// The request, and what it was sent as.
     by_id: std::collections::BTreeMap<u64, (TxnRequest, Kind)>,
     latest: Option<Option<u64>>,
+    /// `--requests F`: each recorded request is appended here, and an id this run did not send
+    /// is looked up here.
+    file: Option<PathBuf>,
+    /// An append to `--requests F` failed: the run exits 1 (k214).
+    save_failed: std::cell::Cell<bool>,
+    /// The lines of F already warned about: each is said once per run, not on every retry.
+    warned: std::collections::BTreeSet<usize>,
+}
+
+/// `true` when `file` is not empty and its last byte is not a newline.
+fn ends_mid_line(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
+/// What `retry <rest>` names, its `--payload V` or `--deadline-ms N` aside.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryTarget {
+    /// The latest write.
+    Latest,
+    /// Request `id`, as `retry <id>` or `retry --id <id>`.
+    Id(u64),
+    /// Anything else: [`Sent::pick`] answers it with a usage line.
+    Other,
+}
+
+fn retry_target(rest: &[&str]) -> RetryTarget {
+    let target = match rest {
+        [target @ .., "--payload" | "--deadline-ms", _] => target,
+        target => target,
+    };
+    match target {
+        [] => RetryTarget::Latest,
+        [id] | ["--id", id] => id.parse().map_or(RetryTarget::Other, RetryTarget::Id),
+        _ => RetryTarget::Other,
+    }
 }
 
 impl Sent {
     fn record(&mut self, request: Option<TxnRequest>, kind: Kind) {
         let id = request.map(|request| {
             let id = request.identity.request.0;
+            self.save(&request, &kind);
             self.by_id.insert(id, (request, kind));
             id
         });
@@ -2546,6 +3133,9 @@ impl Sent {
                 entry.0 = request.clone();
                 self.latest = Some(Some(id));
             }
+            if let Some((request, kind)) = self.by_id.get(&id) {
+                self.save(request, kind);
+            }
         }
     }
 
@@ -2558,6 +3148,128 @@ impl Sent {
         }
     }
 
+    /// The plain answer when `retry <rest>` has nothing to send: no write yet, a latest write
+    /// that sent no request, or a request id this session never sent. For that last one, the
+    /// way to resend an earlier run's request is `retry --id`. `None` when there is something
+    /// to send, or when `rest` is not a retry of a recorded request at all.
+    fn nothing_to_retry(&self, rest: &[&str]) -> Option<String> {
+        match retry_target(rest) {
+            RetryTarget::Latest => match self.latest {
+                None => Some("nothing to retry: this run has sent no write yet".to_owned()),
+                Some(None) => Some(
+                    "nothing to retry: the latest write was refused before it was sent".to_owned(),
+                ),
+                Some(Some(_)) => None,
+            },
+            RetryTarget::Id(id) if !self.by_id.contains_key(&id) => Some(match &self.file {
+                Some(path) => format!(
+                    "nothing to retry as request {id}: this run did not send it, and {} \
+                         holds no request {id}",
+                    path.display()
+                ),
+                None => format!(
+                    "nothing to retry as request {id}: this run did not send it. To resend \
+                         an earlier run's request, start that run and this one with --requests \
+                         F, then retry {id}"
+                ),
+            }),
+            RetryTarget::Id(_) | RetryTarget::Other => None,
+        }
+    }
+
+    /// Take request `id` from `--requests F` when this run did not send it, so `retry` resends
+    /// an earlier run's request unchanged. F's last line for `id` wins: a retry appends what it
+    /// sent. A missing F holds nothing; an F that cannot be read is an error. A line that does
+    /// not parse is skipped, and the answer names it among the warnings, by line only.
+    fn adopt(&mut self, rest: &[&str]) -> Result<Vec<String>, String> {
+        let (Some(path), RetryTarget::Id(id)) = (&self.file, retry_target(rest)) else {
+            return Ok(Vec::new());
+        };
+        if self.by_id.contains_key(&id) {
+            return Ok(Vec::new());
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("--requests {}: {e}", path.display())),
+        };
+        let mut found = None;
+        let mut warnings = Vec::new();
+        let last = text.lines().count();
+        for (at, line) in text.lines().enumerate() {
+            let entry: (TxnRequest, Kind) = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                // Skipped, so one bad line never blocks the other ids (k214). Where and what
+                // class of error, never serde's message: that quotes the text it met, and a
+                // line holds keys and values.
+                Err(e) => {
+                    let line = at + 1;
+                    if !self.warned.insert(line) {
+                        continue;
+                    }
+                    let torn = line == last && !text.ends_with('\n') && e.is_eof();
+                    tracing::warn!(line, torn, class = ?e.classify(), "requests_file_line_skipped");
+                    warnings.push(if torn {
+                        format!(
+                            "--requests {} line {line}: cut short, as a kill during its write \
+                             leaves it; skipped",
+                            path.display()
+                        )
+                    } else {
+                        format!(
+                            "--requests {} line {line}: not a saved request ({:?} error at \
+                             column {}); skipped",
+                            path.display(),
+                            e.classify(),
+                            e.column()
+                        )
+                    });
+                    continue;
+                }
+            };
+            if entry.0.identity.request.0 == id {
+                found = Some(entry);
+            }
+        }
+        if let Some(entry) = found {
+            self.by_id.insert(id, entry);
+        }
+        Ok(warnings)
+    }
+
+    /// Append `request` to `--requests F`, synced, when there is an F. A failed write is said
+    /// on the run's output, logged, and makes the run exit 1: a later run could not retry it.
+    fn save(&self, request: &TxnRequest, kind: &Kind) {
+        let Some(path) = &self.file else {
+            return;
+        };
+        let saved = serde_json::to_string(&(request, kind))
+            .map_err(|e| e.to_string())
+            .and_then(|line| {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| e.to_string())?;
+                // A kill during an append leaves F ending mid-line. Start a line of our own, or
+                // this request would be glued onto that tail and lost to a later run.
+                let torn = ends_mid_line(&mut file).map_err(|e| e.to_string())?;
+                writeln!(file, "{}{line}", if torn { "\n" } else { "" })
+                    .and_then(|()| file.sync_data())
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = saved {
+            let request = request.identity.request.0;
+            tracing::error!(error = %e, request, "requests_file_write_failed");
+            self.save_failed.set(true);
+            say(&format!(
+                "err --requests {}: {e}; a later run cannot retry request {request}",
+                path.display()
+            ));
+        }
+    }
+
     fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Kind), String> {
         let id = match rest {
             [] => match self.latest {
@@ -2567,7 +3279,7 @@ impl Sent {
                 }
                 Some(Some(id)) => id,
             },
-            [id] => id
+            [id] | ["--id", id] => id
                 .parse()
                 .map_err(|_| "retry [<request>]: a request id is a number".to_owned())?,
             _ => return Err("retry [<request>] [--payload <value> | --deadline-ms N]".to_owned()),
@@ -2982,7 +3694,11 @@ fn set_lifecycle(
     rewrite(rt, cluster, &key, |body| {
         let mut record = PartitionRecord::decode(body)?;
         record.lifecycle = lifecycle;
-        Some((record.encode(), format!("{:?}", record.lifecycle)))
+        // A rooted body (layout 3) stays rooted: `encode` alone writes layout 2 and drops the
+        // `PartitionRoot` the open wrote (review F-004).
+        let bytes = PartitionRoot::decode(body)
+            .map_or_else(|| record.encode(), |root| record.encode_with(&root));
+        Some((bytes, format!("{:?}", record.lifecycle)))
     })
 }
 
@@ -3163,30 +3879,144 @@ fn start_voter(rt: &tokio::runtime::Runtime, cluster: &Arc<Cluster>, voter: Vote
     }
 }
 
-fn wait_for(progress: &Progress, what: &str, limit: Duration) {
+/// `wait recovered`: the line it ends with. `Err` when the wait stopped because the open can never
+/// get there (a failed heal): the run then exits 1.
+fn wait_recovered(
+    progress: &Progress,
+    limit: Duration,
+    heal: impl Fn() -> rdb_api::db::HealState,
+) -> Result<String, String> {
     let started = Instant::now();
     loop {
-        let seen = progress.seen();
-        let reached = match what {
-            "recovered" => seen.recovered.is_some(),
-            _ => seen.ready,
-        };
-        if reached {
-            say(&format!(
-                "reached {what} in {}ms",
+        if progress.seen().recovered.is_some() {
+            return Ok(format!(
+                "reached recovered in {}ms",
                 started.elapsed().as_millis()
             ));
-            return;
+        }
+        // A failed heal never recovers: say why now, not after the whole wait (k151). Node 1
+        // recovers only from the plan the heal hands it.
+        if let rdb_api::db::HealState::Failed(error) = heal() {
+            return Err(format!(
+                "stopped waiting for recovered: {}; this open will not become ready",
+                rdb_api::db::ReadyError::Heal(error)
+            ));
         }
         if started.elapsed() >= limit {
-            say(&format!(
-                "timeout waiting for {what} after {}s",
+            return Ok(format!(
+                "timeout waiting for recovered after {}s",
                 limit.as_secs()
             ));
-            return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// How often `wait ready` says it is still waiting.
+const WAIT_PROGRESS_EVERY: Duration = Duration::from_secs(10);
+
+/// `wait ready`: the line it ends with, from `Db::wait_ready`, which answers the present rather
+/// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
+/// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
+/// gives the next step). The run then exits 1. A timeout is said, and is not an error. A wait
+/// that reached ready records that as printed, so the poller does not say it a second time, and
+/// while it waits the poller holds back a bare `ready`, so it never comes before this line.
+///
+/// It asks `wait` for at most `every` at a time, and after each slice that ran out it says
+/// `still waiting for ready: recovery phase P` with node 1's phase then: the tester saw ~40 s
+/// with no line while rEtcd had no quorum. A timeout names the whole bound, not the last slice.
+fn wait_ready_line(
+    progress: &Progress,
+    within: Duration,
+    every: Duration,
+    mut wait: impl FnMut(Duration) -> Result<(), rdb_api::db::ReadyError>,
+    mut said: impl FnMut(&str),
+) -> Result<String, String> {
+    use rdb_api::db::ReadyError;
+    progress
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .awaiting_ready = true;
+    let started = Instant::now();
+    let mut left = within;
+    let answer = loop {
+        let slice = left.min(every);
+        match wait(slice) {
+            Err(ReadyError::TimedOut { phase, .. }) if slice < left => {
+                left -= slice;
+                tracing::info!(
+                    phase = phase.as_str(),
+                    waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "repl_wait_progress"
+                );
+                said(&format!("still waiting for ready: recovery phase {phase}"));
+            }
+            Err(ReadyError::TimedOut { phase, .. }) => {
+                break Err(ReadyError::TimedOut {
+                    within_ms: within.as_millis(),
+                    phase,
+                })
+            }
+            answered => break answered,
+        }
+    };
+    let millis = started.elapsed().as_millis();
+    {
+        // Said by the caller, so the poller says it neither before nor after (k237): `ready`
+        // with no reason is now what was printed. A later change, or a reason, is still the
+        // poller's to say.
+        let mut seen = progress
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.awaiting_ready = false;
+        if answer.is_ok() {
+            seen.ready = true;
+            seen.reason = None;
+        }
+    }
+    let (outcome, line) = match &answer {
+        Ok(()) => ("reached", Ok(format!("reached ready in {millis}ms"))),
+        Err(e @ ReadyError::TimedOut { .. }) => (
+            "timed_out",
+            Ok(format!(
+                "timeout waiting for ready after {}s: {e}",
+                within.as_secs()
+            )),
+        ),
+        Err(e @ ReadyError::Heal(_)) => (
+            "stopped",
+            Err(format!(
+                "stopped waiting for ready: {e}; this open will not become ready"
+            )),
+        ),
+        Err(e @ ReadyError::Stopped { .. }) => {
+            ("stopped", Err(format!("stopped waiting for ready: {e}")))
+        }
+        // A-R196: its text ends "shut this Db down and open the folder again".
+        Err(e @ ReadyError::Blocked { .. }) => {
+            ("blocked", Err(format!("stopped waiting for ready: {e}")))
+        }
+        // A-R196(2a): its text says the data is kept and a reopen will not help.
+        Err(e @ ReadyError::Quarantined) => (
+            "quarantined",
+            Err(format!("stopped waiting for ready: {e}")),
+        ),
+        // PR #60 review F3: its text names the fault and says to open the folder again once.
+        Err(e @ ReadyError::Faulted { .. }) => {
+            ("faulted", Err(format!("stopped waiting for ready: {e}")))
+        }
+    };
+    let error = answer.err().map(|e| e.to_string());
+    tracing::info!(
+        what = "ready",
+        outcome,
+        millis = u64::try_from(millis).unwrap_or(u64::MAX),
+        error = error.as_deref(),
+        "repl_wait"
+    );
+    line
 }
 
 #[cfg(test)]
@@ -3212,9 +4042,18 @@ mod tests {
             - budgets.renew_millis) as u128
     }
 
-    /// The rows that set `RETCD_TEST_DATA_DIR`, as `main` does, hold this: the variable is the
-    /// process's, and these rows run in parallel.
+    /// The rows that start voters hold this, so their runs do not overlap. No row sets
+    /// `RETCD_TEST_DATA_DIR`: `run` names the voters' folder under `--dir` itself.
     static ENV: Mutex<()> = Mutex::new(());
+
+    /// Whether `dir`'s `control` folder holds a voter store: a folder with a `node-1` in it.
+    fn holds_voters(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir.join("control")).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().join("node-1").is_dir())
+        })
+    }
 
     fn owner(stalled: Option<&str>, admits: bool) -> NodeStatus {
         NodeStatus {
@@ -3269,7 +4108,7 @@ mod tests {
     #[test]
     fn a_stall_that_clears_prints_a_cleared_line_and_a_new_stall_prints_again() {
         let stall =
-            "recovery_rebuild_stalled ... its writes stay paused until the absent copy returns";
+            "recovery_rebuild_stalled ... its writes stay paused until the database is opened again";
         let mut printed: Option<String> = None;
         let mut lines = Vec::new();
         for node in [
@@ -3307,7 +4146,8 @@ mod tests {
         fenced.authority = "fenced(Expired)".to_owned();
         fenced.fence = Some(DenyReason::Expired);
         fenced.fence_polling = true;
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let mut seen = Seen {
             ready: true,
             ..Seen::default()
@@ -3449,7 +4289,8 @@ mod tests {
         .skip(2)
         .collect();
         assert_eq!(lines, [blocked]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let stuck = with("held(grant 2)", "Blocked(ControlUnknown)", None);
         let mut healthy = stuck.clone();
         healthy.protection = Some("healthy".to_owned());
@@ -3508,7 +4349,8 @@ mod tests {
         );
 
         let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[], &[]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
         healthy.protection = Some("healthy".to_owned());
         assert_eq!(
@@ -3607,7 +4449,8 @@ mod tests {
         // fenced with its poll live, then `unheld` with its self-replace stopped
         // (`replace_stopped`, kernel `self_replace_stopped`), then a later poll that changes
         // nothing. With and without a restart, the stuck line, once.
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let gave_up = "node 1's grant is unheld and node 1 stopped trying for one: its grant \
                        record is frozen or not its own; nothing in M9 replaces it, so writes \
                        stay stopped for this run: to write again, quit and start rdb_dev again";
@@ -3921,7 +4764,8 @@ mod tests {
     /// a copy out stays unsafe and pauses at L1's pause age (r3: 2.02 s).
     #[test]
     fn ready_after_a_restart_says_writes_pause_soon_not_only_after_the_next_write() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let mut paused = owner(None, false);
         paused.protection = Some("paused".to_owned());
         let mut seen = Seen::default();
@@ -3958,11 +4802,12 @@ mod tests {
     /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
     #[test]
     fn every_ready_line_matches_the_state_that_decides_it() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let failed = "node 2 stopped: its restart as boot 2 failed; a restarted node stays out \
-                      until M10 (#42)";
+                      until the folder is opened again (#42)";
         let owner_note = "the owner, node 1, restarted (now boot 2); a restarted node stays out \
-                          until M10 (#42)";
+                          until the folder is opened again (#42)";
         let stuck = "writes stay stopped for this run: to write again, quit and start rdb_dev \
                      again";
         let pause = |note: &str| {
@@ -4250,7 +5095,7 @@ mod tests {
     #[test]
     fn a_failed_owner_restart_says_not_ready_and_nodes_names_the_stopped_node() {
         let note = "the owner, node 1, stopped: its restart as boot 2 failed; a restarted node \
-                    stays out until M10 (#42)";
+                    stays out until the folder is opened again (#42)";
         let mut seen = Seen::default();
         lines_ready(&mut seen);
         assert_eq!(
@@ -4294,6 +5139,7 @@ mod tests {
             retry,
             no_mutation,
             detail: "control store: list partitions/: x; nothing deleted".to_owned(),
+            retry_after: None,
         };
         assert_eq!(
             admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter, true)),
@@ -4329,6 +5175,7 @@ mod tests {
             detail: "control store: delete grants/1 at revision 5: permission denied; the \
                      delete may have applied; run it again to read where it stands"
                 .to_owned(),
+            retry_after: None,
         };
         let permanent = admin_error_line(NodeId(1), &error(RetryRule::NotWired));
         assert_eq!(
@@ -4350,7 +5197,7 @@ mod tests {
     }
 
     /// F-005, F-006: an open that fails tears the run down as a clean quit does, and without
-    /// `--keep` leaves no directory. The voters' data goes under `--dir`, as `main` puts it, so
+    /// `--keep` leaves no directory. The voters' data goes under `--dir`, as `run` names it, so
     /// the row also proves the order: a store handle still open when the voters close keeps
     /// their RocksDB files, and on Windows `--dir` then cannot be removed.
     /// Integration (~2 s): three real rEtcd voters; the Db open is the injected failure.
@@ -4361,8 +5208,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
-        // As `main` does.
-        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
+        let env_before = std::env::var_os("RETCD_TEST_DATA_DIR");
         let args = Args {
             dir: dir.clone(),
             log_dir: root.path().join("logs"),
@@ -4372,11 +5218,30 @@ mod tests {
             put_timeout: None,
             dedup_cap: None,
             dedup_retention: None,
+            control: None,
+            requests: None,
+            abort_after_commit: false,
+            pause_before_sync: Vec::new(),
+            help: false,
         };
-        let code = run(&args, |_, _, _| async {
-            Err(OpenError::Node("node 2: injected".to_owned()))
+        let voters_under_dir = AtomicBool::new(false);
+        let code = run(&args, |config, _, _| {
+            voters_under_dir.store(holds_voters(&config.dir), Ordering::Relaxed);
+            async { Err(OpenError::Node("node 2: injected".to_owned())) }
         });
         assert_eq!(code, ExitCode::from(1), "a failed open exits 1");
+        assert!(
+            voters_under_dir.load(Ordering::Relaxed),
+            "the voters' data was not under {}",
+            dir.display()
+        );
+        // Found by W1: a row that leaves this changed nests every later row's
+        // folders one level deeper, and the fifth level passed MAX_PATH inside RocksDB.
+        assert_eq!(
+            std::env::var_os("RETCD_TEST_DATA_DIR"),
+            env_before,
+            "the row left RETCD_TEST_DATA_DIR changed"
+        );
         assert!(
             !dir.exists(),
             "the failed open left {} behind",
@@ -4499,7 +5364,6 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
-        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
         let args = Args {
             dir: dir.clone(),
             log_dir: root.path().join("logs"),
@@ -4509,6 +5373,11 @@ mod tests {
             put_timeout: None,
             dedup_cap: Some(65_537),
             dedup_retention: None,
+            control: None,
+            requests: None,
+            abort_after_commit: false,
+            pause_before_sync: Vec::new(),
+            help: false,
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {
@@ -4568,15 +5437,55 @@ mod tests {
 
     /// S1 ruling A7, guard G10: `retry <id> --payload` re-puts the object and condition of a
     /// put. A txn has no single object, so it is refused with a usage line. Unit (~1 ms).
+    /// A-R195a: the put is one sent under an app id (`put --as`); a Db-numbered one is
+    /// `retry_payload_under_a_db_numbered_id_says_to_put_as`'s.
     #[test]
     fn retry_payload_re_puts_a_put_and_refuses_a_txn() {
         let put = Kind::Put {
             object: b"a".to_vec(),
             if_version: Some(3),
         };
-        assert_eq!(payload_put(put, RequestId(4)), Ok((b"a".to_vec(), Some(3))));
+        let app = rdb_api::app_request_id(4).expect("an app id");
+        assert_eq!(payload_put(put, app), Ok((b"a".to_vec(), Some(3))));
         let refused = payload_put(Kind::Txn, RequestId(5)).expect_err("a txn has no one object");
         assert!(refused.ends_with("request 5 was a txn"), "{refused}");
+    }
+
+    /// A-R195a: `retry <id> --payload` sends the put again with `put_as`, and `put_as` refuses
+    /// an id this Db numbered itself (A-R195). So rdb_dev refuses it first, plainly, naming the
+    /// next step, instead of passing on the API's `app_request_id` advice. Unit.
+    #[test]
+    fn retry_payload_under_a_db_numbered_id_says_to_put_as() {
+        let put = Kind::Put {
+            object: b"a".to_vec(),
+            if_version: None,
+        };
+        let refused = payload_put(put, RequestId(4)).expect_err("a Db-numbered put");
+        assert!(
+            refused.contains("request 4")
+                && refused.contains("put --as <n> <object> <value>")
+                && refused.contains("nothing was sent"),
+            "{refused}"
+        );
+        // The walk's first build printed this over three lines (an escaped `\n` in the source).
+        assert!(
+            !refused.contains('\n'),
+            "one line, as the REPL prints it: {refused:?}"
+        );
+    }
+
+    /// A-R195a: `put --as <n>` sends under `app_request_id(n)`; a number that is not one, or is
+    /// 2^63 or more, is refused before anything is sent. Unit.
+    #[test]
+    fn put_as_takes_the_app_s_number_and_refuses_one_out_of_range() {
+        assert_eq!(
+            parse_app_id("7"),
+            Ok(rdb_api::app_request_id(7).expect("7"))
+        );
+        for bad in ["x", "-1", "9223372036854775808"] {
+            let refused = parse_app_id(bad).expect_err(bad);
+            assert!(refused.starts_with("put --as N:"), "{bad}: {refused}");
+        }
     }
 
     /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
@@ -4701,5 +5610,1106 @@ mod tests {
             matches!(&escaped, Change::Set(ops) if matches!(ops[..], [ElemOp::Add(Value::Map(_))])),
             "{escaped:?}"
         );
+    }
+
+    /// D5 (tester S1-8 at 066ab6e, ADR-0013, A-R154): `repl_command` logged the whole typed
+    /// line, so 27 lines of one walk carried key and value text. Every command of the grammar
+    /// is fed with keys, values, map keys and paths that all start `zq`, a pair this row's name
+    /// and module do not contain: no line of the test's log may hold `zq`. Each command still
+    /// logs one `repl_command` line with its verb, and a command that names an object logs it
+    /// as `key_hex`. Unit (~10 ms).
+    #[config_log::retcd_test]
+    fn d5_a_typed_line_logs_its_verb_and_key_hex_never_its_text() {
+        const METHOD: &str = "d5_a_typed_line_logs_its_verb_and_key_hex_never_its_text";
+        let typed = [
+            ("put zqk1 zqv1", "put", Some("zqk1")),
+            ("put --as 7 zqk18 zqv18", "put --as", Some("zqk18")),
+            ("put& zqk2 zqv2 --if-version 3", "put&", Some("zqk2")),
+            ("txn zqk3=zqv3 2:zqk4=zqv4@1", "txn", None),
+            (
+                r#"doc zqk5 --absent set /zqpath "zqv5""#,
+                "doc",
+                Some("zqk5"),
+            ),
+            (r#"map zqk6 put "zqmember" "zqv6""#, "map", Some("zqk6")),
+            (r#"members zqk7 --after "zqafter""#, "members", Some("zqk7")),
+            ("get zqk8", "get", Some("zqk8")),
+            ("read zqk9 --offset 0 --len 1", "read", Some("zqk9")),
+            (
+                "blob upload zqk10 --upload 000102030405060708090a0b0c0d0e0f --chunk-size 4 zqv10",
+                "blob upload",
+                Some("zqk10"),
+            ),
+            (
+                r#"admin damage zqk11 --element "zqelem""#,
+                "admin damage",
+                Some("zqk11"),
+            ),
+            ("retry --payload zqv12", "retry", None),
+            ("zqunknown zqk14", "unknown", None),
+            (r#"put "zqk15 spaced" zqv15"#, "put", Some("zqk15 spaced")),
+            (r#"put "zqk16unterminated zqv16"#, "put", None),
+            ("status 4", "status", None),
+            ("wait ready 60", "wait ready", None),
+            // ADR-0013: a key logs its first 32 bytes only.
+            (
+                "get zqk17-6789012345678901234567890123456789",
+                "get",
+                Some("zqk17-6789012345678901234567890123456789"),
+            ),
+        ];
+        for (line, _, _) in typed {
+            log_command(line);
+        }
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let leaked: Vec<String> = lines
+            .iter()
+            .map(ToString::to_string)
+            .filter(|text| text.contains("zq"))
+            .collect();
+        assert!(leaked.is_empty(), "key or value text logged: {leaked:#?}");
+        let logged: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "repl_command")
+            .collect();
+        assert_eq!(
+            logged.len(),
+            typed.len(),
+            "one repl_command line per command"
+        );
+        for (line, (typed, verb, key)) in logged.iter().zip(typed) {
+            assert_eq!(line["verb"], verb, "{typed}");
+            let key_hex = key.map(|key| hex::encode(&key.as_bytes()[..key.len().min(32)]));
+            assert_eq!(line["key_hex"].as_str(), key_hex.as_deref(), "{typed}");
+        }
+    }
+
+    /// Tester paper cut (S1-8 at 066ab6e): `retry` with nothing sent printed a `usage:` line
+    /// and the run exited 1, as if the line were mistyped. Each way of having nothing to send
+    /// is a plain `nothing to retry` answer, and a request id this run never sent points at
+    /// `--requests F`. A recorded request is not nothing. Unit.
+    #[test]
+    fn retry_with_nothing_sent_says_so_plainly_and_names_requests_for_an_old_request() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let mut sent = Sent::default();
+        for rest in [&[][..], &["--deadline-ms", "100"], &["--payload", "v"]] {
+            let said = sent.nothing_to_retry(rest).expect("nothing was sent");
+            assert!(said.starts_with("nothing to retry: "), "{said}");
+        }
+        sent.record(None, Kind::Txn);
+        let said = sent.nothing_to_retry(&[]).expect("the latest sent nothing");
+        assert!(said.starts_with("nothing to retry: "), "{said}");
+        for rest in [&["7"][..], &["--id", "7"], &["7", "--deadline-ms", "100"]] {
+            let said = sent
+                .nothing_to_retry(rest)
+                .expect("request 7 was never sent");
+            assert!(said.contains("--requests F, then retry 7"), "{said}");
+        }
+        let request = TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(7),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 0,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        sent.record(Some(request), Kind::Txn);
+        assert_eq!(sent.nothing_to_retry(&[]), None);
+        assert_eq!(sent.nothing_to_retry(&["--id", "7"]), None);
+        // Not a retry of a recorded request: `pick` answers these, with a usage line.
+        assert_eq!(sent.nothing_to_retry(&["x"]), None);
+    }
+
+    /// Tester S1-4 (A-R171): a same-id resend after a reopen must send the request unchanged,
+    /// and a fresh compile cannot: it reads the object's moved version, so the walk at 57da754
+    /// answered `REQUEST_ID_REUSE` to the same object and value. `--requests F` carries each
+    /// recorded request to a later run: that run adopts request 7 from F with the same digest,
+    /// the last line for an id wins, and an id F lacks is a plain `nothing to retry`. A damaged
+    /// line is the next row's. Unit (~5 ms, one temp file).
+    #[test]
+    fn a_later_run_adopts_an_earlier_runs_request_from_requests_file_unchanged() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        use rdb_core::contracts::txn::Mutation;
+        let request = |id, value: &'static [u8]| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(id),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![Mutation::Put {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(value),
+                expected_version: None,
+            }],
+        };
+        let root = {
+            let _env = ENV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            config_testkit::fs::temp_dir()
+        };
+        let path = root.path().join("requests.json");
+        let mut first = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        first.record(Some(request(6, b"six")), Kind::Txn);
+        first.record(Some(request(7, b"old")), Kind::Txn);
+        first.record(Some(request(7, b"new")), Kind::Value);
+        first.record(None, Kind::Txn);
+
+        let mut later = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        assert_eq!(later.adopt(&["7"]), Ok(Vec::new()));
+        assert_eq!(later.nothing_to_retry(&["--id", "7"]), None);
+        let (adopted, kind) = later.pick(&["7"]).expect("request 7 adopted");
+        assert_eq!(
+            adopted.request_digest(),
+            request(7, b"new").request_digest(),
+            "the last line for 7 is resent unchanged"
+        );
+        assert!(matches!(kind, Kind::Value), "{kind:?}");
+        assert_eq!(later.adopt(&["9"]), Ok(Vec::new()));
+        let said = later.nothing_to_retry(&["9"]).expect("F holds no 9");
+        assert!(said.ends_with("holds no request 9"), "{said}");
+    }
+
+    /// Tester k214 (A-R189). A damaged line in `--requests F` blocked every retry, and a failed
+    /// append to F printed `err` yet exited 0. Now a line that does not read is skipped with a
+    /// warning that names its line, never its text, and the other ids still retry; a last line
+    /// a kill cut short is said as such, once per run. A failed append makes the run exit 1. Unit
+    /// (~5 ms).
+    #[test]
+    fn a_damaged_or_torn_line_in_requests_file_is_skipped_and_a_failed_append_exits_1() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        use rdb_core::contracts::txn::Mutation;
+        let request = |id, value: &'static [u8]| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(id),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![Mutation::Put {
+                key: Bytes::from_static(b"zqkey"),
+                value: Bytes::from_static(value),
+                expected_version: None,
+            }],
+        };
+        let root = {
+            let _env = ENV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            config_testkit::fs::temp_dir()
+        };
+        let path = root.path().join("requests.json");
+        let line = |id, value| {
+            serde_json::to_string(&(request(id, value), Kind::Txn)).expect("a request line")
+        };
+        let torn = line(8, b"zqeight");
+        let text = format!(
+            "{}\n[\"zqsecret\"\n{}\n{}",
+            line(6, b"zqsix"),
+            line(7, b"zqseven"),
+            &torn[..torn.len() / 2]
+        );
+        std::fs::write(&path, text).expect("write F");
+        let mut later = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        let warnings = later
+            .adopt(&["7"])
+            .expect("a bad line does not block a retry");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains(" line 2: not a saved request"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].ends_with("; skipped"), "{warnings:?}");
+        assert!(warnings[1].contains(" line 4: cut short"), "{warnings:?}");
+        assert!(warnings.iter().all(|w| !w.contains("zq")), "{warnings:?}");
+        let (adopted, _) = later.pick(&["7"]).expect("request 7 adopted past line 2");
+        assert_eq!(
+            adopted.request_digest(),
+            request(7, b"zqseven").request_digest()
+        );
+        // Tester w360c: each retry re-read F and printed the same warnings again. Once per run.
+        assert_eq!(
+            later.adopt(&["6"]),
+            Ok(Vec::new()),
+            "6 too, warned once per run"
+        );
+        assert!(later.pick(&["6"]).is_ok());
+        assert_eq!(exit_code(false, &later), ExitCode::SUCCESS);
+
+        // F ends in a torn line: this run's next save starts a line of its own, so a later run
+        // still retries it (an append glued onto the torn tail would lose it).
+        later.record(Some(request(9, b"zqnine")), Kind::Txn);
+        let mut after = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        after.adopt(&["9"]).expect("F reads");
+        assert!(
+            after.pick(&["9"]).is_ok(),
+            "request 9 saved after a torn line"
+        );
+
+        // F is a folder: the append fails, and the run exits 1 though every line was fine.
+        let mut unwritable = Sent {
+            file: Some(root.path().to_path_buf()),
+            ..Sent::default()
+        };
+        unwritable.record(Some(request(9, b"nine")), Kind::Txn);
+        assert_eq!(exit_code(false, &unwritable), ExitCode::from(1));
+        assert_eq!(exit_code(true, &later), ExitCode::from(1));
+    }
+    /// Tester S1-9 paper cut (k151): on a reopen whose heal failed, `wait ready 30` sat out
+    /// all 30 s and printed a bare timeout, though the open could never become ready. `wait
+    /// ready` and `wait recovered` end as soon as the heal has failed, and say so with the heal's
+    /// error: node 1 recovers only from the plan a heal hands it. A heal still running is
+    /// waited on. A stopped wait is an error, so the run exits 1 (A-R191). Unit (~150 ms).
+    #[test]
+    fn a_wait_ends_at_once_with_the_heal_error_when_the_heal_failed() {
+        use rdb_api::db::{HealState, ReadyError};
+        let progress = Progress::default();
+        let started = Instant::now();
+        let recovered = wait_recovered(&progress, Duration::from_secs(2), || {
+            HealState::Failed(admin::HealError::NodeStopped)
+        })
+        .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "waited {:?}: {recovered}",
+            started.elapsed()
+        );
+        // `wait ready` asks Db::wait_ready, which ends at once on a failed heal itself.
+        let ready = wait_ready_line(
+            &progress,
+            Duration::from_secs(2),
+            WAIT_PROGRESS_EVERY,
+            |_| Err(ReadyError::Heal(admin::HealError::NodeStopped)),
+            |_| (),
+        )
+        .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
+        for (what, line) in [("recovered", recovered), ("ready", ready)] {
+            assert_eq!(
+                line,
+                format!(
+                    "stopped waiting for {what}: the reopen's heal failed: node 1 stopped \
+                     before the heal reached it; this open will not become ready"
+                )
+            );
+        }
+        let line = wait_recovered(&progress, Duration::from_millis(100), || HealState::Running)
+            .expect("a timeout is said, as before");
+        assert_eq!(line, "timeout waiting for recovered after 0s");
+    }
+
+    /// G4 follow-up (stress run at edd664e, `g4/n2.out`): the poller printed `ready` before
+    /// `wait ready`'s own `reached ready`, when it saw writes admitted before the wait returned.
+    /// While the wait runs the poller holds back a bare `ready`; after it, the wait's line is
+    /// what was printed. A wait that times out leaves `ready` to the poller. Unit.
+    #[test]
+    fn the_poller_never_says_ready_before_wait_ready_does() {
+        use rdb_api::db::ReadyError;
+        let progress = Progress::default();
+        let mut polled = Vec::new();
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(1),
+            WAIT_PROGRESS_EVERY,
+            |_| {
+                // The poller, mid-wait, sees writes admitted.
+                polled.push(step_line(&mut progress.inner.lock().unwrap(), true, None));
+                Ok(())
+            },
+            |_| (),
+        )
+        .expect("ready");
+        assert_eq!(polled, vec![None], "the poller held back its `ready`");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        let mut seen = progress.inner.lock().unwrap();
+        assert!(!seen.awaiting_ready);
+        assert_eq!(
+            step_line(&mut seen, true, None),
+            None,
+            "said once, by the wait"
+        );
+        assert_eq!(
+            step_line(&mut seen, true, Some("why".to_owned())).as_deref(),
+            Some("ready for now; why"),
+            "a reason is still the poller's to say"
+        );
+        drop(seen);
+
+        let progress = Progress::default();
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_millis(10),
+            WAIT_PROGRESS_EVERY,
+            |_| {
+                Err(ReadyError::TimedOut {
+                    within_ms: 10,
+                    phase: "Discovering".to_owned(),
+                })
+            },
+            |_| (),
+        )
+        .expect("a timeout is said");
+        assert!(line.starts_with("timeout waiting for ready"), "{line}");
+        assert_eq!(
+            step_line(&mut progress.inner.lock().unwrap(), true, None).as_deref(),
+            Some("ready"),
+            "after a timeout, ready is the poller's to say"
+        );
+    }
+
+    /// Tester D8 (aa3b82e): from a folder's second open on, the request floor `(n-1)<<40` puts
+    /// every write the app sends above `DAMAGE_REQUEST_BASE`, and the waits-on line called the
+    /// app's own put "an admin damage write" and hid its id. The label now goes by origin: only
+    /// an id `admin damage` or `damage-chunk` issued is a damage write. Unit.
+    #[test]
+    fn a_waits_on_line_names_a_second_opens_put_by_its_id_and_only_a_damage_id_as_damage() {
+        let waiting = |request: RequestId| {
+            let mut node = owner(None, false);
+            node.in_flight = Some(request);
+            node.waits_on = Some(rdb_core::contracts::ids::Seq(6));
+            node
+        };
+        let second_open = RequestId((1 << 40) + 1);
+        let line = waits_on_line(&waiting(second_open), &HELD, &[]).expect("a waits-on line");
+        assert!(
+            line.starts_with("partition 1 waits on request 1099511627777's outcome (seq 6),"),
+            "{line}"
+        );
+        let damage = damage_request();
+        let line = waits_on_line(&waiting(damage), &HELD, &[]).expect("a waits-on line");
+        assert!(
+            line.starts_with("partition 1 waits on an admin damage write's outcome (seq 6),"),
+            "{line}"
+        );
+    }
+
+    /// Tester d8b/d8c (A-R191 2): every run issued damage ids from the same `1<<32`, so a
+    /// later run's first `admin damage` reused an id the dedup index still held under the
+    /// damage client, and was refused `GENERATION_CHANGED` with the earlier run's generation.
+    /// Runs started a millisecond apart now issue from ranges that never meet. Unit.
+    #[test]
+    fn damage_ids_of_two_runs_a_millisecond_apart_never_meet() {
+        let at = 1_761_000_000_000;
+        let (first, next) = (damage_start(at), damage_start(at + 1));
+        assert!(
+            next >= first + DAMAGE_IDS_PER_MILLI,
+            "run 2 starts at {next}, inside run 1's ids from {first}"
+        );
+        assert!(first > DAMAGE_REQUEST_BASE, "{first}");
+        let issued = damage_request();
+        assert!(is_damage_request(issued), "{issued:?}");
+        assert!(!is_damage_request(RequestId(issued.0 + (1 << 20))));
+    }
+
+    /// Tester w3a03 (A-R191, k227): `wait ready` read rdb_dev's own latch, so after `node
+    /// restart 1` it said "reached ready in 0ms" and exited 0, while node 1 will not admit a
+    /// write again in this open. It now asks `Db::wait_ready`, which answers the present:
+    /// `Stopped`, with the next step, and the run exits 1. Integration (~10 s): three real
+    /// rEtcd voters, an open, and a real restart of node 1.
+    #[config_log::retcd_test]
+    fn wait_ready_after_node_1_restarts_says_the_next_step_and_exits_1() {
+        const METHOD: &str = "wait_ready_after_node_1_restarts_says_the_next_step_and_exits_1";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("run");
+        let script = root.path().join("script.txt");
+        std::fs::write(&script, "wait ready 60\nnode restart 1\nwait ready 10\n")
+            .expect("write the script");
+        let args = Args {
+            dir,
+            log_dir: root.path().join("logs"),
+            script: Some(script),
+            keep: false,
+            hold: Vec::new(),
+            put_timeout: None,
+            dedup_cap: None,
+            dedup_retention: None,
+            control: None,
+            requests: None,
+            abort_after_commit: false,
+            pause_before_sync: Vec::new(),
+            help: false,
+        };
+        let code = run(&args, Db::open);
+        let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "repl_wait")
+            .collect();
+        assert_eq!(waits.len(), 2, "{waits:#?}");
+        assert_eq!(waits[0]["outcome"], "reached", "{waits:#?}");
+        assert_eq!(waits[1]["outcome"], "stopped", "{waits:#?}");
+        let said = waits[1]["error"].as_str().unwrap_or_default();
+        assert!(
+            said.contains("node 1, restarted") && said.ends_with("open the folder again"),
+            "{said}"
+        );
+        assert_eq!(code, ExitCode::from(1), "a stopped wait exits 1");
+    }
+
+    /// k325 P1: `--help` and `-h` ask for the usage, which is this file's `//!` header without
+    /// its comment markers or code fences. Before, both were an unknown argument (exit 2) and the
+    /// help lived only in the source. `main` prints it to stdout and exits 0. Unit.
+    #[test]
+    fn help_asks_for_the_header_s_usage() {
+        let args = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        for flag in ["--help", "-h"] {
+            assert!(args(&[flag]).expect(flag).help, "{flag}");
+            assert!(
+                args(&["--keep", flag, "--not-a-flag"]).expect(flag).help,
+                "{flag}: what follows it is not read"
+            );
+        }
+        assert!(!args(&[]).expect("defaults").help, "off unless asked");
+        let text = usage();
+        assert!(
+            text.starts_with("`rdb_dev`: three rDB nodes and three rEtcd voters"),
+            "{text}"
+        );
+        for says in [
+            "[--abort-after-commit] [--pause-before-sync N=MS]",
+            "put <object> <value> [--if-version N]",
+            "The JSONL log goes to `<log-dir>/rdb_dev.jsonl`",
+        ] {
+            assert!(text.contains(says), "{says}");
+        }
+        assert!(!text.contains("//!") && !text.contains("```"), "{text}");
+    }
+
+    /// A-R198: `--pause-before-sync N=MS` parses, refuses bad input naming the flag, and arms
+    /// the host hook, so node N's barrier sync sleeps. The flag proves itself here: a run with
+    /// it says it is armed, and node 1's sync then logs the sleep. Why a slow sync must not fail
+    /// the barrier is `m10_a_reopen_whose_owner_syncs_slowly_still_completes_its_barrier`'s
+    /// proof, not this row's. Integration (~3 s): three real rEtcd voters and one open.
+    #[config_log::retcd_test]
+    fn pause_before_sync_parses_and_arms_the_node_s_barrier_sync() {
+        const METHOD: &str = "pause_before_sync_parses_and_arms_the_node_s_barrier_sync";
+        let args = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        let two = args(&["--pause-before-sync", "1=50", "--pause-before-sync", "3=7"])
+            .expect("two good pauses");
+        assert_eq!(
+            two.pause_before_sync,
+            [
+                (NodeId(1), Duration::from_millis(50)),
+                (NodeId(3), Duration::from_millis(7))
+            ]
+        );
+        assert!(
+            args(&[]).expect("defaults").pause_before_sync.is_empty(),
+            "off unless given"
+        );
+        for (bad, says) in [
+            ("4=10", "a node is 1, 2 or 3"),
+            ("1=x", "is not a number of ms"),
+            ("1=", "is not a number of ms"),
+            ("1", "takes <node>=<ms>"),
+        ] {
+            let refused = args(&["--pause-before-sync", bad]).expect_err(bad);
+            assert!(
+                refused.starts_with("--pause-before-sync") && refused.contains(says),
+                "{bad}: {refused}"
+            );
+        }
+        let refused = args(&["--pause-before-sync"]).expect_err("no value");
+        assert_eq!(refused, "--pause-before-sync needs a value");
+
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // RETCD_TEST_DATA_DIR is left as it is: each row that points it into its own `--dir`
+        // nests the next row's folders one level deeper, and a sixth level passed Windows'
+        // MAX_PATH inside RocksDB.
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("run");
+        let script = root.path().join("script.txt");
+        std::fs::write(&script, "wait ready 60\n").expect("write the script");
+        let run_args = Args {
+            dir,
+            log_dir: root.path().join("logs"),
+            script: Some(script),
+            ..args(&["--pause-before-sync", "1=50"]).expect("one pause")
+        };
+        assert_eq!(run(&run_args, Db::open), ExitCode::SUCCESS, "the run");
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let armed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "pause_before_sync_armed")
+            .collect();
+        assert_eq!(armed.len(), 1, "{armed:#?}");
+        assert_eq!(
+            (&armed[0]["@l"], &armed[0]["node"], &armed[0]["ms"]),
+            (&"Warning".into(), &1.into(), &50.into()),
+            "{armed:#?}"
+        );
+        // The node threads carry no test span here, so their lines go to the run's untagged
+        // file. Only this row arms a pause in this binary, and the ENV lock keeps the other
+        // opens out while it runs.
+        config_log::layer::flush_test_logs();
+        let untagged = config_log::testing::test_log_dir()
+            .join(format!("_untagged-{}.jsonl", std::process::id()));
+        let text = std::fs::read_to_string(&untagged)
+            .unwrap_or_else(|e| panic!("read {}: {e}", untagged.display()));
+        let paused: Vec<_> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["@m"] == "test_sync_paused")
+            .map(|line| (line["node"].clone(), line["millis"].clone()))
+            .collect();
+        assert_eq!(paused, [(1.into(), 50.into())], "node 1's sync slept once");
+    }
+
+    /// Tester (lead, 2026-10-23): `wait ready` printed nothing for ~40 s while rEtcd had no
+    /// quorum; only the final timeout named the state. It now says node 1's phase after each
+    /// `every` it waits, and its timeout names the whole bound, not the last slice. Unit.
+    #[test]
+    fn wait_ready_says_the_phase_every_slice_while_it_waits() {
+        use rdb_api::db::ReadyError;
+        let timed_out = |slice: Duration| ReadyError::TimedOut {
+            within_ms: slice.as_millis(),
+            phase: "ProposalUnresolved".to_owned(),
+        };
+        let progress = Progress::default();
+        let (mut asked, mut said) = (Vec::new(), Vec::new());
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(25),
+            Duration::from_secs(10),
+            |slice| {
+                asked.push(slice.as_secs());
+                Err(timed_out(slice))
+            },
+            |line| said.push(line.to_owned()),
+        )
+        .expect("a timeout is said, not an error");
+        assert_eq!(asked, [10, 10, 5], "slices of at most `every`, 25 s in all");
+        assert_eq!(
+            said,
+            ["still waiting for ready: recovery phase ProposalUnresolved"; 2]
+        );
+        assert_eq!(
+            line,
+            "timeout waiting for ready after 25s: node 1 did not admit writes within 25000 ms; \
+             recovery phase ProposalUnresolved"
+        );
+
+        // Ready in the second slice: one line said, then the reached line.
+        let (mut slices, mut said) = (0, Vec::new());
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(25),
+            Duration::from_secs(10),
+            |slice| {
+                slices += 1;
+                if slices == 1 {
+                    Err(timed_out(slice))
+                } else {
+                    Ok(())
+                }
+            },
+            |line| said.push(line.to_owned()),
+        )
+        .expect("ready");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        assert_eq!(said.len(), 1, "{said:?}");
+    }
+
+    /// Lead, on 5eeca8a: only `TimedOut` asks for another slice. An answer no wait changes
+    /// (a failed heal, node 1 restarted, `Blocked`, `Quarantined`) ends the wait on the slice
+    /// that gave it, with nothing said in between, and the run exits 1. Unit.
+    #[test]
+    fn wait_ready_ends_on_the_first_final_answer_without_another_slice() {
+        use rdb_api::db::ReadyError;
+        let finals = [
+            ReadyError::Heal(admin::HealError::NodeStopped),
+            ReadyError::Stopped {
+                note: "node 1 restarted".to_owned(),
+            },
+            ReadyError::Blocked {
+                reason: "BarrierIncomplete".to_owned(),
+            },
+            ReadyError::Quarantined,
+            ReadyError::Faulted {
+                fault: "after-commit hook".to_owned(),
+            },
+        ];
+        let progress = Progress::default();
+        for answer in finals {
+            let (mut slices, mut said) = (0, Vec::<String>::new());
+            let line = wait_ready_line(
+                &progress,
+                Duration::from_secs(60),
+                Duration::from_secs(10),
+                |_| {
+                    slices += 1;
+                    Err(answer.clone())
+                },
+                |line| said.push(line.to_owned()),
+            )
+            .expect_err("a final answer exits 1");
+            assert_eq!((slices, said.len()), (1, 0), "{answer:?}: {line}");
+            assert!(line.contains(&answer.to_string()), "{answer:?}: {line}");
+        }
+    }
+
+    /// Tester, embed.md walk at 6ed41b8: `get m1` on a map answered only `a Map does not take
+    /// this op`. It now names the verb that reads that kind; any other error is left as it is.
+    /// Unit.
+    #[test]
+    fn get_on_another_kind_names_the_verb_that_reads_it() {
+        use rdb_core::contracts::errors::ErrorKind;
+        let refused = |detail: &str| ApiError::new(ErrorKind::InvalidArgument, detail);
+        for (kind, verb) in [
+            ("Map", "members"),
+            ("Set", "members"),
+            ("List", "items"),
+            ("Blob", "read"),
+        ] {
+            let said = get_hint(refused(&format!("a {kind} does not take this op"))).detail;
+            assert_eq!(
+                said,
+                format!(
+                    "a {kind} does not take this op; `get` reads a document, read this one with \
+                     `{verb} <object>`"
+                )
+            );
+        }
+        let other = refused("object id 2000 bytes, over the 1024-byte limit");
+        assert_eq!(get_hint(other.clone()), other, "left as it is");
+    }
+
+    /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
+    /// second bare `ready` line inside the next command's output. One transition is said once:
+    /// a wait that reached ready records it as printed, so the poller says nothing more until
+    /// the state changes again. Unit.
+    #[test]
+    fn a_reached_wait_ready_is_not_said_again_by_the_poller() {
+        let progress = Progress::default();
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(1),
+            WAIT_PROGRESS_EVERY,
+            |_| Ok(()),
+            |_| (),
+        )
+        .expect("ready is not an error");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        let mut seen = progress.seen();
+        assert_eq!(step_line(&mut seen, true, None), None, "said once");
+        assert_eq!(
+            step_line(&mut seen, false, None).as_deref(),
+            Some("not ready: writes not admitted"),
+            "a later change is still said"
+        );
+    }
+
+    /// The child of [`abort_after_commit_aborts_and_the_next_open_rolls_forward`]: one rdb_dev
+    /// run with `--abort-after-commit`, against the parent's voters. Passes at once unless the
+    /// parent started it.
+    #[test]
+    fn zz_abort_after_commit_child() {
+        let (Ok(dir), Ok(control)) = (
+            std::env::var(ABORT_CHILD_DIR),
+            std::env::var(ABORT_CHILD_CONTROL),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let script = dir.with_extension("child-script.txt");
+        std::fs::write(&script, "wait ready 60\n").expect("write the child's script");
+        let args = Args {
+            log_dir: dir.with_extension("child-logs"),
+            script: Some(script),
+            control: Some(control.split(',').map(str::to_owned).collect()),
+            abort_after_commit: true,
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let args = Args { dir, ..args };
+        run(&args, Db::open);
+    }
+
+    const ABORT_CHILD_DIR: &str = "RDB_DEV_ABORT_CHILD_DIR";
+    const ABORT_CHILD_CONTROL: &str = "RDB_DEV_ABORT_CHILD_CONTROL";
+
+    /// A-R184: `--abort-after-commit` is how the tester reaches a commit that no copy links.
+    /// Run 1 writes and quits; run 2 reopens with the flag and dies by abort once its recovery
+    /// commits; open 3 rolls that commit forward, becomes ready, and reads run 1's write back.
+    /// Integration (~10 s): three real rEtcd voters this test hosts, so all three opens meet
+    /// the same control store, and a child process for the run that aborts.
+    #[test]
+    fn abort_after_commit_aborts_and_the_next_open_rolls_forward() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let cluster = rt.block_on(
+            Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS)
+                .start(),
+        );
+        rt.block_on(cluster.leader());
+        let control = cluster.client_endpoints();
+        let dir = root.path().join("run");
+
+        let script = root.path().join("run1.txt");
+        std::fs::write(&script, "wait ready 60\nput zqk zqv1\n").expect("write run 1's script");
+        let run1 = Args {
+            log_dir: root.path().join("run1-logs"),
+            script: Some(script),
+            control: Some(control.clone()),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let run1 = Args {
+            dir: dir.clone(),
+            ..run1
+        };
+        assert_eq!(run(&run1, Db::open), ExitCode::SUCCESS, "run 1 writes");
+
+        let child = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args([
+                "tests::zz_abort_after_commit_child",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(ABORT_CHILD_DIR, &dir)
+            .env(ABORT_CHILD_CONTROL, control.join(","))
+            .output()
+            .expect("spawn run 2");
+        assert!(
+            !child.status.success()
+                && !String::from_utf8_lossy(&child.stdout).contains("test result"),
+            "run 2 must die by abort, not end or panic; got {:?}: {}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout)
+        );
+
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                control,
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            dir,
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+        };
+        let mut db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("open 3 rolls the commit forward");
+        db.wait_ready(Duration::from_secs(60))
+            .expect("open 3 becomes ready");
+        let got = db.get(b"zqk").expect("read back");
+        assert_eq!(
+            got.value.map(|(_, bytes)| bytes.to_vec()),
+            Some(b"zqv1".to_vec()),
+            "run 1's write"
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// Three real rEtcd voters, and one `Db` on them at `<dir>/run`, ready. The caller holds the
+    /// `ENV` lock and shuts down the Db, then the cluster, on the runtime returned.
+    fn ready_on_voters(dir: &std::path::Path) -> (tokio::runtime::Runtime, Cluster, Db) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let cluster = rt.block_on(
+            Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS)
+                .start(),
+        );
+        rt.block_on(cluster.leader());
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                cluster.client_endpoints(),
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            dir: dir.join("run"),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+        };
+        let db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("opens");
+        db.wait_ready(Duration::from_secs(60)).expect("ready");
+        (rt, cluster, db)
+    }
+
+    /// Review F-004 (A-R219): `control lifecycle` rewrote `partitions/1` with
+    /// `PartitionRecord::encode`, layout 2, so a fencing then serving round trip dropped the
+    /// `PartitionRoot` the open wrote. The rewrite keeps the root: after the round trip it reads
+    /// back unchanged, and the next open on the same folder becomes ready. Integration (~5 s):
+    /// three real rEtcd voters and two opens.
+    #[test]
+    fn a_lifecycle_round_trip_keeps_the_partition_root_and_the_next_open_succeeds() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
+        db.shutdown();
+        let key = ControlKey::Partition(PartitionId(1)).encode();
+        let partition_root = || {
+            let leader = cluster.leader_now().expect("a control leader");
+            let read = rt
+                .block_on(cluster.client(leader).get(GetRequest {
+                    key: Bytes::from(key.clone()),
+                }))
+                .expect("partitions/1 reads");
+            PartitionRoot::decode(&read.record.expect("partitions/1 is present").value)
+        };
+        let before = partition_root();
+        assert!(before.is_some(), "the open wrote a root");
+        for (lifecycle, says) in [
+            (PartitionLifecycle::Fencing, "Fencing"),
+            (PartitionLifecycle::Serving, "Serving"),
+        ] {
+            let line = set_lifecycle(&rt, &cluster, PartitionId(1), lifecycle);
+            assert!(line.ends_with(says), "{line}");
+        }
+        assert_eq!(partition_root(), before, "the round trip keeps the root");
+
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                cluster.client_endpoints(),
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            dir: root.path().join("run"),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+        };
+        let mut db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("the next open succeeds");
+        db.wait_ready(Duration::from_secs(60))
+            .expect("the next open becomes ready");
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// A-R211: `admin damage <set> --element K` with `--as newer` or `--as kind0` is refused
+    /// before anything is written. A set member has no envelope, so the sealed record the flag
+    /// names would only be bytes in it, which reads as damage (CORRUPT_HISTORY), never as a newer
+    /// build's record: the echo `as=newer` over member-bytes damage misled the tester. The REPL
+    /// prints the refusal as `usage: ...` and the run exits 1, as for any refused line. `--as
+    /// digest` still damages the member. The help says both. Integration (~3 s): three real
+    /// rEtcd voters and one open.
+    #[test]
+    fn damage_a_set_member_as_newer_or_kind0_is_refused_and_writes_nothing() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let help = usage();
+        for says in [
+            "or any one entry being damaged is enough",
+            "on a set --element takes",
+            "`digest` only; `kind0` and `newer` are refused, and",
+        ] {
+            assert!(help.contains(says), "help lacks {says:?}");
+        }
+        assert!(
+            !help.contains("clear is for a"),
+            "the stricter wording is gone"
+        );
+
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
+        let x = || Value::Text("x".to_owned());
+        db.write(
+            b"s",
+            Change::Set(vec![
+                ElemOp::Add(x()),
+                ElemOp::Add(Value::Text("y".to_owned())),
+            ]),
+            Some(Expected::Absent),
+        )
+        .expect("the set is written");
+        let members = || Look::Members {
+            after: None,
+            limit: 10,
+        };
+        let version = |db: &Db| match db.read(b"s", members()) {
+            Ok(ReadOk {
+                seen: rdb_api::Seen::Members(page),
+                ..
+            }) => (page.collection.version, page.members.len()),
+            other => panic!("the set reads: {other:?}"),
+        };
+        let before = version(&db);
+        for how in ["newer", "kind0"] {
+            let refused =
+                damage_record(&db, &format!(r#"admin damage s --element "x" --as {how}"#))
+                    .expect_err(how);
+            assert_eq!(
+                refused,
+                format!(
+                    "admin damage: a set member holds no envelope, so any bytes in it are \
+                     damage; damage a set member with --as digest, or a newer build's set with \
+                     the root and --as newer; not a member with --as {how}"
+                )
+            );
+            assert_eq!(version(&db), before, "{how}: nothing was written");
+        }
+        damage_record(&db, r#"admin damage s --element "x""#).expect("digest is the default");
+        let damaged = db.read(b"s", members()).expect_err("x holds bytes");
+        assert!(
+            damaged.detail.contains("set member record holds"),
+            "{damaged:?}"
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// k325 P2 (k326): a put and an `admin clear` refused for a newer build's record say the
+    /// next step, `open the folder with the newer build`, as embed.md does. Before, the put said
+    /// only what it met and the clear only `not cleared`. Kind, retry and `no_mutation` are
+    /// unchanged (A-R200). Integration (~3 s): three real rEtcd voters and one open.
+    #[test]
+    fn a_newer_build_s_refusal_names_the_next_step() {
+        use rdb_core::contracts::errors::ErrorKind;
+        const STEP: &str = "; open the folder with the newer build";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
+        db.put(b"x", b"1", None).expect("x is written");
+        damage_record(&db, "admin damage x --as newer").expect("the line parses");
+
+        let put = db
+            .put(b"x", b"2", None)
+            .expect_err("a newer build's record");
+        let clear = db
+            .write(b"x", Change::Clear, None)
+            .expect_err("a newer build's record");
+        for (what, error, ends) in [
+            ("put", &put.error, STEP.to_owned()),
+            ("clear", &clear.error, format!("{STEP}; not cleared")),
+        ] {
+            assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::IncompatibleVersion, RetryRule::Quarantine, true),
+                "{what}: {error:?}"
+            );
+            assert!(
+                error.detail.contains("written by a newer build: ")
+                    && error.detail.ends_with(&ends),
+                "{what}: {error:?}"
+            );
+        }
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// Lead, on the 8e083a9 walk: `admin damage m --element K` (`--as digest`, the default)
+    /// wrote the entry at a version above its root's, so a read answered `element version 3 is
+    /// above its root's version 2`, not the digest fault the mode names, and a `map put` over
+    /// the entry was refused. The tool now writes the root's own bytes in the same write, so
+    /// both carry its version: a read meets the digest fault, and a put over the entry repairs
+    /// it (ADR-rdb-0013 §10). Integration (~3 s): three real rEtcd voters and one open.
+    #[test]
+    fn damage_element_as_digest_reads_as_a_digest_fault_and_a_put_repairs_it() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
+        let int = |n: u64| Value::Integer(Int::from(n));
+        let text = |t: &str| Value::Text(t.to_owned());
+        let entries = (1..=3).map(|n| ElemOp::Put(int(n), text(&n.to_string())));
+        db.write(b"m", Change::Map(entries.collect()), None)
+            .expect("the map is written");
+
+        damage_record(&db, "admin damage m --element 2").expect("the line parses");
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        let fault = db
+            .read(b"m", members.clone())
+            .expect_err("entry 2 is damaged");
+        assert!(
+            fault.detail.contains("do not hash to the stored digest")
+                && !fault.detail.contains("above its root"),
+            "a digest fault: {fault:?}"
+        );
+
+        db.write(
+            b"m",
+            Change::Map(vec![ElemOp::Put(int(2), text("again"))]),
+            None,
+        )
+        .expect("a put over a bad digest repairs the entry");
+        let Ok(ReadOk {
+            seen: rdb_api::Seen::Members(page),
+            ..
+        }) = db.read(b"m", members)
+        else {
+            panic!("the map reads again after the repair");
+        };
+        let read: Vec<_> = page
+            .members
+            .into_iter()
+            .map(|member| (member.key, member.value))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (int(1), Some(text("1"))),
+                (int(2), Some(text("again"))),
+                (int(3), Some(text("3")))
+            ]
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
     }
 }

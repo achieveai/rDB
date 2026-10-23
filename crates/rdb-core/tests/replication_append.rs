@@ -2229,6 +2229,112 @@ fn m7b_123_historical_envelopes_reach_copy_caught_up_and_root_anchor_quarantines
     assert_eq!(rx(&module), &before, "a refused append changes nothing");
 }
 
+/// D3 (lead ruling A-R169): generation 4 wrote nothing, so after `Recovered` into generation 5
+/// at `(10, d10)` the head B holds was sealed under `GEN`, two generations back, and is not
+/// historical (K-B-37 admits the predecessor only). The keepalive that sends it draws
+/// `AlreadyHave` and an ACK and stores nothing; without that ACK L1 never resumes. Twins, each
+/// still `StaleGeneration` and unchanged: another record at 10 (forged digest), one whose bytes
+/// do not hash to the d10 it claims, 11 (above the applied head and the floor), and a receiver
+/// whose floor is below the record it holds (never rebuilt by `Recovered`). From a member that
+/// is not the pinned primary it is `NotAMember`.
+#[retcd_test]
+fn a_head_sealed_two_generations_back_draws_an_ack_and_stores_nothing() {
+    let gen5 = Generation(GEN.0 + 2);
+    let recovered_at_10 = || {
+        let mut module = module();
+        step(
+            &mut module,
+            &event(EventKind::Kernel(KernelEvent::Recovered(Box::new(
+                recovery_at(10, gen5),
+            )))),
+        );
+        assert_eq!(rx(&module).applied_head(), head(10));
+        module
+    };
+    let on_gen5 = |module: &mut Replication, from: NodeId, env: &ReplicationEnvelope| {
+        step(
+            module,
+            &framed_on(B, from, authority(gen5, NEW_EPOCH), NEW_CONFIG, env),
+        )
+    };
+    let held = chain(10).pop().expect("10");
+    assert_eq!(held.header.generation, GEN, "sealed two generations back");
+
+    let mut module = recovered_at_10();
+    let before = rx(&module).clone();
+    let effects = on_gen5(&mut module, C, &held);
+    assert_eq!(
+        effects.len(),
+        2,
+        "a reply and an ACK, no store: {effects:?}"
+    );
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+        AppendOutcome::AlreadyHave
+    );
+    match reply_at(&effects[1], C, FRAME_ID, NEW_CONFIG) {
+        AppendOutcome::Accepted(ack) => {
+            assert_eq!(ack.generation, gen5);
+            assert_eq!(ack.progress.buffered_applied, AppliedSeq(10));
+            assert_eq!(ack.digest_at_buffered, d(10));
+        }
+        other => panic!("an ACK, got {other:?}"),
+    }
+    assert_eq!(rx(&module), &before, "a repeat stores nothing");
+
+    let stale = rejected(AppendReject::StaleGeneration { current: gen5 });
+    let forged = envelope(10, d(9), b"other");
+    // Claims d10 but its bytes hash to something else.
+    let mut unsealed = held.clone();
+    unsealed.mutations[0].value = Some(Bytes::from_static(b"other"));
+    assert_eq!(unsealed.record_digest, d(10));
+    let above = chain(11).pop().expect("11");
+    for (name, env) in [
+        ("forged digest", &forged),
+        ("claimed digest", &unsealed),
+        ("above the head", &above),
+    ] {
+        let mut module = recovered_at_10();
+        let before = rx(&module).clone();
+        let effects = on_gen5(&mut module, C, env);
+        assert_eq!(effects.len(), 1, "{name}: {effects:?}");
+        assert_eq!(
+            reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+            stale,
+            "{name}"
+        );
+        assert_eq!(rx(&module), &before, "{name}: a refusal changes nothing");
+    }
+
+    let effects = on_gen5(&mut recovered_at_10(), A, &held);
+    assert_eq!(
+        reply_at(&effects[0], A, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::NotAMember)
+    );
+
+    // Floor 0: B was never rebuilt by `Recovered`, so 10 is above its floor and generation 5
+    // owns it. The same record is not a repeat there.
+    let mut module = Replication::new();
+    module.install_receiver(
+        AppendReceiver::new(ReceiverInit {
+            config: config(),
+            own: CopyId(1),
+            lineage: authority(gen5, EPOCH),
+            head: head(10),
+            durable: DurableSeq(10),
+        })
+        .expect("B at (10, d10) in generation 5"),
+    );
+    let before = rx(&module).clone();
+    let effects = step(
+        &mut module,
+        &framed_on(B, A, authority(gen5, EPOCH), CONFIG, &held),
+    );
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(reply_of(&effects[0]), stale);
+    assert_eq!(rx(&module), &before);
+}
+
 /// `recovered(cutoff, d(cutoff), takeover_config())`'s result, recovering into `generation`
 /// from the one before it.
 fn recovery_at(cutoff: u64, generation: Generation) -> RecoveryResult {
@@ -5395,4 +5501,148 @@ fn m9_d3_06_receiver_a_retired_copy_still_truncates_on_a_re_emit_of_its_generati
         (rx_.applied_head(), rx_.retired(), rx_.history().highest()),
         (head(10), false, Some(Seq(10)))
     );
+}
+
+// --- dormant receivers (A-R173) -------------------------------------------------------------
+
+/// B's receiver at `(10, d10)` restored dormant from its stored lineage, as the host restores a
+/// copy for an F1 catch-up before the commit (A-R173).
+fn dormant_module() -> Replication {
+    let mut module = Replication::new();
+    let receiver = AppendReceiver::dormant(
+        ReceiverInit {
+            config: config_for(P),
+            own: CopyId(1),
+            lineage: Lineage {
+                partition: P,
+                generation: GEN,
+                owner_epoch: EPOCH,
+            },
+            head: head(10),
+            durable: DurableSeq(10),
+        },
+        REVISION,
+    )
+    .expect("dormant receiver");
+    assert!(receiver.is_dormant());
+    module.install_receiver(receiver);
+    module
+}
+
+/// A-R173 F1 (critic-d7): the stale owner's plain Append passes every frame check a dormant
+/// receiver's stored lineage gives it, so the receiver refuses it by its own check. Refused
+/// with no reply and nothing staged; the same frame stages on a serving receiver, and the
+/// same record carried as a fenced recovery append stages on the dormant one.
+#[retcd_test]
+fn m10_d7_a_stale_owners_plain_append_is_refused_by_a_dormant_receiver() {
+    let mut module = dormant_module();
+    let effects = send(&mut module, label(A), &golden());
+    assert_eq!(
+        effects,
+        vec![EffectKind::Kernel(KernelEffect::Ignored {
+            reason: KernelIgnoredReason::AppendRejected(AppendReject::NotAMember),
+        })],
+        "refused with no Send: a NeedLineage reply would stop the new primary's cursor"
+    );
+    let rx_ = rx(&module);
+    assert_eq!(
+        (rx_.staged(), rx_.accept_head(), rx_.received_seq()),
+        (None, head(10), ReceivedSeq(10)),
+        "nothing moved"
+    );
+    assert!(rx_.is_dormant());
+
+    assert_eq!(
+        staged_batch(&send(&mut self::module(), label(A), &golden())),
+        (BatchId(0), GEN, Seq(11)),
+        "the same frame stages on a serving receiver"
+    );
+
+    let body = recovery_body(&fence(2, EPOCH, REVISION), &golden());
+    let effects = send_bytes(&mut module, label(C), body);
+    assert_eq!(
+        staged_batch(&effects),
+        (BatchId(0), GEN, Seq(11)),
+        "the catch-up's fenced recovery append still stages"
+    );
+}
+
+/// A-R173 F3 (critic-d7): `Recovered` drops a dormant receiver, so the pin builds the side it
+/// gives through today's path: a receiver at what the barrier proved (here nothing), which
+/// answers the new primary's first record with the `NeedPrefix` that starts its catch-up.
+#[retcd_test]
+fn m10_d7_a_recovered_drops_a_dormant_receiver() {
+    let mut module = dormant_module();
+    step(&mut module, &recovered(10, d(10), takeover_config()));
+    let rx_ = rx(&module);
+    assert!(!rx_.is_dormant(), "Recovered left the receiver dormant");
+    assert_eq!(
+        rx_.lineage(),
+        Lineage {
+            partition: P,
+            generation: NEW_GEN,
+            owner_epoch: NEW_EPOCH,
+        }
+    );
+    let effects = send(&mut module, label(C), &taken_over(golden()));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        }),
+        "the built receiver answers the new primary, which then catches it up"
+    );
+}
+
+/// A-R173 F2 (critic-d7): a dormant receiver takes the ladder a catch-up needs only whole —
+/// every rung `0..=head` — and only when it agrees with the rungs held. A refused ladder
+/// writes nothing, and a serving receiver takes none.
+#[retcd_test]
+fn m10_d7_a_restore_history_takes_only_a_dense_agreeing_ladder() {
+    let dense: Vec<(Seq, Digest)> = std::iter::once((Seq::ZERO, Digest::ROOT))
+        .chain((1..=10).map(|seq| (Seq(seq), d(seq))))
+        .collect();
+    let invalid = Err(RdbError::InvalidArgument { field: "rungs" });
+    let mut module = dormant_module();
+    let rx_ = module.receiver(B, P).expect("receiver").clone();
+
+    let mut gap = rx_.clone();
+    let holed: Vec<_> = dense
+        .iter()
+        .copied()
+        .filter(|(seq, _)| *seq != Seq(5))
+        .collect();
+    assert_eq!(gap.restore_history(&holed), invalid, "a gap at 5");
+    assert_eq!(
+        gap.history().digest_at(Seq(4)),
+        None,
+        "a refused ladder writes nothing"
+    );
+
+    let mut short = rx_.clone();
+    assert_eq!(
+        short.restore_history(&dense[..10]),
+        invalid,
+        "stops below the head"
+    );
+
+    let mut wrong = rx_.clone();
+    let mut differs = dense.clone();
+    differs[10].1 = d(9);
+    assert_eq!(
+        wrong.restore_history(&differs),
+        invalid,
+        "disagrees at the head"
+    );
+
+    let mut serving = receiver(P, 10);
+    assert_eq!(
+        serving.restore_history(&dense),
+        Err(RdbError::InvalidArgument { field: "dormant" })
+    );
+
+    assert_eq!(module.restore_history(B, P, &dense), Ok(()));
+    assert_eq!(rx(&module).history().digest_at(Seq(5)), Some(d(5)));
 }

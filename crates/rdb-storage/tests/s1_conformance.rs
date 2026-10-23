@@ -43,7 +43,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, Namespace, SnapshotRead};
 use rdb_sim::storage::history::canonical_history_from;
 use rdb_sim::storage::memory::MemoryEngine;
-use rdb_storage::{verify_lineage, Inherited, RocksEngine};
+use rdb_storage::{verify_lineage, Inherited, RocksEngine, MAX_CHAIN_DEPTH};
 use rdb_value::delta::{materialize, Delta, Op};
 use rdb_value::keys::{root_key, RootKey};
 use rdb_value::path::Path;
@@ -282,7 +282,13 @@ struct Run {
 
 impl Run {
     fn new(seed: u64) -> Self {
-        let db = data_dir(&format!("seed{seed}")).join("db");
+        Self::in_dir(seed, &format!("seed{seed}"))
+    }
+
+    /// A run whose store sits in its own named directory, so two tests in this binary never
+    /// share one.
+    fn in_dir(seed: u64, name: &str) -> Self {
+        let db = data_dir(name).join("db");
         let rocks = RocksEngine::open(&db).expect("open");
         let partitions = PARTITIONS
             .iter()
@@ -376,6 +382,7 @@ impl Run {
         let to = Generation(from.0 + 1);
         let applied = self.applied(index);
         let parent_base = self.rocks().link(id, from).map(|link| link.base.0);
+        let parent_depth = self.rocks().chain_depth(id, from);
         let inherited = self
             .rocks_mut()
             .inherit(id, from, to, Seq(base))
@@ -391,12 +398,23 @@ impl Run {
         let mode = match inherited {
             Inherited::Linked => {
                 assert_eq!(base, applied, "{}: linked below applied", self.context());
+                assert!(
+                    parent_depth < MAX_CHAIN_DEPTH,
+                    "{}: linked past the ceiling",
+                    self.context()
+                );
                 "inherit_linked"
             }
-            Inherited::Copied { .. } => {
-                assert!(base < applied, "{}: copied at applied", self.context());
-                "inherit_copied"
+            // M10 ruling A-R166: at the ceiling a reopen copies at `base == applied` (flattens).
+            Inherited::Copied { .. } if base == applied => {
+                assert!(
+                    parent_depth >= MAX_CHAIN_DEPTH,
+                    "{}: copied at applied below the ceiling",
+                    self.context()
+                );
+                "inherit_flattened"
             }
+            Inherited::Copied { .. } => "inherit_copied",
             Inherited::AlreadyInherited => panic!("{}: a fresh child was a no-op", self.context()),
         };
         self.counts.op(mode);
@@ -406,6 +424,13 @@ impl Run {
         if parent_base.is_some_and(|parent_base| base < parent_base) {
             self.counts.op("inherit_base_below_parent_base");
         }
+        assert!(
+            self.rocks().chain_depth(id, to) <= MAX_CHAIN_DEPTH,
+            "{}: g{} reads {} levels",
+            self.context(),
+            to.0,
+            self.rocks().chain_depth(id, to)
+        );
         let partition = &mut self.partitions[index];
         partition.active = to;
         partition.generations.push(to);
@@ -492,16 +517,29 @@ impl Run {
             .snapshot(id, active, SnapshotHandle(1))
             .expect("rocks snapshot");
         let memory_view = memory.snapshot(id, active, SnapshotHandle(1));
-        assert_eq!(rocks_view.len(), memory_view.len(), "{at}: snapshot len");
+        // M10 decision 2: the RocksDB view leaves `History` out; the oracle's view keeps it.
+        // `History` is compared through `get` and `history_at` below, never through the view.
+        let oracle_history = memory_view.scan(Namespace::History, &[], usize::MAX).len();
+        assert_eq!(
+            rocks_view.len(),
+            memory_view.len() - oracle_history,
+            "{at}: snapshot len, History aside"
+        );
+        assert!(
+            rocks_view
+                .scan(Namespace::History, &[], usize::MAX)
+                .is_empty(),
+            "{at}: the view holds no History"
+        );
         assert_eq!(rocks_view.at(), memory_view.at(), "{at}: snapshot at");
-        for (ns, key, value, version, _) in rocks_view.entries() {
+        for (ns, key, value, version, _) in rocks_view.entries().expect("rocks entries") {
             assert_eq!(
-                memory_view.get(ns, key).as_ref(),
+                memory_view.get(ns, &key),
                 Some(value),
                 "{at}: {ns:?} {key:?}"
             );
             assert_eq!(
-                memory_view.version(ns, key),
+                memory_view.version(ns, &key),
                 Some(version),
                 "{at}: {ns:?} {key:?} version"
             );
@@ -516,6 +554,9 @@ impl Run {
         );
         let mut namespaces = Vec::new();
         for (ns, key) in &partition.written {
+            if *ns == Namespace::History {
+                continue;
+            }
             assert_eq!(
                 rocks_view.get(*ns, key),
                 memory_view.get(*ns, key),
@@ -545,8 +586,26 @@ impl Run {
                 memory_view.scan(ns, from, 2),
                 "{at}: scan {ns:?} from {from:?} limit 2"
             );
-            scans += 2;
+            // Paged as `items()` and blob reads page: each page starts just past the last key
+            // of the one before. The lazy view merges levels per page (M10 decision 2), so a
+            // page boundary that splits a shadowed key or a tombstone must not change the walk.
+            let mut paged = Vec::new();
+            let mut next: Vec<u8> = Vec::new();
+            loop {
+                let page = rocks_view.scan(ns, &next, 2);
+                // A page that returns a key before `next` would walk forever; fail it instead.
+                assert!(
+                    page.iter().all(|(key, _)| key[..] >= next[..]),
+                    "{at}: scan {ns:?} from {next:?} returned an earlier key"
+                );
+                let Some((last, _)) = page.last() else { break };
+                next = [&last[..], &[0]].concat();
+                paged.extend(page);
+            }
+            assert_eq!(paged, all, "{at}: scan {ns:?} paged by 2");
+            scans += 3;
         }
+        assert_eq!(rocks_view.fault(), None, "{at}: the view met no read fault");
 
         let mut gets = 0;
         for (ns, key) in &partition.written {
@@ -823,6 +882,75 @@ fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
         }),
         run_info,
     );
+}
+
+/// Reopens past the chain-depth ceiling (M10 ruling A-R166, spike). One partition is reopened
+/// `DEEP_REOPENS` times, each at its applied seq, with puts, deletes and RocksDB restarts in
+/// between. Reopen 32 would link a 33rd level; it copies the merged state instead, and the
+/// child reads at depth 1, then links again. After every step both engines must agree on
+/// everything `compare` checks (views, paged scans, `get`, `history_at` `1..=applied`, and the
+/// marks of every lineage), and every lineage verifies at the end.
+#[retcd_test]
+fn m10_w2_reopens_past_the_depth_ceiling_flatten_and_agree_with_the_oracle() {
+    const DEEP_REOPENS: usize = 40;
+    const DEEP_SEEDS: u64 = 4;
+    for seed in 0..DEEP_SEEDS {
+        let mut rng = Rng(seed ^ 0xDEE9_0000_0000_0001);
+        let mut run = Run::in_dir(seed, &format!("deep-seed{seed}"));
+        for reopen in 0..DEEP_REOPENS {
+            run.step = format!("deep {reopen}");
+            if reopen > 0 && rng.upto(3) == 0 {
+                run.delete(0);
+            } else {
+                let n = 1 + rng.upto(1);
+                run.put(0, n);
+            }
+            if rng.upto(5) == 0 {
+                run.reopen();
+            }
+            let applied = run.applied(0);
+            run.inherit(0, applied);
+            run.compare();
+        }
+        let flattened = run
+            .counts
+            .ops
+            .get("inherit_flattened")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            flattened, 1,
+            "seed={seed}: 40 reopens from g1 cross the ceiling once: {:?}",
+            run.counts.ops
+        );
+        let (id, active) = (run.partitions[0].id, run.partitions[0].active);
+        assert_eq!(
+            run.rocks().chain_depth(id, active),
+            DEEP_REOPENS + 1 - MAX_CHAIN_DEPTH,
+            "seed={seed}: the flattened child starts again at depth 1"
+        );
+        let view = run
+            .rocks()
+            .snapshot(id, active, SnapshotHandle(0))
+            .expect("view");
+        assert_eq!(
+            view.depth(),
+            DEEP_REOPENS + 1 - MAX_CHAIN_DEPTH,
+            "seed={seed}: a view reports the depth its reads walk"
+        );
+        drop(view);
+        run.verify_all();
+        drop(run.rocks.take());
+        let seed_dir = run
+            .db
+            .parent()
+            .expect("the store sits in its seed directory");
+        assert!(
+            config_testkit::fs::try_remove(seed_dir),
+            "seed={seed}: remove {} after the seed passed",
+            seed_dir.display()
+        );
+    }
 }
 
 /// M8 S5, the RocksDB row (ADR-rdb-0014 §2, §6, §7, Verification): blob B1 and a blob of one
