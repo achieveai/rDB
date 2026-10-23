@@ -926,7 +926,7 @@ pub(crate) fn spawn_on(
     boot: BootId,
 ) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
-    links.register(node, tx.clone());
+    links.register(node, tx.clone(), boot);
     let mut host = Host::new(node, engine, links, control, clock);
     host.boot = boot;
     host.budgets = budgets;
