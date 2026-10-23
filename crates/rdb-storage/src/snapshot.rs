@@ -129,6 +129,8 @@ pub struct RocksSnapshot {
     pinned: Arc<Pinned>,
     /// The first read fault this view (or a clone of it) met; see [`Self::fault`].
     faulted: Arc<OnceLock<StorageFault>>,
+    /// The engine's directory claim, held until the last view closes the database it pins.
+    _claim: Option<Arc<std::fs::File>>,
 }
 
 impl std::fmt::Debug for RocksSnapshot {
@@ -384,6 +386,7 @@ impl RocksEngine {
             levels,
             pinned: Arc::new(Pinned::new(&self.db)),
             faulted: Arc::new(OnceLock::new()),
+            _claim: self.claim.clone(),
         })
     }
 }
