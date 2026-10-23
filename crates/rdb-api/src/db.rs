@@ -171,6 +171,10 @@ pub struct DbConfig {
     /// two clients, and the dedup state keys on it). [`DEFAULT_CLIENT`] is the one client every
     /// earlier build used.
     pub client: ClientId,
+    /// The boot every node of this open starts at (ruling A-R227): a node process passes
+    /// [`next_boot`] of [`Self::dir`], and each restart then takes [`next_boot`] of it too.
+    /// `None`: the directory's `n`-th open starts at `((n - 1) << 16) + 1` and a restart adds one.
+    pub boot: Option<BootId>,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -507,6 +511,57 @@ const fn request_floor(n: u64) -> u64 {
     (n - 1) << 40
 }
 
+/// The file under a process's folder that holds the last boot [`next_boot`] handed out.
+const BOOT_FILE: &str = "boot";
+
+/// A fresh boot for a node process whose folder is `dir` (ruling A-R227): the larger of the
+/// Unix time in microseconds and one past the last boot this function returned for `dir`, which
+/// it persists in `dir/boot` before returning. So boots only grow across restarts, and after a
+/// wipe, or a clock step back, the clock part or the stored part keeps the new one fresh.
+/// Creates `dir` when missing.
+///
+/// # Errors
+///
+/// An I/O error reading or writing `dir/boot`, or `InvalidData` when it does not hold a boot.
+/// Nothing is returned then: a boot that may repeat an earlier one is never handed out.
+pub fn next_boot(dir: &Path) -> std::io::Result<BootId> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(dir)?;
+    let file = dir.join(BOOT_FILE);
+    let last = match std::fs::read_to_string(&file) {
+        Ok(text) => text.trim().parse::<u64>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} does not hold a boot: {error}", file.display()),
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+        });
+    let boot = now.max(last.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} holds the largest boot there is", file.display()),
+        )
+    })?);
+    // Written beside and renamed over, so a crash leaves the old boot or the new one, never
+    // half of one.
+    let staged = dir.join(format!("{BOOT_FILE}.new"));
+    {
+        let mut out = std::fs::File::create(&staged)?;
+        writeln!(out, "{boot}")?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&staged, &file)?;
+    tracing::info!(dir = %dir.display(), last, boot, "next_boot");
+    Ok(BootId(boot))
+}
+
 /// The top bit of a request id: set on every id an app chooses, never on one a `Db` draws
 /// itself, so the two never name the same write (ruling A-R195, D11).
 const APP_REQUEST_BIT: u64 = 1 << 63;
@@ -535,6 +590,9 @@ struct Respawn {
     nodes_dir: PathBuf,
     budgets: Budgets,
     limits: Limits,
+    /// The folder a restart takes [`next_boot`] of, when the open was given its boot
+    /// ([`DbConfig::boot`]). `None`: a restart adds one to the boot it replaces.
+    boots: Option<PathBuf>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -603,6 +661,7 @@ impl Db {
             nodes_dir: config.dir.join("nodes"),
             budgets,
             limits,
+            boots: config.boot.map(|_| config.dir.clone()),
         };
         let mut db = Self::open_spawning(
             config,
@@ -708,7 +767,7 @@ impl Db {
         let engines = std::mem::take(&mut claim.engines);
         let unwind = claim.created.take();
         drop(claim);
-        let boot = base_boot(n);
+        let boot = config.boot.unwrap_or(base_boot(n));
         tracing::info!(
             instance_hex = %admin::instance_hex(&found.instance),
             fresh = found.fresh,
@@ -1889,6 +1948,7 @@ impl Db {
                 nodes_dir,
                 budgets,
                 limits: Limits::default(),
+                boots: None,
             }),
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.clone(), links),
@@ -1923,6 +1983,7 @@ impl Db {
                 nodes_dir: nodes_dir.clone(),
                 budgets,
                 limits,
+                boots: None,
             }),
             links,
             control,
@@ -2018,15 +2079,28 @@ impl Db {
             )));
         };
         let old_boot = handle.boot;
-        // One open never reaches the next open's boots (arch R3b).
-        if old_boot.0 - self.opened.base_boot.0 >= MAX_RESTARTS {
-            return Err(ApiError::invalid(format!(
-                "node {} not restarted: it has restarted {MAX_RESTARTS} times, the most one open \
-                 allows; reopen the directory",
-                node.0
-            )));
-        }
-        let boot = BootId(old_boot.0 + 1);
+        let boot = match &respawn.boots {
+            // A node process's boots come from its folder, so they stay fresh across processes
+            // as well as restarts (ruling A-R227).
+            Some(dir) => next_boot(dir).map_err(|error| {
+                ApiError::host(&format!(
+                    "node {} not restarted: no fresh boot from {}: {error}",
+                    node.0,
+                    dir.display()
+                ))
+            })?,
+            None => {
+                // One open never reaches the next open's boots (arch R3b).
+                if old_boot.0 - self.opened.base_boot.0 >= MAX_RESTARTS {
+                    return Err(ApiError::invalid(format!(
+                        "node {} not restarted: it has restarted {MAX_RESTARTS} times, the most \
+                         one open allows; reopen the directory",
+                        node.0
+                    )));
+                }
+                BootId(old_boot.0 + 1)
+            }
+        };
         handle.stop();
         self.control.forget_node(node, old_boot);
         let started = host::spawn_with(
@@ -2786,6 +2860,7 @@ mod tests {
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
+            boot: None,
         }
     }
 
@@ -2827,6 +2902,7 @@ mod tests {
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
+            boot: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -2916,6 +2992,7 @@ mod tests {
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
+            boot: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3043,6 +3120,7 @@ mod tests {
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
+            boot: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -4497,6 +4575,7 @@ mod tests {
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
+            boot: None,
             ..config(dir.path())
         };
         match rt.block_on(Db::open(above, store, rt.handle().clone())) {
@@ -4540,6 +4619,7 @@ mod tests {
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
+            boot: None,
             ..config(dir.path())
         };
         assert!(
@@ -6883,6 +6963,7 @@ mod tests {
                     local: ALL_NODES.to_vec(),
                     links: None,
                     client: DEFAULT_CLIENT,
+                    boot: None,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),
@@ -6987,6 +7068,7 @@ mod tests {
                     local: ALL_NODES.to_vec(),
                     links: None,
                     client: DEFAULT_CLIENT,
+                    boot: None,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),
@@ -8001,5 +8083,62 @@ mod tests {
             })
             .collect();
         assert_eq!(sent, vec![Some("Compile".to_owned())]);
+    }
+
+    /// Ruling A-R227: `next_boot` hands out the Unix time in microseconds or one past the boot it
+    /// last stored, whichever is larger, so boots only grow: after a clock that reads behind the
+    /// stored boot too. A `boot` file that holds no boot is an error, never a guess.
+    /// Unit: files only.
+    #[test]
+    fn m10_next_boot_only_grows_and_refuses_a_file_that_holds_no_boot() {
+        let dir = config_testkit::fs::temp_dir();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_micros();
+        let first = next_boot(dir.path()).expect("first");
+        assert!(u128::from(first.0) >= now, "{first:?} is the clock's");
+        let second = next_boot(dir.path()).expect("second");
+        assert!(second.0 > first.0, "{second:?} after {first:?}");
+        let ahead = second.0 + 3_600_000_000;
+        std::fs::write(dir.path().join("boot"), format!("{ahead}\n")).expect("write");
+        assert_eq!(next_boot(dir.path()).expect("behind"), BootId(ahead + 1));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("boot")).expect("read"),
+            format!("{}\n", ahead + 1)
+        );
+        std::fs::write(dir.path().join("boot"), "nine\n").expect("write");
+        let refused = next_boot(dir.path()).expect_err("no boot in the file");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData, "{refused}");
+    }
+
+    /// Ruling A-R227: a `Db` given its boot starts every node there, and a restart takes
+    /// `next_boot` of the same folder, past the boot it replaces and past the one stored.
+    /// Integration (~2 s): three node threads, one restart.
+    #[test]
+    fn m10_a_db_given_its_boot_starts_there_and_restarts_at_the_next_boot() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let boot = next_boot(dir.path()).expect("boot");
+        let config = DbConfig {
+            boot: Some(boot),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "after the open");
+        for node in ALL_NODES {
+            assert_eq!(db.boot_of(node), Some(boot), "node {}", node.0);
+        }
+        let restarted = db.restart_node(NodeId(3)).expect("restart");
+        assert!(restarted.0 > boot.0 + 1, "{restarted:?} is a clock boot");
+        assert_eq!(db.boot_of(NodeId(3)), Some(restarted));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("boot")).expect("stored"),
+            format!("{}\n", restarted.0)
+        );
+        db.shutdown();
     }
 }

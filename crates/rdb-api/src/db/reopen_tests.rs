@@ -19,6 +19,7 @@ fn config(dir: &Path) -> DbConfig {
         local: ALL_NODES.to_vec(),
         links: None,
         client: DEFAULT_CLIENT,
+        boot: None,
     }
 }
 
