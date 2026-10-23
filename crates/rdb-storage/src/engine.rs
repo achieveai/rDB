@@ -177,6 +177,11 @@ pub struct RocksEngine {
     /// The lock on the directory's [`CLAIM_FILE`] (lead ruling A-R168); `None` on a read-only
     /// open. Every view holds a clone, so the claim outlives the last handle on `db`.
     pub(crate) claim: Option<Arc<File>>,
+    /// A-R214: RocksDB's latest sequence number when the WAL was last known synced through
+    /// it: read just before a `flush_wal(true)` that succeeded, or just after a synced write.
+    /// `None` until then, so a fresh open counts as unsynced. A write after it, synced or not,
+    /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`].
+    synced_seq: Option<u64>,
 }
 
 /// A storage fault the engine reports at the next matching call instead of calling RocksDB, so
@@ -335,6 +340,7 @@ impl RocksEngine {
             instance,
             injected: None,
             claim: Some(Arc::new(claim)),
+            synced_seq: None,
         })
     }
 
@@ -372,7 +378,18 @@ impl RocksEngine {
             instance,
             injected: None,
             claim: None,
+            synced_seq: None,
         })
+    }
+
+    /// A-R214: whether every write so far is synced: no write, synced or not, since the last
+    /// `flush_wal(true)` that succeeded or the last synced write. `false` on a fresh open. A
+    /// caller that finds every durable mark at its applied mark still syncs when this is
+    /// `false`, because an unsynced write that raises no applied mark (a dedup delete, an
+    /// inherit at base 0, a durable-mark write) lives only in the OS cache until a sync.
+    #[must_use]
+    pub fn wal_synced_through_latest(&self) -> bool {
+        self.synced_seq == Some(self.db.latest_sequence_number())
     }
 
     /// The directory this engine is open on.
@@ -430,6 +447,7 @@ impl RocksEngine {
             });
         }
         self.instance = Some(id);
+        self.synced_seq = Some(self.db.latest_sequence_number());
         tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
         Ok(())
     }
@@ -463,6 +481,7 @@ impl RocksEngine {
             );
             return Err(StorageFault::WriteFailed);
         }
+        self.synced_seq = Some(self.db.latest_sequence_number());
         tracing::debug!(
             target: LOG_TARGET,
             partition = partition.0,
@@ -618,6 +637,8 @@ impl RocksEngine {
         &mut self,
         captured: Vec<CapturedPrefix>,
     ) -> Result<Vec<DurablePrefix>, StorageFault> {
+        // A-R214: read before the sync, so a write racing it can only cost one more sync.
+        let latest = self.db.latest_sequence_number();
         let synced = self
             .fire(InjectedFault::WalFlush)
             .and_then(|()| self.db.flush_wal(true).map_err(|e| e.to_string()));
@@ -625,6 +646,7 @@ impl RocksEngine {
             tracing::error!(target: LOG_TARGET, error = %e, "wal_sync_failed");
             return Err(StorageFault::FlushFailed);
         }
+        self.synced_seq = Some(latest);
         let mut next = self.lineages.clone();
         let mut marks_write = WriteBatch::default();
         let mut durable = Vec::with_capacity(captured.len());

@@ -1939,15 +1939,20 @@ impl Host {
     /// durable marks the engine holds, which are what that sync would have returned: every
     /// durability proof sees the same event either way. Only this duty skips; a
     /// `StoreEffect::Flush`, a barrier `SyncWalThrough` and a holder's sync always sync.
+    ///
+    /// A-R214: it also syncs while any write since the last sync is unsynced, as a dedup delete
+    /// or an inherit at base 0 is: those raise no applied mark, so durable == applied misses
+    /// them ([`RocksEngine::wal_synced_through_latest`]).
     fn flush_duty(&mut self) -> Result<(), Fault> {
         let lineages = self.engine.lineages();
         if lineages.is_empty() {
             return Ok(());
         }
-        let synced = lineages.iter().any(|&(partition, generation)| {
-            self.engine.durable(partition, generation).0
-                < self.engine.buffered_applied(partition, generation).0
-        });
+        let synced = !self.engine.wal_synced_through_latest()
+            || lineages.iter().any(|&(partition, generation)| {
+                self.engine.durable(partition, generation).0
+                    < self.engine.buffered_applied(partition, generation).0
+            });
         let ticket = FlushTicket(self.next_ticket);
         self.next_ticket += 1;
         let started = Instant::now();
@@ -6692,6 +6697,10 @@ mod tests {
         host.flush_duty().expect("flush");
         assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
         assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+        // A-R214: that sync wrote the durable mark unsynced, so one more duty syncs it.
+        host.flush_duty().expect("flush");
+        assert!(host.engine.wal_synced_through_latest());
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
 
         host.engine
             .inject_fault(rdb_storage::InjectedFault::WalFlush);
@@ -6714,6 +6723,89 @@ mod tests {
             "the armed fault failed that sync"
         );
         assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+    }
+
+    /// A-R214: a host over a fresh engine whose one lineage is synced and quiet: a WAL-flush
+    /// fault armed then survives a duty. Every lineage is durable through applied after it.
+    #[cfg(debug_assertions)]
+    fn quiet_host_with_wal_flush_armed(
+        path: &std::path::Path,
+        rt: &tokio::runtime::Runtime,
+    ) -> Host {
+        let mut host = host_over(path, rt);
+        host.engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition: PartitionId(2),
+                generation: Generation(1),
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit");
+        host.flush_duty().expect("flush");
+        host.flush_duty().expect("flush");
+        host.engine
+            .inject_fault(rdb_storage::InjectedFault::WalFlush);
+        host.flush_duty().expect("flush");
+        assert_eq!(
+            host.engine.armed_fault(),
+            Some(rdb_storage::InjectedFault::WalFlush),
+            "a quiet duty does not sync"
+        );
+        host
+    }
+
+    /// A-R214: with every lineage still durable through applied, the next duty syncs anyway,
+    /// and the armed fault fails that sync.
+    #[cfg(debug_assertions)]
+    fn assert_next_duty_syncs(host: &mut Host, what: &str) {
+        let durable_at_applied = host
+            .engine
+            .lineages()
+            .into_iter()
+            .all(|(p, g)| host.engine.durable(p, g).0 == host.engine.buffered_applied(p, g).0);
+        assert!(durable_at_applied, "{what}: no applied mark moved");
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.armed_fault(), None, "{what}: the duty synced");
+        assert!(
+            matches!(
+                host.queue.pop_back().map(|queued| queued.event.kind),
+                Some(EventKind::Storage(StorageEvent::FlushFailed { .. }))
+            ),
+            "{what}: the armed fault failed that sync"
+        );
+    }
+
+    /// A-R214 row 1: the retire duty's dedup delete raises no applied mark, so durable ==
+    /// applied alone would skip the next duty and leave the delete in the OS cache. The
+    /// duty syncs it. Cut (durable == applied alone): the fault stays armed, red.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_dedup_delete_alone_still_makes_the_flush_duty_sync() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
+        host.engine
+            .delete_dedup_below(PartitionId(2), Generation(1), &2_u64.to_be_bytes())
+            .expect("dedup delete");
+        assert_next_duty_syncs(&mut host, "a dedup delete");
+    }
+
+    /// A-R214 row 2: an inherit at base 0 (a landing at cutoff 0) writes the link and the
+    /// seal, and leaves both lineages applied and durable at 0. The duty syncs it. Cut
+    /// (durable == applied alone): the fault stays armed, red.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_inherit_at_base_zero_still_makes_the_flush_duty_sync() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
+        let inherited = host
+            .engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq::ZERO)
+            .expect("inherit");
+        assert_eq!(inherited, Inherited::Linked);
+        assert_next_duty_syncs(&mut host, "an inherit at base 0");
     }
 
     /// Defect D2 (2026-10-07, `rdb_dev --hold 1-2,1-3`, walk A10): with both secondaries
