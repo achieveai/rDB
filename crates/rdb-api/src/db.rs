@@ -565,13 +565,17 @@ pub enum ReadyError {
     },
     /// Node 1's recovery found copies whose histories diverged and quarantined them. That is
     /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
-    /// wait nor a reopen helps (A-R196(2a)). The step is ADR-rdb-0004's for
-    /// `DIVERGENCE_REQUIRES_OPERATOR`; this crate has no command for it yet.
+    /// wait nor a reopen helps (A-R196(2a)).
+    ///
+    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator removes the
+    /// diverged copies from membership and fences again. This build has no command for that, so
+    /// the text does not tell the reader to do it (A-R196(2b)); node 1's `recovery_fact` log
+    /// line names the copies.
     #[error(
-        "the open's recovery found copies whose histories diverged and quarantined them, so node \
-         1 takes no writes, and opening the folder again keeps the same copies: an operator must \
-         remove the diverged copies from membership and fence again (node 1's recovery_fact log \
-         line names them)"
+        "the open's recovery found copies whose histories disagree, so node 1 takes no writes; \
+         the acknowledged data is kept. Opening the folder again will not help, and do not \
+         delete the folder: this build has no repair command yet (removing a copy from \
+         membership comes in a later build)"
     )]
     Quarantined,
 }
@@ -1065,7 +1069,7 @@ impl Db {
     /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, and
     /// [`ReadyError::Blocked`] once its recovery is blocked, whose texts say to shut this `Db`
     /// down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
-    /// recovery is quarantined, whose text gives the operator's step instead.
+    /// recovery is quarantined, whose text says a reopen will not help (A-R196(2a), A-R196(2b)).
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from("unknown");
@@ -5037,9 +5041,9 @@ mod tests {
     }
 
     /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
-    /// open leaves, so `wait_ready` answers at once with `Quarantined`, whose text gives the
-    /// operator's step and not a reopen. Node 1 is a stub that answers every look with that
-    /// phase, spelled as the host spells it. Cut: `wait_ready` does not stop on `Quarantined`,
+    /// open leaves, so `wait_ready` answers at once with `Quarantined`, whose text says the data
+    /// is kept and that neither a reopen nor a repair command helps yet (A-R196(2b)). Node 1 is a
+    /// stub that answers every look with that phase, spelled as the host spells it. Cut: `wait_ready` does not stop on `Quarantined`,
     /// and it polls out its bound to `TimedOut`.
     /// Unit (~50 ms): no node thread.
     #[test]
@@ -5081,13 +5085,12 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(answer, Err(ReadyError::Quarantined));
         assert!(took < Duration::from_secs(1), "answered after {took:?}");
-        let text = answer.expect_err("quarantined").to_string();
         assert_eq!(
-            text,
-            "the open's recovery found copies whose histories diverged and quarantined them, so \
-             node 1 takes no writes, and opening the folder again keeps the same copies: an \
-             operator must remove the diverged copies from membership and fence again (node 1's \
-             recovery_fact log line names them)"
+            answer.expect_err("quarantined").to_string(),
+            "the open's recovery found copies whose histories disagree, so node 1 takes no \
+             writes; the acknowledged data is kept. Opening the folder again will not help, and \
+             do not delete the folder: this build has no repair command yet (removing a copy \
+             from membership comes in a later build)"
         );
         drop(db);
         node_1.join().expect("the stub");
