@@ -573,6 +573,22 @@ const fn request_floor(n: u64) -> u64 {
     (n - 1) << 40
 }
 
+/// The top bit of a request id: set on every id an app chooses, never on one a `Db` draws
+/// itself, so the two never name the same write (ruling A-R195, D11).
+const APP_REQUEST_BIT: u64 = 1 << 63;
+
+/// The request id an app sends under with [`Db::put_as`], [`Db::txn_as`] or [`Db::write_as`]:
+/// its own number `n` with the top bit set. A `Db` numbers its own writes below 2^63, so an id
+/// built here never names one of them. `None` when `n` is 2^63 or more.
+#[must_use]
+pub const fn app_request_id(n: u64) -> Option<RequestId> {
+    if n < APP_REQUEST_BIT {
+        Some(RequestId(n | APP_REQUEST_BIT))
+    } else {
+        None
+    }
+}
+
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db").finish_non_exhaustive()
@@ -1076,6 +1092,30 @@ impl Db {
         }
     }
 
+    /// The identity an `_as` call sends under, or its refusal when `request` is not an app's id
+    /// (A-R195): below 2^63 it could name a write this `Db` numbered itself. Nothing is sent.
+    /// The refusal goes through [`Self::retried`], so it never claims `no_mutation`: an id
+    /// sent by a build from before A-R195 may still be applied.
+    fn app_identity(&self, request: RequestId) -> Result<RequestIdentity, PutError> {
+        if request.0 & APP_REQUEST_BIT == 0 {
+            let refused = PutError {
+                error: ApiError::invalid(format!(
+                    "request id {} is in the range this Db numbers its own writes from, so it \
+                     could name another write; nothing was sent: build the id with \
+                     rdb_api::app_request_id(n)",
+                    request.0
+                )),
+                request: None,
+            };
+            return self.retried(request, Err(refused));
+        }
+        Ok(RequestIdentity {
+            tenant: TENANT,
+            client: CLIENT,
+            request,
+        })
+    }
+
     fn call(&self, call: ClientCall, wait: Duration) -> Option<Answer> {
         let (reply, answer) = mpsc::channel();
         let msg = Msg::Client(Client {
@@ -1117,8 +1157,8 @@ impl Db {
         self.put_identified(self.identity(), object, value, if_version)
     }
 
-    /// [`Self::put`] under request id `request`, which this client may have used already. A
-    /// fresh compile, so a changed payload under a used id meets the dedup rules
+    /// [`Self::put`] under the app's request id `request`, which this client may have used
+    /// already. A fresh compile, so a changed payload under a used id meets the dedup rules
     /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
     /// own.
     ///
@@ -1128,6 +1168,9 @@ impl Db {
     /// already be applied, and the compile refuses (a stale condition, an oversized value)
     /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
     /// that this call sent nothing; ask [`Self::status`] what became of `request`.
+    ///
+    /// First, before anything is compiled or sent, `INVALID_ARGUMENT` when `request` is below
+    /// 2^63, where this `Db` numbers its own writes: build it with [`app_request_id`] (A-R195).
     pub fn put_as(
         &self,
         request: RequestId,
@@ -1135,11 +1178,7 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
-        let identity = RequestIdentity {
-            tenant: TENANT,
-            client: CLIENT,
-            request,
-        };
+        let identity = self.app_identity(request)?;
         self.retried(
             request,
             self.put_identified(identity, object, value, if_version),
@@ -1190,11 +1229,11 @@ impl Db {
         self.txn_identified(self.identity(), puts, deadline)
     }
 
-    /// [`Self::txn`] under request id `request`, which this client may have used already, so an
-    /// app can keep the id before it sends and ask [`Self::status`] after a crash (A-R194). A
-    /// fresh compile, so a changed payload under a used id meets the dedup rules
-    /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
-    /// own.
+    /// [`Self::txn`] under the app's request id `request`, which this client may have used
+    /// already, so an app can keep the id before it sends and ask [`Self::status`] after a
+    /// crash (A-R194). A fresh compile, so a changed payload under a used id meets the dedup
+    /// rules (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this
+    /// `Db`'s own.
     ///
     /// # Errors
     ///
@@ -1202,17 +1241,16 @@ impl Db {
     /// already be applied, and the compile refuses (a stale condition, an oversized value)
     /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
     /// that this call sent nothing; ask [`Self::status`] what became of `request`.
+    ///
+    /// First, before anything is compiled or sent, `INVALID_ARGUMENT` when `request` is below
+    /// 2^63, where this `Db` numbers its own writes: build it with [`app_request_id`] (A-R195).
     pub fn txn_as(
         &self,
         request: RequestId,
         puts: &[TxnPut<'_>],
         deadline: Duration,
     ) -> Result<PutOk, PutError> {
-        let identity = RequestIdentity {
-            tenant: TENANT,
-            client: CLIENT,
-            request,
-        };
+        let identity = self.app_identity(request)?;
         let answer = match deadline_refusal(deadline) {
             Some(error) => Err(PutError {
                 error,
@@ -1329,11 +1367,11 @@ impl Db {
         self.write_identified(self.identity(), object, change, expect)
     }
 
-    /// [`Self::write`] under request id `request`, which this client may have used already, so
-    /// an app can keep the id before it sends and ask [`Self::status`] after a crash (A-R194). A
-    /// fresh compile, so a changed payload under a used id meets the dedup rules
-    /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
-    /// own.
+    /// [`Self::write`] under the app's request id `request`, which this client may have used
+    /// already, so an app can keep the id before it sends and ask [`Self::status`] after a
+    /// crash (A-R194). A fresh compile, so a changed payload under a used id meets the dedup
+    /// rules (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this
+    /// `Db`'s own.
     ///
     /// # Errors
     ///
@@ -1343,6 +1381,9 @@ impl Db {
     /// that this call sent nothing; ask [`Self::status`] what became of `request`. Likewise
     /// `Ok(None)`: the change compiled to nothing here, which says nothing about an earlier
     /// send under `request`.
+    ///
+    /// First, before anything is compiled or sent, `INVALID_ARGUMENT` when `request` is below
+    /// 2^63, where this `Db` numbers its own writes: build it with [`app_request_id`] (A-R195).
     pub fn write_as(
         &self,
         request: RequestId,
@@ -1350,11 +1391,7 @@ impl Db {
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
-        let identity = RequestIdentity {
-            tenant: TENANT,
-            client: CLIENT,
-            request,
-        };
+        let identity = self.app_identity(request)?;
         self.retried(
             request,
             self.write_identified(identity, object, change, expect),
@@ -2980,7 +3017,7 @@ mod tests {
 
         db.links().hold(NodeId(1), NodeId(2));
         db.links().hold(NodeId(1), NodeId(3));
-        let id = RequestId(100);
+        let id = app_request_id(100).expect("below 2^63");
         let putter = {
             let db = Arc::clone(&db);
             std::thread::spawn(move || db.put_as(id, b"a", b"2", None))
@@ -3003,7 +3040,7 @@ mod tests {
         match asker.join().expect("asker").expect("the status query") {
             TxnStatus::Resolved(result) => assert_eq!(result.seq, Seq(3)),
             TxnStatus::Unknown => {}
-            other => panic!("status of request 100: {other:?}"),
+            other => panic!("status of request {}: {other:?}", id.0),
         }
         let changed = changer
             .join()
@@ -3868,7 +3905,11 @@ mod tests {
                 "resend_within",
                 db.resend_within((*request).clone(), Duration::from_secs(2)),
             ),
-            ("put_as", db.put_as(id, b"b", b"2", None)),
+            // `put_as` takes an app's id (A-R195): one never admitted, as the new txn's was.
+            (
+                "put_as",
+                db.put_as(app_request_id(id.0).expect("below 2^63"), b"b", b"2", None),
+            ),
         ] {
             let refused = refused.expect_err(how);
             assert_eq!(
@@ -3976,7 +4017,7 @@ mod tests {
     /// first send and cannot on its resend.
     ///
     /// D-S0-1, the same flaw on `put_as`: it recompiles under a caller-chosen id, and the
-    /// compile refuses before the dedup index is asked. Under applied request 1, a stale
+    /// compile refuses before the dedup index is asked. Under an applied request, a stale
     /// condition answered `CONDITION_FAILED no_mutation=true`, and so did an oversized value.
     /// Integration (~3 s): three node threads; most of it is the open and readiness, which
     /// no `Db` row can skip.
@@ -4055,17 +4096,21 @@ mod tests {
             "a resend cannot know: {again:?}"
         );
 
-        // D-S0-1: `put_as` under applied request 1 (a=1 at seq 2; a is now at version 3).
+        // D-S0-1: `put_as` under an applied app request (A-R195: an app's ids are its own;
+        // a is at version 3).
+        let app = app_request_id(1).expect("below 2^63");
+        db.put_as(app, b"d", b"1", None)
+            .expect("put d=1 under the app's id");
         let stale = db
-            .put_as(put.request, b"a", b"1", Some(2))
+            .put_as(app, b"a", b"1", Some(2))
             .expect_err("a is at version 3");
         assert_eq!(stale.error.kind, ErrorKind::ConditionFailed, "{stale:?}");
         assert!(
             !stale.error.no_mutation,
-            "request 1 is applied at seq 2; the answer must not claim no mutation: {stale:?}"
+            "the app's request is applied; the answer must not claim no mutation: {stale:?}"
         );
         let oversized = db
-            .put_as(put.request, b"a", &vec![b'z'; 1_048_536], None)
+            .put_as(app, b"a", &vec![b'z'; 1_048_536], None)
             .expect_err("past the envelope");
         assert_eq!(
             oversized.error.kind,
@@ -4780,8 +4825,9 @@ mod tests {
     fn m9_s5_put_as_refuses_an_object_id_over_1024_bytes_before_it_is_sent() {
         let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
         let long = vec![b'k'; MAX_OBJECT_ID + 1];
+        let id = app_request_id(77).expect("below 2^63");
         let refused = db
-            .put_as(RequestId(77), &long, b"v", None)
+            .put_as(id, &long, b"v", None)
             .expect_err("over the limit");
         assert_eq!(
             (
@@ -4795,7 +4841,11 @@ mod tests {
                 ErrorKind::InvalidArgument,
                 RetryRule::Definitive,
                 false,
-                "op 0: object id 1025 bytes, over the 1024-byte limit; request 77 not sent",
+                format!(
+                    "op 0: object id 1025 bytes, over the 1024-byte limit; request {} not sent",
+                    id.0
+                )
+                .as_str(),
                 true
             ),
         );
@@ -4803,16 +4853,74 @@ mod tests {
 
         let edge = vec![0_u8; MAX_OBJECT_ID];
         let at = db
-            .put_as(RequestId(77), &edge, b"v", None)
+            .put_as(id, &edge, b"v", None)
             .expect_err("nothing answers");
         assert_eq!(at.error.kind, ErrorKind::Unavailable, "{at:?}");
         match reached(&mailbox) {
             ClientCall::Compile { identity, puts, .. } => assert_eq!(
                 (identity.request, puts[0].object.len()),
-                (RequestId(77), MAX_OBJECT_ID)
+                (id, MAX_OBJECT_ID)
             ),
             other => panic!("the put at the limit is compiled: {other:?}"),
         }
+        db.shutdown();
+    }
+
+    /// Ruling A-R195 (D11): `put_as`, `txn_as` and `write_as` refuse an id below 2^63, where
+    /// this `Db` numbers its own writes, before anything is compiled or sent: the owner hears
+    /// nothing. The refusal is `INVALID_ARGUMENT` with no request, its next step naming
+    /// `app_request_id`, and it does not claim `no_mutation` (D-S0-1). `app_request_id` builds
+    /// ids from 2^63 up and has none for 2^63 or more. Cut: the `_as` check is dropped, and the
+    /// owner hears a compile. Unit (~10 ms): no node thread.
+    #[test]
+    fn m10_r195_an_as_call_under_an_id_below_2_63_is_refused_and_nothing_is_sent() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let put = TxnPut {
+            group: GROUP,
+            object: b"a",
+            value: b"1",
+            if_version: None,
+        };
+        for id in [RequestId(5), RequestId((1 << 63) - 1)] {
+            for (how, refused) in [
+                ("put_as", db.put_as(id, b"a", b"1", None)),
+                ("txn_as", db.txn_as(id, &[put], Duration::from_secs(1))),
+                (
+                    "write_as",
+                    db.write_as(id, b"a", byte_doc(b"1"), None)
+                        .map(|ok| ok.expect("never answered")),
+                ),
+            ] {
+                let refused = refused.expect_err(how);
+                assert_eq!(
+                    (
+                        refused.error.kind,
+                        refused.error.no_mutation,
+                        refused.request.is_none()
+                    ),
+                    (ErrorKind::InvalidArgument, false, true),
+                    "{how} {}: {refused:?}",
+                    id.0
+                );
+                assert_eq!(
+                    refused.error.detail,
+                    format!(
+                        "request id {} is in the range this Db numbers its own writes from, so \
+                         it could name another write; nothing was sent: build the id with \
+                         rdb_api::app_request_id(n)",
+                        id.0
+                    ),
+                    "{how}"
+                );
+                assert!(
+                    mailbox.try_recv().is_err(),
+                    "{how}: nothing reached the owner"
+                );
+            }
+        }
+        assert_eq!(app_request_id(5), Some(RequestId((1 << 63) | 5)));
+        assert_eq!(app_request_id((1 << 63) - 1), Some(RequestId(u64::MAX)));
+        assert_eq!(app_request_id(1 << 63), None);
         db.shutdown();
     }
 

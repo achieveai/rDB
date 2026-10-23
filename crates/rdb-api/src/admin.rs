@@ -282,9 +282,11 @@ async fn adopt(
     Ok(Revision(found.mod_revision))
 }
 
-/// The most opens one data directory may have (arch R3b): `N <= 2^24`, so a boot and a
-/// request id derived from N never wrap.
-pub const MAX_OPENS: u64 = 1 << 24;
+/// The most opens one data directory may have (arch R3b): `N <= 2^23`, so a boot and a
+/// request id derived from N never wrap, and every id a `Db` numbers its own writes with
+/// (`(N - 1) << 40` and up) stays below 2^63, out of the range an app's ids take
+/// (`app_request_id`, ruling A-R195).
+pub const MAX_OPENS: u64 = 1 << 23;
 
 /// The version byte of an open counter's value. Layout 2 (ruling A-R184): N, then the newest
 /// generation of partition 1 a host marked activated, each a little-endian u64. A build from
