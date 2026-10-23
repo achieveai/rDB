@@ -29,4 +29,4 @@ pub use engine::{dump, BindError, InjectedFault, OpenError, RawRecord, RocksEngi
 pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
 pub use keys::{Link, INSTANCE_LEN};
 pub use lineage::{verify_lineage, LineageFault, VerifiedLineage};
-pub use snapshot::RocksSnapshot;
+pub use snapshot::{RocksSnapshot, SnapshotEntry};

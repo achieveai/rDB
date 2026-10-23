@@ -492,16 +492,29 @@ impl Run {
             .snapshot(id, active, SnapshotHandle(1))
             .expect("rocks snapshot");
         let memory_view = memory.snapshot(id, active, SnapshotHandle(1));
-        assert_eq!(rocks_view.len(), memory_view.len(), "{at}: snapshot len");
+        // M10 decision 2: the RocksDB view leaves `History` out; the oracle's view keeps it.
+        // `History` is compared through `get` and `history_at` below, never through the view.
+        let oracle_history = memory_view.scan(Namespace::History, &[], usize::MAX).len();
+        assert_eq!(
+            rocks_view.len(),
+            memory_view.len() - oracle_history,
+            "{at}: snapshot len, History aside"
+        );
+        assert!(
+            rocks_view
+                .scan(Namespace::History, &[], usize::MAX)
+                .is_empty(),
+            "{at}: the view holds no History"
+        );
         assert_eq!(rocks_view.at(), memory_view.at(), "{at}: snapshot at");
-        for (ns, key, value, version, _) in rocks_view.entries() {
+        for (ns, key, value, version, _) in rocks_view.entries().expect("rocks entries") {
             assert_eq!(
-                memory_view.get(ns, key).as_ref(),
+                memory_view.get(ns, &key),
                 Some(value),
                 "{at}: {ns:?} {key:?}"
             );
             assert_eq!(
-                memory_view.version(ns, key),
+                memory_view.version(ns, &key),
                 Some(version),
                 "{at}: {ns:?} {key:?} version"
             );
@@ -516,6 +529,9 @@ impl Run {
         );
         let mut namespaces = Vec::new();
         for (ns, key) in &partition.written {
+            if *ns == Namespace::History {
+                continue;
+            }
             assert_eq!(
                 rocks_view.get(*ns, key),
                 memory_view.get(*ns, key),
@@ -545,8 +561,26 @@ impl Run {
                 memory_view.scan(ns, from, 2),
                 "{at}: scan {ns:?} from {from:?} limit 2"
             );
-            scans += 2;
+            // Paged as `items()` and blob reads page: each page starts just past the last key
+            // of the one before. The lazy view merges levels per page (M10 decision 2), so a
+            // page boundary that splits a shadowed key or a tombstone must not change the walk.
+            let mut paged = Vec::new();
+            let mut next: Vec<u8> = Vec::new();
+            loop {
+                let page = rocks_view.scan(ns, &next, 2);
+                // A page that returns a key before `next` would walk forever; fail it instead.
+                assert!(
+                    page.iter().all(|(key, _)| key[..] >= next[..]),
+                    "{at}: scan {ns:?} from {next:?} returned an earlier key"
+                );
+                let Some((last, _)) = page.last() else { break };
+                next = [&last[..], &[0]].concat();
+                paged.extend(page);
+            }
+            assert_eq!(paged, all, "{at}: scan {ns:?} paged by 2");
+            scans += 3;
         }
+        assert_eq!(rocks_view.fault(), None, "{at}: the view met no read fault");
 
         let mut gets = 0;
         for (ns, key) in &partition.written {

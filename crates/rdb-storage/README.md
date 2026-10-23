@@ -22,7 +22,32 @@ one (linked), or gets a copy of it as of `base` (copied). Format 1
 
 `get`, `read` and `snapshot` try the lineage, then its parent, and so on. They stop at a value,
 a tombstone, or a lineage with no parent. `History` falls through only for `seq <= base` of
-every link crossed. Other namespaces stop at a `copied` link.
+every link crossed. Other namespaces stop at a `copied` link. `snapshot` leaves `History` out (M10
+decision 2): it grew by one record per write, and no kernel module reads it through a view. Read
+it with `read --ns history`.
+
+A `RocksSnapshot` is lazy (M10 decision 2): taking one pins a RocksDB snapshot and copies
+nothing, and each read walks the chain under that pin. So a get costs one point read per level
+until a hit, and a miss reads every level: chain depth, not key count, sets read speed. A read
+that meets a corrupt value answers `None` or an empty page, logs `snapshot_unframe_failed`,
+and records the fault; `RocksSnapshot::fault()` returns it, and the host fails the node on it
+(lead ruling A-R164). A view keeps the database open until it is dropped.
+
+**Chain-depth ceiling: 32 levels.** Each reopen that links adds one level. Measured with
+`snapshot_bench` (dev profile, 1k keys, 2026-10-22, commit 9531f6a + bench page metric):
+
+| depth | get p50 / p99 | miss p50 / p99 | page of 10 p50 / p99 |
+|---|---|---|---|
+| 1 | 2 / 4 us | 1 / 3 us | 13 / 24 us |
+| 10 | 19 / 29 us | 10 / 31 us | 75 / 126 us |
+| 32 | 33 / 73 us | 32 / 77 us | 130 / 322 us |
+| 100 | 108 / 241 us | 204 / 354 us | 573 / 996 us |
+| 200 | 91 / 446 us | 286 / 565 us | 1047 / 2019 us |
+
+A get costs about 1 us per level and a page about 5 us per level; key count barely
+moves them (depth 1, get p50 2 us at 1k keys and 4 us at 100k). Past 32 levels a page read passes 0.3 ms at p99.
+Nothing enforces the ceiling yet: a lineage deeper than 32 should be re-based by a full copy,
+which stops the chain.
 
 ## Entry point
 

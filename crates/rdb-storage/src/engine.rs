@@ -23,7 +23,9 @@
 //! read-only and does not flush.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
@@ -157,14 +159,22 @@ pub(crate) struct Marks {
 /// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). The write-order mutex is `&mut self`:
 /// a capture and its sync cannot interleave with a commit. When M9 adds IO workers it becomes a
 /// real `Mutex`.
+///
+/// A [`crate::RocksSnapshot`] shares the database (M10 decision 2): dropping the engine closes
+/// RocksDB and releases its `LOCK` and its directory claim only once every view taken from it
+/// has been dropped too.
 pub struct RocksEngine {
-    pub(crate) db: DB,
+    /// Shared with every live [`crate::RocksSnapshot`], which pins a RocksDB snapshot on it.
+    pub(crate) db: Arc<DB>,
     path: PathBuf,
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
     /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
     instance: Option<[u8; INSTANCE_LEN]>,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
+    /// The lock on the directory's [`CLAIM_FILE`] (lead ruling A-R168); `None` on a read-only
+    /// open. Every view holds a clone, so the claim outlives the last handle on `db`.
+    pub(crate) claim: Option<Arc<File>>,
 }
 
 /// A storage fault the engine reports at the next matching call instead of calling RocksDB, so
@@ -250,16 +260,13 @@ impl RocksEngine {
     ///
     /// [`OpenError::NoDatabase`] when `path` holds no database, else as [`Self::open`].
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        let path = path.as_ref();
-        if !path.join("CURRENT").exists() {
-            return Err(refused(OpenError::NoDatabase {
-                path: path.to_path_buf(),
-            }));
-        }
-        Self::open(path)
+        Self::open_inner(path.as_ref().to_path_buf(), true).map_err(refused)
     }
 
     /// Open, or create, the engine at `path`.
+    ///
+    /// Takes the directory's claim first (lead ruling A-R168): an OS lock on its `CLAIM` file,
+    /// held for the engine's life and released by the OS on exit or crash.
     ///
     /// Refuses a directory whose column families are not exactly [`COLUMN_FAMILIES`], whose
     /// format marker is missing or not [`FORMAT_VERSION`], or in which any lineage has
@@ -269,11 +276,22 @@ impl RocksEngine {
     ///
     /// An [`OpenError`] naming the refusal.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf()).map_err(refused)
+        Self::open_inner(path.as_ref().to_path_buf(), false).map_err(refused)
     }
 
-    fn open_inner(path: PathBuf) -> Result<Self, OpenError> {
+    /// The claim comes first, before any read of the directory (lead ruling A-R168). Without it
+    /// a racing loser's read-only checks met the winner's `LOG`, or a copy it had not finished
+    /// creating, and the loser was told `Backend` instead of `Locked`. RocksDB's `LOCK` stays as
+    /// the second line.
+    fn open_inner(path: PathBuf, must_exist: bool) -> Result<Self, OpenError> {
+        if must_exist && !path.is_dir() {
+            return Err(OpenError::NoDatabase { path });
+        }
+        let claim = claim(&path)?;
         let existed = path.join("CURRENT").exists();
+        if must_exist && !existed {
+            return Err(OpenError::NoDatabase { path });
+        }
         if existed {
             verify_column_families(&path)?;
             // S1-P1: decide every refusal on a read-only open, which writes no file. A writable
@@ -309,11 +327,12 @@ impl RocksEngine {
             "storage_open"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
             instance,
             injected: None,
+            claim: Some(Arc::new(claim)),
         })
     }
 
@@ -345,11 +364,12 @@ impl RocksEngine {
             "storage_open_read_only"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
             instance,
             injected: None,
+            claim: None,
         })
     }
 
@@ -1180,6 +1200,36 @@ fn handle<'a>(db: &'a DB, path: &Path, name: &str) -> Result<&'a ColumnFamily, O
         path: path.to_path_buf(),
         detail: format!("column family {name} has no handle after open"),
     })
+}
+
+/// The file in a node directory whose OS lock is that directory's claim (lead ruling A-R168).
+/// Never deleted: the OS releases the lock when the holder closes it, exits or crashes, so a
+/// file left behind is not a stale claim.
+pub(crate) const CLAIM_FILE: &str = "CLAIM";
+
+/// Take the claim on `path`, creating the directory and [`CLAIM_FILE`] if missing.
+/// `Locked` when another open, in this process or another, holds it.
+fn claim(path: &Path) -> Result<File, OpenError> {
+    let failed = |what: &str, e: std::io::Error| OpenError::Backend {
+        path: path.to_path_buf(),
+        detail: format!("{what} {CLAIM_FILE}: {e}"),
+    };
+    std::fs::create_dir_all(path).map_err(|e| failed("create the directory for", e))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.join(CLAIM_FILE))
+        .map_err(|e| failed("open", e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(OpenError::Locked {
+            path: path.to_path_buf(),
+            detail: format!("{CLAIM_FILE} is held by another open"),
+        }),
+        Err(TryLockError::Error(e)) => Err(failed("lock", e)),
+    }
 }
 
 /// Classify a RocksDB failure. `Locked` only for the IO errors RocksDB raises on the `LOCK`
