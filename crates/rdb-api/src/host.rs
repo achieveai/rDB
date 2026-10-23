@@ -2038,26 +2038,28 @@ impl Host {
         self.retire_duty(now)
     }
 
-    /// The trim duty's sweep in memory: per partition, the `published_at` entries of its oldest
-    /// generation at least a retention old go, as one `DedupTrim` and one `StatusTrim` below
-    /// the last of them plus one, and that floor is kept for the delete. `kind` names the
-    /// `host_duty` line.
+    /// The trim duty's sweep in memory: per partition and generation, oldest first, the
+    /// `published_at` entries at least a retention old go, as one `DedupTrim` and one
+    /// `StatusTrim` below the last of them plus one, and that floor is kept for the delete. It
+    /// moves to the next generation only once a whole generation has aged, and stops at the
+    /// first entry that has not (PR #60 review F2: a restore holding several generations
+    /// trims them all at once). `kind` names the `host_duty` line.
     fn trim_aged(&mut self, now: Tick, kind: &'static str) {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
         for (partition, published) in &mut self.published_at {
-            let Some(&(generation, _, _)) = published.front() else {
-                continue;
-            };
-            let mut last: Option<(Seq, Tick)> = None;
-            while let Some(&(g, seq, at)) = published.front() {
-                if g != generation || at.plus_millis(retention) > now {
-                    break;
+            while let Some(&(generation, _, _)) = published.front() {
+                let mut last: Option<(Seq, Tick)> = None;
+                while let Some(&(g, seq, at)) = published.front() {
+                    if g != generation || at.plus_millis(retention) > now {
+                        break;
+                    }
+                    last = Some((seq, at));
+                    published.pop_front();
                 }
-                last = Some((seq, at));
-                published.pop_front();
-            }
-            if let Some((last, at)) = last {
+                let Some((last, at)) = last else {
+                    break;
+                };
                 trims.push((*partition, generation, Seq(last.0 + 1), at));
             }
         }
@@ -10397,6 +10399,53 @@ mod tests {
         host.trim_duty(host.clock.now()).expect("trim");
         assert_eq!(dedup_trims_queued(&host), [(1, 6)], "the tick adds no trim");
         assert_eq!(host.trim_deletes, 1, "the floor is deleted on disk too");
+    }
+
+    /// PR #60 review F2: marks of two generations, both a retention old, as several clean
+    /// reopens inside one window leave them. The restore trims both before the landing's
+    /// `Recovered`, a `DedupTrim` and a `StatusTrim` for each, with no trim tick. Before, the
+    /// sweep stopped at the first generation's end, and generation 2's entries counted against
+    /// the dedup cap until later ticks took them one generation each. Cut: `trim_aged` takes
+    /// one generation per sweep, and only generation 1 is queued.
+    #[test]
+    fn a_reopen_trims_the_aged_marks_of_every_generation_at_restore() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let old = Tick(now.0 - 2 * retention);
+        reopened_with_marks(
+            &path,
+            3,
+            &[
+                (Generation(1), Seq(5), old),
+                (Generation(2), Seq(9), old.plus_millis(10)),
+            ],
+        );
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(3))
+            .expect("restore");
+        assert_eq!(
+            dedup_trims_queued(&host),
+            [(1, 6), (2, 10)],
+            "both generations trimmed at restore"
+        );
+        let status_trims: Vec<(u64, u64)> = host
+            .queue
+            .iter()
+            .filter_map(|queued| match queued.event.kind {
+                EventKind::Kernel(KernelEvent::StatusTrim { generation, below }) => {
+                    Some((generation.0, below.0))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(status_trims, [(1, 6), (2, 10)], "and both status floors");
+        assert!(
+            host.published_at[&PartitionId(1)].is_empty(),
+            "nothing aged is left"
+        );
     }
 
     /// A-R183 row 2: a store with no marks (a crash before the first write of marks, or data
