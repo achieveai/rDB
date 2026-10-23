@@ -387,6 +387,22 @@ The recovery CAS cannot be resolved this way: `PartitionRecord` binds no run id 
 bytes cannot be told from a peer's identical decision (ruling F-g). That needs a run id in
 `partitions/{id}`, owed to M10 and tracked as achieveai/rDB#45.
 
+**Amended 2026-10-22 (M10, lead ruling A-R185; critic-d7fix C5): landing is a third `inherit`
+caller.** A copy that answers the discovery window late is left out of the barrier. Before this,
+it landed the new generation without a link, nothing pinned the rebuild, and a `DegradedRf2`
+partition stayed write-paused until the next open, with all three copies healthy. Now, when such a
+copy lands the new generation for the first time, the host links that generation to the copy's
+newest held generation at the selected cutoff. It uses the missed-link guards of §8's A-R177 note
+(ADR-rdb-0010 decision 8): no generation above the new one, head exactly at the cutoff, the digest
+there equal, and a parent below the depth ceiling. The link happens before the copy reports
+`Recovered`. A refused guard writes nothing and sends nothing, and the partition keeps today's
+stall. After the link, the host sends F1 `CopyCaughtUp` at the cutoff and its digest. That
+**zero-record catch-up by link counts as a live catch-up at the cutoff**, so the rebuild pins
+through `CopyCaughtUp` in its existing `Committed` arm, then syncs every required copy, runs the activation CAS and goes
+`Active`. Each (partition, generation) gets at most one link and one `CopyCaughtUp`. No fence, no
+new generation and no timer. Still owed to slice 2: a late copy holding past or below the cutoff,
+and a lost `CopyCaughtUp`, which is not re-sent.
+
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
 | Eligible regulars | Mode | Rules |
