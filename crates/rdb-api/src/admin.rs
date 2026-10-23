@@ -532,10 +532,14 @@ const HEAL: CorrelationId = CorrelationId(2);
 ///
 /// Node 1's grant is gone one of two ways:
 /// - **Case A**, deleted by this heal under `clear_verdict`'s guards:
-///   [`Revocation::ExpiryProven`] from the record it judged.
+///   [`Revocation::ExpiryProven`] from the record it judged, `prior_grant_id` that record's
+///   grant. A record holding `GrantId(0)` is refused before the delete: A1 never issues 0.
 /// - **Case B**, read absent (an earlier heal deleted it and its process died before an
 ///   acquire): [`Revocation::NoGrantHeld`] at that read's revision, `prior_grant_id`
-///   `GrantId(0)` ("none held") and `prior_boot_id` the record's `owner_boot`, never 0.
+///   `GrantId(0)` ("none held").
+///
+/// Either way `prior_boot_id` is the record's `owner_boot`, the owner the F1 commit pinned,
+/// never 0 (R3a; R5 row 8).
 ///
 /// Logged as `heal_takeover_authorized{variant, control_revision, prior_boot, prior_grant,
 /// grant_delete_revision | absent_revision, read_revision}`.
@@ -590,10 +594,18 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         read_revision: Revision(read.read_revision),
         control_revision: Revision(found.mod_revision),
     };
+    // R3a, both cases: the prior boot is the owner the F1 commit pinned (R5 row 8: never 0).
+    if root.owner_boot == BootId(0) {
+        return Err(HealError::Record(format!(
+            "the record at revision {} names owner boot 0",
+            found.mod_revision
+        )));
+    }
+    let prior_boot = root.owner_boot;
     let now = ctx.clock.now();
     // The plan's view: case A carries the old grant, as before; case B has none, so it takes
     // bootstrap's. A1 replaces the view at its first acquire either way.
-    let (prior_grant, prior_boot, view_grant, view_generation, revocation) = match &gone {
+    let (prior_grant, view_grant, view_generation, revocation) = match &gone {
         Gone::Deleted(_, held) => {
             let sample = HostClock::control_time(now, &ctx.budgets);
             let revocation = Revocation::ExpiryProven {
@@ -606,30 +618,16 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
             let held = *held;
             (
                 held.grant,
-                held.boot,
                 held.grant,
                 held.authority_generation,
                 revocation,
             )
         }
         Gone::Absent(absent_revision) => {
-            // R5 row 8: the prior boot names a real process, never 0.
-            if root.owner_boot == BootId(0) {
-                return Err(HealError::Record(format!(
-                    "the record at revision {} names owner boot 0",
-                    found.mod_revision
-                )));
-            }
             let revocation = Revocation::NoGrantHeld {
                 absent_revision: *absent_revision,
             };
-            (
-                GrantId(0),
-                root.owner_boot,
-                GrantId(1),
-                AuthorityGeneration(1),
-                revocation,
-            )
+            (GrantId(0), GrantId(1), AuthorityGeneration(1), revocation)
         }
     };
     let lineage = Lineage {
@@ -852,6 +850,20 @@ async fn judge(
             found.mod_revision
         ))
     })?;
+    // R3a; M10 arch R5 row 9: A1's one minting site counts from 1, so a record holding 0 was
+    // not written by A1. Refused before anything is deleted; a heal's proof carrying it would
+    // read as `NoGrantHeld`'s "none held".
+    if record.grant == GrantId(0) {
+        tracing::warn!(
+            node = node.0,
+            revision = found.mod_revision,
+            "grant_clear_grant_0_refused"
+        );
+        return Err(unreadable(format!(
+            "{key} at revision {} holds grant 0, which no grant issuer writes",
+            found.mod_revision
+        )));
+    }
     let partitions = list_partitions(store).await?;
     let now = clock.now();
     let sample = HostClock::control_time(now, &budgets);
@@ -1551,5 +1563,215 @@ mod tests {
         let (healed, sent) = heal_once(store, &rt);
         assert!(matches!(healed, Err(HealError::Record(_))), "{healed:?}");
         assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// `grants/1` as a dead open's boot-1 process left it holding `grant`: long expired and not
+    /// frozen, so case A's guards clear it. Returns the revision it was written at.
+    fn old_grant(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, grant: GrantId) -> u64 {
+        let old = GrantRecord {
+            grant,
+            node: OWNER,
+            boot: BOOT,
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: 0,
+            frozen: false,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            value: old.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/1")
+        .revision
+    }
+
+    /// Case A (R3a, A-R175): the heal deletes a dead open's expired grant and hands node 1 an
+    /// `ExpiryProven` takeover. `prior_grant_id` is the record's grant; `prior_boot_id` is
+    /// `partitions/1`'s `owner_boot`, which the F1 commit pinned, not the grant's own boot.
+    /// Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_reopen_over_an_expired_grant_hands_node_1_an_expiry_proven_takeover_naming_the_owner_boot()
+    {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let written = rooted(&*store, &rt, BootId(5));
+        let granted = old_grant(&*store, &rt, GrantId(4));
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        let healed = healed.expect("case A heals");
+        assert!(
+            matches!(healed.cleared, GrantCleared::Deleted(deleted) if deleted.0 > granted),
+            "{healed:?}"
+        );
+        let fence = fence_sent(&sent).expect("a FenceProven was sent");
+        assert!(
+            matches!(
+                fence.revocation,
+                Revocation::ExpiryProven {
+                    frozen_expiry_utc_ms: 0,
+                    ..
+                }
+            ),
+            "{fence:?}"
+        );
+        assert_eq!(fence.prior_grant_id, GrantId(4));
+        assert_eq!(
+            fence.prior_boot_id,
+            BootId(5),
+            "partitions/1's owner_boot, not the grant's boot {}",
+            BOOT.0
+        );
+        assert_eq!(fence.control_revision, Revision(written));
+        assert_eq!(grant_revision(&*store, &rt), None, "the old grant is gone");
+    }
+
+    /// Case A (R3a; R5 row 9; A-R175): A1 never issues `GrantId(0)`, and a proof carrying it
+    /// would read as case B's "none held". A record holding it is refused before anything is
+    /// deleted: the heal fails naming it, `grants/1` stays at its revision, and node 1 is sent
+    /// nothing. Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_heal_over_a_grant_record_holding_grant_0_is_refused_and_deletes_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let written = old_grant(&*store, &rt, GrantId(0));
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        match &healed {
+            Err(HealError::Control(detail)) => assert!(detail.contains("grant 0"), "{detail}"),
+            other => panic!("expected a refusal naming grant 0: {other:?}"),
+        }
+        assert_eq!(
+            grant_revision(&*store, &rt),
+            Some(written),
+            "nothing deleted"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// A control store whose `partitions/1` reads answer from the snapshot [`Self::freeze`]
+    /// took: a lagging read, older than anything written after it. Everything else is the
+    /// `MemStore` underneath. Written out by hand because `async-trait` is not a dependency of
+    /// this crate.
+    struct StalePartition {
+        inner: config_testkit::MemStore,
+        stale: std::sync::Mutex<Option<config_core::GetResponse>>,
+    }
+
+    type Reply<'a, T> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConfigError>> + Send + 'a>>;
+
+    impl StalePartition {
+        fn new() -> Self {
+            Self {
+                inner: config_testkit::MemStore::new(),
+                stale: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn freeze(&self, rt: &tokio::runtime::Runtime) {
+            let read = rt
+                .block_on(self.inner.get(GetRequest {
+                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                }))
+                .expect("get partitions/1");
+            *self.stale.lock().expect("stale") = Some(read);
+        }
+    }
+
+    impl ConfigStore for StalePartition {
+        fn get<'a, 'b>(&'a self, request: GetRequest) -> Reply<'b, config_core::GetResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            let stale = self.stale.lock().expect("stale").clone();
+            match stale {
+                Some(read)
+                    if request.key == ControlKey::Partition(PARTITION).encode().as_bytes() =>
+                {
+                    Box::pin(std::future::ready(Ok(read)))
+                }
+                _ => self.inner.get(request),
+            }
+        }
+
+        fn list<'a, 'b>(&'a self, request: ListRequest) -> Reply<'b, config_core::ListResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.list(request)
+        }
+
+        fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.put(request)
+        }
+
+        fn delete<'a, 'b>(
+            &'a self,
+            request: DeleteRequest,
+        ) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.delete(request)
+        }
+
+        fn capabilities(&self) -> config_core::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn watch<'a, 'b>(
+            &'a self,
+            request: config_core::WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.watch(request)
+        }
+    }
+
+    /// A-R163's read-before guards (A-R175): a `partitions/1` read served below the revision of
+    /// the grant delete (case A) or of the read that found the grant absent (case B) is a
+    /// lagging answer, so the heal refuses it and sends node 1 nothing. Unit (~20 ms):
+    /// `MemStore` behind [`StalePartition`].
+    #[test]
+    fn a_partitions_read_older_than_the_grant_is_gone_is_refused_and_sends_nothing() {
+        let rt = runtime();
+
+        let store = Arc::new(StalePartition::new());
+        rooted(&store.inner, &rt, BootId(5));
+        store.freeze(&rt);
+        old_grant(&store.inner, &rt, GrantId(4));
+        let (healed, sent) = heal_once(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        assert!(
+            matches!(healed, Err(HealError::ReadBeforeDelete { read, deleted }) if read < deleted),
+            "case A: {healed:?}"
+        );
+        assert!(sent.is_empty(), "case A: {} messages sent", sent.len());
+
+        let store = Arc::new(StalePartition::new());
+        rooted(&store.inner, &rt, BootId(5));
+        store.freeze(&rt);
+        rt.block_on(store.inner.put(PutRequest {
+            key: Bytes::from_static(b"unrelated"),
+            value: Bytes::from_static(b"x"),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("put unrelated");
+        let (healed, sent) = heal_once(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        assert!(
+            matches!(healed, Err(HealError::ReadBeforeAbsence { read, absent }) if read < absent),
+            "case B: {healed:?}"
+        );
+        assert!(sent.is_empty(), "case B: {} messages sent", sent.len());
     }
 }
