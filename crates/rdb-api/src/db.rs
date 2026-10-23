@@ -5010,7 +5010,8 @@ mod tests {
     /// final in an open by ruling F-a), so `wait_ready` answers at once, well inside 1 s of a
     /// 90 s bound, with `Blocked` naming the reason and saying to open the folder again. Node 1
     /// is a stub that answers every look with that phase, spelled as the host spells it. Cut:
-    /// `wait_ready` does not stop on `Blocked`, and it polls out its bound to `TimedOut`.
+    /// `wait_ready` does not stop on `Blocked`, and it polls out its bound to `TimedOut`. Cut
+    /// (D17): it sleeps 1.5 s before answering, and the time fails.
     /// Unit (~50 ms): no node thread.
     #[test]
     fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_blocked() {
@@ -5046,24 +5047,31 @@ mod tests {
             stalled: None,
             reload_pending: None,
         };
-        let node_1 = std::thread::spawn(move || {
-            while let Ok(msg) = mailbox.recv() {
-                if let Msg::Inspect { reply, .. } = msg {
-                    let _ = reply.send(status.clone());
+        // D17: timed from the first look node 1 answered in time, as the quarantined row below
+        // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
+        let answered = Arc::new(Mutex::new(None::<std::time::Instant>));
+        let node_1 = {
+            let answered = Arc::clone(&answered);
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        let at = std::time::Instant::now();
+                        if reply.send(status.clone()).is_ok() {
+                            lock(&answered).get_or_insert(at);
+                        }
+                    }
                 }
-            }
-        });
+            })
+        };
 
-        let started = std::time::Instant::now();
         let answer = db.wait_ready(Duration::from_secs(3));
-        let took = started.elapsed();
+        let returned = std::time::Instant::now();
         assert_eq!(
             answer,
             Err(ReadyError::Blocked {
                 reason: "BarrierIncomplete { missing: [CopyId(1), CopyId(2)] }".to_owned()
             })
         );
-        assert!(took < Duration::from_secs(1), "answered after {took:?}");
         assert_eq!(
             answer.expect_err("blocked").to_string(),
             "the open's recovery stopped before node 1 took writes (BarrierIncomplete { missing: \
@@ -5072,6 +5080,12 @@ mod tests {
         );
         drop(db);
         node_1.join().expect("the stub");
+        let first = (*lock(&answered)).expect("node 1 answered a look in time");
+        let took = returned.saturating_duration_since(first);
+        assert!(
+            took < Duration::from_secs(1),
+            "answered {took:?} after node 1's first answer"
+        );
     }
 
     /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
