@@ -907,7 +907,7 @@ fn waits_on_line(
             format!("the start record's outcome (seq {})", seq.0)
         }
         // Status does not know an admin damage write: it is another client's (S6 P-3).
-        Some(request) if request.0 >= DAMAGE_REQUEST_BASE => {
+        Some(request) if is_damage_request(request) => {
             format!("an admin damage write's outcome (seq {})", seq.0)
         }
         Some(request) => format!("request {}'s outcome (seq {})", request.0, seq.0),
@@ -2175,13 +2175,25 @@ fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), 
 }
 
 /// The first request id of `admin damage` and `damage-chunk`. Node status names an in-flight
-/// request by id alone, with no client, so these ids start far above any the `Db` sends, and a
-/// note can tell them apart (S6 P-3).
+/// request by id alone, with no client, so a note tells them apart by the ids this process
+/// issued ([`is_damage_request`], S6 P-3, D8).
 const DAMAGE_REQUEST_BASE: u64 = 1 << 32;
 
 /// Request ids for `admin damage` and `damage-chunk`, under their own client.
 static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(DAMAGE_REQUEST_BASE);
+
+/// A fresh request id for `admin damage` or `damage-chunk`.
+fn damage_request() -> RequestId {
+    RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Whether this process issued `request` for `admin damage` or `damage-chunk`. By origin, not
+/// by size: from a folder's second open on, the `Db`'s own ids start at `(n-1)<<40`, above
+/// `DAMAGE_REQUEST_BASE`, and an id alone was then read as a damage write (tester D8).
+fn is_damage_request(request: RequestId) -> bool {
+    (DAMAGE_REQUEST_BASE..DAMAGE_REQUEST.load(Ordering::Relaxed)).contains(&request.0)
+}
 
 /// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
 /// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
@@ -2205,7 +2217,7 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
         identity: RequestIdentity {
             tenant: TenantId(1),
             client: ClientId(2),
-            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+            request: damage_request(),
         },
         affinity: AffinityId(1),
         expected_generation: None,
@@ -2356,7 +2368,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         identity: RequestIdentity {
             tenant: TenantId(1),
             client: ClientId(2),
-            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+            request: damage_request(),
         },
         affinity: AffinityId(1),
         expected_generation: None,
@@ -5241,5 +5253,31 @@ mod tests {
             HealState::Running
         });
         assert_eq!(line, "timeout waiting for ready after 0s");
+    }
+
+    /// Tester D8 (aa3b82e): from a folder's second open on, the request floor `(n-1)<<40` puts
+    /// every write the app sends above `DAMAGE_REQUEST_BASE`, and the waits-on line called the
+    /// app's own put "an admin damage write" and hid its id. The label now goes by origin: only
+    /// an id `admin damage` or `damage-chunk` issued is a damage write. Unit.
+    #[test]
+    fn a_waits_on_line_names_a_second_opens_put_by_its_id_and_only_a_damage_id_as_damage() {
+        let waiting = |request: RequestId| {
+            let mut node = owner(None, false);
+            node.in_flight = Some(request);
+            node.waits_on = Some(rdb_core::contracts::ids::Seq(6));
+            node
+        };
+        let second_open = RequestId((1 << 40) + 1);
+        let line = waits_on_line(&waiting(second_open), &HELD, &[]).expect("a waits-on line");
+        assert!(
+            line.starts_with("partition 1 waits on request 1099511627777's outcome (seq 6),"),
+            "{line}"
+        );
+        let damage = damage_request();
+        let line = waits_on_line(&waiting(damage), &HELD, &[]).expect("a waits-on line");
+        assert!(
+            line.starts_with("partition 1 waits on an admin damage write's outcome (seq 6),"),
+            "{line}"
+        );
     }
 }
