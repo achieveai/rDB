@@ -6613,7 +6613,9 @@ mod tests {
         assert_eq!(
             line,
             "timeout waiting for ready after 25s: node 1 did not admit writes within 25000 ms; \
-             recovery phase ProposalUnresolved"
+             node 1's recovery phase is ProposalUnresolved; next: call `wait_ready` again with \
+             a longer bound, or shut this Db down and open the folder again, once; if that \
+             times out too, stop and report it with this message"
         );
 
         // Ready in the second slice: one line said, then the reached line.
