@@ -3121,6 +3121,9 @@ fn sparse_ladder_plan() -> RunPlan {
             ..spine_survivor(3)
         },
     ));
+    // A-R165: the window closes on the last answer, about 2 s sooner, so the run spends that time
+    // after the commit. Its steady traffic there needs about 500 events to reach the deadline.
+    plan.limits.max_events = 600;
     plan
 }
 

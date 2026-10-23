@@ -1196,3 +1196,176 @@ fn m8s_19_s1_p5_fault_injected_names_its_point() {
     assert_eq!(fired.len(), 1, "{lines:?}");
     assert_eq!(fired[0]["point"], "switch", "{:?}", fired[0]);
 }
+
+/// Every record `(P, generation)` reads, split into its Dedup keys (with the level that holds
+/// each) and everything else.
+fn dedup_and_rest(
+    engine: &RocksEngine,
+    generation: Generation,
+) -> (Vec<(Bytes, Generation)>, Vec<rdb_storage::SnapshotEntry>) {
+    let view = engine
+        .snapshot(P, generation, SnapshotHandle(7))
+        .expect("snapshot");
+    let (dedup, rest): (Vec<_>, Vec<_>) = view
+        .entries()
+        .expect("entries")
+        .into_iter()
+        .partition(|(ns, ..)| *ns == Namespace::Dedup);
+    let dedup = dedup
+        .into_iter()
+        .map(|(_, key, _, _, from)| (key, from))
+        .collect();
+    (dedup, rest)
+}
+
+/// The generation a Dedup key leads with (`dedup_key`'s first 8 bytes, big-endian).
+fn leading(key: &Bytes) -> u64 {
+    u64::from_be_bytes(key[..8].try_into().expect("an 8-byte generation prefix"))
+}
+
+/// D6 fix B (A-R170 draft): `delete_dedup_below(end)` removes every Dedup row whose key sorts
+/// below `end` at every level the lineage reads, keeps the rest, touches no other namespace,
+/// and the result survives a reopen. Over a linked chain g1 <- g2 <- g3, and over a copied
+/// child, where g1's rows were copied under g2's own prefix.
+#[retcd_test]
+fn m10_w2_delete_dedup_below_clears_retired_generations_at_every_level() {
+    let dir = data_dir("m10-dedup-below");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    let g1 = linked_g2(&mut engine);
+    let g2 = write_after(&mut engine, G2, (10, &g1), 12);
+    assert_eq!(engine.inherit(P, G2, G3, Seq(12)), Ok(Inherited::Linked));
+    write_after(&mut engine, G3, (12, &g2), 14);
+    let (before, rest) = dedup_and_rest(&engine, G3);
+    let held: Vec<(u64, Generation)> = before.iter().map(|(k, from)| (leading(k), *from)).collect();
+    assert_eq!(held.len(), 14, "{held:?}");
+    assert!(held.contains(&(1, G1)) && held.contains(&(2, G2)) && held.contains(&(3, G3)));
+
+    for end in [2_u64, 3] {
+        engine
+            .delete_dedup_below(P, G3, &end.to_be_bytes())
+            .expect("delete below");
+        let (dedup, after) = dedup_and_rest(&engine, G3);
+        let kept: Vec<_> = before
+            .iter()
+            .filter(|(k, _)| leading(k) >= end)
+            .cloned()
+            .collect();
+        assert_eq!(dedup, kept, "end={end}: only keys at or above end remain");
+        assert_eq!(after, rest, "end={end}: no other namespace changed");
+    }
+    verify_lineage(&engine, P, G3).expect("g3 still verifies");
+    drop(engine);
+    let engine = RocksEngine::open(&db).expect("reopen");
+    let (dedup, after) = dedup_and_rest(&engine, G3);
+    assert_eq!(dedup.len(), 2, "the deletion survives a reopen: {dedup:?}");
+    assert!(dedup.iter().all(|(k, from)| leading(k) == 3 && *from == G3));
+    assert_eq!(after, rest);
+    drop(engine);
+
+    // A copied child holds g1's rows under its own prefix; they go, and g1 itself, which g2
+    // no longer reads, is left as it was.
+    let dir = data_dir("m10-dedup-below-copied");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = write(&mut engine, G1, 11);
+    assert_eq!(
+        engine.inherit(P, G1, G2, Seq(10)),
+        Ok(Inherited::Copied { keys: 12 })
+    );
+    let (before, rest) = dedup_and_rest(&engine, G2);
+    assert_eq!(before.len(), 10);
+    assert!(before
+        .iter()
+        .all(|(k, from)| leading(k) == 1 && *from == G2));
+    let parent = dedup_and_rest(&engine, G1);
+    engine
+        .delete_dedup_below(P, G2, &2_u64.to_be_bytes())
+        .expect("delete below");
+    let (dedup, after) = dedup_and_rest(&engine, G2);
+    assert_eq!(dedup, Vec::new());
+    assert_eq!(after, rest);
+    assert_eq!(
+        dedup_and_rest(&engine, G1),
+        parent,
+        "g1 is not in g2's read chain"
+    );
+    assert!(engine
+        .get(P, G1, Namespace::Dedup, &dedup_key_of(&g1, 5))
+        .expect("get")
+        .is_some());
+    assert_eq!(
+        engine.delete_dedup_below(P, G5, &2_u64.to_be_bytes()),
+        Err(StorageFault::WriteFailed),
+        "a lineage the engine does not hold is refused"
+    );
+}
+
+/// D6 fix D (A-R170): `delete_dedup_trimmed(g, below)` deletes exactly the rows T1's
+/// `DedupTrim{g, below}` drops from memory — g's own Dedup rows whose value's seq is below
+/// `below` — and keeps everything else: g's younger rows, the parent's rows (they lead with
+/// another generation), and every other namespace. It survives a reopen. An unknown lineage
+/// is refused, and an undecodable value refuses the whole call, deleting nothing.
+#[retcd_test]
+fn m10_w2_delete_dedup_trimmed_drops_what_t1_trimmed_and_nothing_else() {
+    let dir = data_dir("m10-dedup-trimmed");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    let g1 = linked_g2(&mut engine);
+    write_after(&mut engine, G2, (10, &g1), 14);
+    let (before, rest) = dedup_and_rest(&engine, G2);
+    assert_eq!(before.len(), 14);
+
+    assert_eq!(engine.delete_dedup_trimmed(P, G2, Seq(13)), Ok(2));
+    let kept: Vec<_> = before
+        .iter()
+        .filter(|(k, _)| {
+            leading(k) == 1
+                || k.ends_with(&13_u64.to_be_bytes())
+                || k.ends_with(&14_u64.to_be_bytes())
+        })
+        .cloned()
+        .collect();
+    assert_eq!(kept.len(), 12);
+    let (dedup, after) = dedup_and_rest(&engine, G2);
+    assert_eq!(
+        dedup, kept,
+        "g2's seq 11 and 12 go; g1's rows and g2's 13, 14 stay"
+    );
+    assert_eq!(after, rest, "no other namespace changed");
+    assert_eq!(
+        engine.delete_dedup_trimmed(P, G2, Seq(13)),
+        Ok(0),
+        "a repeat deletes nothing"
+    );
+    assert_eq!(
+        engine.delete_dedup_trimmed(P, G5, Seq(13)),
+        Err(StorageFault::WriteFailed),
+        "a lineage the engine does not hold is refused"
+    );
+    drop(engine);
+    let engine = RocksEngine::open(&db).expect("reopen");
+    assert_eq!(
+        dedup_and_rest(&engine, G2),
+        (kept, rest),
+        "survives a reopen"
+    );
+    drop(engine);
+
+    // One undecodable g1 Dedup value: the call refuses and deletes nothing.
+    let dir = data_dir("m10-dedup-trimmed-corrupt");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    write(&mut engine, G1, 3);
+    drop(engine);
+    let mut bad = 1_u64.to_be_bytes().to_vec();
+    bad.extend_from_slice(&[0xFF; 24]);
+    raw_put_g1(&db, Namespace::Dedup, &bad, 3, b"not a dedup value");
+    let mut engine = RocksEngine::open(&db).expect("reopen");
+    let (before, _) = dedup_and_rest(&engine, G1);
+    assert_eq!(before.len(), 4);
+    assert_eq!(
+        engine.delete_dedup_trimmed(P, G1, Seq(10)),
+        Err(StorageFault::Corrupt)
+    );
+    assert_eq!(dedup_and_rest(&engine, G1).0, before, "nothing deleted");
+}

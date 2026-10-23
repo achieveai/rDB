@@ -31,9 +31,10 @@ use bytes::Bytes;
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, DurablePrefix, Namespace, StorageFault};
 use rdb_core::replication::append::PROGRESS_KEY;
+use rdb_core::transaction::dedup::parse_dedup_value;
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, IteratorMode, Options, WriteBatch,
-    WriteOptions, DB,
+    ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction, IteratorMode, Options,
+    WriteBatch, WriteOptions, DB,
 };
 
 use rdb_core::contracts::trace::Version;
@@ -643,6 +644,173 @@ impl RocksEngine {
             );
         }
         Ok(durable)
+    }
+
+    /// Delete every Dedup row `(partition, generation)` reads whose key sorts below `end`, at
+    /// every level its reads walk ([`Self::levels`]): one range delete per level, in one
+    /// `WriteBatch`. Other namespaces, and levels behind a copied link, are not touched. Views
+    /// taken before the call still see the rows.
+    ///
+    /// For retiring the dedup rows of older generations (defect D6, draft of ruling A-R170): a
+    /// `dedup_key` leads with its generation big-endian, so `end = (h + 1).to_be_bytes()` is
+    /// every row of generations `<= h`. Storage reads no key layout; the caller picks `end`.
+    ///
+    /// Local cleanup, not a replicated write: no `applied` mark moves and nothing is added to
+    /// `History`. Unsynced, as [`Self::commit`] is; after a host crash the rows may be back, and
+    /// deleting again is the cure.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] for a lineage the engine does not hold, or when RocksDB
+    /// refuses the write; nothing is deleted.
+    pub fn delete_dedup_below(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        end: &[u8],
+    ) -> Result<(), StorageFault> {
+        if !self.lineages.contains_key(&(partition, generation)) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                "dedup_delete_unknown_lineage"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let levels = self.levels(partition, generation);
+        let cf = self.cf(keys::cf_for(Namespace::Dedup));
+        let mut write = WriteBatch::default();
+        for level in &levels {
+            write.delete_range_cf(
+                cf,
+                encode_key(partition, *level, Namespace::Dedup, &[]),
+                encode_key(partition, *level, Namespace::Dedup, end),
+            );
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(false);
+        opts.disable_wal(false);
+        if let Err(e) = self.db.write_opt(write, &opts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                error = %e,
+                "dedup_delete_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        tracing::info!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            levels = levels.len(),
+            end_hex = %hex(end),
+            "dedup_delete_below"
+        );
+        Ok(())
+    }
+
+    /// Durably delete what `DedupTrim{generation, below}` drops from T1's memory: the Dedup
+    /// rows stored at lineage `(partition, generation)`'s own level whose key leads with
+    /// `generation` and whose value's seq (`parse_dedup_value`) is below `below`. That is
+    /// `DedupIndex::trim`'s predicate, so a reseed after a restart loads no row T1 trimmed
+    /// (defect D6, lead ruling A-R170 D). Returns how many rows it deleted.
+    ///
+    /// Only lineage `generation` writes keys that lead with `generation`, so a plain delete is
+    /// exact: no parent level holds such a key. Any node that applies the trim may call it,
+    /// owner or secondary. Local cleanup, not a replicated write: no `applied` mark moves and
+    /// nothing is added to `History`. The write is synced before this returns, so it survives
+    /// a host crash; one fsync per trim, and the host trims at most once a second.
+    ///
+    /// It reads every row of `generation` at that level once; the host keeps them at about the
+    /// dedup cap.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] for a lineage the engine does not hold, or when RocksDB
+    /// refuses the write. [`StorageFault::Corrupt`] when a read fails or a value does not decode
+    /// as a dedup value. Either way nothing is deleted.
+    pub fn delete_dedup_trimmed(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        below: Seq,
+    ) -> Result<usize, StorageFault> {
+        if !self.lineages.contains_key(&(partition, generation)) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                "dedup_trim_unknown_lineage"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let cf = self.cf(keys::cf_for(Namespace::Dedup));
+        let prefix = encode_key(
+            partition,
+            generation,
+            Namespace::Dedup,
+            &generation.0.to_be_bytes(),
+        );
+        let mut write = WriteBatch::default();
+        let (mut scanned, mut deleted) = (0_usize, 0_usize);
+        for item in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (raw, value) = item.map_err(|e| {
+                tracing::error!(target: LOG_TARGET, error = %e, "dedup_trim_read_failed");
+                StorageFault::Corrupt
+            })?;
+            if !raw.starts_with(&prefix) {
+                break;
+            }
+            scanned += 1;
+            let seq = match unframe(&value) {
+                Some(Frame::Value(_, bytes)) => parse_dedup_value(bytes).map(|v| v.seq),
+                // T1 never deletes a Dedup row, but a tombstone holds nothing to seed.
+                Some(Frame::Tombstone(_)) => continue,
+                None => None,
+            };
+            let Some(seq) = seq else {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    generation = generation.0,
+                    key_hex = %hex(raw.get(keys::PREFIX_LEN..).unwrap_or_default()),
+                    "dedup_trim_value_undecodable"
+                );
+                return Err(StorageFault::Corrupt);
+            };
+            if seq < below {
+                write.delete_cf(cf, &raw);
+                deleted += 1;
+            }
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        if let Err(e) = self.db.write_opt(write, &opts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                error = %e,
+                "dedup_trim_delete_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        tracing::info!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            below = below.0,
+            scanned,
+            deleted,
+            "dedup_trim_deleted"
+        );
+        Ok(deleted)
     }
 
     /// The highest sequence applied to state, not necessarily synced.
