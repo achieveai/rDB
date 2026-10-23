@@ -1,0 +1,17 @@
+// rDB peer and client links between processes (M10 slice 2, arch-s2 "Network (W4)").
+//
+// One bidirectional stream per connection. Each `Envelope.body` is one postcard-encoded
+// `rdb_api::net::wire::Frame`: the first frame each way is the handshake (protocol version,
+// claimed label, boot), every later one a message or a reply. The protobuf layer only carries
+// bytes, so the wire's real schema lives in `wire.rs`, versioned by `protocol_version`.
+syntax = "proto3";
+
+package rdb.net.v1;
+
+message Envelope {
+  bytes body = 1;
+}
+
+service RdbNet {
+  rpc Link(stream Envelope) returns (stream Envelope);
+}

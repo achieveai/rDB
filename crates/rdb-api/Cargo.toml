@@ -21,6 +21,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # A fresh open names its rDB instance with a v4 uuid (M10, arch R3b).
 uuid = { workspace = true }
+# The process links (M10 S2, W4): one tonic bidi stream per peer pair, postcard frames inside,
+# mutual TLS from config-grpc, dev certificates from rcgen (`rdb_node --gen-certs`).
+config-grpc = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tokio-stream = { workspace = true }
+# `CutStore` implements `config_core::ConfigStore`, an `async_trait` trait.
+async-trait = { workspace = true }
+rcgen = { workspace = true }
 
 [dev-dependencies]
 # `rdb_dev` starts three in-process rEtcd voters on RocksDB.
@@ -34,14 +45,17 @@ config-log-macros = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # `rdb_dev` reads JSON values with `doc_scenario`'s parser (`#[path]`, S4 A-1). The `Db` parses
 # no JSON. `float_roundtrip`: the default parser stores ~1 in 3 decimals 1 ULP off (ADR-rdb-0012
-# §3). `serde` for the visitor that refuses a duplicate key; `hex` for `$bytes` output.
-serde = { workspace = true }
+# §3). `serde` (a normal dependency) for the visitor that refuses a duplicate key; `hex` for `$bytes` output.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 hex = { workspace = true }
 # `rdb_dev blob upload` hashes the whole blob and prints `--sha256` for a resumed publish (S4b).
 sha2 = { workspace = true }
 # A host row writes an unframed value straight into a closed copy (M10, A-R164).
 rocksdb = { workspace = true }
+
+[build-dependencies]
+protox = { workspace = true }
+tonic-build = { workspace = true }
 
 [[example]]
 name = "rdb_dev"

@@ -327,6 +327,7 @@ fn run(args: &Args) -> ExitCode {
         local: rdb_api::db::ALL_NODES.to_vec(),
         links: None,
         client: rdb_api::db::DEFAULT_CLIENT,
+        boot: None,
     };
     tracing::info!(
         write = args.write,

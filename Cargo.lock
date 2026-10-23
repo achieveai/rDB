@@ -3506,14 +3506,20 @@ dependencies = [
 name = "rdb-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "config-client",
  "config-core",
+ "config-grpc",
  "config-log",
  "config-log-macros",
  "config-testkit",
  "futures",
  "hex",
+ "postcard",
+ "prost",
+ "protox",
+ "rcgen",
  "rdb-core",
  "rdb-storage",
  "rdb-value",
@@ -3523,6 +3529,9 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
  "tracing",
  "uuid",
 ]
