@@ -38,6 +38,8 @@ pub struct Links {
 #[derive(Debug, Default)]
 struct Inner {
     mailboxes: BTreeMap<NodeId, Sender<Msg>>,
+    /// The boot each registered node runs at (arch-s2 B1: one source for in-process boots).
+    boots: BTreeMap<NodeId, BootId>,
     /// The links to other processes, once attached.
     net: Option<Arc<Net>>,
     /// Held pairs, smaller node first. A hold covers both directions.
@@ -71,9 +73,12 @@ impl Links {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Make `node` reachable at `mailbox`.
-    pub fn register(&self, node: NodeId, mailbox: Sender<Msg>) {
-        self.lock().mailboxes.insert(node, mailbox);
+    /// Make `node` reachable at `mailbox`, running at `boot`. Registering again (a restart)
+    /// replaces both.
+    pub fn register(&self, node: NodeId, mailbox: Sender<Msg>, boot: BootId) {
+        let mut inner = self.lock();
+        inner.mailboxes.insert(node, mailbox);
+        inner.boots.insert(node, boot);
     }
 
     /// Whether `node` is registered.
@@ -93,11 +98,18 @@ impl Links {
         self.lock().net.clone()
     }
 
-    /// The boot node `node` reported at its last handshake with this process; `None` for a
-    /// node this process runs, or one whose link has never come up.
+    /// The boot `node` runs at: the one it registered with when this process runs it (A-R232),
+    /// else the one it reported at its last handshake with this process. `None` for a node
+    /// that is neither registered nor has ever had a link up.
     #[must_use]
     pub fn boot_of(&self, node: NodeId) -> Option<BootId> {
-        self.net().and_then(|net| net.boot_of(node))
+        let inner = self.lock();
+        if let Some(boot) = inner.boots.get(&node) {
+            return Some(*boot);
+        }
+        let net = inner.net.clone();
+        drop(inner);
+        net.and_then(|net| net.boot_of(node))
     }
 
     /// The process links for `to` when this process does not run it.
@@ -269,9 +281,9 @@ mod tests {
         let (tx1, rx1) = mpsc::channel();
         let (tx2, rx2) = mpsc::channel();
         let (tx3, rx3) = mpsc::channel();
-        links.register(NodeId(1), tx1);
-        links.register(NodeId(2), tx2);
-        links.register(NodeId(3), tx3);
+        links.register(NodeId(1), tx1, crate::host::BOOT);
+        links.register(NodeId(2), tx2, crate::host::BOOT);
+        links.register(NodeId(3), tx3, crate::host::BOOT);
 
         links.drop_direction(NodeId(2), NodeId(1));
         assert_eq!(links.send(NodeId(2), NodeId(1), msg("ack lost")), Ok(()));
@@ -302,5 +314,69 @@ mod tests {
         assert_eq!(links.send(NodeId(3), NodeId(1), msg("after")), Ok(()));
         assert_eq!(got(&rx1), ["after"], "the lost one stays lost");
         assert_eq!(got(&rx3), Vec::<String>::new());
+    }
+
+    /// A-R232 (arch-s2 B1, one source): `boot_of` answers a node this process runs with the boot
+    /// it registered, so an owner whose peers share its `Links` can heal without a handshake. A
+    /// restart registers again and the answer moves with it. A node neither registered nor seen
+    /// on a link has none. Integration (~1 s): a real three-node `Db` on one `Links`.
+    #[test]
+    fn boot_of_answers_each_node_this_process_runs_with_its_registered_boot() {
+        use crate::db::{Db, DbConfig, Timeouts, ALL_NODES, DEFAULT_CLIENT};
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        // The spec holds a resume for 5 s; a restart waits for ready, so cut that short.
+        let fast = rdb_core::contracts::event::Budgets {
+            resume_hold_millis: 50,
+            warn_age_millis: 200,
+            pause_age_millis: 400,
+            ..rdb_core::contracts::event::Budgets::SPEC_DEFAULTS
+        };
+        let config = DbConfig {
+            dir: dir.path().to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast))
+            .expect("open");
+        for node in ALL_NODES {
+            let boot = db.boot_of(node);
+            assert!(boot.is_some(), "the Db runs node {}", node.0);
+            assert_eq!(db.links().boot_of(node), boot, "node {}", node.0);
+        }
+        db.wait_ready(crate::host::test_patience(std::time::Duration::from_secs(
+            30,
+        )))
+        .expect("ready before the restart");
+        let restarted = db.restart_node(NodeId(2)).expect("restart node 2");
+        assert_eq!(
+            db.links().boot_of(NodeId(2)),
+            Some(restarted),
+            "the restart's boot"
+        );
+        assert_eq!(db.links().boot_of(NodeId(9)), None, "nobody runs node 9");
+        db.shutdown();
+
+        let links = Links::new();
+        let (tx, _rx) = mpsc::channel();
+        links.register(NodeId(1), tx.clone(), BootId(7));
+        links.register(NodeId(1), tx, BootId(8));
+        assert_eq!(
+            links.boot_of(NodeId(1)),
+            Some(BootId(8)),
+            "registering again replaces"
+        );
     }
 }

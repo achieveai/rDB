@@ -25,11 +25,12 @@ use std::time::Duration;
 
 use config_core::{
     Capabilities, ConfigError, ConfigStore, DeleteRequest, GetRequest, GetResponse, ListPage,
-    ListRequest, ListResponse, MutationResponse, PageRequest, PutRequest, WatchItem,
-    WatchRequest, WatchStream,
+    ListRequest, ListResponse, MutationResponse, PageRequest, PutRequest, WatchItem, WatchRequest,
+    WatchStream,
 };
 use futures::Stream;
 use rdb_core::contracts::ids::NodeId;
+use tracing::Instrument;
 
 use super::wire::Label;
 
@@ -201,7 +202,8 @@ impl Faults {
                 }
                 tokio::time::sleep(POLL).await;
             }
-        })
+        }
+        .instrument(tracing::Span::current()))
     }
 }
 

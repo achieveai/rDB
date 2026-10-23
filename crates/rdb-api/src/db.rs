@@ -8349,7 +8349,7 @@ mod tests {
         );
 
         let (remote, mailbox) = std::sync::mpsc::channel();
-        db.links().register(OWNER, remote);
+        db.links().register(OWNER, remote, crate::host::BOOT);
         let unanswered = db.put(b"a", b"1", None).expect_err("nothing answers");
         assert_eq!(unanswered.error.name(), "UNAVAILABLE", "{unanswered:?}");
         let sent: Vec<_> = mailbox
