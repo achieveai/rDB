@@ -3509,8 +3509,10 @@ impl Host {
     /// Ruling A-R185 (critic-d7fix (c), C2, C3, C6): this copy landed `result` outside its
     /// barrier, so it does not hold the new generation. When it holds its newest older
     /// generation exactly through the cutoff, with the cutoff digest there, it links the new
-    /// generation onto it at the cutoff with [`Self::inherit_missed_link`]'s guards, and answers
-    /// the `CopyCaughtUp` to send: caught up at the cutoff, nothing to copy. Otherwise it writes
+    /// generation onto it at the cutoff ([`Self::land_at`]), and answers the `CopyCaughtUp` to
+    /// send: caught up at the cutoff, nothing to copy. When it holds less (arm 3, A-R224 item
+    /// 3) it links at its own head, logged `land_link_behind`, gets a receiver there, and
+    /// answers nothing: its `Recovered` asks the primary for the rest. Otherwise it writes
     /// nothing, sends nothing and logs `land_link_refused{reason}`; the partition's writes then
     /// stay paused until the database is opened again. Called once per (partition, generation):
     /// `landed` dedups the landing.
@@ -3575,17 +3577,31 @@ impl Host {
             base_seq: cutoff,
             base_digest: digest,
         };
-        match self.inherit_missed_link(partition, anchor) {
-            Ok(from) => {
+        match self.land_at(partition, anchor) {
+            Ok((from, head, at)) => {
                 self.land_linked.insert((partition, generation));
-                tracing::info!(
-                    node,
-                    partition = partition.0,
-                    from = from.0,
-                    to = generation.0,
-                    base = cutoff.0,
-                    "land_link_inherited"
-                );
+                // Arm 3 (arch-s2, A-R224 item 3): behind the cutoff, linked at its own head.
+                let behind = head < cutoff;
+                if behind {
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        from = from.0,
+                        to = generation.0,
+                        head = head.0,
+                        base = cutoff.0,
+                        "land_link_behind"
+                    );
+                } else {
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        from = from.0,
+                        to = generation.0,
+                        base = cutoff.0,
+                        "land_link_inherited"
+                    );
+                }
                 // No frame of the new generation reaches R1 before `Recovered` (pushed after
                 // this), so the receiver installed here sees nothing before it re-anchors.
                 let held = self.replication.receiver(self.node, partition);
@@ -3611,8 +3627,8 @@ impl Host {
                         own: copy,
                         lineage,
                         head: Head {
-                            seq: cutoff,
-                            digest,
+                            seq: head,
+                            digest: at,
                         },
                         durable: DurableSeq(durable),
                     });
@@ -3623,7 +3639,7 @@ impl Host {
                                 node,
                                 partition = partition.0,
                                 generation = generation.0,
-                                head = cutoff.0,
+                                head = head.0,
                                 durable,
                                 "land_receiver_installed"
                             );
@@ -3640,13 +3656,15 @@ impl Host {
                         }
                     }
                 }
-                Some(RecoveryEvent::CopyCaughtUp {
+                // Behind, it is not caught up: its `Recovered` re-anchors the receiver at its
+                // head under the root and R1 sends the rest, older-stamped, then reports it.
+                (!behind).then_some(RecoveryEvent::CopyCaughtUp {
                     copy,
                     head: cutoff,
                     digest,
                 })
             }
-            Err(reason) => refused(reason.trim_start_matches("missed_generation_")),
+            Err(reason) => refused(reason),
         }
     }
 
@@ -5030,6 +5048,53 @@ impl Host {
             Ok(Inherited::Linked | Inherited::AlreadyInherited) => Ok(from),
             Ok(Inherited::Copied { .. }) => Err("missed_generation_copied"),
             Err(_) => Err("missed_generation_link_refused"),
+        }
+    }
+
+    /// Where a copy that landed a commit outside its barrier links the new generation
+    /// (arch-s2 `land_at`, A-R224): at its own head of its newest older generation, when that
+    /// head is at or below the anchor's base. At the base, the digest there must be the
+    /// anchor's (arm 2). Below it (arm 3), the digest at its head is not checked here: the
+    /// `Recovered` that follows re-anchors the receiver at that head, and R1's prefix lookup
+    /// answers `Match` (catch-up, older-stamped records) or `Differs` (named divergence, arm 6).
+    /// Answers the generation linked from, the head and the digest there. A refusal writes
+    /// nothing and names its reason, as [`Self::inherit_missed_link`] does; that one stays the
+    /// survivor's exact-base guard (A-R177), and this one is never called from `survivor`.
+    fn land_at(
+        &mut self,
+        partition: PartitionId,
+        anchor: LineageAnchor,
+    ) -> Result<(Generation, Seq, Digest), &'static str> {
+        let to = anchor.lineage.generation;
+        let base = anchor.base_seq;
+        let from = self
+            .engine
+            .lineages()
+            .into_iter()
+            .filter(|(p, g)| *p == partition && *g < to)
+            .map(|(_, g)| g)
+            .max()
+            .ok_or("anchor_generation_absent")?;
+        let head = Seq(self.engine.buffered_applied(partition, from).0);
+        if head > base {
+            return Err("held_past_base");
+        }
+        let at = if head == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, from, head)?.1
+        };
+        if head == base && at != anchor.base_digest {
+            return Err("base_digest_differs");
+        }
+        if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
+            return Err("link_depth_ceiling");
+        }
+        self.views.remove(&partition);
+        match self.engine.inherit(partition, from, to, head) {
+            Ok(Inherited::Linked | Inherited::AlreadyInherited) => Ok((from, head, at)),
+            Ok(Inherited::Copied { .. }) => Err("copied"),
+            Err(_) => Err("link_refused"),
         }
     }
 

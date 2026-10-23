@@ -356,6 +356,65 @@ fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links
     );
 }
 
+/// Arm 3 (arch-s2 `land_at`, A-R224 item 3): a copy that lands a commit outside its barrier
+/// while it holds less than the cutoff links the new generation at its own head, gets a
+/// receiver there, and answers nothing to send: its `Recovered` asks the primary for the
+/// rest. Cut: `land_at` refuses below the base, as slice 1 did; nothing links, red. Unit,
+/// about 2.5 s (the trio's bootstrap window).
+#[config_log::retcd_test]
+fn a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head() {
+    const METHOD: &str =
+        "a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head";
+    let full = config_testkit::fs::temp_dir();
+    let digests = write_chain(
+        &mut RocksEngine::open(full.path().join("node")).expect("open engine"),
+        Generation(1),
+        2,
+    );
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        1,
+    );
+    let result = landing_at(2, digests[1]);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    assert_eq!(
+        host.land_link(PartitionId(1), &result),
+        None,
+        "not caught up"
+    );
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(2)),
+        Some(rdb_storage::Link {
+            parent: Generation(1),
+            base: Seq(1),
+            copied: false,
+        })
+    );
+    let receiver = host
+        .replication
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("a receiver at its head");
+    assert_eq!(
+        (
+            receiver.lineage().generation,
+            receiver.applied_head().seq,
+            receiver.applied_head().digest
+        ),
+        (Generation(2), Seq(1), digests[0])
+    );
+    let behind: Vec<_> = logged!(METHOD, "land_link_behind")
+        .into_iter()
+        .map(|line| (line["head"].clone(), line["base"].clone()))
+        .collect();
+    assert_eq!(behind, [(1, 2)].map(|(h, b)| (h.into(), b.into())));
+    assert!(logged!(METHOD, "land_link_refused").is_empty());
+    assert_eq!(host.fault, None);
+}
+
 /// review-r185 ADV2 and ADV3: the refusals no row reached, each by name and at its level.
 /// A copy holding no older generation has nothing to link, which is expected on a first
 /// landing, so it logs at info. One already holding the new generation, or one the pin
