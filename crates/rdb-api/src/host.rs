@@ -8242,6 +8242,17 @@ mod tests {
             assert_eq!(fired.scheduled_at, *at, "fence {fence}");
             versions.push(current.0);
 
+            // D15: A1 re-arms `Acquire` only when a poll does not acquire. While the store is
+            // down every poll reads `Unavailable` and re-arms, so wait for that before the store
+            // returns. Otherwise a first poll that comes after the old grant expires acquires at
+            // once, and the version stays 0 (seen under load). Versions never fall in a boot,
+            // so the second fence's version is above 0 by construction.
+            if fence == 1 {
+                trio.until("A1 re-armed Acquire during the outage", |trio| {
+                    let host = &trio.nodes[0].0;
+                    (host.authority.timer_version(AuthorityTimer::Acquire) > current).then_some(())
+                });
+            }
             trio.mem.stop_failing();
             trio.until("node 1 holds a grant again", |trio| {
                 (trio.status(0).admits == Some(true)).then_some(())

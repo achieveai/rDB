@@ -6006,7 +6006,12 @@ mod tests {
     /// Generation 3 is committed fully protected (F1 `Committed`, the mode `Active`), not a
     /// generation 4, with nothing stalled; node 1 admits within patience; a=1 reads back; b=2
     /// lands; and every copy then holds the same applied seq, durable. No fault, no failed heal.
-    fn d7_active_at_3(db: &Db, case: &str) {
+    ///
+    /// Ordered (ruling A-R197, critic D12 A3): b=2 is put only after node 1 logged generation 3
+    /// `recovered mode=Active`, so a put that lands between the first resume and the activation
+    /// re-emit cannot pass it. After the put, node 1 has logged no `set_admission allow=false`
+    /// since that line: the re-emit did not pause lag protection.
+    fn d7_active_at_3(db: &Db, method: &str, case: &str) {
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let deadline = std::time::Instant::now() + patience;
         loop {
@@ -6038,7 +6043,29 @@ mod tests {
             Some(Bytes::from_static(b"1")),
             "{case}: a=1 reads back"
         );
-        let put = db.put(b"b", b"2", None).expect("put b=2");
+        let activated = |lines: &[serde_json::Value]| {
+            lines.iter().position(|line| {
+                line["@m"] == "recovered"
+                    && line["node"] == 1
+                    && line["generation"] == 3
+                    && line["mode"] == "Active"
+            })
+        };
+        while activated(&config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            method,
+        ))
+        .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: node 1 never logged generation 3 recovered mode=Active"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let put = db
+            .put(b"b", b"2", None)
+            .unwrap_or_else(|e| panic!("{case}: put b=2 after the activation re-emit: {e}"));
         loop {
             let holds: Vec<_> = db
                 .node_status()
@@ -6058,6 +6085,18 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+        let active = activated(&lines).expect("logged above");
+        let paused: Vec<_> = lines[active..]
+            .iter()
+            .filter(|line| {
+                line["@m"] == "set_admission" && line["node"] == 1 && line["allow"] == false
+            })
+            .collect();
+        assert!(
+            paused.is_empty(),
+            "{case}: lag protection paused after the activation re-emit: {paused:?}"
+        );
     }
 
     /// Node 2's lines, in order, among `inventory_reported` for generation 2, its first
@@ -6125,7 +6164,7 @@ mod tests {
             Duration::from_millis(2 * window),
         );
         let mut db = open_held(&rt, dir.path(), &store, Vec::new());
-        d7_active_at_3(&db, "answer-first");
+        d7_active_at_3(&db, METHOD, "answer-first");
         db.shutdown();
         node_2_followed_after_the_pin(METHOD);
 
@@ -6190,7 +6229,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         db.links().heal(NodeId(1), NodeId(2));
-        d7_active_at_3(&db, "land-first");
+        d7_active_at_3(&db, METHOD, "land-first");
         db.shutdown();
         node_2_followed_after_the_pin(METHOD);
 
@@ -6287,7 +6326,7 @@ mod tests {
             owner.authority.starts_with("held(") && owner.authority != held.authority
         });
         db.links().heal(NodeId(1), NodeId(2));
-        d7_active_at_3(&db, "after the grant came back and the heal");
+        d7_active_at_3(&db, METHOD, "after the grant came back and the heal");
         db.shutdown();
         drop(db);
 
