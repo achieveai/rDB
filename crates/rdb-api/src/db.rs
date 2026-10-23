@@ -5621,9 +5621,12 @@ mod tests {
     /// the one step that helps: the reopen step for `Blocked`, the A-R196(2b) text for
     /// `Quarantined`. A healthy node 1's refusal is unchanged. Node 1 is a stub that answers
     /// every look with the phase and holds every call unanswered, so each call times out. The
-    /// row looks once with `wait_ready` first, as an app does after an open.
-    /// Cut: `explained` adds nothing, and the stuck cases equal the healthy one.
-    /// Unit (~2 s): no node thread.
+    /// row looks with `wait_ready` first, as an app does after an open. The stub sits on its
+    /// first look past the read timeout, as a host no thread ran for did (k429), so the row
+    /// looks until one is answered (A-R257).
+    /// Cuts: `explained` adds nothing, and the stuck cases equal the healthy one; one
+    /// `wait_ready(50 ms)` look, and the stuck cases lose their step.
+    /// Unit (~3 s): no node thread.
     #[test]
     fn m10_r200_a_stuck_recovery_names_its_state_and_step_on_each_refusal() {
         let refusals = |recovery: Option<String>| {
@@ -5652,17 +5655,35 @@ mod tests {
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
                 let mut held = Vec::new();
+                let mut stalled = false;
                 while let Ok(msg) = mailbox.recv() {
                     match msg {
                         Msg::Inspect { reply, .. } => {
+                            // The first look outlasts the read timeout, as on a starved host.
+                            if !stalled {
+                                stalled = true;
+                                std::thread::sleep(Duration::from_millis(300));
+                            }
                             let _ = reply.send(status.clone());
                         }
                         other => held.push(other),
                     }
                 }
             });
-            // The look the app makes after an open; the refusals read what it found.
-            let _ = db.wait_ready(Duration::from_millis(50));
+            // The look the app makes after an open; the refusals read what it found. A look
+            // nothing answered in time found nothing, so the row looks again within its
+            // patience, as an app told `TimedOut` in phase "unknown" would (A-R257).
+            let patience = crate::host::test_patience(Duration::from_secs(5));
+            let deadline = std::time::Instant::now() + patience;
+            while matches!(
+                db.wait_ready(Duration::from_millis(50)),
+                Err(ReadyError::TimedOut { phase, .. }) if phase == NO_ANSWER
+            ) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "node 1 answered no look within {patience:?}"
+                );
+            }
             let put = db
                 .put(b"a", b"1", None)
                 .expect_err("nothing answers the compile")
