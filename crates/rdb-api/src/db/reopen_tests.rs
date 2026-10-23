@@ -2237,6 +2237,59 @@ fn m10_s2_a_non_owner_node_process_opens_its_copy_without_a_heal() {
     );
 }
 
+/// The lr up race (arch-s2 B1 case 2): node 3's process starts after the owner's reopen has
+/// moved the database to generation 2 and the open counter marks it activated. Its copy still
+/// holds only what came before, so it is behind, not stale: the open passes as joining, runs
+/// node 3 without a heal, and logs `db_open_joining`. Cut: no joining branch, and this open is
+/// refused `Stale` ("the open counter marks generation 2 activated").
+/// Integration (~2 s): one fresh open until ready, one reopen until ready, one node-process
+/// open.
+#[config_log::retcd_test]
+fn m10_s2_a_node_process_whose_copy_is_behind_an_activated_generation_joins() {
+    const METHOD: &str = "m10_s2_a_node_process_whose_copy_is_behind_an_activated_generation_joins";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let third = dir.path().join("nodes").join("3");
+    let behind = config_testkit::fs::temp_dir();
+    copy_dir(&third, behind.path());
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the reopen is ready");
+    db.put(b"b", b"2", None).expect("a put at generation 2");
+    db.shutdown();
+    drop(db);
+    let instance = marker(dir.path(), 1).expect("the copies are bound");
+    let (count, _) = rt
+        .block_on(admin::read_count(&*store, &instance))
+        .expect("the counter");
+    assert_eq!(
+        (stored_generation(&rt, &store), count.activated),
+        (Some(2), Generation(2)),
+        "partitions/1 names generation 2 and the counter marks it activated"
+    );
+
+    std::fs::remove_dir_all(&third).expect("remove node 3's copy");
+    copy_dir(behind.path(), &third);
+    let mut db = open_node(&rt, dir.path(), &store, &[3]).expect("node 3's process joins");
+    let running: Vec<NodeId> = lock(&db.nodes).iter().map(|handle| handle.node).collect();
+    assert_eq!(running, vec![NodeId(3)], "it runs node 3 only");
+    db.shutdown();
+    let joined: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "db_open_joining")
+        .collect();
+    assert_eq!(joined.len(), 1, "{joined:?}");
+    assert_eq!(joined[0]["generation"], 2, "{joined:?}");
+    let logged = messages(METHOD);
+    assert!(
+        !logged.iter().any(|m| m == "db_open_rolled_forward"),
+        "a joining copy is not rolled forward: {logged:?}"
+    );
+}
+
 /// A-R231(a): `DbConfig::local` names each of nodes 1-3 at most once, and a `Db` that runs no
 /// node needs `links`. Each is refused before anything opens. Unit (~10 ms).
 #[config_log::retcd_test]

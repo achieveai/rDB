@@ -351,6 +351,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Fault { .. }
         | Msg::Activated { .. }
         | Msg::Inject { .. }
+        | Msg::PeerBooted { .. }
         | Msg::Stop) => return Err(Box::new((WireError::LocalOnly(local_name(&local)), local))),
     };
     Ok(Outbound::Plain(plain))
@@ -362,6 +363,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Fault { .. } => "Fault",
         Msg::Activated { .. } => "Activated",
         Msg::Inject { .. } => "Inject",
+        Msg::PeerBooted { .. } => "PeerBooted",
         Msg::Stop => "Stop",
         _ => "a peer message",
     }

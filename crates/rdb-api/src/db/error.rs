@@ -269,33 +269,33 @@ pub(super) fn wire_name(kind: ErrorKind) -> String {
 // `db.rs`. Each ends with the step embed.md section 6 gives for it, after `; next: `.
 // W5 wired every one of them (host.rs for `corrupt_history`).
 
-/// What `wait_ready` last saw of node 1, for [`ready_timed_out_text`].
+/// What `wait_ready` last saw of the owner, for [`ready_timed_out_text`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadySeen<'a> {
-    /// Node 1 answered no status look in the time: it may be busy, for example syncing its
+    /// The owner answered no status look in the time: it may be busy, for example syncing its
     /// copies to the barrier. Never "unknown": that read as a fault (tester-s2, #59).
     NoAnswer,
-    /// Node 1 answered and runs no recovery.
+    /// The owner answered and runs no recovery.
     NoRecovery,
-    /// Node 1's recovery phase, as it names it.
+    /// The owner's recovery phase, as it names it.
     Phase(&'a str),
 }
 
-/// `ReadyError::TimedOut`'s text.
-pub(crate) fn ready_timed_out_text(within_ms: u128, seen: ReadySeen<'_>) -> String {
+/// `ReadyError::TimedOut`'s text. It names the node `wait_ready` asked, the owner, which is not
+/// node 1 after a promote (A-R256), and its step is in plain words, not an API name.
+pub(crate) fn ready_timed_out_text(within_ms: u128, owner: u32, seen: ReadySeen<'_>) -> String {
     let state = match seen {
-        ReadySeen::NoAnswer => {
-            "node 1 answered no status look in that time (it may be busy, for example syncing \
-             its copies)"
-                .to_owned()
-        }
-        ReadySeen::NoRecovery => "node 1 runs no recovery".to_owned(),
-        ReadySeen::Phase(phase) => format!("node 1's recovery phase is {phase}"),
+        ReadySeen::NoAnswer => format!(
+            "node {owner} answered no status look in that time (it may be busy, for example \
+             syncing its copies)"
+        ),
+        ReadySeen::NoRecovery => format!("node {owner} runs no recovery"),
+        ReadySeen::Phase(phase) => format!("node {owner}'s recovery phase is {phase}"),
     };
     format!(
-        "node 1 did not admit writes within {within_ms} ms; {state}; next: call `wait_ready` \
-         again with a longer bound, or shut this Db down and open the folder again, once; if \
-         that times out too, stop and report it with this message"
+        "node {owner} did not admit writes within {within_ms} ms; {state}; next: wait again for \
+         longer, or close the database and open its folder again, once; if that times out too, \
+         stop and report it with this message"
     )
 }
 
@@ -467,9 +467,9 @@ mod tests {
     #[test]
     fn every_open_and_wait_text_ends_with_a_next_step() {
         let texts = [
-            ready_timed_out_text(5_000, ReadySeen::NoAnswer),
-            ready_timed_out_text(5_000, ReadySeen::NoRecovery),
-            ready_timed_out_text(5_000, ReadySeen::Phase("Fencing")),
+            ready_timed_out_text(5_000, 2, ReadySeen::NoAnswer),
+            ready_timed_out_text(5_000, 2, ReadySeen::NoRecovery),
+            ready_timed_out_text(5_000, 2, ReadySeen::Phase("Fencing")),
             not_this_store_text("the copies hold data, but the store has no partitions/1"),
             copies_disagree_text("aa, bb"),
             counter_exhausted_text("opens/x", 8),
