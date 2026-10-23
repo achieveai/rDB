@@ -58,7 +58,7 @@ use rdb_core::contracts::recovery::{
     SurvivorInventory,
 };
 use rdb_core::contracts::storage::{
-    CapturedPrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
+    CapturedPrefix, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
 };
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -1933,32 +1933,54 @@ impl Host {
     }
 
     /// The host flusher: every lineage the engine holds, through its applied prefix.
+    ///
+    /// A-R192b: when every lineage is already durable through its applied prefix, the sync
+    /// would move nothing, so the fsync is skipped. `Flushed` still goes out, carrying the
+    /// durable marks the engine holds, which are what that sync would have returned: every
+    /// durability proof sees the same event either way. Only this duty skips; a
+    /// `StoreEffect::Flush`, a barrier `SyncWalThrough` and a holder's sync always sync.
     fn flush_duty(&mut self) -> Result<(), Fault> {
-        let captured: Vec<CapturedPrefix> = self
-            .engine
-            .lineages()
-            .into_iter()
-            .map(|(partition, generation)| CapturedPrefix {
-                partition,
-                generation,
-                through: self.engine.buffered_applied(partition, generation),
-            })
-            .collect();
-        if captured.is_empty() {
+        let lineages = self.engine.lineages();
+        if lineages.is_empty() {
             return Ok(());
         }
+        let synced = lineages.iter().any(|&(partition, generation)| {
+            self.engine.durable(partition, generation).0
+                < self.engine.buffered_applied(partition, generation).0
+        });
         let ticket = FlushTicket(self.next_ticket);
         self.next_ticket += 1;
         let started = Instant::now();
-        let kind = match self.engine.sync_wal_through(captured) {
-            Ok(durable) => StorageEvent::Flushed { ticket, durable },
-            Err(fault) => StorageEvent::FlushFailed { ticket, fault },
+        let kind = if synced {
+            let captured = lineages
+                .into_iter()
+                .map(|(partition, generation)| CapturedPrefix {
+                    partition,
+                    generation,
+                    through: self.engine.buffered_applied(partition, generation),
+                })
+                .collect();
+            match self.engine.sync_wal_through(captured) {
+                Ok(durable) => StorageEvent::Flushed { ticket, durable },
+                Err(fault) => StorageEvent::FlushFailed { ticket, fault },
+            }
+        } else {
+            let durable = lineages
+                .into_iter()
+                .map(|(partition, generation)| DurablePrefix {
+                    partition,
+                    generation,
+                    through: self.engine.durable(partition, generation),
+                })
+                .collect();
+            StorageEvent::Flushed { ticket, durable }
         };
         if self.flushed_once {
             tracing::debug!(
                 node = self.node.0,
                 kind = "flush",
                 ticket = ticket.0,
+                synced,
                 millis = millis(started),
                 "host_duty"
             );
@@ -1968,6 +1990,7 @@ impl Host {
                 node = self.node.0,
                 kind = "flush",
                 ticket = ticket.0,
+                synced,
                 period_ms = HOST_FLUSH_EVERY_MILLIS,
                 "host_duty"
             );
@@ -6602,6 +6625,84 @@ mod tests {
             "no record at seq 1: withheld, never ROOT"
         );
         // Withheld for the missing record, not for a short sync.
+        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+    }
+
+    /// A-R192b: the flush duty syncs only while some lineage is applied past its durable mark.
+    /// Once all are durable through applied, it pushes the same `Flushed` with no fsync: a
+    /// WAL-flush fault armed then stays armed. The next commit makes the duty sync again, and
+    /// the fault fires there. Cut (never skip): the fault fires early. Cut (always skip): the
+    /// first duty leaves seq 1 not durable.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_flush_duty_syncs_only_while_a_lineage_is_applied_past_durable() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let (partition, generation) = (PartitionId(1), Generation(1));
+        let commit = |host: &mut Host, seq: u64| {
+            host.engine
+                .commit(rdb_core::contracts::storage::Batch {
+                    id: rdb_core::contracts::ids::BatchId(seq),
+                    partition,
+                    generation,
+                    seq: Seq(seq),
+                    writes: Vec::new(),
+                })
+                .expect("commit");
+        };
+        let last = |host: &mut Host| {
+            host.queue
+                .pop_back()
+                .map(|queued| queued.event.kind)
+                .expect("the duty pushed an event")
+        };
+        let durable_through = |seq: u64| {
+            EventKind::Storage(StorageEvent::Flushed {
+                ticket: FlushTicket(0),
+                durable: vec![DurablePrefix {
+                    partition,
+                    generation,
+                    through: DurableSeq(seq),
+                }],
+            })
+        };
+        let without_ticket = |kind: EventKind| match kind {
+            EventKind::Storage(StorageEvent::Flushed { durable, .. }) => {
+                EventKind::Storage(StorageEvent::Flushed {
+                    ticket: FlushTicket(0),
+                    durable,
+                })
+            }
+            other => other,
+        };
+
+        commit(&mut host, 1);
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+
+        host.engine
+            .inject_fault(rdb_storage::InjectedFault::WalFlush);
+        host.flush_duty().expect("flush");
+        assert_eq!(
+            host.engine.armed_fault(),
+            Some(rdb_storage::InjectedFault::WalFlush),
+            "nothing to sync: no fsync"
+        );
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+
+        commit(&mut host, 2);
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.armed_fault(), None, "seq 2 needed a sync");
+        assert!(
+            matches!(
+                last(&mut host),
+                EventKind::Storage(StorageEvent::FlushFailed { .. })
+            ),
+            "the armed fault failed that sync"
+        );
         assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
     }
 
