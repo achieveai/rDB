@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! cargo run --release -p rdb-api --example rdb_bench -- --dir D --log-dir L
-//!     [--dataset K] [--rate R] [--minutes M] [--keys K] [--value-bytes B] [--keep]
+//!     [--dataset K] [--rate R] [--writers N] [--minutes M] [--keys K] [--value-bytes B] [--keep]
+//!     [--no-history]
 //! cargo run --release -p rdb-api --example rdb_bench -- --build-dataset K --log-dir L
 //!     [--dataset-root P]
 //! ```
@@ -19,9 +20,14 @@
 //!
 //! Every minute it prints, and logs as `bench_minute`, the writes answered in that minute, the
 //! rate, p50, p99 and max of the put call in milliseconds, refusals by §5.4 name, and the
-//! process's resident memory. The first refusal of each name is printed and logged as
-//! `bench_first_refusal` with the count of writes that published before it. The end prints the
-//! whole run the same way, as `bench_total`.
+//! process's resident memory. Every refusal is logged as `bench_refusal` (its name, writer,
+//! request id and the count of writes that published before it); the first of each name is
+//! also printed. The end prints the whole run the same way, as `bench_total`.
+//!
+//! `--writers N` (lead, M10 S2): N threads share the one `Db`, each with one put in flight and
+//! a slot every `N / R` seconds, so together they offer `R`. Writer `w` puts
+//! `bench/<(i * N + w) mod K>`. The partition still runs one transaction at a time (spec §5.2);
+//! the others wait in its queue.
 //!
 //! A slot more than one second late is not caught up: the schedule restarts from now, and the
 //! slip is counted (`slips`), so a stall shows as a lower rate, never as a burst after it.
@@ -38,6 +44,13 @@
 //! refused: rebuild it with `--build-dataset K`, which replaces one of another format and
 //! refuses to touch a folder without a `STAMP`.
 //!
+//! **Memory split** (lead, M10 S2). Each minute also shows `heap_mb`, the live bytes Rust code
+//! holds (a counting global allocator; RocksDB's C++ heap is not in it), and `wal_mb`, the
+//! three copies' write-ahead logs on disk, which is what their memtables hold until a flush.
+//! At start it measures what one entry costs in each per-write index (`bench_struct_costs`):
+//! the digest ladder, the dedup index and the status index. `--no-history` skips the History
+//! sampler, whose read-only open replays the WAL in this process and so adds to `rss_mb`.
+//!
 //! Exit 0 when every write published (or the dataset was built), 1 when any was refused or the
 //! open failed, 2 on bad arguments. `--dir` is removed at the end unless `--keep`; a dataset is
 //! kept on purpose.
@@ -46,12 +59,13 @@
 #[allow(dead_code)] // `rdb_bench` uses only the leader-following store, none of its faults.
 mod hostile_store;
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -62,6 +76,55 @@ use rdb_api::{AffinityId, Db, DbConfig, Timeouts, TxnPut};
 use rdb_storage::keys::FORMAT_VERSION;
 
 use hostile_store::HostileStore;
+
+/// Live bytes allocated through Rust's allocator. RocksDB's C++ allocations bypass it.
+static HEAP: AtomicI64 = AtomicI64::new(0);
+
+/// The system allocator, counting live bytes into [`HEAP`].
+struct Counting;
+
+// SAFETY: every call forwards to `System` with the caller's own arguments; the counter is a
+// relaxed atomic and touches no allocation.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            HEAP.fetch_add(layout.size() as i64, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc_zeroed(layout);
+        if !p.is_null() {
+            HEAP.fetch_add(layout.size() as i64, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        HEAP.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            HEAP.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// Live Rust heap in MB.
+fn heap_mb() -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let mb = HEAP.load(Ordering::Relaxed) as f64 / 1_048_576.0;
+    mb
+}
 
 /// The control voters' Raft timers, as `rdb_dev` runs them.
 const CONTROL_TIMERS: TestTimers = TestTimers {
@@ -84,19 +147,23 @@ struct Args {
     dir: PathBuf,
     log_dir: PathBuf,
     rate: u32,
+    writers: u32,
     minutes: f64,
     keys: Option<u64>,
     value_bytes: usize,
     keep: bool,
+    no_history: bool,
     dataset: Option<u64>,
     build: Option<u64>,
     root: PathBuf,
 }
 
 fn usage() -> &'static str {
-    "usage: rdb_bench --dir D --log-dir L [--dataset K] [--rate R] [--minutes M] [--keys K] \
-     [--value-bytes B] [--keep]\n       rdb_bench --build-dataset K --log-dir L [--dataset-root P]\n  \
-     --rate 0 sends back to back; default 100. --minutes default 1 (fractions allowed).\n"
+    "usage: rdb_bench --dir D --log-dir L [--dataset K] [--rate R] [--writers N] [--minutes M] \
+     [--keys K] [--value-bytes B] [--keep] [--no-history]\n       \
+     rdb_bench --build-dataset K --log-dir L [--dataset-root P]\n  \
+     --rate 0 sends back to back; default 100. --minutes default 1 (fractions allowed).\n  \
+     --writers N: N threads share the rate, each with one write in flight; default 1.\n"
 }
 
 fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -106,10 +173,12 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
         dir: PathBuf::new(),
         log_dir: PathBuf::new(),
         rate: 100,
+        writers: 1,
         minutes: 1.0,
         keys: None,
         value_bytes: 100,
         keep: false,
+        no_history: false,
         dataset: None,
         build: None,
         root: PathBuf::from("C:/rdb_test_data/bench"),
@@ -120,6 +189,10 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
             "--dir" => dir = Some(PathBuf::from(value("--dir")?)),
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
             "--rate" => args.rate = number(&value("--rate")?, "--rate")?,
+            "--writers" => {
+                let n = positive(&value("--writers")?, "--writers")?;
+                args.writers = u32::try_from(n).map_err(|_| format!("--writers {n}: too many"))?;
+            }
             "--minutes" => {
                 let text = value("--minutes")?;
                 args.minutes = text
@@ -133,6 +206,7 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.value_bytes = number(&value("--value-bytes")?, "--value-bytes")?
             }
             "--keep" => args.keep = true,
+            "--no-history" => args.no_history = true,
             "--dataset" => args.dataset = Some(positive(&value("--dataset")?, "--dataset")?),
             "--build-dataset" => {
                 args.build = Some(positive(&value("--build-dataset")?, "--build-dataset")?);
@@ -174,6 +248,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Before any other thread starts, so the heap counter sees only these structures.
+    let costs = struct_costs();
     let mut config = config_log::LogConfig::for_application("rdb_bench");
     config.dir.clone_from(&args.log_dir);
     config.file_name = "rdb_bench.jsonl".to_string();
@@ -185,6 +261,17 @@ fn main() -> ExitCode {
         }
     };
     eprintln!("log={}", args.log_dir.join("rdb_bench.jsonl").display());
+    tracing::info!(
+        ladder_bytes = costs.ladder,
+        dedup_bytes = costs.dedup,
+        status_bytes = costs.status,
+        entries = COST_ENTRIES,
+        "bench_struct_costs"
+    );
+    println!(
+        "heap bytes per entry: digest ladder {:.1}, dedup index {:.1}, status index {:.1}",
+        costs.ladder, costs.dedup, costs.status
+    );
     if std::env::var_os("RETCD_TEST_PORT_RANGE").is_none() {
         std::env::set_var("RETCD_TEST_PORT_RANGE", "19500-19999");
     }
@@ -201,6 +288,105 @@ fn main() -> ExitCode {
     };
     drop(guard);
     code
+}
+
+/// Entries [`struct_costs`] inserts into each index: sequential keys, as a run writes them.
+const COST_ENTRIES: u32 = 100_000;
+
+/// Heap bytes one entry costs in each per-write index.
+struct Costs {
+    ladder: f64,
+    dedup: f64,
+    status: f64,
+}
+
+/// What one entry costs, measured with the counting allocator: a `DigestLadder` rung (every
+/// copy adds one per write), a `DedupIndex` entry (T1, one per write) and a `StatusIndex`
+/// entry (P1, one per write). Runs single-threaded, before the logger or the cluster starts.
+fn struct_costs() -> Costs {
+    use rdb_core::contracts::authority::Lineage;
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::ids::{
+        ClientId, Generation, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Seq, TenantId,
+    };
+    use rdb_core::contracts::publication::{StatusEntry, StatusOutcome};
+    use rdb_core::contracts::time::Tick;
+    use rdb_core::contracts::txn::{Durability, Outcome, TxnResult};
+    use rdb_core::publication::status::StatusIndex;
+    use rdb_core::replication::progress::DigestLadder;
+    use rdb_core::transaction::dedup::{DedupIndex, Retained, RetainedAnswer};
+
+    let n = u64::from(COST_ENTRIES);
+    let per = |before: i64| {
+        #[allow(clippy::cast_precision_loss)]
+        let bytes = (HEAP.load(Ordering::Relaxed) - before) as f64 / f64::from(COST_ENTRIES);
+        bytes
+    };
+    let identity = |i: u64| RequestIdentity {
+        tenant: TenantId(1),
+        client: ClientId(1),
+        request: RequestId(i),
+    };
+    let (g, partition, epoch) = (Generation(2), PartitionId(1), OwnerEpoch(1));
+
+    let before = HEAP.load(Ordering::Relaxed);
+    let mut ladder = DigestLadder::new();
+    for i in 1..=n {
+        ladder.insert(Seq(i), Digest([7; 32]));
+    }
+    let ladder_cost = per(before);
+    drop(ladder);
+
+    let before = HEAP.load(Ordering::Relaxed);
+    let mut dedup = DedupIndex::default();
+    for i in 1..=n {
+        let result = TxnResult {
+            partition,
+            owner_epoch: epoch,
+            generation: g,
+            seq: Seq(i),
+            outcome: Outcome::Published,
+            durability: Durability::DurableOnRequiredCopies,
+        };
+        let retained = Retained {
+            request_digest: Digest([7; 32]),
+            answer: RetainedAnswer::Applied(result),
+            applied_at_seq: Seq(i),
+        };
+        dedup.insert(g, AffinityId(1), identity(i), retained);
+    }
+    let dedup_cost = per(before);
+    drop(dedup);
+
+    let before = HEAP.load(Ordering::Relaxed);
+    let mut status = StatusIndex::with_cap(g, usize::MAX);
+    let lineage = Lineage {
+        partition,
+        generation: g,
+        owner_epoch: epoch,
+    };
+    for i in 1..=n {
+        let entry = StatusEntry {
+            request: identity(i),
+            lineage,
+            seq: Some(Seq(i)),
+            record_digest: Some(Digest([7; 32])),
+            outcome: StatusOutcome::Unknown,
+            snapshot: None,
+            at: Tick(i),
+        };
+        status
+            .record(entry)
+            .expect("an uncapped index takes every entry");
+    }
+    let status_cost = per(before);
+    drop(status);
+
+    Costs {
+        ladder: ladder_cost,
+        dedup: dedup_cost,
+        status: status_cost,
+    }
 }
 
 /// What a dataset folder's `STAMP` says.
@@ -673,20 +859,114 @@ fn micros_to_ms(micros: u64) -> f64 {
     micros as f64 / 1_000.0
 }
 
+/// What the writers record and the reporter takes once a minute.
+#[derive(Default)]
+struct Shared {
+    minute: Window,
+    minute_slips: u64,
+    slips: u64,
+    published: u64,
+    first_refusal: BTreeMap<String, u64>,
+}
+
+impl Shared {
+    /// This minute's window and slips, and the run's published count; starts a new minute.
+    fn take(&mut self) -> (Window, u64, u64) {
+        let minute = std::mem::take(&mut self.minute);
+        let slips = std::mem::take(&mut self.minute_slips);
+        (minute, slips, self.published)
+    }
+}
+
+/// One writer: client thread `w` of `writers`, one put in flight, a slot every `period` (or
+/// back to back), until `end`. Writer `w` puts `bench/<(i * writers + w) mod keys>`, so writers
+/// touch different objects while `keys` is a multiple of `writers`.
+#[allow(clippy::too_many_arguments)]
+fn writer(
+    db: &Db,
+    w: u32,
+    writers: u64,
+    period: Option<Duration>,
+    keys: u64,
+    value: &[u8],
+    start: Instant,
+    end: Instant,
+    shared: &Mutex<Shared>,
+) {
+    let mut next_slot = start;
+    let mut i: u64 = 0;
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            return;
+        }
+        if let Some(period) = period {
+            if now < next_slot {
+                std::thread::sleep(next_slot - now);
+            } else if now - next_slot > SLIP {
+                next_slot = now;
+                let mut s = shared.lock().expect("no writer panics");
+                s.slips += 1;
+                s.minute_slips += 1;
+            }
+            next_slot += period;
+        }
+        let object = format!("bench/{}", (i * writers + u64::from(w)) % keys);
+        i += 1;
+        let sent = Instant::now();
+        let answer = db.put(object.as_bytes(), value, None);
+        let took = u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let mut s = shared.lock().expect("no writer panics");
+        match answer {
+            Ok(_) => {
+                s.published += 1;
+                s.minute.micros.push(took);
+            }
+            Err(e) => {
+                let kind = e.error.name();
+                let secs = start.elapsed().as_secs_f64();
+                let published = s.published;
+                let request = e.request.as_ref().map(|r| r.identity.request.0);
+                tracing::warn!(
+                    kind = %kind,
+                    writer = w,
+                    request,
+                    published,
+                    secs,
+                    took_ms = micros_to_ms(took),
+                    detail = %e.error.detail,
+                    "bench_refusal"
+                );
+                if !s.first_refusal.contains_key(&kind) {
+                    println!(
+                        "first {kind} (writer {w}) after {published} published writes, \
+                         {secs:.1} s in: {}",
+                        e.error.detail
+                    );
+                    s.first_refusal.insert(kind.clone(), published);
+                }
+                *s.minute.refused.entry(kind).or_default() += 1;
+            }
+        }
+    }
+}
+
 fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
     let value = vec![b'v'; args.value_bytes];
     let period = (args.rate > 0).then(|| Duration::from_secs(1) / args.rate);
     let length = Duration::from_secs_f64(args.minutes * 60.0);
     tracing::info!(
         rate = args.rate,
+        writers = args.writers,
         minutes = args.minutes,
         keys,
         value_bytes = args.value_bytes,
         "bench_start"
     );
     println!(
-        "bench rate={} minutes={} keys={} value_bytes={} pid={}",
+        "bench rate={} writers={} minutes={} keys={} value_bytes={} pid={}",
         args.rate,
+        args.writers,
         args.minutes,
         keys,
         args.value_bytes,
@@ -694,81 +974,54 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
     );
     println!(
         "minute  ok  rate/s  p50ms  p99ms  maxms  refused  slips  rss_mb  published_total  \
-         history_rows  history_mb"
+         history_rows  history_mb  heap_mb  wal_mb"
     );
     sample_rss();
-    sample_history(args.dir.join("db").join("nodes").join("1"));
+    if !args.no_history {
+        sample_history(args.dir.join("db").join("nodes").join("1"));
+    }
+    let nodes = args.dir.join("db").join("nodes");
     let start = Instant::now();
-    let mut next_slot = start;
-    let mut minute = Window::default();
+    let shared = Mutex::new(Shared::default());
     let mut total = Window::default();
     let mut minute_no = 1_u32;
-    let mut minute_end = start + Duration::from_secs(60);
-    let mut published: u64 = 0;
-    let mut slips: u64 = 0;
-    let mut minute_slips: u64 = 0;
-    let mut i: u64 = 0;
-    let mut first_refusal: BTreeMap<String, u64> = BTreeMap::new();
-    let ended_at = loop {
-        let now = Instant::now();
-        if now >= minute_end || now.duration_since(start) >= length {
-            let ended = now.duration_since(start) >= length;
-            let span = if ended {
-                now.duration_since(minute_end - Duration::from_secs(60))
-            } else {
-                Duration::from_secs(60)
-            };
-            report_minute(minute_no, &minute, span, minute_slips, published);
+    let mut minute_start = start;
+    let end = start + length;
+    // Each writer sends at `rate / writers`, so the writers together offer `rate`.
+    let period = period.map(|p| p * args.writers);
+    std::thread::scope(|scope| {
+        for w in 0..args.writers {
+            let (shared, value) = (&shared, &value);
+            let writers = u64::from(args.writers);
+            scope.spawn(move || writer(db, w, writers, period, keys, value, start, end, shared));
+        }
+        loop {
+            let minute_end = minute_start + Duration::from_secs(60);
+            if minute_end >= end {
+                break;
+            }
+            std::thread::sleep(minute_end.saturating_duration_since(Instant::now()));
+            let (minute, slips, published) = shared.lock().expect("no writer panics").take();
+            report_minute(
+                minute_no,
+                &minute,
+                Duration::from_secs(60),
+                slips,
+                published,
+                &nodes,
+            );
             total.add(&minute);
-            minute = Window::default();
-            minute_slips = 0;
             minute_no += 1;
-            minute_end += Duration::from_secs(60);
-            if ended {
-                break now;
-            }
+            minute_start = minute_end;
         }
-        if let Some(period) = period {
-            if now < next_slot {
-                std::thread::sleep(next_slot - now);
-            } else if now - next_slot > SLIP {
-                next_slot = now;
-                slips += 1;
-                minute_slips += 1;
-            }
-            next_slot += period;
-        }
-        let object = format!("bench/{}", i % keys);
-        i += 1;
-        let sent = Instant::now();
-        let answer = db.put(object.as_bytes(), &value, None);
-        let took = u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX);
-        match answer {
-            Ok(_) => {
-                published += 1;
-                minute.micros.push(took);
-            }
-            Err(e) => {
-                let kind = e.error.name();
-                if !first_refusal.contains_key(&kind) {
-                    let secs = start.elapsed().as_secs_f64();
-                    tracing::warn!(
-                        kind = %kind,
-                        published,
-                        secs,
-                        detail = %e.error.detail,
-                        "bench_first_refusal"
-                    );
-                    println!(
-                        "first {kind} after {published} published writes, {secs:.1} s in: {}",
-                        e.error.detail
-                    );
-                    first_refusal.insert(kind.clone(), published);
-                }
-                *minute.refused.entry(kind).or_default() += 1;
-            }
-        }
-    };
+    });
+    // Every writer has stopped: report the last, partial minute.
+    let ended_at = Instant::now();
+    let (minute, minute_slips, published) = shared.lock().expect("no writer panics").take();
+    let span = ended_at.duration_since(minute_start);
+    report_minute(minute_no, &minute, span, minute_slips, published, &nodes);
+    total.add(&minute);
+    let slips = shared.lock().expect("no writer panics").slips;
     let (p50, p99, max) = total.quantiles();
     let secs = ended_at.duration_since(start).as_secs_f64();
     #[allow(clippy::cast_precision_loss)]
@@ -798,16 +1051,20 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
     }
 }
 
-fn report_minute(n: u32, w: &Window, span: Duration, slips: u64, published: u64) {
+fn report_minute(n: u32, w: &Window, span: Duration, slips: u64, published: u64, nodes: &Path) {
     let (p50, p99, max) = w.quantiles();
     #[allow(clippy::cast_precision_loss)]
     let rate = w.micros.len() as f64 / span.as_secs_f64().max(f64::EPSILON);
     let rss = rss_mb();
     let (history_rows, history_mb) = history();
+    let heap = heap_mb();
+    let wal = wal_mb(nodes);
     tracing::info!(
         minute = n,
         history_rows,
         history_mb,
+        heap_mb = heap,
+        wal_mb = wal,
         ok = w.micros.len(),
         rate,
         p50,
@@ -821,10 +1078,32 @@ fn report_minute(n: u32, w: &Window, span: Duration, slips: u64, published: u64)
     );
     println!(
         "{n:>6} {:>4} {rate:>7.1} {p50:>6.2} {p99:>6.2} {max:>6.2} {:>8} {slips:>6} {rss:>7.0} \
-         {published:>16} {history_rows:>13.0} {history_mb:>11.1}",
+         {published:>16} {history_rows:>13.0} {history_mb:>11.1} {heap:>8.1} {wal:>7.1}",
         w.micros.len(),
         w.refused_text()
     );
+}
+
+/// The write-ahead logs (`*.log`) of every copy under `nodes`, in MB: what the copies'
+/// memtables hold until RocksDB flushes them. -1 when the folder cannot be read.
+fn wal_mb(nodes: &Path) -> f64 {
+    let Ok(copies) = std::fs::read_dir(nodes) else {
+        return -1.0;
+    };
+    let mut bytes = 0_u64;
+    for copy in copies.flatten() {
+        let Ok(files) = std::fs::read_dir(copy.path()) else {
+            return -1.0;
+        };
+        for file in files.flatten() {
+            if file.path().extension().is_some_and(|e| e == "log") {
+                bytes += file.metadata().map_or(0, |m| m.len());
+            }
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mb = bytes as f64 / 1_048_576.0;
+    mb
 }
 
 /// This process's resident memory in MB, or -1 when it cannot be read. Slow on Windows (it runs
