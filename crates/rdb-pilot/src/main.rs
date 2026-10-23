@@ -432,6 +432,7 @@ fn run(args: &Args) -> ExitCode {
         }
     };
     let config = DbConfig {
+        ack_floor: true,
         dir: args.dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::ConfigStore;
@@ -50,6 +50,7 @@ use crate::host::{
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
 use crate::transport::Links;
+use ack_floor::AckFloor;
 
 /// The node every S0 call goes to: partition 1's owner.
 const OWNER: NodeId = admin::OWNER;
@@ -103,6 +104,7 @@ pub const MAX_KEY: usize = 1_024;
 /// can still be large.
 pub const MAX_PAGE: usize = 1_000;
 
+mod ack_floor;
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
@@ -181,6 +183,29 @@ pub struct DbConfig {
     /// memtable budget per column family. `StorageOptions::default()` is RocksDB's own, 64 MiB.
     /// A node restarted by [`Db::restart_node`] opens with the same options.
     pub storage: StorageOptions,
+    /// Whether each write tells the owner which of this open's earlier writes the app already
+    /// has its answer for (the client ack floor, M10 S2, rulings A-R252 and A-R267). `true` by
+    /// default. The owner then drops their retained answers, dedup entry and status, in the
+    /// same batch as that write, on every copy. So the dedup cap stops filling at a steady
+    /// write rate, and [`Self::dedup_retention`] need not be lowered to keep writing.
+    ///
+    /// - A write answered `UNKNOWN_OUTCOME`, or refused without `no_mutation`, stays: a later
+    ///   [`Db::status`] or [`Db::resend`] still settles it. At most 8 such writes are kept per
+    ///   `Db`, so per partition (A5); the ninth evicts the oldest, which is logged
+    ///   `ack_floor_pin_evicted` and from then on answers `STATUS_EXPIRED`.
+    /// - A request this `Db` resends after a later write was answered may find its own answer
+    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Submit it as new. While an
+    ///   earlier write of this open is still kept (above), the owner cannot tell such a resend
+    ///   from a new write and applies it: resend only a request whose answer you do not hold.
+    /// - Ids an app chose ([`Db::put_as`], [`Db::txn_as`], [`Db::write_as`]) get no relief:
+    ///   their answers keep the [`Self::dedup_retention`] rule and count against the cap.
+    /// - The floor itself is one dedup entry per open, counted against [`Self::dedup_cap`]: an
+    ///   open writing steadily holds about two (its newest answer and its floor). A cap of 2 or
+    ///   less therefore still fills; use 3 or more.
+    ///
+    /// `false` sends no floor: every answer is kept for [`Self::dedup_retention`], as before
+    /// M10.
+    pub ack_floor: bool,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -398,6 +423,9 @@ pub struct Db {
     clock: HostClock,
     timeouts: Timeouts,
     next_request: AtomicU64,
+    /// This open's ack floor ([`DbConfig::ack_floor`]), and the bound on its write ids. Every
+    /// write id is taken under this lock.
+    ack_floor: Mutex<AckFloor>,
     /// The client this `Db` sends every request as (S2-8): [`DbConfig::client`].
     client: ClientId,
     /// Whether node 1 has been seen admitting writes: by [`Db::node_status`], by a put that
@@ -621,6 +649,23 @@ const fn request_floor(n: u64) -> u64 {
     (n - 1) << 40
 }
 
+/// The ack floor tracker of an open whose first write id is `first` (A-R252): on or off as
+/// [`DbConfig::ack_floor`] says, and carrying a pin for the open's dedup retention.
+fn ack_tracker(config: &DbConfig, budgets: Budgets, first: u64) -> Mutex<AckFloor> {
+    let retention = config
+        .dedup_retention
+        .unwrap_or(Duration::from_millis(budgets.dedup_retention_millis));
+    Mutex::new(AckFloor::new(first, config.ack_floor, retention))
+}
+
+/// The tracker of a `Db` built by hand around nodes, whose ids start at 1: the floor on, as
+/// [`DbConfig::ack_floor`] defaults, with the spec's retention.
+#[cfg(test)]
+fn hand_tracker() -> Mutex<AckFloor> {
+    let retention = Duration::from_millis(Budgets::SPEC_DEFAULTS.dedup_retention_millis);
+    Mutex::new(AckFloor::new(1, true, retention))
+}
+
 /// The file under a process's folder that holds the last boot [`next_boot`] handed out.
 const BOOT_FILE: &str = "boot";
 
@@ -836,6 +881,7 @@ impl Db {
             clock: HostClock::start(),
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
+            ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -983,6 +1029,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
+            ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind,
@@ -1370,6 +1417,48 @@ impl Db {
         }
     }
 
+    /// The identity of a write this `Db` numbers, taken under the ack floor's lock so the floor
+    /// never passes it while it is in flight (A-R252). Refused, with nothing sent, once this
+    /// open's ids are used up: the next is the open's reserved floor record id (A2).
+    fn write_identity(&self) -> Result<RequestIdentity, PutError> {
+        let Some(request) = lock(&self.ack_floor).begin(&self.next_request) else {
+            let mut error = ApiError::new(
+                ErrorKind::Unavailable,
+                "this open's write ids are used up (2^40 per open); nothing was sent: open the \
+                 Db again"
+                    .to_owned(),
+            );
+            error.no_mutation = true;
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        };
+        Ok(RequestIdentity {
+            tenant: TENANT,
+            client: self.client,
+            request: RequestId(request),
+        })
+    }
+
+    /// Record the answer to this `Db`'s own write `request` in the ack floor, and hand it back.
+    /// Held when it says what happened: `Ok`, a refusal with nothing sent (no request handed
+    /// back), or one that claims `no_mutation`. Anything else, `UNKNOWN_OUTCOME` above all, is a
+    /// pin (design-ackfloor rev 3, M3).
+    fn finished<T>(&self, request: RequestId, answer: Result<T, PutError>) -> Result<T, PutError> {
+        let held = match &answer {
+            Ok(_) => true,
+            Err(refused) => refused.request.is_none() || refused.error.no_mutation,
+        };
+        lock(&self.ack_floor).finish(request.0, held, Instant::now());
+        answer
+    }
+
+    /// `request` got a definitive answer by a resend or a status query: it is no longer a pin.
+    fn settled(&self, request: RequestId) {
+        lock(&self.ack_floor).settle(request.0);
+    }
+
     /// The identity an `_as` call sends under, or its refusal when `request` is not an app's id
     /// (A-R195): below 2^63 it could name a write this `Db` numbered itself. Nothing is sent.
     /// The refusal goes through [`Self::retried`], so it never claims `no_mutation`: an id
@@ -1472,7 +1561,9 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
-        self.put_identified(self.identity(), object, value, if_version)
+        let identity = self.write_identity()?;
+        let answer = self.put_identified(identity, object, value, if_version);
+        self.finished(identity.request, answer)
     }
 
     /// [`Self::put`] under the app's request id `request`, which this client may have used
@@ -1544,7 +1635,9 @@ impl Db {
                 request: None,
             });
         }
-        self.txn_identified(self.identity(), puts, deadline)
+        let identity = self.write_identity()?;
+        let answer = self.txn_identified(identity, puts, deadline);
+        self.finished(identity.request, answer)
     }
 
     /// [`Self::txn`] under the app's request id `request`, which this client may have used
@@ -1682,7 +1775,9 @@ impl Db {
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
-        self.write_identified(self.identity(), object, change, expect)
+        let identity = self.write_identity()?;
+        let answer = self.write_identified(identity, object, change, expect);
+        self.finished(identity.request, answer)
     }
 
     /// [`Self::write`] under the app's request id `request`, which this client may have used
@@ -1771,7 +1866,15 @@ impl Db {
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(call, self.timeouts.put) {
-            Some(Answer::Compiled(request)) => {
+            Some(Answer::Compiled(mut request)) => {
+                // The ack floor rides the first send and every resend of it unchanged; it is
+                // not part of the request's digest (A-R252). Only this `Db`'s own write ids
+                // in flight carry one.
+                let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
+                if let Some(carried) = carried {
+                    request.acked_below = Some(carried.acked_below);
+                    request.pinned = carried.pinned;
+                }
                 self.send(ClientCall::Resend { request }, wait).map(Some)
             }
             Some(Answer::Unchanged) => Ok(None),
@@ -1797,6 +1900,12 @@ impl Db {
     /// may have applied on an earlier send, and the kernel refuses an overloaded or late
     /// request before it looks for that (Q-A). Waits as [`Self::txn`] does, for the deadline
     /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
+    ///
+    /// With [`DbConfig::ack_floor`] on, a refused request resent after a later write answers
+    /// `STATUS_EXPIRED`, with nothing applied: submit it as new (spec §5.3). A request answered
+    /// `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
+    /// Until that request is settled, the owner's floor stays below it, so a resend of a later
+    /// write whose answer was dropped is applied as new: resend only what you hold no answer for.
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
         let wait = send_wait(Duration::from_millis(request.remaining_millis));
         let id = request.identity.request;
@@ -1874,6 +1983,13 @@ impl Db {
         };
         if answered.is_ok() {
             self.ready_seen.store(true, Ordering::Relaxed);
+        }
+        // A resend that says what became of the request settles its pin, if it was one.
+        if answered.as_ref().map_or_else(
+            |refused| refused.error.kind == ErrorKind::StatusExpired,
+            |_| true,
+        ) {
+            self.settled(identity);
         }
         answered.map_err(|PutError { error, request }| PutError {
             error: self.explained(reconcile_step(error, request.as_deref())),
@@ -1976,6 +2092,12 @@ impl Db {
     /// of the dedup retention window ([`DbConfig::dedup_retention`]); a resend after that runs
     /// afresh.
     ///
+    /// With [`DbConfig::ack_floor`] on, a write of this `Db`'s that was answered, and that a
+    /// later write of the same open then acknowledged, answers `Expired` when asked with its
+    /// generation: its answer was dropped (spec §5.3). Asked with none it answers `Unknown`, as
+    /// any id without an answer does (A-R63). A write answered `UNKNOWN_OUTCOME` is kept until this call or a resend says
+    /// what became of it, up to 8 such writes.
+    ///
     /// # Errors
     ///
     /// [`ApiError`]: a refusal, or `UNAVAILABLE` when no answer came in time.
@@ -2006,6 +2128,10 @@ impl Db {
                 format!("no status answer in {:?}", self.timeouts.read),
             )),
         };
+        // A definitive answer settles the request's ack floor pin, if it was one.
+        if matches!(answered, Ok(TxnStatus::Resolved(_) | TxnStatus::Expired)) {
+            self.settled(request);
+        }
         answered.map_err(|error| self.explained(error))
     }
 
@@ -2261,6 +2387,7 @@ impl Db {
             clock: HostClock::start(),
             timeouts,
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -2298,6 +2425,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -3338,6 +3466,7 @@ mod tests {
 
     fn config(dir: &std::path::Path) -> DbConfig {
         DbConfig {
+            ack_floor: true,
             dir: dir.to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
@@ -3381,6 +3510,7 @@ mod tests {
             ..Budgets::SPEC_DEFAULTS
         };
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
@@ -3469,6 +3599,7 @@ mod tests {
             ..Budgets::SPEC_DEFAULTS
         };
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts {
@@ -3545,6 +3676,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -3599,6 +3731,7 @@ mod tests {
         };
         let patience = crate::host::test_patience(Duration::from_secs(5));
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts {
@@ -3753,6 +3886,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -3804,6 +3938,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -4190,6 +4325,8 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let config = DbConfig {
             dedup_cap,
+            // A row that sets a cap pins how it fills: the ack floor would empty it (A-R252).
+            ack_floor: dedup_cap.is_none(),
             ..config(dir)
         };
         let db = rt
@@ -4832,6 +4969,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -5189,6 +5327,8 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let config = DbConfig {
             dedup_cap: Some(2),
+            // This row pins how the cap fills: the ack floor would empty it (A-R252).
+            ack_floor: false,
             dedup_retention: Some(Duration::from_millis(300)),
             ..config(dir.path())
         };
@@ -7719,6 +7859,8 @@ mod tests {
             rt.block_on(Db::open_with(
                 DbConfig {
                     dedup_cap: Some(2),
+                    // This row pins how the cap fills: the ack floor would empty it (A-R252).
+                    ack_floor: false,
                     dedup_retention: Some(Duration::from_millis(300)),
                     ..config(dir.path())
                 },
@@ -7793,6 +7935,8 @@ mod tests {
             rt.block_on(Db::open_with(
                 DbConfig {
                     dedup_cap: Some(2),
+                    // This row pins how the cap fills: the ack floor would empty it (A-R252).
+                    ack_floor: false,
                     dedup_retention: Some(retention),
                     local: ALL_NODES.to_vec(),
                     links: None,
@@ -7898,6 +8042,8 @@ mod tests {
             rt.block_on(Db::open_with(
                 DbConfig {
                     dedup_cap: Some(2),
+                    // This row pins how the cap fills: the ack floor would empty it (A-R252).
+                    ack_floor: false,
                     dedup_retention: Some(retention),
                     local: ALL_NODES.to_vec(),
                     links: None,
@@ -8978,5 +9124,195 @@ mod tests {
             (ErrorKind::UnknownOutcome, RetryRule::BoundedJitter, true),
             "{refused:?}"
         );
+    }
+
+    // ---- M10 S2: the client ack floor through a running `Db` (A-R252, A-R267) ----------------
+
+    /// The Dedup rows of node `n`'s newest held lineage of partition 1, after the `Db` has shut
+    /// down.
+    fn dedup_rows(dir: &std::path::Path, n: u32) -> usize {
+        use rdb_core::contracts::storage::{Namespace, SnapshotRead};
+        let engine = RocksEngine::open(dir.join("nodes").join(n.to_string())).expect("open engine");
+        let newest = engine
+            .lineages()
+            .into_iter()
+            .filter(|(partition, _)| *partition == PARTITION)
+            .map(|(_, generation)| generation)
+            .max()
+            .expect("a held lineage");
+        let view = engine
+            .snapshot(PARTITION, newest, crate::host::STEP_VIEW)
+            .expect("view");
+        let rows = view.scan(Namespace::Dedup, &[], usize::MAX).len();
+        assert_eq!(view.fault(), None, "node {n}: the scan met a fault");
+        rows
+    }
+
+    /// D2 (design-ackfloor §5): with the floor on, a `Db` writes far past a small dedup cap, and
+    /// every copy keeps on disk only the newest answer and its open's floor record. Cap 3, 150
+    /// puts, none `OVERLOADED`. With the floor off the fourth put is `OVERLOADED`.
+    /// Integration (~1 s): three node threads, 150 puts.
+    #[config_log::retcd_test]
+    fn m10_s2_d2_a_small_cap_never_fills_and_each_copy_keeps_two_dedup_rows() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let config = DbConfig {
+            dedup_cap: Some(3),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "after the open");
+        for n in 0..150_u32 {
+            db.put(b"a", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+        }
+        db.shutdown();
+        drop(db);
+        for n in 1..=3 {
+            assert_eq!(
+                dedup_rows(dir.path(), n),
+                2,
+                "node {n}: the newest answer and the floor record"
+            );
+        }
+    }
+
+    /// A-R252 M3 and D7, on a running `Db`, cap 8. A txn is answered `UNKNOWN_OUTCOME` (links
+    /// held), a pin, and a new put is refused `PROTECTION_PAUSED` behind it with nothing applied,
+    /// which is held. After the heal, 30 puts land: the pin never fills the cap. The txn, resent,
+    /// replays its answer, since a pin keeps it, and that settles the pin; its status still
+    /// answers. With no pin left, one more put raises the floor past the paused put, which,
+    /// resent, answers `STATUS_EXPIRED` and applies nothing (submit it as new); its status, asked
+    /// with its generation, is `Expired`.
+    /// Integration (~2 s): three node threads, a real pause and a heal.
+    #[config_log::retcd_test]
+    fn m10_s2_m3_a_pin_replays_and_a_paused_put_resent_later_is_expired() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            dedup_cap: Some(8),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let paused = db
+            .put(b"c", b"1", None)
+            .expect_err("refused while the txn is unpublished");
+        assert_eq!(
+            (paused.error.kind, paused.error.no_mutation),
+            (ErrorKind::ProtectionPaused, true),
+            "{paused:?}"
+        );
+        let pending = unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+        let paused = paused.request.expect("a kernel refusal keeps its request");
+        let (pending_id, paused_id) = (pending.identity.request, paused.identity.request);
+        assert_eq!(
+            lock(&db.ack_floor).pins(),
+            [pending_id.0],
+            "the txn is a pin and the paused put is held"
+        );
+
+        db.links().heal_all();
+        admits(&db, "after the heal");
+        publishes(&db, Seq(2), "after the heal");
+        for n in 0..30_u32 {
+            db.put(b"b", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("put {n} under a pin: {refused:?}"));
+        }
+
+        let replayed = db.resend(*pending).expect("the pin replays");
+        assert_eq!((replayed.request, replayed.seq), (pending_id, Seq(2)));
+        assert!(
+            lock(&db.ack_floor).pins().is_empty(),
+            "the replay settles it"
+        );
+        match db.status(pending_id, None).expect("status of the txn") {
+            TxnStatus::Resolved(result) => assert_eq!(result.seq, Seq(2)),
+            other => panic!("status of the txn: {other:?}"),
+        }
+
+        db.put(b"b", b"last", None)
+            .expect("a put that acks past the paused put");
+        let expired = db
+            .resend(*paused)
+            .expect_err("under the floor, with no pin below it");
+        assert_eq!(expired.error.kind, ErrorKind::StatusExpired, "{expired:?}");
+        assert_eq!(db.get(b"c").expect("get c").value, None, "nothing applied");
+        assert_eq!(
+            db.status(paused_id, Some(replayed.generation))
+                .expect("status of the paused put"),
+            TxnStatus::Expired
+        );
+        assert_eq!(
+            db.status(paused_id, None)
+                .expect("status with no generation"),
+            TxnStatus::Unknown,
+            "A-R63: with no generation, never Expired"
+        );
+        db.shutdown();
+    }
+
+    /// D6 (design-ackfloor §5): a reopen's floor covers only its own open. The first open's
+    /// last put is still answered after the reopen has written past it: its status is its
+    /// outcome, never `Expired`, and never `Unknown` for want of its row.
+    /// Integration (~2 s): two opens.
+    #[config_log::retcd_test]
+    fn m10_s2_d6_a_reopen_s_floor_never_touches_the_earlier_open_s_answers() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        let last = db.put(b"b", b"1", None).expect("put b").request;
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        for n in 0..5_u32 {
+            let ok = db
+                .put(b"c", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+            assert!(ok.request.0 > 1 << 40, "an id of the second open: {ok:?}");
+        }
+        match db
+            .status(last, None)
+            .expect("status of the first open's put")
+        {
+            TxnStatus::Resolved(_) => {}
+            other => panic!("the first open's last put: {other:?}"),
+        }
+        db.shutdown();
     }
 }
