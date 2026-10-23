@@ -3544,6 +3544,7 @@ dependencies = [
  "config-log",
  "config-log-macros",
  "hex",
+ "postcard",
  "serde",
  "serde_json",
  "sha2",
