@@ -405,6 +405,18 @@ writes while a copy is unheard, counting it as infinitely behind (B-R38), not be
 proof. Work that lets writes resume while a copy is silent (M10 PC17) must not reopen this.
 Rows: `m9_k1_00`, `m9_k1_02` and `m9_k1_03` (sim); `m9_d2_05` and `m9_k1_01` (unit).
 
+**Amended 2026-10-22 (M10, lead ruling A-R177; critic-f5 C5): a new `inherit` caller, the
+inventory.** A reopened copy may have missed a generation that wrote nothing: its newest generation
+is older than the anchor generation the fenced `partitions/{id}` names, and it holds that older
+generation exactly through the anchor's `base`, with the digest the anchor names there. Its
+inventory now links it to the anchor generation (ADR-rdb-0010 decision 8, amended the same day).
+That happens for a committed anchor only, as a link only, and before the copy reports. The copy then
+reports as an anchor-generation copy at `base`, which every later step already handles. Anything
+else (a tail above `base`, a different digest, a parent at the depth ceiling) fails the inventory by
+name and writes nothing. This changes no row of the table above, and it does not reopen the K1
+amendment: a copy that is unheard, or that holds less than `base` in its own generation, still
+pauses writes (B-R38).
+
 The mode is **derived, never configured**. rDB has no equivalent of
 `unclean.leader.election.enable` and must not acquire one: the Kafka toggle is a single boolean that
 converts a durability guarantee into an availability guarantee, and the equivalent pressure here

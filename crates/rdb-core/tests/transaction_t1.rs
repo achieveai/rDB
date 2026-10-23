@@ -3080,6 +3080,11 @@ fn expired_work_is_cancelled_at_storage_dispatch() {
 /// requests queued behind it are answered at once, as a fence answers them. Nothing of theirs
 /// was written, so `PROTECTION_PAUSED` is a definitive non-admission. Before, they waited
 /// unanswered until A1's `Fence` arrived, and T1 emits no `FenceRequest` to make it come.
+///
+/// M10 D4 (lead ruling A-R180): each answer's mutation proof. The queued requests' paused
+/// refusals prove they wrote nothing; the dispatched request's batch may have landed, so its
+/// `UNKNOWN_OUTCOME` proves nothing. Answering the dispatched request paused would claim a proof
+/// for a batch that may have applied.
 #[retcd_test]
 fn a_failed_batch_answers_the_queue_behind_it() {
     let mut h = H::live();
@@ -3098,6 +3103,16 @@ fn a_failed_batch_answers_the_queue_behind_it() {
             (3, ErrorKind::ProtectionPaused)
         ]
     );
+    let proofs: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Reply(ReplyEffect::Failed { identity, error }) => {
+                Some((identity.request.0, error.proves_no_mutation()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(proofs, vec![(1, false), (2, true), (3, true)]);
     assert_eq!(h.k().queue_len(), 0);
 }
 
@@ -4221,6 +4236,19 @@ fn m7a_71_deny_error_mapping_total_and_checkpoint_sensitive() {
             identity: identity(1)
         }
     );
+}
+
+/// M10 D4 (lead ruling A-R180): `PROTECTION_PAUSED` proves its submission wrote nothing only
+/// because no deny reason maps to it after apply. After apply every reason's error proves
+/// nothing and none is paused, so the proof can never cover a batch that may have landed.
+#[retcd_test]
+fn no_deny_reason_after_apply_is_paused_or_proves_no_mutation() {
+    let at = deny_at();
+    for reason in EVERY_DENY_REASON {
+        let error = deny_error(reason, Boundary::PostApply, &at);
+        assert_ne!(error.kind(), ErrorKind::ProtectionPaused, "{reason:?}");
+        assert!(!error.proves_no_mutation(), "{reason:?}: {error:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

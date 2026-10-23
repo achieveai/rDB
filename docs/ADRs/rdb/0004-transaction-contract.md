@@ -228,7 +228,8 @@ allows; it is not a new rule.
 | Error | Retry rule | Class |
 |---|---|---|
 | `NOT_PRIMARY`, `ROUTE_CHANGED` | refresh route; **retain request identity and expected generation** | no admission |
-| `LEASE_EXPIRED`, `RECOVERY_READ_ONLY`, `PROTECTION_PAUSED` | retry after health/authority recovers; **do not assume an already-admitted request failed** | no admission *for this submission* |
+| `LEASE_EXPIRED`, `RECOVERY_READ_ONLY` | retry after health/authority recovers; **do not assume an already-admitted request failed** | no admission *for this submission* |
+| `PROTECTION_PAUSED` | retry after health/authority recovers; **do not assume an already-admitted request failed** | proves no mutation *by this submission* (amended 2026-10-22, below) |
 | `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | definitive rejection before mutation; the caller changes the request intentionally | proves no mutation *by this submission* |
 | `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | definitive no-admission; bounded jittered retry | proves no mutation *by this submission* |
 | `UNKNOWN_OUTCOME` | query status with the **same identity**; never generate a new request id | ambiguous |
@@ -237,8 +238,10 @@ allows; it is not a new rule.
 | `INCOMPATIBLE_VERSION`, `CORRUPT_HISTORY` | quarantine / reject; operator or rollout action | reject |
 | `DIVERGENCE_REQUIRES_OPERATOR` | the partition is blocked (ADR-rdb-0009, B-R26): no data-path exit; retry after the operator removes the diverged copies and fences; **do not assume an already-admitted request failed** | no admission *for this submission* |
 
-The load-bearing line, and the reason this ADR is gated by V4: **only pre-admission rejection
-proves no mutation, and only by the submission it answers.** Everything after the local atomic
+The load-bearing line, and the reason this ADR is gated by V4: **only a refusal before apply
+proves no mutation, and only by the submission it answers.** (Reworded 2026-10-22 from "only
+pre-admission rejection": `OVERLOADED` and `DEADLINE_BEFORE_ADMISSION` already came from
+after admission and before apply.) Everything after the local atomic
 batch is `UNKNOWN_OUTCOME` until a status query or a recovery decision resolves it.
 
 **Amended 2026-10-18 (M9 S3, #35): the client rule for an unanswered send.** Once any send of a
@@ -246,6 +249,22 @@ request identity went unanswered (a timeout, a lost reply, or `UNKNOWN_OUTCOME`)
 query with the same identity settles it, and only inside the dedup retention window (§4). A
 definitive answer to a later resend does not settle it: §3's checks run before the dedup lookup,
 so that answer covers the resend alone. Past retention, status cannot settle it either (§4).
+
+**Amended 2026-10-22 (M10 D4, lead ruling A-R180; critic-d4): `PROTECTION_PAUSED` proves no
+mutation by this submission.** It keeps its retry rule and leaves the `LEASE_EXPIRED` row's class
+only.
+- Why it holds: every paused refusal is made before apply. The producers are admission check 8,
+  a queue freeze (including the dedup seed and the queue drained behind a failed batch), and
+  `LocalStorageFenced` at the pre-apply boundary. After apply that reason answers
+  `UNKNOWN_OUTCOME`, and no deny reason answers paused. A failed batch answers its own request
+  `UNKNOWN_OUTCOME`, never paused.
+- What it does not change: the proof covers this send only (#35, above). A resend of an identity
+  that may have applied still reports no proof to the app (`Db::retried`), and one waiter per
+  identity keeps a resend's answer off the original's.
+- Not moved: `LEASE_EXPIRED` is also what a deny after apply answers, so it proves nothing.
+  `RECOVERY_READ_ONLY` and `DIVERGENCE_REQUIRES_OPERATOR` are unchanged by this ruling.
+- Pinned by `a_failed_batch_answers_the_queue_behind_it` (each answer's proof) and
+  `no_deny_reason_after_apply_is_paused_or_proves_no_mutation` in `rdb-core/tests/transaction_t1.rs`.
 
 ### 6. The local apply never returns success
 

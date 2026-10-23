@@ -114,6 +114,10 @@ pub struct ApiError {
     pub no_mutation: bool,
     /// Detail, for the log and the operator.
     pub detail: String,
+    /// The soonest a retry can be admitted, when the host knows it (M10 S1-6, critic-d6b
+    /// candidate 3): a lower bound, "not before", never a promise that it will be. `None` when
+    /// nothing is known. Set it with [`Self::with_retry_after`], which also says it in `detail`.
+    pub retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -158,6 +162,7 @@ impl ApiError {
             retry,
             no_mutation,
             detail: detail.into(),
+            retry_after: None,
         }
     }
 
@@ -169,6 +174,7 @@ impl ApiError {
             retry: error.retry_rule(),
             no_mutation: error.proves_no_mutation(),
             detail: error.to_string(),
+            retry_after: None,
         }
     }
 
@@ -192,6 +198,7 @@ impl ApiError {
                 "no generation adopted yet for partition {} on node {}; nothing was sent",
                 partition.0, node.0
             ),
+            retry_after: None,
         }
     }
 
@@ -203,7 +210,25 @@ impl ApiError {
             retry: RetryRule::NotWired,
             no_mutation: false,
             detail: format!("host fault: {detail}"),
+            retry_after: None,
         }
+    }
+
+    /// This error with a "not before" hint: a retry is not admitted sooner than `after` from
+    /// now. Sets [`Self::retry_after`] and ends `detail` with `; not before ~Ns`, the seconds
+    /// rounded up so the text never names a time earlier than the hint.
+    #[must_use]
+    pub fn with_retry_after(mut self, after: Duration) -> Self {
+        let seconds = after.as_millis().div_ceil(1_000);
+        self.detail = format!("{}; not before ~{seconds}s", self.detail);
+        self.retry_after = Some(after);
+        self
+    }
+
+    /// The soonest a retry can be admitted, when the host knows it.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
     }
 
     /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
@@ -256,13 +281,25 @@ pub struct DbConfig {
     pub hold: Vec<(NodeId, NodeId)>,
     /// Call timeouts.
     pub timeouts: Timeouts,
-    /// T1's dedup cap: retained answers allowed before a new write is `OVERLOADED`. `None` is
-    /// the spec's [`RETENTION_CAP_ENTRIES`]; a value above it is refused at open, since P1's
-    /// status index holds no more than that. A dev budget, to reach a full index by hand.
+    /// T1's dedup cap: retained answers allowed per partition before a new write is
+    /// `OVERLOADED`. `None` is the spec's [`RETENTION_CAP_ENTRIES`] (65,536); a value above it
+    /// is refused at open, since P1's status index holds no more than that.
+    ///
+    /// The cap and [`Self::dedup_retention`] together set the write rate a partition sustains:
+    /// about `cap / retention`. At the default cap that is 0.76 writes/s at 24 h, 18/s at 1 h
+    /// and 109/s at 10 min. A burst may use the whole cap at once; once it is full, a new write
+    /// is `OVERLOADED` until trimming frees entries. Each retained entry costs about 1.8 KB of
+    /// memory (measured on a debug build).
     pub dedup_cap: Option<usize>,
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
-    /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
+    /// ([`Budgets::dedup_retention_millis`]). A supported app option (ruling A-R181): a shorter
+    /// window frees the cap sooner, so a partition sustains more writes (see
+    /// [`Self::dedup_cap`] for the rates).
+    ///
+    /// The cost of a shorter window: a resend or a status query made after it can no longer be
+    /// settled (spec §5.3).
+    ///
     /// A `CONDITION_FAILED` answer is kept as long, counted from when it was given, since nothing
     /// need publish after it (ruling A-R108).
     /// A retry of a trimmed request is no longer recognised: it is submitted afresh (spec §5.3).
@@ -278,9 +315,9 @@ impl DbConfig {
     /// # Errors
     ///
     /// [`OpenError::DedupCap`] when [`Self::dedup_cap`] is above [`RETENTION_CAP_ENTRIES`];
-    /// it is also logged as `dedup_cap_refused`.
+    /// it is also logged as `db_open_refused` with `kind=DedupCap`, as every refused open is.
     pub fn check(&self) -> Result<(), OpenError> {
-        limits(self.dedup_cap).map(|_| ())
+        limits(self.dedup_cap).map(|_| ()).map_err(open_refused)
     }
 }
 
@@ -366,27 +403,38 @@ impl std::fmt::Display for PutError {
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     /// Another open, in this process or another, holds this copy's lock. Nothing was started and
-    /// nothing was removed.
-    #[error("{0} is in use by another open")]
+    /// nothing was removed. The text names the next step (tester S1-8 walk, 066ab6e).
+    #[error(
+        "{0} is in use by another open. Close that open, or stop the process that holds it, then \
+         open this directory again"
+    )]
     InUse(PathBuf),
     /// A copy is missing or holds no database while another copy holds data. Nothing was started
-    /// and nothing was removed.
+    /// and nothing was removed. This build does not rebuild a copy (slice 2's S2-4 will).
     #[error(
-        "{0} is missing or empty while another copy holds data; this directory cannot be opened"
+        "{0} is missing or empty while another copy holds data; this directory cannot be opened. \
+         Restore that copy from a backup of this directory, then open it again"
     )]
     CopyMissing(PathBuf),
     /// The copies hold data but name no rDB instance: an M9 directory, which this build does not
-    /// open. Nothing was started and nothing was removed.
+    /// open. Nothing was started and nothing was removed. The text names the next step (tester
+    /// S1-8 walk, 066ab6e); no tool migrates M9 data, so it offers none.
     #[error(
-        "{0} holds data but names no rDB instance (an M9 directory); this build does not open it"
+        "{0} holds data but names no rDB instance (an M9 directory); this build does not open it. \
+         Open it with the M9 build that wrote it, or start a new database in an empty folder: \
+         this build does not migrate M9 data"
     )]
     Unbound(PathBuf),
     /// The copies and the control store do not belong together: the copies name different
     /// instances, or the store's `partitions/1` or open counter does not name this one.
     #[error("this directory and the control store do not belong together: {0}")]
     Mismatch(String),
-    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward.
-    #[error("no copy holds generation {generation} that partitions/1 names: {detail}")]
+    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward: this
+    /// directory is an older copy of the database, which is history.
+    #[error(
+        "no copy holds generation {generation} that partitions/1 names: {detail}. This directory \
+         is an older copy of the database: open the folder that holds the current copies instead"
+    )]
     Stale {
         /// The record's generation.
         generation: u64,
@@ -407,7 +455,8 @@ pub enum OpenError {
     Bootstrap(#[from] admin::BootstrapError),
     /// [`DbConfig::dedup_cap`] is above the cap P1's status index holds. Nothing was started.
     #[error(
-        "dedup_cap {asked} is above the most P1's status index holds ({max}); nothing was started"
+        "dedup_cap {asked} is above the most P1's status index holds ({max}); nothing was \
+         started. Set DbConfig::dedup_cap to at most {max}, or leave it unset for the default"
     )]
     DedupCap {
         /// The cap asked for.
@@ -570,7 +619,7 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
-        let limits = limits(config.dedup_cap)?;
+        let limits = limits(config.dedup_cap).map_err(open_refused)?;
         let budgets = Budgets {
             dedup_retention_millis: config
                 .dedup_retention
@@ -598,7 +647,8 @@ impl Db {
                 host::spawn_on(node, engine, links, control, clock, budgets, limits, boot)
             },
         )
-        .await?;
+        .await
+        .map_err(open_refused)?;
         db.respawn = Some(respawn);
         Ok(db)
     }
@@ -1760,6 +1810,7 @@ impl Db {
                      a write); restart a node only once it is ready",
                     node.0
                 ),
+                retry_after: None,
             });
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
@@ -1938,6 +1989,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         retry: kernel.retry_rule(),
         no_mutation: kernel.proves_no_mutation(),
         detail: "the read was refused".to_owned(),
+        retry_after: None,
     }
 }
 
@@ -1947,6 +1999,27 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
 struct Found {
     instance: [u8; INSTANCE_LEN],
     fresh: bool,
+}
+
+/// Log a refused open as `db_open_refused`, with its kind and its text, and hand it back. An
+/// open reads no app object, so the text holds paths, generations and instance ids, never key
+/// or value text.
+fn open_refused(error: OpenError) -> OpenError {
+    let kind = match &error {
+        OpenError::InUse(_) => "InUse",
+        OpenError::CopyMissing(_) => "CopyMissing",
+        OpenError::Unbound(_) => "Unbound",
+        OpenError::Mismatch(_) => "Mismatch",
+        OpenError::Stale { .. } => "Stale",
+        OpenError::Counter(_) => "Counter",
+        OpenError::Control(_) => "Control",
+        OpenError::Node(_) => "Node",
+        OpenError::Bootstrap(_) => "Bootstrap",
+        OpenError::DedupCap { .. } => "DedupCap",
+        OpenError::Io(_) => "Io",
+    };
+    tracing::warn!(kind, error = %error, "db_open_refused");
+    error
 }
 
 /// The words for a new folder against a store that serves another database (tester D1): both
@@ -2054,11 +2127,8 @@ fn limits(dedup_cap: Option<usize>) -> Result<Limits, OpenError> {
     let mut limits = Limits::default();
     if let Some(asked) = dedup_cap {
         if asked > RETENTION_CAP_ENTRIES {
-            tracing::error!(
-                dedup_cap = asked,
-                max = RETENTION_CAP_ENTRIES,
-                "dedup_cap_refused"
-            );
+            // Logged by the caller, as `db_open_refused` (`open_refused`): one event name for
+            // every refused open (lead ruling, tester S1-8 walk on 066ab6e).
             return Err(OpenError::DedupCap {
                 asked,
                 max: RETENTION_CAP_ENTRIES,
@@ -2286,6 +2356,9 @@ fn send_wait(deadline: Duration) -> Duration {
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod reopen_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4014,10 +4087,25 @@ mod tests {
         );
         let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
-            .filter(|line| line["@m"] == "dedup_cap_refused")
+            .filter(|line| line["@m"] == "db_open_refused")
             .collect();
+        // One event name for every refused open (lead ruling, tester S1-8 walk on 066ab6e).
         assert_eq!(lines.len(), 1, "one refusal line: {lines:?}");
-        assert_eq!(lines[0]["dedup_cap"], RETENTION_CAP_ENTRIES + 1);
+        assert_eq!(
+            (&lines[0]["@l"], &lines[0]["kind"], &lines[0]["error"]),
+            (
+                &serde_json::json!("Warning"),
+                &serde_json::json!("DedupCap"),
+                &serde_json::json!(format!(
+                    "dedup_cap {} is above the most P1's status index holds ({}); nothing was \
+                     started. Set DbConfig::dedup_cap to at most {}, or leave it unset for the \
+                     default",
+                    RETENTION_CAP_ENTRIES + 1,
+                    RETENTION_CAP_ENTRIES,
+                    RETENTION_CAP_ENTRIES
+                ))
+            )
+        );
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
             dedup_retention: None,
