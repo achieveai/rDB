@@ -7,12 +7,14 @@
 //!
 //! * [`host`] — one thread per rDB node. It solely owns that node's `RocksEngine`, the six
 //!   modules and the adopted triple, and runs the duties no kernel emits (§4).
-//! * [`transport`] — [`transport::Links`], the in-process peer links, with a per-link hold.
+//! * [`transport`] — [`transport::Links`], the peer links, with a per-link hold.
+//! * [`net`] — [`net::Net`], links to nodes in other processes: tonic under mutual TLS (M10 S2).
 //! * [`control`] — [`control::ControlAdapter`], `ControlEffect` onto a `config_core::ConfigStore`.
 //! * [`admin`] — bootstrap of partition 1 through F1. It never injects `Recovered`.
 //! * [`db`] — [`Db`]: identities, deadlines, compiles and the §5.4 error mapping.
 //!
-//! All M9 nodes run in one process (Decision 1).
+//! All M9 nodes run in one process (Decision 1). From M10 S2 a node may run in its own process
+//! (`rdb_node`), reached through [`net`].
 //!
 //! # Values
 //!
@@ -36,6 +38,7 @@ pub mod clock;
 pub mod control;
 pub mod db;
 pub mod host;
+pub mod net;
 pub mod transport;
 
 #[cfg(test)]
