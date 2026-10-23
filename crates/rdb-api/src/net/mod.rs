@@ -32,6 +32,9 @@ pub mod certs;
 pub mod faults;
 pub mod wire;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -44,6 +47,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use crate::db::ApiError;
 use crate::host::{Answer, Client, Msg, NodeStatus};
@@ -200,6 +204,9 @@ struct Shared {
     conns: Mutex<BTreeMap<u64, Arc<Conn>>>,
     next_conn: AtomicU64,
     rt: tokio::runtime::Handle,
+    /// The span `Net::start` ran in. Every task the links spawn runs in it, so a line logged on
+    /// a link lands where the process (or a row) logs its own.
+    span: tracing::Span,
     #[allow(clippy::type_complexity)]
     on_boot: Mutex<Option<Box<dyn Fn(NodeId, BootId) + Send + Sync>>>,
 }
@@ -260,6 +267,7 @@ impl Net {
             conns: Mutex::new(BTreeMap::new()),
             next_conn: AtomicU64::new(0),
             rt: tokio::runtime::Handle::current(),
+            span: tracing::Span::current(),
             on_boot: Mutex::new(None),
         });
         let mut tasks = Vec::new();
@@ -289,19 +297,24 @@ impl Net {
                 if let Err(error) = result {
                     tracing::error!(%label, %error, "net_serve_failed");
                 }
-            }));
+            }
+            .instrument(shared.span.clone())));
             tracing::info!(label = %config.label, addr = ?addr, "net_listening");
         }
         for (node, address) in &config.dial {
-            tasks.push(tokio::spawn(dial(
-                Arc::clone(&shared),
-                *node,
-                address.clone(),
-                config.tls.clone(),
-            )));
+            tasks.push(tokio::spawn(
+                dial(
+                    Arc::clone(&shared),
+                    *node,
+                    address.clone(),
+                    config.tls.clone(),
+                )
+                .instrument(shared.span.clone()),
+            ));
         }
         {
             let shared = Arc::clone(&shared);
+            let span = shared.span.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(faults::POLL).await;
@@ -310,7 +323,8 @@ impl Net {
                         conn.release();
                     }
                 }
-            }));
+            }
+            .instrument(span)));
         }
         let net = Arc::new(Self {
             shared,
@@ -357,7 +371,8 @@ impl Net {
             .collect()
     }
 
-    /// Wait until every node in `nodes` has its link up, or `within` passes.
+    /// Wait until every node in `nodes` has its link up, or `within` passes, or one of them
+    /// refuses: a refusal does not heal by waiting.
     ///
     /// # Errors
     ///
@@ -386,7 +401,10 @@ impl Net {
             if down.is_empty() {
                 return Ok(());
             }
-            if tokio::time::Instant::now() >= deadline {
+            let refused = nodes
+                .iter()
+                .any(|node| matches!(states.get(node), Some(LinkState::Refused(_))));
+            if refused || tokio::time::Instant::now() >= deadline {
                 return Err(down.join("; "));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -728,7 +746,9 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
             let conn = Arc::clone(conn);
             let faults = Arc::clone(&shared.faults);
             let n = client.expect("a client message was counted");
+            let span = shared.span.clone();
             shared.rt.spawn_blocking(move || {
+                let _entered = span.enter();
                 let reply_frame = match rx.recv() {
                     Ok(answer) => {
                         if faults.drops_reply(n) {
@@ -762,7 +782,9 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
                 return;
             }
             let conn = Arc::clone(conn);
+            let span = shared.span.clone();
             shared.rt.spawn_blocking(move || {
+                let _entered = span.enter();
                 let reply_frame = match rx.recv() {
                     Ok(status) => WireReply::Status(wire::WireNodeStatus::from(&status)),
                     Err(_) => WireReply::Dropped,
@@ -934,6 +956,7 @@ impl RdbNet for Service {
         let mut inbound = request.into_inner();
         let (tx, rx) = unbounded_channel::<Envelope>();
         let shared = Arc::clone(&self.shared);
+        let span = shared.span.clone();
         tokio::spawn(async move {
             let first = tokio::time::timeout(HANDSHAKE, inbound.next()).await;
             let hello = match first {
@@ -967,7 +990,8 @@ impl RdbNet for Service {
             }
             let reason = read(Arc::clone(&shared), Arc::clone(&conn), inbound).await;
             close(&shared, &conn, &reason);
-        });
+        }
+        .instrument(span));
         let outgoing = UnboundedReceiverStream::new(rx).map(Ok::<_, Status>);
         Ok(Response::new(Box::pin(outgoing)))
     }
