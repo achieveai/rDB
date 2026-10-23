@@ -36,7 +36,44 @@ pub struct TxnRequest {
     pub conditions: Vec<Condition>,
     /// Mutations, applied as one atomic batch.
     pub mutations: Vec<Mutation>,
+    /// The client's ack floor (ruling A-R252; design-ackfloor §1 and rev 3). Every request id of
+    /// the sender's own open below it has its answer, or was never sent, apart from the ids in
+    /// [`Self::pinned`]. So a partition may drop the dedup answers of those ids, and a resend
+    /// of one answers `STATUS_EXPIRED` with nothing applied.
+    ///
+    /// `None` sets no floor: today's rules apply, and answers leave only by
+    /// `dedup_retention` aging and the dedup cap.
+    ///
+    /// Scope: one floor per `(generation, tenant, client, open)`, where the open is the high
+    /// bits of the request id above its 40-bit counter. A floor covers only
+    /// `[open base, acked_below)` of this request's own open, so a reopen, or another app on
+    /// the same client id, is never touched. It may not exceed this request's own id. App-chosen
+    /// ids (`>= 2^63`) get no floor: such a request carries `None`. A request that breaks
+    /// either rule is `INVALID_ARGUMENT`. A floor lower than one already held is a no-op.
+    ///
+    /// Not part of [`Self::request_digest`]: a resend carries a later floor than its first
+    /// send, and that is not `REQUEST_ID_REUSE`. It is kept out by naming, not by serde: the
+    /// digest lists its fields, and this one is not listed.
+    ///
+    /// Always serialised. This type crosses the peer wire in postcard, which is not
+    /// self-describing, so a skipped field shifts every byte after it (ruling A-R259). `default`
+    /// lets JSON written before the field still read.
+    #[serde(default)]
+    pub acked_below: Option<u64>,
+    /// Ids below [`Self::acked_below`] the floor does not cover: each was answered
+    /// `UNKNOWN_OUTCOME`, so its answer stays for a later status query or resend. At most
+    /// [`MAX_PINS`]. Empty pins nothing, and with no floor it means nothing.
+    ///
+    /// Not part of [`Self::request_digest`], for the same reason as the floor. Always
+    /// serialised, for the same reason as the floor.
+    #[serde(default)]
+    pub pinned: Vec<u64>,
 }
+
+/// The most ids one request may pin below its ack floor ([`TxnRequest::pinned`], ruling
+/// A-R252). A request carrying more is `INVALID_ARGUMENT`. What a client does with a ninth
+/// open pin is its own rule (design-ackfloor rev 3, A5), not this contract's.
+pub const MAX_PINS: usize = 8;
 
 impl TxnRequest {
     /// Digest of the **semantic** request: what this transaction asks for, with nothing about
@@ -59,6 +96,8 @@ impl TxnRequest {
     ///   compared *under*. Folding them in would make the comparison vacuous.
     /// * `expected_generation` — an admission check evaluated before anything is mutated
     ///   (spec §5.3), not part of what the caller asked to write.
+    /// * `acked_below` and `pinned` — what the client has already been answered, which moves
+    ///   between a first send and its resend (ruling A-R252).
     ///
     /// Infallible: every length here is bounded by a `u32` that the request could not have been
     /// admitted with if it overflowed, and a count that does not fit is saturated rather than

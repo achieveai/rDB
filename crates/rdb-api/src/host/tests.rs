@@ -2826,6 +2826,8 @@ fn an_expiry_never_expires_the_call_released_after_its_put() {
         remaining_millis,
         conditions: Vec::new(),
         mutations: Vec::new(),
+        acked_below: None,
+        pinned: Vec::new(),
     };
     let send = |host: &mut Host, remaining_millis| {
         let (reply, answer) = mpsc::channel();
@@ -3918,6 +3920,8 @@ fn a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds() {
                 .expect("seven bytes fit an envelope"),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     };
     match trio.ask(ClientCall::Resend { request: damage }) {
         Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(5)),
@@ -3950,6 +3954,8 @@ fn a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds() {
             value: Bytes::from_static(b"not an envelope"),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     };
     match trio.ask(ClientCall::Resend { request: damage }) {
         Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(6)),
@@ -4682,6 +4688,8 @@ fn damage_write(request: u64, object: &[u8], value: Bytes) -> TxnRequest {
             value,
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 
@@ -5298,6 +5306,8 @@ fn m9_s6_a_clear_that_finds_an_unpublished_repair_is_an_unknown_outcome() {
                 expected_version: None,
             },
         ],
+        acked_below: None,
+        pinned: Vec::new(),
     };
     assert_eq!(trio.sent(damage), Ok(3));
     let members = Look::Members {

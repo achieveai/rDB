@@ -166,6 +166,8 @@ pub fn probe_event() -> Event {
             remaining_millis: 1_000,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         })),
     }
 }

@@ -3403,6 +3403,16 @@ fn m7b_163_the_recovered_view_is_the_floor_the_next_view_must_beat() {
 
 // --- Recovered builds R1's side (lead ruling B-R54) --------------------------------------------
 
+/// The boot `result`'s plan names for `copy`: F1 counts a proof only from it (A-R239a).
+fn named_boot(result: &RecoveryResult, copy: CopyId) -> BootId {
+    result
+        .committed
+        .pinned_config
+        .member(copy)
+        .expect("a required copy is a member")
+        .boot
+}
+
 /// `result` with a barrier over `copies`, each proved durable at the cutoff.
 fn requiring(mut result: RecoveryResult, copies: &[CopyId]) -> RecoveryResult {
     let (cutoff, digest) = (result.selected.cutoff_seq, result.selected.cutoff_digest);
@@ -3413,6 +3423,7 @@ fn requiring(mut result: RecoveryResult, copies: &[CopyId]) -> RecoveryResult {
             partition: P,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: named_boot(&result, copy),
         })
         .collect();
     let required = copies.iter().copied().collect();
@@ -3955,6 +3966,7 @@ fn p1_candidate(seq: u64) -> AppliedCandidate {
             correlation: CorrelationId(seq),
             verdict: Verdict::Admit,
         },
+        ack_floor: None,
     }
 }
 
@@ -4525,6 +4537,8 @@ fn f1_durable(copy: CopyId) -> RecoveryEvent {
         partition: P,
         seq: DurableSeq(HEAD),
         digest: d(HEAD),
+        // F1 counts a proof only from the boot its plan names (A-R239a).
+        boot: rf3().member(copy).expect("an RF3 member").boot,
     })
 }
 
@@ -7313,6 +7327,7 @@ fn m9_f1_a_tracker_the_proved_floor_never_rises_above_the_selected_cutoff() {
         partition: P,
         seq: DurableSeq(above.0),
         digest: d(above.0),
+        boot: named_boot(&result, COPY_C),
     };
     result.barrier =
         RecoveryBarrier::try_new(&[proof], &[COPY_C].into_iter().collect(), above, d(above.0))

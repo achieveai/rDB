@@ -347,6 +347,7 @@ mod tests {
             links: None,
             client: DEFAULT_CLIENT,
             boot: None,
+            storage: crate::StorageOptions::default(),
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), fast))

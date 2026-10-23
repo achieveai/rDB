@@ -7,6 +7,7 @@
 //!   read-then-CAS, and a reopened `Db` takes a fresh grant in the same boot after a control store
 //!   outage (A-R96).
 
+use super::tests::{owner_status, owner_when};
 use super::*;
 
 fn config(dir: &Path) -> DbConfig {
@@ -20,6 +21,7 @@ fn config(dir: &Path) -> DbConfig {
         links: None,
         client: DEFAULT_CLIENT,
         boot: None,
+        storage: crate::StorageOptions::default(),
     }
 }
 
@@ -250,7 +252,7 @@ fn m10_a_reopen_with_no_grant_record_heals_no_grant_held_and_reads_back() {
     assert_eq!(got.value.map(|(_, v)| v), Some(Bytes::from_static(b"2")));
     // F1 committed the reopen's generation fully protected (`PartitionMode::Active`: every copy
     // answered), not below it and rebuilding.
-    let owner = db.node_status().into_iter().next().expect("node 1");
+    let owner = owner_status(&db, "node 1 after the heal");
     assert_eq!(
         (owner.recovery.as_deref(), owner.recovered),
         (Some("Committed"), Some(served)),
@@ -541,24 +543,12 @@ fn m10_a_reopened_db_after_a_control_store_outage_takes_a_fresh_grant_in_the_sam
     let mut db = open_short().expect("the reopen");
     db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
         .expect("the reopen is ready");
-    let owner = |db: &Db| db.node_status().into_iter().next().expect("node 1 answers");
-    let before = owner(&db);
+    let before = owner_status(&db, "node 1 after the reopen");
     assert_eq!(before.admits, Some(true), "{before:?}");
 
     let patience = crate::host::test_patience(Duration::from_secs(30));
     let until = |what: &str, done: &dyn Fn(&crate::host::NodeStatus) -> bool| {
-        let deadline = std::time::Instant::now() + patience;
-        loop {
-            let status = owner(&db);
-            if done(&status) {
-                return status;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{what}: last status {status:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        owner_when(&db, what, patience, done)
     };
 
     mem.failing_with(config_core::ConfigError::Unavailable {
@@ -2467,4 +2457,59 @@ fn m10_s2_a_reopen_after_a_promote_heals_node_2_and_leaves_node_1s_grant_frozen(
     );
     reads_back_and_writes(&db, "after the promote and a reopen");
     db.shutdown();
+}
+
+/// A-R253: a node that `Db::restart_node` starts again opens with the `DbConfig::storage` this
+/// `Db` was opened with, not the engine's default. Each engine open logs the memtable budget it
+/// asked RocksDB for, as `write_buffer_bytes_asked` on its `storage_open` line, so node 3's line
+/// from the restart names the asked value, as its line from the first open did.
+/// Integration (~1 s): one fresh open until ready, a put, one restart of node 3.
+#[config_log::retcd_test]
+fn m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with() {
+    const METHOD: &str = "m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with";
+    const ASKED: usize = 1 << 20;
+    let node_3_opens = |dir: &Path| -> Vec<u64> {
+        let node_3 = dir.join("nodes").join("3").display().to_string();
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "storage_open" && line["path"] == node_3.as_str())
+            .map(|line| {
+                line["write_buffer_bytes_asked"]
+                    .as_u64()
+                    .expect("storage_open names the budget it asked for")
+            })
+            .collect()
+    };
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                storage: crate::StorageOptions {
+                    write_buffer_bytes: Some(ASKED),
+                },
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db.put(b"a", b"1", None).expect("a put");
+    let before = node_3_opens(dir.path());
+    assert_eq!(before, vec![ASKED as u64], "node 3's first open");
+
+    assert_eq!(
+        db.restart_node(NodeId(3)).expect("node 3 restarts"),
+        BootId(2)
+    );
+    db.shutdown();
+    assert_eq!(
+        node_3_opens(dir.path()),
+        vec![ASKED as u64, ASKED as u64],
+        "node 3's restart asks for the budget this Db was opened with, not the 64 MiB default"
+    );
 }

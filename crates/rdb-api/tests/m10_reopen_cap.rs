@@ -39,6 +39,7 @@ fn m10_s1_6_a_full_cap_frees_at_the_reopen_once_its_writes_aged_since_their_publ
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
+            storage: rdb_api::StorageOptions::default(),
         };
         let db = rt
             .block_on(Db::open(config, Arc::clone(&store), rt.handle().clone()))

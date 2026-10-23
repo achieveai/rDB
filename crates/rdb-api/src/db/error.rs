@@ -223,8 +223,8 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
             "ask `Db::status` with this request id; never send it under a new request id"
         }
         ErrorKind::UnknownOutcome => {
-            "a read changes nothing, so read again; if this repeats, call `wait_ready` or \
-             `node_status` for the reason"
+            "a read changes nothing, so read again; if this repeats, check that the database's \
+             nodes and its rEtcd are running (on a local run, `scripts/local-rdb.sh status`)"
         }
         ErrorKind::GenerationChanged => {
             "ask `Db::status` with this request id to learn whether it applied; never replay it \
@@ -246,7 +246,13 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
             "an operator must act: keep this Db's log and report this message; retrying will \
              not help"
         }
-        ErrorKind::Unavailable => "call `wait_ready` or `node_status` for the reason",
+        // In plain words, not API names (W5, A-R256): the reader may be an app author or a
+        // person running `scripts/local-rdb.sh`.
+        ErrorKind::Unavailable => {
+            "the database is not serving right now: wait a few seconds and try again; if it \
+             keeps refusing, check that its nodes and its rEtcd are running (on a local run, \
+             `scripts/local-rdb.sh status`)"
+        }
         ErrorKind::UploadChunkConflict => "start the upload again under a new upload id",
         ErrorKind::CorruptBlob => "write `Change::Clear` to the blob, then upload it again",
     }
@@ -450,15 +456,26 @@ mod tests {
         assert!(missing.is_empty(), "no next step: {missing:#?}");
     }
 
-    /// A-R200: a refusal with no recorded state names where the reason is.
+    /// A-R200, then W5 on A-R256: a refusal with no recorded state says what to do in plain
+    /// words. It said "call `wait_ready` or `node_status` for the reason", API names a person
+    /// running `scripts/local-rdb.sh` cannot call; a read's unknown outcome said the same.
+    /// Cut: put either old step back and this row goes red.
     #[test]
-    fn an_unavailable_refusal_says_where_the_reason_is() {
+    fn an_unavailable_refusal_says_what_to_do_in_plain_words() {
         let error = ApiError::new(ErrorKind::Unavailable, "node 1 does not admit writes");
         assert_eq!(
             error.to_string(),
-            "UNAVAILABLE (node 1 does not admit writes; next: call `wait_ready` or \
-             `node_status` for the reason)"
+            "UNAVAILABLE (node 1 does not admit writes; next: the database is not serving right \
+             now: wait a few seconds and try again; if it keeps refusing, check that its nodes \
+             and its rEtcd are running (on a local run, `scripts/local-rdb.sh status`))"
         );
+        let read = step_for(ErrorKind::UnknownOutcome, RetryRule::BoundedJitter);
+        for step in [error.next_step().expect("a step"), read] {
+            assert!(
+                !step.contains("wait_ready") && !step.contains("node_status"),
+                "{step}"
+            );
+        }
     }
 
     /// #59 (tester-s2, A-R230 Q3): every open and wait text W5's sites will carry ends with a

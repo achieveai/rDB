@@ -234,6 +234,9 @@ pub enum ReplyOutcome {
 
 /// P1's inputs (design §4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// P1 events move by value: a candidate is 408 B with one ack floor, and at 100 writes/s
+// the copy costs nothing (ruling A-R258).
+#[allow(clippy::large_enum_variant)]
 pub enum PubEvent {
     /// T1's applied candidate.
     Candidate(AppliedCandidate),

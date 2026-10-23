@@ -34,6 +34,8 @@ use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
 use rdb_storage::RocksEngine;
+/// The storage engine's options, set per open through [`DbConfig::storage`] (ruling A-R248).
+pub use rdb_storage::StorageOptions;
 use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
 use rdb_value::value::Value;
@@ -175,6 +177,10 @@ pub struct DbConfig {
     /// [`next_boot`] of [`Self::dir`], and each restart then takes [`next_boot`] of it too.
     /// `None`: the directory's `n`-th open starts at `((n - 1) << 16) + 1` and a restart adds one.
     pub boot: Option<BootId>,
+    /// The storage engine's options for every node's copy (rulings A-R248, A-R253): today the
+    /// memtable budget per column family. `StorageOptions::default()` is RocksDB's own, 64 MiB.
+    /// A node restarted by [`Db::restart_node`] opens with the same options.
+    pub storage: StorageOptions,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -696,6 +702,8 @@ struct Respawn {
     /// The folder a restart takes [`next_boot`] of, when the open was given its boot
     /// ([`DbConfig::boot`]). `None`: a restart adds one to the boot it replaces.
     boots: Option<PathBuf>,
+    /// The open's storage options, so a restarted node keeps them (A-R253).
+    storage: StorageOptions,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -770,6 +778,7 @@ impl Db {
             budgets,
             limits,
             boots: config.boot.map(|_| config.dir.clone()),
+            storage: config.storage,
         };
         let mut db = Self::open_spawning(
             config,
@@ -878,7 +887,7 @@ impl Db {
         // Opening the engines takes their `LOCK`s, so of two opens racing on one directory one
         // is refused `InUse` here (F-001). Only an open that created `nodes/` and holds node 1's
         // `LOCK` may remove it.
-        let engines = match open_engines(&nodes_dir, &config.local) {
+        let engines = match open_engines(&nodes_dir, &config.local, config.storage) {
             Ok(engines) => engines,
             Err((error, held_owner)) => {
                 if created && held_owner {
@@ -2239,6 +2248,7 @@ impl Db {
                 budgets,
                 limits: Limits::default(),
                 boots: None,
+                storage: StorageOptions::default(),
             }),
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.clone(), links),
@@ -2275,6 +2285,7 @@ impl Db {
                 budgets,
                 limits,
                 boots: None,
+                storage: config.storage,
             }),
             links,
             control,
@@ -2297,6 +2308,7 @@ impl Db {
                 budgets,
                 limits,
                 boot,
+                config.storage,
             )
             .map_err(OpenError::Node)?;
             lock(&db.nodes).push(handle);
@@ -2501,6 +2513,7 @@ impl Db {
             respawn.budgets,
             respawn.limits,
             boot,
+            respawn.storage,
         );
         match started {
             Ok(started) => {
@@ -2931,6 +2944,7 @@ fn one_separator(path: &Path) -> PathBuf {
 fn open_engines(
     nodes_dir: &Path,
     local: &[NodeId],
+    storage: StorageOptions,
 ) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
         rdb_storage::OpenError::Locked { .. } => OpenError::InUse(one_separator(dir)),
@@ -2945,7 +2959,7 @@ fn open_engines(
             missing.push((node, dir));
             continue;
         }
-        match RocksEngine::open_existing(&dir) {
+        match RocksEngine::open_existing_with(&dir, storage) {
             Ok(engine) => {
                 engines.insert(node, engine);
             }
@@ -2962,7 +2976,7 @@ fn open_engines(
         }
     }
     for (node, dir) in missing {
-        match RocksEngine::open(&dir) {
+        match RocksEngine::open_with(&dir, storage) {
             Ok(engine) => {
                 engines.insert(node, engine);
             }
@@ -3257,7 +3271,7 @@ mod tests {
     fn admits_within(db: &Db, phase: &str, patience: Duration) {
         let patience = crate::host::test_patience(patience);
         let deadline = std::time::Instant::now() + patience;
-        while db.node_status().first().and_then(|node| node.admits) != Some(true) {
+        while owner_of(db, db.node_status()).and_then(|node| node.admits) != Some(true) {
             for node in db.node_status() {
                 let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                 crate::host::assert_not_blocked(&node, window);
@@ -3276,19 +3290,23 @@ mod tests {
     /// unpublished txn and refuses new writes `PROTECTION_PAUSED`. `Msg::Inspect` is answered
     /// between drains, so once `published` shows `seq`, the publish's thaw has run too.
     fn publishes(db: &Db, seq: Seq, phase: &str) {
-        let patience = crate::host::test_patience(Duration::from_secs(5));
-        let deadline = std::time::Instant::now() + patience;
-        while !db.node_status().first().is_some_and(|node| {
-            node.published.map(|(_, at)| at) == Some(seq) && node.in_flight.is_none()
-        }) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{phase}: node 1 has not published {seq:?} with nothing in flight within \
-                 {patience:?}: {:?}",
-                db.node_status().first()
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        owner_when(
+            db,
+            &format!("{phase}: node 1 publishes {seq:?} with nothing in flight"),
+            crate::host::test_patience(Duration::from_secs(5)),
+            &|node| node.published.map(|(_, at)| at) == Some(seq) && node.in_flight.is_none(),
+        );
+    }
+
+    /// Node 1's next answer to `node_status`, waited for within the scaled 5 s; see
+    /// [`owner_of`]. For a row that asserts on one look rather than waits for a state.
+    pub(super) fn owner_status(db: &Db, what: &str) -> NodeStatus {
+        owner_when(
+            db,
+            what,
+            crate::host::test_patience(Duration::from_secs(5)),
+            &|_| true,
+        )
     }
 
     /// The spec's budgets with L1's waits cut short, so a fresh partition admits writes within
@@ -3313,6 +3331,7 @@ mod tests {
             links: None,
             client: DEFAULT_CLIENT,
             boot: None,
+            storage: crate::StorageOptions::default(),
         }
     }
 
@@ -3355,6 +3374,7 @@ mod tests {
             links: None,
             client: DEFAULT_CLIENT,
             boot: None,
+            storage: crate::StorageOptions::default(),
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3445,6 +3465,7 @@ mod tests {
             links: None,
             client: DEFAULT_CLIENT,
             boot: None,
+            storage: crate::StorageOptions::default(),
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3574,6 +3595,7 @@ mod tests {
             links: None,
             client: DEFAULT_CLIENT,
             boot: None,
+            storage: crate::StorageOptions::default(),
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3590,13 +3612,12 @@ mod tests {
             }
         };
         let applied = |db: &Db| {
-            db.node_status()
-                .first()
+            owner_of(db, db.node_status())
                 .and_then(|n| n.holds)
                 .map(|h| h.applied)
         };
         until("node 1 admits writes", &|db| {
-            db.node_status().first().and_then(|n| n.admits) == Some(true)
+            owner_of(db, db.node_status()).and_then(|n| n.admits) == Some(true)
         });
         assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
 
@@ -3637,9 +3658,13 @@ mod tests {
             "{:?}",
             changed.error
         );
-        let node = db.node_status().into_iter().next().expect("node 1");
+        let node = owner_status(&db, "node 1 after the heal");
         assert_eq!(node.fault, None, "node 1 never faulted");
-        assert_eq!(applied(&db), Some(3), "request 100 published once");
+        assert_eq!(
+            node.holds.map(|h| h.applied),
+            Some(3),
+            "request 100 published once"
+        );
     }
 
     /// M9 S2a mutant pass: `node_status` reports a control reload that is retrying, on the
@@ -4482,7 +4507,7 @@ mod tests {
         let pending = unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
         let pending_id = pending.identity.request;
         assert_eq!(
-            db.node_status().first().and_then(|owner| owner.in_flight),
+            owner_status(&db, "node 1 with the first txn in flight").in_flight,
             Some(pending_id),
             "node 1 holds the first txn applied and unpublished"
         );
@@ -4548,15 +4573,12 @@ mod tests {
         admits(&db, "after the open");
         let first = db.put(b"a", b"1", None).expect("before the restart");
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
-        let patience = crate::host::test_patience(Duration::from_secs(5));
-        let deadline = std::time::Instant::now() + patience;
-        while db.node_status().first().and_then(|node| node.admits) != Some(false) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "L1 does not pause within {patience:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        owner_when(
+            &db,
+            "L1 pauses",
+            crate::host::test_patience(Duration::from_secs(5)),
+            &|node| node.admits == Some(false),
+        );
         let refused = db.put(b"a", b"9", None).expect_err("paused");
         assert_eq!(
             refused.error.kind,
@@ -4580,8 +4602,8 @@ mod tests {
             "{retried:?}"
         );
         assert_eq!(
-            db.node_status().first().map(|owner| owner.in_flight),
-            Some(None),
+            owner_status(&db, "node 1 while paused").in_flight,
+            None,
             "nothing is applied unpublished at node 1"
         );
         assert_eq!(db.status(id, None).expect("status"), TxnStatus::Unknown);
@@ -4988,6 +5010,8 @@ mod tests {
             remaining_millis: 0,
             conditions: Vec::new(),
             mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let refused = db
             .resend_within(request.clone(), past)
@@ -5836,9 +5860,12 @@ mod tests {
     /// the one step that helps: the reopen step for `Blocked`, the A-R196(2b) text for
     /// `Quarantined`. A healthy node 1's refusal is unchanged. Node 1 is a stub that answers
     /// every look with the phase and holds every call unanswered, so each call times out. The
-    /// row looks once with `wait_ready` first, as an app does after an open.
-    /// Cut: `explained` adds nothing, and the stuck cases equal the healthy one.
-    /// Unit (~2 s): no node thread.
+    /// row looks with `wait_ready` first, as an app does after an open. The stub sits on its
+    /// first look past the read timeout, as a host no thread ran for did (k429), so the row
+    /// looks until one is answered (A-R257).
+    /// Cuts: `explained` adds nothing, and the stuck cases equal the healthy one; one
+    /// `wait_ready(50 ms)` look, and the stuck cases lose their step.
+    /// Unit (~3 s): no node thread.
     #[test]
     fn m10_r200_a_stuck_recovery_names_its_state_and_step_on_each_refusal() {
         let refusals = |recovery: Option<String>| {
@@ -5867,17 +5894,35 @@ mod tests {
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
                 let mut held = Vec::new();
+                let mut stalled = false;
                 while let Ok(msg) = mailbox.recv() {
                     match msg {
                         Msg::Inspect { reply, .. } => {
+                            // The first look outlasts the read timeout, as on a starved host.
+                            if !stalled {
+                                stalled = true;
+                                std::thread::sleep(Duration::from_millis(300));
+                            }
                             let _ = reply.send(status.clone());
                         }
                         other => held.push(other),
                     }
                 }
             });
-            // The look the app makes after an open; the refusals read what it found.
-            let _ = db.wait_ready(Duration::from_millis(50));
+            // The look the app makes after an open; the refusals read what it found. A look
+            // nothing answered in time found nothing, so the row looks again within its
+            // patience, as an app told `TimedOut` in phase "unknown" would (A-R257).
+            let patience = crate::host::test_patience(Duration::from_secs(5));
+            let deadline = std::time::Instant::now() + patience;
+            while matches!(
+                db.wait_ready(Duration::from_millis(50)),
+                Err(ReadyError::TimedOut { phase, .. }) if phase == NO_ANSWER
+            ) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "node 1 answered no look within {patience:?}"
+                );
+            }
             let put = db
                 .put(b"a", b"1", None)
                 .expect_err("nothing answers the compile")
@@ -6313,6 +6358,8 @@ mod tests {
                 value: Bytes::from(newer),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         db.resend(raw).expect("write the newer build's record");
 
@@ -6841,7 +6888,7 @@ mod tests {
     }
 
     /// Node 1's status once `done` holds for it, polled within `patience`; see [`owner_of`].
-    fn owner_when(
+    pub(super) fn owner_when(
         db: &Db,
         what: &str,
         patience: Duration,
@@ -6863,8 +6910,10 @@ mod tests {
     /// A-R237 (int gate k429): node 1 missing from `node_status` because it did not answer
     /// within `Timeouts::read` is "not yet" to the D7 waits, never a panic and never another
     /// node's status. Node 1 here is a stub that sits on its first look past the read timeout,
-    /// as a host no thread ran for did, then answers every look. Cut: `owner_of` as
-    /// `next().expect("node 1")` — the first look finds no node and the row panics.
+    /// as a host no thread ran for did, then answers every look. It looks through
+    /// [`owner_status`], which the rows that assert on one look share (A-R250). Cuts: `owner_of`,
+    /// or `owner_status`, as `next().expect("node 1")` — the first look finds no node and the
+    /// row panics.
     #[test]
     fn m10_d7_node_1_missing_from_node_status_is_not_yet() {
         let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
@@ -6903,12 +6952,7 @@ mod tests {
                 }
             })
         };
-        let owner = owner_when(
-            &db,
-            "node 1 after its stall",
-            Duration::from_secs(10),
-            &|_| true,
-        );
+        let owner = owner_status(&db, "node 1 after its stall");
         assert_eq!(owner.node, OWNER, "node 1's status, not another node's");
         assert!(
             looks.load(Ordering::Relaxed) >= 2,
@@ -7315,14 +7359,16 @@ mod tests {
     /// A-R177 row 9 (critic-f5 residual): a copy below the base in its own generation. Node 2
     /// misses `b` while 1-2 is held, so it stops at seq 1 of generation 1 while nodes 1 and 3
     /// hold 2; the next reopen runs without node 2 and commits generation 2 at base 2. The
-    /// reopen after that cannot link generation 2 for node 2 (its head is below the base), and
-    /// a cross-generation catch-up does not exist yet: it is owed to slice 2. This row guards
-    /// slice 1's bar until then (A-R179): no host fault, and the stall is named
-    /// (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line). It waits for that line, not
-    /// a fixed time.
-    /// Integration (~20 s): the stall only shows after three real opens and the rebuild watch.
+    /// reopen after that cannot link generation 2 for node 2 (its head is below the base).
+    /// Re-cut 2026-10-23 (M10 S2, issue #59, K1/K2): node 2 now catches up across the two
+    /// generations. Generation 3 commits, F1 proves node 2 durable in it
+    /// (`sync_proven node=2 generation=3 durable=3`), node 1 admits writes, and nothing stalls
+    /// or faults. Slice 1's bar was no fault and a named stall (A-R179); the stall is gone now.
+    /// Cut: undo K1/K2's catch-up, and node 2 stalls again, so this row goes red.
+    /// Integration (~20 s): three real opens, and the catch-up needs the third one's recovery.
     #[config_log::retcd_test]
-    fn m10_d7_below_the_base_a_copy_has_no_fault_and_its_stall_is_named() {
+    fn m10_d7_below_the_base_a_copy_catches_up() {
+        const METHOD: &str = "m10_d7_below_the_base_a_copy_catches_up";
         let rt = runtime();
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -7376,14 +7422,30 @@ mod tests {
         drop(db);
 
         let mut db = open(Vec::new());
-        let stalled = settle(&db, "the reopen with node 2 below the base", &|owner| {
-            owner.stalled.is_some()
+        let proven = |line: &serde_json::Value| {
+            line["@m"] == "sync_proven" && line["node"] == 2 && line["generation"] == 3
+        };
+        settle(&db, "the reopen with node 2 below the base", &|owner| {
+            owner.admits == Some(true)
+                && config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                    .iter()
+                    .any(proven)
         });
-        let line = stalled.stalled.clone().unwrap_or_default();
+        let durable: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .filter(|line| proven(line))
+            .map(|line| line["durable"].as_u64())
+            .collect();
         assert!(
-            line.starts_with("recovery_rebuild_stalled") && line.contains("gen=3"),
-            "the stall names generation 3's rebuild: {line}"
+            !durable.is_empty() && durable.iter().all(|seq| *seq == Some(3)),
+            "F1 proves node 2 durable at 3 in generation 3: {durable:?}"
         );
+        let stalled: Vec<_> = db
+            .node_status()
+            .into_iter()
+            .filter(|node| node.stalled.is_some())
+            .collect();
+        assert!(stalled.is_empty(), "nothing stalls: {stalled:?}");
         db.shutdown();
     }
 
@@ -8269,17 +8331,15 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut phase = None;
         let owner = loop {
-            let owner = db
-                .node_status()
-                .into_iter()
-                .find(|s| s.node == OWNER)
-                .expect("node 1 status");
-            if owner.recovery != phase {
-                tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
-                phase.clone_from(&owner.recovery);
-            }
-            if owner.admits == Some(true) {
-                break owner;
+            // Node 1 missing from a look is "not yet" (A-R257); see [`owner_of`].
+            if let Some(owner) = owner_of(&db, db.node_status()) {
+                if owner.recovery != phase {
+                    tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
+                    phase.clone_from(&owner.recovery);
+                }
+                if owner.admits == Some(true) {
+                    break owner;
+                }
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -8498,20 +8558,13 @@ mod tests {
         });
         let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
         until_stored(&rt, &store, 2);
-        let patience = crate::host::test_patience(Duration::from_secs(30));
-        let deadline = std::time::Instant::now() + patience;
-        loop {
-            let owner = db.node_status().into_iter().next().expect("node 1");
-            if owner.recovery.as_deref() == Some("ProposalUnresolved") {
-                assert_eq!(owner.recovered, None, "never committed here: {owner:?}");
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "F1 never reached ProposalUnresolved: {owner:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let owner = owner_when(
+            &db,
+            "F1 reaches ProposalUnresolved",
+            crate::host::test_patience(Duration::from_secs(30)),
+            &|owner| owner.recovery.as_deref() == Some("ProposalUnresolved"),
+        );
+        assert_eq!(owner.recovered, None, "never committed here: {owner:?}");
         db.shutdown();
         drop(db);
         scripted.rescript(Script::default());
@@ -8617,7 +8670,7 @@ mod tests {
         until_stored(&rt, &store, 2);
         let held_until = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < held_until {
-            let owner = db.node_status().into_iter().next().expect("node 1");
+            let owner = owner_status(&db, "node 1 before the mark");
             assert!(
                 owner.authority == "unheld" && owner.admits != Some(true),
                 "node 1 acquired or admits before the mark: {owner:?}"

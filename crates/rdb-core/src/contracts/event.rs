@@ -544,6 +544,9 @@ pub enum KernelEffect {
     /// Re-sending records cannot bring `copy` up to date (§3.4 rule 9 `NotRetained`, §3.6
     /// steps 1 and 1a, the probe cap; lead ruling B-R36). M7 emits the signal only. No kernel
     /// receives it, so it has no event twin.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225):** the host serves it from its engine (a
+    /// snapshot of this primary's copy). No kernel serves it.
     SnapshotCatchupRequired {
         /// The copy.
         copy: CopyId,
