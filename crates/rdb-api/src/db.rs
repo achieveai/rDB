@@ -1187,7 +1187,48 @@ impl Db {
                 request: None,
             });
         }
-        let identity = self.identity();
+        self.txn_identified(self.identity(), puts, deadline)
+    }
+
+    /// [`Self::txn`] under request id `request`, which this client may have used already, so an
+    /// app can keep the id before it sends and ask [`Self::status`] after a crash (A-R194). A
+    /// fresh compile, so a changed payload under a used id meets the dedup rules
+    /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::txn`], except that no answer claims `no_mutation` (D-S0-1). `request` may
+    /// already be applied, and the compile refuses (a stale condition, an oversized value)
+    /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
+    /// that this call sent nothing; ask [`Self::status`] what became of `request`.
+    pub fn txn_as(
+        &self,
+        request: RequestId,
+        puts: &[TxnPut<'_>],
+        deadline: Duration,
+    ) -> Result<PutOk, PutError> {
+        let identity = RequestIdentity {
+            tenant: TENANT,
+            client: CLIENT,
+            request,
+        };
+        let answer = match deadline_refusal(deadline) {
+            Some(error) => Err(PutError {
+                error,
+                request: None,
+            }),
+            None => self.txn_identified(identity, puts, deadline),
+        };
+        self.retried(request, answer)
+    }
+
+    fn txn_identified(
+        &self,
+        identity: RequestIdentity,
+        puts: &[TxnPut<'_>],
+        deadline: Duration,
+    ) -> Result<PutOk, PutError> {
         // Counted before any value is copied (M9 S5).
         if puts.len() > MAX_OPS {
             return Err(PutError {
@@ -1285,18 +1326,55 @@ impl Db {
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
+        self.write_identified(self.identity(), object, change, expect)
+    }
+
+    /// [`Self::write`] under request id `request`, which this client may have used already, so
+    /// an app can keep the id before it sends and ask [`Self::status`] after a crash (A-R194). A
+    /// fresh compile, so a changed payload under a used id meets the dedup rules
+    /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`], except that no answer claims `no_mutation` (D-S0-1). `request` may
+    /// already be applied, and the compile refuses (a stale condition, an oversized value)
+    /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
+    /// that this call sent nothing; ask [`Self::status`] what became of `request`. Likewise
+    /// `Ok(None)`: the change compiled to nothing here, which says nothing about an earlier
+    /// send under `request`.
+    pub fn write_as(
+        &self,
+        request: RequestId,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
+        let identity = RequestIdentity {
+            tenant: TENANT,
+            client: CLIENT,
+            request,
+        };
+        self.retried(
+            request,
+            self.write_identified(identity, object, change, expect),
+        )
+    }
+
+    fn write_identified(
+        &self,
+        identity: RequestIdentity,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
         let put = PutOp {
             group: GROUP,
             object: Bytes::copy_from_slice(object),
             change,
             expect,
         };
-        self.compile_and_send(
-            self.identity(),
-            vec![put],
-            self.timeouts.put,
-            self.timeouts.put,
-        )
+        self.compile_and_send(identity, vec![put], self.timeouts.put, self.timeouts.put)
     }
 
     /// Compile `puts` under `identity` with kernel deadline `deadline`, waiting
@@ -1326,8 +1404,8 @@ impl Db {
             remaining_millis: millis(deadline),
         };
         // Every answer here sent nothing: the compile refused, or never answered (Q3, M9 S6).
-        // `put_as` takes this back to `false` through `Self::retried`: its request id may have
-        // applied on an earlier send.
+        // `put_as`, `txn_as` and `write_as` take this back to `false` through `Self::retried`:
+        // their request id may have applied on an earlier send.
         let refused = |mut error: ApiError| {
             error.no_mutation = true;
             Err(PutError {
@@ -1732,11 +1810,7 @@ impl Db {
     /// ([`Self::status_will_show`]): F1 refuses a retry of a finished write paused too (Message
     /// 7, P2), but a request refused at admission was never queued, and nothing resolves it
     /// (Msg 8, W6-D1). A new put's refusal does not come through here.
-    fn retried(
-        &self,
-        request: RequestId,
-        answer: Result<PutOk, PutError>,
-    ) -> Result<PutOk, PutError> {
+    fn retried<T>(&self, request: RequestId, answer: Result<T, PutError>) -> Result<T, PutError> {
         answer.map_err(|mut refused| {
             refused.error.no_mutation = false;
             if refused.error.kind == ErrorKind::ProtectionPaused && self.status_will_show(request) {

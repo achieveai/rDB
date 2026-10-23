@@ -1638,3 +1638,97 @@ fn m10_a3_open_counter_bytes_this_build_does_not_write_are_unreadable() {
         );
     }
 }
+
+/// A fresh open, ready: the `Db` an `_as` row sends on.
+fn ready_db(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStore>) -> Db {
+    let db = open(rt, dir, store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db
+}
+
+/// The id an app chose and kept before sending: far from any id this `Db` draws itself.
+const CHOSEN: RequestId = RequestId(0x00AB_CDEF);
+
+/// A-R194: `txn_as` sends under the id the app chose, so the app can keep that id before it
+/// sends and ask `status(id, gen)` afterwards, after a crash included. The answer names the
+/// chosen id, status reports it applied at the same position, and both puts read back. Cut:
+/// `txn_as` sends under `self.identity()`, and status of the chosen id is not `Resolved`.
+/// Integration (~2 s): one fresh open until ready, one transaction.
+#[config_log::retcd_test]
+fn m10_r194_a_txn_sent_under_a_chosen_id_is_found_by_status_under_that_id() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = ready_db(&rt, dir.path(), &store);
+
+    let puts = [
+        TxnPut {
+            group: GROUP,
+            object: b"a",
+            value: b"1",
+            if_version: None,
+        },
+        TxnPut {
+            group: GROUP,
+            object: b"b",
+            value: b"2",
+            if_version: None,
+        },
+    ];
+    let ok = db
+        .txn_as(CHOSEN, &puts, Duration::from_secs(5))
+        .expect("the txn");
+    assert_eq!(ok.request, CHOSEN, "the answer names the chosen id");
+    match db
+        .status(CHOSEN, Some(ok.generation))
+        .expect("status of the chosen id")
+    {
+        TxnStatus::Resolved(result) => assert_eq!(
+            (result.generation, result.seq),
+            (ok.generation, ok.seq),
+            "{result:?}"
+        ),
+        other => panic!("status of the chosen id: {other:?}"),
+    }
+    for (object, value) in [(b"a", b"1"), (b"b", b"2")] {
+        assert_eq!(
+            db.get(object).expect("get").value.map(|(_, value)| value),
+            Some(Bytes::copy_from_slice(value))
+        );
+    }
+    db.shutdown();
+}
+
+/// A-R194: `write_as` sends under the id the app chose, as `txn_as` does. Cut: `write_as` sends
+/// under `self.identity()`, and status of the chosen id is not `Resolved`.
+/// Integration (~2 s): one fresh open until ready, one write.
+#[config_log::retcd_test]
+fn m10_r194_a_write_sent_under_a_chosen_id_is_found_by_status_under_that_id() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = ready_db(&rt, dir.path(), &store);
+
+    let ok = db
+        .write_as(CHOSEN, b"a", byte_doc(b"1"), Some(Expected::Absent))
+        .expect("the write")
+        .expect("a create is never unchanged");
+    assert_eq!(ok.request, CHOSEN, "the answer names the chosen id");
+    match db
+        .status(CHOSEN, Some(ok.generation))
+        .expect("status of the chosen id")
+    {
+        TxnStatus::Resolved(result) => assert_eq!(
+            (result.generation, result.seq),
+            (ok.generation, ok.seq),
+            "{result:?}"
+        ),
+        other => panic!("status of the chosen id: {other:?}"),
+    }
+    assert_eq!(
+        db.get(b"a").expect("get a").value.map(|(_, value)| value),
+        Some(Bytes::from_static(b"1"))
+    );
+    db.shutdown();
+}
