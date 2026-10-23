@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-// Print an error with `{}`, not `{:?}`: its text ends with the next step to take.
+// Print an error with `{}`, not `{:?}`: its text says what failed, and most end with the next step.
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
