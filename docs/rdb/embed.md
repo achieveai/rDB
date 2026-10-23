@@ -145,28 +145,71 @@ extra to do, after a clean `shutdown` or after the process was killed.
 
 ### After a reopen: did my write land?
 
-You saved a write's request before the process stopped: from `ok.sent` on success, or from
-`refused.request` on an `UNKNOWN_OUTCOME`. Now you want to know whether it landed.
+To ask later, you need something saved before the process stopped. There are two ways.
 
-- **Sending it again answers `GENERATION_CHANGED`.** The reopen started a new generation (one
-  chapter of the folder's history), and a request from an older one is never replayed or run
-  again. That send changed nothing.
-- **Then ask `db.status(id, None)`.** `Resolved` means it landed. Its `outcome` is
+- **Save the request after its answer.** It is in `ok.sent` on success, or `refused.request` on
+  `UNKNOWN_OUTCOME`. A `TxnRequest` serializes with `serde_json`. Write it to a file, and sync
+  the file (`File::sync_data`) before you rely on it. This does not cover a kill before the
+  answer: `put` builds its request inside `Db`, so there is nothing to save until it returns.
+- **Save the id before the send.** For a put you must be able to settle after a kill, choose its
+  request id yourself. Save the id, synced, then send with `db.put_as(id, ..)` (`put_saved`
+  below). Never use an id twice. In that folder, do not also use `put`, `txn` or `write`: they
+  choose ids of their own, and one could match yours. In this release this works for single
+  puts only.
+
+With neither, a kill before any answer leaves nothing to ask about. Read the data with `get`.
+
+Then ask:
+
+- **A resend answers `GENERATION_CHANGED`.** The reopen started a new generation (one chapter of
+  the folder's history), and a request from an older one is never replayed or run again. That
+  send changed nothing. Look the request up with `status`; do not resend it as a new request.
+- **Ask `db.status(id, generation)`.** `Resolved` means it landed. Its `outcome` is
   `RecoveredApplied` when the answer comes from history kept across the reopen.
-- **`Unknown` or `Expired` is not proof that it did not land.** `Unknown` can turn into
-  `Resolved` later, once the nodes catch up; ask again. `Expired` means the record is older than
-  the dedup retention (`DbConfig::dedup_retention`, 24 h by default). Read the data itself
-  with `get` to decide.
-- **A kill before any answer leaves you no request to ask about.** Read the data with `get`.
+- **The second argument is the generation the request was sent under**: the request's
+  `expected_generation`, or the `generation` of its answer. Pass `None` when you do not know it,
+  as after `put_saved`. A request that landed still answers `Resolved`. Only the not-landed
+  answers differ: without it, a record from an older generation that is gone answers `Unknown`
+  instead of `Expired`.
+- **`Unknown` or `Expired` is not proof that it did not land.** `Expired` means the record is
+  older than the dedup retention (`DbConfig::dedup_retention`, 24 h by default). Ask only after
+  `wait_ready` returns `Ok`. After that, do not keep asking: decide with `get`, or give up and
+  report it. A request of the current open still in flight can answer `Unknown` until it
+  publishes. Ask again a few times within a few seconds at most. Never poll `status` forever.
 
 `crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
 
 ```rust
-use rdb_api::{ApiError, Db, ErrorKind, TxnRequest, TxnStatus};
+use std::error::Error;
+use std::fs::File;
+use std::io::Write;
 
-/// `true`: it landed. `false`: not known yet, which is not proof that it did not land.
+use rdb_api::{ApiError, Db, ErrorKind, Generation, PutOk, RequestId, TxnRequest, TxnStatus};
+
+/// A put you can look up after a kill: its id is saved, synced, before it is sent.
+fn put_saved(
+    db: &Db,
+    ids: &mut File,
+    id: RequestId,
+    object: &[u8],
+    value: &[u8],
+) -> Result<PutOk, Box<dyn Error>> {
+    writeln!(ids, "{}", id.0)?;
+    ids.sync_data()?;
+    Ok(db
+        .put_as(id, object, value, None)
+        .map_err(|refused| refused.error)?)
+}
+
+/// `true`: request `id` landed. `false`: not known, which is not proof that it did not land.
+/// `sent_in`: the generation it was sent under, when you know it.
+fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<bool, ApiError> {
+    Ok(matches!(db.status(id, sent_in)?, TxnStatus::Resolved(_)))
+}
+
+/// The same question for a request saved after its answer (`ok.sent` or `refused.request`).
 fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
-    let id = saved.identity.request;
+    let (id, sent_in) = (saved.identity.request, saved.expected_generation);
     match db.resend(saved) {
         Ok(_) => return Ok(true), // same generation: applied now, or its answer replayed
         Err(refused) if refused.error.kind != ErrorKind::GenerationChanged => {
@@ -174,7 +217,7 @@ fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
         }
         Err(_) => {} // after a reopen: this send applied nothing; ask what the first one did
     }
-    Ok(matches!(db.status(id, None)?, TxnStatus::Resolved(_)))
+    landed(db, id, sent_in)
 }
 ```
 
@@ -187,6 +230,9 @@ fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
   missing value instead. Moving to a clean copy comes with a later release (rejoin and recovery).
+- **A stalled rEtcd pauses writes.** If rEtcd stalls for more than about 2 s, for example during
+  its own leader election, node 1's permission to write can run out. Writes then pause, and
+  resume once it is granted again. Nothing is lost. Tuning that margin is planned.
 
 ## 6. When an open is refused
 
