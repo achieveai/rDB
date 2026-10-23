@@ -23,8 +23,8 @@ built.
   LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }
   ```
 
-- **Time for the first build.** It compiles RocksDB from source: several minutes
-  (6 min 37 s measured on the dev host). Later builds reuse it.
+- **Time for the first build.** It compiles RocksDB from source: about 3 minutes
+  (3 min 2 s for an outside crate on the dev host, 2026-10-22). Later builds reuse it.
 - A checkout of this repository. You depend on its crates by path; nothing is published.
 
 ## 2. Your `Cargo.toml`
@@ -78,16 +78,22 @@ It runs without TLS and with every caller allowed. That is for one machine, neve
 ## 4. Open, wait, use, shut down
 
 ```rust
+use rdb_api::{Db, DbConfig, Timeouts};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
-use rdb_api::{Db, DbConfig, Timeouts};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     // Plain gRPC (TlsMode::Insecure is the default): for a local rEtcd only.
     let client = config_client::GrpcClient::connect(
-        vec!["127.0.0.1:28402".into(), "127.0.0.1:28412".into(), "127.0.0.1:28422".into()],
+        vec![
+            "127.0.0.1:28402".into(),
+            "127.0.0.1:28412".into(),
+            "127.0.0.1:28422".into(),
+        ],
         config_client::GrpcClientOptions::default(),
     )?;
     let store: Arc<dyn config_core::ConfigStore> = Arc::new(client);
@@ -100,12 +106,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     // The same call opens a new folder or one that already holds data.
     let mut db = rt.block_on(Db::open(config, store, rt.handle().clone()))?;
-    // Ready: node 1 admits writes. Errors if not ready in 60 s, or if a reopen's repair failed.
+    // Ready: node 1 admits writes. Errors if not ready in 60 s, if a reopen's repair failed,
+    // or if node 1 stopped in this open.
     db.wait_ready(Duration::from_secs(60))?;
-    db.put(b"greeting", b"hello", None).map_err(|refused| refused.error)?;
-    let got = db.get(b"greeting")?;
-    if got.value.map(|(_, bytes)| bytes.to_vec()) != Some(b"hello".to_vec()) {
-        return Err("read back something other than what was written".into());
+    db.put(b"greeting", b"hello", None)
+        .map_err(|refused| refused.error)?;
+    // `value` is `Some((version, bytes))`, or `None` when the object is absent.
+    match db.get(b"greeting")?.value {
+        Some((version, bytes)) if bytes.as_ref() == b"hello" => {
+            println!("read back hello at version {version}");
+        }
+        other => return Err(format!("read back {other:?}, not hello").into()),
     }
     db.shutdown();
     Ok(())
@@ -116,6 +127,9 @@ fn main() -> Result<(), Box<dyn Error>> {
   calls; do not call them from inside an async task.
 - Every error here returns from `main`, which prints it and exits with code 1. A `Db` that is
   dropped on the way out shuts itself down. In a real app, match on the error instead (section 6).
+- On success it prints `read back hello at version N`. Run it a second time: the same code
+  reopens the folder (section 5), the `put` writes a new version over the old one, and the line
+  shows a higher `N`. `got.value` is `Some((version, bytes))`, or `None` for an absent object.
 - A refused `put` hands back its request in `refused.request`, so you can send it again with
   `db.resend`. The sample just returns the reason.
 - Open-to-ready took about 2.7-2.9 s on the dev host for a new folder, and about 5.5 s for a
@@ -138,6 +152,13 @@ extra to do, after a clean `shutdown` or after the process was killed.
   or `Failed`.
 - **One process opens a folder at a time.** A second open, in this process or another, is refused
   with `InUse`. The first is not disturbed.
+- **Never run two copies of one folder at once.** The lock covers one directory only. A copy of
+  the folder in another directory (a backup you restored beside it, say) opens against the same
+  rEtcd without being refused. Run both and the writes of one are lost. Keep at most one copy
+  open.
+- **If node 1 restarts inside an open (`Db::restart_node`), writes stop for that open.** `wait_ready` then returns
+  `ReadyError::Stopped`, and every refused `put` or `get` says the same next step: shut this `Db`
+  down and open the folder again.
 - **If rEtcd is down at open,** the open fails with `Control` within a few seconds (5 s on the
   dev host). Open again once rEtcd is back.
 - Each open counts as one "reopen" of the folder's history. See the ceilings in section 7 for
@@ -145,28 +166,73 @@ extra to do, after a clean `shutdown` or after the process was killed.
 
 ### After a reopen: did my write land?
 
-You saved a write's request before the process stopped: from `ok.sent` on success, or from
-`refused.request` on an `UNKNOWN_OUTCOME`. Now you want to know whether it landed.
+To ask later, you need something saved before the process stopped. There are two ways.
 
-- **Sending it again answers `GENERATION_CHANGED`.** The reopen started a new generation (one
-  chapter of the folder's history), and a request from an older one is never replayed or run
-  again. That send changed nothing.
-- **Then ask `db.status(id, None)`.** `Resolved` means it landed. Its `outcome` is
+- **Save the request after its answer.** It is in `ok.sent` on success, or `refused.request` on
+  `UNKNOWN_OUTCOME`. A `TxnRequest` serializes with `serde_json`. Write it to a file, and sync
+  the file (`File::sync_data`) before you rely on it. This does not cover a kill before the
+  answer: `put` builds its request inside `Db`, so there is nothing to save until it returns.
+- **Save the id before the send.** For a write you must be able to settle after a kill, choose
+  its request id yourself. Save the id, synced, then send with `db.put_as(id, ..)`,
+  `db.txn_as(id, ..)` or `db.write_as(id, ..)` (`put_saved` below does it for a put). Never use
+  an id twice. In that folder, do not also use `put`, `txn` or `write`: they choose ids of their
+  own, and one could match yours. A send refused before it went out, and `write_as`'s
+  `Ok(None)` (the change came to nothing), say nothing about an earlier send under that id:
+  ask `status`.
+
+With neither, a kill before any answer leaves nothing to ask about. Read the data with `get`.
+
+Then ask:
+
+- **A resend answers `GENERATION_CHANGED`.** The reopen started a new generation (one chapter of
+  the folder's history), and a request from an older one is never replayed or run again. That
+  send changed nothing. Look the request up with `status`; do not resend it as a new request.
+- **Ask `db.status(id, generation)`.** `Resolved` means it landed. Its `outcome` is
   `RecoveredApplied` when the answer comes from history kept across the reopen.
-- **`Unknown` or `Expired` is not proof that it did not land.** `Unknown` can turn into
-  `Resolved` later, once the nodes catch up; ask again. `Expired` means the record is older than
-  the dedup retention (`DbConfig::dedup_retention`, 24 h by default). Read the data itself
-  with `get` to decide.
-- **A kill before any answer leaves you no request to ask about.** Read the data with `get`.
+- **The second argument is the generation the request was sent under**: the request's
+  `expected_generation`, or the `generation` of its answer. Pass `None` when you do not know it,
+  as after `put_saved`. A request that landed still answers `Resolved`. Only the not-landed
+  answers differ: without it, a record from an older generation that is gone answers `Unknown`
+  instead of `Expired`.
+- **`Unknown` or `Expired` is not proof that it did not land.** `Expired` means the record is
+  older than the dedup retention (`DbConfig::dedup_retention`, 24 h by default). Ask only after
+  `wait_ready` returns `Ok`. After that, do not keep asking: decide with `get`, or give up and
+  report it. A request of the current open still in flight can answer `Unknown` until it
+  publishes. Ask again a few times within a few seconds at most. Never poll `status` forever.
 
 `crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
 
 ```rust
-use rdb_api::{ApiError, Db, ErrorKind, TxnRequest, TxnStatus};
+use std::error::Error;
+use std::fs::File;
+use std::io::Write;
 
-/// `true`: it landed. `false`: not known yet, which is not proof that it did not land.
+use rdb_api::{ApiError, Db, ErrorKind, Generation, PutOk, RequestId, TxnRequest, TxnStatus};
+
+/// A put you can look up after a kill: its id is saved, synced, before it is sent.
+fn put_saved(
+    db: &Db,
+    ids: &mut File,
+    id: RequestId,
+    object: &[u8],
+    value: &[u8],
+) -> Result<PutOk, Box<dyn Error>> {
+    writeln!(ids, "{}", id.0)?;
+    ids.sync_data()?;
+    Ok(db
+        .put_as(id, object, value, None)
+        .map_err(|refused| refused.error)?)
+}
+
+/// `true`: request `id` landed. `false`: not known, which is not proof that it did not land.
+/// `sent_in`: the generation it was sent under, when you know it.
+fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<bool, ApiError> {
+    Ok(matches!(db.status(id, sent_in)?, TxnStatus::Resolved(_)))
+}
+
+/// The same question for a request saved after its answer (`ok.sent` or `refused.request`).
 fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
-    let id = saved.identity.request;
+    let (id, sent_in) = (saved.identity.request, saved.expected_generation);
     match db.resend(saved) {
         Ok(_) => return Ok(true), // same generation: applied now, or its answer replayed
         Err(refused) if refused.error.kind != ErrorKind::GenerationChanged => {
@@ -174,19 +240,63 @@ fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
         }
         Err(_) => {} // after a reopen: this send applied nothing; ask what the first one did
     }
-    Ok(matches!(db.status(id, None)?, TxnStatus::Resolved(_)))
+    landed(db, id, sent_in)
 }
 ```
 
+### How many writes a partition takes: the dedup window
+
+rDB keeps each write's answer for a while, so a resend of the same request replays it instead
+of applying twice, and `status` can answer. That store is capped. Two `DbConfig` options set
+it:
+
+- `dedup_retention`: how long an answer is kept. Default 24 h (`None`). This is a supported app
+  option.
+- `dedup_cap`: how many answers are kept at once. Default and maximum 65,536.
+
+So a partition sustains about `cap / retention` writes per second:
+
+| `dedup_retention` | Sustained writes/s |
+|---|---|
+| 24 h (default) | 0.76 |
+| 1 h | 18 |
+| 10 min | 109 |
+
+- **Bursts are free.** A burst may use the whole cap at once.
+- **A full cap answers `OVERLOADED`.** Its `retry_after` (on `ApiError`, also in the message)
+  is the earliest time an entry frees. Wait at least that long before you send again. It is
+  left out when no time is known.
+- **The cost of a shorter window:** a resend or `status` query made after it can no longer be
+  settled. A resend is then treated as a new request.
+- **Memory:** about 1.8 KB per kept answer, so about 114 MB per partition when the cap is full
+  (measured on a debug build).
+- **After a reopen,** old answers free on their original schedule, not a full window after the
+  reopen. One exception: after a crash or kill, writes from the last mark period before it (up
+  to 60 s at defaults) count against the cap for one retention after the reopen. A clean quit
+  (`Db::shutdown`, or dropping the `Db`) does not have this cost.
+
+### When writes pause
+
+Writes can pause without any error in your code. They resume by themselves; nothing is lost.
+A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, say).
+
+- **A copy falls behind or stops answering.** Node 1 pauses writes rather than accept writes
+  only one copy holds. They resume once that copy catches up.
+- **The host is starved** (CPU or disk saturated by other work). Timers run late, so writes
+  can pause and then recover once the host has room.
+- **rEtcd stalls for more than about 2 s,** for example during its own leader election. Node
+  1's permission to write can run out. Writes resume once it is granted again. Tuning that
+  margin is planned.
+
 ### Known limits in this release
 
-- **A reopen after an open that wrote nothing does not become ready.** `wait_ready` returns
-  `TimedOut` (`pilot_kv` exits 5). This is an open bug in the reopen work. Until it is fixed,
-  write at least once in every open of a folder.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
   missing value instead. Moving to a clean copy comes with a later release (rejoin and recovery).
+- **A restarted node stays out until the folder is opened again.** See section 5.
+- **On a very slow or overloaded machine, an open can fail with a "blocked" error** when a
+  copy answers too late. Open the folder again. An automatic retry is planned.
 
 ## 6. When an open is refused
 
@@ -199,11 +309,23 @@ does not help; the "what to do" column does.
 | Error | When | What to do |
 |---|---|---|
 | `OpenError::Mismatch` | The folder and the rEtcd do not belong together: the rEtcd was cleaned, restored, or is another cluster; or a new folder meets an rEtcd that already serves another one | Point at the right rEtcd, or start a separate rEtcd |
-| `OpenError::Stale` | The folder is an old copy: the rEtcd records a newer state than any copy here holds | Open the current folder; this copy is history |
+| `OpenError::Stale` | The folder is an old copy: the rEtcd records a newer generation than any copy here holds | Do not delete this directory: its acknowledged writes are intact. Open the folder, or restore the backup, that holds the generation the message names |
 | `OpenError::Unbound` | The folder was made before M10 (M9's `rdb_dev --keep`) and never bound to an rEtcd | Start a new folder; M9 dev data is not migrated |
 | `OpenError::CopyMissing` | One of the folder's `nodes/<n>` directories is missing or empty while another holds data | Restore that directory from where it came from |
 | `OpenError::Counter` | The folder's open counter is used up (2^24 opens), unreadable, or absent from this rEtcd | Start a new folder; `Absent` means the wrong rEtcd, as for `Mismatch` |
-| `ReadyError::Heal` | The reopen's repair failed | Read the message; open again only after fixing its cause |
+
+A `Stale` whose message says "the open counter marks generation N activated" means a later
+open already served that generation, so this copy cannot catch up to it. A crash during the
+commit of a reopen is not that case: the next open finishes the commit and serves, with
+nothing to do. One exception: if a crash happened during the reopen that followed a crash, the
+reopen refuses with `Stale` and changes nothing. Open it again.
+
+**Not in this open.** Retrying in the same `Db` does not help; a new open may.
+
+| Error | When | What to do |
+|---|---|---|
+| `ReadyError::Heal` | The reopen's repair failed. The message says why: for example, the last run's grant is still held by another open of this folder's data | Do what the message says (often: shut that other open down), then open again |
+| `ReadyError::Stopped` | Node 1 restarted in this open | Shut this `Db` down and open the folder again |
 
 **Worth retrying.**
 
@@ -211,7 +333,7 @@ does not help; the "what to do" column does.
 |---|---|---|
 | `OpenError::InUse` | Another open, in this process or another, holds the folder | Shut that one down first |
 | `OpenError::Control` | rEtcd did not answer a read the open needs | Open again once rEtcd is up |
-| `ReadyError::TimedOut` | Node 1 did not admit writes in time; the message names the recovery phase | Shut down and open again; report it if it repeats |
+| `ReadyError::TimedOut` | Node 1 did not admit writes in time; the message names the recovery phase | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
 failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`.
