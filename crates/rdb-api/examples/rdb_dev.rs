@@ -4,7 +4,7 @@
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
-//!                                           [--control host:port[,host:port...]]
+//!                                           [--control host:port[,host:port...]] [--requests F]
 //! ```
 //!
 //! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
@@ -12,6 +12,17 @@
 //! run with the same `--dir` and E reopens it. The `control` verbs reach rdb_dev's own voters
 //! and are refused under `--control`. Without `--control`, a `--dir` this run did not create is
 //! never removed either; `Db::open` decides whether it can be opened.
+//!
+//! `--requests F` appends every write request this run records for `retry` to F, one JSON
+//! line each, synced, after its answer, so a later run with the same `--requests F` resends an
+//! earlier run's request unchanged: `retry <request>` after a reopen (M10 S1-4). The request
+//! names the generation it was sent in, and a reopen starts a new one, so the resend answers
+//! `GENERATION_CHANGED` and applies nothing (spec §5.3); `status <request>` then says what
+//! became of it. A fresh compile under the same id is no resend: it reads the object's moved
+//! version, so its digest differs and it answers `REQUEST_ID_REUSE`.
+//! F holds keys and values, so it is not a log; use one F per `--dir`. A write still in
+//! flight when the process dies is not in F. Past the dedup retention a request is no longer
+//! recognised (`--dedup-retention-ms`).
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
@@ -57,7 +68,10 @@
 //!                                         queued`, then `bg txn: <answer>`; not remembered
 //! retry [<request>]                       send a write's request again, unchanged: the
 //!                                         latest one's, or the one this session sent as
-//!                                         <request>
+//!                                         <request>, or with `--requests F` the one an
+//!                                         earlier run sent as <request>. With nothing to
+//!                                         send it says `nothing to retry` and fails nothing
+//! retry --id <request>                    the same as `retry <request>`
 //! retry [<request>] --deadline-ms N       the same request with a fresh deadline of N ms
 //! retry [<request>] --payload <value>     the same put and request id with another value,
 //!                                         compiled afresh (REQUEST_ID_REUSE); not remembered.
@@ -330,6 +344,8 @@ struct Args {
     /// `--control E`: an external rEtcd's client endpoints. The run then starts no voters and
     /// never removes `--dir`, so a later run can reopen it.
     control: Option<Vec<String>>,
+    /// `--requests F`: where each recorded write request is appended, for a later run's `retry`.
+    requests: Option<PathBuf>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -344,6 +360,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         dedup_cap: None,
         dedup_retention: None,
         control: None,
+        requests: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -352,6 +369,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--requests" => parsed.requests = Some(PathBuf::from(value("--requests")?)),
             "--control" => {
                 let endpoints: Vec<String> = value("--control")?
                     .split(',')
@@ -889,7 +907,7 @@ fn waits_on_line(
             format!("the start record's outcome (seq {})", seq.0)
         }
         // Status does not know an admin damage write: it is another client's (S6 P-3).
-        Some(request) if request.0 >= DAMAGE_REQUEST_BASE => {
+        Some(request) if is_damage_request(request) => {
             format!("an admin damage write's outcome (seq {})", seq.0)
         }
         Some(request) => format!("request {}'s outcome (seq {})", request.0, seq.0),
@@ -1125,7 +1143,10 @@ fn repl<'scope, 'env>(
         },
         None => Box::new(std::io::BufReader::new(std::io::stdin())),
     };
-    let mut sent = Sent::default();
+    let mut sent = Sent {
+        file: args.requests.clone(),
+        ..Sent::default()
+    };
     let mut bad = false;
     let deadline = args.put_timeout.unwrap_or(Timeouts::default().put);
     for line in input.lines() {
@@ -1141,7 +1162,7 @@ fn repl<'scope, 'env>(
         if args.script.is_some() {
             say(&format!("> {line}"));
         }
-        tracing::info!(command = %line, "repl_command");
+        log_command(&line);
         // A value verb reads its JSON from the raw line (risk R1), so it skips `split_words`.
         if let Some(verb) = line
             .split_whitespace()
@@ -1175,6 +1196,18 @@ fn repl<'scope, 'env>(
             }
         };
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        // Nothing to retry is an answer, not a mistyped line: no `usage:`, and no exit 1.
+        if let ["retry", rest @ ..] = words.as_slice() {
+            if let Err(e) = sent.adopt(rest) {
+                say(&format!("err {e}"));
+                bad = true;
+                continue;
+            }
+            if let Some(nothing) = sent.nothing_to_retry(rest) {
+                say(&nothing);
+                continue;
+            }
+        }
         let outcome = match words.as_slice() {
             ["quit" | "exit"] => break,
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
@@ -1349,7 +1382,9 @@ fn repl<'scope, 'env>(
                 let secs = rest.first().map_or(Ok(30), |s| s.parse::<u64>());
                 match secs {
                     Ok(secs) => {
-                        wait_for(progress, what, Duration::from_secs(secs));
+                        say(&wait_for(progress, what, Duration::from_secs(secs), || {
+                            db.heal_state()
+                        }));
                         Ok(())
                     }
                     Err(_) => Err("wait takes whole seconds".to_owned()),
@@ -1459,6 +1494,72 @@ fn control_verb(
         )),
         _ => Err(format!("unknown command {line:?}")),
     }
+}
+
+/// The `repl_command` log line for one typed command: its verb, and the object it names as
+/// `key_hex` (at most 32 bytes), never the line. A line carries keys, values, map keys and
+/// paths, and a log never holds their text (ADR-0013, A-R154, D5). A verb the grammar does not
+/// know logs as `unknown`, since a mistyped line can be anything.
+fn log_command(line: &str) {
+    let (verb, object) = command_fields(line);
+    match object {
+        Some(object) => {
+            let key_hex = hex::encode(&object.as_bytes()[..object.len().min(32)]);
+            tracing::info!(verb, key_hex = %key_hex, "repl_command");
+        }
+        None => tracing::info!(verb, "repl_command"),
+    }
+}
+
+/// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
+/// object it writes or reads, when it names one. A line `split_words` refuses names no object.
+fn command_fields(line: &str) -> (&'static str, Option<String>) {
+    const VERBS: [&str; 25] = [
+        "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
+        "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
+        "sleep", "quit", "exit", "blob",
+    ];
+    const SUBVERBS: [&str; 18] = [
+        "blob upload",
+        "blob chunk",
+        "blob publish",
+        "blob gc",
+        "admin clear-grant",
+        "admin damage-chunk",
+        "admin damage",
+        "admin clear",
+        "link hold",
+        "link heal",
+        "link drop",
+        "node restart",
+        "wait recovered",
+        "wait ready",
+        "control lifecycle",
+        "control freeze-grant",
+        "control fail",
+        "control stop",
+    ];
+    let mut first = line.split_whitespace();
+    let Some(verb) = first
+        .next()
+        .and_then(|verb| VERBS.iter().copied().find(|known| *known == verb))
+    else {
+        return ("unknown", None);
+    };
+    let pair = first.next().map(|sub| format!("{verb} {sub}"));
+    let verb = pair
+        .and_then(|pair| SUBVERBS.iter().copied().find(|known| *known == pair))
+        .unwrap_or(verb);
+    let at = match verb {
+        "put" | "put&" | "get" | "read" | "doc" | "map" | "set" | "members" | "list" | "items" => 1,
+        "blob upload" | "blob chunk" | "blob publish" | "blob gc" | "admin damage-chunk"
+        | "admin damage" | "admin clear" => 2,
+        _ => return (verb, None),
+    };
+    let object = split_words(line)
+        .ok()
+        .and_then(|mut words| (words.len() > at).then(|| words.swap_remove(at)));
+    (verb, object)
 }
 
 /// One input line as a command: `None` for a blank or comment-only line. An unreadable line
@@ -2074,13 +2175,25 @@ fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), 
 }
 
 /// The first request id of `admin damage` and `damage-chunk`. Node status names an in-flight
-/// request by id alone, with no client, so these ids start far above any the `Db` sends, and a
-/// note can tell them apart (S6 P-3).
+/// request by id alone, with no client, so a note tells them apart by the ids this process
+/// issued ([`is_damage_request`], S6 P-3, D8).
 const DAMAGE_REQUEST_BASE: u64 = 1 << 32;
 
 /// Request ids for `admin damage` and `damage-chunk`, under their own client.
 static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(DAMAGE_REQUEST_BASE);
+
+/// A fresh request id for `admin damage` or `damage-chunk`.
+fn damage_request() -> RequestId {
+    RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Whether this process issued `request` for `admin damage` or `damage-chunk`. By origin, not
+/// by size: from a folder's second open on, the `Db`'s own ids start at `(n-1)<<40`, above
+/// `DAMAGE_REQUEST_BASE`, and an id alone was then read as a damage write (tester D8).
+fn is_damage_request(request: RequestId) -> bool {
+    (DAMAGE_REQUEST_BASE..DAMAGE_REQUEST.load(Ordering::Relaxed)).contains(&request.0)
+}
 
 /// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
 /// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
@@ -2104,7 +2217,7 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
         identity: RequestIdentity {
             tenant: TenantId(1),
             client: ClientId(2),
-            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+            request: damage_request(),
         },
         affinity: AffinityId(1),
         expected_generation: None,
@@ -2255,7 +2368,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         identity: RequestIdentity {
             tenant: TenantId(1),
             client: ClientId(2),
-            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+            request: damage_request(),
         },
         affinity: AffinityId(1),
         expected_generation: None,
@@ -2584,8 +2697,8 @@ fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>),
     }
 }
 
-/// What a recorded request was sent as.
-#[derive(Debug, Clone)]
+/// What a recorded request was sent as. Saved beside the request in `--requests F`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Kind {
     /// A put, with the object and condition it was put with, for `retry --payload`.
     Put {
@@ -2608,12 +2721,39 @@ struct Sent {
     /// The request, and what it was sent as.
     by_id: std::collections::BTreeMap<u64, (TxnRequest, Kind)>,
     latest: Option<Option<u64>>,
+    /// `--requests F`: each recorded request is appended here, and an id this run did not send
+    /// is looked up here.
+    file: Option<PathBuf>,
+}
+
+/// What `retry <rest>` names, its `--payload V` or `--deadline-ms N` aside.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryTarget {
+    /// The latest write.
+    Latest,
+    /// Request `id`, as `retry <id>` or `retry --id <id>`.
+    Id(u64),
+    /// Anything else: [`Sent::pick`] answers it with a usage line.
+    Other,
+}
+
+fn retry_target(rest: &[&str]) -> RetryTarget {
+    let target = match rest {
+        [target @ .., "--payload" | "--deadline-ms", _] => target,
+        target => target,
+    };
+    match target {
+        [] => RetryTarget::Latest,
+        [id] | ["--id", id] => id.parse().map_or(RetryTarget::Other, RetryTarget::Id),
+        _ => RetryTarget::Other,
+    }
 }
 
 impl Sent {
     fn record(&mut self, request: Option<TxnRequest>, kind: Kind) {
         let id = request.map(|request| {
             let id = request.identity.request.0;
+            self.save(&request, &kind);
             self.by_id.insert(id, (request, kind));
             id
         });
@@ -2634,6 +2774,9 @@ impl Sent {
                 entry.0 = request.clone();
                 self.latest = Some(Some(id));
             }
+            if let Some((request, kind)) = self.by_id.get(&id) {
+                self.save(request, kind);
+            }
         }
     }
 
@@ -2646,6 +2789,101 @@ impl Sent {
         }
     }
 
+    /// The plain answer when `retry <rest>` has nothing to send: no write yet, a latest write
+    /// that sent no request, or a request id this session never sent. For that last one, the
+    /// way to resend an earlier run's request is `retry --id`. `None` when there is something
+    /// to send, or when `rest` is not a retry of a recorded request at all.
+    fn nothing_to_retry(&self, rest: &[&str]) -> Option<String> {
+        match retry_target(rest) {
+            RetryTarget::Latest => match self.latest {
+                None => Some("nothing to retry: this run has sent no write yet".to_owned()),
+                Some(None) => Some(
+                    "nothing to retry: the latest write was refused before it was sent".to_owned(),
+                ),
+                Some(Some(_)) => None,
+            },
+            RetryTarget::Id(id) if !self.by_id.contains_key(&id) => Some(match &self.file {
+                Some(path) => format!(
+                    "nothing to retry as request {id}: this run did not send it, and {} \
+                         holds no request {id}",
+                    path.display()
+                ),
+                None => format!(
+                    "nothing to retry as request {id}: this run did not send it. To resend \
+                         an earlier run's request, start that run and this one with --requests \
+                         F, then retry {id}"
+                ),
+            }),
+            RetryTarget::Id(_) | RetryTarget::Other => None,
+        }
+    }
+
+    /// Take request `id` from `--requests F` when this run did not send it, so `retry` resends
+    /// an earlier run's request unchanged. F's last line for `id` wins: a retry appends what it
+    /// sent. A missing F holds nothing; an F that cannot be read or parsed is an error.
+    fn adopt(&mut self, rest: &[&str]) -> Result<(), String> {
+        let (Some(path), RetryTarget::Id(id)) = (&self.file, retry_target(rest)) else {
+            return Ok(());
+        };
+        if self.by_id.contains_key(&id) {
+            return Ok(());
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("--requests {}: {e}", path.display())),
+        };
+        let mut found = None;
+        for (at, line) in text.lines().enumerate() {
+            // Where and what class of error, never serde's message: that quotes the text it
+            // met, and a line holds keys and values.
+            let entry: (TxnRequest, Kind) = serde_json::from_str(line).map_err(|e| {
+                format!(
+                    "--requests {} line {}: not a saved request ({:?} error at column {})",
+                    path.display(),
+                    at + 1,
+                    e.classify(),
+                    e.column()
+                )
+            })?;
+            if entry.0.identity.request.0 == id {
+                found = Some(entry);
+            }
+        }
+        if let Some(entry) = found {
+            self.by_id.insert(id, entry);
+        }
+        Ok(())
+    }
+
+    /// Append `request` to `--requests F`, synced, when there is an F. A failed write is said
+    /// on the run's output and logged, never skipped quietly: a later run could not retry it.
+    fn save(&self, request: &TxnRequest, kind: &Kind) {
+        let Some(path) = &self.file else {
+            return;
+        };
+        let saved = serde_json::to_string(&(request, kind))
+            .map_err(|e| e.to_string())
+            .and_then(|line| {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| e.to_string())?;
+                writeln!(file, "{line}")
+                    .and_then(|()| file.sync_data())
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = saved {
+            let request = request.identity.request.0;
+            tracing::error!(error = %e, request, "requests_file_write_failed");
+            say(&format!(
+                "err --requests {}: {e}; a later run cannot retry request {request}",
+                path.display()
+            ));
+        }
+    }
+
     fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Kind), String> {
         let id = match rest {
             [] => match self.latest {
@@ -2655,7 +2893,7 @@ impl Sent {
                 }
                 Some(Some(id)) => id,
             },
-            [id] => id
+            [id] | ["--id", id] => id
                 .parse()
                 .map_err(|_| "retry [<request>]: a request id is a number".to_owned())?,
             _ => return Err("retry [<request>] [--payload <value> | --deadline-ms N]".to_owned()),
@@ -3251,7 +3489,13 @@ fn start_voter(rt: &tokio::runtime::Runtime, cluster: &Arc<Cluster>, voter: Vote
     }
 }
 
-fn wait_for(progress: &Progress, what: &str, limit: Duration) {
+/// `wait recovered|ready`: the line it ends with.
+fn wait_for(
+    progress: &Progress,
+    what: &str,
+    limit: Duration,
+    heal: impl Fn() -> rdb_api::db::HealState,
+) -> String {
     let started = Instant::now();
     loop {
         let seen = progress.seen();
@@ -3260,18 +3504,18 @@ fn wait_for(progress: &Progress, what: &str, limit: Duration) {
             _ => seen.ready,
         };
         if reached {
-            say(&format!(
-                "reached {what} in {}ms",
-                started.elapsed().as_millis()
-            ));
-            return;
+            return format!("reached {what} in {}ms", started.elapsed().as_millis());
+        }
+        // A failed heal never becomes ready: say why now, not after the whole wait (k151).
+        // Node 1 recovers only from the plan the heal hands it, so neither wait can end well.
+        if let rdb_api::db::HealState::Failed(error) = heal() {
+            return format!(
+                "stopped waiting for {what}: {}; this open will not become ready",
+                rdb_api::db::ReadyError::Heal(error)
+            );
         }
         if started.elapsed() >= limit {
-            say(&format!(
-                "timeout waiting for {what} after {}s",
-                limit.as_secs()
-            ));
-            return;
+            return format!("timeout waiting for {what} after {}s", limit.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -4463,6 +4707,7 @@ mod tests {
             dedup_cap: None,
             dedup_retention: None,
             control: None,
+            requests: None,
         };
         let code = run(&args, |_, _, _| async {
             Err(OpenError::Node("node 2: injected".to_owned()))
@@ -4601,6 +4846,7 @@ mod tests {
             dedup_cap: Some(65_537),
             dedup_retention: None,
             control: None,
+            requests: None,
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {
@@ -4792,6 +5038,248 @@ mod tests {
         assert!(
             matches!(&escaped, Change::Set(ops) if matches!(ops[..], [ElemOp::Add(Value::Map(_))])),
             "{escaped:?}"
+        );
+    }
+
+    /// D5 (tester S1-8 at 066ab6e, ADR-0013, A-R154): `repl_command` logged the whole typed
+    /// line, so 27 lines of one walk carried key and value text. Every command of the grammar
+    /// is fed with keys, values, map keys and paths that all start `zq`, a pair this row's name
+    /// and module do not contain: no line of the test's log may hold `zq`. Each command still
+    /// logs one `repl_command` line with its verb, and a command that names an object logs it
+    /// as `key_hex`. Unit (~10 ms).
+    #[config_log::retcd_test]
+    fn d5_a_typed_line_logs_its_verb_and_key_hex_never_its_text() {
+        const METHOD: &str = "d5_a_typed_line_logs_its_verb_and_key_hex_never_its_text";
+        let typed = [
+            ("put zqk1 zqv1", "put", Some("zqk1")),
+            ("put& zqk2 zqv2 --if-version 3", "put&", Some("zqk2")),
+            ("txn zqk3=zqv3 2:zqk4=zqv4@1", "txn", None),
+            (
+                r#"doc zqk5 --absent set /zqpath "zqv5""#,
+                "doc",
+                Some("zqk5"),
+            ),
+            (r#"map zqk6 put "zqmember" "zqv6""#, "map", Some("zqk6")),
+            (r#"members zqk7 --after "zqafter""#, "members", Some("zqk7")),
+            ("get zqk8", "get", Some("zqk8")),
+            ("read zqk9 --offset 0 --len 1", "read", Some("zqk9")),
+            (
+                "blob upload zqk10 --upload 000102030405060708090a0b0c0d0e0f --chunk-size 4 zqv10",
+                "blob upload",
+                Some("zqk10"),
+            ),
+            (
+                r#"admin damage zqk11 --element "zqelem""#,
+                "admin damage",
+                Some("zqk11"),
+            ),
+            ("retry --payload zqv12", "retry", None),
+            ("zqunknown zqk14", "unknown", None),
+            (r#"put "zqk15 spaced" zqv15"#, "put", Some("zqk15 spaced")),
+            (r#"put "zqk16unterminated zqv16"#, "put", None),
+            ("status 4", "status", None),
+            ("wait ready 60", "wait ready", None),
+            // ADR-0013: a key logs its first 32 bytes only.
+            (
+                "get zqk17-6789012345678901234567890123456789",
+                "get",
+                Some("zqk17-6789012345678901234567890123456789"),
+            ),
+        ];
+        for (line, _, _) in typed {
+            log_command(line);
+        }
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let leaked: Vec<String> = lines
+            .iter()
+            .map(ToString::to_string)
+            .filter(|text| text.contains("zq"))
+            .collect();
+        assert!(leaked.is_empty(), "key or value text logged: {leaked:#?}");
+        let logged: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "repl_command")
+            .collect();
+        assert_eq!(
+            logged.len(),
+            typed.len(),
+            "one repl_command line per command"
+        );
+        for (line, (typed, verb, key)) in logged.iter().zip(typed) {
+            assert_eq!(line["verb"], verb, "{typed}");
+            let key_hex = key.map(|key| hex::encode(&key.as_bytes()[..key.len().min(32)]));
+            assert_eq!(line["key_hex"].as_str(), key_hex.as_deref(), "{typed}");
+        }
+    }
+
+    /// Tester paper cut (S1-8 at 066ab6e): `retry` with nothing sent printed a `usage:` line
+    /// and the run exited 1, as if the line were mistyped. Each way of having nothing to send
+    /// is a plain `nothing to retry` answer, and a request id this run never sent points at
+    /// `--requests F`. A recorded request is not nothing. Unit.
+    #[test]
+    fn retry_with_nothing_sent_says_so_plainly_and_names_requests_for_an_old_request() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let mut sent = Sent::default();
+        for rest in [&[][..], &["--deadline-ms", "100"], &["--payload", "v"]] {
+            let said = sent.nothing_to_retry(rest).expect("nothing was sent");
+            assert!(said.starts_with("nothing to retry: "), "{said}");
+        }
+        sent.record(None, Kind::Txn);
+        let said = sent.nothing_to_retry(&[]).expect("the latest sent nothing");
+        assert!(said.starts_with("nothing to retry: "), "{said}");
+        for rest in [&["7"][..], &["--id", "7"], &["7", "--deadline-ms", "100"]] {
+            let said = sent
+                .nothing_to_retry(rest)
+                .expect("request 7 was never sent");
+            assert!(said.contains("--requests F, then retry 7"), "{said}");
+        }
+        let request = TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(7),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 0,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        sent.record(Some(request), Kind::Txn);
+        assert_eq!(sent.nothing_to_retry(&[]), None);
+        assert_eq!(sent.nothing_to_retry(&["--id", "7"]), None);
+        // Not a retry of a recorded request: `pick` answers these, with a usage line.
+        assert_eq!(sent.nothing_to_retry(&["x"]), None);
+    }
+
+    /// Tester S1-4 (A-R171): a same-id resend after a reopen must send the request unchanged,
+    /// and a fresh compile cannot: it reads the object's moved version, so the walk at 57da754
+    /// answered `REQUEST_ID_REUSE` to the same object and value. `--requests F` carries each
+    /// recorded request to a later run: that run adopts request 7 from F with the same digest,
+    /// the last line for an id wins, an id F lacks is a plain `nothing to retry`, and a damaged
+    /// line is an error naming its line, never its text. Unit (~5 ms, one temp file).
+    #[test]
+    fn a_later_run_adopts_an_earlier_runs_request_from_requests_file_unchanged() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        use rdb_core::contracts::txn::Mutation;
+        let request = |id, value: &'static [u8]| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(id),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![Mutation::Put {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(value),
+                expected_version: None,
+            }],
+        };
+        // `temp_dir` reads RETCD_TEST_DATA_DIR, which the run rows point at their own `--dir`.
+        let root = {
+            let _env = ENV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            config_testkit::fs::temp_dir()
+        };
+        let path = root.path().join("requests.json");
+        let mut first = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        first.record(Some(request(6, b"six")), Kind::Txn);
+        first.record(Some(request(7, b"old")), Kind::Txn);
+        first.record(Some(request(7, b"new")), Kind::Value);
+        first.record(None, Kind::Txn);
+
+        let mut later = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        assert_eq!(later.adopt(&["7"]), Ok(()));
+        assert_eq!(later.nothing_to_retry(&["--id", "7"]), None);
+        let (adopted, kind) = later.pick(&["7"]).expect("request 7 adopted");
+        assert_eq!(
+            adopted.request_digest(),
+            request(7, b"new").request_digest(),
+            "the last line for 7 is resent unchanged"
+        );
+        assert!(matches!(kind, Kind::Value), "{kind:?}");
+        assert_eq!(later.adopt(&["9"]), Ok(()));
+        let said = later.nothing_to_retry(&["9"]).expect("F holds no 9");
+        assert!(said.ends_with("holds no request 9"), "{said}");
+
+        std::fs::write(&path, "[\"zqsecret\"\n").expect("damage F");
+        let mut damaged = Sent {
+            file: Some(path),
+            ..Sent::default()
+        };
+        let error = damaged.adopt(&["7"]).expect_err("a damaged F is an error");
+        assert!(error.contains("line 1: "), "{error}");
+        assert!(!error.contains("zq"), "{error}");
+    }
+
+    /// Tester S1-9 paper cut (k151): on a reopen whose heal failed, `wait ready 30` sat out
+    /// all 30 s and printed a bare timeout, though the open could never become ready. `wait
+    /// ready` and `wait recovered` end as soon as the heal has failed, and say so with the heal's
+    /// error: node 1 recovers only from the plan a heal hands it. A heal still running is
+    /// waited on. Unit (~150 ms; the red run waits out the 2 s limit).
+    #[test]
+    fn a_wait_ends_at_once_with_the_heal_error_when_the_heal_failed() {
+        use rdb_api::db::HealState;
+        let progress = Progress::default();
+        for what in ["ready", "recovered"] {
+            let started = Instant::now();
+            let line = wait_for(&progress, what, Duration::from_secs(2), || {
+                HealState::Failed(admin::HealError::NodeStopped)
+            });
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "waited {:?}: {line}",
+                started.elapsed()
+            );
+            assert_eq!(
+                line,
+                format!(
+                    "stopped waiting for {what}: the reopen's heal failed: node 1 stopped \
+                     before the heal reached it; this open will not become ready"
+                )
+            );
+        }
+        let line = wait_for(&progress, "ready", Duration::from_millis(100), || {
+            HealState::Running
+        });
+        assert_eq!(line, "timeout waiting for ready after 0s");
+    }
+
+    /// Tester D8 (aa3b82e): from a folder's second open on, the request floor `(n-1)<<40` puts
+    /// every write the app sends above `DAMAGE_REQUEST_BASE`, and the waits-on line called the
+    /// app's own put "an admin damage write" and hid its id. The label now goes by origin: only
+    /// an id `admin damage` or `damage-chunk` issued is a damage write. Unit.
+    #[test]
+    fn a_waits_on_line_names_a_second_opens_put_by_its_id_and_only_a_damage_id_as_damage() {
+        let waiting = |request: RequestId| {
+            let mut node = owner(None, false);
+            node.in_flight = Some(request);
+            node.waits_on = Some(rdb_core::contracts::ids::Seq(6));
+            node
+        };
+        let second_open = RequestId((1 << 40) + 1);
+        let line = waits_on_line(&waiting(second_open), &HELD, &[]).expect("a waits-on line");
+        assert!(
+            line.starts_with("partition 1 waits on request 1099511627777's outcome (seq 6),"),
+            "{line}"
+        );
+        let damage = damage_request();
+        let line = waits_on_line(&waiting(damage), &HELD, &[]).expect("a waits-on line");
+        assert!(
+            line.starts_with("partition 1 waits on an admin damage write's outcome (seq 6),"),
+            "{line}"
         );
     }
 }

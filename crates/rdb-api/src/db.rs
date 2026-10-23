@@ -711,15 +711,56 @@ impl Db {
             created: created.then(|| nodes_dir.clone()),
         };
         let found = Self::check(&mut claim.engines, &store).await?;
-        let n = admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
-            .await
-            .map_err(|error| match error {
-                admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
-                    "the copies name instance {}, but {key} is absent",
-                    admin::instance_hex(&found.instance)
-                )),
-                other => OpenError::Counter(other),
-            })?;
+        let absent = |error| match error {
+            admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
+                "the copies name instance {}, but {key} is absent",
+                admin::instance_hex(&found.instance)
+            )),
+            other => OpenError::Counter(other),
+        };
+        let n = match &found.roll {
+            None => admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
+                .await
+                .map_err(absent)?,
+            // Ruling A-R184: count at exactly the revision the decision read, so a host that
+            // activated the generation since then makes this open Stale, then link the copies.
+            Some(roll) => {
+                let n = admin::count_open_at(
+                    &*store,
+                    &found.instance,
+                    roll.count,
+                    roll.revision,
+                    admin::COUNT_WITHIN,
+                )
+                .await
+                .map_err(|error| match error {
+                    moved @ admin::CounterError::Moved { .. } => OpenError::Stale {
+                        generation: roll.to.0,
+                        detail: format!("not rolled forward: {moved}"),
+                    },
+                    other => absent(other),
+                })?;
+                for node in &roll.copies {
+                    claim
+                        .engines
+                        .get_mut(node)
+                        .ok_or_else(|| OpenError::Node(format!("node {}: no engine", node.0)))?
+                        .inherit(PARTITION, roll.from, roll.to, roll.base)
+                        .map_err(|error| {
+                            OpenError::Node(format!("node {}: roll forward: {error}", node.0))
+                        })?;
+                }
+                tracing::info!(
+                    generation = roll.to.0,
+                    from = roll.from.0,
+                    base = roll.base.0,
+                    copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    n,
+                    "db_open_rolled_forward"
+                );
+                n
+            }
+        };
         let engines = std::mem::take(&mut claim.engines);
         let unwind = claim.created.take();
         drop(claim);
@@ -836,6 +877,7 @@ impl Db {
         let fresh = Found {
             instance,
             fresh: true,
+            roll: None,
         };
         let untouched = read
             .record
@@ -884,23 +926,49 @@ impl Db {
             .values()
             .any(|engine| engine.lineages().contains(&(PARTITION, record.generation)));
         if !holds {
-            return Err(OpenError::Stale {
-                generation: record.generation.0,
-                detail: format!(
-                    "partitions/1 is {:?} at generation {}, the copies hold {:?}",
-                    root.mode,
-                    record.generation.0,
-                    engines
-                        .values()
-                        .flat_map(RocksEngine::lineages)
-                        .map(|(_, generation)| generation.0)
-                        .collect::<BTreeSet<_>>()
-                ),
-            });
+            // Ruling A-R184: roll forward only what the open counter proves no host activated.
+            let (count, revision) =
+                admin::read_count(&**store, &instance)
+                    .await
+                    .map_err(|error| match error {
+                        admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
+                            "the copies name instance {}, but {key} is absent",
+                            admin::instance_hex(&instance)
+                        )),
+                        other => OpenError::Counter(other),
+                    })?;
+            return match roll_forward_copies(engines, record.generation, &root, count) {
+                Ok(copies) => Ok(Found {
+                    instance,
+                    fresh: false,
+                    roll: Some(Roll {
+                        count,
+                        revision,
+                        from: root.predecessor_generation,
+                        to: record.generation,
+                        base: root.predecessor_cutoff,
+                        copies,
+                    }),
+                }),
+                Err(why) => Err(OpenError::Stale {
+                    generation: record.generation.0,
+                    detail: format!(
+                        "partitions/1 is {:?} at generation {}, the copies hold {:?}; {why}",
+                        root.mode,
+                        record.generation.0,
+                        engines
+                            .values()
+                            .flat_map(RocksEngine::lineages)
+                            .map(|(_, generation)| generation.0)
+                            .collect::<BTreeSet<_>>()
+                    ),
+                }),
+            };
         }
         Ok(Found {
             instance,
             fresh: false,
+            roll: None,
         })
     }
 
@@ -2047,10 +2115,127 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
 
 /// What [`Db::check`] found: the instance the copies name now, and whether nothing was written
 /// under it yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Found {
     instance: [u8; INSTANCE_LEN],
     fresh: bool,
+    /// Set when no copy holds the record's generation and it may be rolled forward (A-R184).
+    roll: Option<Roll>,
+}
+
+/// A reopen's roll-forward, decided by [`Db::check`] (ruling A-R184): count the open at exactly
+/// the counter revision the decision read, then link `to` onto `from` at `base` on `copies`.
+#[derive(Debug, Clone)]
+struct Roll {
+    count: admin::Count,
+    revision: u64,
+    from: Generation,
+    to: Generation,
+    base: Seq,
+    copies: Vec<NodeId>,
+}
+
+/// Ruling A-R184 (arch R3b check 4, critic-rollfwd F2): the copies a reopen may roll forward to
+/// `generation`, which no copy holds. Only when the open counter proves no host ever activated
+/// `generation`, so it never admitted a write, and only onto copies that hold the predecessor
+/// generation through its cutoff with the record's base digest there, verified from the record
+/// itself. Otherwise why not. Each copy's verdict is logged as `db_open_roll_forward_copy`.
+fn roll_forward_copies(
+    engines: &BTreeMap<NodeId, RocksEngine>,
+    generation: Generation,
+    root: &PartitionRoot,
+    count: admin::Count,
+) -> Result<Vec<NodeId>, String> {
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::envelope::ReplicationEnvelope;
+    if count.activated == admin::ACTIVATED_UNKNOWN {
+        return Err(
+            "the open counter predates activation marks, so it may have admitted \
+                    writes"
+                .to_owned(),
+        );
+    }
+    if count.may_have_admitted(generation) {
+        return Err(format!(
+            "the open counter marks generation {} activated, so it may have admitted writes",
+            count.activated.0
+        ));
+    }
+    // critic-rollfwd A1: a root naming boot 0 was never written by an owner.
+    if root.owner_boot == BootId(0) {
+        return Err("partitions/1 names owner boot 0".to_owned());
+    }
+    let (from, cutoff) = (root.predecessor_generation, root.predecessor_cutoff);
+    if from >= generation || root.base_seq != cutoff {
+        return Err(format!(
+            "partitions/1's root does not start at generation {} seq {}",
+            from.0, cutoff.0
+        ));
+    }
+    // A copy that holds a generation after `from` saw the database move on from it, so this
+    // root is not the one that generation's successor was built on: nothing to roll forward.
+    if let Some(newer) = engines
+        .values()
+        .flat_map(RocksEngine::lineages)
+        .filter(|(partition, held)| *partition == PARTITION && *held > from)
+        .map(|(_, held)| held)
+        .max()
+    {
+        return Err(format!(
+            "a copy holds generation {}, after generation {} that partitions/1's root starts at",
+            newer.0, from.0
+        ));
+    }
+    let holds_base = |engine: &RocksEngine| -> Result<(), &'static str> {
+        if !engine.lineages().contains(&(PARTITION, from)) {
+            return Err("predecessor_absent");
+        }
+        if engine.buffered_applied(PARTITION, from).0 < cutoff.0 {
+            return Err("predecessor_below_cutoff");
+        }
+        let digest = if cutoff == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            let (bytes, _) = engine
+                .history_at(PARTITION, from, cutoff)
+                .map_err(|_| "history_read_failed")?
+                .ok_or("no_record_at_cutoff")?;
+            let envelope = ReplicationEnvelope::decode(&bytes).map_err(|_| "undecodable")?;
+            if envelope.header.seq != cutoff {
+                return Err("wrong_seq");
+            }
+            if envelope.compute_record_digest().ok() != Some(envelope.record_digest) {
+                return Err("digest_mismatch");
+            }
+            envelope.record_digest
+        };
+        if digest != root.base_digest {
+            return Err("base_digest_differs");
+        }
+        Ok(())
+    };
+    let mut copies = Vec::new();
+    for (node, engine) in engines {
+        let verdict = holds_base(engine);
+        tracing::info!(
+            node = node.0,
+            generation = generation.0,
+            from = from.0,
+            cutoff = cutoff.0,
+            verdict = verdict.err().unwrap_or("holds_base"),
+            "db_open_roll_forward_copy"
+        );
+        if verdict.is_ok() {
+            copies.push(*node);
+        }
+    }
+    if copies.is_empty() {
+        return Err(format!(
+            "no copy holds generation {} through seq {} with the record's base digest",
+            from.0, cutoff.0
+        ));
+    }
+    Ok(copies)
 }
 
 /// Log a refused open as `db_open_refused`, with its kind and its text, and hand it back. An
@@ -2874,7 +3059,11 @@ mod tests {
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
-            timeouts: Timeouts::default(),
+            // The answerer is a thread: under a loaded gate it can take over a second to run.
+            timeouts: Timeouts {
+                read: crate::host::test_patience(Duration::from_secs(1)),
+                ..Timeouts::default()
+            },
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -5425,9 +5614,11 @@ mod tests {
     /// A-R174: a put's compile reads only P1's published position, so its cost does not grow
     /// with the status index. Generation 1 gets one more record on every copy, written straight
     /// to disk, whose batch holds 50,000 dedup rows; the reopen seeds them into node 1's status
-    /// index (M7A-194). Then 100 compiles take under 50 ms in all (times the deadline scale). A
+    /// index (M7A-194). Then 100 compiles take under 1 s in all (times the deadline scale). A
     /// compile that copies P1's whole view copies that index each time: 7.6 s for the 100 in a
-    /// debug build, against 19 ms reading the kernel's position (2026-10-23).
+    /// debug build, against 19 ms reading the kernel's position (2026-10-23). The bar sits
+    /// between the two, far from both: a 50 ms bar failed at 285 ms on a loaded gate. A count of
+    /// clones would be exact, but the clone is inside rdb-core's `Publication::view`.
     /// Integration (~5 s): two real opens, and the seed needs a recovery to land.
     #[config_log::retcd_test]
     fn a_compile_beside_a_50k_status_index_does_not_copy_it() {
@@ -5550,7 +5741,7 @@ mod tests {
             Some(Answer::Compiled(_)) => {}
             other => panic!("the warm-up compile: {other:?}"),
         }
-        let bar = crate::host::test_patience(Duration::from_millis(50));
+        let bar = crate::host::test_patience(Duration::from_secs(1));
         let started = std::time::Instant::now();
         for request in 2..=101 {
             match db.call(compile(request), wait) {
@@ -5945,5 +6136,340 @@ mod tests {
             Some(&b"hello"[..]),
             "{got:?}"
         );
+    }
+
+    // ---- A-R184: a reopen rolls forward only a generation no host activated ----
+
+    /// The generation `partitions/1` names in `store` now, `None` when there is no record.
+    fn stored_generation(
+        rt: &tokio::runtime::Runtime,
+        store: &Arc<dyn ConfigStore>,
+    ) -> Option<u64> {
+        let read = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1");
+        read.record
+            .and_then(|found| PartitionRecord::decode(&found.value))
+            .map(|record| record.generation.0)
+    }
+
+    /// Open `dir` on `store` with [`fast`] budgets.
+    fn open_fast(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+    ) -> Result<Db, OpenError> {
+        rt.block_on(Db::open_with(
+            config(dir),
+            Arc::clone(store),
+            rt.handle().clone(),
+            fast(),
+        ))
+    }
+
+    /// A fresh open of `dir` that writes a=1 and quits.
+    fn wrote_a_and_quit(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+    ) {
+        let mut db = open_fast(rt, dir, store).expect("the fresh open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the fresh open is ready");
+        db.put(b"a", b"1", None).expect("put a=1");
+        db.shutdown();
+    }
+
+    /// The reopen is ready, a=1 reads back, and b=2 lands.
+    fn ready_and_reads_back(db: &Db, case: &str) {
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .unwrap_or_else(|error| panic!("{case}: not ready: {error:?}"));
+        let got = db
+            .get(b"a")
+            .unwrap_or_else(|error| panic!("{case}: get a: {error:?}"));
+        assert_eq!(
+            got.value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"1")),
+            "{case}: a=1 reads back"
+        );
+        db.put(b"b", b"2", None)
+            .unwrap_or_else(|error| panic!("{case}: put b: {error:?}"));
+    }
+
+    /// Wait until `partitions/1` names `generation`.
+    fn until_stored(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, generation: u64) {
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        while stored_generation(rt, store) != Some(generation) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "partitions/1 never named generation {generation} within {patience:?}: {:?}",
+                stored_generation(rt, store)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The `db_open_rolled_forward` lines this row logged.
+    fn rolled_forward(method: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open_rolled_forward")
+            .collect()
+    }
+
+    /// Ruling A-R184 (critic-rollfwd row 1, S1-5): a process that dies right after the reopen's
+    /// recovery commits, before any node links the new generation or marks it activated, leaves
+    /// `partitions/1` at a generation no copy holds. The next open rolls it forward onto the
+    /// copies that hold its base, logs `db_open_rolled_forward`, and reads back. The hook faults
+    /// node 1 instead of aborting, so the row goes on in one process. Cut: the open refuses
+    /// every roll-forward (`roll_forward_copies` answers `Err`), and the last open is `Stale`.
+    /// Integration (~10 s): a fresh open, a reopen cut short at its commit, a rolled-forward
+    /// open until ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_after_a_process_died_right_after_its_commit_rolls_forward_and_reads_back() {
+        const METHOD: &str =
+            "m10_a_reopen_after_a_process_died_right_after_its_commit_rolls_forward_and_reads_back";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen cut short");
+        until_stored(&rt, &store, 2);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open that rolls forward");
+        let rolled = rolled_forward(METHOD);
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert_eq!(
+            (&rolled[0]["generation"], &rolled[0]["from"]),
+            (&serde_json::json!(2), &serde_json::json!(1)),
+            "{rolled:?}"
+        );
+        ready_and_reads_back(&db, "after the roll-forward");
+        db.shutdown();
+    }
+
+    /// Ruling A-R184 (critic-rollfwd row 2, #45): a reopen whose recovery CAS landed but kept
+    /// answering "unknown", and that quit with F1 still `ProposalUnresolved`, never activated
+    /// the generation it wrote. The next open rolls it forward and reads back. Cut as the row
+    /// above. Integration (~10 s): a fresh open, a reopen until `ProposalUnresolved`, a
+    /// rolled-forward open until ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_that_quit_with_its_commit_unresolved_rolls_forward_and_reads_back() {
+        const METHOD: &str =
+            "m10_a_reopen_that_quit_with_its_commit_unresolved_rolls_forward_and_reads_back";
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        scripted.rescript(Script {
+            only_prefix: Some(ControlKey::Partition(PARTITION).encode().into_bytes()),
+            lose_put_replies: u32::MAX,
+            ..Script::default()
+        });
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        until_stored(&rt, &store, 2);
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let owner = db.node_status().into_iter().next().expect("node 1");
+            if owner.recovery.as_deref() == Some("ProposalUnresolved") {
+                assert_eq!(owner.recovered, None, "never committed here: {owner:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "F1 never reached ProposalUnresolved: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+        drop(db);
+        scripted.rescript(Script::default());
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open that rolls forward");
+        assert_eq!(rolled_forward(METHOD).len(), 1);
+        ready_and_reads_back(&db, "after the roll-forward");
+        db.shutdown();
+    }
+
+    /// Ruling A-R184 (critic-rollfwd row 3, F2): once a host marked a generation activated, it
+    /// may have admitted writes there, so an open whose copies are older is `Stale` and names
+    /// the mark, never rolled forward over them. Here node 1 is restarted and its grant cleared,
+    /// so no grant protects b, and the copies are put back to a backup taken before b. Cut:
+    /// `Count::may_have_admitted` answers false, the open rolls forward, and b is lost.
+    /// Integration (~15 s): a fresh open, a reopen that writes b, a restart and a cleared grant,
+    /// a refused open.
+    #[config_log::retcd_test]
+    fn m10_an_older_copy_of_an_activated_generation_is_stale_never_rolled_forward() {
+        const METHOD: &str =
+            "m10_an_older_copy_of_an_activated_generation_is_stale_never_rolled_forward";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+        let backup = config_testkit::fs::temp_dir();
+        copy_tree(&dir.path().join("nodes"), &backup.path().join("nodes"));
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the reopen is ready");
+        db.put(b"b", b"2", None).expect("put b=2 at generation 2");
+        db.restart_node(OWNER).expect("restart node 1");
+        let patience = crate::host::test_patience(Duration::from_secs(15));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            match rt.block_on(admin::clear_grant(&db, &*store, OWNER)) {
+                Ok(admin::Clearance::Cleared(_)) => break,
+                Ok(admin::Clearance::Refused { .. }) => {
+                    assert!(std::time::Instant::now() < deadline, "never cleared");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                other => panic!("clear grants/1: {other:?}"),
+            }
+        }
+        db.shutdown();
+        drop(db);
+        std::fs::remove_dir_all(dir.path().join("nodes")).expect("remove nodes/");
+        copy_tree(&backup.path().join("nodes"), &dir.path().join("nodes"));
+
+        let refused = match open_fast(&rt, dir.path(), &store) {
+            Err(error @ OpenError::Stale { .. }) => error,
+            other => panic!(
+                "an older copy of an activated generation: {:?}",
+                other.map(|_| "Db")
+            ),
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("the open counter marks generation 2 activated"),
+            "{refused}"
+        );
+        assert!(rolled_forward(METHOD).is_empty());
+    }
+
+    /// Copy the directory tree `from` to `to`.
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("create");
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy");
+            }
+        }
+    }
+
+    /// Ruling A-R184: a node acquires under a generation, and admits writes, only once the open
+    /// counter marks it activated. While the mark's CAS keeps answering "unknown" without
+    /// applying, node 1 holds no grant and admits nothing; once the store answers, it acquires
+    /// and the reopen is ready. Cut: the first acquire does not wait on the mark, and node 1
+    /// holds a grant while unmarked. Integration (~8 s): a fresh open, a reopen held ~2 s past
+    /// its commit, then ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_acquires_only_once_the_open_counter_marks_its_generation() {
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        // The open's own count passes; every activation mark after it is dropped.
+        scripted.rescript(Script {
+            only_prefix: Some(b"rdb/instances/".to_vec()),
+            pass_puts: 1,
+            drop_puts: u32::MAX,
+            ..Script::default()
+        });
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        until_stored(&rt, &store, 2);
+        let held_until = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < held_until {
+            let owner = db.node_status().into_iter().next().expect("node 1");
+            assert!(
+                owner.authority == "unheld" && owner.admits != Some(true),
+                "node 1 acquired or admits before the mark: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        scripted.rescript(Script::default());
+        ready_and_reads_back(&db, "once the mark lands");
+        db.shutdown();
+    }
+
+    /// Ruling A-R184: the roll-forward's count is a CAS at exactly the revision its decision
+    /// read. Another open counted since then: `Moved`, so that open is `Stale`. A lost reply
+    /// whose bytes landed: counted. Cut: `count_open_at` takes a moved counter as counted.
+    /// Unit (~0.1 s): a `MemStore` and a scripted one.
+    #[test]
+    fn a_roll_forward_count_at_a_moved_revision_is_refused_and_a_lost_reply_is_settled() {
+        let rt = runtime();
+        let instance = [9_u8; INSTANCE_LEN];
+        let store = config_testkit::MemStore::new();
+        rt.block_on(admin::count_open(
+            &store,
+            &instance,
+            true,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("counted");
+        let (read, revision) = rt
+            .block_on(admin::read_count(&store, &instance))
+            .expect("read");
+        rt.block_on(admin::count_open(
+            &store,
+            &instance,
+            false,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("another open counted");
+        match rt.block_on(admin::count_open_at(
+            &store,
+            &instance,
+            read,
+            revision,
+            admin::COUNT_WITHIN,
+        )) {
+            Err(admin::CounterError::Moved { .. }) => {}
+            other => panic!("a moved counter: {other:?}"),
+        }
+
+        let lossy = Scripted::new(Script::default());
+        rt.block_on(admin::count_open(
+            &lossy,
+            &instance,
+            true,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("counted");
+        let (read, revision) = rt
+            .block_on(admin::read_count(&lossy, &instance))
+            .expect("read");
+        lossy.rescript(Script {
+            lose_put_replies: 1,
+            ..Script::default()
+        });
+        let n = rt
+            .block_on(admin::count_open_at(
+                &lossy,
+                &instance,
+                read,
+                revision,
+                admin::COUNT_WITHIN,
+            ))
+            .expect("its own bytes landed");
+        assert_eq!(n, read.n + 1);
     }
 }

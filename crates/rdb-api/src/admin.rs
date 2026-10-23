@@ -286,8 +286,37 @@ async fn adopt(
 /// request id derived from N never wrap.
 pub const MAX_OPENS: u64 = 1 << 24;
 
-/// The version byte of an open counter's value; N follows as a little-endian u64.
-const COUNTER_LAYOUT: u8 = 1;
+/// The version byte of an open counter's value. Layout 2 (ruling A-R184): N, then the newest
+/// generation of partition 1 a host marked activated, each a little-endian u64. A build from
+/// before A-R184 reads layout 2 as `Unreadable`, never as a count.
+const COUNTER_LAYOUT: u8 = 2;
+
+/// Layout 1, written before A-R184: N alone. Read with the activated generation unknown.
+const COUNTER_LAYOUT_N_ONLY: u8 = 1;
+
+/// The activated generation a layout-1 counter leaves unknown: no generation is ever rolled
+/// forward on it, and the next activation replaces it.
+pub const ACTIVATED_UNKNOWN: Generation = Generation(u64::MAX);
+
+/// An open counter's value (arch R3b, rulings A-R160 and A-R184).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Count {
+    /// How many opens were counted: N.
+    pub n: u64,
+    /// The newest generation of partition 1 a host marked activated before its first acquire
+    /// under it ([`activate`]): `Generation(0)` before any, [`ACTIVATED_UNKNOWN`] on a layout-1
+    /// value.
+    pub activated: Generation,
+}
+
+impl Count {
+    /// Whether `generation` may have admitted a write: always, unless the marker proves that no
+    /// host ever activated it.
+    #[must_use]
+    pub fn may_have_admitted(self, generation: Generation) -> bool {
+        self.activated == ACTIVATED_UNKNOWN || self.activated >= generation
+    }
+}
 
 /// How long [`count_open`] keeps reading and CASing before it gives up.
 pub(crate) const COUNT_WITHIN: Duration = Duration::from_secs(10);
@@ -304,16 +333,24 @@ pub fn instance_key(instance: &[u8; INSTANCE_LEN]) -> String {
     format!("rdb/instances/{}", instance_hex(instance))
 }
 
-fn encode_count(n: u64) -> Bytes {
-    let mut out = Vec::with_capacity(9);
+fn encode_count(count: Count) -> Bytes {
+    let mut out = Vec::with_capacity(17);
     out.push(COUNTER_LAYOUT);
-    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&count.n.to_le_bytes());
+    out.extend_from_slice(&count.activated.0.to_le_bytes());
     Bytes::from(out)
 }
 
-fn decode_count(body: &[u8]) -> Option<u64> {
+fn decode_count(body: &[u8]) -> Option<Count> {
     match body {
-        [COUNTER_LAYOUT, rest @ ..] => Some(u64::from_le_bytes(rest.try_into().ok()?)),
+        [COUNTER_LAYOUT, rest @ ..] if rest.len() == 16 => Some(Count {
+            n: u64::from_le_bytes(rest[..8].try_into().ok()?),
+            activated: Generation(u64::from_le_bytes(rest[8..].try_into().ok()?)),
+        }),
+        [COUNTER_LAYOUT_N_ONLY, rest @ ..] => Some(Count {
+            n: u64::from_le_bytes(rest.try_into().ok()?),
+            activated: ACTIVATED_UNKNOWN,
+        }),
         _ => None,
     }
 }
@@ -341,6 +378,15 @@ pub enum CounterError {
         key: String,
         /// Where it was read.
         revision: u64,
+    },
+    /// A roll-forward's count found the counter moved from the revision its decision read
+    /// ([`count_open_at`]): another open counted in between, so the decision no longer holds.
+    #[error("{key} moved from revision {read} that the roll-forward decision read")]
+    Moved {
+        /// The counter's key.
+        key: String,
+        /// The revision the decision read.
+        read: u64,
     },
     /// The store refused, or did not settle the count within [`COUNT_WITHIN`].
     #[error("control store: {0}")]
@@ -384,17 +430,29 @@ pub async fn count_open(
             Err(error) => return Err(CounterError::Control(format!("get {key}: {error}"))),
         };
         let (next, expected) = match read.record {
-            None if fresh => (1, 0),
+            None if fresh => (
+                Count {
+                    n: 1,
+                    activated: Generation(0),
+                },
+                0,
+            ),
             None => return Err(CounterError::Absent { key }),
             Some(found) => {
-                let n = decode_count(&found.value).ok_or_else(|| CounterError::Unreadable {
+                let count = decode_count(&found.value).ok_or_else(|| CounterError::Unreadable {
                     key: key.clone(),
                     revision: found.mod_revision,
                 })?;
-                if n >= MAX_OPENS {
+                if count.n >= MAX_OPENS {
                     return Err(CounterError::Exhausted { key });
                 }
-                (n + 1, found.mod_revision)
+                (
+                    Count {
+                        n: count.n + 1,
+                        ..count
+                    },
+                    found.mod_revision,
+                )
             }
         };
         let written = store
@@ -409,11 +467,12 @@ pub async fn count_open(
             Ok(response) if response.outcome == MutationOutcome::Applied => {
                 tracing::info!(
                     instance_hex = %hex,
-                    n = next,
+                    n = next.n,
+                    activated = next.activated.0,
                     revision = response.revision,
                     "open_counted"
                 );
-                return Ok(next);
+                return Ok(next.n);
             }
             Ok(_) => last = format!("CAS at {expected} was not applied"),
             Err(error)
@@ -433,6 +492,219 @@ pub async fn count_open(
         "{key} was not counted within {} ms; last: {last}",
         within.as_millis()
     )))
+}
+
+/// `instance`'s open counter and the revision it was read at, for a reopen's roll-forward
+/// decision (ruling A-R184). One read, no retry, as the reopen's read of `partitions/1`.
+///
+/// # Errors
+///
+/// [`CounterError::Absent`], [`CounterError::Unreadable`], or [`CounterError::Control`] when the
+/// read fails.
+pub async fn read_count(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+) -> Result<(Count, u64), CounterError> {
+    let key = instance_key(instance);
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| CounterError::Control(format!("get {key}: {error}")))?;
+    let found = read
+        .record
+        .ok_or_else(|| CounterError::Absent { key: key.clone() })?;
+    let count = decode_count(&found.value).ok_or(CounterError::Unreadable {
+        key,
+        revision: found.mod_revision,
+    })?;
+    Ok((count, found.mod_revision))
+}
+
+/// Count one more open of `instance` on a roll-forward (ruling A-R184, k199): a CAS from `read`
+/// at exactly the `revision` the decision read it at, never from a newer value. A conflict means
+/// another open counted since, so the decision no longer holds: [`CounterError::Moved`]. A lost
+/// reply reads again: the counter still at `revision` sends the same CAS again, this CAS's own
+/// bytes there count as applied, and anything else is [`CounterError::Moved`]. Bounded by
+/// `within`. Logged as `open_counted{instance_hex, n, activated, revision, rolled_forward}`.
+///
+/// # Errors
+///
+/// [`CounterError::Moved`], [`CounterError::Exhausted`], or [`CounterError::Control`] when the
+/// store refuses or does not settle within `within`.
+pub async fn count_open_at(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    read: Count,
+    revision: u64,
+    within: Duration,
+) -> Result<u64, CounterError> {
+    let key = instance_key(instance);
+    let hex = instance_hex(instance);
+    if read.n >= MAX_OPENS {
+        return Err(CounterError::Exhausted { key });
+    }
+    let next = Count {
+        n: read.n + 1,
+        ..read
+    };
+    let counted = |at: u64| {
+        tracing::info!(
+            instance_hex = %hex,
+            n = next.n,
+            activated = next.activated.0,
+            revision = at,
+            rolled_forward = true,
+            "open_counted"
+        );
+        Ok(next.n)
+    };
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = String::from("nothing answered");
+    let mut send = true;
+    while tokio::time::Instant::now() < deadline {
+        if send {
+            let written = store
+                .put(PutRequest {
+                    key: Bytes::from(key.clone()),
+                    value: encode_count(next),
+                    expected_mod_revision: Some(revision),
+                    dedup: None,
+                })
+                .await;
+            match written {
+                Ok(response) if response.outcome == MutationOutcome::Applied => {
+                    return counted(response.revision)
+                }
+                Ok(_) | Err(ConfigError::Conflict { .. }) => {
+                    return Err(CounterError::Moved {
+                        key,
+                        read: revision,
+                    })
+                }
+                Err(error)
+                    if matches!(error, ConfigError::DeadlineExceededUnknownOutcome)
+                        || crate::control::transient(&error) =>
+                {
+                    last = error.to_string();
+                }
+                Err(error) => return Err(CounterError::Control(format!("put {key}: {error}"))),
+            }
+        }
+        tracing::warn!(instance_hex = %hex, error = %last, "open_count_retry");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => match read.record {
+                Some(found) if found.mod_revision == revision => send = true,
+                Some(found) if decode_count(&found.value) == Some(next) => {
+                    return counted(found.mod_revision)
+                }
+                _ => {
+                    return Err(CounterError::Moved {
+                        key,
+                        read: revision,
+                    })
+                }
+            },
+            Err(error) if crate::control::transient(&error) => {
+                last = error.to_string();
+                send = false;
+            }
+            Err(error) => return Err(CounterError::Control(format!("get {key}: {error}"))),
+        }
+    }
+    Err(CounterError::Control(format!(
+        "{key} was not counted within {} ms; last: {last}",
+        within.as_millis()
+    )))
+}
+
+/// Mark `generation` of partition 1 activated in `instance`'s open counter (ruling A-R184,
+/// critic-rollfwd F2). A host calls it before its first acquire under `generation` and acquires
+/// only once it returns, so a generation the counter does not name never admitted a write. It
+/// reads the counter and CASes `activated = generation`, keeping N, at the revision read. A
+/// conflict, a lost reply or a store error reads again, so it returns only once the counter names
+/// `generation` or newer, and it never gives up on its own: the node's acquire waits on it, and
+/// a node that stops abandons it. Logged as `open_activated{instance_hex, n, generation,
+/// revision}`, each retry as `open_activate_retry{instance_hex, generation, error}`.
+///
+/// # Errors
+///
+/// [`CounterError::Absent`] or [`CounterError::Unreadable`]: no read again changes them.
+pub async fn activate(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    generation: Generation,
+) -> Result<Count, CounterError> {
+    let key = instance_key(instance);
+    let hex = instance_hex(instance);
+    let activated = |count: Count, revision: u64| {
+        tracing::info!(
+            instance_hex = %hex,
+            n = count.n,
+            generation = generation.0,
+            activated = count.activated.0,
+            revision,
+            "open_activated"
+        );
+        Ok(count)
+    };
+    let mut wait = Duration::from_millis(50);
+    loop {
+        let error = match store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => {
+                let Some(found) = read.record else {
+                    return Err(CounterError::Absent { key });
+                };
+                let count = decode_count(&found.value).ok_or_else(|| CounterError::Unreadable {
+                    key: key.clone(),
+                    revision: found.mod_revision,
+                })?;
+                if count.activated != ACTIVATED_UNKNOWN && count.activated >= generation {
+                    return activated(count, found.mod_revision);
+                }
+                let next = Count {
+                    activated: generation,
+                    ..count
+                };
+                let written = store
+                    .put(PutRequest {
+                        key: Bytes::from(key.clone()),
+                        value: encode_count(next),
+                        expected_mod_revision: Some(found.mod_revision),
+                        dedup: None,
+                    })
+                    .await;
+                match written {
+                    Ok(response) if response.outcome == MutationOutcome::Applied => {
+                        return activated(next, response.revision)
+                    }
+                    Ok(_) => format!("CAS at {} was not applied", found.mod_revision),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!(
+            instance_hex = %hex,
+            generation = generation.0,
+            error = %error,
+            "open_activate_retry"
+        );
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(1));
+    }
 }
 
 /// What a reopen's heal proved and handed node 1 (M10, arch R3a, ruling A-R163).

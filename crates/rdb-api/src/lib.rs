@@ -46,6 +46,14 @@ pub use db::{
     MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE,
 };
 pub use host::{Change, ListEdit, Look, Seen};
+// The rdb-core types `Db`'s calls take and answer with, so an app depends on rdb-api alone
+// (A-R190): request ids, generations, the status answer and the error kinds.
+pub use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
+pub use rdb_core::contracts::ids::{
+    AffinityId, BootId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity,
+    Seq,
+};
+pub use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnResult, TxnStatus};
 // The value types an app builds a change from, by name only (S4 A-8): no `rdb_value` internals.
 pub use rdb_value::blob::{Blob, Manifest, Upload};
 pub use rdb_value::collection::{Collection, CollectionKind, ElemOp, Member, Members};
