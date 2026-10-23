@@ -1835,6 +1835,21 @@ impl Host {
     /// wall clock between a quit and a reopen shortens a restored mark's window by the step,
     /// less `clock_error_millis` (critic-d6b; the same assumption as the heal's guard 2).
     fn trim_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        self.trim_aged(now, "trim");
+        self.trim_delete_duty(now)?;
+        self.mark_duty(
+            now,
+            trim_delete_period(self.budgets.dedup_retention_millis),
+            "marks",
+        )?;
+        self.retire_duty(now)
+    }
+
+    /// The trim duty's sweep in memory: per partition, the `published_at` entries of its oldest
+    /// generation at least a retention old go, as one `DedupTrim` and one `StatusTrim` below
+    /// the last of them plus one, and that floor is kept for the delete. `kind` names the
+    /// `host_duty` line.
+    fn trim_aged(&mut self, now: Tick, kind: &'static str) {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
         for (partition, published) in &mut self.published_at {
@@ -1856,7 +1871,7 @@ impl Host {
         for (partition, generation, below, at) in trims {
             tracing::info!(
                 node = self.node.0,
-                kind = "trim",
+                kind,
                 partition = partition.0,
                 generation = generation.0,
                 below = below.0,
@@ -1883,13 +1898,6 @@ impl Host {
             self.trim_floors
                 .insert((partition, generation), (below, at));
         }
-        self.trim_delete_duty(now)?;
-        self.mark_duty(
-            now,
-            trim_delete_period(self.budgets.dedup_retention_millis),
-            "marks",
-        )?;
-        self.retire_duty(now)
     }
 
     /// A-R183 (S1-6, critic-d6b): durable publish marks. A mark `(generation, seq, tick)` is a
@@ -1989,6 +1997,10 @@ impl Host {
         }
         self.marks_written
             .insert(partition, (self.clock.now(), read));
+        // A-R193: what the marks show already aged is trimmed now, before this landing's
+        // `Recovered` and so before the host admits, not on the first trim tick up to
+        // [`HOST_TRIM_EVERY_MILLIS`] later. T1 and P1 keep a trim that comes before the seed.
+        self.trim_aged(self.clock.now(), "pre_trim");
         Ok(())
     }
 
@@ -9375,12 +9387,14 @@ mod tests {
             .expect("put marks");
     }
 
-    /// A-R183 row 1, the tail (critic-d6b F1/F3): marks left by an earlier process reach seq 5
-    /// of generation 1, published two retentions ago. The reopen's first trim takes seqs 1-5
-    /// and nothing above: rows 6 and 7 were never marked, so they wait for the landing plus
-    /// the retention, as before.
+    /// A-R183 row 1, the tail (critic-d6b F1/F3), and A-R193: marks left by an earlier process
+    /// reach seq 5 of generation 1, published two retentions ago. The restore itself trims
+    /// seqs 1-5, before the landing's `Recovered`, with no trim tick, and nothing above: rows 6
+    /// and 7 were never marked, so they wait for the landing plus the retention, as before. The
+    /// floor keeps seq 5's tick read as later by the clock error (C5); restored out of order, the
+    /// trim would stop below seq 4.
     #[test]
-    fn a_reopen_trims_what_the_marks_cover_on_its_first_tick_and_spares_the_tail() {
+    fn a_reopen_trims_what_the_marks_cover_at_restore_and_spares_the_tail() {
         let dir = config_testkit::fs::temp_dir();
         let path = dir.path().join("node");
         let rt = current_thread();
@@ -9400,15 +9414,21 @@ mod tests {
             .expect("restore");
         let epsilon = Budgets::SPEC_DEFAULTS.clock_error_millis;
         assert_eq!(
-            host.published_at[&PartitionId(1)],
-            [
-                (Generation(1), Seq(3), old.plus_millis(epsilon)),
-                (Generation(1), Seq(5), old.plus_millis(10 + epsilon)),
-            ],
-            "restored oldest first, each tick read as later by the clock error (C5)"
+            dedup_trims_queued(&host),
+            [(1, 6)],
+            "one trim at restore, below seq 6"
+        );
+        assert_eq!(
+            host.trim_floors[&(PartitionId(1), Generation(1))],
+            (Seq(6), old.plus_millis(10 + epsilon)),
+            "the floor is seq 5's tick read as later by the clock error (C5)"
+        );
+        assert!(
+            host.published_at[&PartitionId(1)].is_empty(),
+            "nothing marked is left to age"
         );
         host.trim_duty(host.clock.now()).expect("trim");
-        assert_eq!(dedup_trims_queued(&host), [(1, 6)], "one trim, below seq 6");
+        assert_eq!(dedup_trims_queued(&host), [(1, 6)], "the tick adds no trim");
         assert_eq!(host.trim_deletes, 1, "the floor is deleted on disk too");
     }
 
