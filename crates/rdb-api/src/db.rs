@@ -3112,7 +3112,7 @@ mod tests {
     fn admits_within(db: &Db, phase: &str, patience: Duration) {
         let patience = crate::host::test_patience(patience);
         let deadline = std::time::Instant::now() + patience;
-        while db.node_status().first().and_then(|node| node.admits) != Some(true) {
+        while owner_of(db, db.node_status()).and_then(|node| node.admits) != Some(true) {
             for node in db.node_status() {
                 let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                 crate::host::assert_not_blocked(&node, window);
@@ -3131,19 +3131,23 @@ mod tests {
     /// unpublished txn and refuses new writes `PROTECTION_PAUSED`. `Msg::Inspect` is answered
     /// between drains, so once `published` shows `seq`, the publish's thaw has run too.
     fn publishes(db: &Db, seq: Seq, phase: &str) {
-        let patience = crate::host::test_patience(Duration::from_secs(5));
-        let deadline = std::time::Instant::now() + patience;
-        while !db.node_status().first().is_some_and(|node| {
-            node.published.map(|(_, at)| at) == Some(seq) && node.in_flight.is_none()
-        }) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{phase}: node 1 has not published {seq:?} with nothing in flight within \
-                 {patience:?}: {:?}",
-                db.node_status().first()
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        owner_when(
+            db,
+            &format!("{phase}: node 1 publishes {seq:?} with nothing in flight"),
+            crate::host::test_patience(Duration::from_secs(5)),
+            &|node| node.published.map(|(_, at)| at) == Some(seq) && node.in_flight.is_none(),
+        );
+    }
+
+    /// Node 1's next answer to `node_status`, waited for within the scaled 5 s; see
+    /// [`owner_of`]. For a row that asserts on one look rather than waits for a state.
+    fn owner_status(db: &Db, what: &str) -> NodeStatus {
+        owner_when(
+            db,
+            what,
+            crate::host::test_patience(Duration::from_secs(5)),
+            &|_| true,
+        )
     }
 
     /// The spec's budgets with L1's waits cut short, so a fresh partition admits writes within
@@ -3445,13 +3449,12 @@ mod tests {
             }
         };
         let applied = |db: &Db| {
-            db.node_status()
-                .first()
+            owner_of(db, db.node_status())
                 .and_then(|n| n.holds)
                 .map(|h| h.applied)
         };
         until("node 1 admits writes", &|db| {
-            db.node_status().first().and_then(|n| n.admits) == Some(true)
+            owner_of(db, db.node_status()).and_then(|n| n.admits) == Some(true)
         });
         assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
 
@@ -3492,9 +3495,13 @@ mod tests {
             "{:?}",
             changed.error
         );
-        let node = db.node_status().into_iter().next().expect("node 1");
+        let node = owner_status(&db, "node 1 after the heal");
         assert_eq!(node.fault, None, "node 1 never faulted");
-        assert_eq!(applied(&db), Some(3), "request 100 published once");
+        assert_eq!(
+            node.holds.map(|h| h.applied),
+            Some(3),
+            "request 100 published once"
+        );
     }
 
     /// M9 S2a mutant pass: `node_status` reports a control reload that is retrying, on the
@@ -4337,7 +4344,7 @@ mod tests {
         let pending = unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
         let pending_id = pending.identity.request;
         assert_eq!(
-            db.node_status().first().and_then(|owner| owner.in_flight),
+            owner_status(&db, "node 1 with the first txn in flight").in_flight,
             Some(pending_id),
             "node 1 holds the first txn applied and unpublished"
         );
@@ -4403,15 +4410,12 @@ mod tests {
         admits(&db, "after the open");
         let first = db.put(b"a", b"1", None).expect("before the restart");
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
-        let patience = crate::host::test_patience(Duration::from_secs(5));
-        let deadline = std::time::Instant::now() + patience;
-        while db.node_status().first().and_then(|node| node.admits) != Some(false) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "L1 does not pause within {patience:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        owner_when(
+            &db,
+            "L1 pauses",
+            crate::host::test_patience(Duration::from_secs(5)),
+            &|node| node.admits == Some(false),
+        );
         let refused = db.put(b"a", b"9", None).expect_err("paused");
         assert_eq!(
             refused.error.kind,
@@ -4435,8 +4439,8 @@ mod tests {
             "{retried:?}"
         );
         assert_eq!(
-            db.node_status().first().map(|owner| owner.in_flight),
-            Some(None),
+            owner_status(&db, "node 1 while paused").in_flight,
+            None,
             "nothing is applied unpublished at node 1"
         );
         assert_eq!(db.status(id, None).expect("status"), TxnStatus::Unknown);
@@ -6644,8 +6648,10 @@ mod tests {
     /// A-R237 (int gate k429): node 1 missing from `node_status` because it did not answer
     /// within `Timeouts::read` is "not yet" to the D7 waits, never a panic and never another
     /// node's status. Node 1 here is a stub that sits on its first look past the read timeout,
-    /// as a host no thread ran for did, then answers every look. Cut: `owner_of` as
-    /// `next().expect("node 1")` — the first look finds no node and the row panics.
+    /// as a host no thread ran for did, then answers every look. It looks through
+    /// [`owner_status`], which the rows that assert on one look share (A-R250). Cuts: `owner_of`,
+    /// or `owner_status`, as `next().expect("node 1")` — the first look finds no node and the
+    /// row panics.
     #[test]
     fn m10_d7_node_1_missing_from_node_status_is_not_yet() {
         let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
@@ -6684,12 +6690,7 @@ mod tests {
                 }
             })
         };
-        let owner = owner_when(
-            &db,
-            "node 1 after its stall",
-            Duration::from_secs(10),
-            &|_| true,
-        );
+        let owner = owner_status(&db, "node 1 after its stall");
         assert_eq!(owner.node, OWNER, "node 1's status, not another node's");
         assert!(
             looks.load(Ordering::Relaxed) >= 2,
@@ -8297,20 +8298,13 @@ mod tests {
         });
         let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
         until_stored(&rt, &store, 2);
-        let patience = crate::host::test_patience(Duration::from_secs(30));
-        let deadline = std::time::Instant::now() + patience;
-        loop {
-            let owner = db.node_status().into_iter().next().expect("node 1");
-            if owner.recovery.as_deref() == Some("ProposalUnresolved") {
-                assert_eq!(owner.recovered, None, "never committed here: {owner:?}");
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "F1 never reached ProposalUnresolved: {owner:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let owner = owner_when(
+            &db,
+            "F1 reaches ProposalUnresolved",
+            crate::host::test_patience(Duration::from_secs(30)),
+            &|owner| owner.recovery.as_deref() == Some("ProposalUnresolved"),
+        );
+        assert_eq!(owner.recovered, None, "never committed here: {owner:?}");
         db.shutdown();
         drop(db);
         scripted.rescript(Script::default());
@@ -8416,7 +8410,7 @@ mod tests {
         until_stored(&rt, &store, 2);
         let held_until = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < held_until {
-            let owner = db.node_status().into_iter().next().expect("node 1");
+            let owner = owner_status(&db, "node 1 before the mark");
             assert!(
                 owner.authority == "unheld" && owner.admits != Some(true),
                 "node 1 acquired or admits before the mark: {owner:?}"
