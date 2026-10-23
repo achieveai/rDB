@@ -149,6 +149,30 @@ the rule is inert until a recovery has committed. M7 admits one generation of hi
 than one recovery behind needs `SnapshotCatchupRequired` (§6), which the primary emits before
 sending a record the receiver would reject.
 
+**Amended 2026-10-23 (M10 slice 2, lead ruling A-R223; critic-d3 F1, F2, F3): any older
+generation, bounded by the floor.** "One generation of history" was a scope limit, not a safety
+rule. Writeless reopens made it bite: after two reopens that write nothing, every record a lagging
+copy still needs was sealed two or more generations back, each was refused `STALE_GENERATION`, and
+the copy never caught up (#59). The rule now reads: an envelope with `seq <= history_floor` and
+`generation` **older than** the generation the receiver adopted (not only
+`predecessor_generation`) skips rules 5, 6 and 7, decided exactly as before. The safety argument
+is unchanged, because it never read the generation: the frame fence runs first and still names the
+sender, the root pins the digest at the floor, and every record below chains on the one beneath
+it. Above the floor the adopted generation owns every sequence, so an older record there is still
+`STALE_GENERATION`. A held head sealed generations back is answered as a repeat by the same rule,
+so ruling A-R169's separate `already_holds` path is gone. The primary no longer asks for a
+snapshot before sending such a record (§6 step 1 no longer covers it; "step 1a" in
+`CatchupCursor::send_after` is removed). When the primary's own ladder lacks the rungs, R1 still
+emits `SnapshotCatchupRequired`; its consumer now fills the primary's ladder from its own engine
+once per generation (`Replication::restore_primary_history`) instead of waiting for spec §10.1, and
+the copy is walked by ordinary catch-up. Rows: `m7b_123_historical_envelopes_reach_copy_caught_up_and_root_anchor_quarantines`
+(the two-generations-back twin flipped to admitted),
+`a_head_sealed_two_generations_back_draws_an_ack_and_stores_nothing`,
+`m7b_125_catch_up_sends_the_retained_prefix_and_asks_no_snapshot`,
+`a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for`, the host's
+`h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine`, and the simulator's
+`m10_d3_a_copy_behind_two_writeless_reopens_catches_up`.
+
 **The anchor is looked up on every copy, not adopted from the control message.** The rule above
 rests on one premise: a copy that holds `base_seq` holds `base_digest`. Row 9 checks it on arrival
 for a copy that is *behind* the cutoff, because that copy receives the record at `base_seq`. A copy
@@ -506,7 +530,7 @@ does not describe.
 | A same-generation re-emit keeps the receiver's head | A receiver in the generation it holds, above the cutoff, `Match`, not quarantined, not retired, keeps its head on `Recovered`; a `Differs` or retired one is rewritten as before, and a quarantined one truncates but stays quarantined until a new generation (`m9_d3_03`..`m9_d3_06`, `m9_f2_a`, amended 2026-10-07) |
 | A quarantined copy is marked without an ACK | A copy quarantined at `Recovered` never ACKs; the cursor's `QUARANTINED` outcome reaches the tracker as `CopyQuarantined`, which sets `diverged` and emits exactly one `Alert` and one `CopyLost` |
 | Historical records catch a copy up across a generation change | Copy at seq 50; root committed with `base_seq = 100` under predecessor *g*; envelopes 51..100 carrying *g* are accepted and the copy reaches `CopyCaughtUp` at `(100, base_digest)`; 101 under *g+1* passes the normal ladder; a record at 100 whose digest is not `base_digest` quarantines — **gate V3** |
-| One generation of history only | A copy needing records older than `predecessor_generation` receives `SnapshotCatchupRequired`, never `STALE_GENERATION` |
+| Any older generation below the floor (amended 2026-10-23, A-R223; was "one generation of history only") | A copy needing records sealed two or more generations back, at or below the floor, is sent them and admits them by chain and root anchor, with no snapshot ask; above the floor an older record is still `STALE_GENERATION`; a primary missing the rungs restores them from its own engine once per generation (`m7b_123`, `m7b_125`, `a_head_sealed_two_generations_back_draws_an_ack_and_stores_nothing`, `a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for`, `m10_d3_a_copy_behind_two_writeless_reopens_catches_up`) |
 | A diverged copy leaves the durable views | RF3, threshold 1: copy C diverges; `all_durable_through` and `min_required_durable` ignore C, a later ACK from C is dropped `DIVERGED_COPY`, the step emitted `Alert` + `CopyLost` and no `QualificationChanged` |
 | Divergence with no floor blocks, never silently pauses | Then copy B diverges: effect vector in index order `DivergenceDetected`, `Alert`, `CopyLost`, `QualificationChanged { Lost }`, `BlockPartition { DivergenceRequiresOperator, [C, B] }` — **gate V3** |
 | Set change without a predicate flip emits nothing | RF3, threshold 1, one copy diverges: no `QualificationChanged` in the effect vector; `qualifies_now(head)` still true |

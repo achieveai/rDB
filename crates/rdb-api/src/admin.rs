@@ -1585,22 +1585,28 @@ impl PromoteError {
 }
 
 impl From<PromoteError> for ApiError {
-    /// A-R256: a refused argument is `INVALID_ARGUMENT`; anything else `UNAVAILABLE`, retried
-    /// only by promoting again, which picks up where this one stopped.
+    /// A-R256: a refused argument is `INVALID_ARGUMENT`; anything else `UNAVAILABLE`. Each of
+    /// those texts but `Record`'s ends "promote again", and promoting again picks up where this
+    /// one stopped, so its retry rule is `BoundedJitter`: the step says to try again and agrees
+    /// with the text. A record this build cannot read is `NotWired`: retrying will not help.
     fn from(error: PromoteError) -> Self {
         let no_mutation = error.no_mutation();
-        match error {
+        let retry = match &error {
             PromoteError::Shadow { .. }
             | PromoteError::NotAMember { .. }
             | PromoteError::AlreadyOwner { .. }
-            | PromoteError::DropIsTarget => Self::invalid(error.to_string()),
-            other => Self {
-                kind: ErrorKind::Unavailable,
-                retry: RetryRule::NotWired,
-                no_mutation,
-                detail: other.to_string(),
-                retry_after: None,
-            },
+            | PromoteError::DropIsTarget => return Self::invalid(error.to_string()),
+            PromoteError::Record(_) => RetryRule::NotWired,
+            PromoteError::PeersUnknown { .. }
+            | PromoteError::Unreachable { .. }
+            | PromoteError::Control(_) => RetryRule::BoundedJitter,
+        };
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry,
+            no_mutation,
+            detail: error.to_string(),
+            retry_after: None,
         }
     }
 }
@@ -3231,6 +3237,36 @@ mod tests {
             stopped.to_string(),
             "node 2 stopped before the heal reached it",
             "{stopped:?}"
+        );
+    }
+
+    /// A-R262: an `UNAVAILABLE` promote refusal says to promote again, and its next step agrees:
+    /// try again, never "retrying will not help". The whole text an app shows, for a promote
+    /// with no link to nodes 2 and 3. Cut: the rule is `NotWired`, and the step contradicts the
+    /// text. Unit (~150 ms): `MemStore`, a 100 ms budget.
+    #[test]
+    fn m10_s2_a_promote_refused_unavailable_says_to_try_again_in_its_next_step_too() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2)),
+            Duration::from_millis(100),
+        );
+        assert!(sent.is_empty());
+        let refused = ApiError::from(answer.expect_err("no link to nodes 2 and 3"));
+        assert_eq!(
+            refused.to_string(),
+            "UNAVAILABLE (no link to node 2 and 3 came up within 0.1 seconds, so the promote \
+             cannot pin its boot: start node 2 and 3, then promote again; next: the database is \
+             not serving right now: wait a few seconds and try again; if it keeps refusing, \
+             check that its nodes and its rEtcd are running (on a local run, \
+             `scripts/local-rdb.sh status`))"
         );
     }
 }

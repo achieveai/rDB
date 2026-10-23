@@ -356,6 +356,65 @@ fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links
     );
 }
 
+/// Arm 3 (arch-s2 `land_at`, A-R224 item 3): a copy that lands a commit outside its barrier
+/// while it holds less than the cutoff links the new generation at its own head, gets a
+/// receiver there, and answers nothing to send: its `Recovered` asks the primary for the
+/// rest. Cut: `land_at` refuses below the base, as slice 1 did; nothing links, red. Unit,
+/// about 2.5 s (the trio's bootstrap window).
+#[config_log::retcd_test]
+fn a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head() {
+    const METHOD: &str =
+        "a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head";
+    let full = config_testkit::fs::temp_dir();
+    let digests = write_chain(
+        &mut RocksEngine::open(full.path().join("node")).expect("open engine"),
+        Generation(1),
+        2,
+    );
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        1,
+    );
+    let result = landing_at(2, digests[1]);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    assert_eq!(
+        host.land_link(PartitionId(1), &result),
+        None,
+        "not caught up"
+    );
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(2)),
+        Some(rdb_storage::Link {
+            parent: Generation(1),
+            base: Seq(1),
+            copied: false,
+        })
+    );
+    let receiver = host
+        .replication
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("a receiver at its head");
+    assert_eq!(
+        (
+            receiver.lineage().generation,
+            receiver.applied_head().seq,
+            receiver.applied_head().digest
+        ),
+        (Generation(2), Seq(1), digests[0])
+    );
+    let behind: Vec<_> = logged!(METHOD, "land_link_behind")
+        .into_iter()
+        .map(|line| (line["head"].clone(), line["base"].clone()))
+        .collect();
+    assert_eq!(behind, [(1, 2)].map(|(h, b)| (h.into(), b.into())));
+    assert!(logged!(METHOD, "land_link_refused").is_empty());
+    assert_eq!(host.fault, None);
+}
+
 /// review-r185 ADV2 and ADV3: the refusals no row reached, each by name and at its level.
 /// A copy holding no older generation has nothing to link, which is expected on a first
 /// landing, so it logs at info. One already holding the new generation, or one the pin
@@ -654,4 +713,251 @@ fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
         sent.contains(&(serde_json::json!(2), serde_json::json!(3))),
         "node 2 sent recovery appends to node 3: {sent:?}"
     );
+}
+
+/// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired` on the primary is served from its
+/// engine, never by faulting the node. The first ask restores the primary's ladder at its
+/// generation and logs `snapshot_catchup_served` with every rung, root through the head; a
+/// repeat `(copy, barrier)` is dropped; a new ask at that generation logs
+/// `snapshot_catchup_unservable`; and a node that hosts no primary logs
+/// `snapshot_catchup_unserved{reason=no_primary}`. Before H2 every one of these faulted the
+/// node `host_unsupported: kernel_effect SnapshotCatchupRequired`.
+/// Cuts: the arm removed, red (a fault); the dedup removed, red (the repeat logs
+/// `unservable`); the ladder check removed, red (the new ask is served again).
+/// Integration (~2 s): bootstrap's discovery window, then direct calls.
+#[config_log::retcd_test]
+fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let head = trio.head().expect("node 1 holds a head");
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: CorrelationId(u64::MAX),
+    };
+    let ask = |copy: u8, barrier: u64| KernelEffect::SnapshotCatchupRequired {
+        copy: CopyId(copy),
+        barrier: Seq(barrier),
+    };
+    for (node, copy, barrier) in [(0, 2, head), (0, 2, head), (0, 3, head), (1, 3, head)] {
+        let host = &mut trio.nodes[node].0;
+        assert_eq!(
+            host.kernel(ModuleName::Replication, &ask(copy, barrier), site),
+            Ok(()),
+            "node {} asked for copy {copy} at {barrier}",
+            host.node.0
+        );
+        assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+    }
+    let generation = trio.nodes[0]
+        .0
+        .replication
+        .primary(NodeId(1), PartitionId(1))
+        .expect("node 1 is primary")
+        .tracker()
+        .lineage()
+        .generation;
+    assert!(
+        trio.nodes[0]
+            .0
+            .primary_ladders
+            .contains(&(PartitionId(1), generation)),
+        "node 1's primary holds its ladder at generation {}",
+        generation.0
+    );
+    let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine",
+    )
+    .into_iter()
+    .filter(|line| {
+        line["@m"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("snapshot_catchup_"))
+    })
+    .map(|line| {
+        (
+            line["@m"].as_str().unwrap_or_default().to_owned(),
+            line["node"].as_u64(),
+            line["copy"].as_u64(),
+            line["rungs"].as_u64(),
+            line["reason"].as_str().map(str::to_owned),
+        )
+    })
+    .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "snapshot_catchup_served".to_owned(),
+                Some(1),
+                Some(2),
+                Some(head + 1),
+                None
+            ),
+            (
+                "snapshot_catchup_unservable".to_owned(),
+                Some(1),
+                Some(3),
+                None,
+                None
+            ),
+            (
+                "snapshot_catchup_unserved".to_owned(),
+                Some(2),
+                Some(3),
+                None,
+                Some("no_primary".to_owned())
+            ),
+        ],
+        "served once, the repeat dropped, a new ask unservable, no primary unserved"
+    );
+}
+
+/// H3 (I1, A-R254): R1's `CopyAheadOnControl` on the primary re-posts its committed root to
+/// the copy's node through [`Links::send`], so a held link holds it: nothing reaches node 3
+/// while 1-3 is held, and the heal delivers one `Landed` from node 1 at the committed
+/// generation. A partition with no committed root logs `copy_ahead_unrouted`. Neither faults
+/// the node; before H3 both faulted it `host_unsupported: kernel_effect CopyAheadOnControl`.
+/// Cuts: the arm removed, red (a fault); `Links::post` for `send`, red (node 3 hears it
+/// through the hold).
+/// Integration (~2 s): bootstrap's discovery window, then direct calls.
+#[config_log::retcd_test]
+fn h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let committed = trio.nodes[0].0.committed[&PartitionId(1)].new_generation;
+    let copy = trio.nodes[0].0.committed[&PartitionId(1)]
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .find(|member| member.node == NodeId(3))
+        .expect("node 3 is a member")
+        .copy;
+    // Node 3's mailbox is drained now, so anything in it later is the re-post.
+    while let Ok(msg) = trio.nodes[2].2.try_recv() {
+        trio.nodes[2].0.handle(msg);
+    }
+    trio.links.hold(NodeId(1), NodeId(3));
+    let ahead = KernelEffect::CopyAheadOnControl { copy };
+    for partition in [PartitionId(1), PartitionId(9)] {
+        let site = Site {
+            partition,
+            correlation: CorrelationId(u64::MAX),
+        };
+        let host = &mut trio.nodes[0].0;
+        assert_eq!(
+            host.kernel(ModuleName::Replication, &ahead, site),
+            Ok(()),
+            "partition {}",
+            partition.0
+        );
+        assert_eq!(host.fault, None, "node 1 faulted");
+    }
+    let landed = |rx: &Receiver<Msg>| {
+        let mut landed = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Msg::Landed {
+                result, emitter, ..
+            } = msg
+            {
+                landed.push((emitter, result.new_generation));
+            }
+        }
+        landed
+    };
+    assert_eq!(landed(&trio.nodes[2].2), [], "nothing passes the hold");
+    assert_eq!(trio.links.heal(NodeId(1), NodeId(3)), 1, "one message held");
+    assert_eq!(
+        landed(&trio.nodes[2].2),
+        [(NodeId(1), committed)],
+        "the heal delivers node 1's root"
+    );
+    let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold",
+    )
+    .into_iter()
+    .filter(|line| {
+        line["@m"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("copy_ahead_"))
+    })
+    .map(|line| {
+        (
+            line["@m"].as_str().unwrap_or_default().to_owned(),
+            line["partition"].as_u64(),
+            line["member"].as_u64(),
+        )
+    })
+    .collect();
+    assert_eq!(
+        lines,
+        [
+            ("copy_ahead_reposted".to_owned(), Some(1), Some(3)),
+            ("copy_ahead_unrouted".to_owned(), Some(9), None),
+        ]
+    );
+}
+
+/// Shadow probe (A-R228), host side: a `Recovered` whose pin names a shadow arms R1's
+/// `shadow_timer` on the primary, the host keeps it in its timer table, and fires it to R1,
+/// which sends the shadow the head and arms the next probe under a newer version. The host
+/// has no shadow-specific code: it arms and fires every timer by id. This row shows the
+/// generic path carries this one. Here node 3's copy is made the shadow by restating node 1's
+/// committed root with that role.
+/// Cut: the host drops a `TimerEffect::Arm` for `shadow_timer`, red (nothing is armed).
+/// Integration (~1 s): bootstrap's discovery window, then one probe period.
+#[test]
+fn a_shadow_named_by_the_pin_gets_its_probe_timer_armed_and_fired() {
+    use rdb_core::replication::primary::{shadow_timer, SHADOW_PROBE_MS};
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let mut result = (*trio.nodes[0].0.committed[&PartitionId(1)]).clone();
+    let mut shadowed = false;
+    for member in &mut result.committed.pinned_config.members {
+        if member.node == NodeId(3) {
+            member.role = ReplicaRole::Shadow;
+            shadowed = true;
+        }
+    }
+    assert!(shadowed, "node 3 is a member of the pin");
+    let id = shadow_timer(PartitionId(1));
+    assert!(
+        !trio.nodes[0].0.timers.contains_key(&id),
+        "no shadow, no probe"
+    );
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: CorrelationId::default(),
+    };
+    let host = &mut trio.nodes[0].0;
+    host.push(
+        site,
+        EventKind::Kernel(KernelEvent::Recovered(Box::new(result))),
+        true,
+        None,
+    );
+    host.drain();
+    assert_eq!(host.fault, None, "node 1 faulted");
+    let (armed, at, _) = *host.timers.get(&id).expect("the shadow probe is armed");
+    assert!(
+        at.0 <= trio.clock.now().0 + SHADOW_PROBE_MS,
+        "armed one probe period out"
+    );
+    let fired = trio.until("the probe fired and armed the next", |trio| {
+        trio.nodes[0]
+            .0
+            .timers
+            .get(&id)
+            .map(|(version, _, _)| *version)
+            .filter(|version| *version > armed)
+    });
+    assert_eq!(fired.0, armed.0 + 1, "R1 took the fire and armed the next");
 }
