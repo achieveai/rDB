@@ -1923,6 +1923,10 @@ mod tests {
         assert!(sent.is_empty(), "{} messages sent", sent.len());
     }
 
+    /// When [`old_grant`]'s record expired: long past, and not 0, so a proof that carried a
+    /// constant 0 in place of the record's expiry would not match it.
+    const OLD_EXPIRY_UTC_MS: i64 = 1_000;
+
     /// `grants/1` as a dead open's boot-1 process left it holding `grant`: long expired and not
     /// frozen, so case A's guards clear it. Returns the revision it was written at.
     fn old_grant(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, grant: GrantId) -> u64 {
@@ -1931,7 +1935,7 @@ mod tests {
             node: OWNER,
             boot: BOOT,
             authority_generation: AuthorityGeneration(0),
-            expiry_utc_ms: 0,
+            expiry_utc_ms: OLD_EXPIRY_UTC_MS,
             frozen: false,
         };
         rt.block_on(store.put(PutRequest {
@@ -1946,7 +1950,8 @@ mod tests {
 
     /// Case A (R3a, A-R175): the heal deletes a dead open's expired grant and hands node 1 an
     /// `ExpiryProven` takeover. `prior_grant_id` is the record's grant; `prior_boot_id` is
-    /// `partitions/1`'s `owner_boot`, which the F1 commit pinned, not the grant's own boot.
+    /// `partitions/1`'s `owner_boot`, which the F1 commit pinned, not the grant's own boot. The
+    /// proof's frozen expiry is the deleted record's expiry (A-R207, tester cut r6d).
     /// Unit (~10 ms): `MemStore`.
     #[test]
     fn a_reopen_over_an_expired_grant_hands_node_1_an_expiry_proven_takeover_naming_the_owner_boot()
@@ -1962,15 +1967,16 @@ mod tests {
             "{healed:?}"
         );
         let fence = fence_sent(&sent).expect("a FenceProven was sent");
-        assert!(
-            matches!(
-                fence.revocation,
-                Revocation::ExpiryProven {
-                    frozen_expiry_utc_ms: 0,
-                    ..
-                }
-            ),
-            "{fence:?}"
+        let Revocation::ExpiryProven {
+            frozen_expiry_utc_ms,
+            ..
+        } = fence.revocation
+        else {
+            panic!("expected ExpiryProven: {fence:?}");
+        };
+        assert_eq!(
+            frozen_expiry_utc_ms, OLD_EXPIRY_UTC_MS,
+            "the deleted record's expiry: {fence:?}"
         );
         assert_eq!(fence.prior_grant_id, GrantId(4));
         assert_eq!(
@@ -2004,6 +2010,99 @@ mod tests {
             "nothing deleted"
         );
         assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// Case A over a `grants/1` that does not decode (A-R207, tester cut r10a, heal side): the
+    /// record is there but unreadable, which is not "no grant held". The heal refuses it naming
+    /// the record, `grants/1` stays, and node 1 is sent no `Plan` or anything else.
+    /// Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_heal_over_a_grant_record_that_does_not_decode_is_refused_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        put_at(
+            &*store,
+            &rt,
+            ControlKey::Grant(OWNER),
+            Bytes::from_static(b"not a grant record"),
+        );
+        let written = grant_revision(&*store, &rt).expect("grants/1 written");
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        match &healed {
+            Err(HealError::Control(detail)) => {
+                assert!(detail.contains("is not a grant record"), "{detail}");
+            }
+            other => panic!("expected a refusal naming the unreadable grant: {other:?}"),
+        }
+        assert_eq!(
+            grant_revision(&*store, &rt),
+            Some(written),
+            "nothing deleted"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// A `partitions/` family holding one record this build cannot decode is not a complete
+    /// list, since that record could be a partition in transfer (A-R207, tester cut r10c). With
+    /// an undecodable `partitions/2` beside an expired `grants/1`, `clear_grant` answers
+    /// unreadable (`NotWired`, nothing deleted) and the heal refuses and sends nothing; in both,
+    /// `grants/1` stays at its revision. Unit (~20 ms): `MemStore`.
+    #[test]
+    fn an_undecodable_partitions_record_makes_clear_and_heal_delete_nothing() {
+        let rt = runtime();
+        let damaged = || Bytes::from_static(b"not a partition record");
+
+        let store = config_testkit::MemStore::new();
+        let (db, _mailbox, written) = restarted_owner(&store, &rt);
+        put_at(
+            &store,
+            &rt,
+            ControlKey::Partition(PartitionId(2)),
+            damaged(),
+        );
+        let refused = rt
+            .block_on(clear_grant(&db, &store, OWNER))
+            .expect_err("an unreadable partitions/2 is refused");
+        assert_eq!(
+            (refused.kind, refused.retry, refused.no_mutation),
+            (ErrorKind::Unavailable, RetryRule::NotWired, true),
+            "{refused:?}"
+        );
+        assert!(
+            refused.detail.contains("partitions/2")
+                && refused.detail.contains("is not a partition record")
+                && refused.detail.ends_with("nothing deleted"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            grant_revision(&store, &rt),
+            Some(written),
+            "clear: grants/1"
+        );
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let written = old_grant(&*store, &rt, GrantId(4));
+        put_at(
+            &*store,
+            &rt,
+            ControlKey::Partition(PartitionId(2)),
+            damaged(),
+        );
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        match &healed {
+            Err(HealError::Control(detail)) => {
+                assert!(detail.contains("is not a partition record"), "{detail}");
+            }
+            other => panic!("expected a refusal naming the unreadable partition: {other:?}"),
+        }
+        assert_eq!(
+            grant_revision(&*store, &rt),
+            Some(written),
+            "heal: grants/1"
+        );
+        assert!(sent.is_empty(), "heal: {} messages sent", sent.len());
     }
 
     /// A control store whose `partitions/1` reads answer from the snapshot [`Self::freeze`]
