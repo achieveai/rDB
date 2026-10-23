@@ -14,6 +14,7 @@ use crate::contracts::time::Tick;
 use crate::contracts::txn::{key_scope, Condition, TxnRequest};
 use crate::contracts::version::{check_mandatory, VersionedArtifact};
 use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
+use crate::transaction::dedup::check_floor;
 use crate::transaction::{encoded_len, Admitted, FreezeCause, TxnKernel, TxnRejection};
 
 /// Check 9: how many admitted requests may wait behind the one in flight, unless
@@ -261,6 +262,13 @@ fn malformed(req: &TxnRequest) -> Option<&'static str> {
     }
     if req.conditions.len() > MAX_CONDITIONS {
         return Some("conditions");
+    }
+    // The ack floor's scope (A-R252 A2): the floor record's reserved id, a floor on an
+    // app-chosen id, above the request's own id or in another open, and more than `MAX_PINS`
+    // pins or a pin outside `[open base, floor)`. Before dedup (11), so a resend that breaks it
+    // is refused as a first send is, and nothing is trimmed.
+    if let Err(refusal) = check_floor(req.identity.request, req.acked_below, &req.pinned) {
+        return Some(refusal.field());
     }
     None
 }

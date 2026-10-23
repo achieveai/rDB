@@ -359,6 +359,11 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
 - **A restarted node stays out until the folder is opened again.** See section 5.
+- **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
+  `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
+  It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
+  can promote too. **A dropped node rejoins as a secondary at the next reopen heal; membership
+  is fixed at three nodes.**
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry
