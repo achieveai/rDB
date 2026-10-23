@@ -154,6 +154,7 @@ fn candidate_of(partition: PartitionId, seq: u64, request: u64) -> AppliedCandid
             Verdict::Admit,
             1,
         ),
+        ack_floor: None,
     }
 }
 

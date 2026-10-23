@@ -13,7 +13,7 @@ use crate::contracts::digest::Digest;
 use crate::contracts::errors::ErrorKind;
 use crate::contracts::ids::{ConfigVersion, Generation, RequestIdentity, Seq, SnapshotHandle};
 use crate::contracts::time::Tick;
-use crate::contracts::txn::TxnResult;
+use crate::contracts::txn::{TxnResult, MAX_PINS};
 
 /// T1's applied transaction, handed to P1 (team kernel-a `design.md` §1.3).
 ///
@@ -41,6 +41,31 @@ pub struct AppliedCandidate {
     pub pending_result: TxnResult,
     /// The authority decision T1 applied it under.
     pub authority: AuthorityDecision,
+    /// The client ack floor, set only on the candidate whose envelope carries the floor record
+    /// (ruling A-R255; design-ackfloor rev 3, A3); `None` on every other. P1 acts on it only
+    /// when it publishes this candidate, so it never forgets ahead of the record that makes the
+    /// floor durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_floor: Option<AckFloor>,
+}
+
+/// One client's ack floor, as the forget set P1 must match (ruling A-R255, design-ackfloor
+/// rev 3). P1 forgets the status of the sender's ids in `[open base, below)` except
+/// [`Self::pinned`], where the open base is [`Self::below`] with its low 40 bits (the
+/// counter) cleared: the same set T1 deletes from dedup. The scope is the candidate's own: the
+/// generation of [`AppliedCandidate::lineage`] and the tenant and client of
+/// [`AppliedCandidate::request`]. No affinity: one floor spans every group. Forgetting is
+/// monotone and idempotent, so a `below` at or under one already applied is a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AckFloor {
+    /// The request's [`crate::contracts::txn::TxnRequest::acked_below`], as sent and accepted
+    /// by admission. Not raised to a floor already held and not lowered to a pin: T1's dedup
+    /// record stores the effective floor (the lowest pin, if lower), but its deletes run up to
+    /// this value, and P1 must forget the same ids.
+    pub below: u64,
+    /// The request's [`crate::contracts::txn::TxnRequest::pinned`]: ids below [`Self::below`]
+    /// whose statuses stay. Unused slots are `None`; a pinned id appears once.
+    pub pinned: [Option<u64>; MAX_PINS],
 }
 
 /// Why a partition's data path is frozen. Shared by T1 and P1 (team kernel-a `design.md` §3.1,
