@@ -854,6 +854,32 @@ impl Recovery {
         if let Err(evidence) = decided.check_cutoff(proof.copy, Seq(proof.seq.0), proof.digest) {
             return quarantine(evidence, emit);
         }
+        // A proof counts only from the boot the plan names for its copy (rulings A-R239,
+        // A-R239a). A copy that restarted lost what it had not synced, so its new boot's proof
+        // cannot stand for the boot a commit would name. Waiting cannot fix that: the barrier
+        // ends at once, never retried. The boot is stamped by the host from the answering link,
+        // not claimed by the copy, and only ever refuses a proof here.
+        let named = decided
+            .plan
+            .config
+            .member(proof.copy)
+            .map(|member| member.boot);
+        if named != Some(proof.boot) {
+            tracing::warn!(
+                partition = emit.event().partition.0,
+                copy = proof.copy.0,
+                named_boot = named.map(|boot| boot.0),
+                proof_boot = proof.boot.0,
+                attempt = decided.attempt,
+                "barrier_boot_changed"
+            );
+            return block(
+                BlockReason::BarrierIncomplete {
+                    missing: vec![proof.copy],
+                },
+                emit,
+            );
+        }
         // A proof that does not bind to the cutoff proves nothing, so it never displaces one that
         // does: a late answer to an earlier run's sync is one (ruling B-R74).
         if !binds(&decided, proof) {

@@ -7419,3 +7419,47 @@ fn m10_s2_m2_a_two_copy_promote_never_activates() {
     never_activated(&f1);
     assert_eq!(f1.phase(), RecoveryPhase::Committed);
 }
+
+// ---------------------------------------------------------------------------------------------
+// M10 S2 W9: a proof counts only from the boot the plan names (rulings A-R239, A-R239a).
+// ---------------------------------------------------------------------------------------------
+
+/// A and C prove the cutoff. B restarted after the plan was read and answers its sync from boot
+/// 2, while the plan names boot 1. What boot 1 had not synced is gone, so the proof cannot stand
+/// for the copy a commit would name, though it is the last one the barrier needs. The barrier
+/// ends at once, on its first attempt, naming B: not proposed, not retried, the boot change
+/// logged. The first deadline finds it blocked.
+#[retcd_test]
+fn m10_s2_boot_a_proof_from_a_restarted_copy_blocks_at_once_named() {
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.rec(3_001, durable(C, 20, dg(0, 20)));
+    let restarted = DurableProof {
+        boot: BootId(2),
+        ..proven(B, 20, dg(0, 20))
+    };
+    assert_eq!(
+        f1.rec(3_002, RecoveryEvent::DurableAt(restarted)),
+        vec![block(incomplete(vec![B]))],
+        "the first attempt ends at once, proposing nothing"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(incomplete(vec![B])));
+    assert_eq!(f1.cas_count(), 0, "nothing names the dead boot");
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![ign(ReplicaIgnoreReason::RecoveryBlocked)],
+        "no attempt 2"
+    );
+    assert_eq!(f1.cas_count(), 0);
+
+    let method = "m10_s2_boot_a_proof_from_a_restarted_copy_blocks_at_once_named";
+    assert_eq!(barrier_retries(method), vec![], "never retried");
+    let changed: Vec<(u64, u64, u64)> = own_log_lines(method, "barrier_boot_changed")
+        .iter()
+        .map(|line| {
+            let field = |name: &str| line[name].as_u64().expect("a number");
+            (field("copy"), field("named_boot"), field("proof_boot"))
+        })
+        .collect();
+    assert_eq!(changed, vec![(2, 1, 2)]);
+}
