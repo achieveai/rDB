@@ -438,11 +438,12 @@ fn m9_d3_00_a_copy_back_after_a_degraded_empty_start_keeps_seq_one_and_publishes
     assert!(healthy, "L1 is healthy again after the re-emit");
 }
 
-/// The optional D3 row, in a **non-default configuration**: the resume hold is lowered to 1 s and
-/// the activation CAS is held 1.8 s (its deadline is the 2 s discovery window). L1 then resumes
-/// in `DegradedRf2` and two client writes publish at seq 2 and 3 before the `Active` re-emit,
-/// so the re-emit meets a published tail and owed replies, not only the start record. B, C and
-/// A hold seq 1, so the cutoff is 1 and there is no start record.
+/// The optional D3 row, in a **non-default configuration**: the activation CAS is held 1.8 s (its
+/// deadline is the 2 s discovery window). L1 then resumes (its first resume skips the hold,
+/// A-R165) in `DegradedRf2` and two client writes publish at seq 2 and 3 before the `Active`
+/// re-emit, so the re-emit meets a published tail and owed replies, not only the start record.
+/// B, C and A hold seq 1, so the cutoff is 1 and there is no start record. The re-emit no longer
+/// pauses writes (A-R197), so the 1 s resume hold this row once set is gone.
 const D3_HOLD_WRITES: [u64; 5] = [5_300, 5_500, 9_000, 11_000, 14_000];
 const D3_HOLD_MAX_TICKS: u64 = 16_000;
 
@@ -496,10 +497,6 @@ fn d3_hold() -> RunPlan {
         taken: None,
     });
     plan.steps.sort_by_key(|step| step.at);
-    plan.overrides.push(BudgetOverride {
-        name: BudgetName::ResumeHold,
-        millis: 1_000,
-    });
     plan.seed.extend(
         D3_HOLD_WRITES
             .iter()
@@ -524,6 +521,25 @@ fn m9_d3_09_non_default_hold_writes_published_before_the_re_emit_are_kept() {
         .find(|(_, mode, _)| *mode == PartitionMode::Active)
         .map(|(at, ..)| *at)
         .expect("the result is re-emitted active once A is back");
+    // A-R197 (D12): the re-emit restates the tracker, so L1 keeps admitting across it. Before,
+    // it paused writes again, and this row needed a 1 s resume hold to publish the later ones.
+    let refused_after: Vec<u64> = trace
+        .events
+        .iter()
+        .filter(|event| event.node == B_NODE && event.logical_tick >= active)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::SetAdmission { state },
+                ..
+            } if !state.allow => Some(event.logical_tick),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        refused_after.is_empty(),
+        "no SetAdmission{{allow:false}} on the primary after the re-emit at t{active}: \
+         {refused_after:?}"
+    );
     let generation = Generation(2);
     let published_before: Vec<Seq> = trace
         .events
