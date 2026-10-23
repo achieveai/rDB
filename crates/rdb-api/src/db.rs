@@ -101,7 +101,7 @@ pub const MAX_KEY: usize = 1_024;
 /// can still be large.
 pub const MAX_PAGE: usize = 1_000;
 
-mod error;
+pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
 pub use error::ApiError;
@@ -519,11 +519,12 @@ pub enum ReadyError {
     #[error("the reopen's heal failed: {0}")]
     Heal(admin::HealError),
     /// Node 1 did not admit writes in time.
-    #[error("node 1 did not admit writes within {within_ms} ms; recovery phase {phase}")]
+    #[error("{}", timed_out_text(*.within_ms, .phase))]
     TimedOut {
         /// The bound asked for.
         within_ms: u128,
-        /// Node 1's last recovery phase, in words.
+        /// Node 1's last recovery phase, in words: `unknown` when node 1 answered no status
+        /// look in the time, `none` when it runs no recovery.
         phase: String,
     },
     /// Node 1 restarted, or its restart failed: it does not rejoin in this open (#42), so it
@@ -845,7 +846,7 @@ impl Db {
                     return Err(OpenError::Config(format!(
                         "{} holds no copy of node {}: form the database first (lr up), then \
                          start node {} again",
-                        dir.display(),
+                        one_separator(&dir).display(),
                         node.0,
                         node.0
                     )));
@@ -1009,9 +1010,8 @@ impl Db {
             engines.values().filter_map(RocksEngine::instance).collect();
         if bound.len() > 1 {
             let named: Vec<String> = bound.iter().map(admin::instance_hex).collect();
-            return Err(OpenError::Mismatch(format!(
-                "the copies name different instances: {}",
-                named.join(", ")
+            return Err(OpenError::Mismatch(error::copies_disagree_text(
+                &named.join(", "),
             )));
         }
         let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
@@ -1104,23 +1104,23 @@ impl Db {
                 )))
             }
             (true, None) => {
-                return Err(OpenError::Mismatch(
-                    "the copies hold data, but the store has no partitions/1".to_owned(),
-                ))
+                return Err(OpenError::Mismatch(error::not_this_store_text(
+                    "the copies hold data, but the store has no partitions/1",
+                )))
             }
             (true, Some((_, None))) => {
-                return Err(OpenError::Mismatch(
-                    "the copies hold data, but partitions/1 names no instance".to_owned(),
-                ))
+                return Err(OpenError::Mismatch(error::not_this_store_text(
+                    "the copies hold data, but partitions/1 names no instance",
+                )))
             }
             (_, Some((record, Some(root)))) => (record, root),
         };
         if root.instance != instance {
-            return Err(OpenError::Mismatch(format!(
+            return Err(OpenError::Mismatch(error::not_this_store_text(&format!(
                 "the copies name instance {}, partitions/1 names {}",
                 admin::instance_hex(&instance),
                 admin::instance_hex(&root.instance)
-            )));
+            ))));
         }
         let holds = engines
             .values()
@@ -1240,7 +1240,7 @@ impl Db {
     /// recovery is quarantined, whose text says a reopen will not help (A-R196(2a), A-R196(2b)).
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
-        let mut phase = String::from("unknown");
+        let mut phase = String::from(NO_ANSWER);
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                 return Err(ReadyError::Heal(error.clone()));
@@ -1264,7 +1264,7 @@ impl Db {
                     }
                     None => {}
                 }
-                phase = owner.recovery.unwrap_or_else(|| "none".to_owned());
+                phase = owner.recovery.unwrap_or_else(|| NO_RECOVERY.to_owned());
             }
             if std::time::Instant::now() >= deadline {
                 return Err(ReadyError::TimedOut {
@@ -2498,10 +2498,17 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
             partition,
             grant: GrantId(0),
         },
-        ErrorKind::UnknownOutcome => RdbError::UnknownOutcome {
-            partition,
-            identity,
-        },
+        // A read writes nothing and has no request to ask `status` about, so the kernel's
+        // QueryStatus does not fit it: the step is to read again (ruling A-R230(1)).
+        ErrorKind::UnknownOutcome => {
+            return ApiError {
+                kind,
+                retry: RetryRule::BoundedJitter,
+                no_mutation: true,
+                detail: "the read was refused".to_owned(),
+                retry_after: None,
+            }
+        }
         ErrorKind::GenerationChanged => RdbError::GenerationChanged {
             expected: Generation(0),
             current: Generation(0),
@@ -2697,6 +2704,22 @@ fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
     )
 }
 
+/// [`ReadyError::TimedOut`]'s phase when node 1 answered no status look in the time.
+const NO_ANSWER: &str = "unknown";
+/// [`ReadyError::TimedOut`]'s phase when node 1 runs no recovery.
+const NO_RECOVERY: &str = "none";
+
+/// [`ReadyError::TimedOut`]'s text (A-R230 Q3, #59): it never says "unknown", which read as a
+/// fault while node 1 was busy syncing, and it ends with the step.
+fn timed_out_text(within_ms: u128, phase: &str) -> String {
+    let seen = match phase {
+        NO_ANSWER => error::ReadySeen::NoAnswer,
+        NO_RECOVERY => error::ReadySeen::NoRecovery,
+        phase => error::ReadySeen::Phase(phase),
+    };
+    error::ready_timed_out_text(within_ms, seen)
+}
+
 /// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
 const RETCD_STEP: &str = ". Check that rEtcd is running and reachable from this process, and \
                           that a majority of its nodes is up, then open again";
@@ -2709,10 +2732,12 @@ const RETCD_STEP: &str = ". Check that rEtcd is running and reachable from this 
 /// `Unreadable` stay `Counter`; a roll-forward's `Moved` is its caller's.
 fn counter_refused(instance: &[u8; INSTANCE_LEN], error: admin::CounterError) -> OpenError {
     match error {
-        admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
-            "the copies name instance {}, but {key} is absent",
-            admin::instance_hex(instance)
-        )),
+        admin::CounterError::Absent { key } => {
+            OpenError::Mismatch(error::not_this_store_text(&format!(
+                "the copies name instance {}, but {key} is absent",
+                admin::instance_hex(instance)
+            )))
+        }
         admin::CounterError::Control(detail) => {
             OpenError::Control(format!("open counter: {detail}{RETCD_STEP}"))
         }
@@ -2748,6 +2773,12 @@ fn local_nodes(local: &[NodeId]) -> Result<bool, OpenError> {
     Ok(named.len() < ALL_NODES.len())
 }
 
+/// `path` written with one separator: a folder given with `/` and joined with `nodes` and a node
+/// number reads in a refusal as one path, not in two styles (A-R230).
+fn one_separator(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 /// Open the copies of `local` under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
 /// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
 /// missing copy is created only while no copy holds data. On error, says whether node 1's
@@ -2757,8 +2788,8 @@ fn open_engines(
     local: &[NodeId],
 ) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
-        rdb_storage::OpenError::Locked { .. } => OpenError::InUse(dir.to_path_buf()),
-        rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(dir.to_path_buf()),
+        rdb_storage::OpenError::Locked { .. } => OpenError::InUse(one_separator(dir)),
+        rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(one_separator(dir)),
         other => OpenError::Node(format!("open {}: {other}", dir.display())),
     };
     let mut engines = BTreeMap::new();
@@ -2782,7 +2813,7 @@ fn open_engines(
     if let Some((_, dir)) = missing.first() {
         if engines.values().any(|engine| !engine.lineages().is_empty()) {
             let held = engines.contains_key(&OWNER);
-            return Err((OpenError::CopyMissing(dir.clone()), held));
+            return Err((OpenError::CopyMissing(one_separator(dir)), held));
         }
     }
     for (node, dir) in missing {
@@ -3814,11 +3845,20 @@ mod tests {
             .partition(Result::is_ok);
         assert_eq!((won.len(), lost.len()), (1, 1), "{won:?} {lost:?}");
         match lost.pop() {
-            Some(Err(OpenError::InUse(path))) => assert!(
-                path.starts_with(dir.path().join("nodes")),
-                "{}",
-                path.display()
-            ),
+            Some(Err(error @ OpenError::InUse(_))) => {
+                let OpenError::InUse(path) = &error else {
+                    unreachable!()
+                };
+                assert!(
+                    path.starts_with(dir.path().join("nodes")),
+                    "{}",
+                    path.display()
+                );
+                // One separator style in the text (A-R230): a data root given with `/`
+                // joined with `nodes\N` read as two.
+                let text = error.to_string();
+                assert!(!(text.contains('/') && text.contains('\\')), "{text}");
+            }
             other => panic!("the loser is refused at the claim, not: {other:?}"),
         }
         let mut db = won.pop().expect("one winner").expect("the winner's Db");
@@ -5505,6 +5545,73 @@ mod tests {
         );
     }
 
+    /// #59 (tester-s2), A-R230 Q3: `wait_ready`'s time-out never says "unknown", which read as
+    /// a fault while node 1 was busy syncing, and ends with the step. Node 1 first answers no
+    /// look in the time, then answers with no recovery. The `phase` field keeps its words, which
+    /// `rdb_dev` prints. Cut: `TimedOut` keeps the old text, "recovery phase unknown".
+    /// Unit (~200 ms): no node thread.
+    #[test]
+    fn m10_s2_a_wait_that_times_out_says_what_node_1_answered_and_what_to_do_next() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(50);
+        let step = "; next: call `wait_ready` again with a longer bound, or shut this Db down \
+                    and open the folder again, once; if that times out too, stop and report it \
+                    with this message";
+
+        let silent = db.wait_ready(Duration::from_millis(60));
+        let Err(error @ ReadyError::TimedOut { .. }) = &silent else {
+            panic!("no answer is a time-out: {silent:?}");
+        };
+        assert!(
+            matches!(error, ReadyError::TimedOut { phase, .. } if phase == "unknown"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "node 1 did not admit writes within 60 ms; node 1 answered no status look in \
+                 that time (it may be busy, for example syncing its copies){step}"
+            )
+        );
+
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: None,
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        let node_1 = std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                if let Msg::Inspect { reply, .. } = msg {
+                    let _ = reply.send(status.clone());
+                }
+            }
+        });
+        let idle = db.wait_ready(Duration::from_millis(60));
+        assert_eq!(
+            idle.map_err(|error| error.to_string()),
+            Err(format!(
+                "node 1 did not admit writes within 60 ms; node 1 runs no recovery{step}"
+            ))
+        );
+        drop(db);
+        node_1.join().expect("the stub");
+    }
+
     /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
     /// `UNAVAILABLE` keep their kind, retry rule and proof, and their detail adds the state and
     /// the one step that helps: the reopen step for `Blocked`, the A-R196(2b) text for
@@ -6420,14 +6527,13 @@ mod tests {
                 for node in db.node_status() {
                     assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
                 }
-                let owner = db.node_status().into_iter().next().expect("node 1");
-                if done(&owner) {
-                    return owner;
+                match owner_of(db, db.node_status()) {
+                    Some(owner) if done(&owner) => return owner,
+                    owner => assert!(
+                        std::time::Instant::now() < deadline,
+                        "{what}: not settled within {patience:?}: {owner:?}"
+                    ),
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{what}: not settled within {patience:?}: {owner:?}"
-                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
@@ -6501,6 +6607,110 @@ mod tests {
         .expect("open")
     }
 
+    /// Node 1's status from `nodes`, or `None` when it is not among them. `node_status` leaves
+    /// out a node that does not answer within `Timeouts::read`, and on int gate k429 no thread
+    /// of a starved host ran for 4.8-7.7 s, so a missing node 1 is "not yet", for the caller's
+    /// patience to judge (A-R237). Never another node's status in node 1's place. A failed
+    /// restart is different: no process runs node 1, so it fails the row at once (F-013).
+    fn owner_of(db: &Db, nodes: Vec<NodeStatus>) -> Option<NodeStatus> {
+        assert!(
+            !db.restart_failed(OWNER),
+            "node 1's restart failed: {:?}",
+            db.restart_note()
+        );
+        nodes.into_iter().find(|status| status.node == OWNER)
+    }
+
+    /// Node 1's status once `done` holds for it, polled within `patience`; see [`owner_of`].
+    fn owner_when(
+        db: &Db,
+        what: &str,
+        patience: Duration,
+        done: &dyn Fn(&NodeStatus) -> bool,
+    ) -> NodeStatus {
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            match owner_of(db, db.node_status()) {
+                Some(owner) if done(&owner) => return owner,
+                owner => assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: not within {patience:?}: {owner:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A-R237 (int gate k429): node 1 missing from `node_status` because it did not answer
+    /// within `Timeouts::read` is "not yet" to the D7 waits, never a panic and never another
+    /// node's status. Node 1 here is a stub that sits on its first look past the read timeout,
+    /// as a host no thread ran for did, then answers every look. Cut: `owner_of` as
+    /// `next().expect("node 1")` — the first look finds no node and the row panics.
+    #[test]
+    fn m10_d7_node_1_missing_from_node_status_is_not_yet() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(50);
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: None,
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(true),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        let looks = Arc::new(AtomicU64::new(0));
+        let node_1 = {
+            let looks = Arc::clone(&looks);
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        if looks.fetch_add(1, Ordering::Relaxed) == 0 {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        let _ = reply.send(status.clone());
+                    }
+                }
+            })
+        };
+        let owner = owner_when(
+            &db,
+            "node 1 after its stall",
+            Duration::from_secs(10),
+            &|_| true,
+        );
+        assert_eq!(owner.node, OWNER, "node 1's status, not another node's");
+        assert!(
+            looks.load(Ordering::Relaxed) >= 2,
+            "the first look was missed and a later one answered"
+        );
+        drop(db);
+        node_1.join().expect("node 1 stub");
+    }
+
+    /// A-R237: a failed restart of node 1 still fails a D7 wait at once (F-013), since no process
+    /// runs it. Cut: no restart check in `owner_of` — the wait runs out its patience and fails
+    /// with "not within" instead.
+    #[test]
+    #[should_panic(expected = "node 1's restart failed")]
+    fn m10_d7_a_failed_restart_of_node_1_fails_the_wait_at_once() {
+        let (mut db, _mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(1);
+        lock(&db.nodes)[0].start_failed = true;
+        owner_when(&db, "node 1", Duration::from_millis(500), &|_| true);
+    }
+
     /// The first two opens of the D7 shape: a=1 lands on every copy, then a reopen with node
     /// 2's links held commits generation 2 on nodes 1 and 3 alone and holds a grant, so the
     /// next open heals case A. Node 2 lands generation 2 from the control watch and links it at
@@ -6523,18 +6733,12 @@ mod tests {
             vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))],
         );
         let patience = crate::host::test_patience(Duration::from_secs(30));
-        let deadline = std::time::Instant::now() + patience;
-        loop {
-            let owner = db.node_status().into_iter().next().expect("node 1");
-            if owner.recovered == Some(Generation(2)) && owner.authority.starts_with("held(") {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "generation 2 never committed and held: {owner:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        owner_when(
+            &db,
+            "generation 2 never committed and held",
+            patience,
+            &|owner| owner.recovered == Some(Generation(2)) && owner.authority.starts_with("held("),
+        );
         db.shutdown();
     }
 
@@ -6557,11 +6761,12 @@ mod tests {
             for node in &nodes {
                 assert_eq!(node.fault, None, "{case}: node {} faulted", node.node.0);
             }
-            let owner = nodes.first().expect("node 1");
-            if owner.recovery.as_deref() == Some("Committed")
-                && owner.recovered == Some(Generation(3))
-                && owner.admits == Some(true)
-            {
+            let owner = owner_of(db, nodes);
+            if let Some(owner) = owner.as_ref().filter(|owner| {
+                owner.recovery.as_deref() == Some("Committed")
+                    && owner.recovered == Some(Generation(3))
+                    && owner.admits == Some(true)
+            }) {
                 assert_eq!(owner.stalled, None, "{case}: {owner:?}");
                 break;
             }
@@ -6819,18 +7024,7 @@ mod tests {
         d7_node_2_behind(&rt, dir.path(), &store);
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let until = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| {
-            let deadline = std::time::Instant::now() + patience;
-            loop {
-                let owner = db.node_status().into_iter().next().expect("node 1");
-                if done(&owner) {
-                    return owner;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{what}: not within {patience:?}: {owner:?}"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            owner_when(db, what, patience, done)
         };
 
         let mut db = open_held(&rt, dir.path(), &store, vec![(NodeId(1), NodeId(2))]);
@@ -8420,5 +8614,18 @@ mod tests {
             format!("{}\n", restarted.0)
         );
         db.shutdown();
+    }
+
+    /// Ruling A-R230(1): a read refused `UNKNOWN_OUTCOME` wrote nothing and has no request to
+    /// ask `status` about, so its rule is to read again (`BoundedJitter`, no mutation), never
+    /// the put's `QueryStatus`. Unit.
+    #[test]
+    fn m10_s2_a_read_refused_unknown_outcome_says_read_again_not_query_status() {
+        let refused = refused_read(ErrorKind::UnknownOutcome);
+        assert_eq!(
+            (refused.kind, refused.retry, refused.no_mutation),
+            (ErrorKind::UnknownOutcome, RetryRule::BoundedJitter, true),
+            "{refused:?}"
+        );
     }
 }

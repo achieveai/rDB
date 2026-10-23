@@ -32,11 +32,19 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// L1's waits cut short, as `tests::fast` does, so a fresh open is ready quickly.
+///
+/// Window kind: claims what is reported (A-R244, the A-R237 rule). Every row here claims an
+/// outcome (what an open refuses, keeps or reads back), never how long F1's discovery window
+/// is, so the window is the spec's 2 s times `deadline_scale()`. Unscaled, one 3.2 s mail step
+/// on node 2 under gate load closed it and a reopen went `Blocked` (k435). The product default
+/// stays the spec's.
 fn fast() -> Budgets {
     Budgets {
         resume_hold_millis: 50,
         warn_age_millis: 200,
         pause_age_millis: 400,
+        discovery_window_millis: Budgets::SPEC_DEFAULTS.discovery_window_millis
+            * u64::from(config_testkit::poll::deadline_scale()),
         ..Budgets::SPEC_DEFAULTS
     }
 }
@@ -102,6 +110,10 @@ fn m10_a_reopen_missing_a_copy_says_to_restore_it_and_logs_the_refusal() {
             "cannot be opened. Restore that copy from a backup of this directory, then open it again"
         ),
         "the text names the next step: {text}"
+    );
+    assert!(
+        !(text.contains('/') && text.contains('\\')),
+        "one separator style (A-R230): {text}"
     );
     assert_eq!(
         refusals(METHOD),
@@ -436,7 +448,7 @@ fn m10_a_reopen_whose_recovery_cas_answers_unknown_settles_by_read_then_cas() {
 /// S1-5 (#45), the store keeps answering "unknown": F1 cannot settle, and says so. `wait_ready`
 /// times out naming `ProposalUnresolved`, never a block. Once the store answers again, the next
 /// read-then-CAS lands and a retried `wait_ready` succeeds, with nothing reopened.
-/// Integration (~6 s): one fresh open, a reopen held ~2 s, then one discovery window.
+/// Integration (~6 s at scale 1): one fresh open, a reopen held ~2 s, then one discovery window.
 #[config_log::retcd_test]
 fn m10_a_reopen_whose_store_keeps_answering_unknown_is_ready_once_it_answers() {
     let rt = runtime();
@@ -474,7 +486,10 @@ fn m10_a_reopen_whose_store_keeps_answering_unknown_is_ready_once_it_answers() {
         "F1 is resolving, not blocked"
     );
     let puts = faulty.partition_puts();
-    match db.wait_ready(Duration::from_secs(3)) {
+    // F1 retries once per discovery window, so the wait outlasts one window by 1 s (A-R244:
+    // `fast()` scales the window, and a fixed 3 s saw no retry at scale 3).
+    let one_window = Duration::from_millis(fast().discovery_window_millis);
+    match db.wait_ready(one_window + Duration::from_secs(1)) {
         Err(ReadyError::TimedOut { phase, .. }) => {
             assert_eq!(phase, "ProposalUnresolved", "F1 is still resolving");
         }
@@ -837,7 +852,8 @@ fn m10_cut_copies_naming_two_instances_are_refused_and_left_as_they_were() {
         refused.to_string(),
         format!(
             "this directory and the control store do not belong together: the copies name \
-             different instances: {}",
+             different instances: {}; next: the copies come from different folders, so restore \
+             this folder's copies from one backup, then open it again",
             named.join(", ")
         )
     );
@@ -878,7 +894,8 @@ fn m10_cut_a_reopen_whose_open_counter_is_gone_is_a_mismatch_and_counts_nothing(
         refused.to_string(),
         format!(
             "this directory and the control store do not belong together: the copies name \
-             instance {}, but {key} is absent",
+             instance {}, but {key} is absent; next: point `Db::open` at the rEtcd this folder \
+             was made with; for a new database, start a separate rEtcd",
             admin::instance_hex(&instance)
         )
     );
@@ -1105,7 +1122,10 @@ fn m10_cut_the_open_after_max_opens_is_refused_and_counts_nothing() {
     );
     assert_eq!(
         refused.expect_err("refused").to_string(),
-        format!("{key} has counted 8388608 opens, the most one directory may have")
+        format!(
+            "{key} has counted 8388608 opens, the most one directory may have; next: start a \
+             new folder"
+        )
     );
     let after = read();
     assert_eq!(
@@ -2068,6 +2088,71 @@ fn m10_s2_an_undecodable_partition_record_is_refused_by_its_key_and_changes_noth
     );
 }
 
+/// #59 (tester-s2), A-R230 Q3: a folder opened against a store that does not hold its records
+/// is refused with what was found and the step: point the open at the rEtcd it was made with.
+/// Folder A against an empty store finds no `partitions/1`; against folder B's store it finds
+/// B's instance. Both leave every store as it was. Cut: `check` keeps the old texts, which end
+/// at what was found. Integration (~3 s): two fresh opens until ready, two refused opens.
+#[test]
+fn m10_s2_a_folder_opened_against_another_store_says_to_open_it_against_its_own() {
+    let rt = runtime();
+    let ours: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let theirs: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let empty: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let a = config_testkit::fs::temp_dir();
+    let b = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, a.path(), &ours);
+    written_and_closed(&rt, b.path(), &theirs);
+    let instance_a = marker(a.path(), 1).expect("folder A names its instance");
+    let instance_b = marker(b.path(), 1).expect("folder B names its instance");
+    let step = "; next: point `Db::open` at the rEtcd this folder was made with; for a new \
+                database, start a separate rEtcd";
+    let prefix = "this directory and the control store do not belong together: ";
+
+    for (store, found) in [
+        (
+            &empty,
+            "the copies hold data, but the store has no partitions/1".to_owned(),
+        ),
+        (
+            &theirs,
+            format!(
+                "the copies name instance {}, partitions/1 names {}",
+                admin::instance_hex(&instance_a),
+                admin::instance_hex(&instance_b)
+            ),
+        ),
+    ] {
+        let revision = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("read partitions/1")
+            .read_revision;
+        match open(&rt, a.path(), store) {
+            Err(error @ OpenError::Mismatch(_)) => {
+                assert_eq!(error.to_string(), format!("{prefix}{found}{step}"));
+            }
+            other => panic!("Mismatch, not {:?}", other.map(|_| "Db")),
+        }
+        let after = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("read partitions/1 again")
+            .read_revision;
+        assert_eq!(
+            after, revision,
+            "the refused open wrote nothing to the store: {found}"
+        );
+    }
+    assert_eq!(
+        marker(a.path(), 1),
+        Some(instance_a),
+        "folder A is as it was"
+    );
+}
+
 /// A-R231(a): a node process started on a folder no formation wrote is refused before it
 /// creates anything, and says to form the database first. Unit (~20 ms): nothing opens.
 #[config_log::retcd_test]
@@ -2088,6 +2173,10 @@ fn m10_s2_a_node_process_on_an_unformed_folder_says_to_form_it_first() {
             "holds no copy of node 2: form the database first (lr up), then start node 2 again"
         ),
         "{text}"
+    );
+    assert!(
+        !(text.contains('/') && text.contains('\\')),
+        "one separator style (A-R230): {text}"
     );
     assert!(
         !dir.path().join("nodes").join("2").exists(),
@@ -2178,4 +2267,77 @@ fn m10_s2_a_repeated_or_unknown_local_node_and_an_app_open_without_links_are_ref
         other => panic!("no links is Config, not {:?}", other.map(|_| "Db")),
     }
     assert!(!dir.path().join("nodes").exists(), "nothing was created");
+}
+
+/// arch-s2 B1 case 1, A-R231(a), A-R232: after formation, three node processes, here three
+/// `Db`s on one `Links`, each open only their own copy. Node 1's process is the owner and
+/// heals; its heal pins nodes 2 and 3 at the boots their opens registered, so the trio is
+/// ready, the write made before reads back, and new writes land, also from an app-only `Db`.
+/// Integration (~2 s): one fresh open until ready, three node opens until ready.
+#[config_log::retcd_test]
+fn m10_s2_three_node_processes_on_one_folder_heal_and_serve() {
+    const METHOD: &str = "m10_s2_three_node_processes_on_one_folder_heal_and_serve";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let links = Links::new();
+    let mut nodes: Vec<Db> = [1, 2, 3]
+        .into_iter()
+        .map(|node| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    links: Some(Arc::clone(&links)),
+                    ..node_config(dir.path(), &[node])
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .unwrap_or_else(|e| panic!("node {node}'s process opens: {e}"))
+        })
+        .collect();
+    nodes[0]
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("node 1's process heals and is ready");
+    reads_back_and_writes(&nodes[0], "node 1's process");
+
+    // The boots node 1's heal pinned: each process registered its node at its own open's boot.
+    for (at, db) in nodes.iter().enumerate() {
+        let node = NodeId(u32::try_from(at + 1).expect("three"));
+        assert_eq!(
+            links.boot_of(node),
+            Some(db.opened.base_boot),
+            "node {}",
+            node.0
+        );
+    }
+    let mut app = open_app(&rt, &store, &links, ClientId(2));
+    app.put(b"c", b"3", None).expect("the app's put");
+    assert_eq!(
+        app.get(b"c").expect("get c").value.map(|(_, v)| v),
+        Some(Bytes::from_static(b"3"))
+    );
+    app.shutdown();
+    for db in &mut nodes {
+        db.shutdown();
+    }
+
+    let heal = lock(&nodes[0].opened.heal).clone();
+    assert!(
+        matches!(heal, HealState::Handed(_)),
+        "node 1's heal handed over: {heal:?}"
+    );
+    let started = messages(METHOD)
+        .iter()
+        .filter(|m| *m == "db_heal_started")
+        .count();
+    assert_eq!(started, 1, "one heal, by node 1's process");
+    let logged = messages(METHOD);
+    assert_eq!(
+        logged.iter().filter(|m| *m == "db_open_not_owner").count(),
+        2,
+        "nodes 2 and 3 do not heal: {logged:?}"
+    );
 }
