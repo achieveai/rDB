@@ -6420,14 +6420,13 @@ mod tests {
                 for node in db.node_status() {
                     assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
                 }
-                let owner = db.node_status().into_iter().next().expect("node 1");
-                if done(&owner) {
-                    return owner;
+                match owner_of(db, db.node_status()) {
+                    Some(owner) if done(&owner) => return owner,
+                    owner => assert!(
+                        std::time::Instant::now() < deadline,
+                        "{what}: not settled within {patience:?}: {owner:?}"
+                    ),
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{what}: not settled within {patience:?}: {owner:?}"
-                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
@@ -6501,6 +6500,110 @@ mod tests {
         .expect("open")
     }
 
+    /// Node 1's status from `nodes`, or `None` when it is not among them. `node_status` leaves
+    /// out a node that does not answer within `Timeouts::read`, and on int gate k429 no thread
+    /// of a starved host ran for 4.8-7.7 s, so a missing node 1 is "not yet", for the caller's
+    /// patience to judge (A-R237). Never another node's status in node 1's place. A failed
+    /// restart is different: no process runs node 1, so it fails the row at once (F-013).
+    fn owner_of(db: &Db, nodes: Vec<NodeStatus>) -> Option<NodeStatus> {
+        assert!(
+            !db.restart_failed(OWNER),
+            "node 1's restart failed: {:?}",
+            db.restart_note()
+        );
+        nodes.into_iter().find(|status| status.node == OWNER)
+    }
+
+    /// Node 1's status once `done` holds for it, polled within `patience`; see [`owner_of`].
+    fn owner_when(
+        db: &Db,
+        what: &str,
+        patience: Duration,
+        done: &dyn Fn(&NodeStatus) -> bool,
+    ) -> NodeStatus {
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            match owner_of(db, db.node_status()) {
+                Some(owner) if done(&owner) => return owner,
+                owner => assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: not within {patience:?}: {owner:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A-R237 (int gate k429): node 1 missing from `node_status` because it did not answer
+    /// within `Timeouts::read` is "not yet" to the D7 waits, never a panic and never another
+    /// node's status. Node 1 here is a stub that sits on its first look past the read timeout,
+    /// as a host no thread ran for did, then answers every look. Cut: `owner_of` as
+    /// `next().expect("node 1")` — the first look finds no node and the row panics.
+    #[test]
+    fn m10_d7_node_1_missing_from_node_status_is_not_yet() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(50);
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: None,
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(true),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        let looks = Arc::new(AtomicU64::new(0));
+        let node_1 = {
+            let looks = Arc::clone(&looks);
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        if looks.fetch_add(1, Ordering::Relaxed) == 0 {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        let _ = reply.send(status.clone());
+                    }
+                }
+            })
+        };
+        let owner = owner_when(
+            &db,
+            "node 1 after its stall",
+            Duration::from_secs(10),
+            &|_| true,
+        );
+        assert_eq!(owner.node, OWNER, "node 1's status, not another node's");
+        assert!(
+            looks.load(Ordering::Relaxed) >= 2,
+            "the first look was missed and a later one answered"
+        );
+        drop(db);
+        node_1.join().expect("node 1 stub");
+    }
+
+    /// A-R237: a failed restart of node 1 still fails a D7 wait at once (F-013), since no process
+    /// runs it. Cut: no restart check in `owner_of` — the wait runs out its patience and fails
+    /// with "not within" instead.
+    #[test]
+    #[should_panic(expected = "node 1's restart failed")]
+    fn m10_d7_a_failed_restart_of_node_1_fails_the_wait_at_once() {
+        let (mut db, _mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(1);
+        lock(&db.nodes)[0].start_failed = true;
+        owner_when(&db, "node 1", Duration::from_millis(500), &|_| true);
+    }
+
     /// The first two opens of the D7 shape: a=1 lands on every copy, then a reopen with node
     /// 2's links held commits generation 2 on nodes 1 and 3 alone and holds a grant, so the
     /// next open heals case A. Node 2 lands generation 2 from the control watch and links it at
@@ -6523,18 +6626,12 @@ mod tests {
             vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))],
         );
         let patience = crate::host::test_patience(Duration::from_secs(30));
-        let deadline = std::time::Instant::now() + patience;
-        loop {
-            let owner = db.node_status().into_iter().next().expect("node 1");
-            if owner.recovered == Some(Generation(2)) && owner.authority.starts_with("held(") {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "generation 2 never committed and held: {owner:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        owner_when(
+            &db,
+            "generation 2 never committed and held",
+            patience,
+            &|owner| owner.recovered == Some(Generation(2)) && owner.authority.starts_with("held("),
+        );
         db.shutdown();
     }
 
@@ -6557,11 +6654,12 @@ mod tests {
             for node in &nodes {
                 assert_eq!(node.fault, None, "{case}: node {} faulted", node.node.0);
             }
-            let owner = nodes.first().expect("node 1");
-            if owner.recovery.as_deref() == Some("Committed")
-                && owner.recovered == Some(Generation(3))
-                && owner.admits == Some(true)
-            {
+            let owner = owner_of(db, nodes);
+            if let Some(owner) = owner.as_ref().filter(|owner| {
+                owner.recovery.as_deref() == Some("Committed")
+                    && owner.recovered == Some(Generation(3))
+                    && owner.admits == Some(true)
+            }) {
                 assert_eq!(owner.stalled, None, "{case}: {owner:?}");
                 break;
             }
@@ -6819,18 +6917,7 @@ mod tests {
         d7_node_2_behind(&rt, dir.path(), &store);
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let until = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| {
-            let deadline = std::time::Instant::now() + patience;
-            loop {
-                let owner = db.node_status().into_iter().next().expect("node 1");
-                if done(&owner) {
-                    return owner;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{what}: not within {patience:?}: {owner:?}"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            owner_when(db, what, patience, done)
         };
 
         let mut db = open_held(&rt, dir.path(), &store, vec![(NodeId(1), NodeId(2))]);

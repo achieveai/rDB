@@ -435,6 +435,11 @@ fn an_inherit_at_base_zero_still_makes_the_flush_duty_sync() {
 /// turns that into one stall line naming the mode and those copies, which stays as printed
 /// while F1 keeps naming them. PC15 and mutant M26: F1 names both copies in one step, and a
 /// repeat names no new copy, so across six deadlines the log holds exactly one error line.
+///
+/// Window kind: this row claims what is reported, not when the window closes, so until F1
+/// commits it runs the spec's 2 s times `RETCD_TEST_DEADLINE_SCALE` (A-R237). That window is
+/// also the commit's CAS deadline, and on int gate k429 a starved host ran that CAS 3.7-5.1 s
+/// late, so the plain spec 2 s blocked F1 with `ControlUnknown`. The product default is 2 s.
 #[config_log::retcd_test]
 fn a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled() {
     const METHOD: &str = "a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled";
@@ -455,8 +460,10 @@ fn a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled() {
     let clock = HostClock::start();
     let mut host = Host::new(NodeId(1), engine, links, control, clock);
     // The walk, faster: F1's deadline is the discovery window, shortened once F1 has
-    // committed, so the commit's CAS keeps the spec's 2 s against a host stall. The
+    // committed, so the commit's CAS keeps the scaled spec window against a host stall. The
     // never-pinned watch is pushed out of reach, so only F1's own report can produce the line.
+    host.budgets.discovery_window_millis = Budgets::SPEC_DEFAULTS.discovery_window_millis
+        * u64::from(config_testkit::poll::deadline_scale());
     host.rebuild_pin_wait_millis = 60_000;
     rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
         tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
@@ -745,8 +752,12 @@ fn m10_a_block_that_lasts_is_logged_terminal() {
 /// is pinned and the never-pinned watch must stay quiet. The D2 row's start (`ReadOnly` at
 /// cutoff 0), then the `SyncWalThrough` F1 sends at commit, through the host's own effect
 /// path. Since the D2 kernel step F1 also names the held copies at its deadline, so a stall
-/// line may appear; this row pins only that it is never the never-pinned one. The window is
-/// the spec's 2 s, since it is also the CAS deadline a host stall must not outlast.
+/// line may appear; this row pins only that it is never the never-pinned one.
+///
+/// Window kind: this row claims what is reported, not when the window closes, so it runs the
+/// spec's 2 s times `RETCD_TEST_DEADLINE_SCALE` (A-R237). The window is also the CAS deadline
+/// a host stall must not outlast, and on int gate k429 a starved host ran that CAS 3.7-5.1 s
+/// late. The product default stays 2 s.
 #[config_log::retcd_test]
 fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
     let dir = config_testkit::fs::temp_dir();
@@ -765,6 +776,8 @@ fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
     let control = ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
     let clock = HostClock::start();
     let mut host = Host::new(NodeId(1), engine, links, control, clock);
+    host.budgets.discovery_window_millis = Budgets::SPEC_DEFAULTS.discovery_window_millis
+        * u64::from(config_testkit::poll::deadline_scale());
     host.rebuild_pin_wait_millis = 50;
     rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
         tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
