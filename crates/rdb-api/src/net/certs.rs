@@ -48,7 +48,11 @@ pub fn parse_label_uri(uri: &str) -> Option<Label> {
     }
     match kind {
         "node" => Some(Label::Node(NodeId(value.parse().ok()?))),
-        "app" if value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => {
+        "app"
+            if value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
             Some(Label::App(value.to_owned()))
         }
         _ => None,
@@ -73,7 +77,10 @@ pub fn label_from_der(der: &[u8]) -> Option<Label> {
 #[must_use]
 pub fn files(dir: &Path, label: &Label) -> (PathBuf, PathBuf) {
     let stem = label.to_string();
-    (dir.join(format!("{stem}.pem")), dir.join(format!("{stem}.key")))
+    (
+        dir.join(format!("{stem}.pem")),
+        dir.join(format!("{stem}.key")),
+    )
 }
 
 /// Load `label`'s mutual-TLS material from `dir`.
@@ -155,9 +162,7 @@ pub fn generate(dir: &Path, labels: &[Label]) -> Result<(), String> {
                 .subject_alt_names
                 .push(SanType::DnsName(ia5(&node_domain(*node))?));
         }
-        let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
-            .map_err(rcgen)?;
+        let cert = params.signed_by(&key, &ca_cert, &ca_key).map_err(rcgen)?;
         let (cert_path, key_path) = files(dir, label);
         write(cert_path, cert.pem())?;
         write(key_path, key.serialize_pem())?;

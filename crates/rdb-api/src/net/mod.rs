@@ -141,7 +141,9 @@ struct Conn {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Conn {
@@ -158,11 +160,7 @@ impl Conn {
 
     fn write(&self, frame: &Frame) {
         let body = wire::encode(frame);
-        if self
-            .tx
-            .send(Envelope { body: body.into() })
-            .is_err()
-        {
+        if self.tx.send(Envelope { body: body.into() }).is_err() {
             tracing::debug!(peer = %self.peer, conn = self.id, "net_write_after_close");
         }
     }
@@ -286,19 +284,21 @@ impl Net {
             let tls = config.tls.server_tls_config();
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let label = config.label.clone();
-            tasks.push(tokio::spawn(async move {
-                let served = tonic::transport::Server::builder()
-                    .tls_config(tls)
-                    .map(|mut builder| builder.add_service(service));
-                let result = match served {
-                    Ok(router) => router.serve_with_incoming(incoming).await,
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = result {
-                    tracing::error!(%label, %error, "net_serve_failed");
+            tasks.push(tokio::spawn(
+                async move {
+                    let served = tonic::transport::Server::builder()
+                        .tls_config(tls)
+                        .map(|mut builder| builder.add_service(service));
+                    let result = match served {
+                        Ok(router) => router.serve_with_incoming(incoming).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        tracing::error!(%label, %error, "net_serve_failed");
+                    }
                 }
-            }
-            .instrument(shared.span.clone())));
+                .instrument(shared.span.clone()),
+            ));
             tracing::info!(label = %config.label, addr = ?addr, "net_listening");
         }
         for (node, address) in &config.dial {
@@ -315,16 +315,18 @@ impl Net {
         {
             let shared = Arc::clone(&shared);
             let span = shared.span.clone();
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(faults::POLL).await;
-                    let conns: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
-                    for conn in conns {
-                        conn.release();
+            tasks.push(tokio::spawn(
+                async move {
+                    loop {
+                        tokio::time::sleep(faults::POLL).await;
+                        let conns: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
+                        for conn in conns {
+                            conn.release();
+                        }
                     }
                 }
-            }
-            .instrument(span)));
+                .instrument(span),
+            ));
         }
         let net = Arc::new(Self {
             shared,
@@ -350,7 +352,9 @@ impl Net {
     /// The boot node `node` reported at its last handshake with this process.
     #[must_use]
     pub fn boot_of(&self, node: NodeId) -> Option<BootId> {
-        lock(&self.shared.routes).get(&node).and_then(|route| route.boot)
+        lock(&self.shared.routes)
+            .get(&node)
+            .and_then(|route| route.boot)
     }
 
     /// How each node's link stands.
@@ -528,7 +532,12 @@ fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
         route.refused = None;
         route.last_error = None;
         if let Some(old) = route.conn.replace(Arc::clone(conn)) {
-            tracing::info!(node = node.0, old = old.id, new = conn.id, "net_link_replaced");
+            tracing::info!(
+                node = node.0,
+                old = old.id,
+                new = conn.id,
+                "net_link_replaced"
+            );
             close(shared, &old, "replaced by a newer link");
         }
         let queued = route.queue.len();
@@ -733,7 +742,8 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
                 }),
             );
             if posted.is_err() {
-                let error = ApiError::host(&format!("node {} is not served by {}", to.0, shared.label));
+                let error =
+                    ApiError::host(&format!("node {} is not served by {}", to.0, shared.label));
                 conn.out(Frame::Reply {
                     correlation: reply,
                     reply: WireReply::Answer(WireAnswer::carry(&Answer::Error {
@@ -772,7 +782,13 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
         } => {
             let (tx, rx) = mpsc::channel();
             if links
-                .post_local(to, Msg::Inspect { partition, reply: tx })
+                .post_local(
+                    to,
+                    Msg::Inspect {
+                        partition,
+                        reply: tx,
+                    },
+                )
                 .is_err()
             {
                 conn.out(Frame::Reply {
@@ -934,7 +950,8 @@ struct Service {
 }
 
 /// The stream a listener answers with.
-type Outgoing = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Envelope, Status>> + Send>>;
+type Outgoing =
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Envelope, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl RdbNet for Service {

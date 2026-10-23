@@ -301,7 +301,10 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     )?;
     let addr = net.addr().map_or_else(|| listen.clone(), |a| a.to_string());
     tracing::info!(node = node.0, %addr, boot = boot.0, "rdb_node_listening");
-    println!("rdb_node listening node={} addr={addr} boot={}", node.0, boot.0);
+    println!(
+        "rdb_node listening node={} addr={addr} boot={}",
+        node.0, boot.0
+    );
 
     let config = DbConfig {
         dir: dir.clone(),

@@ -22,8 +22,8 @@ use rdb_core::contracts::authority::{DenyReason, FenceCredential, Lineage};
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::KernelEvent;
 use rdb_core::contracts::ids::{
-    AffinityId, BootId, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId,
-    RequestIdentity, RequestId, Revision, Seq,
+    AffinityId, BootId, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId,
+    RequestIdentity, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
 use rdb_core::contracts::recovery::{LineageAnchor, RecoveryResult};
