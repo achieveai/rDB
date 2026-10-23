@@ -71,6 +71,7 @@ use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
+use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{Inherited, PublishMark, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
 use rdb_value::blob::{Blob, Upload};
@@ -2288,26 +2289,72 @@ impl Host {
     }
 
     /// A-R183 (critic-d6b candidate 3): how long until the trim duty can first free a dedup
-    /// entry of `partition`: the earliest scheduled free (the first retire due, or the oldest
-    /// publish one retention on), at the trim tick that runs it. A lower bound, "not before":
-    /// an admitted write may take the room first. `None` when nothing is scheduled to free.
+    /// entry of `partition`: the earliest scheduled free, at the trim tick that runs it. A lower
+    /// bound, "not before": an admitted write may take the room first.
+    ///
+    /// A-R187: only an event that frees at least one entry T1 holds counts (A-R209's
+    /// [`DedupIndex::holds_through`]; a retired generation holds none). A retire due counts when
+    /// this node holds its serving lineage, as [`Self::retire_duty`] requires, and an older
+    /// generation on disk still holds an entry. A `published_at` bucket `(g, seq, at)` counts when
+    /// `g` holds an entry at or below `seq`; it is trimmed once it and every bucket before it are
+    /// a retention old, since [`Self::trim_aged`] pops front first.
+    /// `None` when nothing counts: the hint is left out, never invented.
     fn cap_frees_in(&self, partition: PartitionId, now: Tick) -> Option<Duration> {
         let retention = self.budgets.dedup_retention_millis;
+        let dedup = self.transaction.kernel(self.node, partition)?.dedup();
+        let every = self.trim_every_millis.max(1);
+        // The first trim tick at or after `due`.
+        let sweep = |due: Tick| {
+            let ticks = due.0.saturating_sub(self.next_trim.0).div_ceil(every);
+            self.next_trim.plus_millis(ticks.saturating_mul(every))
+        };
         let retire = self
             .retire_due
             .iter()
-            .filter(|((p, _), _)| *p == partition)
-            .map(|(_, at)| *at);
+            .filter(|((p, serving), _)| *p == partition && self.retire_frees(*p, *serving, dedup))
+            .map(|(_, at)| sweep(*at))
+            .min();
+        // A sweep pops front first, so a bucket waits for every bucket before it.
+        let mut runs = self.next_trim;
         let aged = self
             .published_at
             .get(&partition)
-            .and_then(VecDeque::front)
-            .map(|&(_, _, at)| at.plus_millis(retention));
-        let due = retire.chain(aged).min()?;
-        let every = self.trim_every_millis.max(1);
-        let ticks = due.0.saturating_sub(self.next_trim.0).div_ceil(every);
-        let runs = self.next_trim.plus_millis(ticks.saturating_mul(every));
+            .into_iter()
+            .flatten()
+            .find_map(|&(generation, seq, at)| {
+                runs = runs.max(sweep(at.plus_millis(retention)));
+                dedup.holds_through(generation, seq).then_some(runs)
+            });
+        let runs = retire.into_iter().chain(aged).min()?;
         Some(Duration::from_millis(runs.0.saturating_sub(now.0)))
+    }
+
+    /// A-R187: whether the retire due for `(partition, serving)` would free an entry T1 holds.
+    /// A disk scan that fails names no free; the retire duty itself faults the node on it.
+    fn retire_frees(
+        &self,
+        partition: PartitionId,
+        serving: Generation,
+        dedup: &DedupIndex,
+    ) -> bool {
+        if !self.engine.lineages().contains(&(partition, serving)) {
+            return false;
+        }
+        match self.dedup_generations_below(partition, serving) {
+            Ok(generations) => generations
+                .into_iter()
+                .any(|generation| dedup.holds_through(generation, Seq(u64::MAX))),
+            Err(fault) => {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    serving = serving.0,
+                    fault = %fault.detail,
+                    "retry_hint_scan_failed"
+                );
+                false
+            }
+        }
     }
 
     /// D6 A: this node landed committed generation `generation` for the first time, so the
@@ -10074,6 +10121,75 @@ mod tests {
             "the hint {after:?} is past one retention and a trim tick"
         );
         assert!(error.detail.contains("not before ~"), "{error:?}");
+    }
+
+    /// A-R187 (A-R209): a full dedup cap that nothing scheduled frees gives no hint, never an
+    /// invented one. Node 1 holds two scheduled frees that free nothing T1 holds. One is real:
+    /// the bootstrap's publish at seq 1, which carries no request, so T1 retained nothing for
+    /// it. The other is a retire due for the generation node 1 serves, below which no generation
+    /// holds a row. Before A-R187 each was named as the hint. Cut either half of the rule and
+    /// the hint comes back.
+    ///
+    /// Constructed: T1's two entries are real puts, and their own buckets are taken out by hand.
+    /// That stands in for entries no bucket covers (a condition failure T1 retains, A-R108),
+    /// which this Trio cannot retain at the cap without a publish; the retire due is set by
+    /// hand too. Trio (~1 s), a 5-minute retention.
+    #[config_log::retcd_test]
+    fn a_full_dedup_cap_that_nothing_scheduled_frees_gives_no_hint() {
+        const RETENTION: u64 = 300_000;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = RETENTION;
+            host.transaction = Transaction::with_limits(Limits {
+                dedup_cap: 2,
+                ..Limits::default()
+            });
+        });
+        trio.bootstrap();
+        trio.ready();
+        for (request, key) in [(1, b"a"), (2, b"b")] {
+            match trio.ask(put(request, key, b"1", None)) {
+                Answer::Txn { .. } => {}
+                other => panic!("put {request}: {other:?}"),
+            }
+        }
+        let owner = &mut trio.nodes[0].0;
+        let kernel = owner
+            .transaction
+            .kernel(owner.node, PartitionId(1))
+            .expect("node 1 serves partition 1");
+        assert_eq!(kernel.dedup().len(), 2, "the cap is full");
+        let served = kernel.lineage().generation;
+        let published = owner
+            .published_at
+            .get_mut(&PartitionId(1))
+            .expect("the puts published");
+        published.retain(|&(_, seq, _)| seq == Seq(1));
+        assert_eq!(
+            published
+                .iter()
+                .map(|&(g, seq, _)| (g, seq))
+                .collect::<Vec<_>>(),
+            [(served, Seq(1))],
+            "the bootstrap's publish is left"
+        );
+        let now = owner.clock.now();
+        owner
+            .retire_due
+            .insert((PartitionId(1), served), now.plus_millis(2_000));
+
+        let error = match trio.ask(put(3, b"c", b"1", None)) {
+            Answer::Error { error, .. } => error,
+            other => panic!("put 3 on a full cap: {other:?}"),
+        };
+        assert_eq!(
+            (error.kind, error.retry),
+            (ErrorKind::Overloaded, RetryRule::BoundedJitter),
+            "{error:?}"
+        );
+        assert_eq!(error.retry_after(), None, "{error:?}");
+        assert!(!error.detail.contains("not before"), "{error:?}");
     }
 
     /// A-R183 with A-R164: publish marks that do not decode fault the restore, so the landing

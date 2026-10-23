@@ -10,6 +10,7 @@
 //! grows, and [`RETENTION_CAP_ENTRIES`] bounds that growth by refusing admission (plan Q-4).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Bound;
 
 use bytes::Bytes;
 
@@ -301,6 +302,26 @@ impl DedupIndex {
     /// Every retired generation, ascending.
     pub fn retired_generations(&self) -> impl Iterator<Item = Generation> + '_ {
         self.retired_generations.iter().copied()
+    }
+
+    /// Whether an entry of exactly `generation` has `applied_at_seq <= through`: whether a
+    /// `DedupTrim{generation, below: through + 1}` would drop anything. With `Seq(u64::MAX)`,
+    /// whether a `RetireGeneration{generation}` would.
+    ///
+    /// It exists for the host's cap retry hint (ruling A-R187, A-R209), which may name only an
+    /// event that frees at least one entry. Read-only; walks one generation's entries and stops
+    /// at the first hit, so it costs at most that generation's size.
+    #[must_use]
+    pub fn holds_through(&self, generation: Generation, through: Seq) -> bool {
+        let end = generation
+            .0
+            .checked_add(1)
+            .map_or(Bound::Unbounded, |next| {
+                Bound::Excluded(first_key(Generation(next)))
+            });
+        self.entries
+            .range((Bound::Included(first_key(generation)), end))
+            .any(|(_, retained)| retained.applied_at_seq <= through)
     }
 
     /// Load the durable records `pending` names from `snapshot`, all or nothing (A-R68, A-R70).
