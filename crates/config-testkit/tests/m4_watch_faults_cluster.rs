@@ -20,16 +20,17 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::{
-    ConfigError, Limits, MutationEvent, MutationEventKind, NodeId, Principal, PrincipalKind,
-    WatchItem, WatchLimits, WatchRequest, WatchRetention,
+    ConfigError, ConfigStore, Limits, MutationEvent, MutationEventKind, NodeId, Principal,
+    PrincipalKind, WatchItem, WatchLimits, WatchRequest, WatchRetention,
 };
 use config_engine::watch::testing::GateHook;
 use config_engine::watch::TerminationReason;
 use config_engine::ManualClock;
 use config_storage::fault::Boundary;
 use config_testkit::cluster::{AuthzKind, Cluster, RocksSpec, StorageKind};
+use config_testkit::poll::poll_until_async;
 use futures::StreamExt;
-use support::{put_req, rocks_cluster_with_scripts};
+use support::{get_req, put_req, rocks_cluster_with_scripts};
 
 /// A failure bound, never a success bound.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -90,17 +91,53 @@ fn progress_watch_req(start_after_revision: u64, every: Duration) -> WatchReques
 /// Apply `n` puts under `prefix` through `id` and return the allocated revisions. Copied from
 /// `m4_watch_cluster.rs`'s helper of the same shape (test binaries cannot share code across
 /// files except via `mod support`).
+///
+/// A put that ends `DeadlineExceededUnknownOutcome` may still commit (ADR-0015), so it is
+/// resolved by reading the key back until it lands, and the revision is the record's. Each key
+/// is fresh, so a record under it can only be this put's. Issue #31: under host load one put of
+/// m4_64's took 2572 ms against the unscaled 2 s write budget, with no election, and failed the
+/// row although apply was never blocked. A put that never lands still fails the row.
 async fn put_n(cluster: &Cluster, id: NodeId, n: u64, prefix: &str) -> Vec<u64> {
     let client = cluster.client_as(id, Principal::development());
     let mut revisions = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let resp = client
-            .put(put_req(&format!("{prefix}{i}"), "v"))
-            .await
-            .unwrap_or_else(|e| panic!("put {prefix}{i}: {e}"));
-        revisions.push(resp.revision);
+        let key = format!("{prefix}{i}");
+        let revision = match client.put(put_req(&key, "v")).await {
+            Ok(resp) => resp.revision,
+            Err(ConfigError::DeadlineExceededUnknownOutcome) => {
+                landed_revision(cluster, client.as_ref(), &key).await
+            }
+            Err(e) => panic!("put {key}: {e}"),
+        };
+        revisions.push(revision);
     }
     revisions
+}
+
+/// The `mod_revision` of `key` once a read finds it: how [`put_n`] resolves an unknown outcome.
+async fn landed_revision(cluster: &Cluster, client: &dyn ConfigStore, key: &str) -> u64 {
+    tracing::info!(key, "m4_put_unknown_outcome_read_back");
+    let last = std::sync::Mutex::new(None);
+    let last = &last;
+    let found = poll_until_async(
+        cluster.deadline(10),
+        cluster.poll_interval(),
+        || async move {
+            match client.get(get_req(key)).await {
+                Ok(got) => got.record.map(|r| r.mod_revision),
+                Err(e) => {
+                    *last
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                    None
+                }
+            }
+        },
+    )
+    .await;
+    found.unwrap_or_else(|t| {
+        panic!("put {key} had an unknown outcome and never landed: {t}; last read error {last:?}")
+    })
 }
 
 /// Collect `WatchItem::Event`s until one's revision equals `last` (inclusive), ignoring
@@ -1896,6 +1933,45 @@ async fn m4_88_leader_change_mid_compaction_apply_recovers() {
 
     cluster.assert_journal_invariants();
     let _ = serving;
+
+    cluster.shutdown().await;
+}
+
+/// Issue #31: [`put_n`] resolves a put whose outcome is unknown instead of failing the row. The
+/// leader's first apply is held past the engine's write budget, so the first put ends
+/// `DeadlineExceededUnknownOutcome` while its entry is committed; the helper reads the key back
+/// and returns the record's revision.
+/// Cut: `put_n` panics on the unknown outcome — this row fails with "put issue31/0: deadline
+/// exceeded".
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_31_put_n_resolves_an_unknown_outcome() {
+    let (cluster, scripts) = rocks_cluster_with_scripts(3).await;
+    let leader = cluster.leader().await;
+    let stall = cluster.config().write_timeout + Duration::from_secs(1);
+    scripts[&leader].delay_on_nth(Boundary::AfterStateBatch, 1, stall);
+
+    let revisions = put_n(&cluster, leader, 2, "issue31/").await;
+
+    let read_backs = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "issue_31_put_n_resolves_an_unknown_outcome",
+    )
+    .into_iter()
+    .filter(|line| line["@m"] == "m4_put_unknown_outcome_read_back")
+    .count();
+    assert_eq!(
+        read_backs, 1,
+        "the stalled put, and only it, had an unknown outcome"
+    );
+    let client = cluster.client(leader);
+    for (i, revision) in revisions.iter().enumerate() {
+        let got = client
+            .get(get_req(&format!("issue31/{i}")))
+            .await
+            .unwrap_or_else(|e| panic!("read issue31/{i}: {e}"));
+        assert_eq!(got.record.map(|r| r.mod_revision), Some(*revision));
+    }
+    assert!(revisions[0] < revisions[1], "{revisions:?}");
 
     cluster.shutdown().await;
 }
