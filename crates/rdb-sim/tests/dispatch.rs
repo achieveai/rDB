@@ -2530,6 +2530,7 @@ fn provider_a_survivor_that_adopted_a_newer_generation_answers_from_it() {
                 partition: PartitionId(1),
                 seq: DurableSeq(3),
                 digest: after.digest(3),
+                boot: PEER_BOOT,
             })
         ))),
         "the pre-commit sync proves seq 3 of generation 2, not the placed generation-1 record"
@@ -2572,6 +2573,7 @@ fn provider_a_survivor_that_landed_a_newer_generation_in_the_barrier_answers_fro
                 partition: PartitionId(1),
                 seq: DurableSeq(2),
                 digest: prior.digest(2),
+                boot: PEER_BOOT,
             };
             result.barrier = RecoveryBarrier::try_new(
                 &[proof],
@@ -2690,6 +2692,7 @@ fn provider_sync_wal_through_proves_only_what_the_engine_made_durable() {
                 partition: PartitionId(1),
                 seq: DurableSeq(seq),
                 digest: digest(seq),
+                boot: PEER_BOOT,
             },
         )))
     };
@@ -6288,6 +6291,8 @@ fn canonical_history_writes_what_t1_commits() {
             value: Bytes::copy_from_slice(&1u64.to_be_bytes()),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     };
     let effects = step(EventKind::Client(ClientEvent::Submit(request)));
     let [EffectKind::Kernel(KernelEffect::AuthorityCheck {
@@ -6512,7 +6517,9 @@ fn canonical_history_from_the_wrong_digest_is_refused_by_a_receiver_at_that_cuto
 /// birth. R1 took the `Recovered` first (it is offered to R1 ahead of L1), so a primary is there
 /// to start the keepalive. From then on, every 100 ms, the primary sends its head to the two
 /// regular secondaries, nodes 2 and 3, and never to the shadow, node 4. Their answers are what
-/// let L1 resume. When L1 admits, R1 cancels the keepalive and node 1 sends nothing more.
+/// let L1 resume. When L1 admits, R1 cancels the keepalive and node 1 sends nothing more
+/// to them. The shadow keeps its own probe (lead ruling A-R228, 2026-10-23), so node 1 still
+/// talks to node 4.
 ///
 /// Every event is offered to all six modules, so R1 would hear `SetAdmission` even unrouted.
 /// What the route adds is the edge: R1 is a **named** consumer, offered straight after T1, so a
@@ -6555,6 +6562,11 @@ fn route_l1s_admission_reaches_r1_whose_keepalive_runs_exactly_while_paused() {
         .iter()
         .map(|sent| (sent.from, sent.to))
         .collect();
+    let shadow_probe = runner
+        .dispatcher()
+        .replication()
+        .primary(NODE, PartitionId(1))
+        .and_then(rdb_core::replication::primary::Primary::shadow_probe);
     let trace = runner.finish().expect("a trace");
 
     let admissions: Vec<(u64, NodeId, bool)> = trace
@@ -6626,11 +6638,19 @@ fn route_l1s_admission_reaches_r1_whose_keepalive_runs_exactly_while_paused() {
             .all(|(_, keepalive, _)| keepalive.is_none()),
         "admission cancels the keepalive"
     );
+    // Lead ruling A-R228: the shadow is fed on its own probe timer, which admission does not
+    // touch, so node 1 still sends to node 4. Nothing more goes to the regular secondaries.
     let sends_then = after_allow.first().expect("samples after admission").2;
     assert!(
-        sent[sends_then..].iter().all(|(sender, _)| *sender != NODE),
-        "and node 1 sends nothing more: {:?}",
+        sent[sends_then..]
+            .iter()
+            .all(|(sender, target)| *sender != NODE || *target == NodeId(4)),
+        "and node 1 sends nothing more to the regular secondaries: {:?}",
         &sent[sends_then..]
+    );
+    assert!(
+        shadow_probe.is_some(),
+        "the shadow probe runs on regardless of admission"
     );
 
     // The route: the two `SetAdmission` events are offered to T1, then R1, then the rest.

@@ -122,6 +122,8 @@ fn write(label: &'static str, request: u64, mutations: Vec<Mutation>) -> Step {
             remaining_millis: DEADLINE_MILLIS,
             conditions: Vec::new(),
             mutations,
+            acked_below: None,
+            pinned: Vec::new(),
         }),
     }
 }
@@ -570,6 +572,7 @@ fn run_host(steps: &[Step]) -> (Vec<Reply>, (Generation, Seq)) {
         links: None,
         client: rdb_api::db::DEFAULT_CLIENT,
         boot: None,
+        storage: rdb_api::StorageOptions::default(),
     };
     let mut db = rt
         .block_on(Db::open(

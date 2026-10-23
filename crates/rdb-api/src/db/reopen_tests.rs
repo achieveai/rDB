@@ -20,6 +20,7 @@ fn config(dir: &Path) -> DbConfig {
         links: None,
         client: DEFAULT_CLIENT,
         boot: None,
+        storage: crate::StorageOptions::default(),
     }
 }
 
@@ -2392,5 +2393,60 @@ fn m10_s2_three_node_processes_on_one_folder_heal_and_serve() {
         logged.iter().filter(|m| *m == "db_open_not_owner").count(),
         2,
         "nodes 2 and 3 do not heal: {logged:?}"
+    );
+}
+
+/// A-R253: a node that `Db::restart_node` starts again opens with the `DbConfig::storage` this
+/// `Db` was opened with, not the engine's default. Each engine open logs the memtable budget it
+/// asked RocksDB for, as `write_buffer_bytes_asked` on its `storage_open` line, so node 3's line
+/// from the restart names the asked value, as its line from the first open did.
+/// Integration (~1 s): one fresh open until ready, a put, one restart of node 3.
+#[config_log::retcd_test]
+fn m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with() {
+    const METHOD: &str = "m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with";
+    const ASKED: usize = 1 << 20;
+    let node_3_opens = |dir: &Path| -> Vec<u64> {
+        let node_3 = dir.join("nodes").join("3").display().to_string();
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "storage_open" && line["path"] == node_3.as_str())
+            .map(|line| {
+                line["write_buffer_bytes_asked"]
+                    .as_u64()
+                    .expect("storage_open names the budget it asked for")
+            })
+            .collect()
+    };
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                storage: crate::StorageOptions {
+                    write_buffer_bytes: Some(ASKED),
+                },
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db.put(b"a", b"1", None).expect("a put");
+    let before = node_3_opens(dir.path());
+    assert_eq!(before, vec![ASKED as u64], "node 3's first open");
+
+    assert_eq!(
+        db.restart_node(NodeId(3)).expect("node 3 restarts"),
+        BootId(2)
+    );
+    db.shutdown();
+    assert_eq!(
+        node_3_opens(dir.path()),
+        vec![ASKED as u64, ASKED as u64],
+        "node 3's restart asks for the budget this Db was opened with, not the 64 MiB default"
     );
 }

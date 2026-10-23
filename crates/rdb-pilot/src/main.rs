@@ -441,6 +441,7 @@ fn run(args: &Args) -> ExitCode {
         links,
         client: ClientId(args.client_id),
         boot: None,
+        storage: rdb_api::StorageOptions::default(),
     };
     tracing::info!(
         write = args.write,

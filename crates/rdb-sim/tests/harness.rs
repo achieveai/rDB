@@ -2193,6 +2193,12 @@ fn fanout_result(revision: u64) -> rdb_core::contracts::recovery::RecoveryResult
         partition: l1_fixture::PARTITION,
         seq: DurableSeq(cutoff.0),
         digest,
+        boot: result
+            .committed
+            .pinned_config
+            .member(CopyId(2))
+            .expect("copy 2 is a member")
+            .boot,
     };
     result.barrier = RecoveryBarrier::try_new(
         &[proof],

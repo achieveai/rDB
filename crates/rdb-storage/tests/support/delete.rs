@@ -76,6 +76,8 @@ pub fn request_batch(
         remaining_millis: 1_000,
         conditions,
         mutations: vec![mutation],
+        acked_below: None,
+        pinned: Vec::new(),
     };
     let request_digest = request.request_digest();
     let mutations = vec![
