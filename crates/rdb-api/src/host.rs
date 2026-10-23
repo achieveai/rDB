@@ -1405,6 +1405,14 @@ impl Host {
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
+        // A-R186: a clean stop writes one final synced mark set, whatever the period, so a
+        // reopen ages every write this process published from its publish tick, not from its
+        // landing. A crash or kill writes none; that tail keeps the landing plus the retention.
+        if self.fault.is_none() {
+            if let Err(fault) = self.mark_duty(self.clock.now(), 0, "final_marks") {
+                self.set_fault(fault);
+            }
+        }
         tracing::info!(
             node = self.node.0,
             boot = self.boot.0,
@@ -1876,7 +1884,11 @@ impl Host {
                 .insert((partition, generation), (below, at));
         }
         self.trim_delete_duty(now)?;
-        self.mark_duty(now)?;
+        self.mark_duty(
+            now,
+            trim_delete_period(self.budgets.dedup_retention_millis),
+            "marks",
+        )?;
         self.retire_duty(now)
     }
 
@@ -1885,12 +1897,13 @@ impl Host {
     /// published by `tick` (C1). At most [`PUBLISH_MARKS`] plus the newest of each generation
     /// ([`sample_marks`]), plus one per floor trimmed but not yet deleted on disk, whose rows
     /// would otherwise lose their mark until the delete. Checked at most once per
-    /// [`trim_delete_period`] and written, synced,
+    /// `period` (the trim duty passes [`trim_delete_period`]; a clean stop passes 0, A-R186)
+    /// and written, synced,
     /// only when they changed (C2), and only for a partition whose marks this process has
     /// restored. A lost or late write only frees less. Only the owner publishes, so the other
-    /// copies write none and keep the landing plus the retention (C7).
-    fn mark_duty(&mut self, now: Tick) -> Result<(), Fault> {
-        let period = trim_delete_period(self.budgets.dedup_retention_millis);
+    /// copies write none and keep the landing plus the retention (C7). `kind` names the
+    /// `host_duty` line.
+    fn mark_duty(&mut self, now: Tick, period: u64, kind: &'static str) -> Result<(), Fault> {
         let mut due = Vec::new();
         for partition in &self.marks_restored {
             let last = self.marks_written.get(partition);
@@ -1920,7 +1933,7 @@ impl Host {
                     .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
                 tracing::info!(
                     node = self.node.0,
-                    kind = "marks",
+                    kind,
                     partition = partition.0,
                     marks = marks.len(),
                     newest = ?marks.last().map(|(g, seq, at)| (g.0, seq.0, at.0)),
@@ -9460,6 +9473,43 @@ mod tests {
             [(1, 6)],
             "generation 1 trimmed at once"
         );
+    }
+
+    /// A-R186: a clean stop writes the publish marks at once, inside the mark period. The host
+    /// restored its marks (none), then published seqs 6 and 7 of generation 1. Its stop through
+    /// `run` leaves both on disk, ticks verbatim (C1), with no trim tick in between. Without the
+    /// final write the disk keeps the empty set and a reopen ages them from its landing.
+    #[test]
+    fn a_clean_stop_writes_the_publish_marks_at_once() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let now = HostClock::start().now();
+        let published = [
+            (Generation(1), Seq(6), Tick(now.0 - 20)),
+            (Generation(1), Seq(7), Tick(now.0 - 10)),
+        ];
+        {
+            let mut host = host_over(&path, &rt);
+            host.restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            host.published_at
+                .entry(PartitionId(1))
+                .or_default()
+                .extend(published);
+            let (tx, rx) = mpsc::channel();
+            tx.send(Msg::Stop).expect("send stop");
+            host.run(&rx);
+        }
+        let marks: Vec<Mark> = RocksEngine::open(&path)
+            .expect("open engine")
+            .publish_marks(PartitionId(1))
+            .expect("read marks")
+            .into_iter()
+            .map(|mark| (mark.generation, mark.seq, mark.tick))
+            .collect();
+        assert_eq!(marks, published, "the stop wrote both marks verbatim");
     }
 
     /// A-R183, lead k205: rows trimmed in memory but not yet deleted on disk keep their mark. A

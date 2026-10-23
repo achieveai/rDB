@@ -6310,6 +6310,103 @@ mod tests {
         db.shutdown();
     }
 
+    /// A-R186, the tester's clean quit: a quit right after the puts that fill the cap still
+    /// leaves their publish marks. Cap 2, retention 4 s: puts a and b fill it and the process
+    /// quits at once, inside the mark period. Two retentions later a reopen lands a put within
+    /// one trim tick plus slack of admitting, not a retention after its landing. Node 1's
+    /// final mark comes back on the reopen at the same generation and seq, its tick plus the
+    /// clock error only (C1). Without the final write nothing marks a or b, and the put waits
+    /// for the landing plus the 4 s retention.
+    /// Integration (~11 s): two opens with two real retentions between them.
+    #[config_log::retcd_test]
+    fn m10_a_clean_quit_at_the_cap_reopens_writable_within_a_trim_tick() {
+        const METHOD: &str = "m10_a_clean_quit_at_the_cap_reopens_writable_within_a_trim_tick";
+        let retention = Duration::from_secs(4);
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(2),
+                    dedup_retention: Some(retention),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.put(b"b", b"1", None).expect("put b");
+        let published = std::time::Instant::now();
+        let refused = db.put(b"c", b"1", None).expect_err("a full cap");
+        assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}");
+        db.shutdown();
+        drop(db);
+        std::thread::sleep(
+            (published + 2 * retention).saturating_duration_since(std::time::Instant::now()),
+        );
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        let admitted = std::time::Instant::now();
+        let bound = Duration::from_millis(crate::host::HOST_TRIM_EVERY_MILLIS + 1_500);
+        loop {
+            match db.put(b"c", b"1", None) {
+                Ok(_) => break,
+                Err(refused) => assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}"),
+            }
+            assert!(
+                admitted.elapsed() < bound,
+                "a and b were not trimmed within {bound:?} of admitting"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        db.shutdown();
+        drop(db);
+
+        // `newest` is `Some((generation, seq, tick))`.
+        let newest = |line: &serde_json::Value| -> Vec<u64> {
+            line["newest"]
+                .as_str()
+                .unwrap_or_default()
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.parse().expect("a number"))
+                .collect()
+        };
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let node_1 = |line: &&serde_json::Value| line["node"] == 1 && line["partition"] == 1;
+        let written = lines
+            .iter()
+            .filter(node_1)
+            .filter(|line| line["@m"] == "host_duty" && line["kind"] == "final_marks")
+            .map(newest)
+            .next()
+            .expect("node 1 wrote its final marks at the first quit");
+        let restored = lines
+            .iter()
+            .filter(node_1)
+            .filter(|line| line["@m"] == "publish_marks_restored")
+            .map(newest)
+            .next_back()
+            .expect("node 1 restored marks at the reopen");
+        let epsilon = fast().clock_error_millis;
+        assert_eq!(
+            written[0], 1,
+            "the final mark is generation 1's: {written:?}"
+        );
+        assert_eq!(
+            restored,
+            [written[0], written[1], written[2] + epsilon],
+            "the reopen restores the final mark verbatim, plus the clock error"
+        );
+    }
+
     /// D6, critic-d6 F1 (A-R170 D): writes spread over more than the retention fill the cap
     /// several times over, and a reopen writes at once. Cap 5, retention 300 ms, seven puts
     /// 800 ms apart: at most two are retained at a time, so each passes. The trim duty deletes
