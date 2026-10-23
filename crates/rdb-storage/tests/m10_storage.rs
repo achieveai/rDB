@@ -356,3 +356,75 @@ fn m10_w2_an_unknown_short_metadata_key_is_refused_at_open() {
     }
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
+
+/// critic-rollfwd A3 (lead k232): a lineage key in the metadata family whose namespace byte is
+/// neither progress nor the engine's own is refused at open by name, writable and read-only
+/// alike, with the next step. Here lineage (1, 1)'s `applied` record has its ns byte garbled, so
+/// skipping it would open the copy as if nothing were applied there. Putting the byte back opens
+/// the copy with its two batches. Cut: `restore_lineages` skips the key (`continue`).
+/// Integration (~1 s): one engine, raw RocksDB edits.
+#[retcd_test]
+fn m10_w2_a_metadata_key_with_a_garbled_namespace_byte_is_refused_at_open() {
+    use rdb_storage::keys::CF_METADATA;
+
+    let dir = data_dir("garbled-ns");
+    let db = dir.join("db");
+    {
+        let mut engine = RocksEngine::open(&db).expect("create");
+        write(&mut engine, 2);
+    }
+    let applied_key = |ns: u8| {
+        let mut key = 1_u32.to_be_bytes().to_vec();
+        key.extend_from_slice(&1_u64.to_be_bytes());
+        key.push(ns);
+        key.extend_from_slice(b"applied");
+        key
+    };
+    let raw_move = |from: &[u8], to: &[u8]| {
+        let raw = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            &db,
+            rdb_storage::keys::COLUMN_FAMILIES,
+        )
+        .expect("raw open");
+        let meta = raw.cf_handle(CF_METADATA).expect("metadata cf");
+        let value = raw
+            .get_cf(meta, from)
+            .expect("get")
+            .expect("the record to move");
+        raw.put_cf(meta, to, &value).expect("put");
+        raw.delete_cf(meta, from).expect("delete");
+    };
+    let engine_ns = applied_key(0xFF);
+    for ns in [0x00_u8, 0x07, 0xFE] {
+        let garbled = applied_key(ns);
+        raw_move(&engine_ns, &garbled);
+        let key_hex: String = garbled.iter().map(|b| format!("{b:02x}")).collect();
+        let problem = format!(
+            "a metadata key with namespace byte {ns:#04x}, which this build never writes there; \
+             this copy cannot be opened: restore it from a backup of this directory, then open \
+             it again"
+        );
+        for (row, refused) in [
+            ("writable", RocksEngine::open(&db).map(|_| ())),
+            ("read-only", RocksEngine::open_read_only(&db).map(|_| ())),
+        ] {
+            match &refused {
+                Err(OpenError::CorruptRecord {
+                    key_hex: found,
+                    problem: said,
+                    ..
+                }) => assert_eq!(
+                    (found.as_str(), said.as_str()),
+                    (key_hex.as_str(), problem.as_str()),
+                    "{row}, ns {ns:#04x}"
+                ),
+                other => panic!("{row}, ns {ns:#04x}: refused as CorruptRecord, not {other:?}"),
+            }
+        }
+        raw_move(&garbled, &engine_ns);
+        let engine = RocksEngine::open(&db).expect("the copy opens once the byte is back");
+        assert_eq!(engine.buffered_applied(PartitionId(1), Generation(1)).0, 2);
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}

@@ -1368,8 +1368,19 @@ fn restore_lineages(
         if ns == ns_byte(Namespace::Meta) {
             return Err(corrupt("a Meta key, which format 1 never stores"));
         }
-        if ns != PRIVATE_NS {
+        // Progress is the one namespace `cf_for` puts in this family. Any other ns byte is a key
+        // no format-1 writer produces, such as an engine record with a garbled ns byte: refused
+        // by name, never skipped, so a lost record never reads as absent (A-R164, critic-rollfwd
+        // A3).
+        if ns == ns_byte(Namespace::Progress) {
             continue;
+        }
+        if ns != PRIVATE_NS {
+            return Err(corrupt(&format!(
+                "a metadata key with namespace byte {ns:#04x}, which this build never writes \
+                 there; this copy cannot be opened: restore it from a backup of this directory, \
+                 then open it again"
+            )));
         }
         // Each shape names its own fault (S1-P9): a length first, then what the bytes say.
         let sized = |record: &str, want: usize| {
