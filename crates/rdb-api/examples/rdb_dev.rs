@@ -164,7 +164,8 @@
 //!                                         Without `--offset`/`--len` it reads the manifest
 //!                                         only, so a damaged chunk shows on a range read only
 //! get <object>                         read at the publication barrier: `value=` for a byte
-//!                                         string, `doc=<json>` for any other document
+//!                                         string, `doc=<json>` for any other document; another
+//!                                         kind is refused, naming `members`, `items` or `read`
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
@@ -209,8 +210,12 @@
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
 //! admin clear <o>                        clear a damaged object: prove it damaged, then
-//!                                         delete all of it, healthy entries too (copy those out
-//!                                         first with `members`; one-entry repair comes later):
+//!                                         delete all of it, healthy entries too. A bad map
+//!                                         entry or set member is repaired by a `map put`/`del`
+//!                                         or `set del` of its key instead; clear is for a
+//!                                         damaged root, a byte 0/3 or newer build's entry
+//!                                         (copy the healthy entries out first with `members`;
+//!                                         one-entry repair for those comes later). It deletes
 //!                                         one batch of its records per call, each at the version
 //!                                         it was read at (`clear ok ...`). Repeat until `clear
 //!                                         unchanged (nothing to clear; nothing sent)`. A
@@ -285,7 +290,9 @@
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //!                                         (default 30). `wait ready` asks Db::wait_ready: after
 //!                                         node 1 restarted, or a failed heal, it stops at once,
-//!                                         says the next step, and the run exits 1
+//!                                         says the next step, and the run exits 1. Every 10 s
+//!                                         it waits it says `still waiting for ready: recovery
+//!                                         phase P`, node 1's phase then
 //! sleep <millis>
 //! quit
 //! ```
@@ -1385,7 +1392,7 @@ fn repl<'scope, 'env>(
                 put_line(db, answer, None);
             }),
             ["get", object] => {
-                read_line(db.read(object.as_bytes(), Look::Doc));
+                read_line(db.read(object.as_bytes(), Look::Doc).map_err(get_hint));
                 Ok(())
             }
             ["blob", "upload", object, rest @ ..] => blob_upload(db, object, rest, &mut sent),
@@ -1493,7 +1500,13 @@ fn repl<'scope, 'env>(
                     Ok(secs) => {
                         let within = Duration::from_secs(secs);
                         let waited = if *what == "ready" {
-                            wait_ready_line(progress, within, |within| db.wait_ready(within))
+                            wait_ready_line(
+                                progress,
+                                within,
+                                WAIT_PROGRESS_EVERY,
+                                |slice| db.wait_ready(slice),
+                                say,
+                            )
                         } else {
                             wait_recovered(progress, within, || db.heal_state())
                         };
@@ -2641,6 +2654,26 @@ fn parse_range(rest: &[&str]) -> Result<Look, String> {
 
 /// A `Db::read` answer as lines. A byte-string document prints as `get` always has; any other
 /// document as JSON.
+/// `get` reads a document. On another kind the read says only `a Map does not take this op`
+/// (tester, embed.md walk), so the verb that reads that kind is named after it.
+fn get_hint(mut error: ApiError) -> ApiError {
+    let verb = [
+        ("a Map does not take this op", "members <object>"),
+        ("a Set does not take this op", "members <object>"),
+        ("a List does not take this op", "items <object>"),
+        ("a Blob does not take this op", "read <object>"),
+    ]
+    .into_iter()
+    .find_map(|(said, verb)| (error.detail == said).then_some(verb));
+    if let Some(verb) = verb {
+        error.detail = format!(
+            "{}; `get` reads a document, read this one with `{verb}`",
+            error.detail
+        );
+    }
+    error
+}
+
 fn read_line(answer: Result<ReadOk, ApiError>) {
     let ok = match answer {
         Ok(ok) => ok,
@@ -3802,19 +3835,49 @@ fn wait_recovered(
     }
 }
 
+/// How often `wait ready` says it is still waiting.
+const WAIT_PROGRESS_EVERY: Duration = Duration::from_secs(10);
+
 /// `wait ready`: the line it ends with, from `Db::wait_ready`, which answers the present rather
 /// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
 /// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
 /// gives the next step). The run then exits 1. A timeout is said, and is not an error. A wait
 /// that reached ready records that as printed, so the poller does not say it a second time.
+///
+/// It asks `wait` for at most `every` at a time, and after each slice that ran out it says
+/// `still waiting for ready: recovery phase P` with node 1's phase then: the tester saw ~40 s
+/// with no line while rEtcd had no quorum. A timeout names the whole bound, not the last slice.
 fn wait_ready_line(
     progress: &Progress,
     within: Duration,
-    wait: impl FnOnce(Duration) -> Result<(), rdb_api::db::ReadyError>,
+    every: Duration,
+    mut wait: impl FnMut(Duration) -> Result<(), rdb_api::db::ReadyError>,
+    mut said: impl FnMut(&str),
 ) -> Result<String, String> {
     use rdb_api::db::ReadyError;
     let started = Instant::now();
-    let answer = wait(within);
+    let mut left = within;
+    let answer = loop {
+        let slice = left.min(every);
+        match wait(slice) {
+            Err(ReadyError::TimedOut { phase, .. }) if slice < left => {
+                left -= slice;
+                tracing::info!(
+                    phase = phase.as_str(),
+                    waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "repl_wait_progress"
+                );
+                said(&format!("still waiting for ready: recovery phase {phase}"));
+            }
+            Err(ReadyError::TimedOut { phase, .. }) => {
+                break Err(ReadyError::TimedOut {
+                    within_ms: within.as_millis(),
+                    phase,
+                })
+            }
+            answered => break answered,
+        }
+    };
     let millis = started.elapsed().as_millis();
     let (outcome, line) = match &answer {
         Ok(()) => {
@@ -5745,9 +5808,13 @@ mod tests {
             started.elapsed()
         );
         // `wait ready` asks Db::wait_ready, which ends at once on a failed heal itself.
-        let ready = wait_ready_line(&progress, Duration::from_secs(2), |_| {
-            Err(ReadyError::Heal(admin::HealError::NodeStopped))
-        })
+        let ready = wait_ready_line(
+            &progress,
+            Duration::from_secs(2),
+            WAIT_PROGRESS_EVERY,
+            |_| Err(ReadyError::Heal(admin::HealError::NodeStopped)),
+            |_| (),
+        )
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
         for (what, line) in [("recovered", recovered), ("ready", ready)] {
             assert_eq!(
@@ -5935,6 +6002,122 @@ mod tests {
         assert_eq!(paused, [(1.into(), 50.into())], "node 1's sync slept once");
     }
 
+    /// Tester (lead, 2026-10-23): `wait ready` printed nothing for ~40 s while rEtcd had no
+    /// quorum; only the final timeout named the state. It now says node 1's phase after each
+    /// `every` it waits, and its timeout names the whole bound, not the last slice. Unit.
+    #[test]
+    fn wait_ready_says_the_phase_every_slice_while_it_waits() {
+        use rdb_api::db::ReadyError;
+        let timed_out = |slice: Duration| ReadyError::TimedOut {
+            within_ms: slice.as_millis(),
+            phase: "ProposalUnresolved".to_owned(),
+        };
+        let progress = Progress::default();
+        let (mut asked, mut said) = (Vec::new(), Vec::new());
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(25),
+            Duration::from_secs(10),
+            |slice| {
+                asked.push(slice.as_secs());
+                Err(timed_out(slice))
+            },
+            |line| said.push(line.to_owned()),
+        )
+        .expect("a timeout is said, not an error");
+        assert_eq!(asked, [10, 10, 5], "slices of at most `every`, 25 s in all");
+        assert_eq!(
+            said,
+            ["still waiting for ready: recovery phase ProposalUnresolved"; 2]
+        );
+        assert_eq!(
+            line,
+            "timeout waiting for ready after 25s: node 1 did not admit writes within 25000 ms; \
+             recovery phase ProposalUnresolved"
+        );
+
+        // Ready in the second slice: one line said, then the reached line.
+        let (mut slices, mut said) = (0, Vec::new());
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(25),
+            Duration::from_secs(10),
+            |slice| {
+                slices += 1;
+                if slices == 1 {
+                    Err(timed_out(slice))
+                } else {
+                    Ok(())
+                }
+            },
+            |line| said.push(line.to_owned()),
+        )
+        .expect("ready");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        assert_eq!(said.len(), 1, "{said:?}");
+    }
+
+    /// Lead, on 5eeca8a: only `TimedOut` asks for another slice. An answer no wait changes
+    /// (a failed heal, node 1 restarted, `Blocked`, `Quarantined`) ends the wait on the slice
+    /// that gave it, with nothing said in between, and the run exits 1. Unit.
+    #[test]
+    fn wait_ready_ends_on_the_first_final_answer_without_another_slice() {
+        use rdb_api::db::ReadyError;
+        let finals = [
+            ReadyError::Heal(admin::HealError::NodeStopped),
+            ReadyError::Stopped {
+                note: "node 1 restarted".to_owned(),
+            },
+            ReadyError::Blocked {
+                reason: "BarrierIncomplete".to_owned(),
+            },
+            ReadyError::Quarantined,
+        ];
+        let progress = Progress::default();
+        for answer in finals {
+            let (mut slices, mut said) = (0, Vec::<String>::new());
+            let line = wait_ready_line(
+                &progress,
+                Duration::from_secs(60),
+                Duration::from_secs(10),
+                |_| {
+                    slices += 1;
+                    Err(answer.clone())
+                },
+                |line| said.push(line.to_owned()),
+            )
+            .expect_err("a final answer exits 1");
+            assert_eq!((slices, said.len()), (1, 0), "{answer:?}: {line}");
+            assert!(line.contains(&answer.to_string()), "{answer:?}: {line}");
+        }
+    }
+
+    /// Tester, embed.md walk at 6ed41b8: `get m1` on a map answered only `a Map does not take
+    /// this op`. It now names the verb that reads that kind; any other error is left as it is.
+    /// Unit.
+    #[test]
+    fn get_on_another_kind_names_the_verb_that_reads_it() {
+        use rdb_core::contracts::errors::ErrorKind;
+        let refused = |detail: &str| ApiError::new(ErrorKind::InvalidArgument, detail);
+        for (kind, verb) in [
+            ("Map", "members"),
+            ("Set", "members"),
+            ("List", "items"),
+            ("Blob", "read"),
+        ] {
+            let said = get_hint(refused(&format!("a {kind} does not take this op"))).detail;
+            assert_eq!(
+                said,
+                format!(
+                    "a {kind} does not take this op; `get` reads a document, read this one with \
+                     `{verb} <object>`"
+                )
+            );
+        }
+        let other = refused("object id 2000 bytes, over the 1024-byte limit");
+        assert_eq!(get_hint(other.clone()), other, "left as it is");
+    }
+
     /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
     /// second bare `ready` line inside the next command's output. One transition is said once:
     /// a wait that reached ready records it as printed, so the poller says nothing more until
@@ -5942,8 +6125,14 @@ mod tests {
     #[test]
     fn a_reached_wait_ready_is_not_said_again_by_the_poller() {
         let progress = Progress::default();
-        let line = wait_ready_line(&progress, Duration::from_secs(1), |_| Ok(()))
-            .expect("ready is not an error");
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(1),
+            WAIT_PROGRESS_EVERY,
+            |_| Ok(()),
+            |_| (),
+        )
+        .expect("ready is not an error");
         assert!(line.starts_with("reached ready in "), "{line}");
         let mut seen = progress.seen();
         assert_eq!(step_line(&mut seen, true, None), None, "said once");

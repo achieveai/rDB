@@ -42,6 +42,7 @@ rdb-api = { path = "<checkout>/crates/rdb-api" }          # the database
 config-core = { path = "<checkout>/crates/config-core" }  # the ConfigStore trait
 config-client = { path = "<checkout>/crates/config-client" } # the rEtcd gRPC client
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+serde_json = "1"                                          # to save a request (section 5)
 
 # RocksDB is unusably slow unoptimized. Optimize dependencies, keep your own code debuggable.
 [profile.dev.package."*"]
@@ -80,10 +81,22 @@ It runs without TLS and with every caller allowed. That is for one machine, neve
 ```rust
 use rdb_api::{Db, DbConfig, Timeouts};
 use std::error::Error;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn main() -> Result<(), Box<dyn Error>> {
+// Print an error with `{}`, not `{:?}`: its text ends with the next step to take.
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -125,7 +138,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 - `Db::open` is async; run it on your runtime. `wait_ready`, `put` and `get` are plain blocking
   calls; do not call them from inside an async task.
-- Every error here returns from `main`, which prints it and exits with code 1. A `Db` that is
+- Every error here returns from `run`. `main` prints its text, which ends with the next step
+  (`InUse`, for one, says to close the other open), and exits with code 1. A `Db` that is
   dropped on the way out shuts itself down. In a real app, match on the error instead (section 6).
 - On success it prints `read back hello at version N`. Run it a second time: the same code
   reopens the folder (section 5), the `put` writes a new version over the old one, and the line
@@ -169,9 +183,11 @@ extra to do, after a clean `shutdown` or after the process was killed.
 To ask later, you need something saved before the process stopped. There are two ways.
 
 - **Save the request after its answer.** It is in `ok.sent` on success, or `refused.request` on
-  `UNKNOWN_OUTCOME`. A `TxnRequest` serializes with `serde_json`. Write it to a file, and sync
-  the file (`File::sync_data`) before you rely on it. This does not cover a kill before the
-  answer: `put` builds its request inside `Db`, so there is nothing to save until it returns.
+  `UNKNOWN_OUTCOME`. Both hold it boxed: pass `*ok.sent` to `did_it_land` below. A
+  `TxnRequest` serializes with `serde_json` (in the `Cargo.toml` of section 2). Write it to a
+  file, and sync the file (`File::sync_data`) before you rely on it. This does not cover a kill
+  before the answer: `put` builds its request inside `Db`, so there is nothing to save until it
+  returns.
 - **Save the id before the send.** For a write you must be able to settle after a kill, choose
   its request id yourself. Build it with `rdb_api::app_request_id(n)` from your own number `n`
   (it returns `None` when `n` is 2^63 or more). Save the id, synced, then send with
@@ -236,7 +252,7 @@ fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<bool, A
     Ok(matches!(db.status(id, sent_in)?, TxnStatus::Resolved(_)))
 }
 
-/// The same question for a request saved after its answer (`ok.sent` or `refused.request`).
+/// The same question for a request saved after its answer: `*ok.sent`, or `refused.request`'s.
 fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
     let (id, sent_in) = (saved.identity.request, saved.expected_generation);
     match db.resend(saved) {
@@ -300,13 +316,23 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
   missing value instead. Moving to a clean copy comes with a later release (rejoin and recovery).
-- **Clearing a damaged object removes all of it.** `db.write(object, Change::Clear, None)`
-  (rdb_dev `admin clear`) deletes the whole map or set, not only the bad entry. One bad entry
-  costs every healthy entry too. Repairing one entry comes with a later release.
-  **If you need the healthy entries, copy them out first**, then clear. Read the object a page
-  at a time with `db.read(object, Look::Members { after, limit })`. A page that reaches the bad
-  entry fails with `CORRUPT_HISTORY`, and the error does not name the entry. Read with a small
-  `limit` up to it; if you know the bad key, set `after` to it to read the rest.
+- **A damaged map or set entry: write over it first.** A read that reaches it fails with
+  `CORRUPT_HISTORY`. Repair it with a write that names its key:
+  - a map: `put` the key again (or `del` it);
+  - a set: `del` the member, or `del` then `add` it in one write.
+
+  That repairs the one entry and keeps every healthy one (ADR-rdb-0013).
+- **Finding the bad key.** The error does not name it; a later release will. Until then, read
+  one entry at a time, `db.read(object, Look::Members { after, limit: 1 })`, with `after` set to
+  the key you read last (`None` to start). The read that fails is the entry right after the last
+  good key. Your app's own record of its keys says which key that is.
+- **What a write does not repair.** An `add` or a `need` on a damaged set member succeeds and
+  leaves it damaged. An entry damaged in header byte 0 or 3 reads as a newer build's, and so
+  does a real newer build's entry: a write that names it is refused `INCOMPATIBLE_VERSION`. For
+  those, and for a damaged root, the only remedy is to clear the object:
+  `db.write(object, Change::Clear, None)` (rdb_dev `admin clear`). **That deletes the whole map
+  or set, healthy entries too.** If you need them, copy them out first with the walk above, then
+  clear. Repairing one such entry (`repair_element`) comes with a later release.
 - **A restarted node stays out until the folder is opened again.** See section 5.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. An automatic
@@ -399,9 +425,6 @@ the one key after the last journalled line: that put was in flight. It is report
 | New folder, `--write 200 --verify` | 2.7-2.9 s | `verified 200/200` |
 | `--write 300 --reopens 1 --verify --bench` | 2.7 s, reopen 5.7 s | `verified 300/300`; get p50 305 us, p99 629 us |
 | Reopen after a kill mid-write, `--verify --bench` | 5.5 s | `verified 1246/1246`; get p50 280 us, p99 709 us |
-
-`--reopens` above 1 runs into the first known limit in section 5: only the first reopen follows
-writes.
 
 ### Ceilings: many reopens
 
