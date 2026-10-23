@@ -41,9 +41,10 @@
 //! and there is nothing to duplicate (ADR-0015, note of 2026-09-18). Each retry dials a
 //! configured endpoint this operation has not dialled yet, and gets an equal share of the time
 //! left, so one dead node cannot spend the whole budget; once every endpoint has been tried it
-//! retries the last one. The endpoint that answers is where later operations start. When none
-//! answers, the error names each endpoint with its reason (ADR-0015, note of 2026-10-22). A
-//! failure after a request was sent never moves to another endpoint.
+//! retries the last one. Later operations start at an endpoint reached by moving on from a
+//! connect failure; a followed leader hint never moves where they start. When none answers,
+//! the error names each endpoint with its reason (ADR-0015, note of 2026-10-22). A failure
+//! after a request was sent never moves to another endpoint.
 //!
 //! Under [`TlsMode::MutualTls`] the connect phase does not end at `connect()`. TLS 1.3 lets
 //! the client finish its half of the handshake before the server has looked at the client
@@ -278,8 +279,8 @@ impl GrpcClient {
     /// the first request — but the connection itself is established on first use, so a
     /// cluster that is still starting does not make construction fail. Requests start at the
     /// first endpoint. A leader hint moves them, and so does a failure to connect: the
-    /// operation then dials the next configured endpoint, and later operations start at the
-    /// endpoint that last answered.
+    /// operation then dials the next configured endpoint. Only that move changes where later
+    /// operations start: they start at the endpoint it reached. A followed hint never does.
     pub fn connect(
         endpoints: Vec<String>,
         opts: GrpcClientOptions,
@@ -391,7 +392,9 @@ impl GrpcClient {
         Ok(self)
     }
 
-    /// The endpoint requests start at.
+    /// The configured pin: the first endpoint, or the one [`GrpcClient::pinned`] named.
+    /// Requests may start elsewhere after a connect failure moved them (ADR-0015, note of
+    /// 2026-10-22).
     pub fn pinned_endpoint(&self) -> &str {
         &self.pinned
     }
@@ -786,7 +789,7 @@ impl GrpcClient {
                             tracing::debug!(%endpoint, "client start moved");
                         }
                     }
-                    unreached.ended_on_connect = false;
+                    unreached.reached(&endpoint);
                     channel
                 }
                 Err(error) => {
@@ -979,6 +982,9 @@ struct Unreached {
     dialled: Vec<String>,
     /// Each endpoint a connect failed at, with its last reason, in order of first failure.
     failed: Vec<(String, String)>,
+    /// Each endpoint a connect succeeded at, in order. The operation went on past it only by
+    /// following a `NotLeader` hint, so each answered but was not the leader (review A4).
+    reached: Vec<String>,
     /// Whether the operation's last attempt was a connect failure.
     ended_on_connect: bool,
 }
@@ -988,6 +994,13 @@ impl Unreached {
         if !self.dialled.iter().any(|e| e == endpoint) {
             self.dialled.push(endpoint.to_owned());
         }
+    }
+
+    fn reached(&mut self, endpoint: &str) {
+        if !self.reached.iter().any(|e| e == endpoint) {
+            self.reached.push(endpoint.to_owned());
+        }
+        self.ended_on_connect = false;
     }
 
     fn undialled(&self, endpoints: &[String]) -> usize {
@@ -1038,7 +1051,14 @@ impl Unreached {
             return last;
         }
         let tried: Vec<&str> = self.failed.iter().map(|(_, r)| r.as_str()).collect();
-        let mut reason = format!("no rEtcd endpoint could be reached: {}", tried.join("; "));
+        // An endpoint that connected answered `NotLeader`, so an endpoint was reached, just
+        // not a leader (review A4).
+        let what = if self.reached.is_empty() {
+            "endpoint"
+        } else {
+            "leader"
+        };
+        let mut reason = format!("no rEtcd {what} could be reached: {}", tried.join("; "));
         let not_tried: Vec<&str> = endpoints
             .iter()
             .filter(|e| !self.dialled.contains(e))
@@ -1048,6 +1068,12 @@ impl Unreached {
             reason.push_str(&format!(
                 "; not tried, the request budget ran out first: {}",
                 not_tried.join(", ")
+            ));
+        }
+        if !self.reached.is_empty() {
+            reason.push_str(&format!(
+                "; reached, but not the leader: {}",
+                self.reached.join(", ")
             ));
         }
         ConfigError::Unavailable { reason }

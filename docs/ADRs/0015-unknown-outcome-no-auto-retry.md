@@ -238,8 +238,12 @@ rule is now:
 - **One dead node cannot spend the whole budget.** A dial that is not a hint follow gets the
   time left divided by the endpoints not yet dialled; the last one gets all of it. A hint
   dial and the call itself keep the full time left.
-- **Later operations start where the last one answered.** The client keeps one start index,
-  shared by its clones. `pinned_endpoint()` still reports the configured pin.
+- **Later operations start where a connect failure moved to.** The client keeps one start
+  index, shared by its clones, and moves it only after moving on from a connect failure. A
+  followed leader hint never moves it, so each operation still pays its own hint round trip.
+  `pinned_endpoint()` still reports the configured pin.
+- **When an endpoint answered but no leader did, the error says so.** It reads "no rEtcd
+  leader could be reached" and lists the endpoints that answered (review A4, 2026-10-23).
 - **When nothing answers, the error says so per endpoint.** `Unavailable` names each endpoint
   with its reason, and those the budget never reached.
 - **A dead node behind a cached channel costs one operation, not two.** A call that got no
