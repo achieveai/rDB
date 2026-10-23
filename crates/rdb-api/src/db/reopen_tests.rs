@@ -1242,3 +1242,107 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         .expect("the live grant is still there");
     assert_eq!(kept.mod_revision, granted, "the live grant was not touched");
 }
+
+/// A-R188 (tester r8 `nr`): once node 1 has restarted, it does not rejoin in this open (#42).
+/// `wait_ready` answers at once with `Stopped`, whose text names the restart and says to shut
+/// the `Db` down and open the folder again, rather than waiting out its bound; a put and a get
+/// refused after it carry the same next step. Taking that step works: the reopen reads the write
+/// made before the restart.
+/// Integration (~3 s): one fresh open until ready, a put, a restart of node 1, a refused put and
+/// get, one reopen until ready.
+#[config_log::retcd_test]
+fn m10_r188_after_node_1_restarts_wait_ready_put_and_get_say_to_open_the_folder_again() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db.put(b"a", b"1", None).expect("a put");
+    assert_eq!(db.restart_node(OWNER).expect("node 1 restarts"), BootId(2));
+
+    let note = "the owner, node 1, restarted (now boot 2); a restarted node stays out until the \
+                folder is opened again (#42)";
+    let step = "nothing is served again in this open: to read or write again, shut this Db down \
+                and open the folder again";
+    let asked = std::time::Instant::now();
+    let stopped = db
+        .wait_ready(Duration::from_secs(30))
+        .expect_err("node 1 does not admit writes again in this open");
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "answered at once, not at the bound: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(
+        stopped,
+        ReadyError::Stopped {
+            note: note.to_owned()
+        }
+    );
+    assert_eq!(stopped.to_string(), format!("{note}; {step}"));
+
+    let put = db
+        .put(b"b", b"2", None)
+        .expect_err("the put is refused")
+        .error;
+    let get = db.get(b"a").expect_err("the get is refused");
+    for (call, error) in [("put", put), ("get", get)] {
+        assert!(
+            error.kind == ErrorKind::Unavailable
+                && error.detail.ends_with(&format!("; {note}; {step}")),
+            "{call}: {error:?}"
+        );
+    }
+    db.shutdown();
+
+    let mut db = open(&rt, dir.path(), &store).expect("the folder opened again");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the reopen is ready");
+    assert_eq!(
+        db.get(b"a")
+            .expect("the write made before the restart")
+            .value
+            .map(|(_, value)| value),
+        Some(Bytes::from_static(b"1"))
+    );
+    db.shutdown();
+}
+
+/// A-R189: a `GENERATION_CHANGED` refusal names the action. A request sent under generation 1
+/// and refused after a reopen moved the partition on says which request, under which
+/// generation, to look it up with `Db::status`, and not to resend it as a new request.
+/// Integration (~3 s): one fresh open until ready, a put, one reopen until ready, one resend.
+#[config_log::retcd_test]
+fn m10_r189_a_generation_changed_refusal_says_to_look_the_request_up_with_status() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let sent = *db.put(b"a", b"1", None).expect("a put").sent;
+    db.shutdown();
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the reopen is ready");
+    let refused = db
+        .resend(sent.clone())
+        .expect_err("a request sent under generation 1 is refused under generation 2");
+    assert_eq!(
+        (refused.error.kind, refused.error.detail.as_str()),
+        (
+            ErrorKind::GenerationChanged,
+            "generation changed: expected Generation(1), current Generation(2); request 1 was \
+             sent under generation 1; look it up with Db::status to see whether it applied; do \
+             not resend it as a new request"
+        )
+    );
+    assert_eq!(
+        refused.request.as_deref(),
+        Some(&sent),
+        "handed back unchanged"
+    );
+    db.shutdown();
+}
