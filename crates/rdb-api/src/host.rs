@@ -3674,6 +3674,8 @@ impl Host {
         }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, base) {
+            // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
+            // generation is held, so `survivor` never calls here. Kept as success (A-R179).
             Ok(Inherited::Linked | Inherited::AlreadyInherited) => {
                 tracing::info!(
                     node = self.node.0,
@@ -4037,11 +4039,12 @@ impl Host {
             return Err("step view missing after refresh".into());
         };
         // What P1 has published here, as `status` reads it: a publish answers unchanged only
-        // at or below it (C-3).
+        // at or below it (C-3). Read from the kernel, never its whole view: that clones the
+        // status index on every put (A-R174).
         let published = self
             .publication
-            .view(self.node, partition)
-            .map(|view| (view.published.generation, view.published.seq));
+            .kernel(self.node, partition)
+            .map(|kernel| (kernel.published().generation, kernel.published().seq));
         // The first put's group is the request's affinity. A put in another group is refused
         // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
         let affinity = puts.first().map_or(AFFINITY, |put| put.group);
@@ -4535,8 +4538,8 @@ impl Host {
                 .map(|state| state.allow && granted),
             published: self
                 .publication
-                .view(self.node, partition)
-                .map(|view| (view.published.generation, view.published.seq)),
+                .kernel(self.node, partition)
+                .map(|kernel| (kernel.published().generation, kernel.published().seq)),
             in_flight: match self
                 .transaction
                 .kernel(self.node, partition)

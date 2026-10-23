@@ -5173,12 +5173,13 @@ mod tests {
     /// misses `b` while 1-2 is held, so it stops at seq 1 of generation 1 while nodes 1 and 3
     /// hold 2; the next reopen runs without node 2 and commits generation 2 at base 2. The
     /// reopen after that cannot link generation 2 for node 2 (its head is below the base), and
-    /// a cross-generation catch-up does not exist yet. Slice 1's bar: no host fault, and the
-    /// stall is named (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line).
-    /// Integration (~20 s): three opens and the rebuild watch's wait.
+    /// a cross-generation catch-up does not exist yet: it is owed to slice 2. This row guards
+    /// slice 1's bar until then (A-R179): no host fault, and the stall is named
+    /// (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line). It waits for that line, not
+    /// a fixed time.
+    /// Integration (~20 s): the stall only shows after three real opens and the rebuild watch.
     #[config_log::retcd_test]
-    #[ignore = "owed: cross-gen catch-up (A-R177)"]
-    fn m10_d7_a_copy_below_the_base_of_a_missed_generation_is_named_stalled() {
+    fn m10_d7_below_the_base_a_copy_has_no_fault_and_its_stall_is_named() {
         let rt = runtime();
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -5240,6 +5241,151 @@ mod tests {
             line.starts_with("recovery_rebuild_stalled") && line.contains("gen=3"),
             "the stall names generation 3's rebuild: {line}"
         );
+        db.shutdown();
+    }
+
+    /// A-R174: a put's compile reads only P1's published position, so its cost does not grow
+    /// with the status index. Generation 1 gets one more record on every copy, written straight
+    /// to disk, whose batch holds 50,000 dedup rows; the reopen seeds them into node 1's status
+    /// index (M7A-194). Then 100 compiles take under 50 ms in all (times the deadline scale). A
+    /// compile that copies P1's whole view copies that index each time: 7.6 s for the 100 in a
+    /// debug build, against 19 ms reading the kernel's position (2026-10-23).
+    /// Integration (~5 s): two real opens, and the seed needs a recovery to land.
+    #[config_log::retcd_test]
+    fn a_compile_beside_a_50k_status_index_does_not_copy_it() {
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::envelope::ReplicationEnvelope;
+        use rdb_core::contracts::ids::BatchId;
+        use rdb_core::contracts::storage::{Batch, Namespace, Write};
+        use rdb_core::transaction::dedup::{dedup_key, dedup_value};
+        const SEEDED: u64 = 50_000;
+        const FIRST: u64 = 1_000_000;
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        for n in 1..=3 {
+            let mut engine =
+                RocksEngine::open(dir.path().join("nodes").join(n.to_string())).expect("engine");
+            let head = Seq(engine.buffered_applied(PARTITION, Generation(1)).0);
+            let (bytes, _) = engine
+                .history_at(PARTITION, Generation(1), head)
+                .expect("read")
+                .expect("the head record");
+            let last = ReplicationEnvelope::decode(&bytes).expect("decode");
+            let seq = Seq(head.0 + 1);
+            let mut env = last.clone();
+            env.header.seq = seq;
+            env.prev_digest = last.record_digest;
+            env.request_identity.request = RequestId(FIRST - 1);
+            env.mutations = Vec::new();
+            env.record_digest = env.compute_record_digest().expect("digest");
+            let mut progress = seq.0.to_le_bytes().to_vec();
+            progress.extend_from_slice(&env.record_digest.0);
+            let mut writes: Vec<Write> = (FIRST..FIRST + SEEDED)
+                .map(|request| Write {
+                    ns: Namespace::Dedup,
+                    key: dedup_key(
+                        Generation(1),
+                        GROUP,
+                        RequestIdentity {
+                            tenant: TENANT,
+                            client: CLIENT,
+                            request: RequestId(request),
+                        },
+                    ),
+                    value: Some(dedup_value(Digest::ROOT, seq, env.header.owner_epoch)),
+                })
+                .collect();
+            writes.push(Write {
+                ns: Namespace::History,
+                key: Bytes::copy_from_slice(&seq.0.to_be_bytes()),
+                value: Some(env.encode().expect("encode")),
+            });
+            writes.push(Write {
+                ns: Namespace::Progress,
+                key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+                value: Some(Bytes::from(progress)),
+            });
+            engine
+                .commit(Batch {
+                    id: BatchId(seq.0),
+                    partition: PARTITION,
+                    generation: Generation(1),
+                    seq,
+                    writes,
+                })
+                .expect("commit");
+        }
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        for request in [FIRST, FIRST + SEEDED - 1] {
+            loop {
+                match db.status(RequestId(request), Some(Generation(1))) {
+                    Ok(TxnStatus::Resolved(result))
+                        if result.outcome == Outcome::RecoveredApplied =>
+                    {
+                        break
+                    }
+                    other => assert!(
+                        std::time::Instant::now() < deadline,
+                        "request {request} not seeded within {patience:?}: {other:?}"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let compile = |request: u64| ClientCall::Compile {
+            identity: RequestIdentity {
+                tenant: TENANT,
+                client: CLIENT,
+                request: RequestId(request),
+            },
+            puts: vec![PutOp {
+                group: GROUP,
+                object: Bytes::from_static(b"a"),
+                change: byte_doc(b"2"),
+                expect: None,
+            }],
+            remaining_millis: 5_000,
+        };
+        let wait = Duration::from_secs(5);
+        match db.call(compile(1), wait) {
+            Some(Answer::Compiled(_)) => {}
+            other => panic!("the warm-up compile: {other:?}"),
+        }
+        let bar = crate::host::test_patience(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        for request in 2..=101 {
+            match db.call(compile(request), wait) {
+                Some(Answer::Compiled(_)) => {}
+                other => panic!("compile {request}: {other:?}"),
+            }
+        }
+        let took = started.elapsed();
+        tracing::info!(
+            took_micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+            "a_r174_compiles"
+        );
+        assert!(took < bar, "100 compiles took {took:?}, over {bar:?}");
         db.shutdown();
     }
 
