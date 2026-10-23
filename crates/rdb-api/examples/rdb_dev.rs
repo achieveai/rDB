@@ -82,6 +82,11 @@
 //! `request R not read` (a read): R is the id it used up. A write also prints `request=-`; a
 //! read prints no `request=` field, so its R is in the detail only.
 //!
+//! A data command (`put`, `put&`, `put --as`, `put-loop`, `txn`, `txn&`, `retry`, `get`,
+//! `read`, `status`, a value verb, a `blob` verb, `admin clear` or `admin repair-element`)
+//! answered with an error prints its `err` line, the run goes on to the next line, and the run
+//! exits 1. A lost reply from `client drop-reply` counts as an error: the app holds one.
+//!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
 //! word starts a comment; one inside a word, as in `{"tag":"#1"}`, or inside a `"..."`
 //! string, as in `{"m":"hello #world"}`, is kept, so a comment after JSON needs a space
@@ -870,12 +875,28 @@ where
         cluster,
         store: hostile,
     });
+    // A `put&` or `txn&` can answer after the last line: read once the scope has joined it.
+    let bg_failed = AtomicBool::new(false);
     let code = std::thread::scope(|scope| {
         scope.spawn(|| poll(&db, &progress, &stop));
-        let code = repl(scope, args, &db, &rt, &*store, control.as_ref(), &progress);
+        let code = repl(
+            scope,
+            args,
+            &db,
+            &rt,
+            &*store,
+            control.as_ref(),
+            &progress,
+            &bg_failed,
+        );
         stop.store(true, Ordering::Relaxed);
         code
     });
+    let code = if code == ExitCode::SUCCESS && bg_failed.load(Ordering::Relaxed) {
+        ExitCode::from(1)
+    } else {
+        code
+    };
     db.shutdown();
     drop(db);
     close(store, local, rt, args, existed);
@@ -1498,9 +1519,11 @@ fn holds_part(node: &NodeStatus) -> String {
     )
 }
 
-/// One command per line; the exit code is 1 when any command failed to parse, and 2 at once
-/// when a line cannot be read. A background put runs on `scope`, so the run waits for it before
-/// shutting down.
+/// One command per line; the exit code is 1 when any command failed to parse or a data command
+/// (a put, read, write, txn, retry, status or blob verb) was answered with an error, and 2 at
+/// once when a line cannot be read. A background put runs on `scope`, so the run waits for it
+/// before shutting down; its error sets `bg_failed`, which the caller reads once it has.
+#[allow(clippy::too_many_arguments)]
 fn repl<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     args: &Args,
@@ -1509,6 +1532,7 @@ fn repl<'scope, 'env>(
     store: &dyn ConfigStore,
     control: Option<&Control<'_>>,
     progress: &Progress,
+    bg_failed: &'env AtomicBool,
 ) -> ExitCode {
     let input: Box<dyn BufRead> = match &args.script {
         Some(path) => match std::fs::File::open(path) {
@@ -1556,10 +1580,15 @@ fn repl<'scope, 'env>(
                 _ => None,
             };
             let done = if let Some(read) = read {
-                read.map(|(object, look)| read_line(db.read(object.as_bytes(), look)))
+                read.map(|(object, look)| {
+                    let answer = db.read(object.as_bytes(), look);
+                    bad |= answer.is_err();
+                    read_line(answer);
+                })
             } else {
                 parse_change(&line).map(|(object, expect, change)| {
-                    write_line(db, db.write(object.as_bytes(), change, expect), &mut sent);
+                    let answer = db.write(object.as_bytes(), change, expect);
+                    bad |= !write_line(db, answer, &mut sent);
                 })
             };
             if let Err(e) = done {
@@ -1577,7 +1606,7 @@ fn repl<'scope, 'env>(
             match parse_repair(&line) {
                 Ok((object, change)) => {
                     let answer = db.write(object.as_bytes(), change, None);
-                    kind_write_line(
+                    bad |= !kind_write_line(
                         db,
                         "repair ",
                         REPAIR_NOTHING,
@@ -1638,7 +1667,7 @@ fn repl<'scope, 'env>(
                     object: object.as_bytes().to_vec(),
                     if_version,
                 };
-                app_put_line(db, answer, kind, &mut sent, &mut drop_reply);
+                bad |= !app_put_line(db, answer, kind, &mut sent, &mut drop_reply);
                 Ok(())
             }),
             ["put", "--as", ..] => Err("put --as <n> <object> <value> [--if-version N]".to_owned()),
@@ -1649,14 +1678,14 @@ fn repl<'scope, 'env>(
                         object: object.as_bytes().to_vec(),
                         if_version,
                     };
-                    app_put_line(db, answer, kind, &mut sent, &mut drop_reply);
+                    bad |= !app_put_line(db, answer, kind, &mut sent, &mut drop_reply);
                     Ok(())
                 }
                 Err(e) => Err(e),
             },
             ["put-loop", count, gap, rest @ ..] => {
                 parse_put_loop(count, gap, rest).map(|(count, gap, object)| {
-                    put_loop(db, count, gap, object);
+                    bad |= !put_loop(db, count, gap, object);
                 })
             }
             ["put-loop", ..] => Err(PUT_LOOP_USAGE.to_owned()),
@@ -1671,18 +1700,24 @@ fn repl<'scope, 'env>(
                 say(&format!("bg {object}: queued"));
                 scope.spawn(move || {
                     let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
+                    if answer.is_err() {
+                        bg_failed.store(true, Ordering::Relaxed);
+                    }
                     say(&format!("bg {object}: {}", put_text(&answer)));
                     bg_note(db, &format!("bg {object}"), &answer);
                 });
             }),
             ["txn", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
                 let answer = db.txn(&txn_puts(&ops), deadline);
-                put_line(db, answer, Some((&mut sent, Kind::Txn)));
+                bad |= !put_line(db, answer, Some((&mut sent, Kind::Txn)));
             }),
             ["txn&", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
                 say("bg txn: queued");
                 scope.spawn(move || {
                     let answer = db.txn(&txn_puts(&ops), deadline);
+                    if answer.is_err() {
+                        bg_failed.store(true, Ordering::Relaxed);
+                    }
                     say(&format!("bg txn: {}", put_text(&answer)));
                     bg_note(db, "bg txn", &answer);
                 });
@@ -1691,7 +1726,7 @@ fn repl<'scope, 'env>(
                 sent.pick(rest).and_then(|(request, kind)| {
                     let id = request.identity.request;
                     let (object, if_version) = payload_put(kind, id)?;
-                    put_line(
+                    bad |= !put_line(
                         db,
                         db.put_as(id, &object, value.as_bytes(), if_version),
                         None,
@@ -1704,7 +1739,7 @@ fn repl<'scope, 'env>(
                     let deadline = Duration::from_millis(ms);
                     let answer = db.resend_within(request, deadline);
                     sent.resent_within(deadline, &answer);
-                    put_line(db, answer, None);
+                    bad |= !put_line(db, answer, None);
                 }),
                 Err(_) => Err("retry [<request>] --deadline-ms N: N is milliseconds".to_owned()),
             },
@@ -1717,26 +1752,40 @@ fn repl<'scope, 'env>(
                         db.resend_within(request, deadline)
                     }
                 };
-                put_line(db, answer, None);
+                bad |= !put_line(db, answer, None);
             }),
             ["get", object] => {
-                read_line(db.read(object.as_bytes(), Look::Doc).map_err(get_hint));
+                let answer = db.read(object.as_bytes(), Look::Doc).map_err(get_hint);
+                bad |= answer.is_err();
+                read_line(answer);
                 Ok(())
             }
-            ["blob", "upload", object, rest @ ..] => blob_upload(db, object, rest, &mut sent),
-            ["blob", "chunk", object, rest @ ..] => blob_chunk(db, object, rest, &mut sent),
-            ["blob", "publish", object, rest @ ..] => blob_publish(db, object, rest, &mut sent),
-            ["blob", "gc", object, rest @ ..] => blob_gc(db, object, rest, &mut sent),
+            ["blob", "upload", object, rest @ ..] => {
+                blob_upload(db, object, rest, &mut sent).map(|ok| bad |= !ok)
+            }
+            ["blob", "chunk", object, rest @ ..] => {
+                blob_chunk(db, object, rest, &mut sent).map(|ok| bad |= !ok)
+            }
+            ["blob", "publish", object, rest @ ..] => {
+                blob_publish(db, object, rest, &mut sent).map(|ok| bad |= !ok)
+            }
+            ["blob", "gc", object, rest @ ..] => {
+                blob_gc(db, object, rest, &mut sent).map(|ok| bad |= !ok)
+            }
             ["blob", ..] => Err(BLOB_USAGE.to_owned()),
             ["read", object, rest @ ..] => parse_range(rest).map(|look| {
-                read_line(db.read(object.as_bytes(), look));
+                let answer = db.read(object.as_bytes(), look);
+                bad |= answer.is_err();
+                read_line(answer);
             }),
             ["read", ..] => Err(READ_USAGE.to_owned()),
             ["get", object, "--previous"] => {
-                get_line(db.get_previous(object.as_bytes()));
+                let answer = db.get_previous(object.as_bytes());
+                bad |= answer.is_err();
+                get_line(answer);
                 Ok(())
             }
-            ["status", rest @ ..] => status_line(db, &sent, rest),
+            ["status", rest @ ..] => status_line(db, &sent, rest).map(|ok| bad |= !ok),
             // App-only, every node is another process: their links are what this one knows.
             ["nodes"] if !args.nodes.is_empty() => {
                 say(APP_ONLY_NODES);
@@ -1772,7 +1821,7 @@ fn repl<'scope, 'env>(
             ["admin", "damage", _, ..] => damage_record(db, &line),
             ["admin", "clear", object] => {
                 let answer = db.write(object.as_bytes(), Change::Clear, None);
-                kind_write_line(
+                bad |= !kind_write_line(
                     db,
                     "clear ",
                     "nothing to clear",
@@ -2574,9 +2623,10 @@ fn parse_token(text: &str) -> Result<Token, String> {
     })
 }
 
-/// A value write's answer, remembered for `retry` as [`Kind::Value`].
-fn write_line(db: &Db, answer: Result<Option<rdb_api::PutOk>, PutError>, sent: &mut Sent) {
-    labelled_write_line(db, "", "nothing to write", answer, sent);
+/// A value write's answer, remembered for `retry` as [`Kind::Value`]. False when it was an
+/// error.
+fn write_line(db: &Db, answer: Result<Option<rdb_api::PutOk>, PutError>, sent: &mut Sent) -> bool {
+    labelled_write_line(db, "", "nothing to write", answer, sent)
 }
 
 /// [`write_line`] with `label` before the answer, and `unchanged` saying why a write that
@@ -2695,8 +2745,9 @@ fn hex_bytes<const N: usize>(text: &str) -> Result<[u8; N], String> {
     <[u8; N]>::try_from(bytes).map_err(|bytes| format!("{} bytes, not {N}", bytes.len()))
 }
 
-/// `blob upload`: each chunk, then the publish, unless `--stop-after` stops it first.
-fn blob_upload(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+/// `blob upload`: each chunk, then the publish, unless `--stop-after` stops it first. `Ok(false)`
+/// when a write was answered with an error, as for each `blob` verb below.
+fn blob_upload(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<bool, String> {
     let args = BlobArgs::parse(rest, &["--upload", "--chunk-size", "--stop-after"])?;
     let upload = args.upload()?;
     let text = args.text()?.as_bytes();
@@ -2726,7 +2777,7 @@ fn blob_upload(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<
             answer,
             sent,
         ) {
-            return Ok(());
+            return Ok(false);
         }
     }
     if let Some(k) = stop_after {
@@ -2742,7 +2793,7 @@ fn blob_upload(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<
             hex::encode(upload),
             hex::encode(sha256)
         ));
-        return Ok(());
+        return Ok(true);
     }
     let change = Change::Publish {
         upload,
@@ -2751,12 +2802,17 @@ fn blob_upload(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<
         sha256,
     };
     let answer = db.write(object.as_bytes(), change, args.expect);
-    labelled_write_line(db, "publish ", "already published", answer, sent);
-    Ok(())
+    Ok(labelled_write_line(
+        db,
+        "publish ",
+        "already published",
+        answer,
+        sent,
+    ))
 }
 
 /// `blob chunk`: one chunk. A guard is passed on for the owner to refuse.
-fn blob_chunk(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+fn blob_chunk(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<bool, String> {
     let args = BlobArgs::parse(rest, &["--upload", "--index"])?;
     let index: u32 = args.number("--index")?;
     let change = Change::Chunk {
@@ -2765,18 +2821,17 @@ fn blob_chunk(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(
         bytes: Bytes::copy_from_slice(args.text()?.as_bytes()),
     };
     let answer = db.write(object.as_bytes(), change, args.expect);
-    labelled_write_line(
+    Ok(labelled_write_line(
         db,
         &format!("chunk {index} "),
         "already stored",
         answer,
         sent,
-    );
-    Ok(())
+    ))
 }
 
 /// `blob publish`: publish an upload whose chunks are stored.
-fn blob_publish(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+fn blob_publish(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<bool, String> {
     let args = BlobArgs::parse(rest, &["--upload", "--size", "--chunk-size", "--sha256"])?;
     if args.text.is_some() {
         return Err("blob publish takes no <text>".to_owned());
@@ -2790,13 +2845,18 @@ fn blob_publish(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result
             .map_err(|e| format!("--sha256 {sha:?}: {e}; it is 64 hex digits"))?,
     };
     let answer = db.write(object.as_bytes(), change, args.expect);
-    labelled_write_line(db, "publish ", "already published", answer, sent);
-    Ok(())
+    Ok(labelled_write_line(
+        db,
+        "publish ",
+        "already published",
+        answer,
+        sent,
+    ))
 }
 
 /// `blob gc`: one batch of the object's unreachable chunks at or below the floor. A guard is
 /// passed on for the owner to refuse.
-fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<bool, String> {
     let args = BlobArgs::parse(rest, &["--floor"])?;
     if args.text.is_some() {
         return Err("blob gc takes no <text>".to_owned());
@@ -2805,8 +2865,13 @@ fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), 
         floor: args.number("--floor")?,
     };
     let answer = db.write(object.as_bytes(), change, args.expect);
-    labelled_write_line(db, "gc ", "nothing to collect", answer, sent);
-    Ok(())
+    Ok(labelled_write_line(
+        db,
+        "gc ",
+        "nothing to collect",
+        answer,
+        sent,
+    ))
 }
 
 /// The lowest request id of `admin damage` and `damage-chunk`. Node status names an in-flight
@@ -3733,23 +3798,27 @@ impl Sent {
 
 /// Print a put's or txn's answer, and remember what it sent when `record` names where. A
 /// refusal is followed by a `note:` line when node 1's queue waits on a write it applied and
-/// has not published ([`waits_note`]).
-fn put_line(db: &Db, answer: Result<rdb_api::PutOk, PutError>, record: Option<(&mut Sent, Kind)>) {
-    labelled_put_line(db, "", answer, record);
+/// has not published ([`waits_note`]). False when the answer was an error: the run then exits 1.
+fn put_line(
+    db: &Db,
+    answer: Result<rdb_api::PutOk, PutError>,
+    record: Option<(&mut Sent, Kind)>,
+) -> bool {
+    labelled_put_line(db, "", answer, record)
 }
 
 /// A `put`'s answer as the app gets it. With `client drop-reply` armed and the put applied, the
 /// reply is lost on the way to the app, which then holds the `UNKNOWN_OUTCOME` it would hold
 /// after a timeout: the day-1 stand-in for S2-7's lost reply (M10 S2, W7). The request is
 /// recorded either way, so `status` and `retry` reach it. A put that did not apply prints its
-/// own answer and leaves the drop armed.
+/// own answer and leaves the drop armed. False when the app holds an error, a lost reply too.
 fn app_put_line(
     db: &Db,
     answer: Result<rdb_api::PutOk, PutError>,
     kind: Kind,
     sent: &mut Sent,
     drop_reply: &mut bool,
-) {
+) -> bool {
     match answer {
         Ok(ok) if *drop_reply => {
             *drop_reply = false;
@@ -3760,6 +3829,7 @@ fn app_put_line(
             );
             say(&lost_reply_text(ok.request));
             sent.record(Some(*ok.sent), kind);
+            false
         }
         answer => put_line(db, answer, Some((sent, kind))),
     }
@@ -3802,8 +3872,10 @@ fn parse_put_loop<'a>(
 /// `put-loop`: `count` puts to `object`, `gap` apart, the i-th writing `i`. Each prints
 /// `put-loop i=I at_ms=T ms=M <answer>`: T the wall clock (Unix ms) it was sent at, M how long
 /// its answer took, the answer as `put` prints it. Logged as `repl_put_loop{i, at_ms, ms,
-/// outcome}`, for S2-2 and S2-6 timings. Not recorded for `retry`.
-fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) {
+/// outcome}`, for S2-2 and S2-6 timings. Not recorded for `retry`. False when any put's answer
+/// was an error; the loop goes on either way.
+fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) -> bool {
+    let mut all_ok = true;
     for i in 1..=count {
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3821,10 +3893,12 @@ fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) {
             "put-loop i={i} at_ms={at_ms} ms={ms} {}",
             put_text(&answer)
         ));
+        all_ok &= answer.is_ok();
         if i < count {
             std::thread::sleep(gap);
         }
     }
+    all_ok
 }
 
 /// [`put_line`] with `label` before the answer, as `chunk 0 ok ...`.
@@ -3833,7 +3907,7 @@ fn labelled_put_line(
     label: &str,
     answer: Result<rdb_api::PutOk, PutError>,
     record: Option<(&mut Sent, Kind)>,
-) {
+) -> bool {
     let remember = |request: Option<TxnRequest>| {
         if let Some((sent, kind)) = record {
             sent.record(request, kind);
@@ -3846,8 +3920,14 @@ fn labelled_put_line(
         }
     }
     match answer {
-        Ok(ok) => remember(Some(*ok.sent)),
-        Err(PutError { request, .. }) => remember(request.map(|request| *request)),
+        Ok(ok) => {
+            remember(Some(*ok.sent));
+            true
+        }
+        Err(PutError { request, .. }) => {
+            remember(request.map(|request| *request));
+            false
+        }
     }
 }
 
@@ -3942,7 +4022,8 @@ fn parse_status(words: &[&str]) -> Result<(u64, Option<Generation>), String> {
     Ok((request, generation))
 }
 
-fn status_line(db: &Db, sent: &Sent, words: &[&str]) -> Result<(), String> {
+/// `status <request> [<generation>]`'s answer. `Ok(false)` when the answer was an error.
+fn status_line(db: &Db, sent: &Sent, words: &[&str]) -> Result<bool, String> {
     let (request, generation) = parse_status(words)?;
     // The nodes first: a request node 1 holds in flight that publishes between the two looks is
     // then answered by the status, never called not in flight (Msg 8, W6-D1).
@@ -3961,9 +4042,12 @@ fn status_line(db: &Db, sent: &Sent, words: &[&str]) -> Result<(), String> {
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
         }
         Ok(status) => say(&known_status_line(request, &status)),
-        Err(error) => say(&format!("err {} ({})", error.name(), error.explain())),
+        Err(error) => {
+            say(&format!("err {} ({})", error.name(), error.explain()));
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A `status` answer other than `Unknown`, in plain numbers as a put's `ok` line (PB-2).
@@ -6684,6 +6768,54 @@ mod tests {
         let issued = damage_request();
         assert!(is_damage_request(issued), "{issued:?}");
         assert!(!is_damage_request(RequestId(issued.0 + (1 << 20))));
+    }
+
+    /// Lead, on the G walk at 315ec20: a put on node 2 printed `err UNAVAILABLE ...` and the run
+    /// exited 0. A data command answered with an error now makes the run exit 1, and the run
+    /// still goes on to the next line. Four runs: a refused put, a refused `put&` that answers
+    /// after the last line (read once the scope has joined it), a `get` of a map (a read
+    /// error), and a clean put and get, which exits 0. Cut: drop `bad |= !app_put_line(..)`
+    /// back to a bare call and the first run exits 0; drop the `bg_failed` check in `run` and
+    /// the second does; drop `get`'s `bad |= answer.is_err()` and the third does. Integration
+    /// (~8 s): three real rEtcd voters per run.
+    #[config_log::retcd_test]
+    fn a_data_command_answered_with_an_error_makes_the_run_exit_1() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        for (name, script, want) in [
+            (
+                "put",
+                "wait ready 60\nput zqe1 v --if-version 9\nput zqe2 v\n",
+                ExitCode::from(1),
+            ),
+            (
+                "bg",
+                "wait ready 60\nput& zqe3 v --if-version 9\n",
+                ExitCode::from(1),
+            ),
+            (
+                "get",
+                "wait ready 60\nmap zqe5 put \"k\" \"v\"\nget zqe5\n",
+                ExitCode::from(1),
+            ),
+            (
+                "clean",
+                "wait ready 60\nput zqe4 v\nget zqe4\n",
+                ExitCode::SUCCESS,
+            ),
+        ] {
+            let path = root.path().join(format!("{name}.txt"));
+            std::fs::write(&path, script).expect("write the script");
+            let args = Args {
+                dir: root.path().join(name),
+                log_dir: root.path().join(format!("{name}-logs")),
+                script: Some(path),
+                ..parse(std::iter::empty()).expect("defaults")
+            };
+            assert_eq!(run(&args, Db::open), want, "{name}: {script}");
+        }
     }
 
     /// Tester w3a03 (A-R191, k227): `wait ready` read rdb_dev's own latch, so after `node
