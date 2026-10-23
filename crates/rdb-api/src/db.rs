@@ -546,7 +546,19 @@ pub enum ReadyError {
         /// Node 1's last recovery phase, in words.
         phase: String,
     },
+    /// Node 1 restarted, or its restart failed: it does not rejoin in this open (#42), so it
+    /// will not admit writes again whatever the wait (A-R188).
+    #[error("{note}; {step}", step = REOPEN_STEP)]
+    Stopped {
+        /// [`Db::restart_note`].
+        note: String,
+    },
 }
+
+/// The next step once node 1 has restarted: nothing it served comes back in this open
+/// (M10 A-R188). Rides on [`ReadyError::Stopped`] and on every put or get refusal after it.
+const REOPEN_STEP: &str = "nothing is served again in this open: to read or write again, shut \
+                           this Db down and open the folder again";
 
 /// The largest restart count one open gives a node, so it never reaches the next open's boots.
 const MAX_RESTARTS: u64 = 65_534;
@@ -1005,17 +1017,22 @@ impl Db {
     }
 
     /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at
-    /// node 1 itself each time, never at what an earlier look saw.
+    /// node 1 itself each time, never at what an earlier look saw. Once node 1 has restarted,
+    /// or its restart failed, answers at once: it does not rejoin in this open (#42).
     ///
     /// # Errors
     ///
-    /// [`ReadyError`].
+    /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, whose text says to shut
+    /// this `Db` down and open the folder again (A-R188).
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from("unknown");
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                 return Err(ReadyError::Heal(error.clone()));
+            }
+            if let Some(note) = self.restart_note().filter(|_| self.owner_restarted()) {
+                return Err(ReadyError::Stopped { note });
             }
             if let Some(owner) = self.inspect(OWNER) {
                 if owner.admits == Some(true) {
@@ -1426,7 +1443,7 @@ impl Db {
             self.ready_seen.store(true, Ordering::Relaxed);
         }
         answered.map_err(|PutError { error, request }| PutError {
-            error: self.explained(error),
+            error: self.explained(reconcile_step(error, request.as_deref())),
             request,
         })
     }
@@ -1610,13 +1627,11 @@ impl Db {
             .any(|handle| handle.node == node && handle.start_failed)
     }
 
-    /// Why writes stopped for good, once a node of this `Db` has restarted or failed to restart;
-    /// `None` while every node runs its first boot. Names each restarted node and its boot, and
-    /// says when the restart failed and the node stays stopped (F-013), in one short clause,
-    /// because it rides on every refused answer (tester walk 5): a restarted copy does not
-    /// rejoin before M10 (achieveai/rDB#42), so writes do not resume, and this `Db`'s data and
-    /// control store cannot be opened again (`NotEmpty`, `AlreadyExists`), so writing again
-    /// takes a new `Db` on new ones (M9 S2b, D2).
+    /// Which nodes of this `Db` have restarted or failed to restart; `None` while every node runs
+    /// its first boot. Names each restarted node and its boot, and says when the restart failed
+    /// and the node stays stopped (F-013), in one short clause, because it rides on every refused
+    /// answer (tester walk 5). A restarted copy does not rejoin in this open (achieveai/rDB#42):
+    /// it takes part again once the folder is opened again (M10 A-R188).
     #[must_use]
     pub fn restart_note(&self) -> Option<String> {
         let restarted: Vec<String> = lock(&self.nodes)
@@ -1638,7 +1653,7 @@ impl Db {
             .collect();
         (!restarted.is_empty()).then(|| {
             format!(
-                "{}; a restarted node stays out until M10 (#42)",
+                "{}; a restarted node stays out until the folder is opened again (#42)",
                 restarted.join(", ")
             )
         })
@@ -1647,25 +1662,38 @@ impl Db {
     /// `error` with [`Self::restart_note`] appended to its detail, for the kinds a restart
     /// leaves every later call with: `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME`, and
     /// `NOT_PRIMARY`, whose `RefreshRoute` would otherwise send the caller looking for a primary
-    /// that no node becomes again in M9 (tester W3-D1). The kind, retry rule and mutation proof
-    /// are unchanged.
+    /// that no node becomes again in this open (tester W3-D1). Once node 1 has restarted, the
+    /// next step follows: shut this `Db` down and open the folder again (A-R188). The kind,
+    /// retry rule and mutation proof are unchanged.
     fn explained(&self, mut error: ApiError) -> ApiError {
-        let Some(note) = self.restart_note() else {
+        let Some(mut note) = self.restart_note() else {
             return error;
         };
+        if self.owner_restarted() {
+            note = format!("{note}; {REOPEN_STEP}");
+        }
         match error.kind {
             ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome => {
                 error.detail = format!("{}; {note}", error.detail);
             }
             ErrorKind::NotPrimary => {
                 error.detail = format!(
-                    "{}; no node becomes primary again in M9: {note}",
+                    "{}; no node becomes primary again in this open: {note}",
                     error.detail
                 );
             }
             _ => {}
         }
         error
+    }
+
+    /// Whether node 1 has restarted, or its restart failed: it then holds nothing and does not
+    /// rejoin in this open (#42), so nothing it served comes back until the folder is opened
+    /// again.
+    fn owner_restarted(&self) -> bool {
+        lock(&self.nodes)
+            .iter()
+            .any(|handle| handle.node == OWNER && handle.boot != self.opened.base_boot)
     }
 
     /// Whether node 1 admits writes or has been seen to; looks once when it has not.
@@ -2015,6 +2043,26 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
         at: read.at,
         waited: read.waited,
     })
+}
+
+/// `error` with the action a `GENERATION_CHANGED` refusal of `sent` asks for (M10 A-R189): the
+/// request may have applied under the generation it was sent under, so the caller looks it up
+/// with [`Db::status`] rather than sending it again as a new request. Any other error, or one
+/// with no request in hand, is returned as it is.
+fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
+    let Some(sent) = sent.filter(|_| error.kind == ErrorKind::GenerationChanged) else {
+        return error;
+    };
+    let under = sent.expected_generation.map_or_else(
+        || "with no expected generation".to_owned(),
+        |generation| format!("under generation {}", generation.0),
+    );
+    error.detail = format!(
+        "{}; request {} was sent {under}; look it up with Db::status to see whether it applied; \
+         do not resend it as a new request",
+        error.detail, sent.identity.request.0
+    );
+    error
 }
 
 /// A read P1 refused with `kind`, with the retry rule and mutation proof the kernel's own table
@@ -4032,14 +4080,19 @@ mod tests {
         let note = db.restart_note().expect("the owner restarted");
         assert_eq!(
             note,
-            "the owner, node 1, restarted (now boot 2); a restarted node stays out until M10 (#42)"
+            "the owner, node 1, restarted (now boot 2); a restarted node stays out until the folder \
+             is opened again (#42)"
         );
         for kind in kinds {
             let plain = ApiError::new(kind, "d");
             let explained = db.explained(plain.clone());
             let detail = match kind {
-                ProtectionPaused | Unavailable | UnknownOutcome => format!("d; {note}"),
-                NotPrimary => format!("d; no node becomes primary again in M9: {note}"),
+                ProtectionPaused | Unavailable | UnknownOutcome => {
+                    format!("d; {note}; {REOPEN_STEP}")
+                }
+                NotPrimary => {
+                    format!("d; no node becomes primary again in this open: {note}; {REOPEN_STEP}")
+                }
                 _ => "d".to_owned(),
             };
             assert_eq!(
@@ -4053,7 +4106,8 @@ mod tests {
         let put = db.put(b"a", b"1", None).expect_err("nor the compile").error;
         for (call, error) in [("get", get), ("status", status), ("put", put)] {
             assert!(
-                error.kind == Unavailable && error.detail.ends_with(&note),
+                error.kind == Unavailable
+                    && error.detail.ends_with(&format!("{note}; {REOPEN_STEP}")),
                 "{call}: {error:?}"
             );
         }
