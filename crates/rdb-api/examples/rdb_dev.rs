@@ -2597,7 +2597,9 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
             // A-R211: a set member has no envelope, so a sealed one there is only bytes, which
             // reads as damage whatever `--as` says. Refused before anything is written.
             Ok((_, CollectionKind::Set)) if matches!(how, "newer" | "kind0") => {
-                return Err(format!("admin damage: {SET_MEMBER_AS}, not --as {how}"));
+                return Err(format!(
+                    "admin damage: {SET_MEMBER_AS}; not a member with --as {how}"
+                ));
             }
             Ok((put, _)) => mutations.push(put),
             Err(said) => {
@@ -6523,7 +6525,7 @@ mod tests {
                 format!(
                     "admin damage: a set member holds no envelope, so any bytes in it are \
                      damage; damage a set member with --as digest, or a newer build's set with \
-                     the root and --as newer, not --as {how}"
+                     the root and --as newer; not a member with --as {how}"
                 )
             );
             assert_eq!(version(&db), before, "{how}: nothing was written");
