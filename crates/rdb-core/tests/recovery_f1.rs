@@ -7153,7 +7153,10 @@ fn barrier_retries(method: &str) -> Vec<(u64, String)> {
         .map(|line| {
             (
                 line["attempt"].as_u64().expect("attempt is a number"),
-                line["unproven"].as_str().expect("unproven is text").to_owned(),
+                line["unproven"]
+                    .as_str()
+                    .expect("unproven is text")
+                    .to_owned(),
             )
         })
         .collect()
@@ -7310,7 +7313,10 @@ fn m10_s2_retry_a_newer_fence_supersedes_a_retry_in_progress() {
     f1.rec(3_000, durable(A, 20, dg(0, 20)));
     f1.step(2 * WINDOW, fired(2));
     assert_eq!(
-        f1.rec(2 * WINDOW + 1, RecoveryEvent::FenceProven(Box::new(proof()))),
+        f1.rec(
+            2 * WINDOW + 1,
+            RecoveryEvent::FenceProven(Box::new(proof()))
+        ),
         vec![ign(ReplicaIgnoreReason::OutOfPhase)],
         "the run's own fence, replayed"
     );
