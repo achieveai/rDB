@@ -771,7 +771,7 @@ async fn watch(
                     Err((kind, detail)) => return fault(&links, site, kind, detail),
                 };
                 cursor = Revision(event.revision);
-                tracing::debug!(
+                tracing::info!(
                     node = site.node.0,
                     prefix = name,
                     revision = event.revision,
@@ -1865,6 +1865,49 @@ mod tests {
                 Box::pin(futures::stream::iter(items).chain(quiet));
             Box::pin(std::future::ready(Ok(stream)))
         }
+    }
+
+    /// M10 S2 (#57 walk, lead to W7): each rEtcd event a watch delivers is logged
+    /// `control_watch_event` at info, so a walk at rdb_dev's default level sees a change reach a
+    /// node. It was debug, below what a walk reads. Cut: back to debug, and `@l` reads `Debug`.
+    /// Unit.
+    #[config_log::retcd_test]
+    fn a_delivered_watch_event_is_logged_at_info() {
+        let script = BTreeMap::from([(
+            ControlPrefix::Partitions.encode().to_owned(),
+            vec![Stream::of(vec![Ok(WatchItem::Event(
+                config_core::MutationEvent {
+                    revision: 4,
+                    key: Bytes::from_static(b"partitions/1"),
+                    kind: config_core::MutationEventKind::Delete,
+                },
+            ))])],
+        )]);
+        let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch::new(script));
+        let links = Links::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(watch(
+            store,
+            links,
+            SITE,
+            ControlPrefix::Partitions,
+            Revision(2),
+            Arc::new(AtomicU32::new(0)),
+        ));
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            "a_delivered_watch_event_is_logged_at_info",
+        )
+        .into_iter()
+        .filter(|line| line["@m"] == "control_watch_event")
+        .collect();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0]["@l"], "Information", "{}", lines[0]);
+        assert_eq!(lines[0]["revision"], 4, "{}", lines[0]);
     }
 
     /// A resume point is only right if it is the furthest revision the node was told about:
