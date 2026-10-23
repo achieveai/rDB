@@ -620,6 +620,12 @@ pub enum RecoveryEffect {
     /// Divergence evidence, kept for the operator.
     Quarantine(DivergenceEvidence),
     /// Automatic promotion is blocked, and why.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, rulings A-R204, A-R225):** whether the block lasts is F1's
+    /// phase after the step, not this effect (A-R102, A-R182); a host reads it from there. A
+    /// barrier deadline is retried first: `BarrierIncomplete` is emitted here only after
+    /// [`crate::recovery::BARRIER_ATTEMPTS`] attempts (1x, 2x and 4x the discovery window), so
+    /// writes stay paused for at most 7 windows before it.
     BlockPromotion {
         /// Why.
         reason: BlockReason,

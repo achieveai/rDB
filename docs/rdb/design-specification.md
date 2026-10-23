@@ -486,6 +486,8 @@ flowchart LR
 | `operations/{id}` | Idempotent operation type, expected versions, phase, checkpoints and outcomes |
 | `planner/grant` | Active planner authority and renewal version |
 
+**Amended 2026-10-23 (M10 S2, lead ruling A-R225 R2-A2): a peer's boot is not read from `nodes/{id}`.** The owner takes each peer's boot UUID from the authenticated net handshake, which is bound to the node label in the peer's certificate. Inside one process it uses the local boots. It does not use `grants/{node}` either: most secondaries hold no grant, and a record can name a process that has died. The `nodes/{id}` row's boot UUID is still the right field, but it is not the source of a pinned member's boot. `Member::boot` in `crates/rdb-core/src/contracts/membership.rs` carries the same amendment.
+
 High-frequency replica watermarks/heartbeats are data-plane telemetry, not rDB writes per transaction. Control records change on authority, membership or lifecycle transitions.
 
 Use single-record revision CAS for authority transitions. Never assume a multi-key rDB transaction: staged records become active via one CAS manifest/root pointer. Readers validate referenced versions before activation; incomplete staged data is inert.
