@@ -614,6 +614,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
+            storage: rdb_api::db::StorageOptions::default(),
         };
         let opened = Instant::now();
         let mut db = rt
