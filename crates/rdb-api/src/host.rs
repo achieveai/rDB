@@ -3488,19 +3488,34 @@ impl Host {
         partition: PartitionId,
         result: &RecoveryResult,
     ) -> Option<RecoveryEvent> {
-        let generation = result.new_generation;
+        // The new generation's lineage, spelled once (review-r185 ADV1).
+        let lineage = result.selected.root;
+        let generation = lineage.generation;
         let cutoff = result.selected.cutoff_seq;
         let digest = result.selected.cutoff_digest;
         let node = self.node.0;
+        // A copy that holds no older generation has nothing to link: expected, so info, not
+        // warn (review-r185 ADV3). Every other reason is a copy that cannot catch up here.
         let refused = |reason: &str| {
-            tracing::warn!(
-                node,
-                partition = partition.0,
-                generation = generation.0,
-                cutoff = cutoff.0,
-                reason,
-                "land_link_refused"
-            );
+            if reason == "anchor_generation_absent" {
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            } else {
+                tracing::warn!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            }
             None
         };
         let Some(copy) = result
@@ -3524,13 +3539,8 @@ impl Host {
         // R1 builds a copy outside the barrier a receiver at the root, which only a catch-up
         // fills; linked here, the copy holds the cutoff, so it gets a receiver at the cutoff, as a
         // barrier copy gets (`proved_head`; ruling A-R185a).
-        let lineage = Lineage {
-            partition: result.committed.pinned_config.partition,
-            generation,
-            owner_epoch: result.committed.authority_view.lineage.owner_epoch,
-        };
         let anchor = LineageAnchor {
-            lineage: result.selected.root,
+            lineage,
             base_seq: cutoff,
             base_digest: digest,
         };
@@ -8146,6 +8156,63 @@ mod tests {
         assert_eq!(
             reasons,
             ["held_past_base", "base_digest_differs"].map(serde_json::Value::from)
+        );
+    }
+
+    /// review-r185 ADV2 and ADV3: the refusals no row reached, each by name and at its level.
+    /// A copy holding no older generation has nothing to link, which is expected on a first
+    /// landing, so it logs at info. One already holding the new generation, or one the pin
+    /// does not name, logs at warn. None links, installs a receiver or faults the host. Cut
+    /// (every reason at warn): red. Unit.
+    #[config_log::retcd_test]
+    fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
+        const METHOD: &str = "a_landing_with_nothing_to_link_is_refused_by_name_at_its_level";
+        let result = landing_at(0, Digest::ROOT);
+        let mut outside = result.clone();
+        outside
+            .committed
+            .pinned_config
+            .members
+            .retain(|member| member.node != NodeId(2));
+        let rt = current_thread();
+        let empty = config_testkit::fs::temp_dir();
+        let mut fresh = host_over(&empty.path().join("node"), &rt);
+        let ahead = config_testkit::fs::temp_dir();
+        let path = ahead.path().join("node");
+        write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(2),
+            1,
+        );
+        let mut holding = host_over(&path, &rt);
+        let refuses = |host: &mut Host, result: &RecoveryResult| {
+            let held = host.engine.lineages();
+            assert_eq!(host.land_link(PartitionId(1), result), None);
+            assert_eq!(host.engine.lineages(), held, "nothing linked");
+            assert!(host
+                .replication
+                .receiver(NodeId(2), PartitionId(1))
+                .is_none());
+            assert_eq!(host.fault, None);
+        };
+        refuses(&mut fresh, &result);
+        refuses(&mut holding, &result);
+        refuses(&mut fresh, &outside);
+        let refused: Vec<_> = logged!(METHOD, "land_link_refused")
+            .into_iter()
+            .map(|line| (line["reason"].clone(), line["@l"].clone()))
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                ("anchor_generation_absent", "Information"),
+                ("held_at_or_above_generation", "Warning"),
+                ("not_a_member", "Warning"),
+            ]
+            .map(|(reason, level)| (
+                serde_json::Value::from(reason),
+                serde_json::Value::from(level)
+            ))
         );
     }
 
