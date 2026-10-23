@@ -5078,7 +5078,8 @@ mod tests {
     /// open leaves, so `wait_ready` answers at once with `Quarantined`, whose text says the data
     /// is kept and that neither a reopen nor a repair command helps yet (A-R196(2b)). Node 1 is a
     /// stub that answers every look with that phase, spelled as the host spells it. Cut: `wait_ready` does not stop on `Quarantined`,
-    /// and it polls out its bound to `TimedOut`.
+    /// and it polls out its bound to `TimedOut`. Cut (D17): it sleeps 1.5 s before answering,
+    /// and the time fails.
     /// Unit (~50 ms): no node thread.
     #[test]
     fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_quarantined() {
@@ -5106,19 +5107,29 @@ mod tests {
             stalled: None,
             reload_pending: None,
         };
-        let node_1 = std::thread::spawn(move || {
-            while let Ok(msg) = mailbox.recv() {
-                if let Msg::Inspect { reply, .. } = msg {
-                    let _ = reply.send(status.clone());
+        // D17: "at once" is timed from the first look node 1 answered in time, not from the
+        // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
+        // so a stub the host did not schedule for 2.2 s failed this row under gate load
+        // (int f5b3306) with `wait_ready` doing nothing wrong. The time is taken before the send,
+        // so it is never after `wait_ready` sees the reply.
+        let answered = Arc::new(Mutex::new(None::<std::time::Instant>));
+        let node_1 = {
+            let answered = Arc::clone(&answered);
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        let at = std::time::Instant::now();
+                        if reply.send(status.clone()).is_ok() {
+                            lock(&answered).get_or_insert(at);
+                        }
+                    }
                 }
-            }
-        });
+            })
+        };
 
-        let started = std::time::Instant::now();
         let answer = db.wait_ready(Duration::from_secs(3));
-        let took = started.elapsed();
+        let returned = std::time::Instant::now();
         assert_eq!(answer, Err(ReadyError::Quarantined));
-        assert!(took < Duration::from_secs(1), "answered after {took:?}");
         assert_eq!(
             answer.expect_err("quarantined").to_string(),
             "the open's recovery found copies whose histories disagree, so node 1 takes no \
@@ -5128,6 +5139,12 @@ mod tests {
         );
         drop(db);
         node_1.join().expect("the stub");
+        let first = (*lock(&answered)).expect("node 1 answered a look in time");
+        let took = returned.saturating_duration_since(first);
+        assert!(
+            took < Duration::from_secs(1),
+            "answered {took:?} after node 1's first answer"
+        );
     }
 
     /// M10 D14: the open's control read finds the store unreachable. The error says to check
