@@ -324,6 +324,10 @@ fn run(args: &Args) -> ExitCode {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        local: rdb_api::db::ALL_NODES.to_vec(),
+        links: None,
+        client: rdb_api::db::DEFAULT_CLIENT,
+        boot: None,
     };
     tracing::info!(
         write = args.write,

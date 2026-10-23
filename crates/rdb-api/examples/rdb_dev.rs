@@ -600,6 +600,10 @@ where
         },
         dedup_cap: args.dedup_cap,
         dedup_retention: args.dedup_retention,
+        local: rdb_api::db::ALL_NODES.to_vec(),
+        links: None,
+        client: rdb_api::db::DEFAULT_CLIENT,
+        boot: None,
     };
     // Before the voters start (PC-2): a refused option starts nothing.
     if let Err(e) = config.check() {
@@ -6420,6 +6424,10 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            local: rdb_api::db::ALL_NODES.to_vec(),
+            links: None,
+            client: rdb_api::db::DEFAULT_CLIENT,
+            boot: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -6464,6 +6472,10 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            local: rdb_api::db::ALL_NODES.to_vec(),
+            links: None,
+            client: rdb_api::db::DEFAULT_CLIENT,
+            boot: None,
         };
         let db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -6519,6 +6531,10 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            local: rdb_api::db::ALL_NODES.to_vec(),
+            links: None,
+            client: rdb_api::db::DEFAULT_CLIENT,
+            boot: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))

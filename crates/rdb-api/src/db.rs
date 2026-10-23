@@ -27,7 +27,7 @@ use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
-    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId,
+    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, RequestId,
     RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -52,10 +52,9 @@ use crate::transport::Links;
 /// The node every S0 call goes to: partition 1's owner.
 const OWNER: NodeId = admin::OWNER;
 
-/// The only tenant and client S0 writes as. Not settable by a caller (lead ruling, 2026-10-07:
-/// no raw identity on the REPL).
+/// The only tenant S0 writes as. Not settable by a caller (lead ruling, 2026-10-07: no raw
+/// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
 const TENANT: TenantId = TenantId(1);
-const CLIENT: ClientId = ClientId(1);
 
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads.
 const GROUP: AffinityId = AffinityId(1);
@@ -102,154 +101,10 @@ pub const MAX_KEY: usize = 1_024;
 /// can still be large.
 pub const MAX_PAGE: usize = 1_000;
 
-/// A failed call, with the §5.4 name and what the caller may do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiError {
-    /// The §5.4 kind.
-    pub kind: ErrorKind,
-    /// What the caller may do.
-    pub retry: RetryRule,
-    /// Whether this submission provably mutated nothing. It says nothing of an earlier send of
-    /// the same request id.
-    pub no_mutation: bool,
-    /// Detail, for the log and the operator.
-    pub detail: String,
-    /// The soonest a retry can be admitted, when the host knows it (M10 S1-6, critic-d6b
-    /// candidate 3): a lower bound, "not before", never a promise that it will be. `None` when
-    /// nothing is known. Set it with [`Self::with_retry_after`], which also says it in `detail`.
-    pub retry_after: Option<Duration>,
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", wire_name(self.kind), self.detail)
-    }
-}
-
-impl std::error::Error for ApiError {}
-
-impl ApiError {
-    /// An error of `kind` raised by the API itself, with a fixed retry rule and mutation proof
-    /// per kind:
-    ///
-    /// | kind | `retry` | `no_mutation` |
-    /// |---|---|---|
-    /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
-    /// | `UnknownOutcome` | `QueryStatus` | `false` |
-    /// | `CorruptHistory`, `CorruptBlob`, `IncompatibleVersion` | `Quarantine` | `false` |
-    /// | `UploadChunkConflict` | `Reconcile` | `true` |
-    /// | any other | `BoundedJitter` | `false` |
-    ///
-    /// This is not what the kernel attaches to the same kind: for example a kernel
-    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves this submission
-    /// mutated nothing.
-    /// Wrap a kernel error with [`Self::from_kernel`], never with this.
-    #[must_use]
-    pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
-        let (retry, no_mutation) = match kind {
-            ErrorKind::ConditionFailed | ErrorKind::InvalidArgument => {
-                (RetryRule::Definitive, true)
-            }
-            ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
-            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob | ErrorKind::IncompatibleVersion => {
-                (RetryRule::Quarantine, false)
-            }
-            ErrorKind::UploadChunkConflict => (RetryRule::Reconcile, true),
-            _ => (RetryRule::BoundedJitter, false),
-        };
-        Self {
-            kind,
-            retry,
-            no_mutation,
-            detail: detail.into(),
-            retry_after: None,
-        }
-    }
-
-    /// The kernel's own error, with its own retry rule and proof.
-    #[must_use]
-    pub fn from_kernel(error: &RdbError) -> Self {
-        Self {
-            kind: error.kind(),
-            retry: error.retry_rule(),
-            no_mutation: error.proves_no_mutation(),
-            detail: error.to_string(),
-            retry_after: None,
-        }
-    }
-
-    /// A caller's argument the API refuses before the kernel sees it.
-    #[must_use]
-    pub fn invalid(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InvalidArgument, detail)
-    }
-
-    /// A put refused before it was sent: this node has adopted no generation yet, so there is
-    /// none to fence it with (`expected_generation` is always set; ADR-0004 §8). This submission
-    /// never left the host, so it mutated nothing, and it may be retried once a generation is
-    /// adopted.
-    #[must_use]
-    pub fn not_adopted(node: NodeId, partition: PartitionId) -> Self {
-        Self {
-            kind: ErrorKind::Unavailable,
-            retry: RetryRule::BoundedJitter,
-            no_mutation: true,
-            detail: format!(
-                "no generation adopted yet for partition {} on node {}; nothing was sent",
-                partition.0, node.0
-            ),
-            retry_after: None,
-        }
-    }
-
-    /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
-    #[must_use]
-    pub fn host(detail: &str) -> Self {
-        Self {
-            kind: ErrorKind::Unavailable,
-            retry: RetryRule::NotWired,
-            no_mutation: false,
-            detail: format!("host fault: {detail}"),
-            retry_after: None,
-        }
-    }
-
-    /// This error with a "not before" hint: a retry is not admitted sooner than `after` from
-    /// now. Sets [`Self::retry_after`] and ends `detail` with `; not before ~Ns`, the seconds
-    /// rounded up so the text never names a time earlier than the hint.
-    #[must_use]
-    pub fn with_retry_after(mut self, after: Duration) -> Self {
-        let seconds = after.as_millis().div_ceil(1_000);
-        self.detail = format!("{}; not before ~{seconds}s", self.detail);
-        self.retry_after = Some(after);
-        self
-    }
-
-    /// The soonest a retry can be admitted, when the host knows it.
-    #[must_use]
-    pub const fn retry_after(&self) -> Option<Duration> {
-        self.retry_after
-    }
-
-    /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
-    #[must_use]
-    pub fn name(&self) -> String {
-        wire_name(self.kind)
-    }
-}
-
-/// `ProtectionPaused` → `PROTECTION_PAUSED`.
-fn wire_name(kind: ErrorKind) -> String {
-    let camel = format!("{kind:?}");
-    let mut out = String::with_capacity(camel.len() + 4);
-    for (i, c) in camel.chars().enumerate() {
-        if c.is_ascii_uppercase() && i > 0 {
-            out.push('_');
-        }
-        out.push(c.to_ascii_uppercase());
-    }
-    out
-}
+mod error;
+#[cfg(test)]
+use error::wire_name;
+pub use error::ApiError;
 
 /// How long `Db` waits for each kind of call.
 #[derive(Debug, Clone, Copy)]
@@ -306,7 +161,28 @@ pub struct DbConfig {
     /// A plain `put` compiles a version condition, so its retry fails `CONDITION_FAILED` once
     /// the first send applied, rather than applying twice.
     pub dedup_retention: Option<Duration>,
+    /// The nodes whose copies this process holds and runs (M10 S2). [`ALL_NODES`] is the
+    /// one-process database: all three copies here. Not read yet: every open runs all three.
+    pub local: Vec<NodeId>,
+    /// The peer links this process's nodes use (M10 S2). `None`: new in-process links. Not
+    /// read yet: every open makes its own in-process links.
+    pub links: Option<Arc<Links>>,
+    /// The client every request of this `Db` is sent as (M10 S2-8: two apps on one node are
+    /// two clients, and the dedup state keys on it). [`DEFAULT_CLIENT`] is the one client every
+    /// earlier build used.
+    pub client: ClientId,
+    /// The boot every node of this open starts at (ruling A-R227): a node process passes
+    /// [`next_boot`] of [`Self::dir`], and each restart then takes [`next_boot`] of it too.
+    /// `None`: the directory's `n`-th open starts at `((n - 1) << 16) + 1` and a restart adds one.
+    pub boot: Option<BootId>,
 }
+
+/// The client a `Db` sends as unless [`DbConfig::client`] names another.
+pub const DEFAULT_CLIENT: ClientId = ClientId(1);
+
+/// The three nodes of partition 1: [`DbConfig::local`] for a database whose copies are all in
+/// this process.
+pub const ALL_NODES: [NodeId; 3] = [NodeId(1), NodeId(2), NodeId(3)];
 
 impl DbConfig {
     /// The checks [`Db::open`] makes before it starts anything, so a caller can make them
@@ -499,6 +375,8 @@ pub struct Db {
     clock: HostClock,
     timeouts: Timeouts,
     next_request: AtomicU64,
+    /// The client this `Db` sends every request as (S2-8): [`DbConfig::client`].
+    client: ClientId,
     /// Whether node 1 has been seen admitting writes: by [`Db::node_status`], by a put that
     /// was answered, or by [`Db::restart_node`]'s own look. Never cleared, so a node can still
     /// be restarted once writes have stopped (M9 S2b, D3).
@@ -633,6 +511,57 @@ const fn request_floor(n: u64) -> u64 {
     (n - 1) << 40
 }
 
+/// The file under a process's folder that holds the last boot [`next_boot`] handed out.
+const BOOT_FILE: &str = "boot";
+
+/// A fresh boot for a node process whose folder is `dir` (ruling A-R227): the larger of the
+/// Unix time in microseconds and one past the last boot this function returned for `dir`, which
+/// it persists in `dir/boot` before returning. So boots only grow across restarts, and after a
+/// wipe, or a clock step back, the clock part or the stored part keeps the new one fresh.
+/// Creates `dir` when missing.
+///
+/// # Errors
+///
+/// An I/O error reading or writing `dir/boot`, or `InvalidData` when it does not hold a boot.
+/// Nothing is returned then: a boot that may repeat an earlier one is never handed out.
+pub fn next_boot(dir: &Path) -> std::io::Result<BootId> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(dir)?;
+    let file = dir.join(BOOT_FILE);
+    let last = match std::fs::read_to_string(&file) {
+        Ok(text) => text.trim().parse::<u64>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} does not hold a boot: {error}", file.display()),
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+        });
+    let boot = now.max(last.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} holds the largest boot there is", file.display()),
+        )
+    })?);
+    // Written beside and renamed over, so a crash leaves the old boot or the new one, never
+    // half of one.
+    let staged = dir.join(format!("{BOOT_FILE}.new"));
+    {
+        let mut out = std::fs::File::create(&staged)?;
+        writeln!(out, "{boot}")?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&staged, &file)?;
+    tracing::info!(dir = %dir.display(), last, boot, "next_boot");
+    Ok(BootId(boot))
+}
+
 /// The top bit of a request id: set on every id an app chooses, never on one a `Db` draws
 /// itself, so the two never name the same write (ruling A-R195, D11).
 const APP_REQUEST_BIT: u64 = 1 << 63;
@@ -661,6 +590,9 @@ struct Respawn {
     nodes_dir: PathBuf,
     budgets: Budgets,
     limits: Limits,
+    /// The folder a restart takes [`next_boot`] of, when the open was given its boot
+    /// ([`DbConfig::boot`]). `None`: a restart adds one to the boot it replaces.
+    boots: Option<PathBuf>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -729,6 +661,7 @@ impl Db {
             nodes_dir: config.dir.join("nodes"),
             budgets,
             limits,
+            boots: config.boot.map(|_| config.dir.clone()),
         };
         let mut db = Self::open_spawning(
             config,
@@ -834,7 +767,7 @@ impl Db {
         let engines = std::mem::take(&mut claim.engines);
         let unwind = claim.created.take();
         drop(claim);
-        let boot = base_boot(n);
+        let boot = config.boot.unwrap_or(base_boot(n));
         tracing::info!(
             instance_hex = %admin::instance_hex(&found.instance),
             fresh = found.fresh,
@@ -861,6 +794,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
+            client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind,
             opened: Opened {
@@ -1147,20 +1081,26 @@ impl Db {
     }
 
     /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
-    /// an answer is awaited.
+    /// an answer is awaited. A node this process does not run is reached over the peer links,
+    /// whatever their holds (ruling A-R226 h1): in a three-process database the owner is
+    /// usually another process.
     fn send_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
-        let nodes = lock(&self.nodes);
-        let handle = nodes
-            .iter()
-            .find(|handle| handle.node == node)
-            .ok_or(NodeStopped(node))?;
-        handle.send(msg)
+        {
+            let nodes = lock(&self.nodes);
+            if let Some(handle) = nodes.iter().find(|handle| handle.node == node) {
+                return handle.send(msg);
+            }
+        }
+        self.links.post(node, msg).map_err(|fault| {
+            tracing::warn!(node = node.0, ?fault, "db_send_unreachable");
+            NodeStopped(node)
+        })
     }
 
     fn identity(&self) -> RequestIdentity {
         RequestIdentity {
             tenant: TENANT,
-            client: CLIENT,
+            client: self.client,
             request: RequestId(self.next_request.fetch_add(1, Ordering::Relaxed)),
         }
     }
@@ -1184,7 +1124,7 @@ impl Db {
         }
         Ok(RequestIdentity {
             tenant: TENANT,
-            client: CLIENT,
+            client: self.client,
             request,
         })
     }
@@ -1344,7 +1284,7 @@ impl Db {
         if puts.len() > MAX_OPS {
             return Err(PutError {
                 error: limit_refused(
-                    identity.request,
+                    identity,
                     "puts",
                     puts.len(),
                     MAX_OPS,
@@ -1498,7 +1438,7 @@ impl Db {
     ) -> Result<Option<PutOk>, PutError> {
         // A request over a limit is refused here, before it reaches the owner's thread: nothing
         // is compiled or sent, and its request id is used up (M9 S5).
-        if let Some(error) = write_refusal(&puts, identity.request) {
+        if let Some(error) = write_refusal(&puts, identity) {
             return Err(PutError {
                 error,
                 request: None,
@@ -1741,7 +1681,7 @@ impl Db {
     ) -> Result<TxnStatus, ApiError> {
         let identity = RequestIdentity {
             tenant: TENANT,
-            client: CLIENT,
+            client: self.client,
             request,
         };
         let answered = match self.call(
@@ -2008,12 +1948,14 @@ impl Db {
                 nodes_dir,
                 budgets,
                 limits: Limits::default(),
+                boots: None,
             }),
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.clone(), links),
             clock: HostClock::start(),
             timeouts,
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -2041,12 +1983,14 @@ impl Db {
                 nodes_dir: nodes_dir.clone(),
                 budgets,
                 limits,
+                boots: None,
             }),
             links,
             control,
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
+            client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -2135,15 +2079,28 @@ impl Db {
             )));
         };
         let old_boot = handle.boot;
-        // One open never reaches the next open's boots (arch R3b).
-        if old_boot.0 - self.opened.base_boot.0 >= MAX_RESTARTS {
-            return Err(ApiError::invalid(format!(
-                "node {} not restarted: it has restarted {MAX_RESTARTS} times, the most one open \
-                 allows; reopen the directory",
-                node.0
-            )));
-        }
-        let boot = BootId(old_boot.0 + 1);
+        let boot = match &respawn.boots {
+            // A node process's boots come from its folder, so they stay fresh across processes
+            // as well as restarts (ruling A-R227).
+            Some(dir) => next_boot(dir).map_err(|error| {
+                ApiError::host(&format!(
+                    "node {} not restarted: no fresh boot from {}: {error}",
+                    node.0,
+                    dir.display()
+                ))
+            })?,
+            None => {
+                // One open never reaches the next open's boots (arch R3b).
+                if old_boot.0 - self.opened.base_boot.0 >= MAX_RESTARTS {
+                    return Err(ApiError::invalid(format!(
+                        "node {} not restarted: it has restarted {MAX_RESTARTS} times, the most \
+                         one open allows; reopen the directory",
+                        node.0
+                    )));
+                }
+                BootId(old_boot.0 + 1)
+            }
+        };
         handle.stop();
         self.control.forget_node(node, old_boot);
         let started = host::spawn_with(
@@ -2285,7 +2242,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
     let partition = PARTITION;
     let identity = RequestIdentity {
         tenant: TENANT,
-        client: CLIENT,
+        client: DEFAULT_CLIENT,
         request: RequestId(0),
     };
     let kernel = match kind {
@@ -2624,12 +2581,13 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
 }
 
 /// The first limit `puts` breaks, as `INVALID_ARGUMENT` naming the put as `op <index>`, or
-/// `None` when every put is within every limit. `request` is the id the refused request used up.
-fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
+/// `None` when every put is within every limit. `identity` is the one the refused request used up.
+fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> {
+    let request = identity.request;
     puts.iter().enumerate().find_map(|(index, put)| {
         if put.object.len() > MAX_OBJECT_ID {
             return Some(limit_refused(
-                request,
+                identity,
                 "object_id",
                 put.object.len(),
                 MAX_OBJECT_ID,
@@ -2644,7 +2602,7 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
         let ops = op_count(&put.change);
         if ops > MAX_OPS {
             return Some(limit_refused(
-                request,
+                identity,
                 "ops",
                 ops,
                 MAX_OPS,
@@ -2665,7 +2623,7 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
         };
         elems
             .iter()
-            .find_map(|elem| key_refusal(elem_key(elem), request, Some(index), "sent"))
+            .find_map(|elem| key_refusal(elem_key(elem), identity, Some(index), "sent"))
     })
 }
 
@@ -2673,7 +2631,7 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
 /// the put, when there is one; `done` ends the detail: `request R not <done>`.
 fn key_refusal(
     key: &Value,
-    request: RequestId,
+    identity: RequestIdentity,
     index: Option<usize>,
     done: &str,
 ) -> Option<ApiError> {
@@ -2681,13 +2639,13 @@ fn key_refusal(
     (found > MAX_KEY).then(|| {
         let op = index.map_or_else(String::new, |index| format!("op {index}: "));
         limit_refused(
-            request,
+            identity,
             "key",
             found,
             MAX_KEY,
             format!(
                 "{op}key {found} bytes, over the {MAX_KEY}-byte limit; request {} not {done}",
-                request.0
+                identity.request.0
             ),
         )
     })
@@ -2751,7 +2709,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {
         return Some(limit_refused(
-            request,
+            *identity,
             "object_id",
             object.len(),
             MAX_OBJECT_ID,
@@ -2772,7 +2730,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     };
     if page > MAX_PAGE {
         return Some(limit_refused(
-            request,
+            *identity,
             "page",
             page,
             MAX_PAGE,
@@ -2785,7 +2743,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     match look {
         Some(Look::Members {
             after: Some(after), ..
-        }) => key_refusal(after, request, None, "read"),
+        }) => key_refusal(after, *identity, None, "read"),
         Some(
             Look::Members { after: None, .. }
             | Look::Doc
@@ -2800,7 +2758,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
 /// A request over a limit: one `limit_refused` line, which never carries the caller's bytes,
 /// and `INVALID_ARGUMENT` with `detail`.
 fn limit_refused(
-    request: RequestId,
+    identity: RequestIdentity,
     limit: &'static str,
     found: usize,
     max: usize,
@@ -2808,8 +2766,8 @@ fn limit_refused(
 ) -> ApiError {
     // `client` with `request` is the key a log query joins on: `request` alone is not unique.
     tracing::info!(
-        client = CLIENT.0,
-        request = request.0,
+        client = identity.client.0,
+        request = identity.request.0,
         limit,
         found,
         max,
@@ -2899,6 +2857,10 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
         }
     }
 
@@ -2937,6 +2899,10 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3023,6 +2989,10 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3086,6 +3056,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -3146,6 +3117,10 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3284,6 +3259,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -3333,6 +3309,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -4312,6 +4289,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
             opened: Opened::default(),
@@ -4594,6 +4572,10 @@ mod tests {
         let above = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES + 1),
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
             ..config(dir.path())
         };
         match rt.block_on(Db::open(above, store, rt.handle().clone())) {
@@ -4634,6 +4616,10 @@ mod tests {
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
             ..config(dir.path())
         };
         assert!(
@@ -6770,7 +6756,7 @@ mod tests {
                         GROUP,
                         RequestIdentity {
                             tenant: TENANT,
-                            client: CLIENT,
+                            client: DEFAULT_CLIENT,
                             request: RequestId(request),
                         },
                     ),
@@ -6822,7 +6808,7 @@ mod tests {
         let compile = |request: u64| ClientCall::Compile {
             identity: RequestIdentity {
                 tenant: TENANT,
-                client: CLIENT,
+                client: DEFAULT_CLIENT,
                 request: RequestId(request),
             },
             puts: vec![PutOp {
@@ -6974,6 +6960,10 @@ mod tests {
                 DbConfig {
                     dedup_cap: Some(2),
                     dedup_retention: Some(retention),
+                    local: ALL_NODES.to_vec(),
+                    links: None,
+                    client: DEFAULT_CLIENT,
+                    boot: None,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),
@@ -7075,6 +7065,10 @@ mod tests {
                 DbConfig {
                     dedup_cap: Some(2),
                     dedup_retention: Some(retention),
+                    local: ALL_NODES.to_vec(),
+                    links: None,
+                    client: DEFAULT_CLIENT,
+                    boot: None,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),
@@ -8004,5 +7998,147 @@ mod tests {
             ))
             .expect("its own bytes landed");
         assert_eq!(n, read.n + 1);
+    }
+
+    /// M10 S2-8 (ruling A-R226 h3): a `Db` opened as client 2 sends its writes as client 2, looks
+    /// them up as client 2, and names client 2 in a limit refusal, which is what a log query
+    /// joins on. Two apps on one node are two clients, so neither can name the other's write.
+    /// Integration (~2 s): three node threads.
+    #[config_log::retcd_test]
+    fn m10_s2_8_a_db_opened_as_client_2_writes_looks_up_and_logs_as_client_2() {
+        const METHOD: &str =
+            "m10_s2_8_a_db_opened_as_client_2_writes_looks_up_and_logs_as_client_2";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = DbConfig {
+            client: ClientId(2),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "after the open");
+        let put = db.put(b"a", b"1", None).expect("put");
+        match db.status(put.request, None).expect("status") {
+            TxnStatus::Resolved(result) => assert_eq!(result.seq, put.seq),
+            other => panic!("client 2 finds its own write: {other:?}"),
+        }
+        let refused = db
+            .put(&[0; MAX_OBJECT_ID + 1], b"1", None)
+            .expect_err("over the limit");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::InvalidArgument,
+            "{refused:?}"
+        );
+        let clients: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "limit_refused")
+            .map(|line| line["client"].clone())
+            .collect();
+        assert_eq!(clients, vec![serde_json::json!(2)]);
+        db.shutdown();
+    }
+
+    /// Ruling A-R226 h1: a call for a node this process does not run goes over the peer links
+    /// (`Links::post`), and with nothing registered for that node it is refused at once as the
+    /// owner's thread stopped, never a wait. Unit: no node thread.
+    #[test]
+    fn m10_a_call_for_a_node_this_process_does_not_run_goes_over_the_links() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let db = Db::by_hand(
+            Vec::new(),
+            store,
+            rt.handle(),
+            Timeouts {
+                put: Duration::from_millis(20),
+                ..Timeouts::default()
+            },
+            None,
+        );
+
+        let refused = db.put(b"a", b"1", None).expect_err("nobody holds node 1");
+        assert!(
+            refused.error.detail.contains("has stopped"),
+            "{:?}",
+            refused.error
+        );
+
+        let (remote, mailbox) = std::sync::mpsc::channel();
+        db.links().register(OWNER, remote, crate::host::BOOT);
+        let unanswered = db.put(b"a", b"1", None).expect_err("nothing answers");
+        assert_eq!(unanswered.error.name(), "UNAVAILABLE", "{unanswered:?}");
+        let sent: Vec<_> = mailbox
+            .try_iter()
+            .map(|msg| match msg {
+                Msg::Client(Client { call, .. }) => format!("{call:?}")
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![Some("Compile".to_owned())]);
+    }
+
+    /// Ruling A-R227: `next_boot` hands out the Unix time in microseconds or one past the boot it
+    /// last stored, whichever is larger, so boots only grow: after a clock that reads behind the
+    /// stored boot too. A `boot` file that holds no boot is an error, never a guess.
+    /// Unit: files only.
+    #[test]
+    fn m10_next_boot_only_grows_and_refuses_a_file_that_holds_no_boot() {
+        let dir = config_testkit::fs::temp_dir();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_micros();
+        let first = next_boot(dir.path()).expect("first");
+        assert!(u128::from(first.0) >= now, "{first:?} is the clock's");
+        let second = next_boot(dir.path()).expect("second");
+        assert!(second.0 > first.0, "{second:?} after {first:?}");
+        let ahead = second.0 + 3_600_000_000;
+        std::fs::write(dir.path().join("boot"), format!("{ahead}\n")).expect("write");
+        assert_eq!(next_boot(dir.path()).expect("behind"), BootId(ahead + 1));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("boot")).expect("read"),
+            format!("{}\n", ahead + 1)
+        );
+        std::fs::write(dir.path().join("boot"), "nine\n").expect("write");
+        let refused = next_boot(dir.path()).expect_err("no boot in the file");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData, "{refused}");
+    }
+
+    /// Ruling A-R227: a `Db` given its boot starts every node there, and a restart takes
+    /// `next_boot` of the same folder, past the boot it replaces and past the one stored.
+    /// Integration (~2 s): three node threads, one restart.
+    #[test]
+    fn m10_a_db_given_its_boot_starts_there_and_restarts_at_the_next_boot() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let boot = next_boot(dir.path()).expect("boot");
+        let config = DbConfig {
+            boot: Some(boot),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "after the open");
+        for node in ALL_NODES {
+            assert_eq!(db.boot_of(node), Some(boot), "node {}", node.0);
+        }
+        let restarted = db.restart_node(NodeId(3)).expect("restart");
+        assert!(restarted.0 > boot.0 + 1, "{restarted:?} is a clock boot");
+        assert_eq!(db.boot_of(NodeId(3)), Some(restarted));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("boot")).expect("stored"),
+            format!("{}\n", restarted.0)
+        );
+        db.shutdown();
     }
 }

@@ -116,6 +116,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        local: rdb_api::db::ALL_NODES.to_vec(),
+        links: None,
+        client: rdb_api::db::DEFAULT_CLIENT,
+        boot: None,
     };
     // The same call opens a new folder or one that already holds data.
     let mut db = rt.block_on(Db::open(config, store, rt.handle().clone()))?;

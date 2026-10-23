@@ -1,24 +1,33 @@
-//! In-process peer links (M9 architecture §3, `rdb_api::transport`).
+//! Peer links (M9 architecture §3, `rdb_api::transport`; M10 S2 process links).
 //!
-//! A concrete struct, no trait until M10. Each rDB node registers its mailbox. A peer message —
-//! a replication frame, or a recovery request and its answer — goes through [`Links::send`] and
-//! honours a hold or a drop. A held link buffers in order and delivers on [`Links::heal`], so a
-//! hold is a delay, never a loss: the frames arrive late, as a slow network delivers them. A
-//! dropped direction ([`Links::drop_direction`]) loses what is sent on it: `send` discards the
-//! message and still answers `Ok`, as a lossy network never tells the sender. Only a retransmit
-//! after [`Links::heal`] gets the message through.
+//! A concrete struct, no trait. Each rDB node this process runs registers its mailbox. A peer
+//! message — a replication frame, or a recovery request and its answer — goes through
+//! [`Links::send`] and honours a hold or a drop. A held link buffers in order and delivers on
+//! [`Links::heal`], so a hold is a delay, never a loss: the frames arrive late, as a slow
+//! network delivers them. A dropped direction ([`Links::drop_direction`]) loses what is sent on
+//! it: `send` discards the message and still answers `Ok`, as a lossy network never tells the
+//! sender. Only a retransmit after [`Links::heal`] gets the message through.
 //!
 //! [`Links::post`] skips the holds. It carries what does not travel on the peer link: client
 //! calls, control completions and the control-plane `Recovered` watch.
+//!
+//! # Other processes (M10 S2)
+//!
+//! A node this process does not run is reached through the attached [`Net`]
+//! ([`Links::attach`]). The in-process holds and drops above cover in-process pairs only; a
+//! link to another process takes its faults from that process's fault file
+//! ([`crate::net::faults`]). [`Links::post_local`] is what the net layer delivers a received
+//! message with: it never goes back out.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rdb_core::contracts::ids::NodeId;
+use rdb_core::contracts::ids::{BootId, NodeId};
 use rdb_core::contracts::transport::LinkFault;
 
 use crate::host::Msg;
+use crate::net::Net;
 
 /// The peer links of one process.
 #[derive(Debug, Default)]
@@ -29,6 +38,10 @@ pub struct Links {
 #[derive(Debug, Default)]
 struct Inner {
     mailboxes: BTreeMap<NodeId, Sender<Msg>>,
+    /// The boot each registered node runs at (arch-s2 B1: one source for in-process boots).
+    boots: BTreeMap<NodeId, BootId>,
+    /// The links to other processes, once attached.
+    net: Option<Arc<Net>>,
     /// Held pairs, smaller node first. A hold covers both directions.
     held: BTreeSet<(NodeId, NodeId)>,
     /// Per direction, what a hold kept back, oldest first.
@@ -60,15 +73,51 @@ impl Links {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Make `node` reachable at `mailbox`.
-    pub fn register(&self, node: NodeId, mailbox: Sender<Msg>) {
-        self.lock().mailboxes.insert(node, mailbox);
+    /// Make `node` reachable at `mailbox`, running at `boot`. Registering again (a restart)
+    /// replaces both.
+    pub fn register(&self, node: NodeId, mailbox: Sender<Msg>, boot: BootId) {
+        let mut inner = self.lock();
+        inner.mailboxes.insert(node, mailbox);
+        inner.boots.insert(node, boot);
     }
 
     /// Whether `node` is registered.
     #[must_use]
     pub fn knows(&self, node: NodeId) -> bool {
         self.lock().mailboxes.contains_key(&node)
+    }
+
+    /// Reach every node this process does not run through `net`. Attaching again replaces it.
+    pub fn attach(&self, net: Arc<Net>) {
+        self.lock().net = Some(net);
+    }
+
+    /// The attached process links, if any.
+    #[must_use]
+    pub fn net(&self) -> Option<Arc<Net>> {
+        self.lock().net.clone()
+    }
+
+    /// The boot `node` runs at: the one it registered with when this process runs it (A-R232),
+    /// else the one it reported at its last handshake with this process. `None` for a node
+    /// that is neither registered nor has ever had a link up.
+    #[must_use]
+    pub fn boot_of(&self, node: NodeId) -> Option<BootId> {
+        let inner = self.lock();
+        if let Some(boot) = inner.boots.get(&node) {
+            return Some(*boot);
+        }
+        let net = inner.net.clone();
+        drop(inner);
+        net.and_then(|net| net.boot_of(node))
+    }
+
+    /// The process links for `to` when this process does not run it.
+    fn remote(inner: &Inner, to: NodeId) -> Option<Arc<Net>> {
+        if inner.mailboxes.contains_key(&to) {
+            return None;
+        }
+        inner.net.clone()
     }
 
     /// Send a peer message from `from` to `to`, honouring a drop and then a hold. A dropped
@@ -80,6 +129,10 @@ impl Links {
     /// [`LinkFault::Unreachable`] when `to` is not registered or its node has stopped.
     pub fn send(&self, from: NodeId, to: NodeId, msg: Msg) -> Result<(), LinkFault> {
         let mut inner = self.lock();
+        if let Some(net) = Self::remote(&inner, to) {
+            drop(inner);
+            return net.send(to, msg);
+        }
         if !inner.mailboxes.contains_key(&to) {
             return Err(LinkFault::Unreachable);
         }
@@ -109,6 +162,22 @@ impl Links {
     ///
     /// [`LinkFault::Unreachable`] when `to` is not registered or its node has stopped.
     pub fn post(&self, to: NodeId, msg: Msg) -> Result<(), LinkFault> {
+        let inner = self.lock();
+        if let Some(net) = Self::remote(&inner, to) {
+            drop(inner);
+            return net.send(to, msg);
+        }
+        let mailbox = inner.mailboxes.get(&to).ok_or(LinkFault::Unreachable)?;
+        mailbox.send(msg).map_err(|_| LinkFault::Unreachable)
+    }
+
+    /// Deliver `msg` to `to` only if this process runs it: what the process links hand over
+    /// on receipt. Never goes back out.
+    ///
+    /// # Errors
+    ///
+    /// [`LinkFault::Unreachable`] when this process does not run `to` or its node has stopped.
+    pub fn post_local(&self, to: NodeId, msg: Msg) -> Result<(), LinkFault> {
         let inner = self.lock();
         let mailbox = inner.mailboxes.get(&to).ok_or(LinkFault::Unreachable)?;
         mailbox.send(msg).map_err(|_| LinkFault::Unreachable)
@@ -212,9 +281,9 @@ mod tests {
         let (tx1, rx1) = mpsc::channel();
         let (tx2, rx2) = mpsc::channel();
         let (tx3, rx3) = mpsc::channel();
-        links.register(NodeId(1), tx1);
-        links.register(NodeId(2), tx2);
-        links.register(NodeId(3), tx3);
+        links.register(NodeId(1), tx1, crate::host::BOOT);
+        links.register(NodeId(2), tx2, crate::host::BOOT);
+        links.register(NodeId(3), tx3, crate::host::BOOT);
 
         links.drop_direction(NodeId(2), NodeId(1));
         assert_eq!(links.send(NodeId(2), NodeId(1), msg("ack lost")), Ok(()));
@@ -245,5 +314,69 @@ mod tests {
         assert_eq!(links.send(NodeId(3), NodeId(1), msg("after")), Ok(()));
         assert_eq!(got(&rx1), ["after"], "the lost one stays lost");
         assert_eq!(got(&rx3), Vec::<String>::new());
+    }
+
+    /// A-R232 (arch-s2 B1, one source): `boot_of` answers a node this process runs with the boot
+    /// it registered, so an owner whose peers share its `Links` can heal without a handshake. A
+    /// restart registers again and the answer moves with it. A node neither registered nor seen
+    /// on a link has none. Integration (~1 s): a real three-node `Db` on one `Links`.
+    #[test]
+    fn boot_of_answers_each_node_this_process_runs_with_its_registered_boot() {
+        use crate::db::{Db, DbConfig, Timeouts, ALL_NODES, DEFAULT_CLIENT};
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        // The spec holds a resume for 5 s; a restart waits for ready, so cut that short.
+        let fast = rdb_core::contracts::event::Budgets {
+            resume_hold_millis: 50,
+            warn_age_millis: 200,
+            pause_age_millis: 400,
+            ..rdb_core::contracts::event::Budgets::SPEC_DEFAULTS
+        };
+        let config = DbConfig {
+            dir: dir.path().to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast))
+            .expect("open");
+        for node in ALL_NODES {
+            let boot = db.boot_of(node);
+            assert!(boot.is_some(), "the Db runs node {}", node.0);
+            assert_eq!(db.links().boot_of(node), boot, "node {}", node.0);
+        }
+        db.wait_ready(crate::host::test_patience(std::time::Duration::from_secs(
+            30,
+        )))
+        .expect("ready before the restart");
+        let restarted = db.restart_node(NodeId(2)).expect("restart node 2");
+        assert_eq!(
+            db.links().boot_of(NodeId(2)),
+            Some(restarted),
+            "the restart's boot"
+        );
+        assert_eq!(db.links().boot_of(NodeId(9)), None, "nobody runs node 9");
+        db.shutdown();
+
+        let links = Links::new();
+        let (tx, _rx) = mpsc::channel();
+        links.register(NodeId(1), tx.clone(), BootId(7));
+        links.register(NodeId(1), tx, BootId(8));
+        assert_eq!(
+            links.boot_of(NodeId(1)),
+            Some(BootId(8)),
+            "registering again replaces"
+        );
     }
 }

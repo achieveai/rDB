@@ -35,6 +35,10 @@ fn m10_s1_6_a_full_cap_frees_at_the_reopen_once_its_writes_aged_since_their_publ
             timeouts: Timeouts::default(),
             dedup_cap: Some(2),
             dedup_retention: Some(RETENTION),
+            local: rdb_api::db::ALL_NODES.to_vec(),
+            links: None,
+            client: rdb_api::db::DEFAULT_CLIENT,
+            boot: None,
         };
         let db = rt
             .block_on(Db::open(config, Arc::clone(&store), rt.handle().clone()))
