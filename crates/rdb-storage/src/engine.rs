@@ -40,8 +40,9 @@ use rocksdb::{
 use rdb_core::contracts::trace::Version;
 
 use crate::keys::{
-    self, decode_copying, decode_key, decode_mark, encode_key, frame, ns_byte, ns_from_byte,
-    private_key, tombstone, unframe, Frame, Link, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
+    self, decode_copying, decode_key, decode_mark, decode_publish_marks, decode_publish_marks_key,
+    encode_key, encode_publish_marks, frame, ns_byte, ns_from_byte, private_key, publish_marks_key,
+    tombstone, unframe, Frame, Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
     COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, PARENT_KEY,
     PRIVATE_NS, SEALED_KEY,
 };
@@ -431,6 +432,79 @@ impl RocksEngine {
         self.instance = Some(id);
         tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
         Ok(())
+    }
+
+    /// Replace `partition`'s publish marks with `marks`, with a synced write, before this
+    /// returns `Ok` (M10 S1-6, lead ruling A-R183). Stored as given, in the order given; an
+    /// empty list is stored as one. The key lives outside every namespace, so no read, seed or
+    /// retire scan of a lineage ever meets it, and it needs no lineage.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] when RocksDB refuses the write; the marks held before stay.
+    pub fn put_publish_marks(
+        &mut self,
+        partition: PartitionId,
+        marks: &[PublishMark],
+    ) -> Result<(), StorageFault> {
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        if let Err(e) = self.db.put_cf_opt(
+            self.cf(CF_METADATA),
+            publish_marks_key(partition),
+            encode_publish_marks(marks),
+            &opts,
+        ) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                error = %e,
+                "publish_marks_write_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        tracing::debug!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            marks = marks.len(),
+            newest = ?marks.last().map(|m| (m.generation.0, m.seq.0, m.tick.0)),
+            "publish_marks_written"
+        );
+        Ok(())
+    }
+
+    /// `partition`'s publish marks, as [`Self::put_publish_marks`] last stored them; empty when
+    /// none were ever stored, as on a copy an older build wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when the read fails or the stored value is not a whole number
+    /// of marks. Never an empty list in their place: a fault is not "no marks".
+    pub fn publish_marks(&self, partition: PartitionId) -> Result<Vec<PublishMark>, StorageFault> {
+        let raw = self
+            .db
+            .get_cf(self.cf(CF_METADATA), publish_marks_key(partition))
+            .map_err(|e| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    error = %e,
+                    "publish_marks_read_failed"
+                );
+                StorageFault::Corrupt
+            })?;
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        decode_publish_marks(&raw).ok_or_else(|| {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                len = raw.len(),
+                "publish_marks_undecodable"
+            );
+            StorageFault::Corrupt
+        })
     }
 
     /// Apply a batch atomically and advance `buffered_applied`. **Buffered, not durable.**
@@ -1007,6 +1081,19 @@ impl std::fmt::Display for RawRecord {
             }
             if self.key.as_ref() == INSTANCE_KEY {
                 return write!(f, "instance_marker={}", hex(&self.value));
+            }
+            if let Some(partition) = decode_publish_marks_key(&self.key) {
+                let marks = decode_publish_marks(&self.value).map_or_else(
+                    || format!("<undecodable {}>", hex(&self.value)),
+                    |marks| {
+                        let shown: Vec<String> = marks
+                            .iter()
+                            .map(|m| format!("{}:{}@{}", m.generation.0, m.seq.0, m.tick.0))
+                            .collect();
+                        format!("[{}]", shown.join(" "))
+                    },
+                );
+                return write!(f, "publish_marks p={} {marks}", partition.0);
             }
             return write!(
                 f,

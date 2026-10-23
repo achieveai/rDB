@@ -1007,6 +1007,7 @@ fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError 
         retry,
         no_mutation,
         detail: format!("control store: {detail}; {tail}"),
+        retry_after: None,
     }
 }
 

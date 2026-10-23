@@ -114,6 +114,10 @@ pub struct ApiError {
     pub no_mutation: bool,
     /// Detail, for the log and the operator.
     pub detail: String,
+    /// The soonest a retry can be admitted, when the host knows it (M10 S1-6, critic-d6b
+    /// candidate 3): a lower bound, "not before", never a promise that it will be. `None` when
+    /// nothing is known. Set it with [`Self::with_retry_after`], which also says it in `detail`.
+    pub retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -158,6 +162,7 @@ impl ApiError {
             retry,
             no_mutation,
             detail: detail.into(),
+            retry_after: None,
         }
     }
 
@@ -169,6 +174,7 @@ impl ApiError {
             retry: error.retry_rule(),
             no_mutation: error.proves_no_mutation(),
             detail: error.to_string(),
+            retry_after: None,
         }
     }
 
@@ -192,6 +198,7 @@ impl ApiError {
                 "no generation adopted yet for partition {} on node {}; nothing was sent",
                 partition.0, node.0
             ),
+            retry_after: None,
         }
     }
 
@@ -203,7 +210,25 @@ impl ApiError {
             retry: RetryRule::NotWired,
             no_mutation: false,
             detail: format!("host fault: {detail}"),
+            retry_after: None,
         }
+    }
+
+    /// This error with a "not before" hint: a retry is not admitted sooner than `after` from
+    /// now. Sets [`Self::retry_after`] and ends `detail` with `; not before ~Ns`, the seconds
+    /// rounded up so the text never names a time earlier than the hint.
+    #[must_use]
+    pub fn with_retry_after(mut self, after: Duration) -> Self {
+        let seconds = after.as_millis().div_ceil(1_000);
+        self.detail = format!("{}; not before ~{seconds}s", self.detail);
+        self.retry_after = Some(after);
+        self
+    }
+
+    /// The soonest a retry can be admitted, when the host knows it.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
     }
 
     /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
@@ -430,7 +455,8 @@ pub enum OpenError {
     Bootstrap(#[from] admin::BootstrapError),
     /// [`DbConfig::dedup_cap`] is above the cap P1's status index holds. Nothing was started.
     #[error(
-        "dedup_cap {asked} is above the most P1's status index holds ({max}); nothing was started"
+        "dedup_cap {asked} is above the most P1's status index holds ({max}); nothing was \
+         started. Set DbConfig::dedup_cap to at most {max}, or leave it unset for the default"
     )]
     DedupCap {
         /// The cap asked for.
@@ -1784,6 +1810,7 @@ impl Db {
                      a write); restart a node only once it is ready",
                     node.0
                 ),
+                retry_after: None,
             });
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
@@ -1962,6 +1989,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         retry: kernel.retry_rule(),
         no_mutation: kernel.proves_no_mutation(),
         detail: "the read was refused".to_owned(),
+        retry_after: None,
     }
 }
 
@@ -4070,8 +4098,10 @@ mod tests {
                 &serde_json::json!("DedupCap"),
                 &serde_json::json!(format!(
                     "dedup_cap {} is above the most P1's status index holds ({}); nothing was \
-                     started",
+                     started. Set DbConfig::dedup_cap to at most {}, or leave it unset for the \
+                     default",
                     RETENTION_CAP_ENTRIES + 1,
+                    RETENTION_CAP_ENTRIES,
                     RETENTION_CAP_ENTRIES
                 ))
             )

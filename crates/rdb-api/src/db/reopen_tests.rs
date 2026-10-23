@@ -637,8 +637,10 @@ fn m10_s1_8_a_dedup_cap_refused_by_check_logs_db_open_refused() {
     assert_eq!(
         refused.to_string(),
         format!(
-            "dedup_cap {} is above the most P1's status index holds ({}); nothing was started",
+            "dedup_cap {} is above the most P1's status index holds ({}); nothing was started. \
+             Set DbConfig::dedup_cap to at most {}, or leave it unset for the default",
             RETENTION_CAP_ENTRIES + 1,
+            RETENTION_CAP_ENTRIES,
             RETENTION_CAP_ENTRIES
         )
     );
@@ -651,5 +653,34 @@ fn m10_s1_8_a_dedup_cap_refused_by_check_logs_db_open_refused() {
     assert!(
         lines.iter().all(|line| line["@m"] != "dedup_cap_refused"),
         "the old event name is gone: {lines:?}"
+    );
+}
+
+/// M10 S1-6 (A-R183, critic-d6b candidate 3): a "not before" hint rides on the error as
+/// `retry_after` and in its text, the seconds rounded up so the words never promise sooner than
+/// the hint. The kind, the retry rule and the mutation proof are untouched, and an error built
+/// without a hint carries none. Unit (~1 ms).
+#[test]
+fn m10_s1_6_an_api_error_carries_a_not_before_hint_in_its_field_and_its_text() {
+    let plain = ApiError::new(ErrorKind::Overloaded, "dedup index full");
+    assert_eq!(
+        plain.retry_after(),
+        None,
+        "no hint unless the host sets one"
+    );
+    let hinted = plain.clone().with_retry_after(Duration::from_millis(1_500));
+    assert_eq!(hinted.retry_after(), Some(Duration::from_millis(1_500)));
+    assert_eq!(hinted.detail, "dedup index full; not before ~2s");
+    assert_eq!(
+        (hinted.kind, hinted.retry, hinted.no_mutation),
+        (plain.kind, plain.retry, plain.no_mutation),
+        "the hint changes nothing else"
+    );
+    assert_eq!(
+        ApiError::new(ErrorKind::Overloaded, "x")
+            .with_retry_after(Duration::from_secs(3))
+            .detail,
+        "x; not before ~3s",
+        "a whole second is not rounded up past itself"
     );
 }
