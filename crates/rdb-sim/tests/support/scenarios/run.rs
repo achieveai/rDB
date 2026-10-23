@@ -1245,6 +1245,25 @@ pub fn census(trace: &Trace) -> BTreeMap<String, usize> {
     counts
 }
 
+/// Every `SetAdmission` L1 published on `node`, as `(tick, allow)`, in trace order: when writes
+/// paused and resumed there.
+#[must_use]
+pub fn admissions(trace: &Trace, node: NodeId) -> Vec<(u64, bool)> {
+    trace
+        .events
+        .iter()
+        .filter(|event| event.node == node)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                module: rdb_core::contracts::event::ModuleName::Protection,
+                note: KernelNote::SetAdmission { state },
+                ..
+            } => Some((event.logical_tick, state.allow)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A digest of the whole trace, stable across runs of one build: FNV-1a over its JSON. Two runs
 /// of one scenario must print the same value.
 #[must_use]

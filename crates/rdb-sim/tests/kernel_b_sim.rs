@@ -1448,8 +1448,9 @@ fn m7b_62_replication_end_to_end_duplicate_gap_and_forged_ack() {
 // `cases::case_a1_p1_new_generation_between_publish_and_reply()` through `cases::without_activation`
 // removed lowers to a three-node generation-2 partition: primary `cases::B_NODE` (node 1),
 // regular secondaries `cases::C_NODE` (node 2, copy 1) and `cases::A_NODE` (node 3, copy 2),
-// recovered at cutoff `A1_P1_HEAD` (10). L1 starts `Paused`, the barrier goes durable at the plan
-// tick and the 5 s hold ends at `A1_P1_RESUMES_AT`; the case's own write, request 11 -> seq 11 at
+// recovered at cutoff `A1_P1_HEAD` (10). L1 starts `Paused` and resumes at `A1_P1_RESUMES_AT`,
+// the host flush that finds the barrier durable, with no hold: it is the generation's first
+// resume (ruling A-R165(2)). The case's own write, request 11 -> seq 11 at
 // `A1_P1_SUBMIT_AT`, applies, is acknowledged by both secondaries, publishes and is replied in
 // that one tick (`tests/scenarios.rs` `a1p1_case_without_its_activation_publishes_through_a1`).
 // The lowering's host flusher flushes every node every `HOST_FLUSH_EVERY_MILLIS` (100). Both rows
