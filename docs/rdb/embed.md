@@ -304,6 +304,9 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
 
 - **A copy falls behind or stops answering.** Node 1 pauses writes rather than accept writes
   only one copy holds. They resume once that copy catches up.
+- **The exception: a copy cut off across two or more reopens with no writes in between.** That
+  copy stays behind, and writes stay paused until a later release, which catches it up across
+  those reopens. Nothing is lost: the other copies hold every acknowledged write.
 - **The host is starved** (CPU or disk saturated by other work). Timers run late, so writes
   can pause and then recover once the host has room.
 - **rEtcd stalls for more than about 2 s,** for example during its own leader election. Node
