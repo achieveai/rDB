@@ -13,6 +13,8 @@
 //!   commit (`Host::refresh_view`), so a write pays it once per node;
 //! - `get_us`: one [`SnapshotRead::get`] of a random present key on a view already built;
 //! - `miss_us`: one get of an absent key (a lazy view walks every level for it);
+//! - `scan10_us`: one page of 10 `User` records from a random key, as `items()` and blob reads
+//!   page (a lazy view opens one iterator per level for it);
 //! - `step_us`: one commit, then a fresh view, then one get: what a read right after a write
 //!   costs a node.
 //!
@@ -174,6 +176,16 @@ fn measure(
         miss_us.push(started.elapsed().as_secs_f64() * 1e6);
         assert!(found.is_none(), "an absent key reads absent");
     }
+    // One page of 10 from a random key, as `items()` and blob reads page.
+    let mut scan_us = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let from = user_key(rng.below(keys));
+        let started = Instant::now();
+        let page = view.scan(Namespace::User, &from, 10);
+        scan_us.push(started.elapsed().as_secs_f64() * 1e6);
+        assert!(!page.is_empty(), "a page from a loaded key is not empty");
+    }
+    assert_eq!(view.fault(), None, "the bench read no corrupt value");
     drop(view);
     let steps = 5;
     let mut step_us = Vec::with_capacity(steps);
@@ -188,21 +200,25 @@ fn measure(
         step_us.push(started.elapsed().as_secs_f64() * 1e6);
         assert!(found.is_some(), "the write just made reads back");
     }
-    let (view_ms, get_us, miss_us, step_us) = (
+    let (view_ms, get_us, miss_us, scan_us, step_us) = (
         sorted(view_ms),
         sorted(get_us),
         sorted(miss_us),
+        sorted(scan_us),
         sorted(step_us),
     );
     format!(
         "view_ms_p50={:.3} view_ms_max={:.3} get_us_p50={:.2} get_us_p99={:.2} \
-         miss_us_p50={:.2} miss_us_p99={:.2} step_us_p50={:.1} step_us_max={:.1}",
+         miss_us_p50={:.2} miss_us_p99={:.2} scan10_us_p50={:.1} scan10_us_p99={:.1} \
+         step_us_p50={:.1} step_us_max={:.1}",
         percentile(&view_ms, 0.5),
         percentile(&view_ms, 1.0),
         percentile(&get_us, 0.5),
         percentile(&get_us, 0.99),
         percentile(&miss_us, 0.5),
         percentile(&miss_us, 0.99),
+        percentile(&scan_us, 0.5),
+        percentile(&scan_us, 0.99),
         percentile(&step_us, 0.5),
         percentile(&step_us, 1.0),
     )
