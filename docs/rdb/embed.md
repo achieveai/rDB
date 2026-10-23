@@ -303,11 +303,14 @@ Writes can pause without any error in your code. Most pauses end by themselves, 
 loses data.
 A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, say).
 
-- **A copy falls behind or stops answering.** Node 1 pauses writes rather than accept writes
-  only one copy holds. They resume once that copy catches up.
+- **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
+  new writes until that copy catches up. Then they resume.
 - **The exception: a copy cut off across two or more reopens with no writes in between.** That
-  copy stays behind, and writes stay paused until a later release, which catches it up across
-  those reopens. Nothing is lost: the other copies hold every acknowledged write.
+  copy stays behind, and writes stay paused:
+  - A plain reopen does not help, even with every link up. Reads still work.
+  - A `put` is refused with `PROTECTION_PAUSED`, retry rule "retry after recovery". Waiting does
+    not clear it in this release; a later release catches the copy up across those reopens.
+  - Nothing is lost: the other copies hold every acknowledged write.
 - **The host is starved** (CPU or disk saturated by other work). Timers run late, so writes
   can pause and then recover once the host has room.
 - **rEtcd stalls for more than about 2 s,** for example during its own leader election. Node

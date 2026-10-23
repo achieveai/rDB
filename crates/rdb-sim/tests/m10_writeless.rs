@@ -39,7 +39,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::recovery::{DurableProof, RecoveryBarrier, RecoveryResult};
 use rdb_core::contracts::storage::Batch;
 use rdb_core::contracts::time::Tick;
-use rdb_core::contracts::trace::{KernelNote, TraceKind};
+use rdb_core::contracts::trace::{KernelNote, ReadServiceOutcome, TraceKind};
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
 use rdb_core::contracts::version::API_VERSION;
 use rdb_sim::harness::run::{
@@ -369,15 +369,20 @@ fn isolate(runner: &mut Runner, node: NodeId, state: LinkState) {
 /// The first write, then `writeless + 1` reopens that write nothing. Returns the runner, B's
 /// newest root and the tick reached.
 ///
-/// With `behind`, that copy is cut off before the first write, so it misses it, and stays cut
-/// through every reopen, each of which leaves it out of its barrier: a copy behind at the quit,
-/// unheard while the writeless generations open. A copy unheard pauses writes (B-R38), so only a
-/// full set is held to admitting after each reopen.
-fn opened(writeless: u64, behind: Option<NodeId>) -> (Runner, RecoveryResult, u64) {
+/// With `behind`, that copy is cut off and stays cut through every reopen, each of which leaves it
+/// out of its barrier: a copy unheard while the writeless generations open. With `misses_write`
+/// it is cut before the first write, so it misses it (a copy behind at the quit); without, right
+/// after the write's answer, so it holds the write and with it every writeless generation's base.
+/// A copy unheard pauses writes (B-R38), so only a full set is held to admitting after each reopen.
+fn opened(
+    writeless: u64,
+    behind: Option<NodeId>,
+    misses_write: bool,
+) -> (Runner, RecoveryResult, u64) {
     support::preamble();
     let plan = plan();
     let mut runner = Runner::new(&plan).expect("the harness takes the plan");
-    if let Some(node) = behind {
+    if let Some(node) = behind.filter(|_| misses_write) {
         let quiet = run_to(&mut runner, FIRST_AT - 100);
         assert!(quiet.is_empty(), "nothing is written before the cut");
         isolate(&mut runner, node, LinkState::Partitioned);
@@ -389,6 +394,9 @@ fn opened(writeless: u64, behind: Option<NodeId>) -> (Runner, RecoveryResult, u6
         vec![(1, Ok((Generation(2), Seq(CUTOFF.0 + 1))))],
         "the first write publishes in generation 2"
     );
+    if let Some(node) = behind.filter(|_| !misses_write) {
+        isolate(&mut runner, node, LinkState::Partitioned);
+    }
     let mut at = FIRST_AT + 1_000;
     let mut root = newest_root(&runner);
     assert_eq!(
@@ -428,7 +436,7 @@ fn opened(writeless: u64, behind: Option<NodeId>) -> (Runner, RecoveryResult, u6
 /// Write, then `writeless` reopens that write nothing, then one more write. Returns the last
 /// write's answer and the generation it was sent in.
 fn chain(writeless: u64) -> (Answer, Generation) {
-    let (mut runner, root, at) = opened(writeless, None);
+    let (mut runner, root, at) = opened(writeless, None, false);
     runner.queue(&submit(at, 2)).expect("queue");
     let last = run_to(&mut runner, at + 1_000);
     let trace = runner.finish().expect("the trace closes");
@@ -485,7 +493,7 @@ fn m10_d3_a_write_after_three_writeless_reopens_publishes() {
 fn m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_loses_nothing() {
     let method =
         "m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_loses_nothing";
-    let (mut runner, root, at) = opened(1, Some(C_NODE));
+    let (mut runner, root, at) = opened(1, Some(C_NODE), true);
     assert_eq!(root.new_generation, Generation(4));
     isolate(&mut runner, C_NODE, LinkState::Up);
     let quiet = run_to(&mut runner, at + SETTLE_MILLIS);
@@ -544,4 +552,138 @@ fn m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_lose
         [CUTOFF.0 + 1, CUTOFF.0 + 1, CUTOFF.0],
         "A and B still hold the acked write; C holds what it had"
     );
+}
+
+/// The client's read of the written key from the primary B at `at`.
+fn read(at: u64, request: u64) -> SeedEvent {
+    let identity = identity(request);
+    SeedEvent {
+        at: Tick(at),
+        node: B_NODE,
+        boot: scenario_run::BOOT,
+        partition: PARTITION,
+        correlation: CorrelationId(9_100 + request),
+        kind: EventKind::Client(ClientEvent::Read {
+            identity,
+            key: scoped_key(identity.tenant, AffinityId(1), b"a"),
+        }),
+    }
+}
+
+/// A-R177 row 7 (critic-f5), the simulator's twin: C holds the first write, then is cut off and
+/// misses `writeless + 1` reopens that write nothing, so every one of their bases is C's own head.
+/// When C is back it links each missed generation onto the one below at that base
+/// (`land_link_inherited`, the landing twin of the host's `inherit_missed_link`): nothing is
+/// refused, nothing faults, L1 on B admits, and the next write publishes in the newest generation,
+/// lands on C, and reads back. Returns the newest generation.
+fn behind_at_base_then_writes(method: &str, writeless: u64) -> Generation {
+    let (mut runner, root, back) = opened(writeless, Some(C_NODE), false);
+    let newest = root.new_generation;
+    isolate(&mut runner, C_NODE, LinkState::Up);
+    let at = back + SETTLE_MILLIS;
+    let quiet = run_to(&mut runner, at);
+    assert!(
+        quiet.is_empty(),
+        "nothing is answered while C lands: {quiet:?}"
+    );
+
+    let base = CUTOFF.0 + 1;
+    let linked: Vec<(u64, u64, u64)> = logged(method, "land_link_inherited")
+        .iter()
+        .filter(|line| line["node"].as_u64() == Some(u64::from(C_NODE.0)))
+        .map(|line| {
+            (
+                line["from"].as_u64().unwrap_or(0),
+                line["to"].as_u64().unwrap_or(0),
+                line["base"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    let missed: Vec<(u64, u64, u64)> = (3..=newest.0).map(|to| (to - 1, to, base)).collect();
+    assert_eq!(
+        linked, missed,
+        "C links every missed generation onto the one below, at its own head"
+    );
+    let refused = logged(method, "land_link_refused");
+    assert!(refused.is_empty(), "no landing is refused: {refused:?}");
+    let faults: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test("m10_writeless", method)
+            .into_iter()
+            .filter(|line| {
+                line["@l"] == "Error"
+                    || line["kernel"]
+                        .as_str()
+                        .is_some_and(|kernel| kernel.contains("Quarantined"))
+            })
+            .collect();
+    assert!(faults.is_empty(), "nothing faults: {faults:?}");
+    let admitted = admissions_since(&runner, back);
+    assert_eq!(
+        admitted.last().map(|(_, allow)| *allow),
+        Some(true),
+        "L1 on B admits once C is back: {admitted:?}"
+    );
+
+    runner.queue(&submit(at, 2)).expect("queue");
+    runner.queue(&read(at + 1_500, 3)).expect("queue");
+    let report = runner
+        .run(RunLimits {
+            max_events: 200_000,
+            deadline: Tick(at + 3_000),
+        })
+        .expect("the segment runs");
+    let mut answers = Vec::new();
+    let mut reads = Vec::new();
+    for (_, reply) in &report.replies {
+        match reply {
+            ReplyEffect::Transaction { result, .. } => {
+                answers.push((result.generation, result.seq));
+            }
+            ReplyEffect::Read { outcome, value, .. } => {
+                reads.push((*outcome, value.map(|(version, _)| version)));
+            }
+            other => panic!("the write is answered and the read served: {other:?}"),
+        }
+    }
+    let written = Seq(base + 1);
+    assert_eq!(
+        answers,
+        vec![(newest, written)],
+        "the write publishes in the newest generation"
+    );
+    assert_eq!(
+        reads,
+        vec![(ReadServiceOutcome::Served, Some(written.0))],
+        "the read finds it"
+    );
+    let on_c = runner
+        .dispatcher()
+        .engine(C_NODE)
+        .expect("C's engine")
+        .buffered_applied(PARTITION, newest)
+        .0;
+    assert_eq!(on_c, written.0, "C applies the write");
+    newest
+}
+
+/// A-R177 row 7 (critic-f5), the simulator's twin: C misses two writeless generations (3 and 4)
+/// holding their base, lands both, and the next write publishes in generation 4 and reads back.
+#[retcd_test]
+fn m10_a_r177_a_copy_at_the_base_misses_two_writeless_generations_and_the_write_reads_back() {
+    let newest = behind_at_base_then_writes(
+        "m10_a_r177_a_copy_at_the_base_misses_two_writeless_generations_and_the_write_reads_back",
+        1,
+    );
+    assert_eq!(newest, Generation(4));
+}
+
+/// A-R177's D3 probe: the three-writeless-reopen chain (generations 3 to 6) with C missing all of
+/// it. C lands all four and the write publishes in generation 6 and reads back.
+#[retcd_test]
+fn m10_a_r177_a_copy_at_the_base_misses_three_writeless_reopens_and_the_write_reads_back() {
+    let newest = behind_at_base_then_writes(
+        "m10_a_r177_a_copy_at_the_base_misses_three_writeless_reopens_and_the_write_reads_back",
+        3,
+    );
+    assert_eq!(newest, Generation(6));
 }
