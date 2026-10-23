@@ -879,6 +879,69 @@ struct RunningNode {
     tls: Option<Arc<config_grpc::TlsRotator>>,
 }
 
+/// A node whose stop missed its deadline: the node, the last lifecycle event it reached, and
+/// the step it was still waiting on.
+#[derive(Debug)]
+struct StopStuck {
+    id: NodeId,
+    deadline: Duration,
+    last: String,
+    waiting_on: &'static str,
+}
+
+impl std::fmt::Display for StopStuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node {} did not stop within {:?}: last lifecycle event `{}`, still waiting on {}",
+            self.id, self.deadline, self.last, self.waiting_on
+        )
+    }
+}
+
+/// One node's stop, step by step, against one deadline.
+struct StopProgress {
+    id: NodeId,
+    span: tracing::Span,
+    deadline: Duration,
+    until: tokio::time::Instant,
+    /// The last lifecycle event this node reached.
+    last: String,
+}
+
+impl StopProgress {
+    /// Run one stop step until the deadline. On success `done` becomes the node's last
+    /// lifecycle event and is logged; on expiry the step's future is dropped.
+    async fn step(
+        &mut self,
+        waiting_on: &'static str,
+        done: &'static str,
+        step: impl std::future::Future<Output = ()>,
+    ) -> Result<(), StopStuck> {
+        if tokio::time::timeout_at(self.until, step).await.is_ok() {
+            self.span
+                .in_scope(|| tracing::info!(event = done, "node stop step"));
+            self.last = done.to_owned();
+            return Ok(());
+        }
+        let stuck = StopStuck {
+            id: self.id,
+            deadline: self.deadline,
+            last: self.last.clone(),
+            waiting_on,
+        };
+        self.span.in_scope(|| {
+            tracing::error!(
+                last_event = %stuck.last,
+                waiting_on,
+                deadline_ms = u64::try_from(stuck.deadline.as_millis()).unwrap_or(u64::MAX),
+                "node stop missed its deadline"
+            )
+        });
+        Err(stuck)
+    }
+}
+
 /// One cluster member, running or stopped, plus the identity that survives a restart.
 struct NodeSlot {
     identity: ClusterIdentity,
@@ -2735,17 +2798,67 @@ impl Cluster {
 
     // ------------------------------- lifecycle -------------------------------
 
+    /// How long [`Cluster::stop_node`] waits for one node to stop: ten worst-case election
+    /// timeouts, stretched by `RETCD_TEST_DEADLINE_SCALE`.
+    ///
+    /// A stop had no bound before this. tonic drains a plane by waiting for every connection it
+    /// accepted to close, with no timeout of its own, so one connection that never finishes
+    /// its HTTP/2 handshake holds the drain forever. On 2026-10-23 an `m4_88` run passed every
+    /// assertion and then sat in [`Cluster::shutdown`] for over ten minutes (#31).
+    pub fn stop_deadline(&self) -> Duration {
+        self.deadline(10)
+    }
+
     /// Stop node `id`: shut down its Raft instance and both of its gRPC servers, so peers see
     /// a refused connection rather than a silent socket.
+    ///
+    /// Panics when the node has not stopped within [`Cluster::stop_deadline`], naming the node,
+    /// its last lifecycle event and the step it is still waiting on. Whatever has not stopped
+    /// by then is dropped, which signals it to stop; the test's runtime ends the rest.
     pub async fn stop_node(&self, id: NodeId) {
-        let running = {
+        if let Err(stuck) = self.stop_within(id, self.stop_deadline()).await {
+            panic!("{stuck}");
+        }
+    }
+
+    /// [`Cluster::stop_node`], returning a stop that missed `deadline` instead of panicking.
+    async fn stop_within(&self, id: NodeId, deadline: Duration) -> Result<(), StopStuck> {
+        let (running, span) = {
             let mut slots = self.lock();
-            slots.get_mut(&id).and_then(|s| s.running.take())
+            let Some(slot) = slots.get_mut(&id) else {
+                return Ok(());
+            };
+            (slot.running.take(), slot.span.clone())
         };
-        let Some(running) = running else { return };
-        let _ = running.node.stop().await;
-        if let Some(gossip) = &running.gossip {
-            gossip.shutdown().await;
+        let Some(running) = running else {
+            return Ok(());
+        };
+        let RunningNode {
+            node,
+            store,
+            peer_server,
+            client_server,
+            gossip,
+            tls,
+        } = running;
+        let metrics = node.metrics();
+        let mut stop = StopProgress {
+            id,
+            span,
+            deadline,
+            until: tokio::time::Instant::now() + deadline,
+            last: format!(
+                "running as {:?} in term {}",
+                metrics.role, metrics.current_term
+            ),
+        };
+        stop.step("raft shutdown", "node stopped", async {
+            let _ = node.stop().await;
+        })
+        .await?;
+        if let Some(gossip) = &gossip {
+            stop.step("gossip shutdown", "gossip shut down", gossip.shutdown())
+                .await?;
             // The admin backend reads this handle; a shut-down gossip node left in it would
             // let a restarted node's `RotateGossipKey` reach a keyring nobody is gossiping
             // with any more.
@@ -2756,8 +2869,16 @@ impl Cluster {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             }
         }
-        let _ = running.client_server.shutdown().await;
-        let _ = running.peer_server.shutdown().await;
+        stop.step("client plane drain", "client plane drained", async {
+            let _ = client_server.shutdown().await;
+        })
+        .await?;
+        stop.step("peer plane drain", "peer plane drained", async {
+            let _ = peer_server.shutdown().await;
+        })
+        .await?;
+        drop((node, store, gossip, tls));
+        Ok(())
     }
 
     /// Alias for [`Cluster::stop_node`] matching the plan's `stop`.
@@ -2890,9 +3011,26 @@ impl Cluster {
     ///
     /// Awaiting the server handles is what makes "the ports are free afterwards" true; drop
     /// alone only *signals* shutdown.
+    ///
+    /// Each node gets its own [`Cluster::stop_deadline`], so the call is bounded by one
+    /// deadline per node and a stuck node cannot hide whether the others stop. When any node
+    /// misses it, this panics after every node has been tried, naming each stuck node; the
+    /// data root then goes the way a dropped cluster's does.
     pub async fn shutdown(mut self) {
+        let mut stopped = Vec::new();
+        let mut stuck = Vec::new();
         for id in self.ids() {
-            self.stop_node(id).await;
+            match self.stop_within(id, self.stop_deadline()).await {
+                Ok(()) => stopped.push(id),
+                Err(s) => stuck.push(s.to_string()),
+            }
+        }
+        if !stuck.is_empty() {
+            panic!(
+                "Cluster::shutdown: {} node(s) did not stop: {}. Stopped: {stopped:?}",
+                stuck.len(),
+                stuck.join("; ")
+            );
         }
         // Only now may the data directories go. Windows refuses to delete a directory RocksDB
         // still has open, so the order here is the difference between a clean test and a
