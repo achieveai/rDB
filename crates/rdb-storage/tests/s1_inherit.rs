@@ -526,9 +526,13 @@ fn files(db: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
-/// A refused open changes no file. Each directory holds a record the open
+/// A refused open changes no database file. Each directory holds a record the open
 /// refuses (format 0, a corrupt parent record, durable above applied) in an unflushed WAL, the
 /// state a writable open would replay, flush and rotate before reading the marker.
+///
+/// The one file a refused open may add is an empty `CLAIM`. The claim is taken before any read
+/// of the directory (lead ruling A-R168), so it comes before the refusal. These directories are
+/// written raw, as an older build leaves them, so they have no claim file yet.
 #[retcd_test]
 fn m8s_29_s1_p1_a_refused_open_changes_no_file() {
     use rdb_storage::keys::FORMAT_VERSION;
@@ -576,12 +580,18 @@ fn m8s_29_s1_p1_a_refused_open_changes_no_file() {
         let before = files(&db);
         RocksEngine::open(&db).expect_err(case);
         RocksEngine::open_existing(&db).expect_err(case);
+        let mut after = files(&db);
         assert_eq!(
-            files(&db).keys().collect::<Vec<_>>(),
+            after.remove("CLAIM"),
+            Some(Vec::new()),
+            "{case}: the open's claim file is there and empty"
+        );
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
             before.keys().collect::<Vec<_>>(),
             "{case}: a refused open added or removed a file"
         );
-        for (name, bytes) in files(&db) {
+        for (name, bytes) in after {
             assert!(
                 before[&name] == bytes,
                 "{case}: a refused open rewrote {name}"
