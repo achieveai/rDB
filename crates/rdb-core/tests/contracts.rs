@@ -359,6 +359,82 @@ fn m10_s2_the_ack_floor_is_not_the_payload_and_absent_is_the_old_shape() {
     assert_eq!(read, resend, "a floor and pins round-trip");
 }
 
+/// Ruling A-R255: an applied candidate carries the ack floor only when its envelope records
+/// one. A candidate without it serialises without the key, as every candidate did before, and
+/// reads back as `None`; one with a floor and two of its eight pin slots round-trips whole.
+#[retcd_test]
+fn m10_s2_a_candidate_without_an_ack_floor_is_the_old_shape() {
+    use rdb_core::contracts::authority::{AuthorityDecision, Checkpoint, Lineage, Verdict};
+    use rdb_core::contracts::ids::{
+        AuthorityGeneration, BootId, CorrelationId, GrantId, NodeId, OwnerEpoch, PartitionId,
+    };
+    use rdb_core::contracts::publication::{AckFloor, AppliedCandidate};
+    use rdb_core::contracts::time::Tick;
+    use rdb_core::contracts::txn::{Durability, TxnResult};
+
+    let lineage = Lineage {
+        partition: PartitionId(4),
+        generation: Generation(3),
+        owner_epoch: OwnerEpoch(5),
+    };
+    let plain = AppliedCandidate {
+        lineage,
+        config_version: ConfigVersion(7),
+        seq: Seq(12),
+        prev_digest: Digest::of(Domain::Record, &[b"11"]),
+        record_digest: Digest::of(Domain::Record, &[b"12"]),
+        request: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(2),
+            request: RequestId(12),
+        },
+        request_digest: request(1_000).request_digest(),
+        pending_result: TxnResult {
+            partition: PartitionId(4),
+            owner_epoch: OwnerEpoch(5),
+            generation: Generation(3),
+            seq: Seq(12),
+            outcome: Outcome::Published,
+            durability: Durability::BufferedOnTwo,
+        },
+        authority: AuthorityDecision {
+            owner: NodeId(1),
+            boot: BootId(1),
+            grant: GrantId(1),
+            authority_generation: AuthorityGeneration(1),
+            lineage,
+            expiry_utc_ms: 0,
+            decided_at: Tick::ZERO,
+            authority_seq: 1,
+            checkpoint: Checkpoint::StorageDispatch,
+            correlation: CorrelationId(12),
+            verdict: Verdict::Admit,
+        },
+        ack_floor: None,
+    };
+    let old = serde_json::to_value(plain).expect("serialise");
+    assert!(
+        !old.as_object()
+            .expect("an object")
+            .contains_key("ack_floor"),
+        "no floor serialises as the old shape: {old}"
+    );
+    let read: AppliedCandidate = serde_json::from_value(old).expect("the old shape reads");
+    assert_eq!(read, plain, "the old shape reads as no floor");
+
+    let mut pinned = [None; MAX_PINS];
+    pinned[0] = Some(5);
+    pinned[1] = Some(9);
+    let floored = AppliedCandidate {
+        ack_floor: Some(AckFloor { below: 11, pinned }),
+        ..plain
+    };
+    let carried = serde_json::to_value(floored).expect("serialise");
+    assert_eq!(carried["ack_floor"]["below"], 11);
+    let read: AppliedCandidate = serde_json::from_value(carried).expect("read");
+    assert_eq!(read, floored, "a floor and its pins round-trip");
+}
+
 /// Domain separation: the same bytes in two domains are two digests.
 #[retcd_test]
 fn m7f_02_domains_do_not_collide() {

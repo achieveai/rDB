@@ -1305,6 +1305,7 @@ impl TxnKernel {
                     request_digest: admitted.request_digest,
                     pending_result: published_result(self.lineage, seq),
                     authority: *authority,
+                    ack_floor: None,
                 };
                 (
                     FreezeCause::UnresolvedTransaction,
