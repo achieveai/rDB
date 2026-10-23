@@ -7042,7 +7042,10 @@ mod tests {
     /// A10, end to end (the tester's row (b), mutant M19). Both secondaries are cut off from the
     /// start, so F1 commits `ReadOnly` at cutoff 0 and names both copies stalled. After the heal
     /// the partition activates, and activation clears the stall line. Then two puts publish at
-    /// seq 2 and 3, and L1 stays unpaused past its pause age.
+    /// seq 2 and 3, and L1 stays unpaused past its pause age, except for a pause that a stall of
+    /// this thread explains, which must end with L1 admitting (D16). Cuts (D16): a 600 ms stall
+    /// of the thread fails the old watch and passes this one; with that stall, an L1 that never
+    /// resumes after a pause fails this one.
     ///
     /// Not D4's regression guard: stepped by hand, it passed 20 of 20 with D4 unfixed, where the
     /// threaded walk lost a copy in ~3 of 23. The sim row `m9_d4_00` guards D4.
@@ -7066,23 +7069,48 @@ mod tests {
             None,
             "activation clears the stall line"
         );
+        // D16: this one thread steps all three hosts, so a stall of it leaves the puts undurable
+        // everywhere for as long as it lasts. Past the pause age L1 pauses, as the spec says it
+        // must (600-680 ms under gate load, int fa72544; diag-d16). So a gap of a flush period
+        // or more between looks is a stall; a pause that begins within one pause age of one is
+        // allowed, and the window starts again from the stall. The watch ends only with L1
+        // healthy and admitting, so a pause with no stall, or one that never ends, still fails.
+        let stall = Duration::from_millis(HOST_FLUSH_EVERY_MILLIS);
+        let pause_age = Duration::from_millis(Trio::PAUSE_AGE_MILLIS);
+        let mut last = Instant::now();
         for (request, object, seq) in [(1, b"a", 2), (2, b"b", 3)] {
             match trio.ask(put(request, object, b"v", None)) {
                 Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(seq)),
                 other => panic!("put {request}: {other:?}"),
             }
         }
-        let past_pause = Instant::now() + Duration::from_millis(2 * Trio::PAUSE_AGE_MILLIS);
-        trio.until("twice the pause age, unpaused", |trio| {
+        let mut past_pause = Instant::now() + 2 * pause_age;
+        let mut woke: Option<Instant> = None;
+        let mut held_since: Option<Instant> = None;
+        trio.until("twice the pause age, unpaused and admitting", |trio| {
+            let now = Instant::now();
+            if now.duration_since(last) >= stall {
+                woke = Some(now);
+                past_pause = past_pause.max(now + 2 * pause_age);
+            }
+            last = now;
             let status = trio.status(0);
-            assert_ne!(
+            let held = matches!(
                 status.protection.as_deref(),
-                Some("paused"),
-                "L1 paused after the heal: {status:?}"
+                Some("paused" | "reprotecting")
             );
-            (Instant::now() >= past_pause).then_some(())
+            if held {
+                let began = *held_since.get_or_insert(now);
+                assert!(
+                    woke.and_then(|woke| began.checked_duration_since(woke))
+                        .is_some_and(|since| since < pause_age),
+                    "L1 paused after the heal with no stall of this thread before it: {status:?}"
+                );
+            } else {
+                held_since = None;
+            }
+            (now >= past_pause && !held && status.admits == Some(true)).then_some(())
         });
-        assert_eq!(trio.status(0).admits, Some(true));
     }
 
     /// The tester's row (d), moved onto the pinned stall by the K1 ruling (condition 6), and
