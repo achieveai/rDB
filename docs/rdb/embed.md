@@ -138,6 +138,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 - `Db::open` is async; run it on your runtime. `wait_ready`, `put` and `get` are plain blocking
   calls; do not call them from inside an async task.
+- The runtime whose handle you pass must keep running until `db.shutdown()` returns. Control
+  calls to rEtcd, watches and the reopen's repair run as tasks on it, also while your thread
+  sits in `wait_ready`, `put` or `get`. A multi-thread runtime, as above, does that. A
+  current-thread runtime runs its tasks only inside its own `block_on`: once `block_on`
+  returns, those tasks stop, and an open that still needs them does not reach ready.
 - Every error here returns from `run`. `main` prints its text, which says what failed and, for
   most errors, the next step (`InUse`, for one, says to close the other open), and exits with
   code 1. A `Db` that is dropped on the way out shuts itself down. In a real app, match on the
@@ -312,6 +317,8 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   - A `put` is refused with `PROTECTION_PAUSED`, retry rule "retry after recovery". Waiting does
     not clear it in this release; a later release catches the copy up across those reopens.
   - Nothing is lost: the other copies hold every acknowledged write.
+  - How this case behaves is checked in rDB's simulator only. A check of the same case
+    against a real open of a folder is still owed (issue #59).
 - **The host is starved** (CPU or disk saturated by other work). Timers run late, so writes
   can pause and then recover once the host has room.
 - **rEtcd stalls for more than about 2 s,** for example during its own leader election. Node

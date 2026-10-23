@@ -691,6 +691,12 @@ impl Db {
     /// events are queued or the heal has started, not when the partition is ready: call
     /// [`Self::wait_ready`].
     ///
+    /// `rt` must belong to a runtime that keeps running until [`Self::shutdown`] returns:
+    /// control calls, watches and the reopen's heal run as tasks on it, also while a caller
+    /// blocks in [`Self::wait_ready`], [`Self::put`] or [`Self::get`]. A multi-thread runtime
+    /// does. A current-thread runtime runs its tasks only inside its own `block_on`, so once
+    /// that returns they stop (PR #60 review F5).
+    ///
     /// # Errors
     ///
     /// [`OpenError`]. Every check runs before a node starts, and a refused check removes
