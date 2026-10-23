@@ -244,6 +244,10 @@ rule is now:
   `pinned_endpoint()` still reports the configured pin.
 - **When an endpoint answered but no leader did, the error says so.** It reads "no rEtcd
   leader could be reached" and lists the endpoints that answered (review A4, 2026-10-23).
+- **When a server answers `Unavailable` after a move, the answer stays and says where it came
+  from.** For example "leader unknown (answered by A; could not reach: B ...; C ...)", each
+  endpoint passed over with its reason. Its class and retry rule are the server's (A-R208,
+  2026-10-23).
 - **When nothing answers, the error says so per endpoint.** `Unavailable` names each endpoint
   with its reason, and those the budget never reached.
 - **A dead node behind a cached channel costs one operation, not two.** A call that got no
