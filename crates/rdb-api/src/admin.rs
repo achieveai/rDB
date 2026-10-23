@@ -113,16 +113,17 @@ pub fn members_at(boot: BootId) -> Vec<Member> {
         .collect()
 }
 
-/// A recovery plan for partition 1 from `anchor`: rf3 at `version` with `members`, the owner at
-/// `boot` in the authority view, every copy a candidate and in `rebuild_required`, node 1
-/// primary with `grant` at `generation`.
+/// A recovery plan for the anchor's partition from `anchor`: rf3 at `version` with `members`,
+/// the owner at `boot` in the authority view, every copy a candidate and in `rebuild_required`,
+/// the pinned primary with `grant` at `generation`. The host's restart re-plan uses it too
+/// (#42, A-R249).
 ///
 /// Only the pinned primary is `primary_eligible` (ruling A-R215). The host acquires, tracks and
 /// adopts on that copy alone, so F1 must lead with it even when another copy holds the longer
 /// prefix: the leader then catches up before its grant. Every copy eligible let `select_leader`
 /// name the prefix source, which owned the record while node 1 held the grant, and the open
 /// served nothing.
-fn recovery_plan(
+pub(crate) fn recovery_plan(
     anchor: LineageAnchor,
     version: ConfigVersion,
     members: Vec<Member>,
@@ -130,7 +131,7 @@ fn recovery_plan(
     grant: GrantId,
     generation: AuthorityGeneration,
 ) -> RecoveryPlan {
-    let config = PartitionConfig::new(PARTITION, version, members);
+    let config = PartitionConfig::new(anchor.lineage.partition, version, members);
     RecoveryPlan {
         anchor,
         candidates: config
