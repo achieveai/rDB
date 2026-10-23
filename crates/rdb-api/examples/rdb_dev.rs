@@ -3712,7 +3712,7 @@ fn wait_ready_line(
         Err(e @ ReadyError::Blocked { .. }) => {
             ("blocked", Err(format!("stopped waiting for ready: {e}")))
         }
-        // A-R196(2a): its text gives the operator's step; a reopen does not clear it.
+        // A-R196(2a): its text says the data is kept and a reopen will not help.
         Err(e @ ReadyError::Quarantined) => (
             "quarantined",
             Err(format!("stopped waiting for ready: {e}")),
