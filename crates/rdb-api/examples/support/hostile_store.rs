@@ -522,7 +522,10 @@ mod tests {
         let answer = rt.block_on(store.get(GetRequest {
             key: Bytes::from_static(b"partitions/1"),
         }));
-        assert!(answer.is_ok(), "the leader answers the same get: {answer:?}");
+        assert!(
+            answer.is_ok(),
+            "the leader answers the same get: {answer:?}"
+        );
         assert_eq!(store.bound(), leader, "the store is bound to the leader");
 
         assert_eq!(

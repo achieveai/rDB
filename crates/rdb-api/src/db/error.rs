@@ -28,6 +28,11 @@ pub struct ApiError {
 /// the stuck-recovery step). A detail that ends with it already says what to do next.
 const OPEN_AGAIN: &str = "open the folder again";
 
+/// The tail `admin.rs` ends a store error with when a delete may have applied: it already says
+/// to run the call again, which a "retrying will not help" step would contradict (rdb_dev row
+/// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
+const RUN_AGAIN: &str = "run it again to read where it stands";
+
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
     /// step. See [`ApiError::explain`].
@@ -148,15 +153,17 @@ impl ApiError {
     }
 
     /// What the caller does next, in words, for this kind and retry rule. `None` when
-    /// [`Self::detail`] already ends with the step: the host said to shut the `Db` down and open
-    /// the folder again, and a second step would contradict it. A write's `UnknownOutcome`
-    /// (`QueryStatus`) keeps its step even then, because asking [`super::Db::status`] with the same id is still right after the
-    /// new open.
+    /// [`Self::detail`] already ends with its own step, which a second one would contradict: the
+    /// host said to shut the `Db` down and open the folder again, or an admin call said to run it
+    /// again to read where it stands. A write's `UnknownOutcome` (`QueryStatus`) keeps its step
+    /// after "open the folder again", because asking [`super::Db::status`] with the same id is
+    /// still right after the new open.
     #[must_use]
     pub fn next_step(&self) -> Option<&'static str> {
         let write_unknown =
             self.kind == ErrorKind::UnknownOutcome && self.retry == RetryRule::QueryStatus;
-        if self.detail.ends_with(OPEN_AGAIN) && !write_unknown {
+        let reopen = self.detail.ends_with(OPEN_AGAIN) && !write_unknown;
+        if reopen || self.detail.ends_with(RUN_AGAIN) {
             return None;
         }
         Some(step_for(self.kind, self.retry))
@@ -178,8 +185,7 @@ impl ApiError {
 /// serves it, so no kind's retry advice applies.
 const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
     if matches!(retry, RetryRule::NotWired) {
-        return "retrying will not help: keep this Db's log and report this message; to try \
-                again, shut this Db down and open the folder again";
+        return "retrying will not help: keep this Db's log and report this message";
     }
     match kind {
         ErrorKind::NotPrimary | ErrorKind::RouteChanged => {
@@ -361,12 +367,27 @@ mod tests {
         ];
         for kind in &all {
             match kind {
-                NotPrimary | RouteChanged | LeaseExpired | RecoveryReadOnly | ProtectionPaused
-                | ConditionFailed | CrossAffinity | InvalidArgument | Overloaded
-                | DeadlineBeforeAdmission | UnknownOutcome | GenerationChanged
-                | RequestIdReuse | StaleContinuation | CorruptHistory | IncompatibleVersion
-                | StatusExpired | DivergenceRequiresOperator | Unavailable
-                | UploadChunkConflict | CorruptBlob => {}
+                NotPrimary
+                | RouteChanged
+                | LeaseExpired
+                | RecoveryReadOnly
+                | ProtectionPaused
+                | ConditionFailed
+                | CrossAffinity
+                | InvalidArgument
+                | Overloaded
+                | DeadlineBeforeAdmission
+                | UnknownOutcome
+                | GenerationChanged
+                | RequestIdReuse
+                | StaleContinuation
+                | CorruptHistory
+                | IncompatibleVersion
+                | StatusExpired
+                | DivergenceRequiresOperator
+                | Unavailable
+                | UploadChunkConflict
+                | CorruptBlob => {}
             }
         }
         all
@@ -466,7 +487,9 @@ mod tests {
                 retry,
                 ..ApiError::new(ErrorKind::UnknownOutcome, "the read was refused")
             };
-            let read = error.explain().contains("a read changes nothing, so read again");
+            let read = error
+                .explain()
+                .contains("a read changes nothing, so read again");
             let status = error.explain().contains("ask `Db::status`");
             match retry {
                 RetryRule::QueryStatus => assert!(status && !read, "{error}"),
@@ -497,12 +520,24 @@ mod tests {
         for kind in every_kind() {
             let error = ApiError::new(kind, detail.clone());
             if kind == ErrorKind::UnknownOutcome {
-                assert!(error.explain().ends_with("never send it under a new request id"));
+                assert!(error
+                    .explain()
+                    .ends_with("never send it under a new request id"));
             } else {
                 assert_eq!(error.next_step(), None, "{kind:?}");
                 assert_eq!(error.explain(), detail, "{kind:?}");
             }
         }
+        // An admin store error that says to run it again keeps that as its only step.
+        let admin = ApiError {
+            retry: RetryRule::NotWired,
+            ..ApiError::new(
+                ErrorKind::Unavailable,
+                "control store: x; the delete may have applied; run it again to read where it \
+                 stands",
+            )
+        };
+        assert_eq!(admin.next_step(), None, "{admin}");
         // A read's `UnknownOutcome` says "read again", which a reopen step contradicts.
         let read = ApiError {
             retry: RetryRule::BoundedJitter,
