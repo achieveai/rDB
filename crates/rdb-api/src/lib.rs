@@ -53,8 +53,8 @@ pub use host::{Change, ListEdit, Look, Seen};
 // (A-R190): request ids, generations, the status answer and the error kinds.
 pub use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 pub use rdb_core::contracts::ids::{
-    AffinityId, BootId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity,
-    Seq,
+    AffinityId, BootId, ClientId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId,
+    RequestIdentity, Seq,
 };
 pub use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnResult, TxnStatus};
 // The value types an app builds a change from, by name only (S4 A-8): no `rdb_value` internals.

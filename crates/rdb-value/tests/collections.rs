@@ -1415,7 +1415,10 @@ fn q1_add_of_a_present_member_writes_nothing_for_it() {
     assert_eq!(after.version(Namespace::User, &a), Some(1));
     assert_eq!(
         members(&after, &root, None, 10).map(|_| ()),
-        corrupt(Corrupt::SetMemberHasValue { len: 1 })
+        corrupt(Corrupt::Element {
+            key: text("b"),
+            error: Box::new(Corrupt::SetMemberHasValue { len: 1 }),
+        })
     );
 }
 
@@ -1571,6 +1574,13 @@ fn r10_each_corrupt_cause_is_named_on_read() {
         s.insert(apple.clone(), element_version, element);
         s
     };
+    // An element's damage is named by its key (#59, A-R230).
+    let at_apple = |error: Corrupt| {
+        corrupt(Corrupt::Element {
+            key: text("apple"),
+            error: Box::new(error),
+        })
+    };
     let reads = |s: &MapSnapshot, want: &Result<(), ValueError>, why: &str| {
         let point = member(s, &root, &text("apple")).map(|_| ());
         assert_eq!(&point, want, "member: {why}");
@@ -1586,7 +1596,7 @@ fn r10_each_corrupt_cause_is_named_on_read() {
     );
     reads(
         &store(map_root(1), entry(), 6),
-        &corrupt(Corrupt::ElementNewerThanRoot {
+        &at_apple(Corrupt::ElementNewerThanRoot {
             element: 6,
             root: 4,
         }),
@@ -1596,22 +1606,22 @@ fn r10_each_corrupt_cause_is_named_on_read() {
     *flipped.last_mut().unwrap() ^= 1;
     reads(
         &store(map_root(1), Bytes::from(flipped), 4),
-        &corrupt(Corrupt::Envelope(EnvelopeError::DigestMismatch)),
+        &at_apple(Corrupt::Envelope(EnvelopeError::DigestMismatch)),
         "entry digest",
     );
     reads(
         &store(map_root(1), map_root(0), 4),
-        &corrupt(Corrupt::EntryNotDocument { found: Kind::Map }),
+        &at_apple(Corrupt::EntryNotDocument { found: Kind::Map }),
         "entry sealed as a map",
     );
     reads(
         &store(map_root(1), seal(Kind::Document, &[0xFF]).unwrap(), 4),
-        &corrupt(Corrupt::Codec(decode(&[0xFF]).unwrap_err())),
+        &at_apple(Corrupt::Codec(decode(&[0xFF]).unwrap_err())),
         "entry not CBOR",
     );
     reads(
         &store(root_record(Kind::Set, 1), Bytes::from_static(b"x"), 4),
-        &corrupt(Corrupt::SetMemberHasValue { len: 1 }),
+        &at_apple(Corrupt::SetMemberHasValue { len: 1 }),
         "set member with bytes",
     );
 

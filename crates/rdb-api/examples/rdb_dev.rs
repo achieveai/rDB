@@ -32,6 +32,9 @@
 //! `warn` naming its line; the other requests still retry. An append to F that fails is said
 //! with `err`, and the run exits 1.
 //!
+//! `--nodes E` and `--client-id N` are slice 2 flags this build does not run yet: either one is
+//! refused with `not built yet: <flag>; nothing was started`, and the run exits 2.
+//!
 //! `--abort-after-commit` is a dev and test hook (A-R184): the process aborts as soon as a
 //! recovery commits, before the new generation is linked or marked activated. With `--control`
 //! and the same `--dir`, the next run must roll that commit forward. Nothing is printed when it
@@ -174,7 +177,9 @@
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
 //! nodes                                   each node's view of partition 1, with the boot its
-//!                                         running process has
+//!                                         running process has. `mode=? roles=?` stands for
+//!                                         the partition mode and each copy's pinned role
+//!                                         (regular or shadow), not reported by this build yet
 //! node restart <n>                        stop node n and start it again on its data at its
 //!                                         boot plus one; prints `node n boot b`. The new
 //!                                         process holds no role and stays out until the folder is
@@ -234,6 +239,15 @@
 //!                                         earlier clear sent deletes, ask its `status`. While
 //!                                         reads are refused, as after a fence, it answers as
 //!                                         `read` does. `retry` resends it unchanged
+//! admin repair-element map|set <o> <K>    repair one bad map entry or set member and keep the
+//!                                         rest: one `del` of K, which deletes it and writes
+//!                                         the root at its count less one in the same write
+//!                                         (ADR-rdb-0013 decision 11). K is JSON, as `map`
+//!                                         takes it. `repair ok ...`; a K not stored answers
+//!                                         `CONDITION_FAILED` (`op 0: the element is absent`)
+//!                                         and writes nothing. A newer build's entry is
+//!                                         refused `INCOMPATIBLE_VERSION` and kept. A damaged
+//!                                         root, or a list item, still takes `admin clear`
 //! admin damage <o> [--element K | --item P] [--as digest|kind0|newer] [--api-version N]
 //!                                         dev only: overwrite the object's stored root, or
 //!                                         with --element its stored map entry or set member
@@ -267,7 +281,9 @@
 //!                                         manifest only and does not see it
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
-//!                                         store
+//!                                         store. A partitions/ record ends `root={..}`: the
+//!                                         base, owner boot, instance and run its recovery
+//!                                         wrote, or `root=-` when it carries none
 //! control voters                          `voters leader=N running=[..] bound=N`: the rEtcd
 //!                                         leader, the running voters, and the voter the Db's
 //!                                         control store calls now
@@ -299,6 +315,21 @@
 //!                                         one direction only, until `link heal` of the pair
 //!                                         or `link heal all`; the sender is never told. A
 //!                                         hold delays, a drop loses. `links` prints both
+//! put-loop <count> <gap-ms> [<object>]    count puts to the object (default `loop`), gap-ms
+//!                                         apart, the i-th writing i; each prints `put-loop
+//!                                         i=I at_ms=T ms=M <answer>`: T the wall clock (Unix
+//!                                         ms) it was sent at, M how long its answer took.
+//!                                         Not remembered for `retry`
+//! client drop-reply                       the next `put` that applies loses its reply on the
+//!                                         way to the app: it prints the `UNKNOWN_OUTCOME` the
+//!                                         app then holds, with its request, and `status` says
+//!                                         what became of it. A put that did not apply prints
+//!                                         its own answer and leaves the drop armed
+//! admin promote [N] [--drop M] | admin rebuild N | admin damage-copy N --seq S
+//! node restart N --wipe | node stop N | control cut N
+//!                                         slice 2 verbs this build does not run yet: each
+//!                                         answers `not built yet: <verb>; nothing was done`,
+//!                                         and the run exits 1
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //!                                         (default 30). `wait ready` asks Db::wait_ready: after
 //!                                         node 1 restarted, or a failed heal, it stops at once,
@@ -499,6 +530,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 for pair in value("--hold")?.split(',') {
                     parsed.hold.push(parse_pair(pair)?);
                 }
+            }
+            // Slice 2 flags this build does not run yet (W7 day 1): refused by name before
+            // anything starts, never as an unknown argument.
+            flag @ ("--nodes" | "--client-id") => {
+                value(flag)?;
+                let shape = if flag == "--nodes" { "E" } else { "N" };
+                return Err(format!(
+                    "not built yet: {flag} {shape}; nothing was started"
+                ));
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -1311,6 +1351,8 @@ fn repl<'scope, 'env>(
         ..Sent::default()
     };
     let mut bad = false;
+    // `client drop-reply`: the next put that applies loses its reply on the way to the app.
+    let mut drop_reply = false;
     let deadline = args.put_timeout.unwrap_or(Timeouts::default().put);
     for line in input.lines() {
         let line = match command(line) {
@@ -1352,6 +1394,31 @@ fn repl<'scope, 'env>(
             }
             continue;
         }
+        // Its K is JSON, read from the raw line as a value verb reads it.
+        if line
+            .split_whitespace()
+            .take(2)
+            .eq(["admin", "repair-element"])
+        {
+            match parse_repair(&line) {
+                Ok((object, change)) => {
+                    let answer = db.write(object.as_bytes(), change, None);
+                    kind_write_line(
+                        db,
+                        "repair ",
+                        REPAIR_NOTHING,
+                        answer,
+                        &mut sent,
+                        Kind::Value,
+                    );
+                }
+                Err(e) => {
+                    say(&format!("usage: {e}; {REPAIR_USAGE}"));
+                    bad = true;
+                }
+            }
+            continue;
+        }
         let words = match split_words(&line) {
             Ok(words) => words,
             Err(e) => {
@@ -1376,6 +1443,12 @@ fn repl<'scope, 'env>(
                 continue;
             }
         }
+        if let Some(verb) = not_built(&words) {
+            tracing::warn!(verb, "repl_not_built");
+            say(&format!("not built yet: {verb}; nothing was done"));
+            bad = true;
+            continue;
+        }
         let outcome = match words.as_slice() {
             ["quit" | "exit"] => break,
             ["put", "--as", n, object, value, rest @ ..] => parse_app_id(n).and_then(|id| {
@@ -1385,7 +1458,7 @@ fn repl<'scope, 'env>(
                     object: object.as_bytes().to_vec(),
                     if_version,
                 };
-                put_line(db, answer, Some((&mut sent, kind)));
+                app_put_line(db, answer, kind, &mut sent, &mut drop_reply);
                 Ok(())
             }),
             ["put", "--as", ..] => Err("put --as <n> <object> <value> [--if-version N]".to_owned()),
@@ -1396,11 +1469,29 @@ fn repl<'scope, 'env>(
                         object: object.as_bytes().to_vec(),
                         if_version,
                     };
-                    put_line(db, answer, Some((&mut sent, kind)));
+                    app_put_line(db, answer, kind, &mut sent, &mut drop_reply);
                     Ok(())
                 }
                 Err(e) => Err(e),
             },
+            ["put-loop", count, gap, rest @ ..] => {
+                parse_put_loop(count, gap, rest).map(|(count, gap, object)| {
+                    put_loop(db, count, gap, object);
+                })
+            }
+            ["put-loop", ..] => Err(PUT_LOOP_USAGE.to_owned()),
+            ["client", "drop-reply"] => {
+                // One armed drop at a time: arming again does not queue a second (tester-s2).
+                say(if drop_reply {
+                    "client drop-reply: already armed; still only the next put that applies loses \
+                     its reply"
+                } else {
+                    "client drop-reply: the next put that applies loses its reply"
+                });
+                drop_reply = true;
+                Ok(())
+            }
+            ["client", ..] => Err("client drop-reply".to_owned()),
             ["put&", object, value, rest @ ..] => parse_if_version(rest).map(|if_version| {
                 let (object, value) = ((*object).to_owned(), (*value).to_owned());
                 say(&format!("bg {object}: queued"));
@@ -1472,6 +1563,7 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["status", request, rest @ ..] => status_line(db, &sent, request, rest),
+            ["status"] => Err(STATUS_USAGE.to_owned()),
             ["nodes"] => {
                 let answered = db.node_status();
                 for node in [1, 2, 3].map(NodeId) {
@@ -1514,7 +1606,7 @@ fn repl<'scope, 'env>(
             }
             ["admin", ..] => Err(format!(
                 "admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | {DAMAGE_USAGE} | \
-                 {DAMAGE_RECORD_USAGE}"
+                 {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
             )),
             ["control", ..] => match control {
                 Some(control) => control_verb(&words, &line, rt, control),
@@ -1601,6 +1693,22 @@ fn repl<'scope, 'env>(
         }
     }
     exit_code(bad, &sent)
+}
+
+/// The verb a slice-2 command names when this build does not run it yet, or `None` (M10 S2, W7
+/// day 1). Such a command answers `not built yet: <verb>; nothing was done` and the run exits 1,
+/// so a walk can be written before the verb works and goes red by name, never as `unknown
+/// command`. Each line leaves this list when its verb is built.
+fn not_built(words: &[&str]) -> Option<&'static str> {
+    Some(match words {
+        ["admin", "promote", ..] => "admin promote [N] [--drop M]",
+        ["admin", "rebuild", ..] => "admin rebuild N",
+        ["admin", "damage-copy", ..] => "admin damage-copy N --seq S",
+        ["node", "restart", _, "--wipe"] => "node restart N --wipe",
+        ["node", "stop", ..] => "node stop N",
+        ["control", "cut", ..] => "control cut N",
+        _ => return None,
+    })
 }
 
 /// How a REPL run ends: 1 when a line was bad or an append to `--requests F` failed (k214).
@@ -1715,12 +1823,12 @@ fn log_command(line: &str) {
 /// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
 /// object it writes or reads, when it names one. A line `split_words` refuses names no object.
 fn command_fields(line: &str) -> (&'static str, Option<String>) {
-    const VERBS: [&str; 25] = [
+    const VERBS: [&str; 27] = [
         "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
-        "sleep", "quit", "exit", "blob",
+        "sleep", "quit", "exit", "blob", "client", "put-loop",
     ];
-    const SUBVERBS: [&str; 19] = [
+    const SUBVERBS: [&str; 26] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -1740,6 +1848,13 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "control freeze-grant",
         "control fail",
         "control stop",
+        "admin promote",
+        "admin rebuild",
+        "admin damage-copy",
+        "node stop",
+        "control cut",
+        "client drop-reply",
+        "admin repair-element",
     ];
     let mut first = line.split_whitespace();
     let Some(verb) = first
@@ -1756,7 +1871,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "put" | "put&" | "get" | "read" | "doc" | "map" | "set" | "members" | "list" | "items" => 1,
         "blob upload" | "blob chunk" | "blob publish" | "blob gc" | "admin damage-chunk"
         | "admin damage" | "admin clear" => 2,
-        "put --as" => 3,
+        "put --as" | "put-loop" | "admin repair-element" => 3,
         _ => return (verb, None),
     };
     let object = split_words(line)
@@ -1965,6 +2080,39 @@ fn parse_change(line: &str) -> Result<(String, Option<Expected>, Change), String
         other => return Err(format!("{other:?} is not a write")),
     };
     Ok((object, expect, change))
+}
+
+const REPAIR_USAGE: &str = "admin repair-element map|set <object> <K>";
+
+/// What `admin repair-element` would say had it compiled to nothing; its `need K present` means
+/// it never does.
+const REPAIR_NOTHING: &str = "nothing to repair";
+
+/// `admin repair-element map|set <object> <K>`: ADR-rdb-0013 decision 11's `repair_element`,
+/// built over the write path's own repair (A-R137 Q1, M10 S2): one write, `need K present` then
+/// `del K`, which deletes the bad entry or member and writes the root at its count less one,
+/// and keeps every other entry. So one bad entry no longer costs the whole object (`admin
+/// clear`). A K not stored fails the `need`: `CONDITION_FAILED`, nothing written. A newer
+/// build's entry is refused `INCOMPATIBLE_VERSION`, as a `del` is, and nothing is deleted.
+fn parse_repair(line: &str) -> Result<(String, Change), String> {
+    let mut words = Words::new(line);
+    words.take("admin")?;
+    words.take("repair-element")?;
+    let kind = words.take("map or set")?;
+    let object = words.take("<object>")?.to_owned();
+    let key = words.key("K")?;
+    // `need K present` first: a `del` of a key that is not stored still writes the root, so
+    // without it a mistyped K would answer `ok` and repair nothing (walk, W7).
+    let ops = vec![ElemOp::NeedPresent(key.clone()), ElemOp::Remove(key)];
+    if let Some(extra) = words.next() {
+        return Err(format!("unexpected {extra:?} after K"));
+    }
+    let change = match kind {
+        "map" => Change::Map(ops),
+        "set" => Change::Set(ops),
+        other => return Err(format!("{other:?} is not map or set")),
+    };
+    Ok((object, change))
 }
 
 /// A `doc` line's ops; at least one.
@@ -2471,7 +2619,7 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
             "err admin damage-chunk: {} retry={:?} request=- ({})",
             error.name(),
             error.retry,
-            error.detail
+            error.explain()
         ),
     });
     Ok(())
@@ -2575,7 +2723,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
                     say(&format!(
                         "err admin damage: --item read {} ({})",
                         error.name(),
-                        error.detail
+                        error.explain()
                     ));
                     return Ok(());
                 }
@@ -2642,7 +2790,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
             "err admin damage: {} retry={:?} request=- ({})",
             error.name(),
             error.retry,
-            error.detail
+            error.explain()
         ),
     });
     Ok(())
@@ -2680,7 +2828,7 @@ fn root_rewrite(
             return Err(format!(
                 "--element root read {} ({})",
                 error.name(),
-                error.detail
+                error.explain()
             ))
         }
     };
@@ -2760,7 +2908,7 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
                 "err {} retry={:?} ({})",
                 error.name(),
                 error.retry,
-                error.detail
+                error.explain()
             ));
             return;
         }
@@ -3302,6 +3450,95 @@ fn put_line(db: &Db, answer: Result<rdb_api::PutOk, PutError>, record: Option<(&
     labelled_put_line(db, "", answer, record);
 }
 
+/// A `put`'s answer as the app gets it. With `client drop-reply` armed and the put applied, the
+/// reply is lost on the way to the app, which then holds the `UNKNOWN_OUTCOME` it would hold
+/// after a timeout: the day-1 stand-in for S2-7's lost reply (M10 S2, W7). The request is
+/// recorded either way, so `status` and `retry` reach it. A put that did not apply prints its
+/// own answer and leaves the drop armed.
+fn app_put_line(
+    db: &Db,
+    answer: Result<rdb_api::PutOk, PutError>,
+    kind: Kind,
+    sent: &mut Sent,
+    drop_reply: &mut bool,
+) {
+    match answer {
+        Ok(ok) if *drop_reply => {
+            *drop_reply = false;
+            tracing::info!(
+                request = ok.request.0,
+                seq = ok.seq.0,
+                "client_reply_dropped"
+            );
+            say(&lost_reply_text(ok.request));
+            sent.record(Some(*ok.sent), kind);
+        }
+        answer => put_line(db, answer, Some((sent, kind))),
+    }
+}
+
+/// What the app holds once an applied put's reply is lost: its request, and the step.
+fn lost_reply_text(request: RequestId) -> String {
+    let request = request.0;
+    format!(
+        "err UNKNOWN_OUTCOME retry=QueryStatus no_mutation=false request={request} (client \
+         drop-reply: the put applied and its reply was lost before the app saw it; ask `status \
+         {request}`, never send it under a new request id)"
+    )
+}
+
+const PUT_LOOP_USAGE: &str = "put-loop <count> <gap-ms> [<object>]";
+
+/// `put-loop`'s count, gap and object (default `loop`).
+fn parse_put_loop<'a>(
+    count: &str,
+    gap: &str,
+    rest: &[&'a str],
+) -> Result<(u64, Duration, &'a str), String> {
+    let count = count
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| format!("{PUT_LOOP_USAGE}: count is a whole number above 0"))?;
+    let gap = gap
+        .parse::<u64>()
+        .map_err(|_| format!("{PUT_LOOP_USAGE}: gap-ms is whole milliseconds"))?;
+    let object = match rest {
+        [] => "loop",
+        [object] => object,
+        _ => return Err(PUT_LOOP_USAGE.to_owned()),
+    };
+    Ok((count, Duration::from_millis(gap), object))
+}
+
+/// `put-loop`: `count` puts to `object`, `gap` apart, the i-th writing `i`. Each prints
+/// `put-loop i=I at_ms=T ms=M <answer>`: T the wall clock (Unix ms) it was sent at, M how long
+/// its answer took, the answer as `put` prints it. Logged as `repl_put_loop{i, at_ms, ms,
+/// outcome}`, for S2-2 and S2-6 timings. Not recorded for `retry`.
+fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) {
+    for i in 1..=count {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        let started = Instant::now();
+        let answer = db.put(object.as_bytes(), i.to_string().as_bytes(), None);
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let outcome = answer
+            .as_ref()
+            .map_or_else(|refused| refused.error.name(), |_| "ok".to_owned());
+        tracing::info!(i, at_ms, ms, outcome = %outcome, "repl_put_loop");
+        say(&format!(
+            "put-loop i={i} at_ms={at_ms} ms={ms} {}",
+            put_text(&answer)
+        ));
+        if i < count {
+            std::thread::sleep(gap);
+        }
+    }
+}
+
 /// [`put_line`] with `label` before the answer, as `chunk 0 ok ...`.
 fn labelled_put_line(
     db: &Db,
@@ -3362,7 +3599,7 @@ fn put_text(answer: &Result<rdb_api::PutOk, PutError>) -> String {
                 error.name(),
                 error.retry,
                 error.no_mutation,
-                error.detail
+                error.explain()
             )
         }
     }
@@ -3380,21 +3617,24 @@ fn get_line(answer: Result<rdb_api::GetOk, rdb_api::ApiError>) {
             )),
             None => say(&format!("absent gen={} at={}", ok.generation.0, ok.at.0)),
         },
-        Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
+        Err(error) => say(&format!("err {} ({})", error.name(), error.explain())),
     }
 }
+
+/// `status`'s words, for a usage error (tester-s2: a bare `status` said "unknown command").
+const STATUS_USAGE: &str = "status <request> [<generation>]";
 
 fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(), String> {
     let request = request
         .parse::<u64>()
-        .map_err(|_| "status <request> [<generation>]".to_owned())?;
+        .map_err(|_| STATUS_USAGE.to_owned())?;
     let generation = match rest {
         [] => None,
         [g] => Some(Generation(
             g.parse()
                 .map_err(|_| "a generation is a number".to_owned())?,
         )),
-        _ => return Err("status <request> [<generation>]".to_owned()),
+        _ => return Err(STATUS_USAGE.to_owned()),
     };
     // The nodes first: a request node 1 holds in flight that publishes between the two looks is
     // then answered by the status, never called not in flight (Msg 8, W6-D1).
@@ -3413,7 +3653,7 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
         }
         Ok(status) => say(&known_status_line(request, &status)),
-        Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
+        Err(error) => say(&format!("err {} ({})", error.name(), error.explain())),
     }
     Ok(())
 }
@@ -3519,6 +3759,10 @@ fn missing_node_line(node: NodeId, boot: Option<BootId>, failed: bool) -> String
 
 /// One node's line. `published=` is left off a secondary: P1 publishes nothing there, so its
 /// `0@<gen>` would read as a real position (PC12).
+///
+/// `mode=? roles=?` stands where the partition mode (`ACTIVE`, `DEGRADED_RF2`, ..) and each
+/// copy's pinned role (regular or shadow) go once `NodeStatus` carries them (M10 S2, W5): a `?`
+/// says this build does not report them yet, so a walk reads it as no entry, not as nothing.
 fn node_line(node: &NodeStatus) -> String {
     let published = match node.published {
         _ if node.role == "secondary" => String::new(),
@@ -3526,7 +3770,8 @@ fn node_line(node: &NodeStatus) -> String {
         None => " published=-".to_owned(),
     };
     format!(
-        "node={} boot={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}{}",
+        "node={} boot={} {} authority={} recovery={} recovered={} role={} l1={} admits={} mode=? \
+         roles=?{published}{}{}",
         node.node.0,
         node.boot.0,
         holds_part(node),
@@ -3566,7 +3811,7 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
                 for record in response.records {
                     let key = String::from_utf8_lossy(&record.key).into_owned();
                     let body = if prefix == "partitions/" {
-                        PartitionRecord::decode(&record.value).map(|r| format!("{r:?}"))
+                        partition_body(&record.value)
                     } else {
                         GrantRecord::decode(&record.value).map(|r| format!("{r:?}"))
                     };
@@ -3580,6 +3825,32 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
             Err(e) => say(&format!("err control list {prefix}: {e}")),
         }
     }
+}
+
+/// A `partitions/` body as `control` prints it: the record, then `root=` and the root a
+/// layout-3 body carries, or `root=-` for a layout-2 body, which has none (M10 S2 triage:
+/// `control` prints the root). The root is where the generation's history starts, the owner
+/// boot and run that wrote it, and the rDB instance it belongs to.
+fn partition_body(body: &[u8]) -> Option<String> {
+    let record = PartitionRecord::decode(body)?;
+    let root = PartitionRoot::decode(body).map_or_else(
+        || "-".to_owned(),
+        |root| {
+            format!(
+                "{{mode={:?} owner_boot={} base={} base_digest={} predecessor={}@{} instance={} \
+                 run={}}}",
+                root.mode,
+                root.owner_boot.0,
+                root.base_seq.0,
+                hex::encode(root.base_digest.0),
+                root.predecessor_cutoff.0,
+                root.predecessor_generation.0,
+                hex::encode(root.instance),
+                root.run.0
+            )
+        },
+    );
+    Some(format!("{record:?} root={root}"))
 }
 
 /// `admin clear-grant`'s error as one line, with its retry rule and mutation proof as a `put`
@@ -3619,6 +3890,8 @@ fn admin_error_line(node: NodeId, error: &ApiError) -> String {
         error.name(),
         error.retry,
         error.no_mutation,
+        // The detail, not `explain`: `{words}` is this line's step, and a second would
+        // contradict it.
         error.detail
     )
 }
@@ -6071,6 +6344,131 @@ mod tests {
             "{said}"
         );
         assert_eq!(code, ExitCode::from(1), "a stopped wait exits 1");
+    }
+
+    /// M10 S2 day 1 (W7): each slice-2 verb this build does not run answers `not built yet` by
+    /// its name, so the tester's walk goes red by name, not as `unknown command`; the verbs it
+    /// sits beside still run. The two slice-2 flags are refused by name before anything starts.
+    /// Cut: drop a line of `not_built` and its verb reads as a usage error. Unit.
+    #[test]
+    fn slice_2_verbs_and_flags_answer_not_built_yet_by_name() {
+        for (line, verb) in [
+            ("admin promote", "admin promote [N] [--drop M]"),
+            ("admin promote 2 --drop 3", "admin promote [N] [--drop M]"),
+            ("admin rebuild 1", "admin rebuild N"),
+            ("admin damage-copy 2 --seq 4", "admin damage-copy N --seq S"),
+            ("node restart 1 --wipe", "node restart N --wipe"),
+            ("node stop 3", "node stop N"),
+            ("control cut 1", "control cut N"),
+        ] {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(not_built(&words), Some(verb), "{line}");
+        }
+        for line in [
+            "node restart 1",
+            "admin clear x",
+            "control",
+            "link drop 1-2",
+        ] {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(not_built(&words), None, "{line} still runs");
+        }
+        let args = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        for (words, said) in [
+            (
+                ["--nodes", "127.0.0.1:1"],
+                "not built yet: --nodes E; nothing was started",
+            ),
+            (
+                ["--client-id", "2"],
+                "not built yet: --client-id N; nothing was started",
+            ),
+        ] {
+            assert_eq!(args(&words).expect_err("refused").as_str(), said);
+        }
+        assert!(usage().contains("not built yet: <verb>; nothing was done"));
+    }
+
+    /// M10 S2 triage, `repair_element` (A-R137 Q1): `admin repair-element map|set <o> <K>` is
+    /// one write, `need K present` then `del K`. Walk W7 (repair.txt): with the `del` alone, a K
+    /// that is not stored still answered `repair ok` and wrote the root, repairing nothing; the
+    /// `need` makes it `CONDITION_FAILED`, nothing written. A byte key reads as `map` reads it.
+    /// Cut: drop the `need` and the first assert is red. Unit.
+    #[test]
+    fn repair_element_needs_k_present_then_deletes_it() {
+        let key = Value::Text("b".into());
+        assert_eq!(
+            parse_repair(r#"admin repair-element map m "b""#).expect("parses"),
+            (
+                "m".to_owned(),
+                Change::Map(vec![ElemOp::NeedPresent(key.clone()), ElemOp::Remove(key)])
+            )
+        );
+        let bytes = Value::Bytes(vec![0, 0xff]);
+        assert_eq!(
+            parse_repair(r#"admin repair-element set s {"$bytes":"00ff"}"#).expect("parses"),
+            (
+                "s".to_owned(),
+                Change::Set(vec![
+                    ElemOp::NeedPresent(bytes.clone()),
+                    ElemOp::Remove(bytes)
+                ])
+            )
+        );
+        for (line, said) in [
+            (
+                r#"admin repair-element list m "a""#,
+                r#""list" is not map or set"#,
+            ),
+            ("admin repair-element map m", "missing K (a JSON value)"),
+            (
+                r#"admin repair-element map m "a" "b""#,
+                r#"unexpected "\"b\"" after K"#,
+            ),
+        ] {
+            assert_eq!(parse_repair(line).expect_err(line), said, "{line}");
+        }
+    }
+
+    /// M10 S2 triage, "`control` prints the root": a layout-3 `partitions/` body carries a
+    /// `PartitionRoot` (base, owner boot, instance, run), and `control` printed the record's
+    /// Debug only, so a walk could not see which instance or base a heal wrote. It now ends
+    /// `root={..}`, or `root=-` for a layout-2 body. Cut: drop the root and the first assert is
+    /// red. Unit.
+    #[test]
+    fn control_prints_the_partition_root() {
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::ids::{Revision, Seq};
+        let record = PartitionRecord {
+            partition: PartitionId(1),
+            owner: NodeId(2),
+            generation: Generation(3),
+            ..PartitionRecord::default()
+        };
+        let root = rdb_core::authority::partition::PartitionRoot {
+            mode: rdb_core::authority::partition::RecordMode::Committed,
+            owner_boot: BootId(5),
+            base_seq: Seq(7),
+            base_digest: Digest([0xab; 32]),
+            predecessor_generation: Generation(2),
+            predecessor_cutoff: Seq(6),
+            instance: [0x11; 16],
+            run: Revision(42),
+        };
+        let rooted = partition_body(&record.encode_with(&root)).expect("decodes");
+        assert!(
+            rooted.ends_with(&format!(
+                "root={{mode=Committed owner_boot=5 base=7 base_digest={} predecessor=6@2 \
+                 instance={} run=42}}",
+                "ab".repeat(32),
+                "11".repeat(16)
+            )),
+            "{rooted}"
+        );
+        assert!(rooted.starts_with("PartitionRecord {"), "{rooted}");
+        let plain = partition_body(&record.encode()).expect("decodes");
+        assert!(plain.ends_with(" root=-"), "{plain}");
+        assert_eq!(partition_body(b"\x09junk"), None);
     }
 
     /// k325 P1: `--help` and `-h` ask for the usage, which is this file's `//!` header without

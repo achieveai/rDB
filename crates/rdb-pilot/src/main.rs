@@ -29,6 +29,21 @@
 //!
 //! Logs go to `L/pilot_kv.jsonl` (default `D` with `.logs` appended) and never carry key or
 //! value text (ADR-0013, A-R154): the pilot logs counts and indices only.
+//!
+//! # Against node processes (M10 S2, ruling A-R226)
+//!
+//! ```text
+//! pilot_kv --dir D --control E --nodes 1=ADDR,2=ADDR,3=ADDR --cert-dir C [--app NAME]
+//!          [--client-id N] [--put KEY=VALUE] [--get KEY] [...the flags above]
+//! ```
+//!
+//! With `--nodes` the pilot runs no copy itself: it opens its `Db` with `local = []` and links
+//! that dial every node, as the app `NAME` (default `pilot`, certificate `C/app-NAME.*`), under
+//! client id `N` (default 1). It waits until every node's link is up, printing
+//! `links up nodes=1,2,3`, or names each node that is not: a refused handshake exits 3, a node
+//! not reached in time exits 5. `D` then holds only the journal. `--put` writes one value and
+//! prints `put seq=<seq> request=<id>`; `--get` prints `get value=<text>` or `get absent`.
+//! `scripts/local-rdb.sh up` prints the exact command for its run.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -37,9 +52,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeMap;
+
 use config_core::ConfigStore;
 use rdb_api::db::ReadyError;
-use rdb_api::{Db, DbConfig, Timeouts};
+use rdb_api::net::faults::Faults;
+use rdb_api::net::wire::Label;
+use rdb_api::net::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
+use rdb_api::transport::Links;
+use rdb_api::{BootId, ClientId, Db, DbConfig, NodeId, Timeouts};
 
 /// The ack journal's file name, inside the rDB folder.
 const JOURNAL: &str = "pilot_kv.journal";
@@ -54,10 +75,19 @@ struct Args {
     reopens: u64,
     verify: bool,
     bench: bool,
+    /// `--nodes`: the node processes to dial. Empty: all three copies in this process.
+    nodes: BTreeMap<u32, String>,
+    cert_dir: Option<PathBuf>,
+    app: String,
+    client_id: u32,
+    put: Option<(String, String)>,
+    get: Option<String>,
 }
 
 const USAGE: &str = "usage: pilot_kv --dir D --control host:port[,host:port...] [--log-dir L] \
-                     [--ready-secs S] [--write N] [--reopens K] [--verify] [--bench]";
+                     [--ready-secs S] [--write N] [--reopens K] [--verify] [--bench] \
+                     [--nodes 1=ADDR,2=ADDR,3=ADDR --cert-dir C [--app NAME] [--client-id N]] \
+                     [--put KEY=VALUE] [--get KEY]";
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut dir = None;
@@ -68,6 +98,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut reopens = 0;
     let mut verify = false;
     let mut bench = false;
+    let mut nodes = BTreeMap::new();
+    let mut cert_dir = None;
+    let mut app = "pilot".to_owned();
+    let mut client_id = rdb_api::db::DEFAULT_CLIENT.0;
+    let mut put = None;
+    let mut get = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -103,12 +139,46 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--verify" => verify = true,
             "--bench" => bench = true,
+            "--nodes" => {
+                for pair in value("--nodes")?
+                    .split(',')
+                    .filter(|p| !p.trim().is_empty())
+                {
+                    let (n, addr) = pair
+                        .trim()
+                        .split_once('=')
+                        .ok_or_else(|| format!("--nodes: {pair:?} is not N=host:port"))?;
+                    let n = n
+                        .parse::<u32>()
+                        .map_err(|_| format!("--nodes: {n:?} is not a node number"))?;
+                    nodes.insert(n, addr.to_owned());
+                }
+            }
+            "--cert-dir" => cert_dir = Some(PathBuf::from(value("--cert-dir")?)),
+            "--app" => app = value("--app")?,
+            "--client-id" => {
+                let text = value("--client-id")?;
+                client_id = text
+                    .parse::<u32>()
+                    .map_err(|_| format!("--client-id takes a number, got {text}"))?;
+            }
+            "--put" => {
+                let text = value("--put")?;
+                let (k, v) = text
+                    .split_once('=')
+                    .ok_or_else(|| "--put takes KEY=VALUE".to_owned())?;
+                put = Some((k.to_owned(), v.to_owned()));
+            }
+            "--get" => get = Some(value("--get")?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
     let dir = dir.ok_or("--dir is required")?;
     if control.is_empty() {
         return Err("--control is required: the rEtcd client endpoints".to_owned());
+    }
+    if !nodes.is_empty() && cert_dir.is_none() {
+        return Err("--nodes needs --cert-dir: the run's certificates".to_owned());
     }
     let log_dir = log_dir.unwrap_or_else(|| {
         let mut name = dir.as_os_str().to_owned();
@@ -124,6 +194,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         reopens,
         verify,
         bench,
+        nodes,
+        cert_dir,
+        app,
+        client_id,
+        put,
+        get,
     })
 }
 
@@ -318,15 +394,23 @@ fn run(args: &Args) -> ExitCode {
         }
     };
     let store: Arc<dyn ConfigStore> = Arc::new(client);
+    let (local, links) = if args.nodes.is_empty() {
+        (rdb_api::db::ALL_NODES.to_vec(), None)
+    } else {
+        match connect(&rt, args) {
+            Ok(links) => (Vec::new(), Some(links)),
+            Err(code) => return code,
+        }
+    };
     let config = DbConfig {
         dir: args.dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
-        local: rdb_api::db::ALL_NODES.to_vec(),
-        links: None,
-        client: rdb_api::db::DEFAULT_CLIENT,
+        local,
+        links,
+        client: ClientId(args.client_id),
         boot: None,
     };
     tracing::info!(
@@ -353,8 +437,105 @@ fn run(args: &Args) -> ExitCode {
         };
     }
     let code = check_phase(&db, args);
+    if code != ExitCode::SUCCESS {
+        db.shutdown();
+        return code;
+    }
+    let code = point_phase(&db, args);
     db.shutdown();
     code
+}
+
+/// `--nodes`: links that dial every node as app `--app`, up before the `Db` opens. Exit 2 when
+/// the certificates cannot be read or the links cannot start, 3 when a node refuses the
+/// handshake, 5 when one is not reached within `--ready-secs`.
+fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, ExitCode> {
+    let label = Label::App(args.app.clone());
+    let cert_dir = args.cert_dir.as_deref().ok_or(ExitCode::from(2))?;
+    let tls = certs::load(cert_dir, &label).map_err(|error| {
+        eprintln!("pilot_kv: --cert-dir: {error}");
+        ExitCode::from(2)
+    })?;
+    let dial: BTreeMap<NodeId, String> = args
+        .nodes
+        .iter()
+        .map(|(n, addr)| (NodeId(*n), addr.clone()))
+        .collect();
+    let peers: Vec<NodeId> = dial.keys().copied().collect();
+    let links = Links::new();
+    let net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label,
+                boot: BootId(0),
+                tls,
+                peers: peers.iter().copied().collect(),
+                dial,
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+            },
+            &links,
+            None,
+        )
+        .map_err(|error| {
+            eprintln!("pilot_kv: links: {error}");
+            ExitCode::from(2)
+        })?
+    };
+    let names = peers.iter().map(|n| n.0.to_string()).collect::<Vec<_>>();
+    match rt.block_on(net.wait_up(&peers, args.ready)) {
+        Ok(()) => {
+            tracing::info!(nodes = ?names, client = args.client_id, "pilot_links_up");
+            println!("links up nodes={}", names.join(","));
+            Ok(links)
+        }
+        Err(down) => {
+            let refused = net
+                .states()
+                .values()
+                .any(|state| matches!(state, LinkState::Refused(_)));
+            tracing::error!(%down, refused, "pilot_links_down");
+            println!("links down: {down}");
+            Err(ExitCode::from(if refused { 3 } else { 5 }))
+        }
+    }
+}
+
+/// `--put` then `--get`, each once. Exit 1 when either fails.
+fn point_phase(db: &Db, args: &Args) -> ExitCode {
+    if let Some((key, value)) = &args.put {
+        match db.put(key.as_bytes(), value.as_bytes(), None) {
+            Ok(ok) => {
+                tracing::info!(seq = ok.seq.0, "pilot_put");
+                println!("put seq={} request={}", ok.seq.0, ok.request.0);
+            }
+            Err(error) => {
+                tracing::error!(error = %error.error, "pilot_put_failed");
+                println!("put failed: {}", error.error);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if let Some(key) = &args.get {
+        match db.get(key.as_bytes()) {
+            Ok(got) => {
+                tracing::info!(present = got.value.is_some(), "pilot_get");
+                match got.value {
+                    Some((_, value)) => {
+                        println!("get value={}", String::from_utf8_lossy(&value));
+                    }
+                    None => println!("get absent"),
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "pilot_get_failed");
+                println!("get failed: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Open the folder and wait until node 1 admits writes. Prints `<label> ms=<open-to-ready>
@@ -701,6 +882,50 @@ mod tests {
         );
         assert!(parsed(&["--dir", "D", "--control", "c:1", "--reopens", "x"]).is_err());
         assert_eq!(args.log_dir, PathBuf::from("D.logs"));
+    }
+
+    /// M10 S2 (A-R226): `--nodes` names the node processes and needs the run's certificates;
+    /// `--client-id`, `--app`, `--put` and `--get` parse as given, and default to one client.
+    #[test]
+    fn node_process_arguments_parse_and_nodes_need_certificates() {
+        let parsed = |words: &[&str]| parse(words.iter().map(|word| (*word).to_owned()));
+        let base = ["--dir", "D", "--control", "c:1"];
+        let with = |extra: &[&str]| {
+            let mut words = base.to_vec();
+            words.extend_from_slice(extra);
+            parsed(&words)
+        };
+        assert_eq!(
+            with(&["--nodes", "1=a:1"]).expect_err("no certificates"),
+            "--nodes needs --cert-dir: the run's certificates"
+        );
+        let args = with(&[
+            "--nodes",
+            "1=127.0.0.1:41, 2=127.0.0.1:42,3=127.0.0.1:43",
+            "--cert-dir",
+            "C",
+            "--app",
+            "pilot-a",
+            "--client-id",
+            "7",
+            "--put",
+            "k=v=w",
+            "--get",
+            "k",
+        ])
+        .expect("parses");
+        assert_eq!(
+            args.nodes.values().collect::<Vec<_>>(),
+            ["127.0.0.1:41", "127.0.0.1:42", "127.0.0.1:43"]
+        );
+        assert_eq!((args.app.as_str(), args.client_id), ("pilot-a", 7));
+        assert_eq!(args.put, Some(("k".to_owned(), "v=w".to_owned())));
+        assert_eq!(args.get.as_deref(), Some("k"));
+        let local = with(&[]).expect("parses");
+        assert!(local.nodes.is_empty());
+        assert_eq!(local.client_id, rdb_api::db::DEFAULT_CLIENT.0);
+        assert!(with(&["--put", "novalue"]).is_err());
+        assert!(with(&["--nodes", "x=a:1", "--cert-dir", "C"]).is_err());
     }
 
     /// The marked span of an example, as embed.md's code block for it must read.

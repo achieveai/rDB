@@ -54,8 +54,18 @@ fn is_newer(got: &ValueError) -> bool {
 
 const NEWER: ValueError = ValueError::Corrupt(Corrupt::Envelope(EnvelopeError::UnknownCodec(0x02)));
 
+/// What a read of a map meeting a newer build's entry at `key` answers: [`NEWER`]'s cause,
+/// named by the key (#59, A-R230).
+fn newer_read(key: Value) -> ValueError {
+    ValueError::Corrupt(Corrupt::Element {
+        key,
+        error: Box::new(Corrupt::Envelope(EnvelopeError::UnknownCodec(0x02))),
+    })
+}
+
 /// What a map write naming `key`, whose entry a newer build wrote, answers (#55): the entry's
-/// error, with its key. A read or a clear meeting the same entry answers [`NEWER`].
+/// error, with its key. A read meeting the same entry, or a clear that proves a sound map by
+/// reading it, answers [`newer_read`]; a clear that scans the records answers [`NEWER`].
 fn newer_entry(key: Value) -> ValueError {
     ValueError::Corrupt(Corrupt::Entry {
         key,
@@ -174,10 +184,14 @@ fn s7_a_newer_map_entry_reads_as_a_newer_build_above_or_at_its_root() {
         let at = format!("above_root={above_root}");
         assert_eq!(
             members(&s, &root, None, usize::MAX).unwrap_err(),
-            NEWER,
+            newer_read(text("b")),
             "{at}"
         );
-        assert_eq!(member(&s, &root, &text("b")).unwrap_err(), NEWER, "{at}");
+        assert_eq!(
+            member(&s, &root, &text("b")).unwrap_err(),
+            newer_read(text("b")),
+            "{at}"
+        );
         let page = members(&s, &root, None, 1).expect("a page before b");
         assert_eq!(page.members.len(), 1, "{at}");
         assert!(members(&s, &root, Some(&text("b")), 10).is_ok(), "{at}");
@@ -348,7 +362,7 @@ fn s7_a_refused_map_write_shows_its_key_safely() {
         assert!(is_newer(&got), "{key:?}");
         assert_eq!(
             members(&s, &root, None, usize::MAX).unwrap_err(),
-            NEWER,
+            newer_read(key.clone()),
             "a read keeps its text: {key:?}"
         );
     }
@@ -400,7 +414,11 @@ fn s7_a_set_member_is_never_a_newer_builds() {
     let s = k.snapshot();
     let read = members(&s, &root, None, usize::MAX).unwrap_err();
     assert!(
-        matches!(read, ValueError::Corrupt(Corrupt::SetMemberHasValue { .. })),
+        matches!(
+            &read,
+            ValueError::Corrupt(Corrupt::Element { key, error })
+                if *key == int(1) && matches!(**error, Corrupt::SetMemberHasValue { .. })
+        ),
         "{read:?}"
     );
     let version = Expected::Version(root_version(&k, &root));
@@ -510,14 +528,17 @@ fn s7_two_faults_in_one_map_never_lose_the_newer_entry() {
         k.commit(&made);
     }
     let s = k.snapshot();
-    assert_eq!(members(&s, &root, None, usize::MAX).unwrap_err(), NEWER);
+    assert_eq!(
+        members(&s, &root, None, usize::MAX).unwrap_err(),
+        newer_read(text("b"))
+    );
     let version = Expected::Version(root_version(&k, &root));
     let del_b = [ElemOp::Remove(text("b"))];
     assert_eq!(
         compile_collection(&s, &root, CollectionKind::Map, version, &del_b).unwrap_err(),
         newer_entry(text("b"))
     );
-    assert_eq!(clear_object(&s, &root).unwrap_err(), NEWER);
+    assert_eq!(clear_object(&s, &root).unwrap_err(), newer_read(text("b")));
     assert_eq!(
         k.records[&b].1,
         newer_record(),
