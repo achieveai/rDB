@@ -5308,9 +5308,8 @@ impl Host {
             // The damaged chunk a Chunk or Publish arm met, with its upload, for the log (A-R132).
             let mut chunk = None;
             let compiled = match &put.change {
-                Change::Doc(delta) => {
-                    rdb_value::compile(view, &root, expected, delta).map_err(|e| compile_error(&e))
-                }
+                Change::Doc(delta) => rdb_value::compile(view, &root, expected, delta)
+                    .map_err(|e| compile_error(&root, &e)),
                 Change::Map(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
@@ -5318,7 +5317,7 @@ impl Host {
                     expected,
                     ops,
                 )
-                .map_err(|e| compile_error(&e)),
+                .map_err(|e| compile_error(&root, &e)),
                 Change::Set(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
@@ -5326,7 +5325,7 @@ impl Host {
                     expected,
                     ops,
                 )
-                .map_err(|e| compile_error(&e)),
+                .map_err(|e| compile_error(&root, &e)),
                 Change::List(edits) => list_compile(view, &root, expected, edits),
                 Change::Chunk { .. } | Change::Gc { .. } | Change::Clear
                     if put.expect.is_some() =>
@@ -5337,7 +5336,7 @@ impl Host {
                     )))
                 }
                 Change::Gc { floor } => rdb_value::blob::collect_garbage(view, &root, *floor)
-                    .map_err(|e| compile_error(&e)),
+                    .map_err(|e| compile_error(&root, &e)),
                 Change::Clear => self.clear(partition, identity, &root, view, published),
                 Change::Chunk {
                     upload,
@@ -5345,7 +5344,7 @@ impl Host {
                     bytes,
                 } => rdb_value::blob::put_chunk(view, &root, upload, *index, bytes).map_err(|e| {
                     chunk = damaged_chunk(&e).map(|index| (*upload, index));
-                    compile_error(&e)
+                    compile_error(&root, &e)
                 }),
                 // `serving` is the adopted generation the request will be fenced with
                 // (ADR-rdb-0014 §6 check 0).
@@ -5366,7 +5365,7 @@ impl Host {
                 )
                 .map_err(|e| {
                     chunk = damaged_chunk(&e).map(|index| (*upload, index));
-                    compile_error(&e)
+                    compile_error(&root, &e)
                 })
                 .and_then(|compiled| {
                     if compiled.mutations.is_empty() {
@@ -5470,14 +5469,14 @@ impl Host {
                     "not damaged",
                     "a write applied since may still be lost; clear again once it is published",
                 )?;
-                Err(compile_error(&error))
+                Err(compile_error(root, &error))
             }
             // No read gate (A-R139): none of these says the object is healthy or that nothing
             // is stored, and no_mutation=true holds on any view: INCOMPATIBLE_VERSION, a chunk
             // record at the root key (`KindMismatch`), a batch over the size limit, or
             // CORRUPT_HISTORY for a stored version with no value (`VersionWithoutValue`).
             Err(error) => {
-                let mut refused = compile_error(&error);
+                let mut refused = compile_error(root, &error);
                 if refused.kind == ErrorKind::IncompatibleVersion {
                     refused.detail.push_str("; not cleared");
                 }
@@ -5907,8 +5906,9 @@ fn fail_waiter(reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
     fault
 }
 
-/// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
-fn compile_error(error: &ValueError) -> ApiError {
+/// A value compile's refusal for the object at `root`, as the caller's error (§5.4 for documents,
+/// S0's subset).
+fn compile_error(root: &RootKey, error: &ValueError) -> ApiError {
     match error {
         // M9 S6: a clear of an object that reads back cleanly.
         ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks) => {
@@ -5940,7 +5940,11 @@ fn compile_error(error: &ValueError) -> ApiError {
             | Corrupt::ChunkMismatch { .. }
             | Corrupt::ChunkMissing { .. },
         ) => ApiError::new(ErrorKind::CorruptBlob, error.to_string()),
-        ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
+        // The caller's own object and element key, never a log's (#59, A-R230).
+        ValueError::Corrupt(corrupt) => match rdb_value::keys::parse(root.as_bytes()) {
+            Ok(parsed) => crate::db::error::corrupt_history(&parsed.object_id, corrupt),
+            Err(_) => crate::db::error::corrupt_history(root.as_bytes(), corrupt),
+        },
     }
 }
 
@@ -6153,7 +6157,7 @@ fn list_compile(
             }
         }
         .map(|compiled| compiled.compiled().clone())
-        .map_err(|e| compile_error(&e))
+        .map_err(|e| compile_error(root, &e))
     };
     let count = match expected {
         Expected::Absent => Ok(0),
@@ -6161,7 +6165,7 @@ fn list_compile(
         // because that refusal comes first.
         Expected::Version(_) => rdb_value::list::list(view, root)
             .map(|found| found.map_or(0, |list| list.count))
-            .map_err(|e| compile_error(&e)),
+            .map_err(|e| compile_error(root, &e)),
     };
     match count.and_then(|count| resolve_edits(edits, count)) {
         Ok(ops) => compile(&ops),
@@ -6369,7 +6373,7 @@ fn object_answer_unchecked(
                 ValueError::Corrupt(corrupt) => Some(damage_code(corrupt)),
                 ValueError::Apply(_) => None,
             };
-            let error = compile_error(&error);
+            let error = compile_error(root, &error);
             log_stored_damage(node, root, &error, damage, chunk);
             Answer::Error {
                 error,
