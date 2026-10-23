@@ -2,7 +2,7 @@
 //!
 //! | Row | Claim |
 //! |---|---|
-//! | M7V-102 | restart forgets what the crashed process held in memory: A1's grant, F1's committed run, R1's primary and retransmit timer, T1's instance, floor and trim memory, P1's instance and scripted view, L1, the adopted triple and the node's armed timers |
+//! | M7V-102 | restart forgets what the crashed process held in memory: A1's grant, F1's committed run, R1's primary and shadow probe timer, T1's instance, floor and trim memory, P1's instance and scripted view, L1, the adopted triple and the node's armed timers |
 //! | M7V-103 | restart touches no other node: every other node's modules, adopted triples and timers are as they were |
 //! | M7V-104 | a restarted node re-learns the committed root through its control watch, and its fresh R1 rebuilds the primary from it over the reopened engine |
 //! | M7V-105 | restart forgets a running catch-up: R1's receiver, source and retransmit timer, and the dispatcher's catch-up asker |
@@ -392,12 +392,17 @@ fn fingerprint(dispatcher: &Dispatcher, node: NodeId) -> String {
 /// Before the crash, node 1's modules hold state that lives nowhere but in the process:
 /// - A1's grant and F1's committed run;
 /// - T1's instance, generation floor and trim memory (a `DedupTrim` is seeded for it);
-/// - R1's primary and retransmit timer;
+/// - R1's primary and its shadow probe timer;
 /// - P1's instance and a scripted view (installed by the row: nothing in a run makes one);
 /// - L1's instance, the armed timers, and the adopted triple for both partitions.
 /// After the restart every one of them is gone. None comes back until an event teaches it, and
 /// M7V-104 is the row about what does. The R1 tables node 1 never holds here (receiver, source)
 /// are pinned by M7V-105.
+///
+/// Re-cut 2026-10-23 (lead ruling A-R228): the spine's only partition retransmit was armed by
+/// the shadow's cursor, node 4, and a shadow no longer arms it. The R1 timer node 1 holds here
+/// is now the shadow probe, which lives on the primary and on the clock, so the primary and
+/// armed-timer clauses cover it. The `retransmits` table is pinned by M7V-105 (mutant M2b).
 ///
 /// Red on HEAD `547c82c`: `Dispatcher::restart` reopened the engine and nothing else, so every
 /// item below survived the crash. The T1, P1 and timer clauses read accessors HEAD did not have,
@@ -449,9 +454,10 @@ fn m7v_102_restart_forgets_what_the_crashed_process_held_in_memory() {
     assert!(
         dispatcher
             .replication()
-            .retransmit_version(NODE, RECOVERED)
+            .primary(NODE, RECOVERED)
+            .and_then(rdb_core::replication::primary::Primary::shadow_probe)
             .is_some(),
-        "precondition: R1 on node 1 armed its retransmit timer"
+        "precondition: R1 on node 1 armed its shadow probe timer"
     );
     assert!(
         dispatcher.publication().kernel(NODE, RECOVERED).is_some(),
@@ -521,13 +527,6 @@ fn m7v_102_restart_forgets_what_the_crashed_process_held_in_memory() {
     }
     if dispatcher.transaction().remembers_trims(NODE, RECOVERED) {
         survived.push("T1 trim memory for partition 1");
-    }
-    if dispatcher
-        .replication()
-        .retransmit_version(NODE, RECOVERED)
-        .is_some()
-    {
-        survived.push("R1 retransmit timer for partition 1");
     }
     if dispatcher.authority(NODE).is_some() {
         survived.push("A1 instance");

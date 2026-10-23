@@ -84,6 +84,16 @@
 //! A shadow never counts toward lag, and a diverged copy's ACKs are dropped at rule 1d, so
 //! neither is sent one.
 //!
+//! # Shadows (lead ruling A-R228)
+//!
+//! A shadow is fed separately (spec §5.2 step 4): never by the stream, the keepalive or the
+//! stream's retransmit, but by its own timer, [`shadow_timer`], armed when a `Recovered` activates
+//! a plan that names a shadow. Each fire sends the head to every shadow with no record in
+//! flight, and re-sends the record in flight to one that went quiet. A shadow that lacks the head
+//! answers `NeedPrefix` and gets a cursor like any lagging copy; its ACKs then walk it to the
+//! head. Its ACKs count toward no predicate, view or lag domain. The timer stops when a
+//! `Recovered` pins no shadow, so a copy re-added as a regular secondary moves to the stream.
+//!
 //! # The stream (spec §5.2 step 4; Gautam 2026-09-27, lead rulings B-R47b and B-R67i)
 //!
 //! Each record the primary applies is shipped to the regular secondaries in the step that
@@ -104,7 +114,7 @@
 //! the copy diverges, and when it leaves every active predicate. An idle cursor, one with nothing
 //! in flight, takes nothing from the stream (M9 S3 W1-D1, ruling A-R106).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::authority::AuthorityView;
 use crate::contracts::digest::Digest;
@@ -121,7 +131,7 @@ use crate::contracts::storage::DurablePrefix;
 use crate::contracts::time::{Tick, TimerEffect, TimerFired};
 use crate::contracts::trace::AckRejectReason;
 use crate::contracts::transport::PeerLabel;
-use crate::replication::catchup::{CatchupCursor, Repeat};
+use crate::replication::catchup::{CatchupCursor, Repeat, RETRANSMIT_TIMER_BASE};
 use crate::replication::progress::{DigestLookup, ProgressTracker};
 use crate::replication::{ignored, wire};
 
@@ -142,6 +152,29 @@ pub fn keepalive_timer(partition: PartitionId) -> TimerId {
     TimerId(REPLICATION_TIMER_BASE + u64::from(partition.0))
 }
 
+/// How often a primary probes each shadow it leads (lead ruling A-R228): the head sent to a
+/// shadow with no record in flight, and the record in flight re-sent to one that has gone quiet.
+pub const SHADOW_PROBE_MS: u64 = 200;
+
+/// The first shadow-probe [`TimerId`]: one per partition, at `base + partition`, `2^41` above
+/// the keepalive block and so `2^40` above the retransmit block, still inside R1's own tag.
+pub const SHADOW_TIMER_BASE: u64 = REPLICATION_TIMER_BASE + (2 << 40);
+
+// R1's three per-partition timer blocks — keepalive at `+ 0`, retransmit at `+ 2^40`, shadow at
+// `+ 2^41` — each span one `u32` of partition ids, so none reaches another, and the last stays
+// below `2^48`, inside the tag no other module's base uses (A1 `0x00A1`, L1 `0x00B1`, P1
+// `0x00D1`, F1 `0x00F1`).
+const PARTITION_SPAN: u64 = 1 << 32;
+const _: () = assert!(REPLICATION_TIMER_BASE + PARTITION_SPAN <= RETRANSMIT_TIMER_BASE);
+const _: () = assert!(RETRANSMIT_TIMER_BASE + PARTITION_SPAN <= SHADOW_TIMER_BASE);
+const _: () = assert!(SHADOW_TIMER_BASE + PARTITION_SPAN <= REPLICATION_TIMER_BASE + (1 << 48));
+
+/// The shadow-probe timer for `partition` (lead ruling A-R228).
+#[must_use]
+pub fn shadow_timer(partition: PartitionId) -> TimerId {
+    TimerId(SHADOW_TIMER_BASE + u64::from(partition.0))
+}
+
 /// The tracker for one partition this node leads, and its running catch-up cursors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Primary {
@@ -156,6 +189,14 @@ pub struct Primary {
     /// The record the stream shipped to each copy that no admitted ACK has reached yet (lead
     /// ruling B-R67i).
     shipped: BTreeMap<CopyId, Shipped>,
+    /// The version of the shadow-probe timer armed now (lead ruling A-R228), while the
+    /// configuration names a shadow; `None` before the plan activates and once none is left.
+    shadow_probe: Option<TimerVersion>,
+    /// The last shadow-probe version armed, counted apart from the keepalive's.
+    shadow_armed: u64,
+    /// The shadows a cursor has started for since the last `Recovered`: the first start for
+    /// each is logged at info, so a tester can see a shadow begin to catch up.
+    shadows_started: BTreeSet<CopyId>,
 }
 
 /// A record the stream shipped to one copy and no admitted ACK has reached: what the
@@ -179,6 +220,9 @@ impl Primary {
             keepalive: None,
             armed: 0,
             shipped: BTreeMap::new(),
+            shadow_probe: None,
+            shadow_armed: 0,
+            shadows_started: BTreeSet::new(),
         }
     }
 
@@ -365,12 +409,23 @@ impl Primary {
     ///
     /// A primary the pin retires stops its keepalive: it leads nothing, and a later
     /// `SetAdmission` finds no serving primary.
+    ///
+    /// This is where a plan activates, so it is where the shadow probe starts (lead ruling
+    /// A-R228): armed when the pin names a shadow and none is armed, cancelled when the pin
+    /// names none — a re-add that made the shadow regular hands it to the stream — or retires
+    /// this primary.
     pub fn on_recovered(&mut self, result: &RecoveryResult, tick: Tick) -> Vec<EffectKind> {
         self.cursors.clear();
         self.shipped.clear();
+        self.shadows_started.clear();
         let mut effects = self.tracker.on_recovered(result, tick);
         if self.tracker.retired() {
             effects.extend(self.stop_keepalive());
+            effects.extend(self.stop_shadow_probe());
+        } else if self.shadows().next().is_none() {
+            effects.extend(self.stop_shadow_probe());
+        } else if self.shadow_probe.is_none() {
+            effects.push(self.arm_shadow_probe(tick));
         }
         effects
     }
@@ -464,6 +519,103 @@ impl Primary {
             .collect()
     }
 
+    /// The shadow-probe version armed now (lead ruling A-R228).
+    #[must_use]
+    pub const fn shadow_probe(&self) -> Option<TimerVersion> {
+        self.shadow_probe
+    }
+
+    /// This partition's shadow-probe timer fired (lead ruling A-R228). The version armed now
+    /// probes each shadow that has not diverged: one whose cursor has a record in flight gets
+    /// that record again when nothing moved the cursor since the last fire
+    /// ([`CatchupCursor::on_retransmit`]); any other gets the head. A shadow that lacks the head
+    /// answers `NeedPrefix`, which starts its cursor; one that holds it answers `AlreadyHave`
+    /// and its ACK. So a shadow is walked to the head and kept within one interval of it, on its
+    /// own timer, never the stream's: the stream and its retransmit stay with the regular
+    /// secondaries (spec §5.2 step 4, "shadows receive separately"). The timer re-arms while the
+    /// configuration names a shadow; with none left the fire is `NotRequired` and it stops. Any
+    /// other version is `StaleTimer` and sends nothing.
+    pub fn on_shadow_tick(&mut self, fired: &TimerFired, now: Tick) -> Vec<EffectKind> {
+        if self.shadow_probe != Some(fired.version) {
+            return vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::StaleTimer,
+            ))];
+        }
+        self.shadow_probe = None;
+        let shadows: Vec<CopyId> = self.shadows().collect();
+        if shadows.is_empty() {
+            return vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::NotRequired,
+            ))];
+        }
+        let head = self.tracker.head();
+        let partition = self.tracker.partition();
+        let mut effects = Vec::new();
+        for copy in shadows
+            .into_iter()
+            .filter(|copy| !self.tracker.is_diverged(*copy))
+        {
+            match self.cursors.get_mut(&copy) {
+                Some(cursor) if cursor.unacked().is_some() => {
+                    effects.extend(cursor.on_retransmit());
+                }
+                _ if head == Seq::ZERO => {}
+                _ => {
+                    tracing::debug!(
+                        partition = partition.0,
+                        copy = copy.0,
+                        head = head.0,
+                        "r1.shadow_probe"
+                    );
+                    effects.push(EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                        copy,
+                        from: head,
+                        through: head,
+                    }));
+                }
+            }
+        }
+        effects.push(self.arm_shadow_probe(now));
+        effects
+    }
+
+    /// The shadows the configuration names, in copy order.
+    fn shadows(&self) -> impl Iterator<Item = CopyId> + '_ {
+        self.tracker
+            .peers()
+            .filter(|(_, peer)| peer.role == ReplicaRole::Shadow)
+            .map(|(copy, _)| copy)
+    }
+
+    /// Whether `copy` is a shadow of the configuration.
+    fn is_shadow(&self, copy: CopyId) -> bool {
+        self.tracker
+            .peer(copy)
+            .is_some_and(|peer| peer.role == ReplicaRole::Shadow)
+    }
+
+    /// Arm the shadow probe [`SHADOW_PROBE_MS`] from `now` under a new version.
+    fn arm_shadow_probe(&mut self, now: Tick) -> EffectKind {
+        self.shadow_armed += 1;
+        let version = TimerVersion(self.shadow_armed);
+        self.shadow_probe = Some(version);
+        EffectKind::Timer(TimerEffect::Arm {
+            id: shadow_timer(self.tracker.partition()),
+            version,
+            at: now.plus_millis(SHADOW_PROBE_MS),
+        })
+    }
+
+    /// Cancel the shadow probe, if one is armed.
+    fn stop_shadow_probe(&mut self) -> Option<EffectKind> {
+        self.shadow_probe.take().map(|version| {
+            EffectKind::Timer(TimerEffect::Cancel {
+                id: shadow_timer(self.tracker.partition()),
+                version,
+            })
+        })
+    }
+
     /// Cancel the keepalive, if one is armed.
     fn stop_keepalive(&mut self) -> Option<EffectKind> {
         self.keepalive.take().map(|version| {
@@ -474,26 +626,35 @@ impl Primary {
         })
     }
 
-    /// Whether any running cursor, or the stream, has a record it sent and no ACK has answered:
-    /// what keeps the partition's retransmit timer armed (lead rulings B-R67a and B-R67i).
+    /// Whether any running cursor of a regular secondary, or the stream, has a record it sent
+    /// and no ACK has answered: what keeps the partition's retransmit timer armed (lead rulings
+    /// B-R67a and B-R67i). A shadow's cursor is paced by the shadow probe instead (lead ruling
+    /// A-R228), so a silent shadow neither arms nor holds the stream's timer.
     #[must_use]
     pub fn awaits_ack(&self) -> bool {
         !self.shipped.is_empty()
             || self
                 .cursors
-                .values()
-                .any(|cursor| cursor.unacked().is_some())
+                .iter()
+                .any(|(copy, cursor)| !self.is_shadow(*copy) && cursor.unacked().is_some())
     }
 
-    /// One fire of the partition's retransmit timer: each cursor's re-send, if it makes one, in
-    /// copy order ([`CatchupCursor::on_retransmit`]), then the stream's (lead ruling B-R67i). A
+    /// One fire of the partition's retransmit timer: each regular secondary's cursor's re-send,
+    /// if it makes one, in copy order ([`CatchupCursor::on_retransmit`]), then the stream's
+    /// (lead ruling B-R67i). A shadow's cursor waits for the shadow probe (lead ruling A-R228). A
     /// shipped record is re-sent byte for byte once a whole interval has passed without the
     /// ACK that would forget it: the first fire after the send only marks the wait.
     pub fn on_retransmit(&mut self) -> Vec<EffectKind> {
+        let tracker = &self.tracker;
         let mut effects: Vec<_> = self
             .cursors
-            .values_mut()
-            .filter_map(CatchupCursor::on_retransmit)
+            .iter_mut()
+            .filter(|(copy, _)| {
+                tracker
+                    .peer(**copy)
+                    .is_none_or(|peer| peer.role != ReplicaRole::Shadow)
+            })
+            .filter_map(|(_, cursor)| cursor.on_retransmit())
             .collect();
         for (copy, shipped) in &mut self.shipped {
             if shipped.waited {
@@ -596,6 +757,18 @@ impl Primary {
     /// record there left nothing awaiting an ACK, so the retransmit timer lapsed and a ship lost
     /// one way was never re-sent.
     fn drive(&mut self, copy: CopyId, outcome: AppendOutcome) -> Vec<EffectKind> {
+        if !self.cursors.contains_key(&copy)
+            && self.is_shadow(copy)
+            && self.shadows_started.insert(copy)
+        {
+            tracing::info!(
+                partition = self.tracker.partition().0,
+                copy = copy.0,
+                head = self.tracker.head().0,
+                outcome = ?outcome,
+                "r1.shadow_cursor_started"
+            );
+        }
         let cursor = self
             .cursors
             .entry(copy)
