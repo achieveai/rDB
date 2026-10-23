@@ -4242,9 +4242,10 @@ fn wait_ready_line(
                 );
                 said(&format!("still waiting for ready: recovery phase {phase}"));
             }
-            Err(ReadyError::TimedOut { phase, .. }) => {
+            Err(ReadyError::TimedOut { owner, phase, .. }) => {
                 break Err(ReadyError::TimedOut {
                     within_ms: within.as_millis(),
+                    owner,
                     phase,
                 })
             }
@@ -6254,6 +6255,7 @@ mod tests {
             |_| {
                 Err(ReadyError::TimedOut {
                     within_ms: 10,
+                    owner: NodeId(1),
                     phase: "Discovering".to_owned(),
                 })
             },
@@ -6627,6 +6629,7 @@ mod tests {
         use rdb_api::db::ReadyError;
         let timed_out = |slice: Duration| ReadyError::TimedOut {
             within_ms: slice.as_millis(),
+            owner: NodeId(1),
             phase: "ProposalUnresolved".to_owned(),
         };
         let progress = Progress::default();
@@ -6650,9 +6653,9 @@ mod tests {
         assert_eq!(
             line,
             "timeout waiting for ready after 25s: node 1 did not admit writes within 25000 ms; \
-             node 1's recovery phase is ProposalUnresolved; next: call `wait_ready` again with \
-             a longer bound, or shut this Db down and open the folder again, once; if that \
-             times out too, stop and report it with this message"
+             node 1's recovery phase is ProposalUnresolved; next: wait again for longer, or \
+             close the database and open its folder again, once; if that times out too, stop \
+             and report it with this message"
         );
 
         // Ready in the second slice: one line said, then the reached line.
