@@ -714,3 +714,531 @@ fn m10_s1_6_an_api_error_carries_a_not_before_hint_in_its_field_and_its_text() {
         "a whole second is not rounded up past itself"
     );
 }
+
+// ---- Guard rows for the tester's surviving cuts at 066ab6e (lead, k-cuts) ----
+
+/// Copy a closed copy's directory, file by file.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create the copy's directory");
+    for entry in std::fs::read_dir(from).expect("list the copy") {
+        let entry = entry.expect("an entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("its type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a file");
+        }
+    }
+}
+
+/// Set (`Some`) or remove (`None`) copy `node`'s instance marker with a raw RocksDB write.
+fn set_marker(dir: &Path, node: u32, marker: Option<[u8; INSTANCE_LEN]>) {
+    let path = dir.join("nodes").join(node.to_string());
+    let raw = rocksdb::DB::open_cf(
+        &rocksdb::Options::default(),
+        &path,
+        rdb_storage::keys::COLUMN_FAMILIES,
+    )
+    .expect("raw open");
+    let metadata = raw
+        .cf_handle(rdb_storage::keys::CF_METADATA)
+        .expect("the metadata family");
+    // `rdb_storage`'s instance marker key (crate-private there).
+    match marker {
+        Some(id) => raw
+            .put_cf(metadata, b"instance", id)
+            .expect("set the marker"),
+        None => raw
+            .delete_cf(metadata, b"instance")
+            .expect("remove the marker"),
+    }
+}
+
+/// The instance copy `node` names, read without taking it.
+fn marker(dir: &Path, node: u32) -> Option<[u8; INSTANCE_LEN]> {
+    RocksEngine::open_read_only(dir.join("nodes").join(node.to_string()))
+        .expect("read-only open")
+        .instance()
+}
+
+/// The open counter's record of `instance`, if any.
+fn counter(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    instance: &[u8; INSTANCE_LEN],
+) -> Option<config_core::Record> {
+    rt.block_on(store.get(config_core::GetRequest {
+        key: Bytes::from(admin::instance_key(instance)),
+    }))
+    .expect("read the counter")
+    .record
+}
+
+/// Survivor 1 (unwind needs `created`): a reopen refused while it holds node 1's lock never
+/// removes a `nodes/` it did not create. Copy 2 is missing; the refusal keeps copies 1 and 3,
+/// and once copy 2 is restored from a backup, as the text says, the reopen reads the write back.
+/// Integration (~2 s): one fresh open until ready, one refused reopen, one reopen until ready.
+#[config_log::retcd_test]
+fn m10_cut_a_refused_reopen_keeps_the_nodes_it_did_not_create() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let nodes = dir.path().join("nodes");
+    let backup = dir.path().join("backup-2");
+    copy_dir(&nodes.join("2"), &backup);
+    std::fs::remove_dir_all(nodes.join("2")).expect("remove copy 2");
+
+    match open(&rt, dir.path(), &store) {
+        Err(OpenError::CopyMissing(_)) => {}
+        other => panic!("CopyMissing, not {:?}", other.map(|_| "Db")),
+    }
+    for n in [1, 3] {
+        assert!(
+            nodes.join(n.to_string()).join("CURRENT").exists(),
+            "copy {n} survives a refused reopen that did not create nodes/"
+        );
+    }
+
+    copy_dir(&backup, &nodes.join("2"));
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen with copy 2 restored");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("ready");
+    let got = db.get(b"a").expect("read a back");
+    assert_eq!(got.value.map(|(_, v)| v), Some(Bytes::from_static(b"1")));
+    db.shutdown();
+}
+
+/// Survivor 2 (`bound.len() > 1`): copies that name two instances are `Mismatch`, naming both,
+/// and the refusal rebinds neither copy. Copy 3 is made to name another instance.
+/// Integration (~1 s): one fresh open until ready, a raw marker write, one refused reopen.
+#[config_log::retcd_test]
+fn m10_cut_copies_naming_two_instances_are_refused_and_left_as_they_were() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let ours = marker(dir.path(), 1).expect("the fresh open bound the copies");
+    let other = [0x22; INSTANCE_LEN];
+    assert_ne!(ours, other);
+    set_marker(dir.path(), 3, Some(other));
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::Mismatch(_)) => error,
+        other => panic!("Mismatch, not {:?}", other.map(|_| "Db")),
+    };
+    let both: BTreeSet<[u8; INSTANCE_LEN]> = [ours, other].into_iter().collect();
+    let named: Vec<String> = both.iter().map(admin::instance_hex).collect();
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "this directory and the control store do not belong together: the copies name \
+             different instances: {}",
+            named.join(", ")
+        )
+    );
+    assert_eq!(
+        [1, 2, 3].map(|n| marker(dir.path(), n)),
+        [Some(ours), Some(ours), Some(other)],
+        "the refusal bound nothing"
+    );
+}
+
+/// Survivor 3 (counter absent): a reopen whose open counter is gone is `Mismatch` naming the
+/// instance and the key, never counted again from N = 1, and the counter stays absent.
+/// Integration (~1 s): one fresh open until ready, a store delete, one refused reopen.
+#[config_log::retcd_test]
+fn m10_cut_a_reopen_whose_open_counter_is_gone_is_a_mismatch_and_counts_nothing() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let instance = marker(dir.path(), 1).expect("bound");
+    let key = admin::instance_key(&instance);
+    assert!(
+        counter(&rt, &store, &instance).is_some(),
+        "the first open counted"
+    );
+    rt.block_on(store.delete(config_core::DeleteRequest {
+        key: Bytes::from(key.clone()),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("delete the counter");
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::Mismatch(_)) => error,
+        other => panic!("Mismatch, not {:?}", other.map(|_| "Db")),
+    };
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "this directory and the control store do not belong together: the copies name \
+             instance {}, but {key} is absent",
+            admin::instance_hex(&instance)
+        )
+    );
+    assert!(
+        counter(&rt, &store, &instance).is_none(),
+        "the refused reopen wrote no counter"
+    );
+}
+
+/// Survivor 4 (Unbound's `holds_data` guard): one copy with data that names no instance, beside
+/// two that do (copy 3 put back from an M9 backup), is `Unbound` naming that copy, and the
+/// refusal does not bind it. Without the guard the open binds it and goes on.
+/// Integration (~1 s): one fresh open until ready, a raw marker delete, one refused reopen.
+#[config_log::retcd_test]
+fn m10_cut_one_unbound_copy_with_data_is_refused_and_stays_unbound() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let ours = marker(dir.path(), 1).expect("bound");
+    set_marker(dir.path(), 3, None);
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::Unbound(_)) => error,
+        other => panic!("Unbound, not {:?}", other.map(|_| "Db")),
+    };
+    assert!(
+        refused.to_string().starts_with(
+            "nodes/3 holds data but names no rDB instance (an M9 directory); this build does not \
+             open it."
+        ),
+        "{refused}"
+    );
+    assert_eq!(
+        [1, 2, 3].map(|n| marker(dir.path(), n)),
+        [Some(ours), Some(ours), None],
+        "the refusal bound nothing"
+    );
+}
+
+/// A `MemStore` on which a second open counts in the gap between the first open's read of the
+/// counter and its CAS: the first `get` of `key` reads, then runs [`admin::count_open`] for the
+/// same instance on the inner store, then answers with what it read.
+struct CountRace {
+    inner: config_testkit::MemStore,
+    key: Bytes,
+    instance: [u8; INSTANCE_LEN],
+    /// What the racing open was counted as, once it has run.
+    raced: tokio::sync::Mutex<Option<u64>>,
+}
+
+impl ConfigStore for CountRace {
+    fn get<'a, 'b>(
+        &'a self,
+        request: config_core::GetRequest,
+    ) -> Reply<'b, config_core::GetResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            let racing = request.key == self.key;
+            let read = self.inner.get(request).await?;
+            let mut raced = self.raced.lock().await;
+            if racing && raced.is_none() {
+                let n = admin::count_open(&self.inner, &self.instance, false, admin::COUNT_WITHIN)
+                    .await
+                    .expect("the racing open counts");
+                *raced = Some(n);
+            }
+            Ok(read)
+        })
+    }
+
+    fn list<'a, 'b>(
+        &'a self,
+        request: config_core::ListRequest,
+    ) -> Reply<'b, config_core::ListResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.list(request)
+    }
+
+    fn put<'a, 'b>(
+        &'a self,
+        request: config_core::PutRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.put(request)
+    }
+
+    fn delete<'a, 'b>(
+        &'a self,
+        request: config_core::DeleteRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.delete(request)
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn watch<'a, 'b>(
+        &'a self,
+        request: config_core::WatchRequest,
+    ) -> Reply<'b, config_core::WatchStream>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.watch(request)
+    }
+}
+
+/// Survivor 5 (the counter's CAS): open A reads N, open B counts N + 1 before A writes, and A's
+/// write is conditioned on what it read, so A conflicts, reads again and is counted N + 2. Two
+/// opens never get one number, so never one boot range or request floor. An unconditioned write
+/// hands A the number B already has.
+/// Unit (~1 ms): `count_open` against a store that races it.
+#[test]
+fn m10_cut_two_opens_counting_at_once_never_get_one_number() {
+    let rt = runtime();
+    let instance = [0x33; INSTANCE_LEN];
+    let store = CountRace {
+        inner: config_testkit::MemStore::new(),
+        key: Bytes::from(admin::instance_key(&instance)),
+        instance,
+        raced: tokio::sync::Mutex::new(None),
+    };
+    let first = rt
+        .block_on(admin::count_open(
+            &store.inner,
+            &instance,
+            true,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("the first open");
+    assert_eq!(first, 1);
+    let a = rt
+        .block_on(admin::count_open(
+            &store,
+            &instance,
+            false,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("open A");
+    let b = rt
+        .block_on(store.raced.lock())
+        .expect("open B ran in A's gap");
+    assert_eq!(
+        (b, a),
+        (2, 3),
+        "B counted in A's gap, so A is counted after it"
+    );
+    let next = rt
+        .block_on(admin::count_open(
+            &store.inner,
+            &instance,
+            false,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("the next open");
+    assert_eq!(next, 4);
+}
+
+/// Survivor 6 (`MAX_OPENS`): the 2^24-th open is counted, and the one after it is refused
+/// `Exhausted` with the counter left as it was. The counter is seeded with layout 1's bytes
+/// (`[1]` then N as a little-endian u64), which this build reads.
+/// Unit (~1 ms): `count_open` against a `MemStore`.
+#[test]
+fn m10_cut_the_open_after_max_opens_is_refused_and_counts_nothing() {
+    let rt = runtime();
+    let store = config_testkit::MemStore::new();
+    let instance = [0x44; INSTANCE_LEN];
+    let key = admin::instance_key(&instance);
+    let mut value = vec![1_u8];
+    value.extend_from_slice(&(admin::MAX_OPENS - 1).to_le_bytes());
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(key.clone()),
+        value: Bytes::from(value),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("seed the counter");
+    assert_eq!(
+        rt.block_on(admin::count_open(
+            &store,
+            &instance,
+            false,
+            admin::COUNT_WITHIN
+        )),
+        Ok(admin::MAX_OPENS),
+        "the last open in range is counted"
+    );
+    let read = || {
+        rt.block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        }))
+        .expect("read the counter")
+        .record
+        .expect("the counter")
+    };
+    let at_cap = read();
+    let refused = rt.block_on(admin::count_open(
+        &store,
+        &instance,
+        false,
+        admin::COUNT_WITHIN,
+    ));
+    assert_eq!(
+        refused,
+        Err(admin::CounterError::Exhausted { key: key.clone() })
+    );
+    assert_eq!(
+        refused.expect_err("refused").to_string(),
+        format!("{key} has counted 16777216 opens, the most one directory may have")
+    );
+    let after = read();
+    assert_eq!(
+        (after.mod_revision, after.value),
+        (at_cap.mod_revision, at_cap.value),
+        "the refused open wrote nothing"
+    );
+}
+
+/// Survivor 7 (`MAX_RESTARTS`): one open restarts a node at most `MAX_RESTARTS` times, so its
+/// boots never reach the next open's range. The node's boot is set one restart short of the
+/// cap; that restart runs, and the next is `INVALID_ARGUMENT` saying to reopen, with the node
+/// left at its boot.
+/// Integration (~2 s): one fresh open until ready, two restarts of node 2.
+#[config_log::retcd_test]
+fn m10_cut_a_node_restarted_max_restarts_times_is_not_restarted_again() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let node = NodeId(2);
+    let base = db.opened.base_boot;
+    let short = BootId(base.0 + MAX_RESTARTS - 1);
+    lock(&db.nodes)
+        .iter_mut()
+        .find(|handle| handle.node == node)
+        .expect("node 2")
+        .boot = short;
+
+    let last = db.restart_node(node).expect("the last restart in range");
+    assert_eq!(last, BootId(base.0 + MAX_RESTARTS));
+    let refused = db.restart_node(node).expect_err("one restart past the cap");
+    assert_eq!(
+        (refused.kind, refused.detail.as_str()),
+        (
+            ErrorKind::InvalidArgument,
+            "node 2 not restarted: it has restarted 65534 times, the most one open allows; \
+             reopen the directory"
+        )
+    );
+    assert_eq!(
+        db.boot_of(node),
+        Some(last),
+        "the refused restart left the node as it was"
+    );
+    db.shutdown();
+}
+
+/// R5 row 6, the heal's clear guard: `clear_until` counts node 1's grant as gone only when it
+/// was deleted or read absent. A record naming the boot this open runs node 1 at is the live
+/// process's grant (`Clearance::Current`), so the heal keeps asking until its time runs out,
+/// never reads `partitions/1`, and sends node 1 nothing. Without the guard it fences over a
+/// grant a live process holds. Unit (~300 ms): `MemStore`, the heal's own bound.
+#[test]
+fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_nothing() {
+    use config_core::{GetRequest, PutRequest};
+    use rdb_core::authority::grant::GrantRecord;
+    use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+    use rdb_core::contracts::control::ControlKey;
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::ids::{
+        AuthorityGeneration, BootId, Generation, GrantId, OwnerEpoch, Revision, Seq,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let open = BootId((1 << 16) + 1);
+    let record = PartitionRecord {
+        partition: crate::admin::PARTITION,
+        owner: crate::admin::OWNER,
+        generation: Generation(3),
+        owner_epoch: OwnerEpoch(3),
+        config_version: crate::admin::CONFIG_VERSION,
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    let root = PartitionRoot {
+        mode: rdb_core::authority::partition::RecordMode::Active,
+        owner_boot: BootId(5),
+        base_seq: Seq(7),
+        base_digest: Digest::ROOT,
+        predecessor_generation: Generation(2),
+        predecessor_cutoff: Seq(7),
+        instance: [7; INSTANCE_LEN],
+        run: Revision(1),
+    };
+    let partitions = Bytes::from(ControlKey::Partition(crate::admin::PARTITION).encode());
+    rt.block_on(store.put(PutRequest {
+        key: partitions.clone(),
+        value: record.encode_with(&root),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("put partitions/1");
+    let live = GrantRecord {
+        grant: GrantId(4),
+        node: crate::admin::OWNER,
+        boot: open,
+        authority_generation: AuthorityGeneration(0),
+        expiry_utc_ms: 0,
+        frozen: false,
+    };
+    let grants = Bytes::from(ControlKey::Grant(crate::admin::OWNER).encode());
+    let granted = rt
+        .block_on(store.put(PutRequest {
+            key: grants.clone(),
+            value: live.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/1")
+        .revision;
+
+    let (owner, mailbox) = std::sync::mpsc::channel();
+    let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        store: Arc::clone(&store),
+        boot: open,
+        budgets: rdb_core::contracts::event::Budgets::SPEC_DEFAULTS,
+        clock: crate::clock::HostClock::start(),
+        owner,
+        within: Duration::from_millis(300),
+    }));
+    let sent: Vec<_> = mailbox.try_iter().collect();
+
+    match &healed {
+        Err(crate::admin::HealError::NotCleared { node: 1, last, .. }) => {
+            assert_eq!(last, "Current", "{healed:?}");
+        }
+        other => panic!("expected NotCleared for node 1: {other:?}"),
+    }
+    assert!(sent.is_empty(), "{} messages sent to node 1", sent.len());
+    let kept = rt
+        .block_on(store.get(GetRequest { key: grants }))
+        .expect("get grants/1")
+        .record
+        .expect("the live grant is still there");
+    assert_eq!(kept.mod_revision, granted, "the live grant was not touched");
+}
