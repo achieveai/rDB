@@ -903,3 +903,61 @@ fn h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold() {
         ]
     );
 }
+
+/// Shadow probe (A-R228), host side: a `Recovered` whose pin names a shadow arms R1's
+/// `shadow_timer` on the primary, the host keeps it in its timer table, and fires it to R1,
+/// which sends the shadow the head and arms the next probe under a newer version. The host
+/// has no shadow-specific code: it arms and fires every timer by id. This row shows the
+/// generic path carries this one. Here node 3's copy is made the shadow by restating node 1's
+/// committed root with that role.
+/// Cut: the host drops a `TimerEffect::Arm` for `shadow_timer`, red (nothing is armed).
+/// Integration (~1 s): bootstrap's discovery window, then one probe period.
+#[test]
+fn a_shadow_named_by_the_pin_gets_its_probe_timer_armed_and_fired() {
+    use rdb_core::replication::primary::{shadow_timer, SHADOW_PROBE_MS};
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let mut result = (*trio.nodes[0].0.committed[&PartitionId(1)]).clone();
+    let mut shadowed = false;
+    for member in &mut result.committed.pinned_config.members {
+        if member.node == NodeId(3) {
+            member.role = ReplicaRole::Shadow;
+            shadowed = true;
+        }
+    }
+    assert!(shadowed, "node 3 is a member of the pin");
+    let id = shadow_timer(PartitionId(1));
+    assert!(
+        !trio.nodes[0].0.timers.contains_key(&id),
+        "no shadow, no probe"
+    );
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: CorrelationId::default(),
+    };
+    let host = &mut trio.nodes[0].0;
+    host.push(
+        site,
+        EventKind::Kernel(KernelEvent::Recovered(Box::new(result))),
+        true,
+        None,
+    );
+    host.drain();
+    assert_eq!(host.fault, None, "node 1 faulted");
+    let (armed, at, _) = *host.timers.get(&id).expect("the shadow probe is armed");
+    assert!(
+        at.0 <= trio.clock.now().0 + SHADOW_PROBE_MS,
+        "armed one probe period out"
+    );
+    let fired = trio.until("the probe fired and armed the next", |trio| {
+        trio.nodes[0]
+            .0
+            .timers
+            .get(&id)
+            .map(|(version, _, _)| *version)
+            .filter(|version| *version > armed)
+    });
+    assert_eq!(fired.0, armed.0 + 1, "R1 took the fire and armed the next");
+}
