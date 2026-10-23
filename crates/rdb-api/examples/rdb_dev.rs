@@ -1481,13 +1481,7 @@ fn repl<'scope, 'env>(
             }
             ["put-loop", ..] => Err(PUT_LOOP_USAGE.to_owned()),
             ["client", "drop-reply"] => {
-                // One armed drop at a time: arming again does not queue a second (tester-s2).
-                say(if drop_reply {
-                    "client drop-reply: already armed; still only the next put that applies loses \
-                     its reply"
-                } else {
-                    "client drop-reply: the next put that applies loses its reply"
-                });
+                say(drop_reply_line(drop_reply));
                 drop_reply = true;
                 Ok(())
             }
@@ -1562,8 +1556,7 @@ fn repl<'scope, 'env>(
                 get_line(db.get_previous(object.as_bytes()));
                 Ok(())
             }
-            ["status", request, rest @ ..] => status_line(db, &sent, request, rest),
-            ["status"] => Err(STATUS_USAGE.to_owned()),
+            ["status", rest @ ..] => status_line(db, &sent, rest),
             ["nodes"] => {
                 let answered = db.node_status();
                 for node in [1, 2, 3].map(NodeId) {
@@ -3621,10 +3614,25 @@ fn get_line(answer: Result<rdb_api::GetOk, rdb_api::ApiError>) {
     }
 }
 
+/// What `client drop-reply` answers. One armed drop at a time: arming again does not queue a
+/// second, and says so (tester-s2 paper cut 2).
+const fn drop_reply_line(armed: bool) -> &'static str {
+    if armed {
+        "client drop-reply: already armed; still only the next put that applies loses its reply"
+    } else {
+        "client drop-reply: the next put that applies loses its reply"
+    }
+}
+
 /// `status`'s words, for a usage error (tester-s2: a bare `status` said "unknown command").
 const STATUS_USAGE: &str = "status <request> [<generation>]";
 
-fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(), String> {
+/// `status`'s words after the verb: a request id and an optional generation. Bare, or with
+/// anything else, it is [`STATUS_USAGE`].
+fn parse_status(words: &[&str]) -> Result<(u64, Option<Generation>), String> {
+    let [request, rest @ ..] = words else {
+        return Err(STATUS_USAGE.to_owned());
+    };
     let request = request
         .parse::<u64>()
         .map_err(|_| STATUS_USAGE.to_owned())?;
@@ -3636,6 +3644,11 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
         )),
         _ => return Err(STATUS_USAGE.to_owned()),
     };
+    Ok((request, generation))
+}
+
+fn status_line(db: &Db, sent: &Sent, words: &[&str]) -> Result<(), String> {
+    let (request, generation) = parse_status(words)?;
     // The nodes first: a request node 1 holds in flight that publishes between the two looks is
     // then answered by the status, never called not in flight (Msg 8, W6-D1).
     let nodes = db.node_status();
@@ -6469,6 +6482,30 @@ mod tests {
         let plain = partition_body(&record.encode()).expect("decodes");
         assert!(plain.ends_with(" root=-"), "{plain}");
         assert_eq!(partition_body(b"\x09junk"), None);
+    }
+
+    /// tester-s2 paper cut 1: a bare `status` said `usage: unknown command "status"`. It
+    /// answers `status`'s own usage, as a bad request id or extra word does. Unit.
+    /// Cut: `parse_status` answers "unknown command" when bare, and this row fails.
+    #[test]
+    fn a_bare_status_answers_its_usage() {
+        assert_eq!(parse_status(&[]), Err(STATUS_USAGE.to_owned()));
+        assert_eq!(parse_status(&["x"]), Err(STATUS_USAGE.to_owned()));
+        assert_eq!(parse_status(&["1", "2", "3"]), Err(STATUS_USAGE.to_owned()));
+        assert_eq!(parse_status(&["7"]), Ok((7, None)));
+        assert_eq!(parse_status(&["7", "2"]), Ok((7, Some(Generation(2)))));
+    }
+
+    /// tester-s2 paper cut 2: arming `client drop-reply` twice dropped one reply and said
+    /// nothing. The second arm says it was already armed and still drops one. Unit.
+    #[test]
+    fn a_second_drop_reply_says_it_was_already_armed() {
+        assert!(!drop_reply_line(false).contains("already"));
+        assert!(
+            drop_reply_line(true).starts_with("client drop-reply: already armed; still only "),
+            "{}",
+            drop_reply_line(true)
+        );
     }
 
     /// k325 P1: `--help` and `-h` ask for the usage, which is this file's `//!` header without
