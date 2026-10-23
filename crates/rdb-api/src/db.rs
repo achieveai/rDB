@@ -597,10 +597,11 @@ pub enum ReadyError {
          membership comes in a later build)"
     )]
     Quarantined,
-    /// Node 1 faulted before it took writes. A faulted node takes no writes again in this open,
-    /// so no wait helps (PR #60 review F3). The text carries the fault as node 1 recorded it.
+    /// Node 1 faulted, before or after it took writes. A faulted node takes no writes again in
+    /// this open, so no wait helps (PR #60 review F3). The text carries the fault as node 1
+    /// recorded it.
     #[error(
-        "node 1 stopped on a fault before it took writes, and it takes none in this open: \
+        "node 1 stopped on a fault, and it takes no writes in this open: \
          {fault}. Shut this Db down and open the folder again, once; if that open stops the \
          same way, stop and report it with this message, and do not delete the folder"
     )]
@@ -1113,8 +1114,8 @@ impl Db {
     /// or its restart failed, answers at once: it does not rejoin in this open (#42). So does a
     /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
     /// one fence only (ruling F-a, A-R196). So does a quarantined one, which nothing in an open
-    /// leaves (A-R196(2a)). So does a node 1 that faulted before it took writes: a faulted node
-    /// takes none again in this open (PR #60 review F3).
+    /// leaves (A-R196(2a)). So does a node 1 that has faulted, before or after ready: a faulted
+    /// node takes no writes again in this open (PR #60 review F3).
     ///
     /// # Errors
     ///
@@ -8101,6 +8102,23 @@ mod tests {
                 std::fs::copy(entry.path(), target).expect("copy");
             }
         }
+    }
+
+    /// PR #60 review round 2: `wait_ready` answers `Faulted` for any fault on node 1, one after
+    /// it took writes too, so the text claims nothing about when the node stopped. Pins the
+    /// whole text. Cut: the round-1 text ("stopped on a fault before it took writes"), red.
+    /// Unit.
+    #[test]
+    fn the_faulted_text_says_no_writes_in_this_open_and_not_when_it_stopped() {
+        let error = ReadyError::Faulted {
+            fault: "storage write fault".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "node 1 stopped on a fault, and it takes no writes in this open: storage write \
+             fault. Shut this Db down and open the folder again, once; if that open stops the \
+             same way, stop and report it with this message, and do not delete the folder"
+        );
     }
 
     /// PR #60 review F3: a node that faulted takes no writes again in this open, so once node 1
