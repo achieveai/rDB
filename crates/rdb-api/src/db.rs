@@ -5072,15 +5072,17 @@ mod tests {
         db.shutdown();
     }
 
-    /// A-R173 F5 (critic-d7): a copy that missed a commit. The first reopen holds node 2's links,
-    /// so its commit pins generation 2 on nodes 1 and 3 alone, and node 2 keeps generation 1.
-    /// Neither reopen writes. The second reopen finds node 2 a generation behind the record: it
-    /// must end with node 1 admitting writes and reading the write back, or in a named
-    /// `Blocked`. Never a host fault, and never a failed heal.
+    /// A-R177 (critic-f5 option 1, row 1): a copy that missed a writeless generation. The first
+    /// reopen holds node 2's links, so generation 2 commits on nodes 1 and 3 alone, `DegradedRf2`,
+    /// and node 2 keeps generation 1. B-R38 pauses writes while a copy is unheard, so generation 2
+    /// never admits: that is pinned here, not assumed. Neither reopen writes. The second reopen
+    /// heals case A; node 2's inventory finds generation 2 absent, holds generation 1 exactly
+    /// through its base with the same digest, and links generation 2 onto it. Generation 3 then
+    /// commits with every copy, fully protected, admits writes and reads the write back. Never a
+    /// host fault, never a failed heal.
     /// Integration (~10 s): three opens, two discovery windows.
     #[config_log::retcd_test]
-    #[ignore = "owed: A-R177 option (1), a missed writeless link inherited at inventory"]
-    fn m10_d7_a_copy_that_missed_a_commit_ends_caught_up_or_named_blocked() {
+    fn m10_d7_a_copy_that_missed_a_writeless_generation_links_it_and_the_reopen_admits() {
         let rt = runtime();
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -5097,10 +5099,8 @@ mod tests {
             ))
             .expect("open")
         };
-        // How a reopen ended: node 1's recovered generation and phase, once it admits writes, its
-        // F1 blocks, or (with `committed`) it has committed and holds a grant, so the next open
-        // heals case A, not case B (critic-d7 F5). Any fault or failed heal fails the row.
-        let settle = |db: &Db, what: &str, committed: bool| -> (Option<Generation>, String, bool) {
+        // Node 1's status once `done` holds for it. Any fault or failed heal fails the row.
+        let settle = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| -> NodeStatus {
             let deadline = std::time::Instant::now() + patience;
             loop {
                 if let HealState::Failed(error) = db.heal_state() {
@@ -5110,18 +5110,12 @@ mod tests {
                     assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
                 }
                 let owner = db.node_status().into_iter().next().expect("node 1");
-                let phase = owner.recovery.clone().unwrap_or_default();
-                if owner.admits == Some(true)
-                    || phase.starts_with("Blocked")
-                    || (committed
-                        && owner.recovered.is_some()
-                        && owner.authority.starts_with("held("))
-                {
-                    return (owner.recovered, phase, owner.admits == Some(true));
+                if done(&owner) {
+                    return owner;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "{what}: neither admits nor Blocked within {patience:?}; phase {phase}"
+                    "{what}: not settled within {patience:?}: {owner:?}"
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -5132,18 +5126,24 @@ mod tests {
         db.shutdown();
         drop(db);
 
+        // Settled once it committed and holds a grant, so the next open heals case A.
         let mut db = open(vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))]);
-        let (first, phase, _) = settle(&db, "the reopen without node 2", true);
+        let first = settle(&db, "the reopen without node 2", &|owner| {
+            owner.recovered.is_some() && owner.authority.starts_with("held(")
+        });
+        assert_eq!(first.recovered, Some(Generation(2)), "{first:?}");
         assert_eq!(
-            first,
-            Some(Generation(2)),
-            "the first reopen commits generation 2 without node 2; phase {phase}"
+            first.admits,
+            Some(false),
+            "B-R38: generation 2 pauses writes while node 2 is unheard"
         );
         db.shutdown();
         drop(db);
 
         let mut db = open(Vec::new());
-        let (second, phase, admits) = settle(&db, "the reopen with node 2 behind", false);
+        let second = settle(&db, "the reopen with node 2 behind", &|owner| {
+            owner.admits == Some(true)
+        });
         assert!(
             matches!(
                 db.heal_state(),
@@ -5154,19 +5154,92 @@ mod tests {
             ),
             "the second reopen heals case A: the first reopen held a grant"
         );
-        if admits {
-            let read = db.get(b"a").expect("get a");
-            assert_eq!(
-                read.value.map(|(_, bytes)| bytes),
-                Some(Bytes::from_static(b"1")),
-                "the second reopen reads the write back; generation {second:?}"
-            );
-        } else {
-            assert!(
-                phase.starts_with("Blocked(") && phase.len() > "Blocked()".len(),
-                "a named Blocked, not {phase}"
-            );
-        }
+        assert_eq!(second.recovered, Some(Generation(3)), "{second:?}");
+        assert_eq!(
+            (second.recovery.as_deref(), second.stalled.as_deref()),
+            (Some("Committed"), None),
+            "generation 3 committed fully protected, nothing stalled"
+        );
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(
+            read.value.map(|(_, bytes)| bytes),
+            Some(Bytes::from_static(b"1")),
+            "the second reopen reads the write back"
+        );
+        db.shutdown();
+    }
+
+    /// A-R177 row 9 (critic-f5 residual): a copy below the base in its own generation. Node 2
+    /// misses `b` while 1-2 is held, so it stops at seq 1 of generation 1 while nodes 1 and 3
+    /// hold 2; the next reopen runs without node 2 and commits generation 2 at base 2. The
+    /// reopen after that cannot link generation 2 for node 2 (its head is below the base), and
+    /// a cross-generation catch-up does not exist yet. Slice 1's bar: no host fault, and the
+    /// stall is named (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line).
+    /// Integration (~20 s): three opens and the rebuild watch's wait.
+    #[config_log::retcd_test]
+    #[ignore = "owed: cross-gen catch-up (A-R177)"]
+    fn m10_d7_a_copy_below_the_base_of_a_missed_generation_is_named_stalled() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = |hold: Vec<(NodeId, NodeId)>| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    hold,
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let settle = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| -> NodeStatus {
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                if let HealState::Failed(error) = db.heal_state() {
+                    panic!("{what}: the heal failed: {error}");
+                }
+                for node in db.node_status() {
+                    assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
+                }
+                let owner = db.node_status().into_iter().next().expect("node 1");
+                if done(&owner) {
+                    return owner;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: not settled within {patience:?}: {owner:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let mut db = open(Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.put(b"b", b"2", None).expect("put b while 1-2 is held");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))]);
+        let first = settle(&db, "the reopen without node 2", &|owner| {
+            owner.recovered.is_some() && owner.authority.starts_with("held(")
+        });
+        assert_eq!(first.recovered, Some(Generation(2)), "{first:?}");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(Vec::new());
+        let stalled = settle(&db, "the reopen with node 2 below the base", &|owner| {
+            owner.stalled.is_some()
+        });
+        let line = stalled.stalled.clone().unwrap_or_default();
+        assert!(
+            line.starts_with("recovery_rebuild_stalled") && line.contains("gen=3"),
+            "the stall names generation 3's rebuild: {line}"
+        );
         db.shutdown();
     }
 
