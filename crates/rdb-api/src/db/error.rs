@@ -324,6 +324,17 @@ pub(crate) fn copies_disagree_text(named: &str) -> String {
     )
 }
 
+/// `CORRUPT_HISTORY` for a read of `object` that met `corrupt` (#59, A-R230): it names the object,
+/// and an element's key when [`rdb_value::Corrupt::Element`] carries one, for the caller only.
+/// A log line names neither; `host.rs` logs the damage code and `key_hex`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn corrupt_history(object: &[u8], corrupt: &rdb_value::Corrupt) -> ApiError {
+    ApiError::new(
+        ErrorKind::CorruptHistory,
+        format!("object \"{}\": {corrupt}", object.escape_ascii()),
+    )
+}
+
 /// The open counter's refusal for good, for `admin::CounterError::Exhausted`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn counter_exhausted_text(key: &str, max: u64) -> String {
@@ -485,6 +496,25 @@ mod tests {
         }
         assert!(texts[0].contains("may be busy"), "{}", texts[0]);
         assert!(texts[2].contains("phase is Fencing"), "{}", texts[2]);
+    }
+
+    /// #59, A-R230: `CORRUPT_HISTORY` names the object and the damaged element's key for the
+    /// caller, then says how to keep the rest.
+    #[test]
+    fn a_damaged_element_names_its_object_and_key() {
+        let corrupt = rdb_value::Corrupt::Element {
+            key: rdb_value::value::Value::Text("b".into()),
+            error: Box::new(rdb_value::Corrupt::SetMemberHasValue { len: 3 }),
+        };
+        let error = corrupt_history(b"cart\n", &corrupt);
+        assert_eq!(error.kind, ErrorKind::CorruptHistory);
+        let text = error.to_string();
+        assert!(
+            text.starts_with("CORRUPT_HISTORY (object \"cart\\n\": element "),
+            "{text}"
+        );
+        assert!(text.contains("\"b\""), "{text}");
+        assert!(text.ends_with("(embed.md, Known limits))"), "{text}");
     }
 
     /// A-R230 (tester-s2): a refused read said `UNKNOWN_OUTCOME` and to query a status, but a read
