@@ -529,3 +529,127 @@ fn m10_a_reopened_db_after_a_control_store_outage_takes_a_fresh_grant_in_the_sam
     reads_back_and_writes(&db, "after the outage");
     db.shutdown();
 }
+
+// ---- S1-8, the tester's walk on 066ab6e: every refusal names a next step, under one event ----
+
+/// A second open of a directory another open holds: `InUse`, whose text says to close that open
+/// or stop its process, then open again; the `Db` logs one `db_open_refused` naming the kind. The
+/// first open is untouched and still serves.
+/// Integration (~1 s): one fresh open until ready, then one refused open beside it.
+#[config_log::retcd_test]
+fn m10_s1_8_a_second_open_of_a_held_directory_says_to_close_the_first() {
+    const METHOD: &str = "m10_s1_8_a_second_open_of_a_held_directory_says_to_close_the_first";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut first = open(&rt, dir.path(), &store).expect("the first open");
+    first
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the first open is ready");
+    first.put(b"a", b"1", None).expect("a put");
+
+    let path = match open(&rt, dir.path(), &store) {
+        Err(OpenError::InUse(path)) => path,
+        other => panic!("a held directory is InUse, not {:?}", other.map(|_| "Db")),
+    };
+    assert!(
+        path.starts_with(dir.path().join("nodes")),
+        "{}",
+        path.display()
+    );
+    assert_eq!(
+        OpenError::InUse(path.clone()).to_string(),
+        format!(
+            "{} is in use by another open. Close that open, or stop the process that holds it, \
+             then open this directory again",
+            path.display()
+        ),
+        "the text names the next step"
+    );
+    assert_eq!(
+        refusals(METHOD),
+        vec![("Warning".to_owned(), "InUse".to_owned())],
+        "one db_open_refused naming the kind"
+    );
+    reads_back_and_writes(&first, "the first open, after the refusal");
+    first.shutdown();
+}
+
+/// Copies that hold data but name no instance, as an M9 `rdb_dev --keep` folder does: `Unbound`,
+/// whose text says to open it with the M9 build or start a new database in an empty folder, and
+/// that this build does not migrate it; the `Db` logs one `db_open_refused` naming the kind.
+/// Integration (~1 s): one fresh open until ready, the instance marker removed from every copy
+/// with a raw RocksDB write, then one refused reopen.
+#[config_log::retcd_test]
+fn m10_s1_8_an_m9_directory_says_to_use_the_m9_build_or_a_new_folder() {
+    const METHOD: &str = "m10_s1_8_an_m9_directory_says_to_use_the_m9_build_or_a_new_folder";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    for n in 1..=3 {
+        let path = dir.path().join("nodes").join(n.to_string());
+        let raw = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            &path,
+            rdb_storage::keys::COLUMN_FAMILIES,
+        )
+        .expect("raw open");
+        let metadata = raw
+            .cf_handle(rdb_storage::keys::CF_METADATA)
+            .expect("the metadata family");
+        // `rdb_storage`'s instance marker key (crate-private there): absent means unbound.
+        raw.delete_cf(metadata, b"instance")
+            .expect("remove the marker");
+    }
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::Unbound(_)) => error,
+        other => panic!("an M9 directory is Unbound, not {:?}", other.map(|_| "Db")),
+    };
+    assert_eq!(
+        refused.to_string(),
+        "nodes/1 holds data but names no rDB instance (an M9 directory); this build does not open \
+         it. Open it with the M9 build that wrote it, or start a new database in an empty folder: \
+         this build does not migrate M9 data",
+        "the text names the next step"
+    );
+    assert_eq!(
+        refusals(METHOD),
+        vec![("Warning".to_owned(), "Unbound".to_owned())],
+        "one db_open_refused naming the kind"
+    );
+}
+
+/// `DbConfig::check`, which `rdb_dev` runs before it starts the control store, refuses a dedup cap
+/// above the status cap and logs it as `db_open_refused` with `kind=DedupCap`, at the level of
+/// every other refused open: one query finds them all. The text is pinned.
+/// Unit (~1 ms): nothing starts.
+#[config_log::retcd_test]
+fn m10_s1_8_a_dedup_cap_refused_by_check_logs_db_open_refused() {
+    const METHOD: &str = "m10_s1_8_a_dedup_cap_refused_by_check_logs_db_open_refused";
+    let dir = config_testkit::fs::temp_dir();
+    let above = DbConfig {
+        dedup_cap: Some(RETENTION_CAP_ENTRIES + 1),
+        ..config(dir.path())
+    };
+    let refused = above.check().expect_err("above the status cap");
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "dedup_cap {} is above the most P1's status index holds ({}); nothing was started",
+            RETENTION_CAP_ENTRIES + 1,
+            RETENTION_CAP_ENTRIES
+        )
+    );
+    assert_eq!(
+        refusals(METHOD),
+        vec![("Warning".to_owned(), "DedupCap".to_owned())],
+        "one db_open_refused naming the kind"
+    );
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    assert!(
+        lines.iter().all(|line| line["@m"] != "dedup_cap_refused"),
+        "the old event name is gone: {lines:?}"
+    );
+}
