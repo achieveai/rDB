@@ -450,7 +450,8 @@ failed (`open refused: <Variant>: ...`); 4 `--verify` found a journalled key mis
 The journal is written without buffering, so a killed process keeps every line it wrote. It is
 not synced to disk, so it proves nothing about power loss. After a kill, `--verify` may also find
 the one key after the last journalled line: that put was in flight. It is reported apart as
-`unjournalled_present` and does not fail the check.
+`unjournalled_present` and does not fail the check. A last line a kill cut short is left out
+and said; the next `--write` drops it from the file before it appends.
 
 ### Measured on the dev host
 

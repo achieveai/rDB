@@ -30,7 +30,7 @@
 //! Logs go to `L/pilot_kv.jsonl` (default `D` with `.logs` appended) and never carry key or
 //! value text (ADR-0013, A-R154): the pilot logs counts and indices only.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -165,6 +165,8 @@ impl Entry {
 struct Journal {
     entries: Vec<Entry>,
     torn: bool,
+    /// The bytes of its whole lines: where a cut-short last line starts.
+    whole: u64,
 }
 
 impl Journal {
@@ -188,6 +190,7 @@ fn parse_journal(text: &str) -> Result<Journal, String> {
             journal.torn = true;
             break;
         };
+        journal.whole += line.len() as u64 + 1;
         let line = line.strip_suffix('\r').unwrap_or(line);
         let fields: Vec<&str> = line.split(' ').collect();
         let bad = || format!("journal line {}: malformed", number + 1);
@@ -420,6 +423,25 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The journal at `path`, open to append after `journal`'s whole lines. No `BufWriter`: each
+/// line goes to the OS in its own write, so a killed process has handed over every line it
+/// wrote. Not fsynced; the proof is a process kill, not power loss.
+///
+/// A last line a kill cut short is dropped first (PR #60 review F7): appended to, it and the
+/// first new line would make one malformed line, and the journal would no longer read back.
+/// Its put was acknowledged, but the line was never whole, so it was already left out.
+fn open_journal(path: &Path, journal: &Journal) -> std::io::Result<File> {
+    if journal.torn {
+        // Through its own handle: on Windows an append-only one may not truncate.
+        OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(journal.whole)?;
+        tracing::warn!(kept_bytes = journal.whole, "pilot_journal_tail_dropped");
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
 /// `--write`: put new keys after the highest journalled one.
 fn write_phase(db: &Db, args: &Args) -> ExitCode {
     let path = args.dir.join(JOURNAL);
@@ -434,7 +456,14 @@ fn write_phase(db: &Db, args: &Args) -> ExitCode {
         println!("journal: last line cut short by a kill; left out");
     }
     if let Some(n) = args.write {
-        if let Err(code) = write(db, &path, journal.next_index(), n) {
+        let file = match open_journal(&path, &journal) {
+            Ok(file) => file,
+            Err(error) => {
+                println!("journal: {}: {error}", path.display());
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(code) = write(db, &path, file, journal.next_index(), n) {
             return code;
         }
     }
@@ -502,17 +531,7 @@ fn check_phase(db: &Db, args: &Args) -> ExitCode {
 /// Put `n` keys from `first`, appending each acknowledged one to the journal at `path` before
 /// the next put. Stops at the first refusal: a put that was not acknowledged is not journalled,
 /// and the pilot does not guess at it.
-fn write(db: &Db, path: &Path, first: u64, n: u64) -> Result<(), ExitCode> {
-    // No `BufWriter`: each line goes to the OS in its own write, so a killed process has
-    // handed over every line it wrote. Not fsynced; the proof is a process kill, not power loss.
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| {
-            println!("journal: {}: {error}", path.display());
-            ExitCode::from(1)
-        })?;
+fn write(db: &Db, path: &Path, mut file: File, first: u64, n: u64) -> Result<(), ExitCode> {
     let started = Instant::now();
     for index in first..first.saturating_add(n) {
         let ok = match db.put(key(index).as_bytes(), &value(index), None) {
@@ -613,6 +632,34 @@ mod tests {
         }
     }
 
+    /// PR #60 review F7: a `--write` after a kill cut the last line short appends after the
+    /// whole lines, not after the fragment, so the journal still reads back. Cut: open to
+    /// append without dropping the fragment; it and the first new line make one malformed
+    /// line, and the read-back is refused, red. Unit.
+    #[test]
+    fn a_write_after_a_cut_short_line_leaves_a_journal_that_reads_back() {
+        let dir = std::env::var_os("RETCD_TEST_DATA_DIR")
+            .map_or_else(std::env::temp_dir, PathBuf::from)
+            .join(format!("pilot-f7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join(JOURNAL);
+        std::fs::write(&path, format!("{}pilot/00000001 9", entry(0).line())).expect("seed");
+
+        let journal = read_journal(&path).expect("a torn last line is not an error");
+        assert!(journal.torn);
+        let mut file = open_journal(&path, &journal).expect("open");
+        file.write_all(entry(1).line().as_bytes()).expect("append");
+        drop(file);
+
+        let read = read_journal(&path);
+        std::fs::remove_dir_all(&dir).expect("clean up");
+        let journal = read.expect("the journal reads back after the write");
+        assert_eq!(
+            (journal.entries, journal.torn),
+            (vec![entry(0), entry(1)], false)
+        );
+    }
+
     /// C-8: journal ⊆ present, exact values. A journalled key that reads back absent or with
     /// another value is named; the key after the highest journalled may be present (a put the
     /// kill caught) and is reported apart; a failed read is an error, never "absent".
@@ -621,6 +668,7 @@ mod tests {
         let journal = Journal {
             entries: vec![entry(0), entry(1), entry(2)],
             torn: false,
+            ..Journal::default()
         };
         let present = |keys: &[(u64, Vec<u8>)]| {
             let keys: std::collections::BTreeMap<String, Vec<u8>> = keys
