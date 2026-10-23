@@ -372,24 +372,43 @@ impl RocksEngine {
         generation: Generation,
         handle: SnapshotHandle,
     ) -> Result<RocksSnapshot, StorageFault> {
+        Ok(RocksSnapshot {
+            handle,
+            at: Seq(self.buffered_applied(partition, generation).0),
+            partition,
+            generation,
+            levels: self.levels(partition, generation),
+            pinned: Arc::new(Pinned::new(&self.db)),
+            faulted: Arc::new(OnceLock::new()),
+            _claim: self.claim.clone(),
+        })
+    }
+
+    /// How many levels a read of `(partition, generation)` walks for every namespace but
+    /// `History`: the lineage and its ancestors up the links, stopping at a lineage whose own
+    /// link is `copied` (its copy already holds the parent's state). A get costs one point read per level; see [`MAX_CHAIN_DEPTH`].
+    #[must_use]
+    pub fn chain_depth(&self, partition: PartitionId, generation: Generation) -> usize {
+        self.levels(partition, generation).len()
+    }
+
+    /// The generations a read can reach, newest first: up the links, stopping at a lineage whose
+    /// link is `copied` (the copy holds its parent's state as of `base`).
+    pub(crate) fn levels(&self, partition: PartitionId, generation: Generation) -> Vec<Generation> {
         let mut levels = vec![generation];
         let mut current = generation;
         while let Some(link) = self.link(partition, current).filter(|link| !link.copied) {
             current = link.parent;
             levels.push(current);
         }
-        Ok(RocksSnapshot {
-            handle,
-            at: Seq(self.buffered_applied(partition, generation).0),
-            partition,
-            generation,
-            levels,
-            pinned: Arc::new(Pinned::new(&self.db)),
-            faulted: Arc::new(OnceLock::new()),
-            _claim: self.claim.clone(),
-        })
+        levels
     }
 }
+
+/// The most levels a lineage's reads walk (M10 ruling A-R166). An inherit that would link a
+/// child one level past it copies the parent's merged state instead, so the child starts again
+/// at depth 1. Measured in the crate README ("Chain-depth ceiling").
+pub const MAX_CHAIN_DEPTH: usize = 32;
 
 /// The first key past every key that starts with `prefix`. A lineage prefix ends in an ns byte
 /// below `0xFF`, so incrementing that byte is enough.

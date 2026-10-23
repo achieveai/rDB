@@ -28,20 +28,28 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use bytes::Bytes;
-use rdb_core::contracts::ids::{BatchId, Generation, PartitionId, Seq, SnapshotHandle};
+use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::envelope::{EnvelopeHeader, ReplicationEnvelope};
+use rdb_core::contracts::ids::{
+    BatchId, ClientId, ConfigVersion, Generation, LeaseId, OwnerEpoch, PartitionId, RequestId,
+    RequestIdentity, Seq, SnapshotHandle, TenantId,
+};
 use rdb_core::contracts::storage::{Batch, Namespace, SnapshotRead, Write};
+use rdb_core::contracts::txn::Outcome;
+use rdb_core::contracts::version::ENVELOPE_VERSION;
 use rdb_core::replication::append::PROGRESS_KEY;
-use rdb_storage::{Inherited, RocksEngine};
+use rdb_storage::{Inherited, RocksEngine, MAX_CHAIN_DEPTH};
 
 const P: PartitionId = PartitionId(1);
 const USAGE: &str = "usage: snapshot_bench --dir <D> [--keys LIST] [--depths LIST] \
-                     [--depth-keys N] [--samples N]";
+                     [--depth-keys N] [--flatten-keys LIST] [--samples N]";
 
 struct Args {
     dir: PathBuf,
     keys: Vec<u64>,
     depths: Vec<u64>,
     depth_keys: u64,
+    flatten_keys: Vec<u64>,
     samples: usize,
 }
 
@@ -51,6 +59,7 @@ fn parse() -> Result<Args, String> {
         keys: vec![1_000, 10_000, 100_000],
         depths: vec![1, 10, 100],
         depth_keys: 1_000,
+        flatten_keys: vec![1_000, 10_000, 100_000],
         samples: 2_000,
     };
     let list = |v: &str| -> Result<Vec<u64>, String> {
@@ -66,6 +75,7 @@ fn parse() -> Result<Args, String> {
             "--keys" => args.keys = list(&value)?,
             "--depths" => args.depths = list(&value)?,
             "--depth-keys" => args.depth_keys = value.parse().map_err(|e| format!("{e}"))?,
+            "--flatten-keys" => args.flatten_keys = list(&value)?,
             "--samples" => args.samples = value.parse().map_err(|e| format!("{e}"))?,
             _ => return Err(format!("unknown flag {flag}")),
         }
@@ -97,35 +107,67 @@ fn user_key(i: u64) -> Bytes {
 }
 
 /// One put as the host commits it: the user key, its History record, a Dedup row, Progress.
+///
+/// The History record is a real envelope, because an inherit that copies (the flatten axis)
+/// decodes the record at its base. The records do not chain (`prev_digest` is the root), so
+/// `verify_lineage` would refuse this data; nothing here calls it.
 fn put(engine: &mut RocksEngine, generation: Generation, seq: u64, key: u64) {
     let fill = |n: usize, byte: u64| Bytes::from(vec![(byte % 251) as u8; n]);
+    let mutations = vec![
+        Write {
+            ns: Namespace::User,
+            key: user_key(key),
+            value: Some(fill(100, seq)),
+        },
+        Write {
+            ns: Namespace::Dedup,
+            key: Bytes::from(format!("d{seq:015}")),
+            value: Some(fill(40, seq)),
+        },
+    ];
+    let mut envelope = ReplicationEnvelope {
+        header: EnvelopeHeader {
+            protocol_version: ENVELOPE_VERSION,
+            partition: P,
+            generation,
+            config_version: ConfigVersion(1),
+            owner_epoch: OwnerEpoch(1),
+            seq: Seq(seq),
+            body_len: 0,
+        },
+        lease_id: LeaseId(1),
+        prev_digest: Digest::ROOT,
+        request_identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(seq),
+        },
+        request_digest: Digest::ROOT,
+        conditions_result: Vec::new(),
+        mutations,
+        result: Outcome::Published,
+        record_digest: Digest::ROOT,
+    };
+    envelope.record_digest = envelope.compute_record_digest().expect("record digest");
+    let mut progress = seq.to_le_bytes().to_vec();
+    progress.extend_from_slice(&envelope.record_digest.0);
+    let mut writes = envelope.mutations.clone();
+    writes.push(Write {
+        ns: Namespace::History,
+        key: Bytes::copy_from_slice(&seq.to_be_bytes()),
+        value: Some(envelope.encode().expect("encode the envelope")),
+    });
+    writes.push(Write {
+        ns: Namespace::Progress,
+        key: Bytes::from_static(PROGRESS_KEY),
+        value: Some(Bytes::from(progress)),
+    });
     let batch = Batch {
         id: BatchId(seq),
         partition: P,
         generation,
         seq: Seq(seq),
-        writes: vec![
-            Write {
-                ns: Namespace::User,
-                key: user_key(key),
-                value: Some(fill(100, seq)),
-            },
-            Write {
-                ns: Namespace::History,
-                key: Bytes::copy_from_slice(&seq.to_be_bytes()),
-                value: Some(fill(200, seq)),
-            },
-            Write {
-                ns: Namespace::Dedup,
-                key: Bytes::from(format!("d{seq:015}")),
-                value: Some(fill(40, seq)),
-            },
-            Write {
-                ns: Namespace::Progress,
-                key: Bytes::from_static(PROGRESS_KEY),
-                value: Some(fill(40, seq)),
-            },
-        ],
+        writes,
     };
     engine.commit(batch).expect("commit");
 }
@@ -235,12 +277,20 @@ fn load(engine: &mut RocksEngine, keys: u64, depth: u64, rng: &mut Lcg) -> Gener
     let mut top = Generation(1);
     for level in 2..=depth {
         let child = Generation(level);
-        let linked = engine.inherit(P, top, child, Seq(seq)).expect("inherit");
-        assert_eq!(
-            linked,
-            Inherited::Linked,
-            "a reopen links at the applied seq"
-        );
+        let parent_depth = engine.chain_depth(P, top);
+        let inherited = engine.inherit(P, top, child, Seq(seq)).expect("inherit");
+        if parent_depth < MAX_CHAIN_DEPTH {
+            assert_eq!(
+                inherited,
+                Inherited::Linked,
+                "a reopen links at the applied seq"
+            );
+        } else {
+            assert!(
+                matches!(inherited, Inherited::Copied { .. }),
+                "past the ceiling a reopen copies: {inherited:?}"
+            );
+        }
         top = child;
         for _ in 0..10 {
             seq += 1;
@@ -260,8 +310,41 @@ fn case(root: &Path, axis: &str, keys: u64, depth: u64, samples: usize) {
     let mut engine = RocksEngine::open(&dir).expect("open");
     let top = load(&mut engine, keys, depth, &mut rng);
     let load_s = loaded.elapsed().as_secs_f64();
+    let reached = engine.chain_depth(P, top);
     let line = measure(&mut engine, top, keys, samples, &mut rng);
-    println!("axis={axis} keys={keys} depth={depth} load_s={load_s:.1} {line}");
+    println!(
+        "axis={axis} keys={keys} depth={depth} chain_depth={reached} load_s={load_s:.1} {line}"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the case directory");
+}
+
+/// The one-time cost of the flatten (M10 ruling A-R166): `keys` keys under a chain at the
+/// ceiling, then the one reopen that copies instead of linking.
+fn flatten_case(root: &Path, keys: u64, samples: usize) {
+    let dir = root.join(format!("flatten-{keys}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("remove a stale case directory");
+    }
+    let mut rng = Lcg(keys ^ 0xF1A7);
+    let mut engine = RocksEngine::open(&dir).expect("open");
+    let depth = u64::try_from(MAX_CHAIN_DEPTH).expect("a small constant");
+    let top = load(&mut engine, keys, depth, &mut rng);
+    let before = engine.chain_depth(P, top);
+    let seq = engine.buffered_applied(P, top).0;
+    let child = Generation(top.0 + 1);
+    let started = Instant::now();
+    let inherited = engine.inherit(P, top, child, Seq(seq)).expect("inherit");
+    let flatten_ms = started.elapsed().as_secs_f64() * 1e3;
+    let Inherited::Copied { keys: copied } = inherited else {
+        panic!("a reopen at the ceiling copies: {inherited:?}");
+    };
+    let after = engine.chain_depth(P, child);
+    let line = measure(&mut engine, child, keys, samples, &mut rng);
+    println!(
+        "axis=flatten keys={keys} depth_before={before} depth_after={after} \
+         flatten_ms={flatten_ms:.1} copied={copied} {line}"
+    );
     drop(engine);
     std::fs::remove_dir_all(&dir).expect("remove the case directory");
 }
@@ -288,6 +371,9 @@ fn main() -> ExitCode {
     }
     for &depth in &args.depths {
         case(&args.dir, "depth", args.depth_keys, depth, args.samples);
+    }
+    for &keys in &args.flatten_keys {
+        flatten_case(&args.dir, keys, args.samples);
     }
     ExitCode::SUCCESS
 }
