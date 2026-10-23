@@ -34,8 +34,8 @@ use bytes::Bytes;
 use rdb_core::authority::partition::INSTANCE_LEN;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
-    PartitionMode, Verdict,
+    AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, Boundary, DenyReason,
+    FenceCredential, FenceScope, FencingProof, Lineage, PartitionMode, Revocation, Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -51,7 +51,7 @@ use rdb_core::contracts::ids::{
     RequestIdentity, Revision, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
-use rdb_core::contracts::membership::{CopyId, PartitionConfig};
+use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
     DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
@@ -377,6 +377,16 @@ pub enum Msg {
         partition: PartitionId,
         /// Where the answer goes.
         reply: Sender<NodeStatus>,
+    },
+    /// Peer `node` started again as `boot` (#42, A-R249). Local only: the net handshake posts
+    /// it when it sees a new boot for a known peer, and [`crate::db::Db::restart_node`] does in
+    /// process. The record owner re-plans each partition whose pinned config holds a member at an
+    /// older boot than its link now reports; any other node logs `peer_booted_ignored`.
+    PeerBooted {
+        /// The peer that restarted.
+        node: NodeId,
+        /// Its new boot.
+        boot: BootId,
     },
     /// Stop the thread.
     Stop,
@@ -952,6 +962,20 @@ pub(crate) fn spawn_on(
     })
 }
 
+/// The owner's re-plan of a partition after a member restarted (#42, A-R249; arch-s2 "Restart
+/// heal and drain"). A restarted copy is linked again only by a commit that pins its new boot,
+/// so the owner drains its own epoch and plans the next generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejoin {
+    /// `RevokeEpochRequested` for this epoch is with A1; the plan follows its `DrainProof`.
+    Revoking(OwnerEpoch),
+    /// The plan and its fence went to F1 for this generation; the commit ends the re-plan.
+    Planned(Generation),
+}
+
+/// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
+const REJOIN: CorrelationId = CorrelationId(3);
+
 /// A partition's activation marks on one node (ruling A-R184).
 #[derive(Debug, Default, Clone, Copy)]
 struct Activation {
@@ -1335,6 +1359,8 @@ struct Host {
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    /// Per partition, the restart re-plan this owner is running (#42, A-R249).
+    rejoins: BTreeMap<PartitionId, Rejoin>,
     /// The instance this node's engine is bound to when it started, whose open counter holds
     /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
     /// is marked, and nothing waits on a mark.
@@ -1434,6 +1460,7 @@ impl Host {
             ladders: BTreeSet::new(),
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
+            rejoins: BTreeMap::new(),
             instance: engine_instance,
             activation: BTreeMap::new(),
             after_commit,
@@ -1765,6 +1792,10 @@ impl Host {
             Msg::Client(client) => self.client(client),
             Msg::Inspect { partition, reply } => {
                 let _ = reply.send(self.status(partition));
+                Ok(())
+            }
+            Msg::PeerBooted { node, boot } => {
+                self.peer_booted(node, boot);
                 Ok(())
             }
             Msg::Stop => Ok(()),
@@ -3010,6 +3041,9 @@ impl Host {
             }
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 tracing::info!(node, ?fact, "authority_fact");
+                if *fact == AuthorityFact::DrainProof {
+                    self.drained(site)?;
+                }
             }
             KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
                 self.report_view(view);
@@ -3223,7 +3257,239 @@ impl Host {
         }
         self.schedule_acquire(result, site);
         self.watch_rebuild(result, partition);
+        self.rejoin_committed(partition, result.new_generation);
         Ok(())
+    }
+
+    /// #42 (A-R249): peer `node` started again as `boot`. Each partition with a commit here is
+    /// checked; only its pinned primary acts (arch-s2: the record owner always heals).
+    fn peer_booted(&mut self, node: NodeId, boot: BootId) {
+        let link_boot = self.links.boot_of(node).map(|boot| boot.0);
+        tracing::info!(
+            node = self.node.0,
+            peer = node.0,
+            boot = boot.0,
+            link_boot = ?link_boot,
+            "peer_booted"
+        );
+        if self.committed.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                peer = node.0,
+                boot = boot.0,
+                why = "no recovery has committed on this node",
+                "peer_booted_ignored"
+            );
+            return;
+        }
+        let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
+        for partition in partitions {
+            if let Some(why) = self.rejoin_if_stale(partition) {
+                tracing::info!(
+                    node = self.node.0,
+                    peer = node.0,
+                    boot = boot.0,
+                    partition = partition.0,
+                    why,
+                    "peer_booted_ignored"
+                );
+            }
+        }
+    }
+
+    /// Start the restart re-plan when this node is `partition`'s pinned primary and a member's
+    /// link reports a newer boot than the commit pinned: ask A1 to revoke the committed epoch,
+    /// whose `DrainProof` [`Self::drained`] plans from. `Some(why)` when nothing was started.
+    /// A re-plan already running is left alone: one still revoking plans at the live boots,
+    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]).
+    fn rejoin_if_stale(&mut self, partition: PartitionId) -> Option<&'static str> {
+        let Some(committed) = self.committed.get(&partition) else {
+            return Some("no commit for this partition");
+        };
+        let config = &committed.committed.pinned_config;
+        let owner = config
+            .members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if !owner {
+            return Some("not the partition's pinned primary");
+        }
+        let stale: Vec<(u32, u64, u64)> = config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .filter_map(|member| {
+                let live = self.links.boot_of(member.node)?;
+                (live > member.boot).then_some((member.node.0, member.boot.0, live.0))
+            })
+            .collect();
+        if stale.is_empty() {
+            return Some("every member's pinned boot is current");
+        }
+        if let Some(rejoin) = self.rejoins.get(&partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                rejoin = ?rejoin,
+                stale = ?stale,
+                "rejoin_pending"
+            );
+            return None;
+        }
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = committed.new_generation.0,
+            epoch = epoch.0,
+            stale = ?stale,
+            "rejoin_revoke"
+        );
+        self.rejoins.insert(partition, Rejoin::Revoking(epoch));
+        let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
+        self.push(
+            Site {
+                partition,
+                correlation: REJOIN,
+            },
+            EventKind::Kernel(KernelEvent::Authority(revoke)),
+            false,
+            None,
+        );
+        None
+    }
+
+    /// A1's `DrainProof`: the epoch the re-plan revoked is durable, so no write is admitted
+    /// under it again. Plan the next generation with every member at the boot its link reports
+    /// now, fenced by the drain at the commit's revision (#42; the sim's `reinspect_now`).
+    fn drained(&mut self, site: Site) -> Result<(), Fault> {
+        let partition = site.partition;
+        let Some(Rejoin::Revoking(epoch)) = self.rejoins.get(&partition).copied() else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                rejoin = ?self.rejoins.get(&partition),
+                "drain_proof_unasked"
+            );
+            return Ok(());
+        };
+        let committed = self.committed.get(&partition).ok_or_else(|| {
+            Fault::from(format!(
+                "drain proof for partition {} with no commit to plan from",
+                partition.0
+            ))
+        })?;
+        let root = committed.selected.root;
+        if root.owner_epoch != epoch {
+            return Err(Fault::from(format!(
+                "drain proof for partition {}: epoch {} was revoked but the commit now serves \
+                 epoch {}",
+                partition.0, epoch.0, root.owner_epoch.0
+            )));
+        }
+        let anchor = LineageAnchor {
+            lineage: root,
+            base_seq: committed.selected.cutoff_seq,
+            base_digest: committed.selected.cutoff_digest,
+        };
+        let pinned = &committed.committed.pinned_config;
+        let members: Vec<Member> = pinned
+            .members
+            .iter()
+            .map(|member| {
+                let boot = if member.node == self.node {
+                    self.boot
+                } else {
+                    // A member with no link keeps the boot it was pinned at: F1 then cannot
+                    // reach it, which its barrier names.
+                    self.links.boot_of(member.node).unwrap_or(member.boot)
+                };
+                Member { boot, ..*member }
+            })
+            .collect();
+        // A1's own view when it published one; the plan's otherwise. A1 replaces it at the
+        // install after commit either way (as `admin::heal`).
+        let (view, view_source) = match self.authority_views.get(&partition) {
+            Some(view) => (view, "published"),
+            None => (&committed.committed.authority_view, "committed"),
+        };
+        let revision = committed.committed.revision;
+        let version = ConfigVersion(pinned.config_version.0 + 1);
+        let generation = root.generation.next();
+        let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
+        let plan = crate::admin::recovery_plan(
+            anchor,
+            version,
+            members,
+            self.boot,
+            view.grant_id,
+            view.authority_generation,
+        );
+        let fence = FencingProof {
+            partition,
+            prior_generation: root.generation,
+            prior_owner_epoch: root.owner_epoch,
+            prior_grant_id: view.grant_id,
+            prior_boot_id: self.boot,
+            revocation: Revocation::DurableDrain {
+                ack_revision: revision,
+            },
+            control_revision: revision,
+            decision_tick: self.clock.now(),
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            config_version = version.0,
+            control_revision = revision.0,
+            view_source,
+            boots = ?boots,
+            "rejoin_plan"
+        );
+        self.rejoins.insert(partition, Rejoin::Planned(generation));
+        for event in [
+            RecoveryEvent::Plan(Box::new(plan)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ] {
+            self.push(
+                Site {
+                    partition,
+                    correlation: REJOIN,
+                },
+                EventKind::Kernel(KernelEvent::Recovery(event)),
+                false,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// The commit that ends a restart re-plan. A peer that restarted again while it ran was
+    /// pinned at its older boot, so the partition is checked once more: a newer boot supersedes
+    /// (arch-s2).
+    fn rejoin_committed(&mut self, partition: PartitionId, generation: Generation) {
+        let Some(Rejoin::Planned(planned)) = self.rejoins.get(&partition).copied() else {
+            return;
+        };
+        if generation < planned {
+            return;
+        }
+        self.rejoins.remove(&partition);
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            "rejoin_committed"
+        );
+        if let Some(why) = self.rejoin_if_stale(partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                why,
+                "rejoin_current"
+            );
+        }
     }
 
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
@@ -6262,6 +6528,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",
         Msg::Inspect { .. } => "inspect",
+        Msg::PeerBooted { .. } => "peer_booted",
         Msg::Stop => "stop",
     }
 }
