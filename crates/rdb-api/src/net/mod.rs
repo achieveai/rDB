@@ -815,6 +815,30 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
     let _ = to;
 }
 
+/// Wait until this process's own node can take messages: registered in its [`Links`], which
+/// `Db::open` does once the copy is open. A node process starts its links first, so without
+/// this a peer handshakes with it, sends, and the message is dropped `Unreachable` (found
+/// walking `lr up`: the owner's recovery ask was lost and it healed `DegradedRf2`). No wait
+/// for an app.
+async fn serving(shared: &Shared) {
+    let Label::Node(me) = shared.label else {
+        return;
+    };
+    let mut logged = false;
+    loop {
+        match shared.links.upgrade() {
+            Some(links) if links.knows(me) => return,
+            Some(_) => {}
+            None => return,
+        }
+        if !logged {
+            tracing::info!(node = me.0, "net_waiting_for_local_node");
+            logged = true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn own_hello(shared: &Shared) -> Hello {
     Hello {
         protocol_version: shared.protocol_version,
@@ -836,6 +860,7 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
     let mut backoff = Duration::from_millis(100);
     let mut reported: Option<String> = None;
     loop {
+        serving(&shared).await;
         let reason = match dial_once(&shared, node, &address, &tls).await {
             Ok(reason) => {
                 backoff = Duration::from_millis(100);
@@ -998,6 +1023,7 @@ impl RdbNet for Service {
                 let _ = tx.send(envelope(&Frame::Refused { reason }));
                 return;
             }
+            serving(&shared).await;
             let _ = tx.send(envelope(&Frame::Welcome(own_hello(&shared))));
             let conn = new_conn(&shared, label.clone(), tx);
             if let Label::Node(node) = &label {

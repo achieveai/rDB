@@ -572,6 +572,16 @@ struct Side {
     links: Arc<Links>,
     net: Arc<Net>,
     mail: Receiver<Msg>,
+    /// The node's mailbox and boot, while a row holds its registration back.
+    unregistered: Option<(NodeId, mpsc::Sender<Msg>, BootId)>,
+}
+
+impl Side {
+    /// Register the node a row held back, as `Db::open` does once its copy is open.
+    fn register(&mut self) {
+        let (node, tx, boot) = self.unregistered.take().expect("held back");
+        self.links.register(node, tx, boot);
+    }
 }
 
 struct Spec<'a> {
@@ -586,6 +596,8 @@ struct Spec<'a> {
     version: u32,
     dial: BTreeMap<NodeId, String>,
     peers: &'a [u32],
+    /// Whether its node is registered before its links start.
+    registered: bool,
 }
 
 impl<'a> Spec<'a> {
@@ -598,7 +610,14 @@ impl<'a> Spec<'a> {
             version: PROTOCOL_VERSION,
             dial: BTreeMap::new(),
             peers,
+            registered: true,
         }
+    }
+
+    /// Start the links before the node is registered, as `rdb_node` does: its `Db` opens after.
+    fn unregistered(mut self) -> Self {
+        self.registered = false;
+        self
     }
 
     fn dialling(mut self, node: u32, addr: std::net::SocketAddr) -> Self {
@@ -613,7 +632,13 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
     let tls = certs::load(spec.certs, spec.cert_of.as_ref().unwrap_or(&own)).expect("certs");
     let links = Links::new();
     let (tx, mail) = mpsc::channel();
-    links.register(NodeId(spec.node), tx, BootId(u64::from(spec.node) * 11));
+    let boot = BootId(u64::from(spec.node) * 11);
+    let unregistered = if spec.registered {
+        links.register(NodeId(spec.node), tx, boot);
+        None
+    } else {
+        Some((NodeId(spec.node), tx, boot))
+    };
     let listener = if listen {
         Some(config_testkit::ports::ephemeral_listener().await.0)
     } else {
@@ -633,7 +658,12 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
         listener,
     )
     .expect("net starts");
-    Side { links, net, mail }
+    Side {
+        links,
+        net,
+        mail,
+        unregistered,
+    }
 }
 
 fn certs_for(dir: &FsPath, nodes: &[u32]) {
@@ -875,4 +905,86 @@ async fn a_certificate_from_another_ca_gets_no_link() {
         .expect_err("no link");
     assert!(error.contains("node 1: not reachable"), "{error}");
     assert!(!matches!(one.net.states()[&NodeId(2)], LinkState::Up(_)));
+}
+
+/// M10 S2, found walking `lr up`: node 3's link came up while its `Db` was still opening, so
+/// node 1's recovery ask reached a process whose node could not take it yet and was dropped
+/// (`net_deliver_unreachable`), and node 1 healed `DegradedRf2`. A node's link now comes up
+/// only once its node is registered, so nothing sent on it arrives before the node can take it.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_link_comes_up_only_once_its_node_can_take_messages() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let mut one = side(Spec::node(1, dir.path(), &[2]).unregistered(), true).await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    let early = two
+        .net
+        .wait_up(&[NodeId(1)], Duration::from_millis(600))
+        .await;
+    assert!(
+        early.is_err(),
+        "node 1 cannot take messages yet, so its link is not up: {early:?}"
+    );
+    assert_eq!(two.links.boot_of(NodeId(1)), None, "no handshake yet");
+
+    one.register();
+    two.net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("up once node 1 is registered");
+    let ask = || Msg::Restore {
+        partition: PartitionId(1),
+        seed: seed(),
+    };
+    two.links.send(NodeId(2), NodeId(1), ask()).expect("sent");
+    let (got, _mail) = next(one.mail).await;
+    assert_eq!(
+        format!("{got:?}"),
+        format!("{:?}", ask()),
+        "delivered, not dropped"
+    );
+}
+
+/// The dialling half of the row above: node 2's process dials node 1 only once node 2 is
+/// registered, so node 1 never holds a link to a node that cannot take its messages yet.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_dials_only_once_its_node_can_take_messages() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let mut two = side(
+        Spec::node(2, dir.path(), &[1])
+            .dialling(1, addr)
+            .unregistered(),
+        false,
+    )
+    .await;
+    let early = one
+        .net
+        .wait_up(&[NodeId(2)], Duration::from_millis(600))
+        .await;
+    assert!(
+        early.is_err(),
+        "node 2 cannot take messages yet, so it has not dialled: {early:?}"
+    );
+    assert_eq!(one.links.boot_of(NodeId(2)), None, "no handshake yet");
+
+    two.register();
+    one.net
+        .wait_up(&[NodeId(2)], PATIENCE)
+        .await
+        .expect("up once node 2 is registered");
+    let ask = || Msg::Restore {
+        partition: PartitionId(1),
+        seed: seed(),
+    };
+    one.links.send(NodeId(1), NodeId(2), ask()).expect("sent");
+    let (got, _mail) = next(two.mail).await;
+    assert_eq!(
+        format!("{got:?}"),
+        format!("{:?}", ask()),
+        "delivered, not dropped"
+    );
 }
