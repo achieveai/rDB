@@ -2889,6 +2889,9 @@ mod tests {
 
         db.links().heal_all();
         admits(&db, "after the heal");
+        // D13: `admits` can be true while T1 still holds request 2 unpublished; wait for
+        // the publish too, so the resend never meets that freeze.
+        publishes(&db, Seq(3), "after the heal");
         let resent = db.resend(*request).expect("resend after the heal");
         assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
         let read = db.get(b"a").expect("get a");
@@ -2974,6 +2977,9 @@ mod tests {
 
         db.links().heal_all();
         admits(&db, "after the heal");
+        // D13: `admits` can be true while T1 still holds request 2 unpublished; wait for
+        // the publish too, so the resend never meets that freeze.
+        publishes(&db, Seq(3), "after the heal");
         let resent = db.resend(*request).expect("resend after the heal");
         assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
         let read = db.get(b"a").expect("get a");
