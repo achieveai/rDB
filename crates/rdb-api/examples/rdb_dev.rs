@@ -4454,16 +4454,19 @@ fn wait_recovered(
 }
 
 /// `wait ready`'s line after a slice that ran out, from [`ReadyError::TimedOut`]'s documented
-/// `phase`: "unknown" is node 1 answering no status look in that slice, which the line says in
-/// words rather than as a fault (A-R245, #59); "none" is node 1 running no recovery.
+/// `owner` and `phase`: "unknown" is the owner answering no status look in that slice, which the
+/// line says in words rather than as a fault (A-R245, #59); "none" is the owner running no
+/// recovery. The owner is the node `wait_ready` asked: node 2 after a promote (A-R256).
 ///
 /// [`ReadyError::TimedOut`]: rdb_api::db::ReadyError::TimedOut
-fn still_waiting_line(phase: &str) -> String {
+fn still_waiting_line(owner: NodeId, phase: &str) -> String {
+    let owner = owner.0;
     match phase {
-        "unknown" => "still waiting for ready: node 1 answered no status look in that time (it \
-                      may be busy, for example syncing its copies, or down)"
-            .to_owned(),
-        "none" => "still waiting for ready: node 1 runs no recovery".to_owned(),
+        "unknown" => format!(
+            "still waiting for ready: node {owner} answered no status look in that time (it may \
+             be busy, for example syncing its copies, or down)"
+        ),
+        "none" => format!("still waiting for ready: node {owner} runs no recovery"),
         phase => format!("still waiting for ready: recovery phase {phase}"),
     }
 }
@@ -4499,14 +4502,14 @@ fn wait_ready_line(
     let answer = loop {
         let slice = left.min(every);
         match wait(slice) {
-            Err(ReadyError::TimedOut { phase, .. }) if slice < left => {
+            Err(ReadyError::TimedOut { owner, phase, .. }) if slice < left => {
                 left -= slice;
                 tracing::info!(
                     phase = phase.as_str(),
                     waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "repl_wait_progress"
                 );
-                said(&still_waiting_line(&phase));
+                said(&still_waiting_line(owner, &phase));
             }
             Err(ReadyError::TimedOut { owner, phase, .. }) => {
                 break Err(ReadyError::TimedOut {
@@ -6959,11 +6962,12 @@ mod tests {
     }
 
     /// A-R245: a slice in which node 1 gave no status answer said `recovery phase unknown`,
-    /// which read as a fault. Each slice now says what node 1 answered: nothing, no recovery,
-    /// or its phase. Cut: print `recovery phase {phase}` for every phase and the first two
-    /// lines go red. Unit.
+    /// which read as a fault. Each slice now says what the owner answered: nothing, no
+    /// recovery, or its phase. A-R256: the owner is named, node 2 here as after a promote.
+    /// Cut: print `recovery phase {phase}` for every phase, or name node 1 always, and the
+    /// first two lines go red. Unit.
     #[test]
-    fn still_waiting_says_what_node_1_answered() {
+    fn still_waiting_says_what_the_owner_answered() {
         use rdb_api::db::ReadyError;
         let phases = ["unknown", "none", "ProposalUnresolved"];
         let (mut slices, mut said) = (0, Vec::new());
@@ -6976,6 +6980,7 @@ mod tests {
                 match phases.get(slices - 1) {
                     Some(phase) => Err(ReadyError::TimedOut {
                         within_ms: slice.as_millis(),
+                        owner: NodeId(2),
                         phase: (*phase).to_owned(),
                     }),
                     None => Ok(()),
@@ -6987,9 +6992,9 @@ mod tests {
         assert_eq!(
             said,
             [
-                "still waiting for ready: node 1 answered no status look in that time (it may be \
+                "still waiting for ready: node 2 answered no status look in that time (it may be \
                  busy, for example syncing its copies, or down)",
-                "still waiting for ready: node 1 runs no recovery",
+                "still waiting for ready: node 2 runs no recovery",
                 "still waiting for ready: recovery phase ProposalUnresolved",
             ]
         );
