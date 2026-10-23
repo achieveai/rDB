@@ -26,7 +26,9 @@
 
 use config_log::retcd_test;
 
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::partition::{
+    PartitionLifecycle, PartitionRecord, PartitionRoot, INSTANCE_LEN,
+};
 use rdb_core::authority::AuthorityTimer;
 use rdb_core::contracts::authority::{
     AuthorityView, BlockReason, DenyReason, FencingProof, Lineage, PartitionMode, Revocation,
@@ -6918,5 +6920,182 @@ fn w10_d1_a_refused_held_fence_leaves_the_activation_resolving() {
             RecoveryPhase::ActivationUnresolved,
             "{outcome:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// M10 S1-5 (achieveai/rDB#45, lead ruling A-R182): bound to an rDB instance, the recovery CAS
+// resolves an `Unknown` or `Unavailable` answer by read-then-CAS, as the activation does.
+// ---------------------------------------------------------------------------------------------
+
+/// [`proposing`] for an F1 bound to an rDB instance: its recovery CAS writes layout 3, whose root
+/// carries the run id (the fence's `control_revision`).
+fn bound_proposing() -> F1 {
+    let mut f1 = F1 {
+        module: Recovery::bound_to(Some([7; INSTANCE_LEN])),
+        log: Vec::new(),
+        requests: Vec::new(),
+    };
+    f1.rec(0, RecoveryEvent::Plan(Box::new(plan(&[]))));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    let mut last = Vec::new();
+    for copy in [A, B, C] {
+        last = f1.report(WINDOW, inv(copy, 20));
+    }
+    if !last.contains(&r(RecoveryEffect::CloseWindow)) {
+        f1.step(WINDOW, fired(1));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    for copy in [A, B, C] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    f1
+}
+
+/// The bytes the run's last CAS wrote.
+fn proposed_bytes(f1: &F1) -> Bytes {
+    f1.log
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            EffectKind::Control(ControlEffect::Cas {
+                value: Some(value), ..
+            }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("the run sent a CAS")
+}
+
+/// The CAS proposing `value` at `expected`, as the harness shows it.
+fn cas_bytes(expected: Revision, value: Bytes) -> EffectKind {
+    EffectKind::Control(ControlEffect::Cas {
+        request: LATEST,
+        key: ControlKey::Partition(PARTITION),
+        expected: Some(expected),
+        value: Some(value),
+    })
+}
+
+/// The `at` and version of the last discovery timer `effects` arm.
+fn armed(effects: &[EffectKind]) -> Option<(u64, u64)> {
+    effects.iter().rev().find_map(|e| match e {
+        EffectKind::Timer(TimerEffect::Arm { version, at, .. }) => Some((version.0, at.0)),
+        _ => None,
+    })
+}
+
+/// The record the fence was proven against: the prior owner, layout 2.
+fn prior_record() -> PartitionRecord {
+    PartitionRecord {
+        generation: PRIOR_GEN,
+        owner_epoch: PRIOR_EPOCH,
+        ..record(B)
+    }
+}
+
+/// A bound recovery CAS answered `Unknown` is resolved, not blocked: F1 reports the block fact,
+/// reads `partitions/{p}` at once and waits in `ProposalUnresolved`. The read decides:
+///
+/// * this run's own bytes above the fence revision (the CAS landed): the same CAS there;
+/// * the fenced record still at the fence revision (the CAS never applied): the same CAS at the
+///   fence revision.
+///
+/// Only that CAS's `Committed` commits.
+#[retcd_test]
+fn m10_s1_5_a_bound_recovery_cas_answered_unknown_settles_by_read_then_cas() {
+    for landed in [true, false] {
+        let mut f1 = bound_proposing();
+        let ours = proposed_bytes(&f1);
+        let unknown = f1.step(3_100, cas_result(CasOutcome::Unknown));
+        assert_eq!(
+            unknown[..2],
+            [block(BlockReason::ControlUnknown), get()],
+            "landed={landed}"
+        );
+        assert_eq!(armed(&unknown).map(|(_, at)| at), Some(3_100 + WINDOW));
+        assert_eq!(f1.phase(), RecoveryPhase::ProposalUnresolved);
+
+        let (read, at) = if landed {
+            (found_at(6, ours.clone()), Revision(6))
+        } else {
+            (
+                found_at(CONTROL_REV.0, prior_record().encode()),
+                CONTROL_REV,
+            )
+        };
+        assert_eq!(
+            f1.step(3_200, read),
+            vec![cas_bytes(at, ours.clone())],
+            "landed={landed}: one CAS, at the revision the read found"
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::ProposalUnresolved);
+
+        let committed = f1.step(3_300, cas_result(CasOutcome::Committed(Revision(9))));
+        recovered(&committed);
+        assert_eq!(f1.phase(), RecoveryPhase::Committed, "landed={landed}");
+    }
+}
+
+/// `Unavailable` is resolved too, but waits for the exchange's own deadline before it reads; an
+/// unanswered or unreadable read re-reads on the next fire.
+#[retcd_test]
+fn m10_s1_5_a_bound_recovery_cas_answered_unavailable_reads_at_its_deadline() {
+    let mut f1 = bound_proposing();
+    let ours = proposed_bytes(&f1);
+    let (version, deadline) = armed(&f1.log).expect("the CAS is bounded");
+    assert_eq!(
+        f1.step(3_100, cas_result(CasOutcome::Unavailable)),
+        vec![block(BlockReason::ControlUnavailable)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ProposalUnresolved);
+
+    let read = f1.step(deadline, fired(version));
+    assert_eq!(read[0], get());
+    let (version, deadline) = armed(&read).expect("the read is bounded");
+    assert_eq!(
+        f1.step(deadline - 1, read_result(ReadOutcome::Unavailable)),
+        vec![ign(ReplicaIgnoreReason::Outstanding)]
+    );
+    let again = f1.step(deadline, fired(version));
+    assert_eq!(again[0], get(), "the next fire reads again");
+    assert_eq!(
+        f1.step(deadline + 1, found_at(6, ours.clone())),
+        vec![cas_bytes(Revision(6), ours)]
+    );
+    recovered(&f1.step(deadline + 2, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+}
+
+/// A resolving recovery CAS commits only on its own bytes or the untouched fenced record. Any
+/// other record blocks, through the conflict re-read's rule: the same record from another run is a
+/// peer's decision, anything else is contention.
+#[retcd_test]
+fn m10_s1_5_a_resolving_recovery_cas_blocks_on_any_other_record() {
+    let f1 = bound_proposing();
+    let ours = proposed_bytes(&f1);
+    let mut root = PartitionRoot::decode(&ours).expect("bound F1 writes layout 3");
+    root.run = Revision(CONTROL_REV.0 + 1);
+    let peers = PartitionRecord::decode(&ours)
+        .expect("a record")
+        .encode_with(&root);
+
+    for (read, reason) in [
+        (found_at(6, peers), BlockReason::OvertakenByPeer),
+        (
+            found_at(6, prior_record().encode()),
+            BlockReason::CasContention,
+        ),
+        (
+            read_result(ReadOutcome::Absent { as_of: Revision(6) }),
+            BlockReason::CasContention,
+        ),
+    ] {
+        let mut f1 = bound_proposing();
+        f1.step(3_100, cas_result(CasOutcome::Unknown));
+        assert_eq!(f1.phase(), RecoveryPhase::ProposalUnresolved);
+        assert_eq!(f1.step(3_200, read), vec![block(reason.clone())]);
+        assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason));
+        assert_eq!(f1.cas_count(), 1, "no CAS on another record");
     }
 }

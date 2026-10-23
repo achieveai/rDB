@@ -290,9 +290,9 @@ impl DbConfig {
     /// # Errors
     ///
     /// [`OpenError::DedupCap`] when [`Self::dedup_cap`] is above [`RETENTION_CAP_ENTRIES`];
-    /// it is also logged as `dedup_cap_refused`.
+    /// it is also logged as `db_open_refused` with `kind=DedupCap`, as every refused open is.
     pub fn check(&self) -> Result<(), OpenError> {
-        limits(self.dedup_cap).map(|_| ())
+        limits(self.dedup_cap).map(|_| ()).map_err(open_refused)
     }
 }
 
@@ -378,8 +378,11 @@ impl std::fmt::Display for PutError {
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     /// Another open, in this process or another, holds this copy's lock. Nothing was started and
-    /// nothing was removed.
-    #[error("{0} is in use by another open")]
+    /// nothing was removed. The text names the next step (tester S1-8 walk, 066ab6e).
+    #[error(
+        "{0} is in use by another open. Close that open, or stop the process that holds it, then \
+         open this directory again"
+    )]
     InUse(PathBuf),
     /// A copy is missing or holds no database while another copy holds data. Nothing was started
     /// and nothing was removed. This build does not rebuild a copy (slice 2's S2-4 will).
@@ -389,9 +392,12 @@ pub enum OpenError {
     )]
     CopyMissing(PathBuf),
     /// The copies hold data but name no rDB instance: an M9 directory, which this build does not
-    /// open. Nothing was started and nothing was removed.
+    /// open. Nothing was started and nothing was removed. The text names the next step (tester
+    /// S1-8 walk, 066ab6e); no tool migrates M9 data, so it offers none.
     #[error(
-        "{0} holds data but names no rDB instance (an M9 directory); this build does not open it"
+        "{0} holds data but names no rDB instance (an M9 directory); this build does not open it. \
+         Open it with the M9 build that wrote it, or start a new database in an empty folder: \
+         this build does not migrate M9 data"
     )]
     Unbound(PathBuf),
     /// The copies and the control store do not belong together: the copies name different
@@ -2093,11 +2099,8 @@ fn limits(dedup_cap: Option<usize>) -> Result<Limits, OpenError> {
     let mut limits = Limits::default();
     if let Some(asked) = dedup_cap {
         if asked > RETENTION_CAP_ENTRIES {
-            tracing::error!(
-                dedup_cap = asked,
-                max = RETENTION_CAP_ENTRIES,
-                "dedup_cap_refused"
-            );
+            // Logged by the caller, as `db_open_refused` (`open_refused`): one event name for
+            // every refused open (lead ruling, tester S1-8 walk on 066ab6e).
             return Err(OpenError::DedupCap {
                 asked,
                 max: RETENTION_CAP_ENTRIES,
@@ -4056,10 +4059,23 @@ mod tests {
         );
         let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
-            .filter(|line| line["@m"] == "dedup_cap_refused")
+            .filter(|line| line["@m"] == "db_open_refused")
             .collect();
+        // One event name for every refused open (lead ruling, tester S1-8 walk on 066ab6e).
         assert_eq!(lines.len(), 1, "one refusal line: {lines:?}");
-        assert_eq!(lines[0]["dedup_cap"], RETENTION_CAP_ENTRIES + 1);
+        assert_eq!(
+            (&lines[0]["@l"], &lines[0]["kind"], &lines[0]["error"]),
+            (
+                &serde_json::json!("Warning"),
+                &serde_json::json!("DedupCap"),
+                &serde_json::json!(format!(
+                    "dedup_cap {} is above the most P1's status index holds ({}); nothing was \
+                     started",
+                    RETENTION_CAP_ENTRIES + 1,
+                    RETENTION_CAP_ENTRIES
+                ))
+            )
+        );
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
             dedup_retention: None,
