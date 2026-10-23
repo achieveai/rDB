@@ -5961,8 +5961,10 @@ mod tests {
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
-    /// it. Puts landing on node 2 wait for W6's `CopyAheadOnControl` arm (A-R254): until it merges, node 2's host faults on it.
-    /// Cut: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced.
+    /// it. A put then lands on node 2 at the new generation, and the write made before reads
+    /// back there.
+    /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
+    /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -6007,6 +6009,29 @@ mod tests {
         let old = db.put(b"c", b"3", None);
         db.route.owner.store(2, Ordering::Relaxed);
         assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
+
+        // A-R254, A-R256: writes go on at node 2, the write made before reads back there.
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            match db.put(b"b", b"2", None) {
+                Ok(put) => break put,
+                Err(refused) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no put landed on node 2 within {patience:?}: {refused:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(put.generation, promoted.generation, "{put:?}");
+        for (key, value) in [(&b"a"[..], &b"1"[..]), (b"b", b"2")] {
+            assert_eq!(
+                db.get(key).expect("get").value.map(|(_, v)| v),
+                Some(Bytes::copy_from_slice(value)),
+                "{} at node 2",
+                String::from_utf8_lossy(key)
+            );
+        }
         db.shutdown();
     }
 
