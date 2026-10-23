@@ -62,6 +62,8 @@ for `seq <= base`; only the read chain for the other namespaces is cut. `chain_d
 
 About 15 us per record copied (User and Dedup). The reopen that flattens blocks for that long.
 
+**Retiring Dedup rows (D6, draft of A-R170, 2026-10-22).** `RocksEngine::delete_dedup_below(P, G, end)` range-deletes every Dedup key below `end` at each level `(P, G)` reads, in one unsynced batch; nothing else moves. A `dedup_key` leads with its generation, so `end = (h+1)` big-endian retires generations `<= h`. Levels behind a copied link are left for M11's GC.
+
 ## Entry point
 
 ```sh
@@ -146,6 +148,7 @@ invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (t
 | `rdb_storage` | `meta_write_refused`, `sealed_generation_write_refused`, `staging_generation_write_refused` (ERROR) | `partition, generation, seq` + `sealed_by` / `parent, base` |
 | `rdb_storage` | `wal_sync_ancestor` | `partition, generation, durable` |
 | `rdb_storage` | `batch_commit` | `partition, generation, seq, writes, applied` |
+| `rdb_storage` | `dedup_delete_below` / `dedup_delete_unknown_lineage`, `dedup_delete_failed` (ERROR) | `partition, generation` + `levels, end_hex` / `error` |
 | `rdb_storage` | `wal_sync` (DEBUG; one per captured lineage per flush, so `RUST_LOG=rdb_storage=debug` to see it) | `partition, generation, captured, durable` |
 | `rdb_storage` | `lineage_verified` / `lineage_verify_failed` | `partition, generation, applied, durable` / `fault` |
 | `rdb_storage` | `storage_open_refused_*` (level ERROR, one per refusal, field `error`) | suffix `locked`, `column_families`, `format`, `durable_above_applied`, `corrupt_record`, `no_database`, `backend`. Logged by `open`, `open_existing`, `open_read_only` and `dump` alike. |

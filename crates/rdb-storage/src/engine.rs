@@ -645,6 +645,72 @@ impl RocksEngine {
         Ok(durable)
     }
 
+    /// Delete every Dedup row `(partition, generation)` reads whose key sorts below `end`, at
+    /// every level its reads walk ([`Self::levels`]): one range delete per level, in one
+    /// `WriteBatch`. Other namespaces, and levels behind a copied link, are not touched. Views
+    /// taken before the call still see the rows.
+    ///
+    /// For retiring the dedup rows of older generations (defect D6, draft of ruling A-R170): a
+    /// `dedup_key` leads with its generation big-endian, so `end = (h + 1).to_be_bytes()` is
+    /// every row of generations `<= h`. Storage reads no key layout; the caller picks `end`.
+    ///
+    /// Local cleanup, not a replicated write: no `applied` mark moves and nothing is added to
+    /// `History`. Unsynced, as [`Self::commit`] is; after a host crash the rows may be back, and
+    /// deleting again is the cure.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] for a lineage the engine does not hold, or when RocksDB
+    /// refuses the write; nothing is deleted.
+    pub fn delete_dedup_below(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        end: &[u8],
+    ) -> Result<(), StorageFault> {
+        if !self.lineages.contains_key(&(partition, generation)) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                "dedup_delete_unknown_lineage"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let levels = self.levels(partition, generation);
+        let cf = self.cf(keys::cf_for(Namespace::Dedup));
+        let mut write = WriteBatch::default();
+        for level in &levels {
+            write.delete_range_cf(
+                cf,
+                encode_key(partition, *level, Namespace::Dedup, &[]),
+                encode_key(partition, *level, Namespace::Dedup, end),
+            );
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(false);
+        opts.disable_wal(false);
+        if let Err(e) = self.db.write_opt(write, &opts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                error = %e,
+                "dedup_delete_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        tracing::info!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            levels = levels.len(),
+            end_hex = %hex(end),
+            "dedup_delete_below"
+        );
+        Ok(())
+    }
+
     /// The highest sequence applied to state, not necessarily synced.
     #[must_use]
     pub fn buffered_applied(&self, partition: PartitionId, generation: Generation) -> AppliedSeq {
