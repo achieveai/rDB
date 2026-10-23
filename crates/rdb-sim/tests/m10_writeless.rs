@@ -495,6 +495,8 @@ fn m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_lose
         .iter()
         .filter(|line| line["reason"] == "held_below_base")
         .map(|line| {
+            // A copy that cannot link warns; only `anchor_generation_absent` is info (ADV3).
+            assert_eq!(line["@l"], "Warning", "held_below_base warns: {line}");
             (
                 line["node"].as_u64().unwrap_or(0),
                 line["generation"].as_u64().unwrap_or(0),

@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent, FenceCredential, Lineage};
 use rdb_core::contracts::control::WatchTermination;
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::errors::RdbError;
 use rdb_core::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName,
@@ -40,9 +41,10 @@ use rdb_core::contracts::event::{
 };
 use rdb_core::contracts::ids::{
     AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket, Generation,
-    NodeId, OwnerEpoch, PartitionId, ReplicaRole, Seq, SnapshotHandle, TimerId, TimerVersion,
+    NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq, SnapshotHandle, TimerId,
+    TimerVersion,
 };
-use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::membership::{CopyId, PartitionConfig};
 use rdb_core::contracts::publication::PublicationEffect;
 use rdb_core::contracts::recovery::{
     DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryResult, SurvivorInventory,
@@ -258,6 +260,11 @@ pub struct Dispatcher {
     /// Each recovery catch-up routed to a source, by `(partition, target copy, source node)`:
     /// the F1 that asked, which is where the source's `CopyCaughtUp` goes (B-R59 surface item 4).
     catch_ups: BTreeMap<(PartitionId, CopyId, NodeId), (NodeId, PartitionId, CorrelationId)>,
+    /// Each F1's plan configuration, by the planning `(node, partition)`: the host's `plans`,
+    /// read only to seed a dormant receiver for a catch-up (A-R173). Dropped with the process.
+    plans: BTreeMap<(NodeId, PartitionId), PartitionConfig>,
+    /// Each `(node, partition)` whose dormant receiver holds its ladder: the host's `ladders`.
+    ladders: BTreeSet<(NodeId, PartitionId)>,
     /// The last `RecoveryResult` each F1 emitted, by the emitter's `(node, partition)`: what a
     /// post-commit `SyncWalThrough` is served from (lead ruling B-R55 item 3, M7B-137). After
     /// commit the copies are the pinned configuration's and the cutoff lives in the new
@@ -398,6 +405,8 @@ impl Dispatcher {
             addressed: BTreeMap::new(),
             survivors: BTreeMap::new(),
             catch_ups: BTreeMap::new(),
+            plans: BTreeMap::new(),
+            ladders: BTreeSet::new(),
             committed: BTreeMap::new(),
             transfer_plans: BTreeMap::new(),
             transfers: BTreeMap::new(),
@@ -820,6 +829,8 @@ impl Dispatcher {
         self.clock.forget_timers(node);
         self.timer_sites.retain(|(held, _), _| *held != node);
         self.catch_ups.retain(|(_, _, source), _| *source != node);
+        self.plans.retain(|(held, _), _| *held != node);
+        self.ladders.retain(|(held, _)| *held != node);
     }
 
     /// Hold, for release with this restart, each partition's newest committed root, when its
@@ -1193,6 +1204,10 @@ impl Dispatcher {
             let mut effects = self.restore_revocations(&ctx, event)?;
             effects.extend(self.authority.step(&ctx, event)?);
             return Ok(effects);
+        }
+        if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
+            self.plans
+                .insert((event.node, event.partition), plan.config.clone());
         }
         if module != ModuleName::Replication {
             return self.module_mut(module).step(&ctx, event);
@@ -2144,6 +2159,13 @@ impl Dispatcher {
     /// `QueryInventory` was answered from, so F1 can only name a copy placed there. The asking F1
     /// is remembered, so the source's `CopyCaughtUp` goes back to it.
     ///
+    /// First, the twin of the host's `route_catch_up` restores (A-R173, A-R213): the target's
+    /// node, then the source's, restore a dormant receiver from the asking F1's plan
+    /// configuration and the credential ([`Self::restore_dormant`]); the source's also gets its
+    /// ladder. **One difference from the host:** both restores happen here, synchronously at
+    /// routing. The host sends the target `Msg::Restore`, and the source restores when its
+    /// `Msg::CatchUp` arrives.
+    ///
     /// # Errors
     ///
     /// `harness::dispatch::deliver::recovery` when no holder was placed for `source`: F1 selected
@@ -2168,6 +2190,31 @@ impl Dispatcher {
             .members
             .get(&holder)
             .ok_or(SimError::Config { field: "member" })?;
+        match self.plans.get(&(site.0, partition)).cloned() {
+            Some(config) => {
+                let seed = DormantSeed::new(config, &credential);
+                match seed.config.members.iter().find(|member| member.copy == to) {
+                    Some(target) => {
+                        let target = target.node;
+                        self.restore_dormant(target, partition, &seed, false);
+                    }
+                    None => tracing::warn!(
+                        node = site.0 .0,
+                        partition = partition.0,
+                        to = to.0,
+                        reason = "not_placed",
+                        "dormant_restore_skipped"
+                    ),
+                }
+                self.restore_dormant(holder, partition, &seed, true);
+            }
+            None => tracing::warn!(
+                node = site.0 .0,
+                partition = partition.0,
+                reason = "no_plan",
+                "dormant_restore_skipped"
+            ),
+        }
         self.catch_ups.insert((partition, to, holder), site);
         let kind = EventKind::Kernel(KernelEvent::CatchUp {
             from: source,
@@ -2179,6 +2226,150 @@ impl Dispatcher {
         let id = Self::schedule_on(scheduler, now, holder, boot, partition, site.2, kind)?;
         self.routed.insert(id);
         Ok(())
+    }
+
+    /// The twin of the host's `restore_dormant` (A-R173): restore R1's dormant receiver for
+    /// `node`'s copy of `partition` from its engine's lineage at the seed's generation. A node
+    /// running a live side (a live receiver, or a primary) keeps it. `with_history` also gives
+    /// the receiver its ladder, `(0, ROOT)` through its head, once.
+    ///
+    /// Never faults: a copy that cannot be restored is logged `dormant_restore_refused{reason}`
+    /// and holds no receiver, so R1 refuses its catch-up `NotASource` and F1's deadline ends
+    /// the recovery `Blocked`. A down node has no process to restore.
+    fn restore_dormant(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        seed: &DormantSeed,
+        with_history: bool,
+    ) {
+        if self.is_down(node) {
+            return;
+        }
+        let dormant = self
+            .replication
+            .receiver(node, partition)
+            .map(AppendReceiver::is_dormant);
+        // A live side is kept. The receiver half is pinned by m7b_136. No row reaches the primary
+        // half yet: that takes a second recovery of a live partition (slice-2 residual, A-R216).
+        if dormant == Some(false)
+            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
+        {
+            return;
+        }
+        let refused = |reason: &str| {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                generation = seed.lineage.generation.0,
+                reason,
+                "dormant_restore_refused"
+            );
+        };
+        if dormant.is_none() {
+            match self.dormant_receiver(node, partition, seed) {
+                Ok(receiver) => {
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        copy = receiver.copy().0,
+                        generation = receiver.lineage().generation.0,
+                        head = receiver.applied_head().seq.0,
+                        revision = seed.revision.0,
+                        "dormant_restored"
+                    );
+                    self.replication.install_receiver(receiver);
+                    // A new dormant receiver holds no ladder yet, whatever an earlier one held.
+                    self.ladders.remove(&(node, partition));
+                }
+                Err(reason) => return refused(reason),
+            }
+        }
+        if with_history && !self.ladders.contains(&(node, partition)) {
+            let built = self
+                .dormant_rungs(node, partition, seed.lineage.generation)
+                .and_then(|rungs| {
+                    self.replication
+                        .restore_history(node, partition, &rungs)
+                        .map(|()| rungs.len())
+                        .map_err(|_| "ladder_refused")
+                });
+            match built {
+                Ok(rungs) => {
+                    self.ladders.insert((node, partition));
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        rungs,
+                        "dormant_ladder_built"
+                    );
+                }
+                Err(reason) => refused(reason),
+            }
+        }
+    }
+
+    /// The dormant receiver `node`'s engine supports for `seed`, or the host's reason there is
+    /// none. A stored record that fails its check is `no_record` here: [`stored_digest`] logs
+    /// which check, where the host names each.
+    fn dormant_receiver(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        seed: &DormantSeed,
+    ) -> Result<AppendReceiver, &'static str> {
+        let own = seed
+            .config
+            .members
+            .iter()
+            .find(|member| member.node == node)
+            .ok_or("not_a_member")?;
+        let generation = seed.lineage.generation;
+        let engine = self.engines.get(&node).ok_or("seed_generation_absent")?;
+        let held: Vec<Generation> = engine
+            .lineages()
+            .filter(|((p, _), _)| *p == partition)
+            .map(|((_, g), _)| *g)
+            .collect();
+        if held.iter().any(|g| *g > generation) {
+            return Err("copy_ahead_of_seed");
+        }
+        if !held.contains(&generation) {
+            return Err("seed_generation_absent");
+        }
+        let seq = Seq(engine.buffered_applied(partition, generation).0);
+        let digest =
+            stored_digest(engine, (node, partition, generation), seq).ok_or("no_record")?;
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: seed.config.clone(),
+                own: own.copy,
+                lineage: seed.lineage,
+                head: Head { seq, digest },
+                // Claims nothing durable: the barrier's proofs come from `SyncWalThrough`.
+                durable: DurableSeq(0),
+            },
+            seed.revision,
+        )
+        .map_err(|_| "receiver_refused")
+    }
+
+    /// Every stored digest `(0, ROOT)` through `node`'s head of `generation`.
+    fn dormant_rungs(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<Vec<(Seq, Digest)>, &'static str> {
+        let engine = self.engines.get(&node).ok_or("seed_generation_absent")?;
+        let head = engine.buffered_applied(partition, generation).0;
+        (0..=head)
+            .map(|seq| {
+                stored_digest(engine, (node, partition, generation), Seq(seq))
+                    .map(|digest| (Seq(seq), digest))
+                    .ok_or("no_record")
+            })
+            .collect()
     }
 
     /// Route one copy's inventory answer to the asking F1: what its holder reports for it today
@@ -2524,15 +2715,28 @@ impl Dispatcher {
         let digest = result.selected.cutoff_digest;
         // A-R185c: on a refusal the host stalls here until reopen; the sim walks up (slice-2
         // residual). The caller lands the copy empty and R1 copies from the root.
+        // A copy that holds no older generation has nothing to link: expected, so info, not
+        // warn, as the host (review-r185 ADV3). Every other reason is a copy that cannot catch up.
         let refused = |reason: &str| {
-            tracing::warn!(
-                node = member.0,
-                partition = partition.0,
-                generation = generation.0,
-                cutoff = cutoff.0,
-                reason,
-                "land_link_refused"
-            );
+            if reason == "anchor_generation_absent" {
+                tracing::info!(
+                    node = member.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            } else {
+                tracing::warn!(
+                    node = member.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            }
             None
         };
         let Some(copy) = result
@@ -3165,6 +3369,30 @@ fn in_barrier(result: &RecoveryResult, node: NodeId) -> bool {
         .iter()
         .find(|member| member.node == node)
         .is_some_and(|member| result.barrier.required().contains(&member.copy))
+}
+
+/// What a node restores its dormant receiver from (A-R173): the host's `DormantSeed`. The
+/// asking F1's plan configuration, and the prior lineage and control revision of the credential
+/// F1 minted from its fence proof.
+#[derive(Debug, Clone)]
+struct DormantSeed {
+    config: PartitionConfig,
+    lineage: Lineage,
+    revision: Revision,
+}
+
+impl DormantSeed {
+    fn new(config: PartitionConfig, credential: &FenceCredential) -> Self {
+        Self {
+            config,
+            lineage: Lineage {
+                partition: credential.partition,
+                generation: credential.prior_generation,
+                owner_epoch: credential.prior_owner_epoch,
+            },
+            revision: credential.control_revision,
+        }
+    }
 }
 
 fn stored_digest(

@@ -299,7 +299,8 @@ So a partition sustains about `cap / retention` writes per second:
 
 ### When writes pause
 
-Writes can pause without any error in your code. They resume by themselves; nothing is lost.
+Writes can pause without any error in your code. Most pauses end by themselves, and none
+loses data.
 A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, say).
 
 - **A copy falls behind or stops answering.** Node 1 pauses writes rather than accept writes
