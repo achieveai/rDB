@@ -32,6 +32,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::protection::{AdmissionState, ReplicationLag};
+use rdb_core::contracts::publication::AckFloor;
 use rdb_core::contracts::recovery::{
     CommittedRoot, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap, SelectedLineage,
 };
@@ -47,12 +48,12 @@ use rdb_core::publication::POST_APPLY_DEADLINE_MILLIS;
 use rdb_core::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
 use rdb_core::transaction::admission::{MAX_CONDITIONS, MAX_REQUEST_MUTATIONS};
 use rdb_core::transaction::dedup::{
-    dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, APP_ID_MIN, MAX_PINS, OPEN_BITS,
-    OPEN_MASK, SEED_PAGE,
+    dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, APP_ID_MIN, DEDUP_KEY_LEN,
+    DEDUP_VALUE_LEN, MAX_PINS, OPEN_BITS, OPEN_MASK, SEED_PAGE,
 };
 use rdb_core::transaction::{
-    deny_error, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode, StartRecord,
-    Transaction, TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX,
+    deny_error, record_len, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode,
+    StartRecord, Transaction, TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX,
     RETENTION_CAP_ENTRIES,
 };
 
@@ -106,6 +107,9 @@ impl Snap {
                 }
                 (Namespace::Dedup, Some(value)) => {
                     self.dedup.insert(write.key.to_vec(), value.clone());
+                }
+                (Namespace::Dedup, None) => {
+                    self.dedup.remove(write.key.as_ref());
                 }
                 _ => {}
             }
@@ -499,6 +503,30 @@ impl H {
             panic!("expected Dispatched");
         };
         (batch.id, *record_digest, seq)
+    }
+
+    /// [`Self::resolve`] for any client, returning the batch T1 shipped.
+    fn resolve_batch(&mut self, req: TxnRequest) -> Batch {
+        let identity = req.identity;
+        let correlation = self.admit(req);
+        let effects = self.step(answer(correlation, 1, Verdict::Admit));
+        let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+            panic!("expected exactly one batch, got {effects:?}");
+        };
+        let batch = batch.clone();
+        let Some(Inflight::Dispatched { record_digest, .. }) = self.k().inflight() else {
+            panic!("expected Dispatched");
+        };
+        let digest = *record_digest;
+        assert_eq!(self.step(committed(batch.id, batch.seq.0)).len(), 2);
+        let published = kernel(KernelEvent::Published {
+            lineage: lineage(),
+            seq: batch.seq,
+            record_digest: digest,
+            request: identity,
+        });
+        assert_eq!(self.step(published), vec![]);
+        batch
     }
 
     /// Dispatch, complete, publish: one fully resolved transaction.
@@ -6033,6 +6061,200 @@ fn m10_s2_admission_refuses_an_ack_floor_outside_its_scope() {
         assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
     }
     let _ = h.admit(floor(20, Some(10), nine[..MAX_PINS].to_vec()));
+}
+
+/// `put(request, b"a", b"1")` carrying an ack floor.
+fn floored(request: u64, acked_below: Option<u64>, pinned: &[u64]) -> TxnRequest {
+    let mut req = put(request, b"a", b"1");
+    req.acked_below = acked_below;
+    req.pinned = pinned.to_vec();
+    req
+}
+
+/// `req` in group `affinity` instead of [`AFF`].
+fn in_group(mut req: TxnRequest, affinity: AffinityId) -> TxnRequest {
+    req.affinity = affinity;
+    for mutation in &mut req.mutations {
+        if let Mutation::Put { key, .. } = mutation {
+            *key = scoped_key(TENANT, affinity, b"a");
+        }
+    }
+    req
+}
+
+/// How many `Dedup` records `batch` deletes, and how many it puts.
+fn dedup_writes(batch: &Batch) -> (usize, usize) {
+    let dedup = batch.writes.iter().filter(|w| w.ns == Namespace::Dedup);
+    let deletes = dedup.clone().filter(|w| w.value.is_none()).count();
+    (deletes, dedup.count() - deletes)
+}
+
+/// Design-ackfloor D1 and D10 (A-R252 M2). A client that holds every answer before its next
+/// write keeps T1's index at its own last entry and one floor record, though it writes two groups
+/// in turn: one floor per open trims across groups. So a dedup cap of 100 never answers
+/// `OVERLOADED` over 1,000 writes, and the durable records stay as flat as the index.
+#[retcd_test]
+fn m10_s2_d1_a_held_floor_keeps_the_index_flat_across_two_groups() {
+    let mut h = H::live_with(Limits {
+        dedup_cap: 100,
+        ..Limits::default()
+    });
+    let other = AffinityId(AFF.0 + 1);
+    for request in 1..=1_000 {
+        let req = floored(request, Some(request), &[]);
+        let req = if request % 2 == 0 {
+            in_group(req, other)
+        } else {
+            req
+        };
+        let _ = h.resolve_batch(req);
+        assert!(
+            h.k().dedup().len() <= 2,
+            "{request}: {}",
+            h.k().dedup().len()
+        );
+        assert!(h.snap.dedup.len() <= 2, "{request}: {}", h.snap.dedup.len());
+    }
+}
+
+/// Design-ackfloor D5 (A-R252 M2). Floor writes use only the room a request leaves under both
+/// of check 10's bounds, and the rest waits for the client's next request. With 200 answers held:
+/// a 255-write request adds nothing; a 254-write one adds the floor record only; one whose value
+/// leaves room for three deletes adds three; a one-put request deletes 64. Every batch ships, and
+/// the backlog drains to the last entry and the floor record.
+#[retcd_test]
+fn m10_s2_d5_floor_writes_use_only_the_room_a_request_leaves() {
+    let mut h = H::live();
+    for request in 1..=200 {
+        let _ = h.resolve(put(request, b"a", b"1"));
+    }
+    let puts = |request: u64, n: usize| {
+        let mut req = floored(request, Some(request), &[]);
+        req.mutations = (0..n)
+            .map(|i| Mutation::Put {
+                key: key(format!("m{i}").as_bytes()),
+                value: Bytes::from_static(b"v"),
+                expected_version: None,
+            })
+            .collect();
+        req
+    };
+    assert_eq!(dedup_writes(&h.resolve_batch(puts(201, 255))), (0, 1));
+    assert_eq!(dedup_writes(&h.resolve_batch(puts(202, 254))), (0, 2));
+    // Room for the floor record, three deletes and five bytes to spare.
+    let dedup_put = 6 + DEDUP_KEY_LEN + 4 + DEDUP_VALUE_LEN;
+    let dedup_delete = 6 + DEDUP_KEY_LEN;
+    let empty = Mutation::Put {
+        key: key(b"a"),
+        value: Bytes::new(),
+        expected_version: None,
+    };
+    let room = dedup_put + 3 * dedup_delete + 5;
+    let mut big = floored(203, Some(203), &[]);
+    big.mutations = vec![Mutation::Put {
+        key: key(b"a"),
+        value: Bytes::from(vec![0; MAX_ENVELOPE_BYTES - record_len(0, &[empty]) - room]),
+        expected_version: None,
+    }];
+    assert_eq!(dedup_writes(&h.resolve_batch(big)), (3, 2));
+    assert_eq!(
+        dedup_writes(&h.resolve_batch(floored(204, Some(204), &[]))),
+        (64, 2)
+    );
+    // 1..=204 less 3 and 64 leaves 137 below the floor: 64, 64, then the last 9 and 205, 206.
+    let drained: Vec<_> = (205..=207)
+        .map(|request| dedup_writes(&h.resolve_batch(floored(request, Some(request), &[]))).0)
+        .collect();
+    assert_eq!(drained, [64, 64, 11]);
+    assert_eq!((h.k().dedup().len(), h.snap.dedup.len()), (2, 2));
+}
+
+/// Design-ackfloor D3 and D4, A-R252 M3. Client 5 writes 1..=10, then 11 with floor 11 and pin 4:
+/// - the candidate carries the floor as sent, for P1 to forget by (A-R255);
+/// - a resend of 3 is `STATUS_EXPIRED` and applies nothing, and the pin's resend replays;
+/// - client 6's id 3 is untouched, and a floor lower than the one held moves nothing;
+/// - after failover the seed holds the floor: 3 is still `STATUS_EXPIRED`.
+#[retcd_test]
+fn m10_s2_d3_a_resend_under_the_floor_is_status_expired_before_and_after_failover() {
+    let mut h = H::live();
+    let other = |request| {
+        let mut req = put(request, b"b", b"1");
+        req.identity.client = ClientId(6);
+        req
+    };
+    for request in 1..=10 {
+        let _ = h.resolve(put(request, b"a", b"1"));
+    }
+    let _ = h.resolve_batch(other(3));
+    let correlation = h.admit(floored(11, Some(11), &[4]));
+    let effects = h.step(answer(correlation, 1, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected exactly one batch, got {effects:?}");
+    };
+    assert_eq!(dedup_writes(batch), (9, 2), "ids 1..=10 but the pin");
+    let batch = batch.clone();
+    let effects = h.step(committed(batch.id, batch.seq.0));
+    let [_, EffectKind::Kernel(KernelEffect::AppliedCandidate(candidate))] = effects.as_slice()
+    else {
+        panic!("expected LocalApplied and a candidate, got {effects:?}");
+    };
+    let mut pinned = [None; MAX_PINS];
+    pinned[0] = Some(4);
+    assert_eq!(candidate.ack_floor, Some(AckFloor { below: 11, pinned }));
+    let digest = candidate.record_digest;
+    // A3: nothing is trimmed until `Published`.
+    let held = |h: &H| h.k().dedup().get(GEN, AFF, identity(3)).is_some();
+    assert!(held(&h));
+    assert_eq!(h.step(published(batch.seq.0, digest, 11)), vec![]);
+    assert!(!held(&h));
+
+    let head = h.k().next_seq();
+    assert_eq!(
+        h.step(submit(put(3, b"a", b"1"))),
+        fail(
+            3,
+            RdbError::StatusExpired {
+                identity: identity(3)
+            }
+        )
+    );
+    assert_eq!(h.k().next_seq(), head, "nothing applied");
+    assert!(matches!(
+        h.step(submit(put(4, b"a", b"1"))).as_slice(),
+        [EffectKind::Reply(ReplyEffect::Transaction { .. })]
+    ));
+    assert!(matches!(
+        h.step(submit(other(3))).as_slice(),
+        [EffectKind::Reply(ReplyEffect::Transaction { .. })]
+    ));
+    let backwards = h.resolve_batch(floored(12, Some(2), &[]));
+    assert_eq!(
+        dedup_writes(&backwards),
+        (0, 1),
+        "a lower floor moves nothing"
+    );
+
+    // Failover to B in g8: the seed loads g7's floor record with what is left.
+    let at = h.snap.at.0;
+    let _ = h.step(recovered(Generation(8), at, NODE_B, PartitionMode::Active));
+    h.node = NODE_B;
+    let _ = h.step(recovered(Generation(8), at, NODE_B, PartitionMode::Active));
+    let _ = h.step(admission(true, None));
+    assert_eq!(
+        h.step(submit(put(3, b"a", b"1"))),
+        fail(
+            3,
+            RdbError::StatusExpired {
+                identity: identity(3)
+            }
+        )
+    );
+    assert_eq!(h.k().seed_pending(), None);
+    assert_eq!(
+        failed(&h.step(submit(put(4, b"a", b"1")))),
+        ErrorKind::GenerationChanged,
+        "the pin was kept, so it reconciles as any older answer does"
+    );
 }
 
 /// M9 S0 rule 1, "T1 `Open`". An empty partition recovered read-only owes the start record but

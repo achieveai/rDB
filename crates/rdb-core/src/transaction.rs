@@ -37,7 +37,7 @@ use crate::contracts::event::{
 };
 use crate::contracts::ids::{
     AffinityId, BatchId, BootId, ConfigVersion, CorrelationId, Generation, GrantId, LeaseId,
-    NodeId, PartitionId, RequestIdentity, Seq,
+    NodeId, PartitionId, RequestId, RequestIdentity, Seq,
 };
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::protection::AdmissionState;
@@ -54,10 +54,11 @@ use crate::contracts::version::{API_VERSION, ENVELOPE_VERSION};
 use crate::publication::POST_APPLY_DEADLINE_MILLIS;
 use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS, PROGRESS_KEY};
 
+use crate::contracts::publication::AckFloor;
 pub use crate::contracts::publication::{AppliedCandidate, FreezeCause};
 pub use admission::{admit, deny_error, freeze_error, Boundary, DenyContext, QUEUE_CAP};
 pub use dedup::{
-    DedupIndex, Retained, RetainedAnswer, SeedBlocked, SeedPending, TrimMemory,
+    DedupIndex, FloorPlan, Retained, RetainedAnswer, SeedBlocked, SeedPending, TrimMemory,
     RETENTION_CAP_ENTRIES,
 };
 
@@ -241,6 +242,9 @@ pub struct Reservation {
     pub envelope: ReplicationEnvelope,
     /// Its canonical encoding, the history record.
     pub record: Bytes,
+    /// The ack floor the envelope carries: its dedup deletes and floor record (A-R252). Applied
+    /// to the index only at this envelope's `Published` (A3).
+    pub floor: Option<FloorPlan>,
 }
 
 /// The one transaction past the queue (spec §5.2's last paragraph).
@@ -275,6 +279,8 @@ pub enum Inflight {
         authority: AuthorityDecision,
         /// Whether storage has answered for it.
         completed: bool,
+        /// The reservation's ack floor, applied at `Published` (A-R252 A3).
+        floor: Option<FloorPlan>,
     },
 }
 
@@ -945,6 +951,15 @@ impl TxnKernel {
             };
             return vec![reply(identity, TxnRejection::NotAdmitted(error))];
         }
+        //     An id under its open's ack floor that the index no longer holds was trimmed: its
+        //     client held an answer for it (A-R252 M3). Never applied again: it is
+        //     `STATUS_EXPIRED`. After `get` and `older`, so a pin's resend still replays.
+        if self.dedup.below_floor(generation, identity) {
+            return vec![reply(
+                identity,
+                TxnRejection::NotAdmitted(RdbError::StatusExpired { identity }),
+            )];
+        }
         // 12. Conditions, against the authoritative local state. No sequence is reserved, so
         //     the failure is aged at `next_seq`, the first sequence published after it: aged at
         //     the one before, a trim of that older sequence dropped it early (A-R71, hunt_06).
@@ -1067,18 +1082,69 @@ impl TxnKernel {
         }
     }
 
+    /// Step 13's ack floor (A-R252, design-ackfloor §2 "Bounds"): the dedup deletes and the floor
+    /// record this envelope carries, or `None` when the request sets no floor or leaves no room.
+    ///
+    /// Only the room the request leaves is used: writes up to [`MAX_MUTATIONS`] after its own and
+    /// its dedup row, and bytes up to [`MAX_ENVELOPE_BYTES`] after [`encoded_len`]. The floor
+    /// record goes first; deletes take the rest, at most [`dedup::TRIM_PER_ENVELOPE`]. What does
+    /// not fit waits for the client's next request, which finds it from the index. So a full
+    /// 255-write request adds nothing, and check 10's bounds still describe the record.
+    fn floor_plan(&self, req: &TxnRequest) -> Option<FloorPlan> {
+        let below = req.acked_below?;
+        // The request's writes, its own dedup row, and the floor record.
+        let writes = MAX_MUTATIONS.checked_sub(req.mutations.len().saturating_add(2))?;
+        let bytes = MAX_ENVELOPE_BYTES
+            .checked_sub(encoded_len(req).saturating_add(DEDUP_WRITE_LEN))?
+            / DEDUP_DELETE_LEN;
+        let pinned: Vec<_> = req.pinned.iter().copied().map(RequestId).collect();
+        self.dedup.trim_plan(
+            self.lineage.generation,
+            req.identity,
+            RequestId(below),
+            &pinned,
+            dedup::TRIM_PER_ENVELOPE.min(writes).min(bytes),
+        )
+    }
+
     /// Step 13: the envelope at `next_seq`, chained to `prev_digest`.
     ///
     /// Check 10 has already refused a record over [`MAX_ENVELOPE_BYTES`] and more writes than
     /// [`admission::MAX_REQUEST_MUTATIONS`] (spec §4.2, rulings L-R184y and L-R185b), so this
     /// record passes every secondary's append row 2. Both bounds are checked again here on
-    /// the record itself, each refused with check 10's error (ruling L-R185d).
+    /// the record itself, each refused with check 10's error (ruling L-R185d). The ack floor's
+    /// writes ([`Self::floor_plan`]) follow the request's dedup row, inside both bounds.
     fn reserve(&self, admitted: &Admitted) -> Result<Reservation, RdbError> {
         let mut envelope = self.envelope(
             &admitted.req,
             admitted.request_digest,
             admitted.admitted_under.grant_id,
         );
+        let floor = self.floor_plan(&admitted.req);
+        if let Some(plan) = &floor {
+            let deletes = plan
+                .deletes
+                .iter()
+                .map(|(generation, affinity, identity)| Write {
+                    ns: Namespace::Dedup,
+                    key: dedup::dedup_key(*generation, *affinity, *identity),
+                    value: None,
+                });
+            envelope.mutations.extend(deletes);
+            envelope.mutations.push(Write {
+                ns: Namespace::Dedup,
+                key: dedup::dedup_key(
+                    plan.generation,
+                    dedup::FLOOR_AFFINITY,
+                    plan.record_identity(),
+                ),
+                value: Some(dedup::floor_value(
+                    plan.floor,
+                    envelope.header.seq,
+                    self.lineage.owner_epoch,
+                )),
+            });
+        }
         // Check 10's two bounds, in its order, refused again on the record itself in every
         // build: either one, shipped, stalls the partition on a record no secondary takes
         // (rulings L-R184y, L-R185d). The count first, before any hashing.
@@ -1099,6 +1165,7 @@ impl TxnKernel {
             seq: envelope.header.seq,
             envelope,
             record,
+            floor,
         })
     }
 
@@ -1272,6 +1339,7 @@ impl TxnKernel {
                 bytes: u64::try_from(reservation.record.len()).unwrap_or(u64::MAX),
                 authority: *answer,
                 completed: false,
+                floor: reservation.floor,
             });
             return vec![TxnEffect::StorageBatch(Batch {
                 id: batch,
@@ -1295,6 +1363,7 @@ impl TxnKernel {
             bytes,
             authority,
             completed,
+            floor,
         }) = &mut self.inflight
         else {
             return vec![ignored(AuthorityIgnoreReason::UnmatchedCompletion)];
@@ -1316,7 +1385,7 @@ impl TxnKernel {
                     request_digest: admitted.request_digest,
                     pending_result: published_result(self.lineage, seq),
                     authority: *authority,
-                    ack_floor: None,
+                    ack_floor: floor.as_ref().and_then(|_| ack_floor(&admitted.req)),
                 };
                 (
                     FreezeCause::UnresolvedTransaction,
@@ -1388,6 +1457,7 @@ impl TxnKernel {
             seq: dispatched_seq,
             record_digest: dispatched,
             completed: true,
+            floor,
             ..
         }) = &self.inflight
         else {
@@ -1425,6 +1495,11 @@ impl TxnKernel {
                     applied_at_seq: seq,
                 },
             );
+        }
+        // The ack floor moves with the envelope that carried it, and only now (A-R252 A3): its
+        // deletes and floor record are on every copy, so the index drops the same entries.
+        if let Some(plan) = floor {
+            self.dedup.apply_floor(plan, seq);
         }
         self.inflight = None;
         self.completed_at = None;
@@ -1693,22 +1768,38 @@ pub fn record_len(conditions: usize, mutations: &[Mutation]) -> usize {
     // Header; then lease id, prev digest, identity, request digest, the conditions and mutations
     // count prefixes, the result tag and the record digest.
     const FIXED: usize = ENVELOPE_HEADER_LEN + 8 + 32 + 16 + 32 + 4 + 4 + 1 + 32;
-    // Per write: namespace tag, key length and has-value tag. A put adds a value length.
-    const WRITE: usize = 1 + 4 + 1;
-    const VALUE: usize = 4;
-    // Step 13's one `Dedup` write, fixed-width.
-    const DEDUP: usize = WRITE + dedup::DEDUP_KEY_LEN + VALUE + dedup::DEDUP_VALUE_LEN;
     // One outcome byte per condition.
-    let fixed = (FIXED + DEDUP).saturating_add(conditions);
+    let fixed = (FIXED + DEDUP_WRITE_LEN).saturating_add(conditions);
     mutations.iter().fold(fixed, |len, mutation| {
         let write = match mutation {
-            Mutation::Put { key, value, .. } => (WRITE + VALUE)
+            Mutation::Put { key, value, .. } => (WRITE_LEN + VALUE_LEN)
                 .saturating_add(key.len())
                 .saturating_add(value.len()),
-            Mutation::Delete { key, .. } => WRITE.saturating_add(key.len()),
+            Mutation::Delete { key, .. } => WRITE_LEN.saturating_add(key.len()),
         };
         len.saturating_add(write)
     })
+}
+
+/// Encoded bytes of any write before its key: namespace tag, key length and has-value tag.
+const WRITE_LEN: usize = 1 + 4 + 1;
+/// Encoded bytes a write with a value adds: the value's length.
+const VALUE_LEN: usize = 4;
+/// Encoded bytes of one fixed-width `Dedup` put: step 13's own dedup row, or a floor record.
+const DEDUP_WRITE_LEN: usize =
+    WRITE_LEN + dedup::DEDUP_KEY_LEN + VALUE_LEN + dedup::DEDUP_VALUE_LEN;
+/// Encoded bytes of one `Dedup` delete an ack floor adds.
+const DEDUP_DELETE_LEN: usize = WRITE_LEN + dedup::DEDUP_KEY_LEN;
+
+/// The [`AckFloor`] P1 forgets by: the request's `acked_below` and `pinned` as sent, which
+/// admission's check 10 bounded to [`dedup::MAX_PINS`] pins (ruling A-R255).
+fn ack_floor(req: &TxnRequest) -> Option<AckFloor> {
+    let below = req.acked_below?;
+    let mut pinned = [None; dedup::MAX_PINS];
+    for (slot, pin) in pinned.iter_mut().zip(&req.pinned) {
+        *slot = Some(*pin);
+    }
+    Some(AckFloor { below, pinned })
 }
 
 /// `Frozen{cause}` with nothing unresolved.
