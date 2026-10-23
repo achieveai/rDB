@@ -355,9 +355,10 @@
 //!                                         generation G (was node P); node m dropped`.
 //!                                         A refusal prints `err admin promote: <error>`
 //!                                         and the run exits 1. Known gap: under `--nodes`
-//!                                         (`lr promote`) this build answers INVALID_ARGUMENT
-//!                                         "built without budgets", because the app-only
-//!                                         `Db` opens with none
+//!                                         (`lr promote`) this build answers UNAVAILABLE
+//!                                         "node 2 could not be sent the new plan": the plan
+//!                                         goes as a message that never crosses the wire.
+//!                                         The partition is then left fencing, with no writes
 //! admin rebuild N | admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
