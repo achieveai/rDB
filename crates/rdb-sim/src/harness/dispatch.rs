@@ -841,7 +841,8 @@ impl Dispatcher {
         self.plans.retain(|(held, _), _| *held != node);
         self.ladders.retain(|(held, _)| *held != node);
         self.primary_ladders.retain(|(held, _, _)| *held != node);
-        self.snapshots_served.retain(|(held, _, _, _)| *held != node);
+        self.snapshots_served
+            .retain(|(held, _, _, _)| *held != node);
     }
 
     /// Hold, for release with this restart, each partition's newest committed root, when its
@@ -1953,10 +1954,16 @@ impl Dispatcher {
             return unserved("no_primary");
         };
         let generation = primary.tracker().lineage().generation;
-        if !self.snapshots_served.insert((node, partition, copy, barrier)) {
+        if !self
+            .snapshots_served
+            .insert((node, partition, copy, barrier))
+        {
             return Ok(());
         }
-        if self.primary_ladders.contains(&(node, partition, generation)) {
+        if self
+            .primary_ladders
+            .contains(&(node, partition, generation))
+        {
             tracing::warn!(
                 node = node.0,
                 partition = partition.0,
@@ -3012,7 +3019,10 @@ impl Dispatcher {
                     generation,
                     owner_epoch: result.committed.authority_view.lineage.owner_epoch,
                 },
-                head: Head { seq: head, digest: at },
+                head: Head {
+                    seq: head,
+                    digest: at,
+                },
                 durable: DurableSeq(0),
             });
             match receiver {

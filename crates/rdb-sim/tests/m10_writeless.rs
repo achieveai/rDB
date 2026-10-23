@@ -531,7 +531,10 @@ fn m10_d3_a_copy_behind_two_writeless_reopens_catches_up() {
     let refused = logged(method, "land_link_refused");
     assert!(refused.is_empty(), "no landing is refused: {refused:?}");
     let unconsumed = logged(method, "kernel effect refused: no consumer");
-    assert!(unconsumed.is_empty(), "every effect is consumed: {unconsumed:?}");
+    assert!(
+        unconsumed.is_empty(),
+        "every effect is consumed: {unconsumed:?}"
+    );
     let faults: Vec<serde_json::Value> =
         config_testkit::logs::lines_for_current_test("m10_writeless", method)
             .into_iter()
@@ -588,9 +591,13 @@ fn m10_d3_a_copy_behind_two_writeless_reopens_catches_up() {
 fn m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine() {
     let method = "m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine";
     support::preamble();
-    let mut runner = Runner::new(&plan_with(Seq(CUTOFF.0 - 1))).expect("the harness takes the plan");
+    let mut runner =
+        Runner::new(&plan_with(Seq(CUTOFF.0 - 1))).expect("the harness takes the plan");
     let quiet = run_to(&mut runner, FIRST_AT - 100);
-    assert!(quiet.is_empty(), "nothing is written before the first write");
+    assert!(
+        quiet.is_empty(),
+        "nothing is written before the first write"
+    );
 
     let a = u64::from(A_NODE.0);
     let behind: Vec<(u64, u64, u64, u64)> = logged(method, "land_link_behind")
