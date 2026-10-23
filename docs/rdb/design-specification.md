@@ -332,6 +332,8 @@ Within one active generation, primary reads pass the same authority gate and ser
 
 Dedup key is `(tenant, client_id, request_id)` scoped to its affinity group and generation; store request digest and result atomically. Same identity with changed payload is `REQUEST_ID_REUSE`. Keep dedup entries at least 24 hours; beyond retention callers cannot infer nonexecution from absence. So a retry is deduplicated only inside the retention window: past it, a retry with the same identity is admitted as a new request and may apply again, at a new sequence, unless it names an expected generation that has since changed (clarified 2026-10-18, M9 S3; row M7A-89; [ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §4).
 
+**Amended 2026-10-22 (M10, lead rulings A-R181, A-R182): the retention window is an app option.** 24 hours stays the default. An app may set a shorter window with `DbConfig::dedup_retention` (`crates/rdb-api/src/db.rs`; its doc and `DbConfig::dedup_cap`'s give the write rate each window sustains and the memory per entry). The cost is the rule above, sooner: past the window, a resend or a status query with the same identity cannot be settled.
+
 A retry with stale expected generation returns `GENERATION_CHANGED` before any mutation. The caller must reconcile on recovery; it must not silently retry a lost-generation transaction as a new effect. A transaction received by a replica may recover even if its client never saw success.
 
 ### 5.4 Error categories
