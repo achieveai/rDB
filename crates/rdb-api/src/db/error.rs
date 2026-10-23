@@ -149,12 +149,14 @@ impl ApiError {
 
     /// What the caller does next, in words, for this kind and retry rule. `None` when
     /// [`Self::detail`] already ends with the step: the host said to shut the `Db` down and open
-    /// the folder again, and a second step would contradict it. `UnknownOutcome` keeps its step
-    /// even then, because asking [`super::Db::status`] with the same id is still right after the
+    /// the folder again, and a second step would contradict it. A write's `UnknownOutcome`
+    /// (`QueryStatus`) keeps its step even then, because asking [`super::Db::status`] with the same id is still right after the
     /// new open.
     #[must_use]
     pub fn next_step(&self) -> Option<&'static str> {
-        if self.detail.ends_with(OPEN_AGAIN) && self.kind != ErrorKind::UnknownOutcome {
+        let write_unknown =
+            self.kind == ErrorKind::UnknownOutcome && self.retry == RetryRule::QueryStatus;
+        if self.detail.ends_with(OPEN_AGAIN) && !write_unknown {
             return None;
         }
         Some(step_for(self.kind, self.retry))
@@ -209,8 +211,14 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
         ErrorKind::DeadlineBeforeAdmission => {
             "send the same request again with `Db::resend_within` and a longer deadline"
         }
-        ErrorKind::UnknownOutcome => {
+        // Only a write carries `QueryStatus`; a read has no request to ask about (tester-s2,
+        // A-R230), so any other rule here is a read's.
+        ErrorKind::UnknownOutcome if matches!(retry, RetryRule::QueryStatus) => {
             "ask `Db::status` with this request id; never send it under a new request id"
+        }
+        ErrorKind::UnknownOutcome => {
+            "a read changes nothing, so read again; if this repeats, call `wait_ready` or \
+             `node_status` for the reason"
         }
         ErrorKind::GenerationChanged => {
             "ask `Db::status` with this request id to learn whether it applied; never replay it \
@@ -249,6 +257,76 @@ pub(super) fn wire_name(kind: ErrorKind) -> String {
         out.push(c.to_ascii_uppercase());
     }
     out
+}
+
+// Texts for the open and the wait (ruling A-R230 Q3): W7 owns the words, W5 the call sites in
+// `db.rs`. Each ends with the step embed.md section 6 gives for it, after `; next: `.
+// Unused outside tests until W5 swaps those sites, hence the `allow`s; W5 removes them.
+
+/// What `wait_ready` last saw of node 1, for [`ready_timed_out_text`].
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadySeen<'a> {
+    /// Node 1 answered no status look in the time: it may be busy, for example syncing its
+    /// copies to the barrier. Never "unknown": that read as a fault (tester-s2, #59).
+    NoAnswer,
+    /// Node 1 answered and runs no recovery.
+    NoRecovery,
+    /// Node 1's recovery phase, as it names it.
+    Phase(&'a str),
+}
+
+/// `ReadyError::TimedOut`'s text.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn ready_timed_out_text(within_ms: u128, seen: ReadySeen<'_>) -> String {
+    let state = match seen {
+        ReadySeen::NoAnswer => {
+            "node 1 answered no status look in that time (it may be busy, for example syncing \n             its copies)"
+                .to_owned()
+        }
+        ReadySeen::NoRecovery => "node 1 runs no recovery".to_owned(),
+        ReadySeen::Phase(phase) => format!("node 1's recovery phase is {phase}"),
+    };
+    format!(
+        "node 1 did not admit writes within {within_ms} ms; {state}; next: call `wait_ready` \n         again with a longer bound, or shut this Db down and open the folder again, once; if \n         that times out too, stop and report it with this message"
+    )
+}
+
+/// The step after the control store does not hold this folder's records.
+#[cfg_attr(not(test), allow(dead_code))]
+const NOT_THIS_STORE_STEP: &str = "point `Db::open` at the rEtcd this folder was made with; for a \n                                   new database, start a separate rEtcd";
+
+/// `OpenError::Mismatch`'s detail when the store does not hold this folder's records: its
+/// `partitions/1` is absent, names no instance or another one, or its open counter is absent.
+/// `what` says which, without a step.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn not_this_store_text(what: &str) -> String {
+    format!("{what}; next: {NOT_THIS_STORE_STEP}")
+}
+
+/// `OpenError::Mismatch`'s detail when the copies name different instances: they come from
+/// different folders. `named` lists the instances.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn copies_disagree_text(named: &str) -> String {
+    format!(
+        "the copies name different instances: {named}; next: the copies come from different \n         folders, so restore this folder's copies from one backup, then open it again"
+    )
+}
+
+/// The open counter's refusal for good, for `admin::CounterError::Exhausted`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn counter_exhausted_text(key: &str, max: u64) -> String {
+    format!(
+        "{key} has counted {max} opens, the most one directory may have; next: start a new \n         folder"
+    )
+}
+
+/// The open counter's refusal for good, for `admin::CounterError::Unreadable`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn counter_unreadable_text(key: &str, revision: u64) -> String {
+    format!(
+        "{key} at revision {revision} is not an open counter; next: do not delete this \n         folder, its acknowledged writes are intact; stop and report it with this message"
+    )
 }
 
 #[cfg(test)]
@@ -352,6 +430,52 @@ mod tests {
         );
     }
 
+    /// #59 (tester-s2, A-R230 Q3): every open and wait text W5's sites will carry ends with a
+    /// step after `; next: `, and `TimedOut` never says "unknown", which read as a fault while
+    /// node 1 was busy syncing.
+    #[test]
+    fn every_open_and_wait_text_ends_with_a_next_step() {
+        let texts = [
+            ready_timed_out_text(5_000, ReadySeen::NoAnswer),
+            ready_timed_out_text(5_000, ReadySeen::NoRecovery),
+            ready_timed_out_text(5_000, ReadySeen::Phase("Fencing")),
+            not_this_store_text("the copies hold data, but the store has no partitions/1"),
+            copies_disagree_text("aa, bb"),
+            counter_exhausted_text("opens/x", 8),
+            counter_unreadable_text("opens/x", 7),
+        ];
+        for text in &texts {
+            let step = text.rsplit_once("; next: ").map(|(_, step)| step);
+            assert!(
+                step.is_some_and(|step| step.split_whitespace().count() >= 3),
+                "no next step: {text}"
+            );
+            assert!(!text.contains("unknown"), "{text}");
+        }
+        assert!(texts[0].contains("may be busy"), "{}", texts[0]);
+        assert!(texts[2].contains("phase is Fencing"), "{}", texts[2]);
+    }
+
+    /// A-R230 (tester-s2): a refused read said `UNKNOWN_OUTCOME` and to query a status, but a read
+    /// has no request. With any rule but `QueryStatus` the step is a read's. Green once W5's
+    /// `refused_read` gives the read its own rule; this row pins the text for that rule.
+    #[test]
+    fn an_unknown_outcome_without_a_request_says_to_read_again() {
+        for retry in every_retry() {
+            let error = ApiError {
+                retry,
+                ..ApiError::new(ErrorKind::UnknownOutcome, "the read was refused")
+            };
+            let read = error.explain().contains("a read changes nothing, so read again");
+            let status = error.explain().contains("ask `Db::status`");
+            match retry {
+                RetryRule::QueryStatus => assert!(status && !read, "{error}"),
+                RetryRule::NotWired => assert!(!status && !read, "{error}"),
+                _ => assert!(read && !status, "{error}"),
+            }
+        }
+    }
+
     /// A host fault (`NotWired`) says no retry helps, whatever its kind.
     #[test]
     fn a_host_fault_says_retrying_will_not_help() {
@@ -379,5 +503,11 @@ mod tests {
                 assert_eq!(error.explain(), detail, "{kind:?}");
             }
         }
+        // A read's `UnknownOutcome` says "read again", which a reopen step contradicts.
+        let read = ApiError {
+            retry: RetryRule::BoundedJitter,
+            ..ApiError::new(ErrorKind::UnknownOutcome, detail.clone())
+        };
+        assert_eq!(read.next_step(), None, "{read}");
     }
 }
