@@ -2179,3 +2179,76 @@ fn m10_s2_a_repeated_or_unknown_local_node_and_an_app_open_without_links_are_ref
     }
     assert!(!dir.path().join("nodes").exists(), "nothing was created");
 }
+
+/// arch-s2 B1 case 1, A-R231(a), A-R232: after formation, three node processes, here three
+/// `Db`s on one `Links`, each open only their own copy. Node 1's process is the owner and
+/// heals; its heal pins nodes 2 and 3 at the boots their opens registered, so the trio is
+/// ready, the write made before reads back, and new writes land, also from an app-only `Db`.
+/// Integration (~2 s): one fresh open until ready, three node opens until ready.
+#[config_log::retcd_test]
+fn m10_s2_three_node_processes_on_one_folder_heal_and_serve() {
+    const METHOD: &str = "m10_s2_three_node_processes_on_one_folder_heal_and_serve";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let links = Links::new();
+    let mut nodes: Vec<Db> = [1, 2, 3]
+        .into_iter()
+        .map(|node| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    links: Some(Arc::clone(&links)),
+                    ..node_config(dir.path(), &[node])
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .unwrap_or_else(|e| panic!("node {node}'s process opens: {e}"))
+        })
+        .collect();
+    nodes[0]
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("node 1's process heals and is ready");
+    reads_back_and_writes(&nodes[0], "node 1's process");
+
+    // The boots node 1's heal pinned: each process registered its node at its own open's boot.
+    for (at, db) in nodes.iter().enumerate() {
+        let node = NodeId(u32::try_from(at + 1).expect("three"));
+        assert_eq!(
+            links.boot_of(node),
+            Some(db.opened.base_boot),
+            "node {}",
+            node.0
+        );
+    }
+    let mut app = open_app(&rt, &store, &links, ClientId(2));
+    app.put(b"c", b"3", None).expect("the app's put");
+    assert_eq!(
+        app.get(b"c").expect("get c").value.map(|(_, v)| v),
+        Some(Bytes::from_static(b"3"))
+    );
+    app.shutdown();
+    for db in &mut nodes {
+        db.shutdown();
+    }
+
+    let heal = lock(&nodes[0].opened.heal).clone();
+    assert!(
+        matches!(heal, HealState::Handed(_)),
+        "node 1's heal handed over: {heal:?}"
+    );
+    let started = messages(METHOD)
+        .iter()
+        .filter(|m| *m == "db_heal_started")
+        .count();
+    assert_eq!(started, 1, "one heal, by node 1's process");
+    let logged = messages(METHOD);
+    assert_eq!(
+        logged.iter().filter(|m| *m == "db_open_not_owner").count(),
+        2,
+        "nodes 2 and 3 do not heal: {logged:?}"
+    );
+}
