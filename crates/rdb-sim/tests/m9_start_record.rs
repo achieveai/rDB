@@ -53,7 +53,7 @@ use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::RecoveryEffect;
 use rdb_core::contracts::storage::StorageFault;
 use rdb_core::contracts::time::Tick;
-use rdb_core::contracts::trace::{AckRejectReason, ApplyOutcome};
+use rdb_core::contracts::trace::ApplyOutcome;
 use rdb_core::contracts::trace::{
     BudgetName, KernelNote, ProtectionPhase, ReadServiceOutcome, SyncWithheldReason, Trace,
     TraceKind,
@@ -834,11 +834,16 @@ fn written(replies: &[ReplyEffect]) -> Vec<(RequestId, Seq)> {
 }
 
 /// F1, step 2 (P > C): B and C hold 20 records and commit `DegradedRf2` at cutoff 20 while A is
-/// cut. A holds 19: it lands outside the barrier below the cutoff, so it links nothing (A-R185
-/// C2), returns at t4000 and catches the new generation up one record per 100 ms round trip. A
-/// copy that held all 20 would link at the cutoff when it lands and copy nothing
-/// (`m10_land_link`), so it would never exercise the catch-up this row is about.
+/// cut. A holds [`F1_A_HOLDS`]: it lands outside the barrier below the cutoff, links the new
+/// generation at its own head (arm 3, A-R224 item 3), returns at t4000 and catches the rest up
+/// one record per 100 ms round trip. A copy that held all 20 would link at the cutoff when it
+/// lands and copy nothing (`m10_land_link`), so it would never exercise the catch-up this row is
+/// about.
 const F1_HEAD: u64 = 20;
+/// What A holds of the prior generation. Re-cut 2026-10-23 from 19 (A-R185b): under arm 3 a copy
+/// at 19 links at 19 and catches up one record, done before the first write. At 1 the walk is
+/// 19 records, about 1.9 s, so the writes at t5300 and t5500 still arrive mid-catch-up.
+const F1_A_HOLDS: u64 = 1;
 const F1_BACK: u64 = 4_000;
 const F1_WRITES: [u64; 5] = [F1_BACK + 1_300, F1_BACK + 1_500, 9_000, 11_000, 14_000];
 
@@ -848,7 +853,7 @@ fn f1_slow_catch_up() -> RunPlan {
     let from_b: Vec<_> = plan
         .preloads
         .iter()
-        .filter(|(node, batch)| *node == B_NODE && batch.seq.0 < F1_HEAD)
+        .filter(|(node, batch)| *node == B_NODE && batch.seq.0 <= F1_A_HOLDS)
         .map(|(_, batch)| batch.clone())
         .collect();
     let (_, _, generation, _) = *plan
@@ -859,7 +864,7 @@ fn f1_slow_catch_up() -> RunPlan {
     plan.preloads
         .extend(from_b.into_iter().map(|batch| (A_NODE, batch)));
     plan.preload_durable
-        .push((A_NODE, PARTITION, generation, DurableSeq(F1_HEAD - 1)));
+        .push((A_NODE, PARTITION, generation, DurableSeq(F1_A_HOLDS)));
     for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
         plan.network_ops.push(NetworkOp::SetLink {
             a,
@@ -897,15 +902,20 @@ fn f1_slow_catch_up() -> RunPlan {
     plan
 }
 
-/// The cutoff ≥ 1 guard: here F1 cannot reach its step 2. A rebuild target's ACKs below the
-/// cutoff are `InFlightUnverified` and emit no `PeerProgress`, so L1 cannot resume while it
-/// catches up, and the catch-up's last ACK both pins the rebuild at the cutoff and first makes
-/// the copy heard. At cutoff 0 the start record bypasses `admit` and P = 1 > C = 0; that is
+/// The cutoff ≥ 1 guard: here F1 cannot reach its step 2. While A catches up, L1 on the primary
+/// holds admission shut with `BarrierNotDurable`: the barrier is not durable on a quorum until
+/// A reaches the cutoff, so no write publishes first, and the catch-up's last ACK pins the
+/// rebuild at the cutoff.
+///
+/// Re-cut 2026-10-23 (K3, `restore_primary_history`): A's ACKs below the cutoff were
+/// `InFlightUnverified`, because the primary held no rung there. It now holds its engine's
+/// ladder, so they are verified and `Recorded`. The hold is the barrier, not an unheard copy;
+/// the writes still wait. At cutoff 0 the start record bypasses `admit` and P = 1 > C = 0; that is
 /// `m9_f1_01`.
 ///
-/// A-R185b: A holds 19 records, one below the cutoff, on purpose. A copy holding 20 links at
-/// landing and never catches up (`m10_land_link`), so this row would no longer test the pin.
-/// Do not restore 20.
+/// A-R185b: A holds fewer records than the cutoff on purpose. A copy holding 20 links at
+/// landing and never catches up (`m10_land_link`), and under arm 3 one holding 19 catches up a
+/// single record, so either would no longer test the pin. Do not restore 20 or 19.
 #[retcd_test]
 fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_for_it() {
     let (replies, trace, violations) = run_judged(&f1_slow_catch_up());
@@ -922,17 +932,30 @@ fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_f
         caught_up > F1_WRITES[1],
         "the catch-up is still running when the first two writes arrive (t{caught_up})"
     );
-    let unverified = noted(&trace, B_NODE, |_, note| {
-        matches!(
-            note,
-            KernelNote::Ignored {
-                reason: KernelIgnoredReason::AckRejected(AckRejectReason::InFlightUnverified)
-            }
-        )
-    });
+    let held_back: Vec<u64> = noted(&trace, B_NODE, |module, note| {
+        *module == ModuleName::Protection
+            && matches!(
+                note,
+                KernelNote::Ignored {
+                    reason: KernelIgnoredReason::Replica(ReplicaIgnoreReason::BarrierNotDurable)
+                }
+            )
+    })
+    .into_iter()
+    .filter(|at| (F1_BACK..=caught_up).contains(at))
+    .collect();
     assert!(
-        unverified.len() >= 10 && unverified.iter().all(|at| *at <= caught_up),
-        "A's catch-up ACKs below the cutoff are unverified: {unverified:?}"
+        held_back.len() >= 10,
+        "L1 holds admission on the barrier while A catches up: {held_back:?}"
+    );
+    let admitted = noted(
+        &trace,
+        B_NODE,
+        |_, note| matches!(note, KernelNote::SetAdmission { state } if state.allow),
+    );
+    assert!(
+        admitted.iter().all(|at| *at < F1_BACK || *at >= caught_up),
+        "L1 admits nothing while A catches up (t{F1_BACK}..t{caught_up}): {admitted:?}"
     );
     let points: Vec<Seq> = trace
         .events

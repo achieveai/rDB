@@ -4963,11 +4963,14 @@ impl Host {
             post_commit,
             "sync_proven"
         );
+        // The boot of this process, the one that synced (A-R239a). Links here are in-process,
+        // so it is not the copy's claim; F1 counts it only if the plan names it.
         Some(RecoveryEvent::DurableAt(DurableProof {
             copy,
             partition,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: self.boot,
         }))
     }
 

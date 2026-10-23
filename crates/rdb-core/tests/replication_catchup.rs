@@ -661,7 +661,7 @@ fn cursor_fn_body(name: &str) -> &'static str {
 
 /// M7B-59: D §3.6 outcome table and D §7 "no `_ =>`" (K-B-18). Every `AppendOutcome` the cursor
 /// can be given reaches its own handler, and so does every `AppendReject` nested in `Rejected`
-/// (CB-4: one enum, so the claim spans two matches, `on_outcome_within` and `on_reject`).
+/// (CB-4: one enum, so the claim spans two matches, `on_outcome` and `on_reject`).
 ///
 /// Per variant: `Accepted` sends the next record; `AlreadyHave` clears `outstanding` and the
 /// probe count and sends nothing, because the receiver follows it with its ACK and that ACK
@@ -674,10 +674,9 @@ fn cursor_fn_body(name: &str) -> &'static str {
 ///
 /// Q-50: the plan's path `replication.rs` is now `replication/catchup.rs`, and a whole-file grep
 /// would hit `Repeat::judge`'s `match digest`, which is not an outcome match. So the grep is
-/// scoped to the two handler bodies. The outer match is in `on_outcome_within`, which takes the
-/// prior base step 1a reads (lead rulings B-R71, B-R71a). `on_outcome` must stay a bare
-/// delegation to it, so a match that moves out of `on_outcome_within` fails this row rather than
-/// escaping the grep.
+/// scoped to the two handler bodies. The outer match is in `on_outcome` (A-R224 folded
+/// `on_outcome_within` back into it when step 1a went), so a match that moves out of it fails
+/// this row rather than escaping the grep.
 #[retcd_test]
 fn m7b_59_every_append_outcome_variant_reaches_a_named_handler() {
     use AppendReject as R;
@@ -769,16 +768,12 @@ fn m7b_59_every_append_outcome_variant_reaches_a_named_handler() {
     outer.insert(outcome_name(AppendOutcome::Rejected(R::TooLarge)));
     assert_eq!(outer.len(), 5, "every AppendOutcome variant, once");
 
-    // Q-50, over both matches: no wildcard arm, and every variant named in its own arm. The outer
-    // match is `on_outcome_within`'s; `on_outcome` only delegates to it, with no match of its own.
-    let wrapper = cursor_fn_body("on_outcome");
-    assert!(wrapper.contains("self.on_outcome_within("), "{wrapper}");
-    assert!(!wrapper.contains("match "), "{wrapper}");
-    let on_outcome = cursor_fn_body("on_outcome_within");
+    // Q-50, over both matches: no wildcard arm, and every variant named in its own arm.
+    let on_outcome = cursor_fn_body("on_outcome");
     let on_reject = cursor_fn_body("on_reject");
     assert!(on_outcome.contains("match outcome {"), "{on_outcome}");
     assert!(on_reject.contains("match reject {"), "{on_reject}");
-    for (name, body) in [("on_outcome_within", on_outcome), ("on_reject", on_reject)] {
+    for (name, body) in [("on_outcome", on_outcome), ("on_reject", on_reject)] {
         assert!(!body.contains("_ =>"), "{name} has a wildcard arm");
     }
     for variant in outer {

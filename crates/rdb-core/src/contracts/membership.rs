@@ -48,6 +48,11 @@ pub struct Member {
     /// UUID (spec §7.1), and the membership the control provider activates
     /// ([`crate::contracts::trace::TraceKind::TopologyChange`]) names it. A frame from a
     /// different boot of the same node is not from this member.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225 R2-A2):** a peer's boot comes from the
+    /// authenticated net handshake, bound to the node label in the peer's certificate; in one
+    /// process, from the local boots. Not from `grants/{n}`: most secondaries hold no grant,
+    /// and a record can name a dead process. Spec §7.1 carries the same amendment.
     pub boot: BootId,
     /// What the slot is allowed to do for the protection predicate.
     pub role: ReplicaRole,
