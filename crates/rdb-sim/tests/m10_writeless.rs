@@ -33,7 +33,7 @@ use rdb_core::contracts::event::{
     ClientEvent, Effect, EffectKind, EventKind, KernelEffect, ModuleName, ReplyEffect,
 };
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, ConfigVersion, CorrelationId, DurableSeq, Generation, OwnerEpoch,
+    AffinityId, ClientId, ConfigVersion, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch,
     RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::recovery::{DurableProof, RecoveryBarrier, RecoveryResult};
@@ -206,7 +206,9 @@ fn newest_root(runner: &Runner) -> RecoveryResult {
 /// carries the root out, so the dispatcher inherits it on B and fans it out to A and C through
 /// their control watches. A root carried out by hand is not an offer, so its `RecoveredFact`
 /// note is not in the trace (`Runner::carry_out`); it is returned instead, for the next reopen.
-fn reopen(runner: &mut Runner, root: &RecoveryResult) -> RecoveryResult {
+///
+/// A copy `behind` is left out of the barrier, and its links are left as they are.
+fn reopen(runner: &mut Runner, root: &RecoveryResult, behind: Option<NodeId>) -> RecoveryResult {
     let kernel = runner
         .dispatcher()
         .transaction()
@@ -243,7 +245,11 @@ fn reopen(runner: &mut Runner, root: &RecoveryResult) -> RecoveryResult {
         owner_epoch: next.owner_epoch,
     };
     let members = &root.committed.pinned_config.members;
-    let copies: BTreeSet<_> = members.iter().map(|member| member.copy).collect();
+    let copies: BTreeSet<_> = members
+        .iter()
+        .filter(|member| Some(member.node) != behind)
+        .map(|member| member.copy)
+        .collect();
     let proofs: Vec<DurableProof> = copies
         .iter()
         .map(|copy| DurableProof {
@@ -266,8 +272,7 @@ fn reopen(runner: &mut Runner, root: &RecoveryResult) -> RecoveryResult {
     later.selected.cutoff_seq = cutoff;
     later.selected.cutoff_digest = digest;
     later.selected.source = source;
-    later.barrier =
-        RecoveryBarrier::try_new(&proofs, &copies, cutoff, digest).expect("a barrier of all three");
+    later.barrier = RecoveryBarrier::try_new(&proofs, &copies, cutoff, digest).expect("a barrier");
     later.loss.cutoff_seq = cutoff;
     later.loss.highest_advertised_seq = cutoff;
     later.loss.uncertain = false;
@@ -290,11 +295,14 @@ fn reopen(runner: &mut Runner, root: &RecoveryResult) -> RecoveryResult {
     // held by the cut and land when it heals; B's first frames are lost, and its next ones reach
     // members that have landed.
     let cut = |state| {
-        [A_NODE, C_NODE].map(|member| NetworkOp::SetLink {
-            a: B_NODE,
-            b: member,
-            state,
-        })
+        [A_NODE, C_NODE]
+            .into_iter()
+            .filter(|member| Some(*member) != behind)
+            .map(move |member| NetworkOp::SetLink {
+                a: B_NODE,
+                b: member,
+                state,
+            })
     };
     for op in cut(LinkState::Partitioned) {
         runner.dispatcher_mut().inject_network(op).expect("cut");
@@ -342,12 +350,38 @@ fn admissions_since(runner: &Runner, from: u64) -> Vec<(u64, bool)> {
         .collect()
 }
 
-/// Write, then `writeless` reopens that write nothing, then one more write. Returns the last
-/// write's answer and the generation it was sent in.
-fn chain(writeless: u64) -> (Answer, Generation) {
+/// `node`'s links to the other two, set to `state`.
+fn isolate(runner: &mut Runner, node: NodeId, state: LinkState) {
+    for other in [A_NODE, B_NODE, C_NODE] {
+        if other != node {
+            runner
+                .dispatcher_mut()
+                .inject_network(NetworkOp::SetLink {
+                    a: node,
+                    b: other,
+                    state,
+                })
+                .expect("the link is set");
+        }
+    }
+}
+
+/// The first write, then `writeless + 1` reopens that write nothing. Returns the runner, B's
+/// newest root and the tick reached.
+///
+/// With `behind`, that copy is cut off before the first write, so it misses it, and stays cut
+/// through every reopen, each of which leaves it out of its barrier: a copy behind at the quit,
+/// unheard while the writeless generations open. A copy unheard pauses writes (B-R38), so only a
+/// full set is held to admitting after each reopen.
+fn opened(writeless: u64, behind: Option<NodeId>) -> (Runner, RecoveryResult, u64) {
     support::preamble();
     let plan = plan();
     let mut runner = Runner::new(&plan).expect("the harness takes the plan");
+    if let Some(node) = behind {
+        let quiet = run_to(&mut runner, FIRST_AT - 100);
+        assert!(quiet.is_empty(), "nothing is written before the cut");
+        isolate(&mut runner, node, LinkState::Partitioned);
+    }
     runner.queue(&submit(FIRST_AT, 1)).expect("queue");
     let first = run_to(&mut runner, FIRST_AT + 1_000);
     assert_eq!(
@@ -363,7 +397,7 @@ fn chain(writeless: u64) -> (Answer, Generation) {
         "generation 2 is B's newest root"
     );
     for reopened in 1..=writeless + 1 {
-        root = reopen(&mut runner, &root);
+        root = reopen(&mut runner, &root, behind);
         let generation = root.new_generation;
         let opened = at;
         at += SETTLE_MILLIS;
@@ -379,13 +413,22 @@ fn chain(writeless: u64) -> (Answer, Generation) {
             ?admitted,
             "reopen.admissions"
         );
-        assert_eq!(
-            admitted.last().map(|(_, allow)| *allow),
-            Some(true),
-            "generation {}: L1 on B admits again after the reopen: {admitted:?}",
-            generation.0
-        );
+        if behind.is_none() {
+            assert_eq!(
+                admitted.last().map(|(_, allow)| *allow),
+                Some(true),
+                "generation {}: L1 on B admits again after the reopen: {admitted:?}",
+                generation.0
+            );
+        }
     }
+    (runner, root, at)
+}
+
+/// Write, then `writeless` reopens that write nothing, then one more write. Returns the last
+/// write's answer and the generation it was sent in.
+fn chain(writeless: u64) -> (Answer, Generation) {
+    let (mut runner, root, at) = opened(writeless, None);
     runner.queue(&submit(at, 2)).expect("queue");
     let last = run_to(&mut runner, at + 1_000);
     let trace = runner.finish().expect("the trace closes");
@@ -404,6 +447,14 @@ fn chain(writeless: u64) -> (Answer, Generation) {
     (answer, root.new_generation)
 }
 
+/// This test's log lines whose message is `message`.
+fn logged(method: &str, message: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test("m10_writeless", method)
+        .into_iter()
+        .filter(|line| line.get("@m").and_then(serde_json::Value::as_str) == Some(message))
+        .collect()
+}
+
 /// A-R169 row 2 (D3): write in generation 2, a reopen into 3, a writeless reopen into 4, write.
 /// L1 admits after each reopen, and the write publishes in generation 4 right after the first.
 #[retcd_test]
@@ -420,4 +471,77 @@ fn m10_d3_a_write_after_three_writeless_reopens_publishes() {
     let (answer, generation) = chain(3);
     assert_eq!(generation, Generation(6));
     assert_eq!(answer, Ok((Generation(6), Seq(CUTOFF.0 + 2))));
+}
+
+/// A-R169 probe (3), kept as the slice-1 guard (A-R212, like A-R179's row 9). C is cut off before
+/// the first write, so it misses it, and stays unheard through two reopens that write nothing,
+/// each leaving it out of the barrier. When it is back it lands both generations below their
+/// base (`land_link_refused`, `held_below_base`), and B's R1 asks for a snapshot
+/// (`SnapshotCatchupRequired`), which nothing consumes yet. Catching up across generations is
+/// owed to slice 2. The slice-1 bar: nothing faults, the stall is named, writes stay paused, and
+/// the acked write is still held by A and B. When slice 2 lands the catch-up, this row goes red
+/// and becomes the catch-up row.
+#[retcd_test]
+fn m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_loses_nothing() {
+    let method =
+        "m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_loses_nothing";
+    let (mut runner, root, at) = opened(1, Some(C_NODE));
+    assert_eq!(root.new_generation, Generation(4));
+    isolate(&mut runner, C_NODE, LinkState::Up);
+    let quiet = run_to(&mut runner, at + SETTLE_MILLIS);
+    assert!(quiet.is_empty(), "nothing is answered: {quiet:?}");
+
+    let below: Vec<(u64, u64)> = logged(method, "land_link_refused")
+        .iter()
+        .filter(|line| line["reason"] == "held_below_base")
+        .map(|line| {
+            // A copy that cannot link warns; only `anchor_generation_absent` is info (ADV3).
+            assert_eq!(line["@l"], "Warning", "held_below_base warns: {line}");
+            (
+                line["node"].as_u64().unwrap_or(0),
+                line["generation"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert_eq!(
+        below,
+        vec![(u64::from(C_NODE.0), 3), (u64::from(C_NODE.0), 4)],
+        "C lands both writeless generations below their base, named"
+    );
+    let unconsumed: Vec<String> = logged(method, "kernel effect refused: no consumer")
+        .iter()
+        .filter_map(|line| line["kernel"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        unconsumed.len() == 1 && unconsumed[0].starts_with("SnapshotCatchupRequired"),
+        "the stall is B's ask for a snapshot, and nothing else: {unconsumed:?}"
+    );
+    let faults: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test("m10_writeless", method)
+            .into_iter()
+            .filter(|line| {
+                line["@l"] == "Error"
+                    || line["kernel"]
+                        .as_str()
+                        .is_some_and(|kernel| kernel.contains("Quarantined"))
+            })
+            .collect();
+    assert!(faults.is_empty(), "nothing faults: {faults:?}");
+
+    let admitted = admissions_since(&runner, FIRST_AT + 1_000);
+    assert!(
+        admitted.iter().all(|(_, allow)| !allow),
+        "writes stay paused from the first reopen on: {admitted:?}"
+    );
+    let durable = [A_NODE, B_NODE, C_NODE].map(|node| {
+        runner
+            .dispatcher()
+            .engine(node)
+            .map_or(0, |engine| engine.durable(PARTITION, Generation(2)).0)
+    });
+    assert_eq!(
+        durable,
+        [CUTOFF.0 + 1, CUTOFF.0 + 1, CUTOFF.0],
+        "A and B still hold the acked write; C holds what it had"
+    );
 }

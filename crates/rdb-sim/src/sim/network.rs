@@ -328,9 +328,12 @@ impl Network {
     /// 3. With no plan, the frame arrives once, at once, under `label`. A delay or a drop is
     ///    something a scenario asks for, never a default.
     ///
+    /// A frame from a node to itself crosses no link: it arrives once, at once, and no partition
+    /// or plan applies, as the host's `Links::send` puts it in the node's own mailbox (A-R216).
+    ///
     /// # Errors
     ///
-    /// [`SimError::Config`] naming `link` for a frame from a node to itself.
+    /// None today; kept for the callers' `?`.
     ///
     /// [`Network::frames`] keeps the frame as it was handed in, before a forged role, an
     /// overstated durable position or a corruption, as it does for every fate.
@@ -341,12 +344,15 @@ impl Network {
         label: PeerLabel,
         frame: Frame,
     ) -> Result<Fate, SimError> {
-        if from == to {
-            return Err(SimError::Config { field: "link" });
-        }
         let id = frame.id;
         let mut corrupted = false;
-        let fate = if self.link(from, to) == LinkState::Partitioned {
+        let fate = if from == to {
+            Fate::Delivered(vec![Arrival {
+                delay_millis: 0,
+                label,
+                frame: frame.clone(),
+            }])
+        } else if self.link(from, to) == LinkState::Partitioned {
             Fate::Partitioned
         } else {
             let acknowledged = acknowledgement(&frame);

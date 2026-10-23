@@ -437,7 +437,8 @@ fn run_demo() -> Result<String, String> {
             .iter()
             .map(|member| Candidate {
                 copy: member.copy,
-                primary_eligible: true,
+                // Only the pinned primary may lead (A-R215), as the embedded host plans it.
+                primary_eligible: member.role == ReplicaRole::Primary,
                 healthy: true,
                 within_capacity: true,
                 has_valid_grant: true,

@@ -815,8 +815,9 @@ fn txn_request(submit: &ClientOp, digest_id: u64) -> TxnRequest {
 }
 
 /// Placement's recovery plan for `partition`, anchored at `anchor`: every member a candidate,
-/// every non-shadow copy required for the rebuild, and the authority view placement hands the
-/// new owner on the anchor's lineage.
+/// only the pinned primary eligible to lead (A-R215: the leader F1 names is the owner, and must
+/// be the copy the pinned configuration serves as primary), every non-shadow copy required for
+/// the rebuild, and the authority view placement hands the new owner on the anchor's lineage.
 fn recovery_plan(
     topology: &Topology,
     partition: PartitionId,
@@ -830,7 +831,7 @@ fn recovery_plan(
             .iter()
             .map(|member| Candidate {
                 copy: member.copy,
-                primary_eligible: true,
+                primary_eligible: member.role == ReplicaRole::Primary,
                 healthy: true,
                 within_capacity: true,
                 has_valid_grant: true,
