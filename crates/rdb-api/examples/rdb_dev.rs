@@ -82,10 +82,11 @@
 //! `request R not read` (a read): R is the id it used up. A write also prints `request=-`; a
 //! read prints no `request=` field, so its R is in the detail only.
 //!
-//! A data command (`put`, `put&`, `put --as`, `put-loop`, `txn`, `txn&`, `retry`, `get`,
-//! `read`, `status`, a value verb, a `blob` verb, `admin clear` or `admin repair-element`)
-//! answered with an error prints its `err` line, the run goes on to the next line, and the run
-//! exits 1. A lost reply from `client drop-reply` counts as an error: the app holds one.
+//! Any command answered with an error prints its `err` line, the run goes on to the next line,
+//! and the run exits 1. That is every data command (`put`, `put&`, `txn`, `get`, `status`, a
+//! value or `blob` verb, ...), every `control` verb (a refusal under `--control` too), every
+//! `admin` verb, `node restart` and `wait ready`. A lost reply from `client drop-reply`
+//! counts as an error: the app holds one.
 //!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
 //! word starts a comment; one inside a word, as in `{"tag":"#1"}`, or inside a `"..."`
@@ -1038,6 +1039,18 @@ fn say(line: &str) {
     let _ = out.flush();
 }
 
+/// Says a command's answer and whether it was not an error: every error answer starts `err `
+/// (A-R268: any command answered with an error makes the run exit 1).
+fn answer(line: &str) -> bool {
+    say(line);
+    !line.starts_with("err ")
+}
+
+/// [`answer`] for an answer of several lines: says them all, and is false if any is an error.
+fn answer_all(lines: &[String]) -> bool {
+    lines.iter().fold(true, |ok, line| answer(line) && ok)
+}
+
 /// What the poller has seen.
 #[derive(Debug, Default)]
 struct Progress {
@@ -1805,20 +1818,22 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["node", "restart", node] => parse_node(node).map(|node| {
-                say(&match db.restart_node(node) {
+                bad |= !answer(&match db.restart_node(node) {
                     Ok(boot) => format!("node {} boot {}", node.0, boot.0),
                     Err(e) => format!("err node restart {}: {e}", node.0),
                 });
             }),
             ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
             ["admin", "clear-grant", node] => parse_node(node).map(|node| {
-                say(&match rt.block_on(admin::clear_grant(db, store, node)) {
+                bad |= !answer(&match rt.block_on(admin::clear_grant(db, store, node)) {
                     Ok(clearance) => clearance_line(clearance, node, db),
                     Err(e) => admin_error_line(node, &e),
                 });
             }),
-            ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
-            ["admin", "damage", _, ..] => damage_record(db, &line),
+            ["admin", "damage-chunk", object, rest @ ..] => {
+                damage_chunk(db, object, rest).map(|ok| bad |= !ok)
+            }
+            ["admin", "damage", _, ..] => damage_record(db, &line).map(|ok| bad |= !ok),
             ["admin", "clear", object] => {
                 let answer = db.write(object.as_bytes(), Change::Clear, None);
                 bad |= !kind_write_line(
@@ -1841,9 +1856,7 @@ fn repl<'scope, 'env>(
                 })
             }
             ["admin", "status"] => {
-                admin_status_lines(rt, db, store)
-                    .iter()
-                    .for_each(|l| say(l));
+                bad |= !answer_all(&admin_status_lines(rt, db, store));
                 Ok(())
             }
             ["admin", ..] => Err(format!(
@@ -1853,11 +1866,9 @@ fn repl<'scope, 'env>(
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
             )),
             ["control", ..] => match control {
-                Some(control) => control_verb(&words, &line, rt, control),
+                Some(control) => control_verb(&words, &line, rt, control).map(|ok| bad |= !ok),
                 None => {
-                    external_control_lines(&words, &line, rt, store)
-                        .iter()
-                        .for_each(|l| say(l));
+                    bad |= !answer_all(&external_control_lines(&words, &line, rt, store));
                     Ok(())
                 }
             },
@@ -2064,51 +2075,42 @@ fn control_verb(
     line: &str,
     rt: &tokio::runtime::Runtime,
     control: &Control<'_>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     match words {
         ["control", "lifecycle", partition, word] => {
             parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
-                say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
+                answer(&set_lifecycle(rt, control.cluster, partition, lifecycle))
             })
         }
         ["control", "lifecycle", ..] => Err(format!(
             "control lifecycle <p> <{}>",
             LIFECYCLE_WORDS.join("|")
         )),
-        ["control", "freeze-grant", node] => parse_node(node).map(|node| {
-            say(&freeze_grant(rt, control.cluster, node));
-        }),
+        ["control", "freeze-grant", node] => {
+            parse_node(node).map(|node| answer(&freeze_grant(rt, control.cluster, node)))
+        }
         ["control", "freeze-grant", ..] => Err("control freeze-grant <n>".to_owned()),
-        ["control"] => {
-            control_lines(rt, control.cluster);
-            Ok(())
-        }
-        ["control", "voters"] => {
-            say(&voters_line(control));
-            Ok(())
-        }
-        ["control", "gap"] => {
-            say(&gap(rt, control));
-            Ok(())
-        }
-        ["control", "drop-watches"] => {
-            say(&format!("dropped {} watches", control.store.drop_watches()));
-            Ok(())
-        }
+        ["control"] => Ok(control_lines(rt, control.cluster)),
+        ["control", "voters"] => Ok(answer(&voters_line(control))),
+        ["control", "gap"] => Ok(answer(&gap(rt, control))),
+        ["control", "drop-watches"] => Ok(answer(&format!(
+            "dropped {} watches",
+            control.store.drop_watches()
+        ))),
         ["control", verb @ ("gap" | "drop-watches"), ..] => {
             Err(format!("control {verb}: takes no arguments"))
         }
         ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
             control.store.fail_lists(fault);
-            say(&format!("fail list {word}"));
+            answer(&format!("fail list {word}"))
         }),
         ["control", "fail", "put", prefix, word, rest @ ..] => {
             parse_put_fault(word, rest).map(|(fault, count)| {
                 control.store.fail_puts(prefix, fault, count);
-                say(&match fault {
+                answer(&match fault {
                     Some(_) => format!("fail put {prefix} {word} {count}"),
                     None => format!("fail put {prefix} off"),
-                });
+                })
             })
         }
         ["control", "fail", ..] => Err(format!(
@@ -2118,11 +2120,11 @@ fn control_verb(
         )),
         ["control", verb @ ("stop" | "start"), voter] => {
             parse_voter(control.cluster, voter).map(|voter| {
-                say(&if *verb == "stop" {
+                answer(&if *verb == "stop" {
                     stop_voter(rt, control, voter)
                 } else {
                     start_voter(rt, control.cluster, voter)
-                });
+                })
             })
         }
         ["control", "stop" | "start", ..] => Err(format!(
@@ -2921,7 +2923,7 @@ fn is_damage_request(request: RequestId) -> bool {
 /// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
 /// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
 /// tool only, to reach that answer by hand; the product never writes a chunk this way.
-fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
+fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<bool, String> {
     use rdb_core::contracts::errors::ErrorKind;
     use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
     use rdb_core::contracts::txn::{Condition, Mutation};
@@ -2957,7 +2959,7 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
     };
     // PB-5: no request id is printed. This write is under damage-chunk's own client, so
     // `status` and `retry` would look up another write under the same number.
-    say(&match db.resend(request) {
+    Ok(answer(&match db.resend(request) {
         Ok(ok) => format!(
             "damage-chunk ok p=1 gen={} seq={} {:?} request=- (damage-chunk's own client; \
              status does not know it)",
@@ -2972,8 +2974,7 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
             error.retry,
             error.explain()
         ),
-    });
-    Ok(())
+    }))
 }
 
 const DAMAGE_USAGE: &str = "admin damage-chunk <object> --upload U --index I";
@@ -2988,7 +2989,7 @@ const DAMAGE_USAGE: &str = "admin damage-chunk <object> --upload U --index I";
 ///   written, valid but unreadable here.
 ///
 /// Only a stored record is overwritten: a missing one is refused, never written.
-fn damage_record(db: &Db, line: &str) -> Result<(), String> {
+fn damage_record(db: &Db, line: &str) -> Result<bool, String> {
     use rdb_core::contracts::errors::ErrorKind;
     use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
     use rdb_core::contracts::txn::{Condition, Mutation};
@@ -3065,23 +3066,24 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
                     seen: rdb_api::Seen::Absent,
                     ..
                 }) => {
-                    say(&format!("err admin damage: no stored record at {what}"));
-                    return Ok(());
+                    return Ok(answer(&format!(
+                        "err admin damage: no stored record at {what}"
+                    )));
                 }
                 Ok(_) => return Err(format!("admin damage: --item: {object} is not a list")),
                 Err(error) => {
                     // The lookup's own error, without a retry rule: nothing was written.
-                    say(&format!(
+                    return Ok(answer(&format!(
                         "err admin damage: --item read {} ({})",
                         error.name(),
                         error.explain()
-                    ));
-                    return Ok(());
+                    )));
                 }
             };
             let Some(found) = page.items.first() else {
-                say(&format!("err admin damage: no stored record at {what}"));
-                return Ok(());
+                return Ok(answer(&format!(
+                    "err admin damage: no stored record at {what}"
+                )));
             };
             (rdb_value::keys::item_key(&root, found.id), what)
         }
@@ -3107,8 +3109,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
             }
             Ok((put, _)) => mutations.push(put),
             Err(said) => {
-                say(&format!("err admin damage: {said}"));
-                return Ok(());
+                return Ok(answer(&format!("err admin damage: {said}")));
             }
         }
     }
@@ -3130,7 +3131,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         pinned: Vec::new(),
     };
     // No request id is printed, as for damage-chunk (PB-5): another client's number.
-    say(&match db.resend(request) {
+    Ok(answer(&match db.resend(request) {
         Ok(ok) => format!(
             "damage ok p=1 gen={} seq={} {:?} as={how} request=- (damage's own client; status \
              does not know it)",
@@ -3145,8 +3146,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
             error.retry,
             error.explain()
         ),
-    });
-    Ok(())
+    }))
 }
 
 /// The map's or set's root record as it is stored, `{"keys": 1, "count": n}` sealed under its
@@ -4185,16 +4185,13 @@ fn node_line(node: &NodeStatus) -> String {
 
 /// `control`: the records, read from the voter that is leader now through a client of its own,
 /// never through the Db's store, so what that store is doing never hides them (critic A3).
-fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
+fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) -> bool {
     let Some(leader) = cluster.leader_now() else {
-        say("err control: no rEtcd leader now; try again");
-        return;
+        return answer("err control: no rEtcd leader now; try again");
     };
     // Only this thread stops a voter, so the leader is still running here.
     let store = cluster.client(leader);
-    for line in record_lines(rt, &*store, "control") {
-        say(&line);
-    }
+    answer_all(&record_lines(rt, &*store, "control"))
 }
 
 /// The `partitions/` and `grants/` records `store` holds, one line each, as `control` and
@@ -6818,6 +6815,53 @@ mod tests {
         }
     }
 
+    /// A-R268: one rule for the whole tool. Any command answered with an `err` line makes the
+    /// run exit 1, and the run goes on. Four runs: `admin damage` of an object never written,
+    /// `control lifecycle` of a partition that has no record, `admin status` while the store's
+    /// lists fail, and the same reads answered cleanly, which exits 0. `node restart`, the
+    /// other `control` verbs and `admin clear-grant` say their answer through the same
+    /// [`answer`]. Cut: drop `admin status`'s `bad |=` and the third run exits 0. Integration
+    /// (~8 s): three real rEtcd voters per run.
+    #[config_log::retcd_test]
+    fn any_command_answered_with_an_error_makes_the_run_exit_1() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        for (name, script, want) in [
+            (
+                "damage",
+                "wait ready 60\nadmin damage zqn1\nput zqn2 v\n",
+                ExitCode::from(1),
+            ),
+            (
+                "control",
+                "wait ready 60\ncontrol lifecycle 9 fencing\ncontrol voters\n",
+                ExitCode::from(1),
+            ),
+            (
+                "status",
+                "wait ready 60\ncontrol fail list unavailable\nadmin status\n",
+                ExitCode::from(1),
+            ),
+            (
+                "clean",
+                "wait ready 60\ncontrol\ncontrol voters\nadmin status\n",
+                ExitCode::SUCCESS,
+            ),
+        ] {
+            let path = root.path().join(format!("{name}.txt"));
+            std::fs::write(&path, script).expect("write the script");
+            let args = Args {
+                dir: root.path().join(name),
+                log_dir: root.path().join(format!("{name}-logs")),
+                script: Some(path),
+                ..parse(std::iter::empty()).expect("defaults")
+            };
+            assert_eq!(run(&args, Db::open), want, "{name}: {script}");
+        }
+    }
+
     /// Tester w3a03 (A-R191, k227): `wait ready` read rdb_dev's own latch, so after `node
     /// restart 1` it said "reached ready in 0ms" and exited 0, while node 1 will not admit a
     /// write again in this open. It now asks `Db::wait_ready`, which answers the present:
@@ -7488,6 +7532,19 @@ mod tests {
                  its records"
             )]
         );
+        // A-R268: the refusal is an error answer, so the run exits 1; the listing is not.
+        assert!(!answer_all(&external_control_lines(
+            &["control", "stop", "1"],
+            "control stop 1",
+            &rt,
+            &store
+        )));
+        assert!(answer_all(&external_control_lines(
+            &["control"],
+            "control",
+            &rt,
+            &store
+        )));
     }
 
     /// Lead, on 5eeca8a: only `TimedOut` asks for another slice. An answer no wait changes
