@@ -229,9 +229,17 @@
 //!                                         whose digest fails (`digest`, the default), whose
 //!                                         kind is 0x00 (`kind0`), or whose codec is 0x02,
 //!                                         digest correct (`newer`: a newer build's record). A
-//!                                         set member holding any bytes is damage too. A
+//!                                         set member holding any bytes is damage too. With
+//!                                         --element the root's own bytes are written again
+//!                                         in the same write, so a read meets that fault and
+//!                                         a `map put`/`del` of K repairs a `digest` entry. A
 //!                                         missing record is refused, and so is an item kept
-//!                                         inside its block (`no stored record`).
+//!                                         inside its block (`no stored record`). --item does
+//!                                         not write the list's root, so whatever `--as` says,
+//!                                         a read answers `element version V is above its
+//!                                         root's version`; the item digest path is rdb-value's
+//!                                         row d2_a_write_refuses_a_damaged_item_record_as_
+//!                                         the_read_does
 //!                                         --api-version N sends the write as API version N
 //!                                         (default 1): any other is another build's request
 //!                                         (newer or older), refused before apply
@@ -2504,6 +2512,24 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         }
         (None, None) => (root.to_bytes(), object.to_owned()),
     };
+    let mut mutations = vec![Mutation::Put {
+        key: key.clone(),
+        value: Bytes::from(bytes),
+        expected_version: None,
+    }];
+    // An element written alone lands at a version above its root's, and a read names that
+    // first (`element version V is above its root's`), never the fault `--as` asked for; a map
+    // write over it is refused too. So the root's own bytes go in the same write, at the
+    // version read: both carry the write's version (lead, on the 8e083a9 walk).
+    if element.is_some() {
+        match root_rewrite(db, object, &root, &what) {
+            Ok(put) => mutations.push(put),
+            Err(said) => {
+                say(&format!("err admin damage: {said}"));
+                return Ok(());
+            }
+        }
+    }
     let request = TxnRequest {
         // M9 S7: `--api-version N` sends the write as a newer (or older) build's request.
         api_version: api_version.unwrap_or(rdb_core::contracts::version::API_VERSION),
@@ -2516,12 +2542,8 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         expected_generation: None,
         remaining_millis: 5_000,
         // Only a stored record is damaged; a missing one is refused, never written.
-        conditions: vec![Condition::Present { key: key.clone() }],
-        mutations: vec![Mutation::Put {
-            key,
-            value: Bytes::from(bytes),
-            expected_version: None,
-        }],
+        conditions: vec![Condition::Present { key }],
+        mutations,
     };
     // No request id is printed, as for damage-chunk (PB-5): another client's number.
     say(&match db.resend(request) {
@@ -2541,6 +2563,58 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
         ),
     });
     Ok(())
+}
+
+/// The map's or set's root record as it is stored, `{"keys": 1, "count": n}` sealed under its
+/// kind (ADR-rdb-0013), written back at the version a root-only read saw. A read with no
+/// element listed checks no element, so a root over an already damaged entry still reads.
+fn root_rewrite(
+    db: &Db,
+    object: &str,
+    root: &rdb_value::keys::RootKey,
+    what: &str,
+) -> Result<rdb_core::contracts::txn::Mutation, String> {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_value::collection::KEY_PROFILE_V1;
+    use rdb_value::value::{Map, MapKey};
+    let not_collection = format!("--element: {object} is not a map or a set");
+    let look = Look::Members {
+        after: None,
+        limit: 0,
+    };
+    let found = match db.read(object.as_bytes(), look) {
+        Ok(ReadOk {
+            seen: rdb_api::Seen::Members(page),
+            ..
+        }) => page.collection,
+        Ok(ReadOk {
+            seen: rdb_api::Seen::Absent,
+            ..
+        }) => return Err(format!("no stored record at {what}")),
+        Ok(_) => return Err(not_collection),
+        Err(error) if error.kind == ErrorKind::InvalidArgument => return Err(not_collection),
+        Err(error) => {
+            return Err(format!(
+                "--element root read {} ({})",
+                error.name(),
+                error.detail
+            ))
+        }
+    };
+    let mut fields = Map::new();
+    fields.insert(
+        MapKey::new("keys"),
+        Value::Integer(Int::new(KEY_PROFILE_V1).expect("1 is an integer")),
+    );
+    fields.insert(MapKey::new("count"), Value::Integer(Int::from(found.count)));
+    let payload = rdb_value::cbor::encode(&Value::Map(fields)).expect("a two-field map encodes");
+    let sealed = rdb_value::envelope::seal(found.kind.kind(), &payload)
+        .expect("a root payload is a few bytes");
+    Ok(rdb_core::contracts::txn::Mutation::Put {
+        key: root.to_bytes(),
+        value: sealed,
+        expected_version: Some(found.version),
+    })
 }
 
 const DAMAGE_RECORD_USAGE: &str = "admin damage <object> [--element K | --item P] \
@@ -5990,6 +6064,98 @@ mod tests {
             got.value.map(|(_, bytes)| bytes.to_vec()),
             Some(b"zqv1".to_vec()),
             "run 1's write"
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// Lead, on the 8e083a9 walk: `admin damage m --element K` (`--as digest`, the default)
+    /// wrote the entry at a version above its root's, so a read answered `element version 3 is
+    /// above its root's version 2`, not the digest fault the mode names, and a `map put` over
+    /// the entry was refused. The tool now writes the root's own bytes in the same write, so
+    /// both carry its version: a read meets the digest fault, and a put over the entry repairs
+    /// it (ADR-rdb-0013 §10). Integration (~3 s): three real rEtcd voters and one open.
+    #[test]
+    fn damage_element_as_digest_reads_as_a_digest_fault_and_a_put_repairs_it() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let cluster = rt.block_on(
+            Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS)
+                .start(),
+        );
+        rt.block_on(cluster.leader());
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                cluster.client_endpoints(),
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            dir: root.path().join("run"),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+        };
+        let mut db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("opens");
+        db.wait_ready(Duration::from_secs(60)).expect("ready");
+        let int = |n: u64| Value::Integer(Int::from(n));
+        let text = |t: &str| Value::Text(t.to_owned());
+        let entries = (1..=3).map(|n| ElemOp::Put(int(n), text(&n.to_string())));
+        db.write(b"m", Change::Map(entries.collect()), None)
+            .expect("the map is written");
+
+        damage_record(&db, "admin damage m --element 2").expect("the line parses");
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        let fault = db
+            .read(b"m", members.clone())
+            .expect_err("entry 2 is damaged");
+        assert!(
+            fault.detail.contains("do not hash to the stored digest")
+                && !fault.detail.contains("above its root"),
+            "a digest fault: {fault:?}"
+        );
+
+        db.write(
+            b"m",
+            Change::Map(vec![ElemOp::Put(int(2), text("again"))]),
+            None,
+        )
+        .expect("a put over a bad digest repairs the entry");
+        let Ok(ReadOk {
+            seen: rdb_api::Seen::Members(page),
+            ..
+        }) = db.read(b"m", members)
+        else {
+            panic!("the map reads again after the repair");
+        };
+        let read: Vec<_> = page
+            .members
+            .into_iter()
+            .map(|member| (member.key, member.value))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (int(1), Some(text("1"))),
+                (int(2), Some(text("again"))),
+                (int(3), Some(text("3")))
+            ]
         );
         db.shutdown();
         rt.block_on(cluster.shutdown());
