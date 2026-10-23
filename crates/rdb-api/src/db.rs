@@ -256,13 +256,25 @@ pub struct DbConfig {
     pub hold: Vec<(NodeId, NodeId)>,
     /// Call timeouts.
     pub timeouts: Timeouts,
-    /// T1's dedup cap: retained answers allowed before a new write is `OVERLOADED`. `None` is
-    /// the spec's [`RETENTION_CAP_ENTRIES`]; a value above it is refused at open, since P1's
-    /// status index holds no more than that. A dev budget, to reach a full index by hand.
+    /// T1's dedup cap: retained answers allowed per partition before a new write is
+    /// `OVERLOADED`. `None` is the spec's [`RETENTION_CAP_ENTRIES`] (65,536); a value above it
+    /// is refused at open, since P1's status index holds no more than that.
+    ///
+    /// The cap and [`Self::dedup_retention`] together set the write rate a partition sustains:
+    /// about `cap / retention`. At the default cap that is 0.76 writes/s at 24 h, 18/s at 1 h
+    /// and 109/s at 10 min. A burst may use the whole cap at once; once it is full, a new write
+    /// is `OVERLOADED` until trimming frees entries. Each retained entry costs about 1.8 KB of
+    /// memory (measured on a debug build).
     pub dedup_cap: Option<usize>,
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
-    /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
+    /// ([`Budgets::dedup_retention_millis`]). A supported app option (ruling A-R181): a shorter
+    /// window frees the cap sooner, so a partition sustains more writes (see
+    /// [`Self::dedup_cap`] for the rates).
+    ///
+    /// The cost of a shorter window: a resend or a status query made after it can no longer be
+    /// settled (spec §5.3).
+    ///
     /// A `CONDITION_FAILED` answer is kept as long, counted from when it was given, since nothing
     /// need publish after it (ruling A-R108).
     /// A retry of a trimmed request is no longer recognised: it is submitted afresh (spec §5.3).
@@ -370,9 +382,10 @@ pub enum OpenError {
     #[error("{0} is in use by another open")]
     InUse(PathBuf),
     /// A copy is missing or holds no database while another copy holds data. Nothing was started
-    /// and nothing was removed.
+    /// and nothing was removed. This build does not rebuild a copy (slice 2's S2-4 will).
     #[error(
-        "{0} is missing or empty while another copy holds data; this directory cannot be opened"
+        "{0} is missing or empty while another copy holds data; this directory cannot be opened. \
+         Restore that copy from a backup of this directory, then open it again"
     )]
     CopyMissing(PathBuf),
     /// The copies hold data but name no rDB instance: an M9 directory, which this build does not
@@ -385,8 +398,12 @@ pub enum OpenError {
     /// instances, or the store's `partitions/1` or open counter does not name this one.
     #[error("this directory and the control store do not belong together: {0}")]
     Mismatch(String),
-    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward.
-    #[error("no copy holds generation {generation} that partitions/1 names: {detail}")]
+    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward: this
+    /// directory is an older copy of the database, which is history.
+    #[error(
+        "no copy holds generation {generation} that partitions/1 names: {detail}. This directory \
+         is an older copy of the database: open the folder that holds the current copies instead"
+    )]
     Stale {
         /// The record's generation.
         generation: u64,
@@ -570,7 +587,7 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
-        let limits = limits(config.dedup_cap)?;
+        let limits = limits(config.dedup_cap).map_err(open_refused)?;
         let budgets = Budgets {
             dedup_retention_millis: config
                 .dedup_retention
@@ -598,7 +615,8 @@ impl Db {
                 host::spawn_on(node, engine, links, control, clock, budgets, limits, boot)
             },
         )
-        .await?;
+        .await
+        .map_err(open_refused)?;
         db.respawn = Some(respawn);
         Ok(db)
     }
@@ -1949,6 +1967,27 @@ struct Found {
     fresh: bool,
 }
 
+/// Log a refused open as `db_open_refused`, with its kind and its text, and hand it back. An
+/// open reads no app object, so the text holds paths, generations and instance ids, never key
+/// or value text.
+fn open_refused(error: OpenError) -> OpenError {
+    let kind = match &error {
+        OpenError::InUse(_) => "InUse",
+        OpenError::CopyMissing(_) => "CopyMissing",
+        OpenError::Unbound(_) => "Unbound",
+        OpenError::Mismatch(_) => "Mismatch",
+        OpenError::Stale { .. } => "Stale",
+        OpenError::Counter(_) => "Counter",
+        OpenError::Control(_) => "Control",
+        OpenError::Node(_) => "Node",
+        OpenError::Bootstrap(_) => "Bootstrap",
+        OpenError::DedupCap { .. } => "DedupCap",
+        OpenError::Io(_) => "Io",
+    };
+    tracing::warn!(kind, error = %error, "db_open_refused");
+    error
+}
+
 /// The words for a new folder against a store that serves another database (tester D1): both
 /// databases, and what to do instead.
 fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
@@ -2286,6 +2325,9 @@ fn send_wait(deadline: Duration) -> Duration {
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod reopen_tests;
 
 #[cfg(test)]
 mod tests {

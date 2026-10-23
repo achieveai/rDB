@@ -332,6 +332,8 @@ Within one active generation, primary reads pass the same authority gate and ser
 
 Dedup key is `(tenant, client_id, request_id)` scoped to its affinity group and generation; store request digest and result atomically. Same identity with changed payload is `REQUEST_ID_REUSE`. Keep dedup entries at least 24 hours; beyond retention callers cannot infer nonexecution from absence. So a retry is deduplicated only inside the retention window: past it, a retry with the same identity is admitted as a new request and may apply again, at a new sequence, unless it names an expected generation that has since changed (clarified 2026-10-18, M9 S3; row M7A-89; [ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §4).
 
+**Amended 2026-10-22 (M10, lead rulings A-R181, A-R182): the retention window is an app option.** 24 hours stays the default. An app may set a shorter window with `DbConfig::dedup_retention` (`crates/rdb-api/src/db.rs`; its doc and `DbConfig::dedup_cap`'s give the write rate each window sustains and the memory per entry). The cost is the rule above, sooner: past the window, a resend or a status query with the same identity cannot be settled.
+
 A retry with stale expected generation returns `GENERATION_CHANGED` before any mutation. The caller must reconcile on recovery; it must not silently retry a lost-generation transaction as a new effect. A transaction received by a replica may recover even if its client never saw success.
 
 ### 5.4 Error categories
@@ -350,7 +352,7 @@ stateDiagram-v2
   RecoveredOrLost --> [*]: caller reconciles generation
 ```
 
-**Takeaway:** only pre-admission rejection proves no mutation, and only by the submission it answers; post-apply failure is an unknown outcome resolved by status or recovery.
+**Takeaway:** only a refusal before apply proves no mutation, and only by the submission it answers; post-apply failure is an unknown outcome resolved by status or recovery. (Reworded 2026-10-22 from "only pre-admission rejection": `OVERLOADED` and `DEADLINE_BEFORE_ADMISSION` already came from after admission and before apply.)
 
 **Client rule (amended 2026-10-18, M9 S3, #35):** once any send of a request ID went unanswered (a timeout, a lost reply or `UNKNOWN_OUTCOME`), only a status query with the same identity settles it, and only inside the dedup retention window (§5.3). A definitive rejection of a later resend does not settle it. Admission checks run before the dedup lookup, so a resend of a request that already applied can be refused, and that answer covers the resend alone ([ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §3 and §5). While a write is applied but not yet published, status answers `UNKNOWN_OUTCOME`; ask again with the same identity.
 
@@ -358,7 +360,8 @@ stateDiagram-v2
 | Error | Retry rule |
 |---|---|
 | `NOT_PRIMARY`, `ROUTE_CHANGED` | Refresh route; retain request identity and expected generation |
-| `LEASE_EXPIRED`, `RECOVERY_READ_ONLY`, `PROTECTION_PAUSED` | Retry after health/authority recovers; do not assume already-admitted request failed |
+| `LEASE_EXPIRED`, `RECOVERY_READ_ONLY` | Retry after health/authority recovers; do not assume already-admitted request failed |
+| `PROTECTION_PAUSED` | Retry after health/authority recovers; do not assume already-admitted request failed. Proves no mutation by this submission (amended 2026-10-22, below) |
 | `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | Definitive rejection before mutation; caller changes request intentionally |
 | `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | Definitive no-admission; bounded jittered retry |
 | `UNKNOWN_OUTCOME` | Query status with same identity; do not generate a new request ID |
@@ -366,6 +369,8 @@ stateDiagram-v2
 | `BLOB_DEPENDENCY_UNAVAILABLE` | Definitive pre-admission rejection; resume/repair chunk preparation and retry the same publication identity |
 | `STALE_CONTINUATION` | Restart the scan at a new snapshot/version; never silently continue against changed ordering |
 | `CORRUPT_BLOB`, `CORRUPT_HISTORY`, `INCOMPATIBLE_VERSION`, `STATUS_EXPIRED` | Quarantine/reject; operator or rollout action; corrupt blob streams yield no successful partial result |
+
+**Amended 2026-10-22 (M10 D4, lead ruling A-R180): `PROTECTION_PAUSED` proves no mutation by this submission; `LEASE_EXPIRED` does not.** Every paused refusal is made before apply: admission's L1 check, a frozen queue (including the queue drained behind a failed batch), and a local storage fence found before apply. A failed batch answers its own request `UNKNOWN_OUTCOME`, never paused. `LEASE_EXPIRED` is also what an authority deny after apply answers, so it proves nothing. The proof covers this send only (client rule above): a resend of a request that may have applied still reports no proof to the app. `RECOVERY_READ_ONLY` and `DIVERGENCE_REQUIRES_OPERATOR` are unchanged. [ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §5 holds the full amendment and the rows that pin it.
 
 (Status 2026-10-21, M9 S6: a stored record written by a newer build answers `INCOMPATIBLE_VERSION`, not `CORRUPT_HISTORY` or `CORRUPT_BLOB`: it may be valid, and it waits for the rollout. Damage stays `CORRUPT_*`, and the admin clear (`Change::Clear`) removes it; the clear refuses a newer build's record. A read that meets another fault first still answers `CORRUPT_HISTORY` until M9 S7. [ADR-rdb-0012](../ADRs/rdb/0012-document-encoding-cbor-profile.md) §12.)
 

@@ -91,13 +91,21 @@ impl PartitionLifecycle {
 
 /// Which step of a recovery a layout-3 record was written by (M10, arch R3b).
 ///
-/// A reopen reads it to tell a generation that was committed but never activated, which it may
-/// roll forward (lead ruling A-R161), from one that served writes.
+/// It names the CAS that wrote the record, not whether the generation serves. A recovery that
+/// commits with every required copy already holding the barrier goes straight to
+/// `PartitionMode::Active` and runs no activation CAS, so its record stays `Committed` while it
+/// serves writes. Only a recovery that rebuilds a copy writes `Active`.
+///
+/// Nothing decides on it today (traced 2026-10-22, M10): a reopen names it only in
+/// `OpenError::Stale`'s detail, the heal reads the root's boot and base but not its mode, and
+/// F1's own re-read of its CAS ignores the mode. A reader that needs "has this generation served
+/// writes" (lead ruling A-R161's roll-forward) cannot get it from this field alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecordMode {
-    /// F1's recovery CAS wrote it: the generation is committed, not yet serving.
+    /// F1's recovery CAS wrote it: the generation is committed. It may already serve, if the
+    /// commit needed no rebuild.
     Committed,
-    /// F1's activation CAS wrote it: the generation serves.
+    /// F1's activation CAS wrote it, after a rebuild: the generation serves.
     Active,
 }
 
