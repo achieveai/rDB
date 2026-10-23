@@ -2192,25 +2192,48 @@ fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), 
     Ok(())
 }
 
-/// The first request id of `admin damage` and `damage-chunk`. Node status names an in-flight
+/// The lowest request id of `admin damage` and `damage-chunk`. Node status names an in-flight
 /// request by id alone, with no client, so a note tells them apart by the ids this process
 /// issued ([`is_damage_request`], S6 P-3, D8).
 const DAMAGE_REQUEST_BASE: u64 = 1 << 32;
 
-/// Request ids for `admin damage` and `damage-chunk`, under their own client.
-static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(DAMAGE_REQUEST_BASE);
+/// Damage ids one run may issue before it could reach those of a run started a millisecond
+/// later.
+const DAMAGE_IDS_PER_MILLI: u64 = 1 << 12;
 
-/// A fresh request id for `admin damage` or `damage-chunk`.
+/// The first damage id of a run started at `unix_millis`. Every run starts its own range, so a
+/// later run never reuses an earlier run's id: the dedup index still holds that id under the
+/// damage client, and a reuse was refused `GENERATION_CHANGED` with the earlier run's
+/// generation (A-R191 2, tester d8b/d8c).
+fn damage_start(unix_millis: u64) -> u64 {
+    DAMAGE_REQUEST_BASE + unix_millis * DAMAGE_IDS_PER_MILLI
+}
+
+/// This run's first damage id, fixed at its first use.
+fn this_runs_damage_start() -> u64 {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock reads after 1970");
+        damage_start(u64::try_from(now.as_millis()).expect("millis since 1970 fit a u64"))
+    })
+}
+
+/// How many damage ids this run has issued.
+static DAMAGE_ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fresh request id for `admin damage` or `damage-chunk`, under their own client.
 fn damage_request() -> RequestId {
-    RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed))
+    RequestId(this_runs_damage_start() + DAMAGE_ISSUED.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Whether this process issued `request` for `admin damage` or `damage-chunk`. By origin, not
-/// by size: from a folder's second open on, the `Db`'s own ids start at `(n-1)<<40`, above
-/// `DAMAGE_REQUEST_BASE`, and an id alone was then read as a damage write (tester D8).
+/// by size: from a folder's second open on, the `Db`'s own ids start at `(n-1)<<40`, and an id
+/// alone was then read as a damage write (tester D8).
 fn is_damage_request(request: RequestId) -> bool {
-    (DAMAGE_REQUEST_BASE..DAMAGE_REQUEST.load(Ordering::Relaxed)).contains(&request.0)
+    let start = this_runs_damage_start();
+    (start..start + DAMAGE_ISSUED.load(Ordering::Relaxed)).contains(&request.0)
 }
 
 /// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
@@ -5397,5 +5420,23 @@ mod tests {
             line.starts_with("partition 1 waits on an admin damage write's outcome (seq 6),"),
             "{line}"
         );
+    }
+
+    /// Tester d8b/d8c (A-R191 2): every run issued damage ids from the same `1<<32`, so a
+    /// later run's first `admin damage` reused an id the dedup index still held under the
+    /// damage client, and was refused `GENERATION_CHANGED` with the earlier run's generation.
+    /// Runs started a millisecond apart now issue from ranges that never meet. Unit.
+    #[test]
+    fn damage_ids_of_two_runs_a_millisecond_apart_never_meet() {
+        let at = 1_761_000_000_000;
+        let (first, next) = (damage_start(at), damage_start(at + 1));
+        assert!(
+            next >= first + DAMAGE_IDS_PER_MILLI,
+            "run 2 starts at {next}, inside run 1's ids from {first}"
+        );
+        assert!(first > DAMAGE_REQUEST_BASE, "{first}");
+        let issued = damage_request();
+        assert!(is_damage_request(issued), "{issued:?}");
+        assert!(!is_damage_request(RequestId(issued.0 + (1 << 20))));
     }
 }
