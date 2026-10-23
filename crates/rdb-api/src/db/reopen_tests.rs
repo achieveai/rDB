@@ -1230,7 +1230,13 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
 
     match &healed {
         Err(crate::admin::HealError::NotCleared { node: 1, last, .. }) => {
-            assert_eq!(last, "Current", "{healed:?}");
+            assert_eq!(
+                last,
+                "it names the boot this open runs node 1 at, so another open of this folder's \
+                 data may be running now, for example a live copy of this folder: shut it down, \
+                 then open again",
+                "{healed:?}"
+            );
         }
         other => panic!("expected NotCleared for node 1: {other:?}"),
     }
@@ -1241,4 +1247,488 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         .record
         .expect("the live grant is still there");
     assert_eq!(kept.mod_revision, granted, "the live grant was not touched");
+}
+
+/// A-R191b (tester w3a03 `heal/walk.out` c1): a reopen whose heal meets the last run's grant
+/// still in force, because a live copy of the folder renews it, fails in plain words. The text
+/// gives the wait in seconds, the time of day the grant may stay in use until and how far off
+/// that is, and the next step: shut the other open down, then open again. Before, it was Rust
+/// Debug: `Refused { refusal: NotProvenExpired, until_utc_ms: .. }`. Cut: `clear_until` keeps
+/// `format!("{clearance:?}")`. Unit (~300 ms): `MemStore`, the heal's own bound.
+#[test]
+fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words() {
+    use config_core::PutRequest;
+    use rdb_core::authority::grant::GrantRecord;
+    use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+    use rdb_core::contracts::control::ControlKey;
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::ids::{
+        AuthorityGeneration, BootId, Generation, GrantId, OwnerEpoch, Revision, Seq,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let record = PartitionRecord {
+        partition: crate::admin::PARTITION,
+        owner: crate::admin::OWNER,
+        generation: Generation(3),
+        owner_epoch: OwnerEpoch(3),
+        config_version: crate::admin::CONFIG_VERSION,
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    let root = PartitionRoot {
+        mode: rdb_core::authority::partition::RecordMode::Active,
+        owner_boot: BootId(1),
+        base_seq: Seq(7),
+        base_digest: Digest::ROOT,
+        predecessor_generation: Generation(2),
+        predecessor_cutoff: Seq(7),
+        instance: [7; INSTANCE_LEN],
+        run: Revision(1),
+    };
+    rt.block_on(store.put(PutRequest {
+        key: Bytes::from(ControlKey::Partition(crate::admin::PARTITION).encode()),
+        value: record.encode_with(&root),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("put partitions/1");
+    // The last run's grant, renewed a moment ago by the live copy: in force for 90 s more.
+    let clock = crate::clock::HostClock::start();
+    let expiry_utc_ms = i64::try_from(clock.now().0).expect("a UTC time") + 90_000;
+    let held = GrantRecord {
+        grant: GrantId(4),
+        node: crate::admin::OWNER,
+        boot: BootId(1),
+        authority_generation: AuthorityGeneration(0),
+        expiry_utc_ms,
+        frozen: false,
+    };
+    rt.block_on(store.put(PutRequest {
+        key: Bytes::from(ControlKey::Grant(crate::admin::OWNER).encode()),
+        value: held.encode(),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("put grants/1");
+
+    let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
+    let (owner, _mailbox) = std::sync::mpsc::channel();
+    let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        store: Arc::clone(&store),
+        boot: BootId((1 << 16) + 1),
+        budgets,
+        clock,
+        owner,
+        within: Duration::from_millis(300),
+    }));
+    let error = healed.expect_err("a grant still in use is not cleared");
+    assert!(
+        matches!(error, crate::admin::HealError::NotCleared { node: 1, .. }),
+        "{error:?}"
+    );
+
+    // The guard's until-time: the expiry plus clock error and dispatch margin, as a time of day.
+    let until = expiry_utc_ms
+        + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("a margin");
+    let of_day = until.div_euclid(1000).rem_euclid(86_400);
+    let at = format!(
+        "{:02}:{:02}:{:02}",
+        of_day / 3600,
+        of_day / 60 % 60,
+        of_day % 60
+    );
+    let text = error.to_string();
+    let head = format!(
+        "the last run's grant for node 1 (grants/1) was still held after 0.3 seconds of trying: \
+         it may still be in use until {at} UTC (about "
+    );
+    let tail = " seconds from now), and later if its holder keeps renewing it; another open may \
+                hold this folder's data, for example a live copy of this folder: shut it down, \
+                then open again";
+    let seconds = text
+        .strip_prefix(&head)
+        .and_then(|rest| rest.strip_suffix(tail))
+        .unwrap_or_else(|| panic!("the text differs:\n{text}\nexpected:\n{head}<seconds>{tail}"));
+    let seconds: f64 = seconds
+        .parse()
+        .unwrap_or_else(|_| panic!("{seconds:?} is not a number of seconds: {text}"));
+    let margin_s = f64::from(
+        u32::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("a margin"),
+    ) / 1000.0;
+    assert!(
+        (85.0 + margin_s..=90.0 + margin_s).contains(&seconds),
+        "about {seconds} s from now, not about {} s: {text}",
+        90.0 + margin_s
+    );
+}
+
+/// A-R188 (tester r8 `nr`): once node 1 has restarted, it does not rejoin in this open (#42).
+/// `wait_ready` answers at once with `Stopped`, whose text names the restart and says to shut
+/// the `Db` down and open the folder again, rather than waiting out its bound; a put and a get
+/// refused after it carry the same next step. Taking that step works: the reopen reads the write
+/// made before the restart.
+/// Integration (~3 s): one fresh open until ready, a put, a restart of node 1, a refused put and
+/// get, one reopen until ready.
+#[config_log::retcd_test]
+fn m10_r188_after_node_1_restarts_wait_ready_put_and_get_say_to_open_the_folder_again() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db.put(b"a", b"1", None).expect("a put");
+    assert_eq!(db.restart_node(OWNER).expect("node 1 restarts"), BootId(2));
+
+    let note = "the owner, node 1, restarted (now boot 2); a restarted node stays out until the \
+                folder is opened again (#42)";
+    let step = "nothing is served again in this open: to read or write again, shut this Db down \
+                and open the folder again";
+    let asked = std::time::Instant::now();
+    let stopped = db
+        .wait_ready(Duration::from_secs(30))
+        .expect_err("node 1 does not admit writes again in this open");
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "answered at once, not at the bound: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(
+        stopped,
+        ReadyError::Stopped {
+            note: note.to_owned()
+        }
+    );
+    assert_eq!(stopped.to_string(), format!("{note}; {step}"));
+
+    let put = db
+        .put(b"b", b"2", None)
+        .expect_err("the put is refused")
+        .error;
+    let get = db.get(b"a").expect_err("the get is refused");
+    for (call, error) in [("put", put), ("get", get)] {
+        assert!(
+            error.kind == ErrorKind::Unavailable
+                && error.detail.ends_with(&format!("; {note}; {step}")),
+            "{call}: {error:?}"
+        );
+    }
+    db.shutdown();
+
+    let mut db = open(&rt, dir.path(), &store).expect("the folder opened again");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the reopen is ready");
+    assert_eq!(
+        db.get(b"a")
+            .expect("the write made before the restart")
+            .value
+            .map(|(_, value)| value),
+        Some(Bytes::from_static(b"1"))
+    );
+    db.shutdown();
+}
+
+/// A-R189: a `GENERATION_CHANGED` refusal names the action. A request sent under generation 1
+/// and refused after a reopen moved the partition on says which request, under which
+/// generation, to look it up with `Db::status`, and not to resend it as a new request.
+/// Integration (~3 s): one fresh open until ready, a put, one reopen until ready, one resend.
+#[config_log::retcd_test]
+fn m10_r189_a_generation_changed_refusal_says_to_look_the_request_up_with_status() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let sent = *db.put(b"a", b"1", None).expect("a put").sent;
+    db.shutdown();
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the reopen is ready");
+    let refused = db
+        .resend(sent.clone())
+        .expect_err("a request sent under generation 1 is refused under generation 2");
+    assert_eq!(
+        (refused.error.kind, refused.error.detail.as_str()),
+        (
+            ErrorKind::GenerationChanged,
+            "generation changed: expected Generation(1), current Generation(2); request 1 was \
+             sent under generation 1; look it up with Db::status to see whether it applied; do \
+             not resend it as a new request"
+        )
+    );
+    assert_eq!(
+        refused.request.as_deref(),
+        Some(&sent),
+        "handed back unchanged"
+    );
+    db.shutdown();
+}
+
+/// `partitions/1`'s generation now, `None` with no record.
+fn stored_generation(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> Option<u64> {
+    rt.block_on(store.get(config_core::GetRequest {
+        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+    }))
+    .expect("get partitions/1")
+    .record
+    .and_then(|found| PartitionRecord::decode(&found.value))
+    .map(|record| record.generation.0)
+}
+
+/// review-r184 M1 (k220): a layout-1 open counter (`[1]` then N, written before A-R184) leaves
+/// the activated generation unknown, and unknown never rolls forward. A reopen cut short right
+/// after its commit leaves `partitions/1` at a generation no copy holds; with the counter put
+/// back to layout-1 bytes, the next open is `Stale` naming the unknown mark, rolls nothing
+/// forward, and counts nothing. Cut: both unknown arms (`roll_forward_copies`'s by-name guard and
+/// `Count::may_have_admitted`'s) answer "never activated", and the open rolls forward.
+/// Integration (~5 s): a fresh open, a reopen cut short at its commit, a refused open.
+#[config_log::retcd_test]
+fn m10_m1_a_layout_1_open_counter_never_rolls_forward() {
+    const METHOD: &str = "m10_m1_a_layout_1_open_counter_never_rolls_forward";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen cut short");
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + patience;
+    while stored_generation(&rt, &store) != Some(2) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "partitions/1 never named generation 2: {:?}",
+            stored_generation(&rt, &store)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    db.shutdown();
+    drop(db);
+    crate::host::set_after_commit(dir.path(), None);
+
+    let instance = marker(dir.path(), 1).expect("the copies are bound");
+    let key = admin::instance_key(&instance);
+    let (count, revision) = rt
+        .block_on(admin::read_count(&*store, &instance))
+        .expect("the counter");
+    let mut layout_1 = vec![1_u8];
+    layout_1.extend_from_slice(&count.n.to_le_bytes());
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(key.clone()),
+        value: Bytes::from(layout_1),
+        expected_mod_revision: Some(revision),
+        dedup: None,
+    }))
+    .expect("the counter as layout 1");
+    let (seeded, seeded_at) = rt
+        .block_on(admin::read_count(&*store, &instance))
+        .expect("layout 1 reads");
+    assert_eq!(
+        (seeded.n, seeded.activated),
+        (count.n, admin::ACTIVATED_UNKNOWN)
+    );
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::Stale { generation: 2, .. }) => error,
+        other => panic!("a layout-1 counter is Stale, not {:?}", other.map(|_| "Db")),
+    };
+    assert!(
+        refused
+            .to_string()
+            .contains("the open counter predates activation marks, so it may have admitted writes"),
+        "{refused}"
+    );
+    let rolled: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "db_open_rolled_forward")
+        .collect();
+    assert!(rolled.is_empty(), "{rolled:?}");
+    assert_eq!(
+        rt.block_on(admin::read_count(&*store, &instance))
+            .expect("the counter"),
+        (seeded, seeded_at),
+        "the refused open counted nothing"
+    );
+}
+
+/// review-r184 A3 (k220): open counter bytes this build does not write are `Unreadable`, never
+/// a count. Layout 2 is exactly 17 bytes and layout 1 exactly 9; any other length, or any other
+/// version byte, is refused by both the read a reopen decides on and the count an open makes,
+/// and neither writes. An older build reads layout 2 by the same rule: its decoder knows only
+/// version byte 1. Cuts: layout 2 accepts 16 or more bytes after its version byte; layout 1
+/// accepts any version byte.
+/// Unit (~1 ms): `MemStore`.
+#[test]
+fn m10_a3_open_counter_bytes_this_build_does_not_write_are_unreadable() {
+    let rt = runtime();
+    let n = 5_u64.to_le_bytes();
+    let activated = 3_u64.to_le_bytes();
+    let bytes = |version: u8, parts: &[&[u8]]| {
+        let mut out = vec![version];
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        out
+    };
+    let cases = [
+        ("layout 2, one byte short", bytes(2, &[&n, &activated[..7]])),
+        ("layout 2, one byte long", bytes(2, &[&n, &activated, &[0]])),
+        ("layout 2, N only", bytes(2, &[&n])),
+        ("layout 1, one byte short", bytes(1, &[&n[..7]])),
+        (
+            "layout 1, with an activated generation",
+            bytes(1, &[&n, &activated]),
+        ),
+        ("version 3, layout 2's length", bytes(3, &[&n, &activated])),
+        ("version 3, layout 1's length", bytes(3, &[&n])),
+        ("version 0", bytes(0, &[&n])),
+        ("empty", Vec::new()),
+    ];
+    for (case, value) in cases {
+        let store = config_testkit::MemStore::new();
+        let instance = [0x55; INSTANCE_LEN];
+        let key = admin::instance_key(&instance);
+        let written = rt
+            .block_on(store.put(config_core::PutRequest {
+                key: Bytes::from(key.clone()),
+                value: Bytes::from(value.clone()),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .expect("seed")
+            .revision;
+        let unreadable = admin::CounterError::Unreadable {
+            key: key.clone(),
+            revision: written,
+        };
+        assert_eq!(
+            rt.block_on(admin::read_count(&store, &instance)),
+            Err(unreadable.clone()),
+            "{case}: read_count"
+        );
+        assert_eq!(
+            rt.block_on(admin::count_open(
+                &store,
+                &instance,
+                false,
+                admin::COUNT_WITHIN
+            )),
+            Err(unreadable),
+            "{case}: count_open"
+        );
+        let after = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(key),
+            }))
+            .expect("get")
+            .record
+            .expect("still there");
+        assert_eq!(
+            (after.mod_revision, after.value.to_vec()),
+            (written, value),
+            "{case}: nothing was written"
+        );
+    }
+}
+
+/// A fresh open, ready: the `Db` an `_as` row sends on.
+fn ready_db(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStore>) -> Db {
+    let db = open(rt, dir, store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db
+}
+
+/// The id an app chose and kept before sending: far from any id this `Db` draws itself.
+const CHOSEN: RequestId = RequestId(0x00AB_CDEF);
+
+/// A-R194: `txn_as` sends under the id the app chose, so the app can keep that id before it
+/// sends and ask `status(id, gen)` afterwards, after a crash included. The answer names the
+/// chosen id, status reports it applied at the same position, and both puts read back. Cut:
+/// `txn_as` sends under `self.identity()`, and status of the chosen id is not `Resolved`.
+/// Integration (~2 s): one fresh open until ready, one transaction.
+#[config_log::retcd_test]
+fn m10_r194_a_txn_sent_under_a_chosen_id_is_found_by_status_under_that_id() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = ready_db(&rt, dir.path(), &store);
+
+    let puts = [
+        TxnPut {
+            group: GROUP,
+            object: b"a",
+            value: b"1",
+            if_version: None,
+        },
+        TxnPut {
+            group: GROUP,
+            object: b"b",
+            value: b"2",
+            if_version: None,
+        },
+    ];
+    let ok = db
+        .txn_as(CHOSEN, &puts, Duration::from_secs(5))
+        .expect("the txn");
+    assert_eq!(ok.request, CHOSEN, "the answer names the chosen id");
+    match db
+        .status(CHOSEN, Some(ok.generation))
+        .expect("status of the chosen id")
+    {
+        TxnStatus::Resolved(result) => assert_eq!(
+            (result.generation, result.seq),
+            (ok.generation, ok.seq),
+            "{result:?}"
+        ),
+        other => panic!("status of the chosen id: {other:?}"),
+    }
+    for (object, value) in [(b"a", b"1"), (b"b", b"2")] {
+        assert_eq!(
+            db.get(object).expect("get").value.map(|(_, value)| value),
+            Some(Bytes::copy_from_slice(value))
+        );
+    }
+    db.shutdown();
+}
+
+/// A-R194: `write_as` sends under the id the app chose, as `txn_as` does. Cut: `write_as` sends
+/// under `self.identity()`, and status of the chosen id is not `Resolved`.
+/// Integration (~2 s): one fresh open until ready, one write.
+#[config_log::retcd_test]
+fn m10_r194_a_write_sent_under_a_chosen_id_is_found_by_status_under_that_id() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = ready_db(&rt, dir.path(), &store);
+
+    let ok = db
+        .write_as(CHOSEN, b"a", byte_doc(b"1"), Some(Expected::Absent))
+        .expect("the write")
+        .expect("a create is never unchanged");
+    assert_eq!(ok.request, CHOSEN, "the answer names the chosen id");
+    match db
+        .status(CHOSEN, Some(ok.generation))
+        .expect("status of the chosen id")
+    {
+        TxnStatus::Resolved(result) => assert_eq!(
+            (result.generation, result.seq),
+            (ok.generation, ok.seq),
+            "{result:?}"
+        ),
+        other => panic!("status of the chosen id: {other:?}"),
+    }
+    assert_eq!(
+        db.get(b"a").expect("get a").value.map(|(_, value)| value),
+        Some(Bytes::from_static(b"1"))
+    );
+    db.shutdown();
 }
