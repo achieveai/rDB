@@ -27,7 +27,7 @@ use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
-    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId,
+    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, RequestId,
     RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -55,7 +55,7 @@ const OWNER: NodeId = admin::OWNER;
 /// The only tenant and client S0 writes as. Not settable by a caller (lead ruling, 2026-10-07:
 /// no raw identity on the REPL).
 const TENANT: TenantId = TenantId(1);
-const CLIENT: ClientId = ClientId(1);
+const CLIENT: ClientId = DEFAULT_CLIENT;
 
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads.
 const GROUP: AffinityId = AffinityId(1);
@@ -102,154 +102,10 @@ pub const MAX_KEY: usize = 1_024;
 /// can still be large.
 pub const MAX_PAGE: usize = 1_000;
 
-/// A failed call, with the §5.4 name and what the caller may do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiError {
-    /// The §5.4 kind.
-    pub kind: ErrorKind,
-    /// What the caller may do.
-    pub retry: RetryRule,
-    /// Whether this submission provably mutated nothing. It says nothing of an earlier send of
-    /// the same request id.
-    pub no_mutation: bool,
-    /// Detail, for the log and the operator.
-    pub detail: String,
-    /// The soonest a retry can be admitted, when the host knows it (M10 S1-6, critic-d6b
-    /// candidate 3): a lower bound, "not before", never a promise that it will be. `None` when
-    /// nothing is known. Set it with [`Self::with_retry_after`], which also says it in `detail`.
-    pub retry_after: Option<Duration>,
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", wire_name(self.kind), self.detail)
-    }
-}
-
-impl std::error::Error for ApiError {}
-
-impl ApiError {
-    /// An error of `kind` raised by the API itself, with a fixed retry rule and mutation proof
-    /// per kind:
-    ///
-    /// | kind | `retry` | `no_mutation` |
-    /// |---|---|---|
-    /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
-    /// | `UnknownOutcome` | `QueryStatus` | `false` |
-    /// | `CorruptHistory`, `CorruptBlob`, `IncompatibleVersion` | `Quarantine` | `false` |
-    /// | `UploadChunkConflict` | `Reconcile` | `true` |
-    /// | any other | `BoundedJitter` | `false` |
-    ///
-    /// This is not what the kernel attaches to the same kind: for example a kernel
-    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves this submission
-    /// mutated nothing.
-    /// Wrap a kernel error with [`Self::from_kernel`], never with this.
-    #[must_use]
-    pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
-        let (retry, no_mutation) = match kind {
-            ErrorKind::ConditionFailed | ErrorKind::InvalidArgument => {
-                (RetryRule::Definitive, true)
-            }
-            ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
-            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob | ErrorKind::IncompatibleVersion => {
-                (RetryRule::Quarantine, false)
-            }
-            ErrorKind::UploadChunkConflict => (RetryRule::Reconcile, true),
-            _ => (RetryRule::BoundedJitter, false),
-        };
-        Self {
-            kind,
-            retry,
-            no_mutation,
-            detail: detail.into(),
-            retry_after: None,
-        }
-    }
-
-    /// The kernel's own error, with its own retry rule and proof.
-    #[must_use]
-    pub fn from_kernel(error: &RdbError) -> Self {
-        Self {
-            kind: error.kind(),
-            retry: error.retry_rule(),
-            no_mutation: error.proves_no_mutation(),
-            detail: error.to_string(),
-            retry_after: None,
-        }
-    }
-
-    /// A caller's argument the API refuses before the kernel sees it.
-    #[must_use]
-    pub fn invalid(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InvalidArgument, detail)
-    }
-
-    /// A put refused before it was sent: this node has adopted no generation yet, so there is
-    /// none to fence it with (`expected_generation` is always set; ADR-0004 §8). This submission
-    /// never left the host, so it mutated nothing, and it may be retried once a generation is
-    /// adopted.
-    #[must_use]
-    pub fn not_adopted(node: NodeId, partition: PartitionId) -> Self {
-        Self {
-            kind: ErrorKind::Unavailable,
-            retry: RetryRule::BoundedJitter,
-            no_mutation: true,
-            detail: format!(
-                "no generation adopted yet for partition {} on node {}; nothing was sent",
-                partition.0, node.0
-            ),
-            retry_after: None,
-        }
-    }
-
-    /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
-    #[must_use]
-    pub fn host(detail: &str) -> Self {
-        Self {
-            kind: ErrorKind::Unavailable,
-            retry: RetryRule::NotWired,
-            no_mutation: false,
-            detail: format!("host fault: {detail}"),
-            retry_after: None,
-        }
-    }
-
-    /// This error with a "not before" hint: a retry is not admitted sooner than `after` from
-    /// now. Sets [`Self::retry_after`] and ends `detail` with `; not before ~Ns`, the seconds
-    /// rounded up so the text never names a time earlier than the hint.
-    #[must_use]
-    pub fn with_retry_after(mut self, after: Duration) -> Self {
-        let seconds = after.as_millis().div_ceil(1_000);
-        self.detail = format!("{}; not before ~{seconds}s", self.detail);
-        self.retry_after = Some(after);
-        self
-    }
-
-    /// The soonest a retry can be admitted, when the host knows it.
-    #[must_use]
-    pub const fn retry_after(&self) -> Option<Duration> {
-        self.retry_after
-    }
-
-    /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
-    #[must_use]
-    pub fn name(&self) -> String {
-        wire_name(self.kind)
-    }
-}
-
-/// `ProtectionPaused` → `PROTECTION_PAUSED`.
-fn wire_name(kind: ErrorKind) -> String {
-    let camel = format!("{kind:?}");
-    let mut out = String::with_capacity(camel.len() + 4);
-    for (i, c) in camel.chars().enumerate() {
-        if c.is_ascii_uppercase() && i > 0 {
-            out.push('_');
-        }
-        out.push(c.to_ascii_uppercase());
-    }
-    out
-}
+mod error;
+#[cfg(test)]
+use error::wire_name;
+pub use error::ApiError;
 
 /// How long `Db` waits for each kind of call.
 #[derive(Debug, Clone, Copy)]
@@ -306,7 +162,24 @@ pub struct DbConfig {
     /// A plain `put` compiles a version condition, so its retry fails `CONDITION_FAILED` once
     /// the first send applied, rather than applying twice.
     pub dedup_retention: Option<Duration>,
+    /// The nodes whose copies this process holds and runs (M10 S2). [`ALL_NODES`] is the
+    /// one-process database: all three copies here. Not read yet: every open runs all three.
+    pub local: Vec<NodeId>,
+    /// The peer links this process's nodes use (M10 S2). `None`: new in-process links. Not
+    /// read yet: every open makes its own in-process links.
+    pub links: Option<Arc<Links>>,
+    /// The client every request of this `Db` is sent as (M10 S2-8: two apps on one node are
+    /// two clients). [`DEFAULT_CLIENT`] is the one client every earlier build used. Not read
+    /// yet: every request is sent as [`DEFAULT_CLIENT`].
+    pub client: ClientId,
 }
+
+/// The client a `Db` sends as unless [`DbConfig::client`] names another.
+pub const DEFAULT_CLIENT: ClientId = ClientId(1);
+
+/// The three nodes of partition 1: [`DbConfig::local`] for a database whose copies are all in
+/// this process.
+pub const ALL_NODES: [NodeId; 3] = [NodeId(1), NodeId(2), NodeId(3)];
 
 impl DbConfig {
     /// The checks [`Db::open`] makes before it starts anything, so a caller can make them
@@ -2899,6 +2772,9 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
         }
     }
 
@@ -2937,6 +2813,9 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3023,6 +2902,9 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -3146,6 +3028,9 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -4594,6 +4479,9 @@ mod tests {
         let above = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES + 1),
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
             ..config(dir.path())
         };
         match rt.block_on(Db::open(above, store, rt.handle().clone())) {
@@ -4634,6 +4522,9 @@ mod tests {
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
             dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
             ..config(dir.path())
         };
         assert!(
@@ -6974,6 +6865,9 @@ mod tests {
                 DbConfig {
                     dedup_cap: Some(2),
                     dedup_retention: Some(retention),
+                    local: ALL_NODES.to_vec(),
+                    links: None,
+                    client: DEFAULT_CLIENT,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),
@@ -7075,6 +6969,9 @@ mod tests {
                 DbConfig {
                     dedup_cap: Some(2),
                     dedup_retention: Some(retention),
+                    local: ALL_NODES.to_vec(),
+                    links: None,
+                    client: DEFAULT_CLIENT,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),
