@@ -2775,6 +2775,8 @@ struct Sent {
     file: Option<PathBuf>,
     /// An append to `--requests F` failed: the run exits 1 (k214).
     save_failed: std::cell::Cell<bool>,
+    /// The lines of F already warned about: each is said once per run, not on every retry.
+    warned: std::collections::BTreeSet<usize>,
 }
 
 /// What `retry <rest>` names, its `--payload V` or `--deadline-ms N` aside.
@@ -2896,6 +2898,9 @@ impl Sent {
                 // line holds keys and values.
                 Err(e) => {
                     let line = at + 1;
+                    if !self.warned.insert(line) {
+                        continue;
+                    }
                     let torn = line == last && !text.ends_with('\n') && e.is_eof();
                     tracing::warn!(line, torn, class = ?e.classify(), "requests_file_line_skipped");
                     warnings.push(if torn {
@@ -5338,7 +5343,8 @@ mod tests {
     /// Tester k214 (A-R189). A damaged line in `--requests F` blocked every retry, and a failed
     /// append to F printed `err` yet exited 0. Now a line that does not read is skipped with a
     /// warning that names its line, never its text, and the other ids still retry; a last line
-    /// a kill cut short is said as such. A failed append makes the run exit 1. Unit (~5 ms).
+    /// a kill cut short is said as such, once per run. A failed append makes the run exit 1. Unit
+    /// (~5 ms).
     #[test]
     fn a_damaged_or_torn_line_in_requests_file_is_skipped_and_a_failed_append_exits_1() {
         use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
@@ -5398,7 +5404,12 @@ mod tests {
             adopted.request_digest(),
             request(7, b"zqseven").request_digest()
         );
-        later.adopt(&["6"]).expect("6 too");
+        // Tester w360c: each retry re-read F and printed the same warnings again. Once per run.
+        assert_eq!(
+            later.adopt(&["6"]),
+            Ok(Vec::new()),
+            "6 too, warned once per run"
+        );
         assert!(later.pick(&["6"]).is_ok());
         assert_eq!(exit_code(false, &later), ExitCode::SUCCESS);
 
