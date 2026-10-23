@@ -285,7 +285,9 @@
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //!                                         (default 30). `wait ready` asks Db::wait_ready: after
 //!                                         node 1 restarted, or a failed heal, it stops at once,
-//!                                         says the next step, and the run exits 1
+//!                                         says the next step, and the run exits 1. Every 10 s
+//!                                         it waits it says `still waiting for ready: recovery
+//!                                         phase P`, node 1's phase then
 //! sleep <millis>
 //! quit
 //! ```
@@ -1493,7 +1495,13 @@ fn repl<'scope, 'env>(
                     Ok(secs) => {
                         let within = Duration::from_secs(secs);
                         let waited = if *what == "ready" {
-                            wait_ready_line(progress, within, |within| db.wait_ready(within))
+                            wait_ready_line(
+                                progress,
+                                within,
+                                WAIT_PROGRESS_EVERY,
+                                |slice| db.wait_ready(slice),
+                                say,
+                            )
                         } else {
                             wait_recovered(progress, within, || db.heal_state())
                         };
@@ -3802,19 +3810,49 @@ fn wait_recovered(
     }
 }
 
+/// How often `wait ready` says it is still waiting.
+const WAIT_PROGRESS_EVERY: Duration = Duration::from_secs(10);
+
 /// `wait ready`: the line it ends with, from `Db::wait_ready`, which answers the present rather
 /// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
 /// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
 /// gives the next step). The run then exits 1. A timeout is said, and is not an error. A wait
 /// that reached ready records that as printed, so the poller does not say it a second time.
+///
+/// It asks `wait` for at most `every` at a time, and after each slice that ran out it says
+/// `still waiting for ready: recovery phase P` with node 1's phase then: the tester saw ~40 s
+/// with no line while rEtcd had no quorum. A timeout names the whole bound, not the last slice.
 fn wait_ready_line(
     progress: &Progress,
     within: Duration,
-    wait: impl FnOnce(Duration) -> Result<(), rdb_api::db::ReadyError>,
+    every: Duration,
+    mut wait: impl FnMut(Duration) -> Result<(), rdb_api::db::ReadyError>,
+    mut said: impl FnMut(&str),
 ) -> Result<String, String> {
     use rdb_api::db::ReadyError;
     let started = Instant::now();
-    let answer = wait(within);
+    let mut left = within;
+    let answer = loop {
+        let slice = left.min(every);
+        match wait(slice) {
+            Err(ReadyError::TimedOut { phase, .. }) if slice < left => {
+                left -= slice;
+                tracing::info!(
+                    phase = phase.as_str(),
+                    waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "repl_wait_progress"
+                );
+                said(&format!("still waiting for ready: recovery phase {phase}"));
+            }
+            Err(ReadyError::TimedOut { phase, .. }) => {
+                break Err(ReadyError::TimedOut {
+                    within_ms: within.as_millis(),
+                    phase,
+                })
+            }
+            answered => break answered,
+        }
+    };
     let millis = started.elapsed().as_millis();
     let (outcome, line) = match &answer {
         Ok(()) => {
@@ -5745,9 +5783,13 @@ mod tests {
             started.elapsed()
         );
         // `wait ready` asks Db::wait_ready, which ends at once on a failed heal itself.
-        let ready = wait_ready_line(&progress, Duration::from_secs(2), |_| {
-            Err(ReadyError::Heal(admin::HealError::NodeStopped))
-        })
+        let ready = wait_ready_line(
+            &progress,
+            Duration::from_secs(2),
+            WAIT_PROGRESS_EVERY,
+            |_| Err(ReadyError::Heal(admin::HealError::NodeStopped)),
+            |_| (),
+        )
         .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
         for (what, line) in [("recovered", recovered), ("ready", ready)] {
             assert_eq!(
@@ -5935,6 +5977,61 @@ mod tests {
         assert_eq!(paused, [(1.into(), 50.into())], "node 1's sync slept once");
     }
 
+    /// Tester (lead, 2026-10-23): `wait ready` printed nothing for ~40 s while rEtcd had no
+    /// quorum; only the final timeout named the state. It now says node 1's phase after each
+    /// `every` it waits, and its timeout names the whole bound, not the last slice. Unit.
+    #[test]
+    fn wait_ready_says_the_phase_every_slice_while_it_waits() {
+        use rdb_api::db::ReadyError;
+        let timed_out = |slice: Duration| ReadyError::TimedOut {
+            within_ms: slice.as_millis(),
+            phase: "ProposalUnresolved".to_owned(),
+        };
+        let progress = Progress::default();
+        let (mut asked, mut said) = (Vec::new(), Vec::new());
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(25),
+            Duration::from_secs(10),
+            |slice| {
+                asked.push(slice.as_secs());
+                Err(timed_out(slice))
+            },
+            |line| said.push(line.to_owned()),
+        )
+        .expect("a timeout is said, not an error");
+        assert_eq!(asked, [10, 10, 5], "slices of at most `every`, 25 s in all");
+        assert_eq!(
+            said,
+            ["still waiting for ready: recovery phase ProposalUnresolved"; 2]
+        );
+        assert_eq!(
+            line,
+            "timeout waiting for ready after 25s: node 1 did not admit writes within 25000 ms; \
+             recovery phase ProposalUnresolved"
+        );
+
+        // Ready in the second slice: one line said, then the reached line.
+        let (mut slices, mut said) = (0, Vec::new());
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(25),
+            Duration::from_secs(10),
+            |slice| {
+                slices += 1;
+                if slices == 1 {
+                    Err(timed_out(slice))
+                } else {
+                    Ok(())
+                }
+            },
+            |line| said.push(line.to_owned()),
+        )
+        .expect("ready");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        assert_eq!(said.len(), 1, "{said:?}");
+    }
+
     /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
     /// second bare `ready` line inside the next command's output. One transition is said once:
     /// a wait that reached ready records it as printed, so the poller says nothing more until
@@ -5942,8 +6039,14 @@ mod tests {
     #[test]
     fn a_reached_wait_ready_is_not_said_again_by_the_poller() {
         let progress = Progress::default();
-        let line = wait_ready_line(&progress, Duration::from_secs(1), |_| Ok(()))
-            .expect("ready is not an error");
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(1),
+            WAIT_PROGRESS_EVERY,
+            |_| Ok(()),
+            |_| (),
+        )
+        .expect("ready is not an error");
         assert!(line.starts_with("reached ready in "), "{line}");
         let mut seen = progress.seen();
         assert_eq!(step_line(&mut seen, true, None), None, "said once");
