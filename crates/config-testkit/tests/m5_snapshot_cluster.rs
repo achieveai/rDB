@@ -97,18 +97,11 @@ async fn m5_05_snapshot_id_unique_per_build_at_the_same_last_log_id() {
     let (cluster, _scripts) = seeded_cluster().await;
     let leader = cluster.leader().await;
 
-    let first = cluster
-        .node(leader)
-        .trigger_snapshot()
-        .await
-        .expect("the first build must not be refused");
-    let (first_id, first_log_id) = match first {
-        SnapshotTriggered::Started {
-            snapshot_id: Some(id),
-            last_log_id: Some(log_id),
-        } => (id, log_id),
-        other => panic!("the first build on an idle cluster must publish something: {other:?}"),
-    };
+    // The first build's id comes from `published_id`, not from the trigger's answer: the trigger
+    // stops waiting after the node's `write_timeout` (2 s, not scaled) and then answers
+    // `snapshot_id: None` while the build carries on (#29, ruling A-R203).
+    let first_id = published_id(trigger_in_background(&cluster, leader)).await;
+    let first_log_index = published_log_index(&cluster, leader, &first_id);
 
     // No writes at all between the two triggers, matching the row's setup exactly. Whatever
     // the second call reports, it must never claim the same snapshot_id as the first at that
@@ -124,7 +117,7 @@ async fn m5_05_snapshot_id_unique_per_build_at_the_same_last_log_id() {
             last_log_id: Some(second_log_id),
         } => {
             assert_eq!(
-                second_log_id, first_log_id,
+                second_log_id.index, first_log_index,
                 "no writes happened between the two triggers, so both builds cover the same log id"
             );
             assert_ne!(
@@ -226,18 +219,10 @@ async fn m5_16_published_snapshot_survives_restart() {
     let (cluster, _scripts) = seeded_cluster().await;
     let leader = cluster.leader().await;
 
-    let triggered = cluster
-        .node(leader)
-        .trigger_snapshot()
-        .await
-        .expect("triggering a build on an idle, unfaulted node must succeed");
-    let (published_id, published_log_id) = match triggered {
-        SnapshotTriggered::Started {
-            snapshot_id: Some(id),
-            last_log_id: Some(log_id),
-        } => (id, log_id),
-        other => panic!("expected a real publication on a clean node, got {other:?}"),
-    };
+    // The id comes from `published_id`, not from the trigger's answer, which is `None` when the
+    // build outlasts the node's `write_timeout` (#29, ruling A-R203).
+    let published_id = published_id(trigger_in_background(&cluster, leader)).await;
+    let published_log_index = published_log_index(&cluster, leader, &published_id);
 
     // Best-effort: the running node still holds RocksDB's LOCK, so this is expected to fail
     // and is only here in case a previous row's handle leaked. `restart` below is what actually
@@ -268,10 +253,10 @@ async fn m5_16_published_snapshot_survives_restart() {
     );
     assert_eq!(
         after_restart.last_log_id.map(|l| l.index),
-        Some(published_log_id.index),
-        "the recorded last_log_id must match what was published before the restart: {:?} vs {:?}",
+        Some(published_log_index),
+        "the recorded last_log_id must match what was published before the restart: {:?} vs \
+         index {published_log_index}",
         after_restart.last_log_id,
-        published_log_id
     );
 }
 
@@ -430,6 +415,23 @@ async fn published_id(build: BackgroundBuild) -> String {
             .unwrap_or_else(|t| panic!("the build must publish a snapshot id: {t}")),
         other => panic!("the build must publish a snapshot id: {other:?}"),
     }
+}
+
+/// The log index `node`'s current snapshot covers, which must be the build that published
+/// `snapshot_id`. The index is read from the store because [`published_id`] can answer from the
+/// store too, when the trigger stopped waiting, and then the trigger names no log id.
+fn published_log_index(cluster: &Cluster, node: NodeId, snapshot_id: &str) -> u64 {
+    let meta = cluster
+        .rocks_store(node)
+        .snapshot_meta()
+        .expect("a published build is the current snapshot");
+    assert_eq!(
+        meta.snapshot_id, snapshot_id,
+        "the published build is the current snapshot"
+    );
+    meta.last_log_id
+        .map(|log_id| log_id.index)
+        .expect("a published build records the last log id it covers")
 }
 
 /// Wait until openraft's core has taken in that the build which published `snapshot_id` is
