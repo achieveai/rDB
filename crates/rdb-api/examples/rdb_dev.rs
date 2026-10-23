@@ -5,7 +5,7 @@
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
 //!                                           [--control host:port[,host:port...]] [--requests F]
-//!                                           [--abort-after-commit]
+//!                                           [--abort-after-commit] [--pause-before-sync N=MS]
 //! ```
 //!
 //! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
@@ -32,6 +32,12 @@
 //! recovery commits, before the new generation is linked or marked activated. With `--control`
 //! and the same `--dir`, the next run must roll that commit forward. Nothing is printed when it
 //! fires; the abort may lose the last log lines.
+//!
+//! `--pause-before-sync N=MS` is a dev and test hook (A-R198): node N's next barrier sync (the
+//! fsync a recovery waits on before it commits) sleeps MS ms first, once, as a slow disk would.
+//! It is said at start and logged as `pause_before_sync_armed` (warn); the sleep itself is
+//! logged as `test_sync_paused` with `node` and `millis`. N is 1, 2 or 3; repeat the flag for
+//! more nodes. A bootstrap and a reopen both sync before they commit.
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
@@ -362,6 +368,9 @@ struct Args {
     /// `--abort-after-commit`: abort the whole process once a recovery commits, before it is
     /// linked or marked activated (A-R184). The next open must roll it forward.
     abort_after_commit: bool,
+    /// `--pause-before-sync <node>=<ms>`, repeatable: that node's next barrier sync sleeps
+    /// `ms` before it fsyncs, once (A-R198).
+    pause_before_sync: Vec<(NodeId, Duration)>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -378,6 +387,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         control: None,
         requests: None,
         abort_after_commit: false,
+        pause_before_sync: Vec::new(),
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -387,6 +397,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
             "--abort-after-commit" => parsed.abort_after_commit = true,
+            "--pause-before-sync" => parsed
+                .pause_before_sync
+                .push(parse_pause(&value("--pause-before-sync")?)?),
             "--requests" => parsed.requests = Some(PathBuf::from(value("--requests")?)),
             "--control" => {
                 let endpoints: Vec<String> = value("--control")?
@@ -437,6 +450,18 @@ fn parse_node(text: &str) -> Result<NodeId, String> {
         Ok(n @ 1..=3) => Ok(NodeId(n)),
         _ => Err(format!("{text:?}: a node is 1, 2 or 3")),
     }
+}
+
+/// `--pause-before-sync`'s `<node>=<ms>`; every refusal names the flag.
+fn parse_pause(text: &str) -> Result<(NodeId, Duration), String> {
+    let (node, millis) = text
+        .split_once('=')
+        .ok_or_else(|| format!("--pause-before-sync takes <node>=<ms>, not {text:?}"))?;
+    let node = parse_node(node).map_err(|e| format!("--pause-before-sync: {e}"))?;
+    let millis = millis.trim().parse::<u64>().map_err(|_| {
+        format!("--pause-before-sync: {millis:?} is not a number of ms, in {text:?}")
+    })?;
+    Ok((node, Duration::from_millis(millis)))
 }
 
 fn parse_pair(text: &str) -> Result<(NodeId, NodeId), String> {
@@ -523,6 +548,16 @@ where
         rdb_api::host::abort_after_commit(&args.dir);
         tracing::warn!(dir = %args.dir.display(), "abort_after_commit_armed");
         say("abort-after-commit: this process aborts once a recovery commits");
+    }
+    for &(node, pause) in &args.pause_before_sync {
+        let node_dir = args.dir.join("nodes").join(node.0.to_string());
+        rdb_api::host::pause_before_sync(&node_dir, pause);
+        let ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+        tracing::warn!(node = node.0, ms, "pause_before_sync_armed");
+        say(&format!(
+            "pause-before-sync: node {}'s next barrier sync sleeps {ms} ms before it fsyncs",
+            node.0
+        ));
     }
     let (store, local) = match &args.control {
         Some(endpoints) => {
@@ -4883,6 +4918,7 @@ mod tests {
             control: None,
             requests: None,
             abort_after_commit: false,
+            pause_before_sync: Vec::new(),
         };
         let code = run(&args, |_, _, _| async {
             Err(OpenError::Node("node 2: injected".to_owned()))
@@ -5023,6 +5059,7 @@ mod tests {
             control: None,
             requests: None,
             abort_after_commit: false,
+            pause_before_sync: Vec::new(),
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {
@@ -5597,6 +5634,7 @@ mod tests {
             control: None,
             requests: None,
             abort_after_commit: false,
+            pause_before_sync: Vec::new(),
         };
         let code = run(&args, Db::open);
         let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
@@ -5612,6 +5650,88 @@ mod tests {
             "{said}"
         );
         assert_eq!(code, ExitCode::from(1), "a stopped wait exits 1");
+    }
+
+    /// A-R198: `--pause-before-sync N=MS` parses, refuses bad input naming the flag, and arms
+    /// the host hook, so node N's barrier sync sleeps. The flag proves itself here: a run with
+    /// it says it is armed, and node 1's sync then logs the sleep. Why a slow sync must not fail
+    /// the barrier is `m10_a_reopen_whose_owner_syncs_slowly_still_completes_its_barrier`'s
+    /// proof, not this row's. Integration (~3 s): three real rEtcd voters and one open.
+    #[config_log::retcd_test]
+    fn pause_before_sync_parses_and_arms_the_node_s_barrier_sync() {
+        const METHOD: &str = "pause_before_sync_parses_and_arms_the_node_s_barrier_sync";
+        let args = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        let two = args(&["--pause-before-sync", "1=50", "--pause-before-sync", "3=7"])
+            .expect("two good pauses");
+        assert_eq!(
+            two.pause_before_sync,
+            [
+                (NodeId(1), Duration::from_millis(50)),
+                (NodeId(3), Duration::from_millis(7))
+            ]
+        );
+        assert!(
+            args(&[]).expect("defaults").pause_before_sync.is_empty(),
+            "off unless given"
+        );
+        for (bad, says) in [
+            ("4=10", "a node is 1, 2 or 3"),
+            ("1=x", "is not a number of ms"),
+            ("1=", "is not a number of ms"),
+            ("1", "takes <node>=<ms>"),
+        ] {
+            let refused = args(&["--pause-before-sync", bad]).expect_err(bad);
+            assert!(
+                refused.starts_with("--pause-before-sync") && refused.contains(says),
+                "{bad}: {refused}"
+            );
+        }
+        let refused = args(&["--pause-before-sync"]).expect_err("no value");
+        assert_eq!(refused, "--pause-before-sync needs a value");
+
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // RETCD_TEST_DATA_DIR is left as it is: each row that points it into its own `--dir`
+        // nests the next row's folders one level deeper, and a sixth level passed Windows'
+        // MAX_PATH inside RocksDB.
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("run");
+        let script = root.path().join("script.txt");
+        std::fs::write(&script, "wait ready 60\n").expect("write the script");
+        let run_args = Args {
+            dir,
+            log_dir: root.path().join("logs"),
+            script: Some(script),
+            ..args(&["--pause-before-sync", "1=50"]).expect("one pause")
+        };
+        assert_eq!(run(&run_args, Db::open), ExitCode::SUCCESS, "the run");
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let armed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "pause_before_sync_armed")
+            .collect();
+        assert_eq!(armed.len(), 1, "{armed:#?}");
+        assert_eq!(
+            (&armed[0]["@l"], &armed[0]["node"], &armed[0]["ms"]),
+            (&"Warning".into(), &1.into(), &50.into()),
+            "{armed:#?}"
+        );
+        // The node threads carry no test span here, so their lines go to the run's untagged
+        // file. Only this row arms a pause in this binary, and the ENV lock keeps the other
+        // opens out while it runs.
+        config_log::layer::flush_test_logs();
+        let untagged = config_log::testing::test_log_dir()
+            .join(format!("_untagged-{}.jsonl", std::process::id()));
+        let text = std::fs::read_to_string(&untagged)
+            .unwrap_or_else(|e| panic!("read {}: {e}", untagged.display()));
+        let paused: Vec<_> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["@m"] == "test_sync_paused")
+            .map(|line| (line["node"].clone(), line["millis"].clone()))
+            .collect();
+        assert_eq!(paused, [(1.into(), 50.into())], "node 1's sync slept once");
     }
 
     /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
