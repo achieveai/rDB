@@ -568,6 +568,10 @@ fn run_host(steps: &[Step]) -> (Vec<Reply>, (Generation, Seq)) {
         },
         dedup_cap: None,
         dedup_retention: None,
+        local: rdb_api::db::ALL_NODES.to_vec(),
+        links: None,
+        client: rdb_api::db::DEFAULT_CLIENT,
+        boot: None,
         storage: rdb_api::StorageOptions::default(),
     };
     let mut db = rt

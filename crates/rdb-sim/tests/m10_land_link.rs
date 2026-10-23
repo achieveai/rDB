@@ -14,9 +14,11 @@
 //! from the root: every record at or below the cutoff was sent again. Reaching `Active` that way
 //! is not what the host does, so the simulator did not check the host's path.
 //!
-//! **Guards (C2), one row each.** A holding past the cutoff, below it, or a different record at
-//! it links nothing and logs `land_link_refused` with the host's reason. The host's depth guard
-//! has no twin: the memory engine has no chain-depth ceiling.
+//! **Guards (C2), one row each.** A holding past the cutoff, or a different record at it, links
+//! nothing and logs `land_link_refused` with the host's reason. The host's depth guard has no
+//! twin: the memory engine has no chain-depth ceiling. A holding less than the cutoff links at
+//! its own head instead (arm 3, A-R224 item 3, 2026-10-23), logged `land_link_behind`, and R1
+//! walks it from there.
 //!
 //! **A refusal differs (A-R185c).** The host stalls here until reopen; the sim walks up (slice-2
 //! residual): a refused copy lands empty and R1 copies it from the root.
@@ -343,13 +345,50 @@ fn m10_c7_a_late_copy_past_the_cutoff_links_nothing() {
     );
 }
 
-/// C2: A holds one record short of the cutoff. It links nothing.
+/// C2, re-cut by arm 3 (A-R224 item 3): A holds one record short of the cutoff. It links the new
+/// generation onto the prior one at its own head, logged `land_link_behind` once, and claims no
+/// catch-up: R1 walks it from there. Nothing at or below A's own head is sent to it again, the
+/// partition goes `Active`, and A applies the write. Until arm 3 this copy linked nothing
+/// (`held_below_base`) and was walked from the root.
 #[retcd_test]
-fn m10_c7_a_late_copy_below_the_cutoff_links_nothing() {
-    assert_refused(
-        Held::Below,
-        "m10_c7_a_late_copy_below_the_cutoff_links_nothing",
-        "held_below_base",
+fn m10_c7_a_late_copy_below_the_cutoff_links_at_its_own_head() {
+    let method = "m10_c7_a_late_copy_below_the_cutoff_links_at_its_own_head";
+    let own_head = Seq(CUTOFF.0 - 1);
+    let ran = run(&plan(Held::Below));
+    assert_eq!(
+        ran.link,
+        (Some(PRIOR), own_head),
+        "A links the new generation onto the prior one at its own head"
+    );
+    let behind = logged(method, "land_link_behind");
+    assert_eq!(behind.len(), 1, "one link, logged once: {behind:?}");
+    assert_eq!(
+        (
+            behind[0].get("head").and_then(serde_json::Value::as_u64),
+            behind[0].get("base").and_then(serde_json::Value::as_u64),
+        ),
+        (Some(own_head.0), Some(CUTOFF.0)),
+        "{behind:?}"
+    );
+    assert_eq!(logged(method, "land_link_refused").len(), 0);
+    assert_eq!(logged(method, "land_link_inherited").len(), 0);
+    let sent = sent_to_a(&ran.trace);
+    tracing::info!(?sent, "c7.below.sent_to_a");
+    assert!(
+        sent.iter().all(|seq| *seq > own_head),
+        "nothing at or below A's own head is sent to A again: {sent:?}"
+    );
+    let recovered = recovered_on_primary(&ran.trace);
+    assert!(
+        recovered
+            .iter()
+            .any(|(at, mode, _)| *at > BACK_AT && *mode == PartitionMode::Active),
+        "the partition goes active once A is back: {recovered:?}"
+    );
+    assert!(
+        ran.applied > CUTOFF.0,
+        "A applies the write: applied {}",
+        ran.applied
     );
 }
 

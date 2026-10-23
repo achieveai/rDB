@@ -48,6 +48,7 @@ use rdb_core::contracts::trace::{
 };
 use rdb_core::contracts::transport::{Frame, PeerLabel, TransportEvent};
 use rdb_core::contracts::version::ENVELOPE_VERSION;
+use rdb_core::recovery::BARRIER_ATTEMPTS;
 use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent};
 use rdb_sim::harness::trace::validate;
@@ -201,6 +202,9 @@ fn recovery_seed(at: u64, event: RecoveryEvent) -> SeedEvent {
 struct Run {
     trace: Trace,
     primary: Option<(Lineage, CopyId, Seq)>,
+    /// B's engine at the end: its real durable mark in the prior generation, and the flushes
+    /// that claimed more than they synced ([`StorageOp::FalseDurable`]).
+    b_engine: (DurableSeq, Vec<AppliedSeq>),
 }
 
 /// Run `plan` to its limits. Nothing is installed by hand: R1 builds its primary from F1's
@@ -223,9 +227,23 @@ fn run_plan(plan: &RunPlan) -> Run {
             let tracker = primary.tracker();
             (tracker.lineage(), tracker.own(), tracker.head())
         });
+    let b_engine = runner
+        .dispatcher()
+        .engine(B_NODE)
+        .map(|engine| {
+            (
+                engine.durable(PARTITION, Generation(1)),
+                engine.false_claims().to_vec(),
+            )
+        })
+        .expect("B has an engine");
     let trace = runner.finish().expect("a trace");
     validate(&trace).expect("a well-formed trace");
-    Run { trace, primary }
+    Run {
+        trace,
+        primary,
+        b_engine,
+    }
 }
 
 /// The lineage F1 selected: the one the recovery commits and R1's primary must serve.
@@ -392,9 +410,17 @@ fn buffered_b_plan() -> RunPlan {
 /// **every** proof, so no ownership was proposed before `DurableAt{B}`; it commits, and the oracle
 /// finds nothing.
 ///
-/// The twin: B's sync is a `StorageOp::FalseDurable` (it reports success and syncs nothing). B's
-/// one request is `SyncWithheld{B, 50, Short{durable 45}}`, B has no `SyncProven`, no CAS is ever
-/// proposed, and F1's post-selection deadline blocks naming B alone.
+/// The twins: B's sync is a `StorageOp::FalseDurable` (it reports success and syncs nothing).
+/// A false claim never proves: its request is `SyncWithheld{B, 50, Short{durable 45}}`, because
+/// the proof is read from B's engine watermark and never from the claim.
+/// - One lie: F1's barrier retry (R2-A1) asks B again. That sync is real, so B proves 50, its
+///   engine reads durable 50, and the one CAS comes only after B's second sync.
+/// - [`BARRIER_ATTEMPTS`] lies: every attempt is withheld, B stays durable at 45, no CAS is ever
+///   proposed, and the last attempt's deadline blocks naming B alone.
+///
+/// Re-cut 2026-10-23 (W9 1d8295a). Before the retry, one lie blocked at the first deadline. Cuts:
+/// counting a short sync as proven at dispatch's `sync_wal_through` turns both twins red, and
+/// so does removing the retry.
 ///
 /// The `DurableAt` delivery is not itself a trace kind (`ModuleDispatch` names no event kind), so
 /// `SyncProven` stands for it: the provider records it as it routes `DurableAt` (B-R55a).
@@ -494,33 +520,86 @@ fn m7b_104_buffered_entries_from_a_live_survivor_are_fsynced_before_the_barrier_
     );
     oracle_is_clean(trace);
 
-    // Twin: B's sync is false. No proof for B, no CAS; the deadline names B alone.
-    let mut plan = buffered_b_plan();
-    plan.provenance = rdb_core::contracts::trace::Provenance::Authored {
-        case: String::from("m7b-104-false-durable-b"),
-    };
-    plan.storage_ops = vec![StorageOp::FalseDurable {
-        node: B_NODE,
-        through: AppliedSeq(HEAD),
-    }];
+    // Twin 1: B's first sync is false; the lie is spent once (`take_planned`). It moves
+    // nothing and reports no durable prefix, so F1 withholds it short at 45 and counts nothing.
+    // The barrier's retry (R2-A1, 1d8295a) asks B again, that sync is real, and only then is B
+    // proven and the CAS proposed. Re-cut 2026-10-23: before the retry this twin blocked.
+    let twin = run_plan(&false_durable_b(1));
+    let trace = &twin.trace;
+    let sync = syncs(trace);
+    tracing::info!(events = trace.events.len(), ?sync, b_engine = ?twin.b_engine, "m7b_104 twin");
+    let b_syncs: Vec<Sync> = sync.iter().copied().filter(|s| s.copy == B).collect();
+    assert_eq!(
+        b_syncs.first().map(|s| (s.cutoff, s.fate)),
+        Some((
+            Seq(HEAD),
+            SyncFate::Withheld(SyncWithheldReason::Short {
+                durable: DurableSeq(B_DURABLE)
+            })
+        )),
+        "B's first request is withheld, short at its preloaded 45: {sync:?}"
+    );
+    assert!(
+        b_syncs[1..].iter().all(|s| s.fate
+            == SyncFate::Proven {
+                durable: DurableSeq(HEAD)
+            }),
+        "every later proof of B is a real durable 50: {sync:?}"
+    );
+    assert_eq!(
+        twin.b_engine,
+        (DurableSeq(HEAD), vec![AppliedSeq(HEAD)]),
+        "B's engine made one false claim and is really durable at 50"
+    );
+    let cas = positions(trace, is_recovery_cas);
+    let b_proven = b_syncs.get(1).map(|s| s.index).expect("the retry proves B");
+    assert!(
+        cas.first().is_some_and(|first| *first > b_proven),
+        "the recovery CAS follows B's real proof at {b_proven}: {cas:?}"
+    );
+    assert!(!facts(trace)
+        .iter()
+        .any(|effect| matches!(effect, RecoveryEffect::BlockPromotion { .. })));
+    assert_eq!(
+        twin.primary,
+        Some((selected_root(trace), B, Seq(HEAD))),
+        "R1's primary from Recovered"
+    );
+    oracle_is_clean(trace);
+
+    // Twin 2: B's sync is false on every attempt. No proof for B, no CAS; the last attempt's
+    // deadline names B alone.
+    // Three attempts wait 1, 2 and 4 discovery windows (2 s here) after discovery: the last
+    // deadline is near t16000, so this twin runs past the plan's 6 s.
+    let mut plan = false_durable_b(BARRIER_ATTEMPTS);
+    plan.limits.deadline = Tick(20_000);
     let twin = run_plan(&plan);
     let trace = &twin.trace;
     let sync = syncs(trace);
-    tracing::info!(events = trace.events.len(), ?sync, "m7b_104 twin");
+    tracing::info!(events = trace.events.len(), ?sync, b_engine = ?twin.b_engine, "m7b_104 liar");
     let b_fates: Vec<(Seq, SyncFate)> = sync
         .iter()
         .filter(|s| s.copy == B)
         .map(|s| (s.cutoff, s.fate))
         .collect();
+    let attempts = usize::try_from(BARRIER_ATTEMPTS).expect("small");
     assert_eq!(
         b_fates,
-        vec![(
-            Seq(HEAD),
-            SyncFate::Withheld(SyncWithheldReason::Short {
-                durable: DurableSeq(B_DURABLE)
-            })
-        )],
-        "B's one request is withheld, short at its preloaded 45"
+        vec![
+            (
+                Seq(HEAD),
+                SyncFate::Withheld(SyncWithheldReason::Short {
+                    durable: DurableSeq(B_DURABLE)
+                })
+            );
+            attempts
+        ],
+        "each of B's {attempts} requests is withheld, short at its preloaded 45"
+    );
+    assert_eq!(
+        twin.b_engine.0,
+        DurableSeq(B_DURABLE),
+        "B's engine is still durable at 45 only"
     );
     assert_eq!(
         positions(trace, is_recovery_cas),
@@ -551,6 +630,21 @@ fn m7b_104_buffered_entries_from_a_live_survivor_are_fsynced_before_the_barrier_
     );
     assert_eq!(twin.primary, None, "no primary without a recovery");
     oracle_is_clean(trace);
+}
+
+/// M7B-104's plan with B's next `lies` syncs false ([`StorageOp::FalseDurable`] through 50).
+fn false_durable_b(lies: u32) -> RunPlan {
+    let mut plan = buffered_b_plan();
+    plan.provenance = rdb_core::contracts::trace::Provenance::Authored {
+        case: format!("m7b-104-false-durable-b-x{lies}"),
+    };
+    plan.storage_ops = (0..lies)
+        .map(|_| StorageOp::FalseDurable {
+            node: B_NODE,
+            through: AppliedSeq(HEAD),
+        })
+        .collect();
+    plan
 }
 
 // ---------------------------------------------------------------------------------------------
