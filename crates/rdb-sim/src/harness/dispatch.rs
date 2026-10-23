@@ -60,7 +60,10 @@ use rdb_core::{
     authority::Authority,
     publication::{Publication, ReplicationView},
     recovery::{Recovery, RecoveryPhase},
-    replication::{wire, Replication},
+    replication::{
+        append::{AppendReceiver, Head, ReceiverInit},
+        wire, Replication,
+    },
     transaction::Transaction,
 };
 
@@ -2456,7 +2459,8 @@ impl Dispatcher {
             let first =
                 self.landed
                     .insert((watch.member, watch.partition, watch.result.new_generation));
-            if first && in_barrier(&watch.result, watch.member) {
+            let barrier = in_barrier(&watch.result, watch.member);
+            if first && barrier {
                 self.engine_mut(watch.member).inherit(
                     watch.partition,
                     watch.result.retained_status_map.predecessor_generation,
@@ -2464,6 +2468,13 @@ impl Dispatcher {
                     watch.result.selected.cutoff_seq,
                 )?;
             }
+            // Ruling A-R185 (C1, C7): a member outside the barrier links the new generation now,
+            // before its `Recovered` re-anchors its receiver, as the host's `Host::land` does.
+            let caught_up = if first && !barrier {
+                self.land_link(watch.member, watch.partition, &watch.result)
+            } else {
+                None
+            };
             // Under the member's current boot ([`Self::boot`]), which only `restart` changes. A
             // pinned member the cluster never registered is a scenario fault.
             let boot = *self
@@ -2480,8 +2491,150 @@ impl Dispatcher {
                 EventKind::Kernel(KernelEvent::Recovered(watch.result)),
             )?;
             self.routed.insert(id);
+            // Then it reports itself caught up at the cutoff to the F1 that committed, as the
+            // host does in B-R59's shape; F1's `Committed` arm pins it and syncs it.
+            if let Some(event) = caught_up {
+                let kind = EventKind::Kernel(KernelEvent::Recovery(event));
+                let site = (watch.emitter, watch.partition, watch.correlation);
+                let id = self.schedule(scheduler, now, site, kind)?;
+                self.routed.insert(id);
+            }
         }
         Ok(count)
+    }
+
+    /// Ruling A-R185 (critic-d7fix (c), C2, C3, C6, C7): the twin of the host's
+    /// `Host::land_link`. `member` landed `result` outside its barrier, so it does not hold the
+    /// new generation. When it holds its newest older generation exactly through the cutoff,
+    /// with the cutoff digest there, it links the new generation onto it at the cutoff,
+    /// installs a receiver at the cutoff unless a live one is held (A-R185a), and answers the
+    /// `CopyCaughtUp` to send: caught up at the cutoff, nothing to copy. Otherwise it writes
+    /// nothing, sends nothing, and logs `land_link_refused` with the host's reason. Called once
+    /// per `(member, partition, generation)`: [`Self::landed`] dedups the landing.
+    ///
+    /// The host's chain-depth guard has no twin: the memory engine has no depth ceiling.
+    fn land_link(
+        &mut self,
+        member: NodeId,
+        partition: PartitionId,
+        result: &RecoveryResult,
+    ) -> Option<RecoveryEvent> {
+        let generation = result.new_generation;
+        let cutoff = result.selected.cutoff_seq;
+        let digest = result.selected.cutoff_digest;
+        let refused = |reason: &str| {
+            tracing::warn!(
+                node = member.0,
+                partition = partition.0,
+                generation = generation.0,
+                cutoff = cutoff.0,
+                reason,
+                "land_link_refused"
+            );
+            None
+        };
+        let Some(copy) = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|held| held.node == member)
+            .map(|held| held.copy)
+        else {
+            return refused("not_a_member");
+        };
+        let engine = self.engine_mut(member);
+        let held: Vec<Generation> = engine
+            .lineages()
+            .filter(|((p, _), _)| *p == partition)
+            .map(|((_, g), _)| *g)
+            .collect();
+        if held.iter().any(|g| *g >= generation) {
+            return refused("held_at_or_above_generation");
+        }
+        let Some(from) = held.into_iter().filter(|g| *g < generation).max() else {
+            return refused("anchor_generation_absent");
+        };
+        let head = Seq(engine.buffered_applied(partition, from).0);
+        if head < cutoff {
+            return refused("held_below_base");
+        }
+        if head > cutoff {
+            return refused("held_past_base");
+        }
+        let Some(at) = stored_digest(engine, (member, partition, from), cutoff) else {
+            return refused("no_record");
+        };
+        if at != digest {
+            return refused("base_digest_differs");
+        }
+        if engine.inherit(partition, from, generation, cutoff).is_err() {
+            return refused("link_refused");
+        }
+        tracing::info!(
+            node = member.0,
+            partition = partition.0,
+            from = from.0,
+            to = generation.0,
+            base = cutoff.0,
+            "land_link_inherited"
+        );
+        let held = self.replication.receiver(member, partition);
+        if let Some(kept) = held.filter(|held| !held.is_dormant()) {
+            // A live receiver re-anchors itself on `Recovered`, and a quarantined one stays
+            // quarantined: neither is replaced (A-R185a, as the host).
+            tracing::info!(
+                node = member.0,
+                partition = partition.0,
+                generation = generation.0,
+                kept_generation = kept.lineage().generation.0,
+                quarantined = kept.quarantine().is_some(),
+                "land_receiver_kept"
+            );
+        } else {
+            // Claims nothing durable: F1's sync proves the cutoff, and the next flush raises it.
+            let receiver = AppendReceiver::new(ReceiverInit {
+                config: result.committed.pinned_config.clone(),
+                own: copy,
+                lineage: Lineage {
+                    partition: result.committed.pinned_config.partition,
+                    generation,
+                    owner_epoch: result.committed.authority_view.lineage.owner_epoch,
+                },
+                head: Head {
+                    seq: cutoff,
+                    digest,
+                },
+                durable: DurableSeq(0),
+            });
+            match receiver {
+                Ok(receiver) => {
+                    self.replication.install_receiver(receiver);
+                    tracing::info!(
+                        node = member.0,
+                        partition = partition.0,
+                        generation = generation.0,
+                        head = cutoff.0,
+                        "land_receiver_installed"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        node = member.0,
+                        partition = partition.0,
+                        generation = generation.0,
+                        ?error,
+                        "land_link_receiver_refused"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(RecoveryEvent::CopyCaughtUp {
+            copy,
+            head: cutoff,
+            digest,
+        })
     }
 
     /// Release the held watches `released` picks, [`CONTROL_WATCH_MILLIS`] after `now`.
