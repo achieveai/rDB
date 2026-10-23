@@ -1,19 +1,25 @@
 //! M10 D14 (ruling A-R199): a connect failure moves on to another configured endpoint.
 //!
 //! A failure to connect wrote nothing (ADR-0015, note of 2026-09-18), so the client may try
-//! the next configured endpoint, and later operations start at the one that answered. A
+//! the next configured endpoint, and later operations start at the one it moved to. A
 //! failure after the request reached a socket is never moved: its outcome may be unknown.
 
 mod support;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use config_client::{GrpcClient, GrpcClientOptions};
-use config_core::{ConfigError, ConfigStore, GetRequest, MutationOutcome, PutRequest};
+use config_client::{GrpcClient, GrpcClientOptions, MtlsConfig, TlsMode};
+use config_core::{
+    ConfigError, ConfigStore, GetRequest, LeaderHint, MutationOutcome, NodeId, PutRequest,
+};
 use config_log::retcd_test;
+use config_testkit::tls::TlsFixture;
 
 use support::{Node, ResetServer};
+
+const SEED: u64 = 0x5eed_d014;
 
 fn options(budget: Duration) -> GrpcClientOptions {
     GrpcClientOptions {
@@ -154,4 +160,106 @@ async fn m10_d14_a_failure_after_sending_never_moves_on() {
         "the request never reached the socket"
     );
     live.shutdown().await;
+}
+
+/// D14 floor row 4 (review A2): a TLS refusal is a connect failure too, so it moves on.
+/// Two strangers, each ahead of a node this client trusts:
+/// - signed by another CA, which the client refuses during `connect()`;
+/// - signed by our CA but trusting only another, so it refuses the client's certificate
+///   and only the probe sees it (ADR-0015, fix-round note).
+///
+/// Each put lands once, on the trusted node, and nothing reaches the stranger.
+/// Cut: move only on a plain `connect()` error, and the probe case answers `Unavailable`.
+#[retcd_test]
+async fn m10_d14_a_tls_refusal_at_the_first_endpoint_moves_on_to_a_trusted_one() {
+    let cluster = support::cluster();
+    let ours = Arc::new(TlsFixture::new(cluster, SEED));
+    let theirs = Arc::new(TlsFixture::other_ca(cluster, SEED));
+    let picky = MtlsConfig {
+        ca_pem: theirs.ca_pem().as_bytes().to_vec(),
+        ..ours.node_mtls(NodeId(1))
+    };
+    let cases = [
+        ("signed by another CA", theirs.node_mtls(NodeId(1))),
+        ("refuses our client certificate", picky),
+    ];
+    for (case, stranger_tls) in cases {
+        let stranger = Node::start_with(TlsMode::MutualTls(stranger_tls), cluster).await;
+        let trusted =
+            Node::start_with(TlsMode::MutualTls(ours.node_mtls(NodeId(2))), cluster).await;
+        let client = GrpcClient::connect(
+            vec![stranger.endpoint.clone(), trusted.endpoint.clone()],
+            GrpcClientOptions {
+                tls: TlsMode::MutualTls(ours.client_mtls("svc-a")),
+                ..options(Duration::from_secs(5))
+            },
+        )
+        .expect("client connects");
+
+        let response = client
+            .put(put())
+            .await
+            .unwrap_or_else(|e| panic!("{case}: the trusted node answers: {e:?}"));
+        assert_eq!(response.outcome, MutationOutcome::Applied, "{case}");
+        let stats = client.stats();
+        assert_eq!(
+            (stats.sends, stats.reconnects),
+            (1, 1),
+            "{case}: one refused dial, one send: {stats:?}"
+        );
+        assert_eq!(
+            (stranger.store.call_count(), trusted.store.call_count()),
+            (0, 1),
+            "{case}: nothing reached the stranger"
+        );
+        stranger.shutdown().await;
+        trusted.shutdown().await;
+    }
+}
+
+/// Review A4: the first endpoint answers `NotLeader` with a hint to the second, which is
+/// down. Nothing was applied, and the error says no leader could be reached. It names the
+/// down endpoint with its reason and the one that answered, rather than claiming no endpoint
+/// could be reached.
+/// Cut: drop the "reached" half, and the text says no endpoint could be reached.
+#[retcd_test]
+async fn m10_d14_a_follower_that_answers_with_its_leader_down_says_no_leader_was_reached() {
+    const BUDGET: Duration = Duration::from_millis(1500);
+    let follower = Node::start().await;
+    let down = dead_endpoint().await;
+    follower.store.set_error(Some(ConfigError::NotLeader {
+        hint: Some(LeaderHint {
+            node_id: NodeId(2),
+            endpoint: down.clone(),
+        }),
+    }));
+    let client = GrpcClient::connect(
+        vec![follower.endpoint.clone(), down.clone()],
+        options(BUDGET),
+    )
+    .expect("client connects");
+
+    let error = client.put(put()).await.expect_err("the leader is down");
+    let ConfigError::Unavailable { reason } = &error else {
+        panic!("a leader that never connected is Unavailable: {error:?}");
+    };
+    assert!(
+        reason.starts_with("no rEtcd leader could be reached: "),
+        "{reason}"
+    );
+    let (unreached, answered) = reason
+        .split_once("; reached, but not the leader: ")
+        .unwrap_or_else(|| panic!("the endpoint that answered is named: {reason}"));
+    assert!(
+        unreached.contains(down.as_str()) && !unreached.contains(follower.endpoint.as_str()),
+        "the down leader, with its reason, and only it: {reason}"
+    );
+    assert_eq!(answered, follower.endpoint, "{reason}");
+    let stats = client.stats();
+    assert_eq!(
+        (stats.sends, stats.hint_follows, follower.store.call_count()),
+        (1, 1, 1),
+        "{stats:?}"
+    );
+    follower.shutdown().await;
 }

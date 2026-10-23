@@ -586,7 +586,10 @@ async fn m3_64_unavailable_before_submission_reconnect_bounded() {
     );
 
     let stats = client.stats();
-    assert!(stats.sends <= 4, "stats={stats:?}");
+    // A stopped node's client plane may still answer, refusing `unavailable: stopped` before
+    // anything enters a log: one send at most, never a retry of it.
+    assert!(stats.sends <= 1, "at most the one refused send: {stats:?}");
+    assert!(stats.reconnects <= 3, "reconnects are bounded: {stats:?}");
 
     // `before` was captured against three running nodes; only the two still running are
     // comparable after the stop.
