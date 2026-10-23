@@ -314,12 +314,29 @@ pub const A1_P1_HOLD_MILLIS: u64 = 2_500;
 /// The A1/P1 case: where B and C survive. `Synchronize` preloads seqs 1..=10 as client writes
 /// with request ids 1..=10, so those ids are taken.
 pub const A1_P1_HEAD: u64 = 10;
-/// The A1/P1 case: the tick L1 lifts B's resume hold. Recovery fences at `PLAN_AT + 1`, the
-/// survivor window closes 2 s later, and L1 holds writes for `resume_hold_millis` after that.
-pub const A1_P1_RESUMES_AT: u64 = PLAN_AT + 1 + 2_000 + Budgets::SPEC_DEFAULTS.resume_hold_millis;
-/// The A1/P1 case: the tick its write is submitted on B. After the resume hold: submitted
-/// inside it, L1 refuses the write `ProtectionPaused` and nothing is dispatched.
-pub const A1_P1_SUBMIT_AT: u64 = A1_P1_RESUMES_AT + 300;
+/// The A1/P1 case: the tick L1 on B resumes writes (measured 2026-10-23 at int 1f530a7, and
+/// asserted by M7V-47's A1/P1 row). Recovery fences at `PLAN_AT + 1`, and the survivor window
+/// closes 2 s later at the cutoff, where the recovery lands on B and L1 starts paused. The host's
+/// first flush runs in that same tick, before R1 has walked the barrier's copies up. The next
+/// flush, one `HOST_FLUSH_EVERY_MILLIS` later, brings the copies' progress, the barrier goes
+/// durable, and L1 resumes in that round. It is the generation's first resume, so it
+/// skips the 5 s resume hold (ruling A-R165(2)); the hold applies to a resume after a later
+/// pause, which M7B-141 owns.
+pub const A1_P1_RESUMES_AT: u64 = PLAN_AT + 1 + 2_000 + super::run::HOST_FLUSH_EVERY_MILLIS;
+/// The A1/P1 case: the tick its write is submitted on B. Submitted while L1 is paused, L1 refuses
+/// it `ProtectionPaused`; submitted before A1's grant on B (`ACQUIRE_AFTER_CUTOFF_MILLIS` after
+/// the cutoff), A1 refuses it. The assert below keeps it after both.
+///
+/// The value, 7303, is kept from when the first resume held 5 s (fence + window + hold + 300),
+/// not re-derived from [`A1_P1_RESUMES_AT`]: every A1/P1 row's ticks were derived from it,
+/// among them m7v_86's cut, kernel-a's `SUBMIT`, kernel-b's stack rows and the held reply.
+/// Moving it re-derives each of those.
+pub const A1_P1_SUBMIT_AT: u64 = 7_303;
+const _: () = assert!(
+    A1_P1_SUBMIT_AT > A1_P1_RESUMES_AT
+        && A1_P1_SUBMIT_AT > PLAN_AT + 1 + 2_000 + super::run::ACQUIRE_AFTER_CUTOFF_MILLIS,
+    "the write is submitted after L1 on B resumes and after A1's grant on B"
+);
 /// The A1/P1 case: its write's request id. The first id the preload did not use: reusing one of
 /// the preloaded ids under another digest is refused `RequestIdReuse`.
 pub const A1_P1_REQUEST: RequestId = RequestId(A1_P1_HEAD + 1);

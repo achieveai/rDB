@@ -715,21 +715,8 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
         Some(cases::F1_R1_FIRST_HOST_ROUND_AT),
         "the host's first round is at the latest cutoff F1 can choose"
     );
-    let admissions: Vec<(u64, bool)> = trace
-        .events
-        .iter()
-        .filter(|event| event.node == cases::B_NODE)
-        .filter_map(|event| match &event.kind {
-            TraceKind::KernelNoted {
-                module: ModuleName::Protection,
-                note: KernelNote::SetAdmission { state },
-                ..
-            } => Some((event.logical_tick, state.allow)),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        admissions,
+        scenario_run::admissions(trace, cases::B_NODE),
         vec![
             (cases::F1_R1_PAUSED_AT, false),
             (cases::F1_R1_FIRST_HOST_ROUND_AT, true)
@@ -1015,6 +1002,9 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
 /// decision, because A1's `Fence` precedes its `Answer`.
 ///
 /// **Kernel half**, read from the trace:
+/// - L1 on B starts paused at the cutoff and resumes once at [`cases::A1_P1_RESUMES_AT`], the first host
+///   flush that finds the barrier durable, with no hold (A-R165(2)). It does not pause again
+///   before the submit.
 /// - On the write's correlation, A1 decides `Dispatch` and `Publication` `Valid` in generation 2,
 ///   and B publishes seq 11 there.
 /// - After that publish, the `RecoveredFact` that creates generation 3 is recorded.
@@ -1069,6 +1059,28 @@ fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_runs_through_the_r
             if deadline.0 == cases::A1_P1_MAX_TICKS),
         "the case runs to its deadline inside its event budget: {:?}",
         run.report.stop
+    );
+
+    // L1 on B: paused from the cutoff, resumed once at the first host flush that finds the barrier
+    // durable, with no hold (A-R165(2)), and not paused again before the write is submitted.
+    let admitted = scenario_run::admissions(&run.trace, cases::B_NODE);
+    tracing::info!(?admitted, "a1p1 admissions");
+    assert_eq!(
+        admitted.get(..2),
+        Some(
+            &[
+                (cases::PLAN_AT + 1 + 2_000, false),
+                (cases::A1_P1_RESUMES_AT, true)
+            ][..]
+        ),
+        "L1 on B starts paused at the cutoff and resumes at A1_P1_RESUMES_AT: {admitted:?}"
+    );
+    assert!(
+        !admitted
+            .iter()
+            .any(|(at, allow)| !allow
+                && (cases::A1_P1_RESUMES_AT..=cases::A1_P1_SUBMIT_AT).contains(at)),
+        "L1 on B stays resumed through the submit: {admitted:?}"
     );
 
     // Kernel half.

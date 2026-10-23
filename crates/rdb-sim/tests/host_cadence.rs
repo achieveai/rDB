@@ -120,23 +120,6 @@ fn run(plan: &RunPlan) -> Ran {
     }
 }
 
-/// Every `SetAdmission` L1 published for `node`, as `(tick, allow)`, in trace order.
-fn admissions(trace: &Trace, node: NodeId) -> Vec<(u64, bool)> {
-    trace
-        .events
-        .iter()
-        .filter(|event| event.node == node)
-        .filter_map(|event| match &event.kind {
-            TraceKind::KernelNoted {
-                module: ModuleName::Protection,
-                note: KernelNote::SetAdmission { state },
-                ..
-            } => Some((event.logical_tick, state.allow)),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Every committed control CAS on `key`, as `(trace index, tick)`.
 fn committed_cas(trace: &Trace, key: ControlKey) -> Vec<(usize, u64)> {
     trace
@@ -206,7 +189,7 @@ fn m7v_93_a_recovered_scenario_flushes_after_the_cutoff_and_l1_resumes() {
     // The kernel half: L1 on the primary resumes, after a flush and the resume hold.
     let ran = run(&plan);
     let trace = &ran.trace;
-    let admitted = admissions(trace, B_NODE);
+    let admitted = scenario_run::admissions(trace, B_NODE);
     tracing::info!(?admitted, census = ?scenario_run::census(trace), "m7v_93 admissions");
     let resumed = admitted
         .iter()

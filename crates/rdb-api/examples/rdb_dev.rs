@@ -6,7 +6,10 @@
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
 //!                                           [--control host:port[,host:port...]] [--requests F]
 //!                                           [--abort-after-commit] [--pause-before-sync N=MS]
+//! cargo run -p rdb-api --example rdb_dev -- --help
 //! ```
+//!
+//! `--help` (or `-h`) prints this text to stdout and exits 0; arguments after it are not read.
 //!
 //! `--control E` uses an external rEtcd (such as `scripts/local-cluster.sh up`) at the client
 //! endpoints E instead of three in-process voters. `--dir` is then never removed, so a second
@@ -396,6 +399,27 @@ struct Args {
     /// `--pause-before-sync <node>=<ms>`, repeatable: that node's next barrier sync sleeps
     /// `ms` before it fsyncs, once (A-R198).
     pause_before_sync: Vec<(NodeId, Duration)>,
+    /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
+    help: bool,
+}
+
+/// The usage: this file's own `//!` header, so the help and the source comment cannot drift.
+/// The header's code fences are left out; everything else is printed as written.
+fn usage() -> String {
+    include_str!("rdb_dev.rs")
+        .lines()
+        .take_while(|line| line.starts_with("//!"))
+        .map(|line| {
+            line.strip_prefix("//! ")
+                .or_else(|| line.strip_prefix("//!"))
+                .unwrap_or(line)
+        })
+        .filter(|line| !line.starts_with("```"))
+        .fold(String::new(), |mut text, line| {
+            text.push_str(line);
+            text.push('\n');
+            text
+        })
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -413,6 +437,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         requests: None,
         abort_after_commit: false,
         pause_before_sync: Vec::new(),
+        help: false,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -421,6 +446,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--help" | "-h" => {
+                parsed.help = true;
+                return Ok(parsed);
+            }
             "--abort-after-commit" => parsed.abort_after_commit = true,
             "--pause-before-sync" => parsed
                 .pause_before_sync
@@ -508,6 +537,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if args.help {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
     // An existing --dir goes to `Db::open`, which decides whether it can be reopened (M10
     // S1-1); rdb_dev refuses nothing about it itself.
     let mut config = config_log::LogConfig::for_application("rdb_dev");
@@ -775,6 +808,9 @@ struct Seen {
     faults: Vec<String>,
     /// Each node's stall line as last printed, until it clears.
     stalled: std::collections::BTreeMap<u32, String>,
+    /// While `wait ready` runs: its own `reached ready` line says ready, so the poller does not
+    /// (k237, lead ruling on the G4 follow-up: the poller's `ready` printed before it).
+    awaiting_ready: bool,
 }
 
 impl Progress {
@@ -1171,9 +1207,13 @@ fn stopped_owner_step(seen: &mut Seen, restart_note: Option<&str>) -> Option<Str
 }
 
 /// The `ready` or `not ready` line for `admits` and `reason`, given what `seen` holds as
-/// printed, as [`ready_step`] describes.
+/// printed, as [`ready_step`] describes. A bare `ready` waits while `wait ready` runs: that
+/// wait ends with its own line and records it as printed ([`wait_ready_line`]).
 fn step_line(seen: &mut Seen, admits: bool, reason: Option<String>) -> Option<String> {
     if admits == seen.ready && reason == seen.reason {
+        return None;
+    }
+    if seen.awaiting_ready && admits && reason.is_none() {
         return None;
     }
     let line = match (admits, &reason) {
@@ -3854,7 +3894,8 @@ const WAIT_PROGRESS_EVERY: Duration = Duration::from_secs(10);
 /// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
 /// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
 /// gives the next step). The run then exits 1. A timeout is said, and is not an error. A wait
-/// that reached ready records that as printed, so the poller does not say it a second time.
+/// that reached ready records that as printed, so the poller does not say it a second time, and
+/// while it waits the poller holds back a bare `ready`, so it never comes before this line.
 ///
 /// It asks `wait` for at most `every` at a time, and after each slice that ran out it says
 /// `still waiting for ready: recovery phase P` with node 1's phase then: the tester saw ~40 s
@@ -3867,6 +3908,11 @@ fn wait_ready_line(
     mut said: impl FnMut(&str),
 ) -> Result<String, String> {
     use rdb_api::db::ReadyError;
+    progress
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .awaiting_ready = true;
     let started = Instant::now();
     let mut left = within;
     let answer = loop {
@@ -3891,18 +3937,22 @@ fn wait_ready_line(
         }
     };
     let millis = started.elapsed().as_millis();
-    let (outcome, line) = match &answer {
-        Ok(()) => {
-            // Said here, so the poller does not say it again (k237): `ready` with no reason is
-            // now what was printed. A later change, or a reason, is still the poller's to say.
-            let mut seen = progress
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        // Said by the caller, so the poller says it neither before nor after (k237): `ready`
+        // with no reason is now what was printed. A later change, or a reason, is still the
+        // poller's to say.
+        let mut seen = progress
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.awaiting_ready = false;
+        if answer.is_ok() {
             seen.ready = true;
             seen.reason = None;
-            ("reached", Ok(format!("reached ready in {millis}ms")))
         }
+    }
+    let (outcome, line) = match &answer {
+        Ok(()) => ("reached", Ok(format!("reached ready in {millis}ms"))),
         Err(e @ ReadyError::TimedOut { .. }) => (
             "timed_out",
             Ok(format!(
@@ -5143,6 +5193,7 @@ mod tests {
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
+            help: false,
         };
         let voters_under_dir = AtomicBool::new(false);
         let code = run(&args, |config, _, _| {
@@ -5297,6 +5348,7 @@ mod tests {
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
+            help: false,
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {
@@ -5842,6 +5894,65 @@ mod tests {
         assert_eq!(line, "timeout waiting for recovered after 0s");
     }
 
+    /// G4 follow-up (stress run at edd664e, `g4/n2.out`): the poller printed `ready` before
+    /// `wait ready`'s own `reached ready`, when it saw writes admitted before the wait returned.
+    /// While the wait runs the poller holds back a bare `ready`; after it, the wait's line is
+    /// what was printed. A wait that times out leaves `ready` to the poller. Unit.
+    #[test]
+    fn the_poller_never_says_ready_before_wait_ready_does() {
+        use rdb_api::db::ReadyError;
+        let progress = Progress::default();
+        let mut polled = Vec::new();
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_secs(1),
+            WAIT_PROGRESS_EVERY,
+            |_| {
+                // The poller, mid-wait, sees writes admitted.
+                polled.push(step_line(&mut progress.inner.lock().unwrap(), true, None));
+                Ok(())
+            },
+            |_| (),
+        )
+        .expect("ready");
+        assert_eq!(polled, vec![None], "the poller held back its `ready`");
+        assert!(line.starts_with("reached ready in "), "{line}");
+        let mut seen = progress.inner.lock().unwrap();
+        assert!(!seen.awaiting_ready);
+        assert_eq!(
+            step_line(&mut seen, true, None),
+            None,
+            "said once, by the wait"
+        );
+        assert_eq!(
+            step_line(&mut seen, true, Some("why".to_owned())).as_deref(),
+            Some("ready for now; why"),
+            "a reason is still the poller's to say"
+        );
+        drop(seen);
+
+        let progress = Progress::default();
+        let line = wait_ready_line(
+            &progress,
+            Duration::from_millis(10),
+            WAIT_PROGRESS_EVERY,
+            |_| {
+                Err(ReadyError::TimedOut {
+                    within_ms: 10,
+                    phase: "Discovering".to_owned(),
+                })
+            },
+            |_| (),
+        )
+        .expect("a timeout is said");
+        assert!(line.starts_with("timeout waiting for ready"), "{line}");
+        assert_eq!(
+            step_line(&mut progress.inner.lock().unwrap(), true, None).as_deref(),
+            Some("ready"),
+            "after a timeout, ready is the poller's to say"
+        );
+    }
+
     /// Tester D8 (aa3b82e): from a folder's second open on, the request floor `(n-1)<<40` puts
     /// every write the app sends above `DAMAGE_REQUEST_BASE`, and the waits-on line called the
     /// app's own put "an admin damage write" and hid its id. The label now goes by origin: only
@@ -5915,6 +6026,7 @@ mod tests {
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
+            help: false,
         };
         let code = run(&args, Db::open);
         let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
@@ -5930,6 +6042,35 @@ mod tests {
             "{said}"
         );
         assert_eq!(code, ExitCode::from(1), "a stopped wait exits 1");
+    }
+
+    /// k325 P1: `--help` and `-h` ask for the usage, which is this file's `//!` header without
+    /// its comment markers or code fences. Before, both were an unknown argument (exit 2) and the
+    /// help lived only in the source. `main` prints it to stdout and exits 0. Unit.
+    #[test]
+    fn help_asks_for_the_header_s_usage() {
+        let args = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        for flag in ["--help", "-h"] {
+            assert!(args(&[flag]).expect(flag).help, "{flag}");
+            assert!(
+                args(&["--keep", flag, "--not-a-flag"]).expect(flag).help,
+                "{flag}: what follows it is not read"
+            );
+        }
+        assert!(!args(&[]).expect("defaults").help, "off unless asked");
+        let text = usage();
+        assert!(
+            text.starts_with("`rdb_dev`: three rDB nodes and three rEtcd voters"),
+            "{text}"
+        );
+        for says in [
+            "[--abort-after-commit] [--pause-before-sync N=MS]",
+            "put <object> <value> [--if-version N]",
+            "The JSONL log goes to `<log-dir>/rdb_dev.jsonl`",
+        ] {
+            assert!(text.contains(says), "{says}");
+        }
+        assert!(!text.contains("//!") && !text.contains("```"), "{text}");
     }
 
     /// A-R198: `--pause-before-sync N=MS` parses, refuses bad input naming the flag, and arms
@@ -6266,6 +6407,76 @@ mod tests {
             Some(b"zqv1".to_vec()),
             "run 1's write"
         );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// k325 P2 (k326): a put and an `admin clear` refused for a newer build's record say the
+    /// next step, `open the folder with the newer build`, as embed.md does. Before, the put said
+    /// only what it met and the clear only `not cleared`. Kind, retry and `no_mutation` are
+    /// unchanged (A-R200). Integration (~3 s): three real rEtcd voters and one open.
+    #[test]
+    fn a_newer_build_s_refusal_names_the_next_step() {
+        use rdb_core::contracts::errors::ErrorKind;
+        const STEP: &str = "; open the folder with the newer build";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let cluster = rt.block_on(
+            Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS)
+                .start(),
+        );
+        rt.block_on(cluster.leader());
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                cluster.client_endpoints(),
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            dir: root.path().join("run"),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+        };
+        let mut db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("opens");
+        db.wait_ready(Duration::from_secs(60)).expect("ready");
+        db.put(b"x", b"1", None).expect("x is written");
+        damage_record(&db, "admin damage x --as newer").expect("the line parses");
+
+        let put = db
+            .put(b"x", b"2", None)
+            .expect_err("a newer build's record");
+        let clear = db
+            .write(b"x", Change::Clear, None)
+            .expect_err("a newer build's record");
+        for (what, error, ends) in [
+            ("put", &put.error, STEP.to_owned()),
+            ("clear", &clear.error, format!("{STEP}; not cleared")),
+        ] {
+            assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::IncompatibleVersion, RetryRule::Quarantine, true),
+                "{what}: {error:?}"
+            );
+            assert!(
+                error.detail.contains("written by a newer build: ")
+                    && error.detail.ends_with(&ends),
+                "{what}: {error:?}"
+            );
+        }
         db.shutdown();
         rt.block_on(cluster.shutdown());
     }
