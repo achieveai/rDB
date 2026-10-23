@@ -73,7 +73,7 @@ $B --dir <D> [--log-dir <L>] <command>
 | Command | Does |
 |---|---|
 | `write --records N [--partition P] [--generation G] [--abort]` | Commits the next N (1..=1000000) canonical batches of lineage (P, G), default (1, 1). Resumes after the lineage's applied seq and head digest (read through the chain), so a second run never re-commits seq 1. Refused (exit 8) on a sealed or staging lineage. |
-| `inherit --partition P --from G1 --to G2 --base B [--abort]` | (P, G2) starts at (P, G1)'s state at seq B. Linked when G1's applied is B; copied when it is above B (a late write). Same args again: no-op (`inherit_noop`). |
+| `inherit --partition P --from G1 --to G2 --base B [--abort]` | (P, G2) starts at (P, G1)'s state at seq B. Linked when G1's applied is B; copied when it is above B (a late write), or when G1 already reads through 32 levels (the flatten, A-R166). Same args again: no-op (`inherit_noop`). |
 | `delete [--partition P] [--generation G]` | Commits the next seq as a delete of the canonical user key `k`, with its chained History record. A tombstone in a linked lineage. |
 | `read [--partition P] [--generation G] [--ns user|dedup|history|progress|meta] [--key-hex H]` | One record as (P, G) sees it through the chain: `version=` and `from=<generation>`. Default key: `k` (user) or the progress key. **Read-only** (`open_read_only`): no lock, writes no file, so it works while a writer holds the database. |
 | `snapshot [--partition P] [--generation G]` | Every record of (P, G)'s `RocksSnapshot`, through the chain. **Read-only** like `read`: no lock, writes no file. |
