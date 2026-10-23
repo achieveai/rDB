@@ -340,7 +340,19 @@
 //!                                         app then holds, with its request, and `status` says
 //!                                         what became of it. A put that did not apply prints
 //!                                         its own answer and leaves the drop armed
-//! admin promote [N] [--drop M] | admin rebuild N | admin damage-copy N --seq S
+//! admin promote <n> [--drop <m>]          make node n own partition 1 while its owner is dead
+//!                                         or cut off. The new configuration keeps every
+//!                                         member but m, by default the prior owner. It
+//!                                         waits out the prior owner's grant first, so it
+//!                                         can take the grant's length and some seconds.
+//!                                         Prints `promoted: node n owns partition 1 at
+//!                                         generation G (was node P); node m dropped`.
+//!                                         A refusal prints `err admin promote: <error>`
+//!                                         and the run exits 1. Known gap: under `--nodes`
+//!                                         (`lr promote`) this build answers INVALID_ARGUMENT
+//!                                         "built without budgets", because the app-only
+//!                                         `Db` opens with none
+//! admin rebuild N | admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
 //!                                         answers `not built yet: <verb>; nothing was done`,
@@ -1749,6 +1761,15 @@ fn repl<'scope, 'env>(
                 );
                 Ok(())
             }
+            ["admin", "promote", rest @ ..] => {
+                parse_promote(rest).map(|(to, drop)| match promote_line(db, to, drop) {
+                    Ok(line) => say(&line),
+                    Err(line) => {
+                        say(&line);
+                        bad = true;
+                    }
+                })
+            }
             ["admin", "status"] => {
                 admin_status_lines(rt, db, store)
                     .iter()
@@ -1756,7 +1777,8 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["admin", ..] => Err(format!(
-                "admin status | admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | \
+                "admin status | {PROMOTE_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                 clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
             )),
@@ -1853,7 +1875,6 @@ fn repl<'scope, 'env>(
 /// command`. Each line leaves this list when its verb is built.
 fn not_built(words: &[&str]) -> Option<&'static str> {
     Some(match words {
-        ["admin", "promote", ..] => "admin promote [N] [--drop M]",
         ["admin", "rebuild", ..] => "admin rebuild N",
         ["admin", "damage-copy", ..] => "admin damage-copy N --seq S",
         ["node", "restart", _, "--wipe"] => "node restart N --wipe",
@@ -1869,8 +1890,6 @@ const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are 1, 2 or
 
 /// `admin promote N [--drop M]`'s words after `promote`: the node to own partition 1, and the
 /// node to drop, `None` for `Db::promote`'s default, the prior owner. A node cannot be both.
-/// The call site lands with W5's `Db::promote`; until then the verb answers `not built yet`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
     let (to, drop) = match rest {
         [to] => (parse_node(to)?, None),
@@ -1886,14 +1905,38 @@ fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
     Ok((to, drop))
 }
 
-/// `admin promote`'s one line on success (lead, A-R245): the new owner, the dropped node, and
-/// the generation partition 1 runs at now.
-#[cfg_attr(not(test), allow(dead_code))]
-fn promoted_line(owner: NodeId, dropped: NodeId, generation: Generation) -> String {
+/// `admin promote`'s one line on success (lead, A-R245, A-R256): the new owner, the generation
+/// it committed, the prior owner and the member the new configuration leaves out.
+fn promoted_line(promoted: &admin::Promoted) -> String {
     format!(
-        "promoted: node {} owns partition 1 at generation {}; node {} dropped",
-        owner.0, generation.0, dropped.0
+        "promoted: node {} owns partition 1 at generation {} (was node {}); node {} dropped",
+        promoted.owner.0, promoted.generation.0, promoted.prior_owner.0, promoted.dropped.0
     )
+}
+
+/// `admin promote <n> [--drop <m>]`'s answer: `promoted: ..`, or `Err` with `err admin promote:
+/// ..` and the error's own text, which names the next step; the run then exits 1.
+fn promote_line(db: &Db, to: NodeId, drop: Option<NodeId>) -> Result<String, String> {
+    say(&format!(
+        "promote: node {} takes partition 1; this first waits out the prior owner's grant",
+        to.0
+    ));
+    match db.promote(to, drop) {
+        Ok(promoted) => {
+            tracing::info!(
+                owner = promoted.owner.0,
+                prior_owner = promoted.prior_owner.0,
+                dropped = promoted.dropped.0,
+                generation = promoted.generation.0,
+                "repl_promoted"
+            );
+            Ok(promoted_line(&promoted))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "repl_promote_refused");
+            Err(format!("err admin promote: {error}"))
+        }
+    }
 }
 
 /// The verb a command names when it acts on a node this process runs, refused under `--nodes`
@@ -6657,8 +6700,6 @@ mod tests {
     #[test]
     fn slice_2_verbs_and_flags_answer_not_built_yet_by_name() {
         for (line, verb) in [
-            ("admin promote", "admin promote [N] [--drop M]"),
-            ("admin promote 2 --drop 3", "admin promote [N] [--drop M]"),
             ("admin rebuild 1", "admin rebuild N"),
             ("admin damage-copy 2 --seq 4", "admin damage-copy N --seq S"),
             ("node restart 1 --wipe", "node restart N --wipe"),
@@ -6670,6 +6711,7 @@ mod tests {
         }
         for line in [
             "node restart 1",
+            "admin promote 2 --drop 3",
             "admin clear x",
             "control",
             "link drop 1-2",
@@ -7123,8 +7165,8 @@ mod tests {
 
     /// A-R245: `admin promote N [--drop M]` reads the node to promote and the one to drop,
     /// `None` leaving `Db::promote` to drop the prior owner; one node cannot be both, and the
-    /// success line names owner, dropped node and generation. Cut: drop the `drop == to` check
-    /// and the `2 --drop 2` line goes red. Unit.
+    /// success line names the new owner, generation, prior owner and dropped node (A-R256).
+    /// Cut: drop the `drop == to` check and the `2 --drop 2` line goes red. Unit.
     #[test]
     fn admin_promote_reads_its_nodes_and_says_one_line() {
         fn words(line: &str) -> Vec<&str> {
@@ -7144,9 +7186,17 @@ mod tests {
         for bad in ["", "4", "2 --drop", "2 3", "2 --drop 3 x"] {
             assert!(parse_promote(&words(bad)).is_err(), "{bad:?}");
         }
+        let promoted = admin::Promoted {
+            owner: NodeId(2),
+            prior_owner: NodeId(1),
+            dropped: NodeId(3),
+            generation: Generation(3),
+            frozen_grant: rdb_core::contracts::ids::GrantId(1),
+            control_revision: rdb_core::contracts::ids::Revision(40),
+        };
         assert_eq!(
-            promoted_line(NodeId(2), NodeId(1), Generation(3)),
-            "promoted: node 2 owns partition 1 at generation 3; node 1 dropped"
+            promoted_line(&promoted),
+            "promoted: node 2 owns partition 1 at generation 3 (was node 1); node 3 dropped"
         );
     }
 
