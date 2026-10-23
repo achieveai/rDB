@@ -899,6 +899,11 @@ fn close(
     }
 }
 
+/// `nodes` under `--nodes`: no node runs here, so none answers a status look from this process
+/// (walk a2: each said `boot=? did not answer in time; try again`, which read as a fault).
+const APP_ONLY_NODES: &str =
+    "nodes: none runs in this process (--nodes); `admin status` says each node's link";
+
 /// How long `--nodes` waits for every link to come up before it goes on with those that are.
 const LINK_WAIT: Duration = Duration::from_secs(5);
 
@@ -1690,6 +1695,11 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["status", rest @ ..] => status_line(db, &sent, rest),
+            // App-only, every node is another process: their links are what this one knows.
+            ["nodes"] if !args.nodes.is_empty() => {
+                say(APP_ONLY_NODES);
+                Ok(())
+            }
             ["nodes"] => {
                 let answered = db.node_status();
                 for node in [1, 2, 3].map(NodeId) {
