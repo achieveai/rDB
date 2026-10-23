@@ -524,9 +524,11 @@ impl Drop for Net {
     }
 }
 
-/// Bring `conn` up as node `node`'s route, at `boot`; send what waited for it.
+/// Bring `conn` up as node `node`'s route, at `boot`; send what waited for it. A known peer
+/// back at another boot restarted: every node this process runs hears it as
+/// [`Msg::PeerBooted`] (#42, ruling A-R251), so the record owner can re-plan around it.
 fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
-    let new_boot = {
+    let (new_boot, previous) = {
         let mut routes = lock(&shared.routes);
         let Some(route) = routes.get_mut(&node) else {
             tracing::warn!(peer = %conn.peer, "net_link_from_unknown_node");
@@ -555,14 +557,55 @@ fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
             queued,
             "net_link_up"
         );
-        previous != Some(boot)
+        (previous != Some(boot), previous)
     };
     if new_boot {
         tracing::info!(node = node.0, boot = boot.0, "net_peer_booted");
+        if let Some(old) = previous {
+            rebooted(shared, node, old, boot);
+        }
         if let Some(observer) = &*lock(&shared.on_boot) {
             observer(node, boot);
         }
     }
+}
+
+/// Peer `node`, last seen at `old`, is back at `boot`: post [`Msg::PeerBooted`] to each node
+/// this process runs. Logged `peer_rebooted{node, old, boot, told}`, `told` naming the nodes
+/// posted to; one whose thread has stopped logs `peer_rebooted_unposted`.
+fn rebooted(shared: &Shared, node: NodeId, old: BootId, boot: BootId) {
+    let Some(links) = shared.links.upgrade() else {
+        return;
+    };
+    let own = match &shared.label {
+        Label::Node(own) => Some(*own),
+        Label::App(_) => None,
+    };
+    let candidates: BTreeSet<NodeId> = lock(&shared.routes)
+        .keys()
+        .copied()
+        .chain(own)
+        .filter(|local| *local != node)
+        .collect();
+    let mut told = Vec::new();
+    for local in candidates.into_iter().filter(|local| links.knows(*local)) {
+        match links.post_local(local, Msg::PeerBooted { node, boot }) {
+            Ok(()) => told.push(local.0),
+            Err(fault) => tracing::warn!(
+                node = node.0,
+                to = local.0,
+                ?fault,
+                "peer_rebooted_unposted"
+            ),
+        }
+    }
+    tracing::info!(
+        node = node.0,
+        old = old.0,
+        boot = boot.0,
+        told = ?told,
+        "peer_rebooted"
+    );
 }
 
 /// Take `conn` down: forget it, drop every waiter on it, and free its route.
