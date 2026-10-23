@@ -41,6 +41,8 @@
 //! node this process runs. It waits up to 5 s for every link, then says one line per node,
 //! `link node=N up boot=B` or `link node=N down: <last dial error>`, and goes on either way: a
 //! dead node is what an admin run replaces. `admin status` says the records and those lines.
+//! `node restart`, `link hold` and `link drop` act on a node this process runs, so under
+//! `--nodes` each answers `err <line>: <verb> refused under --nodes: ..` and the run exits 1.
 //!
 //! `--client-id N` is a slice 2 flag this build does not run yet: it is refused with
 //! `not built yet: --client-id N; nothing was started`, and the run exits 2.
@@ -1581,6 +1583,12 @@ fn repl<'scope, 'env>(
                 continue;
             }
         }
+        if let Some(verb) = app_only_refusal(&words).filter(|_| !args.nodes.is_empty()) {
+            tracing::warn!(verb, "repl_app_only_refused");
+            say(&format!("err {line}: {verb} {APP_ONLY_REFUSED}"));
+            bad = true;
+            continue;
+        }
         if let Some(verb) = not_built(&words) {
             tracing::warn!(verb, "repl_not_built");
             say(&format!("not built yet: {verb}; nothing was done"));
@@ -1853,6 +1861,55 @@ fn not_built(words: &[&str]) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// `admin promote`'s usage (A-R245).
+const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are 1, 2 or 3; without \
+                             --drop the prior owner is dropped";
+
+/// `admin promote N [--drop M]`'s words after `promote`: the node to own partition 1, and the
+/// node to drop, `None` for `Db::promote`'s default, the prior owner. A node cannot be both.
+/// The call site lands with W5's `Db::promote`; until then the verb answers `not built yet`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
+    let (to, drop) = match rest {
+        [to] => (parse_node(to)?, None),
+        [to, "--drop", drop] => (parse_node(to)?, Some(parse_node(drop)?)),
+        _ => return Err(PROMOTE_USAGE.to_owned()),
+    };
+    if drop == Some(to) {
+        return Err(format!(
+            "node {} cannot be promoted and dropped at once; {PROMOTE_USAGE}",
+            to.0
+        ));
+    }
+    Ok((to, drop))
+}
+
+/// `admin promote`'s one line on success (lead, A-R245): the new owner, the dropped node, and
+/// the generation partition 1 runs at now.
+#[cfg_attr(not(test), allow(dead_code))]
+fn promoted_line(owner: NodeId, dropped: NodeId, generation: Generation) -> String {
+    format!(
+        "promoted: node {} owns partition 1 at generation {}; node {} dropped",
+        owner.0, generation.0, dropped.0
+    )
+}
+
+/// The verb a command names when it acts on a node this process runs, refused under `--nodes`
+/// (A-R245), or `None`. Under `--nodes` no node runs here, so such a verb would act on nothing.
+/// The line answers `err <line>: <verb> refused under --nodes: ..` and the run exits 1.
+fn app_only_refusal(words: &[&str]) -> Option<&'static str> {
+    Some(match words {
+        ["node", "restart", ..] => "node restart",
+        ["link", "hold", ..] => "link hold",
+        ["link", "drop", ..] => "link drop",
+        _ => return None,
+    })
+}
+
+/// Why [`app_only_refusal`]'s verbs are refused, after the verb's name.
+const APP_ONLY_REFUSED: &str = "refused under --nodes: it acts on a node this process runs, and \
+                                this process runs none";
 
 /// How a REPL run ends: 1 when a line was bad or an append to `--requests F` failed (k214).
 fn exit_code(bad: bool, sent: &Sent) -> ExitCode {
@@ -7013,6 +7070,61 @@ mod tests {
         );
         let never = std::collections::BTreeMap::from([(NodeId(1), LinkState::Waiting(None))]);
         assert_eq!(link_lines(&never), ["link node=1 down: not reached yet"]);
+    }
+
+    /// A-R245 (lead, on 22dd78d): under `--nodes`, the verbs that act on a node this process
+    /// runs are refused by name; the verbs beside them are not. Cut: drop the `link drop` arm
+    /// and its line goes red. Unit.
+    #[test]
+    fn app_only_refuses_the_verbs_that_act_on_a_local_node() {
+        for (line, verb) in [
+            ("node restart 1", "node restart"),
+            ("node restart 2 --wipe", "node restart"),
+            ("link hold 1-2", "link hold"),
+            ("link drop 2-3", "link drop"),
+        ] {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(app_only_refusal(&words), Some(verb), "{line}");
+        }
+        for line in [
+            "link heal 1-2",
+            "links",
+            "admin status",
+            "nodes",
+            "wait ready 5",
+        ] {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(app_only_refusal(&words), None, "{line} still runs");
+        }
+    }
+
+    /// A-R245: `admin promote N [--drop M]` reads the node to promote and the one to drop,
+    /// `None` leaving `Db::promote` to drop the prior owner; one node cannot be both, and the
+    /// success line names owner, dropped node and generation. Cut: drop the `drop == to` check
+    /// and the `2 --drop 2` line goes red. Unit.
+    #[test]
+    fn admin_promote_reads_its_nodes_and_says_one_line() {
+        fn words(line: &str) -> Vec<&str> {
+            line.split_whitespace().collect()
+        }
+        assert_eq!(parse_promote(&words("2")), Ok((NodeId(2), None)));
+        assert_eq!(
+            parse_promote(&words("2 --drop 3")),
+            Ok((NodeId(2), Some(NodeId(3))))
+        );
+        assert_eq!(
+            parse_promote(&words("2 --drop 2")),
+            Err(format!(
+                "node 2 cannot be promoted and dropped at once; {PROMOTE_USAGE}"
+            ))
+        );
+        for bad in ["", "4", "2 --drop", "2 3", "2 --drop 3 x"] {
+            assert!(parse_promote(&words(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            promoted_line(NodeId(2), NodeId(1), Generation(3)),
+            "promoted: node 2 owns partition 1 at generation 3; node 1 dropped"
+        );
     }
 
     /// A-R245: `admin status` lists both prefixes through the store it is given, the Db's own,
