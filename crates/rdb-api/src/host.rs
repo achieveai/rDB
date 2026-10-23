@@ -1494,9 +1494,15 @@ impl Host {
                     break;
                 }
             }
+            // PR #60 review F4: a step that faults the node ends the turn. Nothing after it
+            // runs, so no duty writes marks, links or activations for a node that has failed.
             if self.fault.is_none() {
                 self.drain();
+            }
+            if self.fault.is_none() {
                 self.run_due();
+            }
+            if self.fault.is_none() {
                 self.drain();
             }
             let wait = self.wait();
@@ -1789,8 +1795,25 @@ impl Host {
         }
     }
 
+    /// Fail the node and every waiter. The first fault is the cause, so it is the one kept and
+    /// reported, and any waiter still open is answered with it; a later fault is only logged
+    /// (PR #60 review F4).
     fn set_fault(&mut self, fault: Fault) {
-        tracing::error!(node = self.node.0, detail = %fault.detail, damage = ?fault.damage, "host_fault");
+        let fault = match self.fault.take() {
+            Some(first) => {
+                tracing::error!(
+                    node = self.node.0,
+                    detail = %fault.detail,
+                    first = %first.detail,
+                    "host_fault_after_fault"
+                );
+                first
+            }
+            None => {
+                tracing::error!(node = self.node.0, detail = %fault.detail, damage = ?fault.damage, "host_fault");
+                fault
+            }
+        };
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
@@ -6880,6 +6903,85 @@ mod tests {
         assert_eq!(
             before, MAIL_BEFORE_DUTIES,
             "the duty ran right after the cap"
+        );
+    }
+
+    /// PR #60 review F4: a queued event that faults the node ends its turn. The mailbox holds
+    /// `MAIL_BEFORE_DUTIES` letters, then `Stop`, with the flush duty due: first an injected
+    /// timer whose offer faults (`fail_step_view`), then stale-boot letters that change nothing.
+    /// The read stops at the cap with the timer still queued, so the drain after it faults, and
+    /// the flush duty after that drain must not run. Cut: the duties run on whatever the
+    /// drain did, and a `flush` duty line follows the fault, red. Unit, under a second.
+    #[config_log::retcd_test]
+    fn a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn() {
+        const METHOD: &str = "a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn";
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition: PartitionId(2),
+                generation: Generation(1),
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit");
+        host.next_flush = host.clock.now();
+        host.fail_step_view = true;
+        let stale = BootId(host.boot.0 + 1);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Inject {
+            partition: PartitionId(2),
+            correlation: CorrelationId::default(),
+            kind: EventKind::Timer(TimerFired {
+                id: HEALTH_EVAL_TIMER,
+                version: TimerVersion(0),
+                scheduled_at: host.clock.now(),
+            }),
+        })
+        .expect("send");
+        for _ in 1..MAIL_BEFORE_DUTIES {
+            tx.send(Msg::Activated {
+                boot: stale,
+                partition: PartitionId(2),
+                generation: Generation(1),
+            })
+            .expect("send");
+        }
+        tx.send(Msg::Stop).expect("send");
+        host.run(&rx);
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let fault = lines
+            .iter()
+            .position(|line| line["@m"] == "host_fault")
+            .expect("the injected timer faulted the node");
+        let letters = lines[..fault]
+            .iter()
+            .filter(|line| line["@m"] == "control_stale_boot_dropped")
+            .count();
+        assert_eq!(letters, MAIL_BEFORE_DUTIES - 1, "it faulted after the cap");
+        let after: Vec<_> = lines[fault + 1..]
+            .iter()
+            .filter(|line| line["@m"] == "host_duty" || line["@m"] == "host_fault")
+            .collect();
+        assert!(after.is_empty(), "nothing ran after the fault: {after:?}");
+    }
+
+    /// PR #60 review F4: the first fault is the one the node keeps and reports. A later one is
+    /// logged, never kept. Cut: `set_fault` overwrites, and the status names the later one, red.
+    #[test]
+    fn a_second_fault_keeps_the_first() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.set_fault(Fault::from("the first".to_owned()));
+        host.set_fault(Fault::from("the second".to_owned()));
+        assert_eq!(
+            host.status(PartitionId(2)).fault.as_deref(),
+            Some("the first"),
+            "the first fault is kept"
         );
     }
 
