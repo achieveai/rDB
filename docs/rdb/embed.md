@@ -143,6 +143,43 @@ extra to do, after a clean `shutdown` or after the process was killed.
 - Each open counts as one "reopen" of the folder's history. See the ceilings in section 7 for
   what that costs over many reopens.
 
+### After a reopen: did my write land?
+
+You saved a write's request before the process stopped: from `ok.sent` on success, or from
+`refused.request` on an `UNKNOWN_OUTCOME`. Now you want to know whether it landed.
+
+- **Sending it again answers `GENERATION_CHANGED`.** The reopen started a new generation (one
+  chapter of the folder's history), and a request from an older one is never replayed or run
+  again. That send changed nothing.
+- **Then ask `db.status(id, None)`.** `Resolved` means it landed. Its `outcome` is
+  `RecoveredApplied` when the answer comes from history kept across the reopen.
+- **`Unknown` or `Expired` is not proof that it did not land.** `Unknown` can turn into
+  `Resolved` later, once the nodes catch up; ask again. `Expired` means the record is older than
+  the dedup retention (`DbConfig::dedup_retention`, 24 h by default). Read the data itself
+  with `get` to decide.
+- **A kill before any answer leaves you no request to ask about.** Read the data with `get`.
+
+Add `rdb-core = { path = "<checkout>/crates/rdb-core" }` to `Cargo.toml` for these types.
+`crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
+
+```rust
+use rdb_api::{ApiError, Db};
+use rdb_core::{ErrorKind, TxnRequest, TxnStatus};
+
+/// `true`: it landed. `false`: not known yet, which is not proof that it did not land.
+fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
+    let id = saved.identity.request;
+    match db.resend(saved) {
+        Ok(_) => return Ok(true), // same generation: applied now, or its answer replayed
+        Err(refused) if refused.error.kind != ErrorKind::GenerationChanged => {
+            return Err(refused.error)
+        }
+        Err(_) => {} // after a reopen: this send applied nothing; ask what the first one did
+    }
+    Ok(matches!(db.status(id, None)?, TxnStatus::Resolved(_)))
+}
+```
+
 ### Known limits in this release
 
 - **A reopen after an open that wrote nothing does not become ready.** `wait_ready` returns

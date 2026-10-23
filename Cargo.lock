@@ -3550,6 +3550,7 @@ dependencies = [
  "config-core",
  "config-log",
  "rdb-api",
+ "rdb-core",
  "tokio",
  "tracing",
 ]

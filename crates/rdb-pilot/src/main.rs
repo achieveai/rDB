@@ -693,4 +693,18 @@ mod tests {
         assert!(parsed(&["--dir", "D", "--control", "c:1", "--reopens", "x"]).is_err());
         assert_eq!(args.log_dir, PathBuf::from("D.logs"));
     }
+
+    /// Lead k212: embed.md's "did my write land?" code block must be code that compiles. It is
+    /// the marked span of `examples/did_it_land.rs`, which clippy and the build compile; this
+    /// row fails when the two differ, so the doc cannot drift from the compiled copy.
+    #[test]
+    fn the_did_it_land_snippet_in_embed_md_is_the_one_that_compiles() {
+        let example = include_str!("../examples/did_it_land.rs").replace("\r\n", "\n");
+        let guide = include_str!("../../../docs/rdb/embed.md").replace("\r\n", "\n");
+        let begin = example.find("// embed.md begin\n").expect("begin marker") + 18;
+        let end = example.find("// embed.md end\n").expect("end marker");
+        let block = format!("```rust\n{}```\n", &example[begin..end]);
+        assert!(block.contains("fn did_it_land"), "{block}");
+        assert!(guide.contains(&block), "embed.md lacks, verbatim:\n{block}");
+    }
 }
