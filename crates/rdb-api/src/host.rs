@@ -71,7 +71,7 @@ use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-use rdb_storage::{RocksEngine, RocksSnapshot};
+use rdb_storage::{Inherited, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
@@ -100,6 +100,12 @@ pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 /// older than [`Budgets::dedup_retention_millis`] and lets T1 and P1 drop their retained
 /// answers (achieveai/rDB#34).
 pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
+
+/// D6 (ruling A-R172): the trim duty deletes trimmed Dedup rows on disk at most once per this
+/// period: a quarter of the retention, and never less often than once a minute.
+fn trim_delete_period(retention_millis: u64) -> u64 {
+    (retention_millis / 4).min(60_000)
+}
 
 /// How long after a recovery the primary's A1 is first woken to acquire its grant, when the
 /// recovery did not commit `Active`. The same value as the lowering's
@@ -1054,6 +1060,19 @@ struct Host {
     /// first, until the trim duty ages it out. Only the owner's P1 publishes, so only the owner
     /// fills it.
     published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
+    /// [`HOST_TRIM_EVERY_MILLIS`]; crate tests lower it.
+    trim_every_millis: u64,
+    /// D6 (A-R170 D, A-R172): per partition, the newest trim floor `(generation, below)` not yet
+    /// deleted on disk, and when the last durable delete ran. One delete per
+    /// [`trim_delete_period`] at most, with the latest floor.
+    trim_floors: BTreeMap<PartitionId, (Generation, Seq)>,
+    trim_deleted_at: BTreeMap<PartitionId, Tick>,
+    /// How many trims the duty sent and how many durable deletes ran, for the rows.
+    trims_sent: u64,
+    trim_deletes: u64,
+    /// D6 (A-R170 A, critic-d6 C1): per committed generation this node landed, when the Dedup
+    /// rows of every older generation it holds retire: one retention after the landing.
+    retire_due: BTreeMap<(PartitionId, Generation), Tick>,
     flushed_once: bool,
     /// Per partition, the step view and the `(generation, applied)` it was built at. Per
     /// partition, because the flusher's completions arrive on partition 0 and would otherwise
@@ -1148,6 +1167,12 @@ impl Host {
             next_ticket: 1,
             next_trim: now.plus_millis(HOST_TRIM_EVERY_MILLIS),
             published_at: BTreeMap::new(),
+            trim_every_millis: HOST_TRIM_EVERY_MILLIS,
+            trim_floors: BTreeMap::new(),
+            trim_deleted_at: BTreeMap::new(),
+            trims_sent: 0,
+            trim_deletes: 0,
+            retire_due: BTreeMap::new(),
             flushed_once: false,
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -1505,8 +1530,11 @@ impl Host {
             }
         }
         if self.next_trim <= now {
-            self.next_trim = now.plus_millis(HOST_TRIM_EVERY_MILLIS);
-            self.trim_duty(now);
+            self.next_trim = now.plus_millis(self.trim_every_millis);
+            if let Err(detail) = self.trim_duty(now) {
+                self.set_fault(detail);
+                return;
+            }
         }
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -1591,10 +1619,14 @@ impl Host {
     /// last aged seq plus one, so no younger entry goes. A write ages from its publish, never
     /// its commit, so a write still held unpublished is never trimmed. A sweep, not a waiter.
     ///
-    /// Publish times live in this process only. A new owner, promoted or restarted, has none
-    /// for the rows it seeds, so it must age them itself (for example, stamp them at its own
-    /// activation) and retire the old generation; M10 owes that (ruling A-R105).
-    fn trim_duty(&mut self, now: Tick) {
+    /// D6 (A-R170 D, A-R172): what a trim drops from memory is deleted on disk too, so a reopen
+    /// does not seed it again. The delete runs at most once per [`trim_delete_period`], with
+    /// the latest floor; a reopen may seed what the trims since the last delete dropped.
+    ///
+    /// Publish times live in this process only, so the rows a reopen seeds are aged from the
+    /// landing instead: [`Self::retire_duty`] retires every older generation one retention
+    /// after this node landed the new one (A-R170 A). A fault in either delete fails the node.
+    fn trim_duty(&mut self, now: Tick) -> Result<(), String> {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
         for (partition, published) in &mut self.published_at {
@@ -1639,7 +1671,165 @@ impl Host {
                 false,
                 None,
             );
+            self.trims_sent += 1;
+            self.trim_floors.insert(partition, (generation, below));
         }
+        self.trim_delete_duty(now)?;
+        self.retire_duty(now)
+    }
+
+    /// D6 D: the latest trim floor of each partition, deleted on disk once per
+    /// [`trim_delete_period`] at most (A-R172). Local and unreplicated; synced by storage.
+    fn trim_delete_duty(&mut self, now: Tick) -> Result<(), String> {
+        let period = trim_delete_period(self.budgets.dedup_retention_millis);
+        let due: Vec<(PartitionId, (Generation, Seq))> = self
+            .trim_floors
+            .iter()
+            .filter(|(partition, _)| {
+                self.trim_deleted_at
+                    .get(partition)
+                    .is_none_or(|last| last.plus_millis(period) <= now)
+            })
+            .map(|(partition, floor)| (*partition, *floor))
+            .collect();
+        for (partition, (generation, below)) in due {
+            self.trim_floors.remove(&partition);
+            self.trim_deleted_at.insert(partition, now);
+            let deleted = self
+                .engine
+                .delete_dedup_trimmed(partition, generation, below)
+                .map_err(|fault| {
+                    format!(
+                        "dedup trim delete of p{} g{} below {}: {fault:?}",
+                        partition.0, generation.0, below.0
+                    )
+                })?;
+            self.trim_deletes += 1;
+            tracing::info!(
+                node = self.node.0,
+                kind = "trim_delete",
+                partition = partition.0,
+                generation = generation.0,
+                below = below.0,
+                deleted,
+                period_ms = period,
+                "host_duty"
+            );
+        }
+        Ok(())
+    }
+
+    /// D6 A (A-R170, critic-d6 C1 and critic-f5 C6): one retention after this node landed a
+    /// committed generation `g`, every older generation whose Dedup rows it holds retires. T1
+    /// and P1 drop them (`RetireGeneration`), and storage deletes them at every level `g` reads
+    /// (`delete_dedup_below`, `end` = the newest retired generation plus one, never `g`).
+    ///
+    /// The generations are read from disk, never from what this node landed: a copy can hold a
+    /// generation it never landed (a missed link, A-R177). A generation this node did not
+    /// inherit retires nothing here; a later landing it does hold covers it.
+    fn retire_duty(&mut self, now: Tick) -> Result<(), String> {
+        let due: Vec<(PartitionId, Generation)> = self
+            .retire_due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        for (partition, serving) in due {
+            self.retire_due.remove(&(partition, serving));
+            if !self.engine.lineages().contains(&(partition, serving)) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    serving = serving.0,
+                    "dedup_retire_not_held"
+                );
+                continue;
+            }
+            let retired = self.dedup_generations_below(partition, serving)?;
+            let Some(newest) = retired.last().copied() else {
+                continue;
+            };
+            let site = Site {
+                partition,
+                correlation: CorrelationId::default(),
+            };
+            for generation in &retired {
+                self.push(
+                    site,
+                    EventKind::Kernel(KernelEvent::RetireGeneration {
+                        generation: *generation,
+                    }),
+                    false,
+                    None,
+                );
+            }
+            self.engine
+                .delete_dedup_below(partition, serving, &(newest.0 + 1).to_be_bytes())
+                .map_err(|fault| {
+                    format!(
+                        "dedup retire delete of p{} g{} through g{}: {fault:?}",
+                        partition.0, serving.0, newest.0
+                    )
+                })?;
+            tracing::info!(
+                node = self.node.0,
+                kind = "retire",
+                partition = partition.0,
+                serving = serving.0,
+                retired = ?retired.iter().map(|g| g.0).collect::<Vec<_>>(),
+                "host_duty"
+            );
+        }
+        Ok(())
+    }
+
+    /// The generations below `serving` that hold a Dedup row lineage `(partition, serving)`
+    /// reads, oldest first. A `dedup_key` leads with its generation, so one seek finds each.
+    fn dedup_generations_below(
+        &self,
+        partition: PartitionId,
+        serving: Generation,
+    ) -> Result<Vec<Generation>, String> {
+        let view = self
+            .engine
+            .snapshot(partition, serving, STEP_VIEW)
+            .map_err(|fault| {
+                format!("retire view of p{} g{}: {fault:?}", partition.0, serving.0)
+            })?;
+        let mut found = Vec::new();
+        let mut from = 0_u64.to_be_bytes().to_vec();
+        while let Some((key, _)) = view.scan(Namespace::Dedup, &from, 1).into_iter().next() {
+            let Some(generation) = key
+                .get(..8)
+                .and_then(|head| <[u8; 8]>::try_from(head).ok())
+                .map(u64::from_be_bytes)
+            else {
+                return Err(format!(
+                    "retire scan of p{} g{}: a dedup key of {} bytes",
+                    partition.0,
+                    serving.0,
+                    key.len()
+                ));
+            };
+            if generation >= serving.0 {
+                break;
+            }
+            found.push(Generation(generation));
+            from = (generation + 1).to_be_bytes().to_vec();
+        }
+        view_whole(&view, "retire scan")?;
+        Ok(found)
+    }
+
+    /// D6 A: this node landed committed generation `generation` for the first time, so the
+    /// older generations' Dedup rows retire one retention from now (A-R170; "stamp now" is
+    /// accepted, critic-d6 F2).
+    fn stamp_retirement(&mut self, partition: PartitionId, generation: Generation) {
+        let at = self
+            .clock
+            .now()
+            .plus_millis(self.budgets.dedup_retention_millis);
+        self.retire_due.insert((partition, generation), at);
     }
 
     /// F-014: the put sent as `event` still waits at its deadline plus the margin, so P1 has
@@ -2351,7 +2541,9 @@ impl Host {
         );
         self.inherit(partition, result)?;
         self.committed.insert(partition, Box::new(result.clone()));
-        self.landed.insert((partition, result.new_generation));
+        if self.landed.insert((partition, result.new_generation)) {
+            self.stamp_retirement(partition, result.new_generation);
+        }
         // In-process fan-out (lead ruling, 2026-10-07, under Decision 1): the result reaches the
         // other members as the control plane's watch of `partitions/{id}` would. M10 replaces it
         // with that watch.
@@ -2603,6 +2795,9 @@ impl Host {
         );
         if first && barrier {
             self.inherit(partition, &result)?;
+        }
+        if first {
+            self.stamp_retirement(partition, result.new_generation);
         }
         self.answer_deferred_syncs(partition, result.new_generation);
         self.schedule_acquire(&result, site);
@@ -3502,8 +3697,10 @@ impl Host {
     ///   ([`Self::survivor`]): the anchor, its applied head and every stored record digest from
     ///   the base through the head. Anything it cannot prove from what it stores answers
     ///   `InventoryFailed`, logged as `inventory_failed{reason}`, never an invented ladder.
+    ///   A copy that missed the anchor's generation while it was silent links it first, when
+    ///   it holds the base exactly ([`Self::inherit_missed_link`], A-R177).
     fn inventory(
-        &self,
+        &mut self,
         partition: PartitionId,
         copy: CopyId,
         anchor: LineageAnchor,
@@ -3575,7 +3772,7 @@ impl Host {
     /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
     /// plan is made, never here.
     fn survivor(
-        &self,
+        &mut self,
         partition: PartitionId,
         copy: CopyId,
         anchor: LineageAnchor,
@@ -3589,7 +3786,7 @@ impl Host {
             return Err("copy_ahead_of_anchor");
         }
         if !lineages.contains(&(partition, generation)) {
-            return Err("anchor_generation_absent");
+            self.inherit_missed_link(partition, anchor)?;
         }
         let link = self
             .engine
@@ -3623,6 +3820,71 @@ impl Host {
             ladder,
             quarantined: None,
         })
+    }
+
+    /// A-R177 (critic-f5 option 1): this copy missed the anchor's generation, committed while
+    /// it was silent and never landed here. When it holds its newest generation exactly through
+    /// the anchor's base, with the verified digest there equal to the anchor's, the anchor's
+    /// prefix is its own: it links the anchor's generation onto that one at the base, as a
+    /// landing inherit would have, and then reports as a copy that landed it.
+    ///
+    /// Guards, in this order, before anything is written (C2): no generation above the anchor
+    /// (checked by the caller); the newest held generation is below the anchor's; its head is
+    /// the base exactly, never above (a tail above the base is uncertain data an ask must not
+    /// truncate); its digest at the base is the anchor's. Then only a link (C1): a parent
+    /// already at [`MAX_CHAIN_DEPTH`] levels would need a multi-batch copy inside the discovery
+    /// window, so it is refused. A refusal writes nothing and names its reason.
+    fn inherit_missed_link(
+        &mut self,
+        partition: PartitionId,
+        anchor: LineageAnchor,
+    ) -> Result<(), &'static str> {
+        let to = anchor.lineage.generation;
+        let base = anchor.base_seq;
+        let from = self
+            .engine
+            .lineages()
+            .into_iter()
+            .filter(|(p, g)| *p == partition && *g < to)
+            .map(|(_, g)| g)
+            .max()
+            .ok_or("anchor_generation_absent")?;
+        let head = Seq(self.engine.buffered_applied(partition, from).0);
+        if head < base {
+            return Err("missed_generation_held_below_base");
+        }
+        if head > base {
+            return Err("missed_generation_held_past_base");
+        }
+        let digest = if base == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, from, base)?.1
+        };
+        if digest != anchor.base_digest {
+            return Err("missed_generation_base_digest_differs");
+        }
+        if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
+            return Err("missed_generation_link_depth_ceiling");
+        }
+        self.views.remove(&partition);
+        match self.engine.inherit(partition, from, to, base) {
+            // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
+            // generation is held, so `survivor` never calls here. Kept as success (A-R179).
+            Ok(Inherited::Linked | Inherited::AlreadyInherited) => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    from = from.0,
+                    to = to.0,
+                    base = base.0,
+                    "inventory_link_inherited"
+                );
+                Ok(())
+            }
+            Ok(Inherited::Copied { .. }) => Err("missed_generation_copied"),
+            Err(_) => Err("missed_generation_link_refused"),
+        }
     }
 
     /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`). `None` is a
@@ -3972,11 +4234,12 @@ impl Host {
             return Err("step view missing after refresh".into());
         };
         // What P1 has published here, as `status` reads it: a publish answers unchanged only
-        // at or below it (C-3).
+        // at or below it (C-3). Read from the kernel, never its whole view: that clones the
+        // status index on every put (A-R174).
         let published = self
             .publication
-            .view(self.node, partition)
-            .map(|view| (view.published.generation, view.published.seq));
+            .kernel(self.node, partition)
+            .map(|kernel| (kernel.published().generation, kernel.published().seq));
         // The first put's group is the request's affinity. A put in another group is refused
         // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
         let affinity = puts.first().map_or(AFFINITY, |put| put.group);
@@ -4470,8 +4733,8 @@ impl Host {
                 .map(|state| state.allow && granted),
             published: self
                 .publication
-                .view(self.node, partition)
-                .map(|view| (view.published.generation, view.published.seq)),
+                .kernel(self.node, partition)
+                .map(|kernel| (kernel.published().generation, kernel.published().seq)),
             in_flight: match self
                 .transaction
                 .kernel(self.node, partition)
@@ -6310,18 +6573,18 @@ mod tests {
             ..root
         };
         let report =
-            |trio: &Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
+            |trio: &mut Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
 
         assert!(
             matches!(
-                report(&trio, bootstrap),
+                report(&mut trio, bootstrap),
                 RecoveryEvent::InventoryReported(_)
             ),
             "an empty copy reports the root"
         );
         assert_eq!(
             report(
-                &trio,
+                &mut trio,
                 LineageAnchor {
                     base_seq: Seq(1),
                     ..bootstrap
@@ -6331,27 +6594,261 @@ mod tests {
             "an anchor past the root"
         );
         assert_eq!(
-            report(&trio, root),
+            report(&mut trio, root),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
             "an empty copy asked for a reopen's generation 1"
         );
         trio.bootstrap();
         trio.ready();
         assert_eq!(
-            report(&trio, bootstrap),
+            report(&mut trio, bootstrap),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
             "a copy holding generation 1, asked for the bootstrap's empty anchor"
         );
         // M10 (reopen): a copy holding the anchor's generation reports from its engine, and
         // one whose stored base is not the anchor's answers nothing.
         assert!(
-            matches!(report(&trio, root), RecoveryEvent::InventoryReported(_)),
+            matches!(report(&mut trio, root), RecoveryEvent::InventoryReported(_)),
             "a copy holding generation 1 at its anchor"
         );
         assert_eq!(
-            report(&trio, past_root),
+            report(&mut trio, past_root),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
             "a copy whose generation 1 starts elsewhere"
+        );
+    }
+
+    /// A-R177 rows: `n` chained records in `generation` of partition 1, committed as R1 stages
+    /// them (the record, its `History` row, the applied-head `Progress` row). Their digests,
+    /// `[0]` at seq 1.
+    fn write_chain(engine: &mut RocksEngine, generation: Generation, n: u64) -> Vec<Digest> {
+        use rdb_core::contracts::digest::Domain;
+        use rdb_core::contracts::envelope::EnvelopeHeader;
+        use rdb_core::contracts::ids::{BatchId, ClientId, LeaseId, TenantId};
+        use rdb_core::contracts::storage::{Batch, Write};
+        use rdb_core::contracts::txn::Outcome;
+        use rdb_core::contracts::version::ENVELOPE_VERSION;
+        let mut digests: Vec<Digest> = Vec::new();
+        for seq in 1..=n {
+            let mut env = ReplicationEnvelope {
+                header: EnvelopeHeader {
+                    protocol_version: ENVELOPE_VERSION,
+                    partition: PartitionId(1),
+                    generation,
+                    config_version: ConfigVersion(1),
+                    owner_epoch: OwnerEpoch(generation.0),
+                    seq: Seq(seq),
+                    body_len: 0,
+                },
+                lease_id: LeaseId(1),
+                prev_digest: digests.last().copied().unwrap_or(Digest::ROOT),
+                request_identity: RequestIdentity {
+                    tenant: TenantId(1),
+                    client: ClientId(1),
+                    request: RequestId(seq),
+                },
+                request_digest: Digest::of(Domain::Record, &[&seq.to_le_bytes()]),
+                conditions_result: Vec::new(),
+                mutations: vec![Write {
+                    ns: Namespace::User,
+                    key: Bytes::copy_from_slice(&seq.to_be_bytes()),
+                    value: Some(Bytes::from_static(b"v")),
+                }],
+                result: Outcome::Published,
+                record_digest: Digest::ROOT,
+            };
+            env.record_digest = env.compute_record_digest().expect("digest");
+            digests.push(env.record_digest);
+            let mut progress = seq.to_le_bytes().to_vec();
+            progress.extend_from_slice(&env.record_digest.0);
+            let mut writes = env.mutations.clone();
+            writes.push(Write {
+                ns: Namespace::History,
+                key: Bytes::copy_from_slice(&seq.to_be_bytes()),
+                value: Some(env.encode().expect("encode")),
+            });
+            writes.push(Write {
+                ns: Namespace::Progress,
+                key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+                value: Some(Bytes::from(progress)),
+            });
+            engine
+                .commit(Batch {
+                    id: BatchId(seq),
+                    partition: PartitionId(1),
+                    generation,
+                    seq: Seq(seq),
+                    writes,
+                })
+                .expect("commit");
+        }
+        digests
+    }
+
+    /// Node 2's host over the engine at `path`, which a row filled first.
+    fn host_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
+        let engine = RocksEngine::open(path).expect("open engine");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
+        Host::new(NodeId(2), engine, links, control, HostClock::start())
+    }
+
+    /// A reopen's anchor at `generation`, from `base` with `digest` there.
+    fn anchor_at(generation: u64, base: u64, digest: Digest) -> LineageAnchor {
+        LineageAnchor {
+            lineage: Lineage {
+                partition: PartitionId(1),
+                generation: Generation(generation),
+                owner_epoch: OwnerEpoch(generation),
+            },
+            base_seq: Seq(base),
+            base_digest: digest,
+        }
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// A-R177 row 2 (critic-f5 C1-C4): a copy that missed generation 2, written nowhere, holds
+    /// generation 1 exactly through the anchor's base with the anchor's digest there. Its
+    /// inventory links generation 2 onto generation 1 at the base and reports from it.
+    #[test]
+    fn a_copy_that_missed_a_writeless_generation_links_it_at_inventory() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1])) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(2), digests[1]));
+            }
+            other => panic!("expected a report, got {other:?}"),
+        }
+        assert_eq!(
+            host.engine.link(PartitionId(1), Generation(2)),
+            Some(rdb_storage::Link {
+                parent: Generation(1),
+                base: Seq(2),
+                copied: false,
+            })
+        );
+    }
+
+    /// A-R177 rows 3-5 (critic-f5 C2): the guards refuse before anything is written, each by
+    /// name: the digest at the base differs, the copy holds past the base (uncertain data an
+    /// ask must not truncate), or below it.
+    #[test]
+    fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            3,
+        );
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let held = host.engine.lineages();
+        for (anchor, reason) in [
+            (
+                anchor_at(2, 3, digests[1]),
+                "missed_generation_base_digest_differs",
+            ),
+            (
+                anchor_at(2, 2, digests[1]),
+                "missed_generation_held_past_base",
+            ),
+            (
+                anchor_at(2, 4, digests[2]),
+                "missed_generation_held_below_base",
+            ),
+        ] {
+            assert_eq!(
+                host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
+                Err(reason)
+            );
+            assert_eq!(
+                host.inventory(PartitionId(1), CopyId(1), anchor),
+                RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+            );
+            assert_eq!(host.engine.lineages(), held, "{reason}: nothing written");
+        }
+    }
+
+    /// A-R177 row 6 (critic-f5 C1): a link onto a parent already at the chain ceiling would be
+    /// a multi-batch flatten inside the discovery window, so it is refused, nothing staged.
+    #[test]
+    fn a_missed_generation_is_not_linked_onto_a_parent_at_the_chain_ceiling() {
+        let ceiling = MAX_CHAIN_DEPTH as u64;
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            let digests = write_chain(&mut engine, Generation(1), 2);
+            for to in 2..=ceiling {
+                assert_eq!(
+                    engine.inherit(PartitionId(1), Generation(to - 1), Generation(to), Seq(2)),
+                    Ok(Inherited::Linked)
+                );
+            }
+            assert_eq!(
+                engine.chain_depth(PartitionId(1), Generation(ceiling)),
+                MAX_CHAIN_DEPTH
+            );
+            digests
+        };
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let held = host.engine.lineages();
+        let anchor = anchor_at(ceiling + 1, 2, digests[1]);
+        assert_eq!(
+            host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
+            Err("missed_generation_link_depth_ceiling")
+        );
+        assert_eq!(host.engine.lineages(), held, "nothing staged or linked");
+    }
+
+    /// A-R177 row 8 (critic-f5 C3): the node stops after the link and before its answer. The
+    /// next open's inventory, from the same directory, reports as a copy that landed the
+    /// generation, and the link is unchanged.
+    #[test]
+    fn a_link_made_at_inventory_survives_a_restart_before_the_answer() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        let anchor = anchor_at(2, 2, digests[1]);
+        let rt = current_thread();
+        {
+            let mut host = host_over(&path, &rt);
+            assert!(host.survivor(PartitionId(1), CopyId(1), anchor).is_ok());
+        }
+        let mut host = host_over(&path, &rt);
+        match host.inventory(PartitionId(1), CopyId(1), anchor) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(2), digests[1]));
+            }
+            other => panic!("expected a report after the restart, got {other:?}"),
+        }
+        assert_eq!(
+            host.engine.link(PartitionId(1), Generation(2)),
+            Some(rdb_storage::Link {
+                parent: Generation(1),
+                base: Seq(2),
+                copied: false,
+            })
         );
     }
 
@@ -7880,6 +8377,66 @@ mod tests {
                 .iter()
                 .all(|line| line["node"] == 1 && line["partition"] == 1),
             "nothing trimmed for the idle partition: {trims:?}"
+        );
+    }
+
+    /// D6 (ruling A-R172): the trim duty deletes trimmed Dedup rows on disk at most once per a
+    /// quarter of the retention, with the latest floor. Trim ticks every 50 ms and a 400 ms
+    /// retention make a 100 ms period; puts about 40 ms apart give a trim on most ticks. So
+    /// the deletes run, but on fewer ticks than the trims, and node 1's disk keeps fewer
+    /// generation-1 Dedup rows than it wrote. A delete on every trim fails the count.
+    /// Trio (~3 s): a 1.5 s run of puts on real trim ticks.
+    #[config_log::retcd_test]
+    fn the_durable_trim_delete_runs_at_most_once_per_period() {
+        use rdb_core::transaction::dedup::parse_dedup_key;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.trim_every_millis = 50;
+            host.budgets.dedup_retention_millis = 400;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let until = trio.clock.now().plus_millis(1_500);
+        let mut request = 1;
+        let mut landed = 0_usize;
+        while trio.clock.now() < until {
+            match trio.ask(put(request, b"a", b"1", None)) {
+                Answer::Txn { .. } => landed += 1,
+                Answer::Error { error, .. } => {
+                    assert_ne!(
+                        error.kind,
+                        ErrorKind::Overloaded,
+                        "put {request}: {error:?}"
+                    );
+                }
+                other => panic!("put {request}: {other:?}"),
+            }
+            request += 1;
+            let next = trio.clock.now().plus_millis(40);
+            trio.until("40 ms", |trio| (trio.clock.now() >= next).then_some(()));
+        }
+        let owner = &trio.nodes[0].0;
+        let (trims, deletes) = (owner.trims_sent, owner.trim_deletes);
+        assert!(trims >= 4, "trims {trims}, deletes {deletes}");
+        assert!(
+            deletes >= 1 && deletes < trims,
+            "trims {trims}, deletes {deletes}: at most one delete per period"
+        );
+        let view = owner
+            .engine
+            .snapshot(PartitionId(1), Generation(1), STEP_VIEW)
+            .expect("view");
+        let held = view
+            .scan(Namespace::Dedup, &[], usize::MAX)
+            .into_iter()
+            .filter(|(key, _)| {
+                parse_dedup_key(key).is_some_and(|key| key.generation == Generation(1))
+            })
+            .count();
+        assert!(
+            held < landed,
+            "node 1 holds {held} generation-1 Dedup rows of {landed} puts that landed"
         );
     }
 
