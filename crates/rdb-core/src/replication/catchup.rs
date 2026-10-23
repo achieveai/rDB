@@ -181,8 +181,8 @@ pub struct CatchupCursor {
     outstanding: Option<Seq>,
     /// Probes answered since the copy last accepted a record.
     probe_rounds: u8,
-    /// A record was sent since the last `CopyCaughtUp`. This flag is what makes that effect
-    /// fire once per catch-up, and never for a copy that was never behind.
+    /// A record was sent, or a snapshot asked, since the last `CopyCaughtUp`. This flag is what
+    /// makes that effect fire once per catch-up, and never for a copy that was never behind.
     catching_up: bool,
     stopped: Option<Stop>,
     /// The last record sent that no ACK has answered since (lead ruling B-R67a). Unlike
@@ -429,7 +429,14 @@ impl CatchupCursor {
         self.outstanding = None;
         self.unacked = None;
         match history.lookup(have, head_digest) {
-            DigestLookup::NotRetained => vec![self.snapshot(head)],
+            // The copy is behind even though nothing is sent: once the consumer has served the
+            // snapshot, the head can reach it by the keepalive or the stream, not by this
+            // cursor, and the ACK that shows it must still end the catch-up (#50 40-run check,
+            // 2026-10-23: F1's rebuild waited on it for ever).
+            DigestLookup::NotRetained => {
+                self.catching_up = true;
+                vec![self.snapshot(head)]
+            }
             // Emit the proof and nothing else. The tracker writes `diverged` and the rest of
             // the vector (K-B-45).
             DigestLookup::Differs { .. } => {
