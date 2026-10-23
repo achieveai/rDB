@@ -3543,6 +3543,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdb-pilot"
+version = "0.1.0"
+dependencies = [
+ "config-client",
+ "config-core",
+ "config-log",
+ "rdb-api",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rdb-sim"
 version = "0.1.0"
 dependencies = [

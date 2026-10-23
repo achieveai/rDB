@@ -1406,17 +1406,18 @@ fn h1_scaffolding_a_clean_resume_is_traced_paused_resuming_healthy() {
         report.stop
     );
     let phases = h1_phases(&trace);
-    // Two `Resuming` lines since ruling B-R44: entering the hold, then its start being set.
+    // One `Resuming` line: the generation's first resume skips the hold (ruling A-R165), so the
+    // hold's start is never set and `Healthy` follows in the same evaluation. A later resume
+    // still traces two (ruling B-R44); the hold-start row below walks one.
     assert_eq!(
         phases.iter().map(|(_, phase)| *phase).collect::<Vec<_>>(),
         vec![
             ProtectionPhase::Paused,
             ProtectionPhase::Resuming,
-            ProtectionPhase::Resuming,
             ProtectionPhase::Healthy
         ]
     );
-    let (healthy, _) = phases[3];
+    let (healthy, _) = phases[2];
     let (allow, state) = h1_admissions(&trace)
         .into_iter()
         .rev()
@@ -1440,6 +1441,9 @@ fn h1_scaffolding_a_warn_is_recorded_as_a_note_and_a_warn_line() {
     let mut seed = vec![
         l1_fixture::on_primary(0, l1_fixture::recovered(0)),
         l1_fixture::on_primary(0, l1_fixture::gained()),
+        // The copy reports its durable point: an unreported copy is durable through nothing,
+        // barrier 0 included (ruling A-R167), and would hold the partition paused for good.
+        l1_fixture::on_primary(0, l1_fixture::durable(0)),
     ];
     for t in (100..=5_100).step_by(100) {
         seed.push(l1_fixture::on_primary(t, l1_fixture::progress(2)));
@@ -1695,6 +1699,9 @@ fn h1_scaffolding_the_resume_hold_start_is_traced_when_set_and_when_cleared() {
     support::preamble();
     let mut seed = vec![
         l1_fixture::on_primary(0, l1_fixture::recovered(40)),
+        // A `Lost` edge pauses again, so the resume below is not the generation's first and
+        // holds the full `resume_hold_millis` (ruling A-R165).
+        l1_fixture::on_primary(5, l1_fixture::lost()),
         l1_fixture::on_primary(10, l1_fixture::gained()),
         l1_fixture::on_primary(20, l1_fixture::durable(40)),
     ];
