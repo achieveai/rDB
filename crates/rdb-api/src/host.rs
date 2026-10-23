@@ -5085,7 +5085,7 @@ impl Host {
                     mutations.extend(compiled.mutations);
                 }
                 Err(mut refused) => {
-                    log_stored_damage(self.node, &root, &refused, chunk);
+                    log_stored_damage(self.node, &root, &refused, None, chunk);
                     refused.detail = format!("op {index}: {}", refused.detail);
                     return Ok(Err(refused));
                 }
@@ -5707,6 +5707,36 @@ fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
     }
 }
 
+/// D9b: the code a damage line names stored damage by, never its `Display`, which for a map
+/// entry quotes the app's key (`Corrupt::Entry`). Exhaustive on purpose: a new variant is a
+/// compile error here, not a line that quietly falls back to the text.
+const fn damage_code(corrupt: &Corrupt) -> &'static str {
+    match corrupt {
+        Corrupt::Envelope(_) => "envelope",
+        Corrupt::Codec(_) => "codec",
+        Corrupt::VersionWithoutValue => "version_without_value",
+        Corrupt::Key(_) => "key",
+        Corrupt::Root(_) => "root",
+        Corrupt::ListRoot(_) => "list_root",
+        Corrupt::UnknownKeyProfile(_) => "unknown_key_profile",
+        Corrupt::UnknownSub(_) => "unknown_sub",
+        Corrupt::Entry { .. } => "entry",
+        Corrupt::EntryNotDocument { .. } => "entry_not_document",
+        Corrupt::ItemNotDocument { .. } => "item_not_document",
+        Corrupt::ListRecordAtRoot { .. } => "list_record_at_root",
+        Corrupt::SetMemberHasValue { .. } => "set_member_has_value",
+        Corrupt::ElementNewerThanRoot { .. } => "element_newer_than_root",
+        Corrupt::OrphanElement => "orphan_element",
+        Corrupt::CountMismatch { .. } => "count_mismatch",
+        Corrupt::Manifest(_) => "manifest",
+        Corrupt::Chunk { .. } => "chunk",
+        Corrupt::ChunkMissing { .. } => "chunk_missing",
+        Corrupt::Block { .. } => "block",
+        Corrupt::ItemMissing { .. } => "item_missing",
+        Corrupt::ChunkMismatch { .. } => "chunk_mismatch",
+    }
+}
+
 /// One warn line per clear batch compiled (M9 S6): what it deletes and the damage that proved
 /// it. `root` is `deleted` in the batch that empties the object, `guarded` while it is kept,
 /// and `absent` when there is none. No record bytes are logged.
@@ -5737,7 +5767,7 @@ fn log_clear(node: NodeId, identity: RequestIdentity, root: &RootKey, cleared: &
         deletes = compiled.mutations.len(),
         faulting = cleared.faulting,
         root = root_word,
-        damage = %cleared.damage,
+        damage = damage_code(&cleared.damage),
         "clear_compiled"
     );
 }
@@ -6017,8 +6047,12 @@ fn object_answer_unchecked(
         },
         Err(error) => {
             let chunk = upload.zip(damaged_chunk(&error));
+            let damage = match &error {
+                ValueError::Corrupt(corrupt) => Some(damage_code(corrupt)),
+                ValueError::Apply(_) => None,
+            };
             let error = compile_error(&error);
-            log_stored_damage(node, root, &error, chunk);
+            log_stored_damage(node, root, &error, damage, chunk);
             Answer::Error {
                 error,
                 request: None,
@@ -6045,7 +6079,17 @@ const fn damaged_chunk(error: &ValueError) -> Option<u32> {
 /// no log of its own. `chunk` adds `upload` (hex) and `index` where the finder knew them: a
 /// chunk that failed its check (A-R132). Damage to the manifest itself names no upload, so the
 /// line leaves both out rather than guess one.
-fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Option<(Upload, u32)>) {
+///
+/// D9b: `damage` is [`damage_code`] where the finder held the `Corrupt` (a read), absent where
+/// only the refusal reached it (a compile). The refusal's detail is never logged: it is the
+/// error's text, and that can quote the app's key.
+fn log_stored_damage(
+    node: NodeId,
+    root: &RootKey,
+    error: &ApiError,
+    damage: Option<&'static str>,
+    chunk: Option<(Upload, u32)>,
+) {
     if !matches!(
         error.kind,
         ErrorKind::CorruptBlob | ErrorKind::CorruptHistory
@@ -6060,9 +6104,9 @@ fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Opti
             %key_hex,
             root_unparsed,
             kind = %error.name(),
+            damage,
             upload = %format!("{:032x}", u128::from_be_bytes(upload)),
             index,
-            detail = %error.detail,
             "stored_damage"
         ),
         None => tracing::warn!(
@@ -6070,7 +6114,7 @@ fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Opti
             %key_hex,
             root_unparsed,
             kind = %error.name(),
-            detail = %error.detail,
+            damage,
             "stored_damage"
         ),
     }
@@ -11515,8 +11559,8 @@ mod tests {
         let error = ApiError::new(ErrorKind::CorruptHistory, "damaged".to_owned());
         for (request, object) in [(1, &b"zqa"[..]), (2, &long[..])] {
             let root = root_key(TenantId(1), AFFINITY, object);
-            log_stored_damage(NodeId(1), &root, &error, None);
-            log_stored_damage(NodeId(1), &root, &error, Some(([7; 16], 2)));
+            log_stored_damage(NodeId(1), &root, &error, None, None);
+            log_stored_damage(NodeId(1), &root, &error, None, Some(([7; 16], 2)));
             let cleared = Cleared {
                 compiled: Compiled {
                     mutations: vec![Mutation::Delete {
@@ -11553,6 +11597,68 @@ mod tests {
                     "{message} carries the object's text: {text}"
                 );
             }
+        }
+    }
+
+    /// D9b: the damage lines name the damage by a code, never by the error's text. A map
+    /// entry's damage quotes the app's key in its `Display` ("map entry \"zqk-secret\": ..."),
+    /// so the refusal's detail is left out of `stored_damage`, and `clear_compiled` logs
+    /// `damage_code`. The damage is built by hand: no stored record carries it to these sites
+    /// today, so the row pins the sites, whatever text a refusal carries.
+    /// Unit (~10 ms): the two log functions called by hand.
+    #[config_log::retcd_test]
+    fn d9b_damage_lines_log_a_code_and_never_the_error_text() {
+        const METHOD: &str = "d9b_damage_lines_log_a_code_and_never_the_error_text";
+        let entry = Corrupt::Entry {
+            key: Value::Text("zqk-secret".to_owned()),
+            error: rdb_value::envelope::EnvelopeError::UnknownKind(0),
+        };
+        let text = entry.to_string();
+        assert!(
+            text.contains("zqk-secret"),
+            "the fixture quotes the key: {text}"
+        );
+        let root = root_key(TenantId(1), AFFINITY, b"m");
+        let refused = ApiError::new(ErrorKind::CorruptHistory, text);
+        log_stored_damage(NodeId(1), &root, &refused, None, None);
+        log_stored_damage(NodeId(1), &root, &refused, Some(damage_code(&entry)), None);
+        log_stored_damage(
+            NodeId(1),
+            &root,
+            &refused,
+            Some(damage_code(&entry)),
+            Some(([7; 16], 2)),
+        );
+        let cleared = Cleared {
+            compiled: Compiled {
+                mutations: vec![Mutation::Delete {
+                    key: root.to_bytes(),
+                    expected_version: Some(3),
+                }],
+                conditions: Vec::new(),
+            },
+            damage: entry,
+            faulting: 1,
+        };
+        log_clear(NodeId(1), identity(1), &root, &cleared);
+
+        let stored = logged!(METHOD, "stored_damage");
+        let codes: Vec<_> = stored.iter().map(|line| line["damage"].clone()).collect();
+        assert_eq!(
+            codes,
+            [serde_json::Value::Null, "entry".into(), "entry".into()],
+            "{stored:?}"
+        );
+        let clear = logged!(METHOD, "clear_compiled");
+        assert_eq!(clear.len(), 1, "{clear:?}");
+        assert_eq!(clear[0]["damage"], "entry", "{clear:?}");
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        for line in &lines {
+            let text = line.to_string();
+            assert!(
+                !text.contains("zqk") && line.get("detail").is_none(),
+                "a log line carries the error's text: {text}"
+            );
         }
     }
 
