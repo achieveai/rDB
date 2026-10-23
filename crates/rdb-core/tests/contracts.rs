@@ -327,11 +327,13 @@ fn m7f_02_request_digest_covers_the_semantic_fields_only() {
 
 /// Ruling A-R252: the ack floor and its pins say what the client has been answered, which moves
 /// between a first send and its resend, so neither is in the request digest; a resend with a
-/// later floor is the same payload, not `REQUEST_ID_REUSE`. Absent is the shape every request
-/// had before them: a request with neither serialises without either key, and one written
-/// without them reads back as no floor and no pins.
+/// later floor is the same payload, not `REQUEST_ID_REUSE`. A request with no floor keeps the
+/// digest it had before the fields existed (pinned below as a golden). Ruling A-R259: the
+/// request crosses the peer wire in postcard, which is not self-describing, so it must
+/// round-trip whole with and without a floor; and JSON written before the fields still reads,
+/// as no floor and no pins.
 #[retcd_test]
-fn m10_s2_the_ack_floor_is_not_the_payload_and_absent_is_the_old_shape() {
+fn m10_s2_the_ack_floor_is_not_the_payload_and_crosses_postcard_whole() {
     assert_eq!(MAX_PINS, 8);
     let first = request(1_000);
     let mut resend = request(1_000);
@@ -342,28 +344,35 @@ fn m10_s2_the_ack_floor_is_not_the_payload_and_absent_is_the_old_shape() {
         resend.request_digest(),
         "the floor and pins are not the payload"
     );
-
-    let old = serde_json::to_value(&first).expect("serialise");
-    let keys = old.as_object().expect("an object");
-    assert!(
-        !keys.contains_key("acked_below") && !keys.contains_key("pinned"),
-        "no floor and no pins serialise as the old shape: {old}"
+    assert_eq!(
+        first.request_digest().to_hex(),
+        "be896f14c9b2711f1b67c24883a849f6966ab421560fa666fa95e159eb3e3c98",
+        "a request with no floor keeps its digest"
     );
-    let read: TxnRequest = serde_json::from_value(old).expect("the old shape reads");
-    assert_eq!(read, first, "the old shape reads as no floor and no pins");
 
-    let carried = serde_json::to_value(&resend).expect("serialise");
-    assert_eq!(carried["acked_below"], 3);
-    assert_eq!(carried["pinned"], serde_json::json!([1, 2]));
-    let read: TxnRequest = serde_json::from_value(carried).expect("read");
-    assert_eq!(read, resend, "a floor and pins round-trip");
+    for sent in [&first, &resend] {
+        let bytes = postcard::to_stdvec(sent).expect("postcard encode");
+        let got: TxnRequest = postcard::from_bytes(&bytes).expect("postcard decode");
+        assert_eq!(&got, sent, "the request crosses postcard whole");
+    }
+
+    let mut old = serde_json::to_value(&first).expect("serialise");
+    let keys = old.as_object_mut().expect("an object");
+    keys.remove("acked_below").expect("acked_below is written");
+    keys.remove("pinned").expect("pinned is written");
+    let read: TxnRequest = serde_json::from_value(old).expect("JSON without the fields reads");
+    assert_eq!(
+        read, first,
+        "JSON without the fields reads as no floor and no pins"
+    );
 }
 
 /// Ruling A-R255: an applied candidate carries the ack floor only when its envelope records
-/// one. A candidate without it serialises without the key, as every candidate did before, and
-/// reads back as `None`; one with a floor and two of its eight pin slots round-trips whole.
+/// one. Ruling A-R259: a candidate crosses the peer wire in postcard inside
+/// `KernelEvent::AppliedCandidate`, so with no floor and with a floor and two of its eight pin
+/// slots it round-trips whole; and JSON written before the field still reads, as `None`.
 #[retcd_test]
-fn m10_s2_a_candidate_without_an_ack_floor_is_the_old_shape() {
+fn m10_s2_a_candidate_ack_floor_crosses_postcard_whole() {
     use rdb_core::contracts::authority::{AuthorityDecision, Checkpoint, Lineage, Verdict};
     use rdb_core::contracts::ids::{
         AuthorityGeneration, BootId, CorrelationId, GrantId, NodeId, OwnerEpoch, PartitionId,
@@ -412,16 +421,6 @@ fn m10_s2_a_candidate_without_an_ack_floor_is_the_old_shape() {
         },
         ack_floor: None,
     };
-    let old = serde_json::to_value(plain).expect("serialise");
-    assert!(
-        !old.as_object()
-            .expect("an object")
-            .contains_key("ack_floor"),
-        "no floor serialises as the old shape: {old}"
-    );
-    let read: AppliedCandidate = serde_json::from_value(old).expect("the old shape reads");
-    assert_eq!(read, plain, "the old shape reads as no floor");
-
     let mut pinned = [None; MAX_PINS];
     pinned[0] = Some(5);
     pinned[1] = Some(9);
@@ -429,10 +428,19 @@ fn m10_s2_a_candidate_without_an_ack_floor_is_the_old_shape() {
         ack_floor: Some(AckFloor { below: 11, pinned }),
         ..plain
     };
-    let carried = serde_json::to_value(floored).expect("serialise");
-    assert_eq!(carried["ack_floor"]["below"], 11);
-    let read: AppliedCandidate = serde_json::from_value(carried).expect("read");
-    assert_eq!(read, floored, "a floor and its pins round-trip");
+    for sent in [plain, floored] {
+        let bytes = postcard::to_stdvec(&sent).expect("postcard encode");
+        let got: AppliedCandidate = postcard::from_bytes(&bytes).expect("postcard decode");
+        assert_eq!(got, sent, "the candidate crosses postcard whole");
+    }
+
+    let mut old = serde_json::to_value(plain).expect("serialise");
+    old.as_object_mut()
+        .expect("an object")
+        .remove("ack_floor")
+        .expect("ack_floor is written");
+    let read: AppliedCandidate = serde_json::from_value(old).expect("JSON without it reads");
+    assert_eq!(read, plain, "JSON without the field reads as no floor");
 }
 
 /// Domain separation: the same bytes in two domains are two digests.

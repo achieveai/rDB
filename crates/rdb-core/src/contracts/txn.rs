@@ -52,15 +52,21 @@ pub struct TxnRequest {
     /// either rule is `INVALID_ARGUMENT`. A floor lower than one already held is a no-op.
     ///
     /// Not part of [`Self::request_digest`]: a resend carries a later floor than its first
-    /// send, and that is not `REQUEST_ID_REUSE`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// send, and that is not `REQUEST_ID_REUSE`. It is kept out by naming, not by serde: the
+    /// digest lists its fields, and this one is not listed.
+    ///
+    /// Always serialised. This type crosses the peer wire in postcard, which is not
+    /// self-describing, so a skipped field shifts every byte after it (ruling A-R259). `default`
+    /// lets JSON written before the field still read.
+    #[serde(default)]
     pub acked_below: Option<u64>,
     /// Ids below [`Self::acked_below`] the floor does not cover: each was answered
     /// `UNKNOWN_OUTCOME`, so its answer stays for a later status query or resend. At most
     /// [`MAX_PINS`]. Empty pins nothing, and with no floor it means nothing.
     ///
-    /// Not part of [`Self::request_digest`], for the same reason as the floor.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Not part of [`Self::request_digest`], for the same reason as the floor. Always
+    /// serialised, for the same reason as the floor.
+    #[serde(default)]
     pub pinned: Vec<u64>,
 }
 
