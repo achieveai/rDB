@@ -25,7 +25,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -196,6 +196,9 @@ const AFFINITY: AffinityId = AffinityId(1);
 
 /// The longest the thread sleeps with nothing due, so a missed wake costs at most this.
 const IDLE_WAIT: Duration = Duration::from_millis(1_000);
+
+/// D10: the most letters `Host::run` takes from its mailbox before it runs the due duties.
+const MAIL_BEFORE_DUTIES: usize = 256;
 
 /// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
 /// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
@@ -1001,6 +1004,21 @@ pub(crate) fn pause_before_inventory(node_dir: &std::path::Path, pause: Duration
         .push((node_dir.to_path_buf(), pause));
 }
 
+/// Test-only: node directories whose host sleeps once, for the time given, before its next
+/// barrier sync (a `SyncWalThrough` before the commit), as a slow fsync would (D10).
+#[cfg(test)]
+static PAUSE_BEFORE_SYNC: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+/// Test-only: the host on the copy at `node_dir` sleeps `pause` before its next barrier sync,
+/// once.
+#[cfg(test)]
+pub(crate) fn pause_before_sync(node_dir: &std::path::Path, pause: Duration) {
+    PAUSE_BEFORE_SYNC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), pause));
+}
+
 fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
     AFTER_COMMIT
         .lock()
@@ -1297,6 +1315,9 @@ struct Host {
     /// Peer frames this process took from its mailbox, for `node_stopped`: what a restarted
     /// node is still sent, though it holds no role (M9 S2b, critic A5).
     frames_received: u64,
+    /// D10 (A-R196(1)): asks F1 put to a copy this node holds, answered once every effect of the
+    /// step that made them is out, so the asks to peers leave before this node's own fsync.
+    own_asks: Vec<(Site, PeerAsk)>,
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
@@ -1377,6 +1398,7 @@ impl Host {
             stepped_at: now,
             authority_views: BTreeMap::new(),
             frames_received: 0,
+            own_asks: Vec::new(),
             #[cfg(test)]
             fail_step_view: false,
             #[cfg(test)]
@@ -1393,7 +1415,17 @@ impl Host {
             count = 0,
             "host_duty"
         );
-        loop {
+        'run: loop {
+            // D10 (A-R196(1)): mail already here is taken before the due duties, so a deadline
+            // that came due during a stall is judged after the answers that beat it, not before.
+            // At most `MAIL_BEFORE_DUTIES` letters, so a busy mailbox cannot starve the duties.
+            for _ in 0..MAIL_BEFORE_DUTIES {
+                match rx.try_recv() {
+                    Ok(Msg::Stop) | Err(TryRecvError::Disconnected) => break 'run,
+                    Ok(msg) => self.handle(msg),
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
             if self.fault.is_none() {
                 self.run_due();
                 self.drain();
@@ -2644,6 +2676,13 @@ impl Host {
                     }
                 }
                 EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site)?,
+            }
+        }
+        // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
+        // its own fsync never delays theirs.
+        for (site, ask) in std::mem::take(&mut self.own_asks) {
+            if let Some(answer) = self.answer(site.partition, &ask) {
+                self.answer_here(site, answer);
             }
         }
         self.report_unproven();
@@ -3954,9 +3993,8 @@ impl Host {
     /// Ask `holder` over the peer link (a hold delays it), or answer here when it is us.
     fn ask(&mut self, holder: NodeId, site: Site, ask: PeerAsk) {
         if holder == self.node {
-            if let Some(answer) = self.answer(site.partition, &ask) {
-                self.answer_here(site, answer);
-            }
+            // D10: answered by `deliver` after the step's other effects, peer asks included.
+            self.own_asks.push((site, ask));
             return;
         }
         let msg = Msg::PeerAsk {
@@ -4575,6 +4613,22 @@ impl Host {
         post_commit: bool,
     ) -> Option<RecoveryEvent> {
         let node = self.node.0;
+        #[cfg(test)]
+        if !post_commit {
+            let pause = {
+                let mut pauses = PAUSE_BEFORE_SYNC
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = pauses
+                    .iter()
+                    .position(|(dir, _)| self.engine.path().starts_with(dir));
+                at.map(|at| pauses.remove(at).1)
+            };
+            if let Some(pause) = pause {
+                tracing::info!(node, millis = pause.as_millis(), "test_sync_paused");
+                std::thread::sleep(pause);
+            }
+        }
         let captured = vec![CapturedPrefix {
             partition,
             generation,

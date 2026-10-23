@@ -2678,7 +2678,12 @@ mod tests {
 
     /// Wait until node 1 admits writes, failing at once if any node is stuck in discovery.
     fn admits(db: &Db, phase: &str) {
-        let patience = crate::host::test_patience(Duration::from_secs(5));
+        admits_within(db, phase, Duration::from_secs(5));
+    }
+
+    /// [`admits`] with its own patience, scaled the same way.
+    fn admits_within(db: &Db, phase: &str, patience: Duration) {
+        let patience = crate::host::test_patience(patience);
         let deadline = std::time::Instant::now() + patience;
         while db.node_status().first().and_then(|node| node.admits) != Some(true) {
             for node in db.node_status() {
@@ -6410,6 +6415,68 @@ mod tests {
             [(serde_json::json!(1), serde_json::json!(written[1] + 1))],
             "node 1 trimmed generation 1 through the final mark at the restore"
         );
+    }
+
+    /// D10 (A-R196(1)): a reopen whose owner syncs slowly still completes its barrier. Node 1's
+    /// own barrier sync sleeps a second past the discovery window, as a slow fsync under load
+    /// did. Its asks to nodes 2 and 3 leave before its own sync, and the run loop reads their
+    /// answers before it judges the overdue deadline, so F1 commits and a reads back. Either
+    /// half alone fails it `BarrierIncomplete`: asks sent after the sleep are answered after the
+    /// deadline, and answers queued during the sleep are read after it.
+    /// Integration (~5 s): two opens, a 3 s sleep.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_whose_owner_syncs_slowly_still_completes_its_barrier() {
+        const METHOD: &str = "m10_a_reopen_whose_owner_syncs_slowly_still_completes_its_barrier";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+        crate::host::pause_before_sync(
+            &dir.path().join("nodes").join("1"),
+            Duration::from_millis(window + 1_000),
+        );
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits_within(&db, "the reopen", Duration::from_secs(15));
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(
+            read.value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"1"))
+        );
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["@m"] == "test_sync_paused" && line["node"] == 1),
+            "node 1's own barrier sync slept"
+        );
+        // The reopen's barrier is the last three pre-commit proofs: node 1's comes last, after
+        // the peers it asked first.
+        let proven: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "sync_proven" && line["post_commit"] == false)
+            .map(|line| line["node"].as_u64().unwrap_or_default())
+            .collect();
+        let barrier = &proven[proven.len().saturating_sub(3)..];
+        assert_eq!(barrier.len(), 3, "three barrier proofs: {proven:?}");
+        assert_eq!(barrier[2], 1, "node 1 proved its own copy last: {proven:?}");
+        let blocked: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                line["@m"] == "recovery_fact"
+                    && line["effect"]
+                        .as_str()
+                        .is_some_and(|effect| effect.starts_with("BlockPromotion"))
+            })
+            .collect();
+        assert!(blocked.is_empty(), "the barrier completed: {blocked:?}");
     }
 
     /// D6, critic-d6 F1 (A-R170 D): writes spread over more than the retention fill the cap
