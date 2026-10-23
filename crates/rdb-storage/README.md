@@ -2,10 +2,11 @@
 
 The M1 storage seam on real RocksDB. S0: write batches, crash the process, reopen, check what
 survived. S1: generation inheritance (ADR-rdb-0010) — a new generation reads through to the old
-one (linked), or gets a copy of it as of `base` (copied). Format 1
-(`keys::FORMAT_VERSION = 1`); S0's provisional 0 is refused at open (exit 6).
+one (linked), or gets a copy of it as of `base` (copied). Format 2
+(`keys::FORMAT_VERSION = 2`, M10 S2); a format-1 copy still opens. S0's provisional 0 is
+refused at open (exit 6).
 
-## Format 1, in one screen
+## Format 2, in one screen
 
 - Key: `partition u32 BE | generation u64 BE | ns u8 | key`.
 - Value: `kind u8 | version u64 BE | bytes`. Kind 0 value, 1 tombstone (no bytes; only in a
@@ -19,6 +20,11 @@ one (linked), or gets a copy of it as of `base` (copied). Format 1
   `instance_marker=<hex>`.
 - Publish marks (M10 S1-6): `metadata` key `publish` + partition u32 BE, the partition's
   marks (24 B each), synced. Short too, so it needed no format bump either.
+- Epoch revocations (format 2, M10 S2): `metadata` key `revoked` + partition u32 BE, the
+  partition's revoked owner epochs (8 B each, ascending), synced
+  (`persist_epoch_revocation`; `epoch_revocations` for the host's replay at start). `dump`
+  shows `revoked_epochs p=<id> [<epochs>]`. A format-1 copy keeps marker 1 until its first
+  revocation; that batch writes marker 2, so a format-1 build then refuses the copy.
 - A new key needs a `FORMAT_VERSION` bump. This build refuses a short `metadata` key it
   does not define (A-R184), so a copy holding a newer build's key would not open here.
 - A stored `Meta` record is refused at open; a `Meta` write is refused at commit.

@@ -496,3 +496,152 @@ fn m10_a_synced_metadata_write_syncs_the_wal_before_it_counts_as_synced() {
     }
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
+
+/// Put `value` at `key` in the `metadata` column family of the closed copy at `db`.
+fn put_raw(db: &std::path::Path, key: &[u8], value: &[u8]) {
+    let raw = rocksdb::DB::open_cf(
+        &rocksdb::Options::default(),
+        db,
+        rdb_storage::keys::COLUMN_FAMILIES,
+    )
+    .expect("raw open");
+    let meta = raw
+        .cf_handle(rdb_storage::keys::CF_METADATA)
+        .expect("metadata cf");
+    raw.put_cf(meta, key, value).expect("raw put");
+}
+
+/// The format marker of the closed copy at `db`.
+fn marker(db: &std::path::Path) -> u32 {
+    let raw = rocksdb::DB::open_cf_for_read_only(
+        &rocksdb::Options::default(),
+        db,
+        rdb_storage::keys::COLUMN_FAMILIES,
+        false,
+    )
+    .expect("raw read-only open");
+    let meta = raw
+        .cf_handle(rdb_storage::keys::CF_METADATA)
+        .expect("metadata cf");
+    let found = raw
+        .get_cf(meta, b"format")
+        .expect("read")
+        .expect("a marker");
+    u32::from_be_bytes(found.as_slice().try_into().expect("4 bytes"))
+}
+
+/// Format 2 (M10 S2, arch-s2 "Restart heal and drain"): A1's `PersistEpochRevocation` lands
+/// here. A format-1 copy (an S1 directory) still opens and stays format 1, so an S1 build can
+/// still open it, until its first revocation, whose synced batch moves the marker to 2. The
+/// revocations survive a reopen, read-only included, come back by partition then epoch for the
+/// host's replay, and `dump` names them. A stored value that is not whole epochs is `Corrupt`,
+/// never "none revoked", for the read and for the next revocation alike. Cuts: accept only
+/// format 2 (the S1 copy is refused at open); write no marker with the revocation (it reads 1);
+/// drop the `revoked` key from the keys an open accepts (the reopen is refused). Unit, under a
+/// second.
+#[retcd_test]
+fn m10_s2_epoch_revocations_survive_a_reopen_and_move_a_format_1_copy_to_2() {
+    use rdb_storage::keys::{FORMAT_VERSION, OLDEST_FORMAT_VERSION};
+    let dir = data_dir("revocations");
+    let db = dir.join("db");
+    let (p1, p2) = (PartitionId(1), PartitionId(2));
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 2);
+    }
+    assert_eq!(marker(&db), FORMAT_VERSION, "a new copy is format 2");
+    put_raw(&db, b"format", &OLDEST_FORMAT_VERSION.to_be_bytes());
+    {
+        let mut engine = RocksEngine::open(&db).expect("an S1 copy opens");
+        assert_eq!(engine.epoch_revocations(), Ok(Vec::new()), "none held");
+        write(&mut engine, 3);
+    }
+    assert_eq!(marker(&db), 1, "opens and writes leave an S1 copy format 1");
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        for (partition, epoch) in [(p1, 5), (p2, 4), (p1, 3), (p1, 5)] {
+            engine
+                .persist_epoch_revocation(partition, OwnerEpoch(epoch))
+                .expect("revoke");
+        }
+    }
+    assert_eq!(marker(&db), 2, "the first revocation moved the marker");
+    let held = vec![
+        (p1, OwnerEpoch(3)),
+        (p1, OwnerEpoch(5)),
+        (p2, OwnerEpoch(4)),
+    ];
+    {
+        let engine = RocksEngine::open(&db).expect("a reopen");
+        assert_eq!(engine.epoch_revocations(), Ok(held.clone()), "durable");
+    }
+    let reader = RocksEngine::open_read_only(&db).expect("read-only open");
+    assert_eq!(reader.epoch_revocations(), Ok(held));
+    drop(reader);
+    assert!(
+        dump(&db)
+            .expect("dump")
+            .iter()
+            .any(|r| r.to_string() == "metadata revoked_epochs p=1 [3 5]"),
+        "dump names them"
+    );
+
+    let mut key = b"revoked".to_vec();
+    key.extend_from_slice(&1_u32.to_be_bytes());
+    put_raw(&db, &key, &[0; 7]);
+    let mut engine = RocksEngine::open(&db).expect("open with an undecodable list");
+    assert_eq!(engine.epoch_revocations(), Err(StorageFault::Corrupt));
+    assert_eq!(
+        engine.persist_epoch_revocation(p1, OwnerEpoch(6)),
+        Err(StorageFault::Corrupt),
+        "never written over"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// A revocation's write is synced and counts as synced (A-R214). An armed `SyncedPut` fails it:
+/// nothing is written, the copy stays format 1, and nothing counts as synced. Debug builds only,
+/// as the fault point and the count are. Unit, under a second.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_an_epoch_revocation_is_one_synced_write_or_nothing() {
+    use rdb_storage::InjectedFault;
+    let dir = data_dir("revocation-synced");
+    let db = dir.join("db");
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 1);
+    }
+    put_raw(&db, b"format", &1_u32.to_be_bytes());
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 2);
+        engine.inject_fault(InjectedFault::SyncedPut);
+        let before = engine.wal_syncs();
+        assert_eq!(
+            engine.persist_epoch_revocation(PartitionId(1), OwnerEpoch(2)),
+            Err(StorageFault::WriteFailed)
+        );
+        assert_eq!(
+            engine.epoch_revocations(),
+            Ok(Vec::new()),
+            "nothing written"
+        );
+        assert_eq!(engine.wal_syncs(), before, "nothing synced");
+        assert!(!engine.wal_synced_through_latest());
+    }
+    assert_eq!(marker(&db), 1, "the failed write left the copy format 1");
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        write(&mut engine, 3);
+        let before = engine.wal_syncs();
+        engine
+            .persist_epoch_revocation(PartitionId(1), OwnerEpoch(2))
+            .expect("revoke");
+        assert_eq!(engine.wal_syncs(), before + 1, "one sync");
+        assert!(engine.wal_synced_through_latest(), "it counts as synced");
+    }
+    assert_eq!(marker(&db), 2);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}

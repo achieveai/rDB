@@ -9,7 +9,7 @@
 //! - [`dump`] lists every stored record read-only, for debugging.
 //! - [`RocksEngine::inherit`] links a new generation to its parent at a cutoff; [`RocksEngine::get`]
 //!   reads through the chain.
-//! - [`keys`] is the physical layout, [`keys::FORMAT_VERSION`] `1` (ADR-rdb-0010).
+//! - [`keys`] is the physical layout, [`keys::FORMAT_VERSION`] `2` (ADR-rdb-0010; M10 S2).
 //!
 //! Manual entry point: `cargo run -p rdb-storage --example rocks_scenario -- --help`. The
 //! scenario walk-through is `crates/rdb-storage/README.md`.
