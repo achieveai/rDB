@@ -1025,6 +1025,32 @@ pub fn pause_before_sync(node_dir: &std::path::Path, pause: Duration) {
         .push((node_dir.to_path_buf(), pause));
 }
 
+/// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
+/// an iteration, when its own copy of partition 1 is durable further than the primary's floor
+/// and at least through the `Seq` given. So the peers' answers that would raise the floor land
+/// in its mailbox while it sleeps. Crate tests only.
+#[cfg(test)]
+static STALL_LOOP: Mutex<Vec<(PathBuf, Seq, Duration)>> = Mutex::new(Vec::new());
+
+/// Arm [`STALL_LOOP`] for the host on `node_dir`, as `DbConfig::dir` joined with `nodes/<n>`.
+#[cfg(test)]
+pub(crate) fn stall_loop_once(node_dir: &std::path::Path, through: Seq, pause: Duration) {
+    STALL_LOOP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), through, pause));
+}
+
+/// Whether the stall armed for `node_dir` has yet to fire.
+#[cfg(test)]
+pub(crate) fn stall_loop_armed(node_dir: &std::path::Path) -> bool {
+    STALL_LOOP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(dir, _, _)| dir == node_dir)
+}
+
 fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
     AFTER_COMMIT
         .lock()
@@ -1422,17 +1448,38 @@ impl Host {
             "host_duty"
         );
         'run: loop {
+            #[cfg(test)]
+            self.stall_loop();
             // D10 (A-R196(1)): mail already here is taken before the due duties, so a deadline
             // that came due during a stall is judged after the answers that beat it, not before.
+            // D18 (A-R206): and drained before them too. A peer frame's `DurableAdvanced` is
+            // queued only when its frame is stepped, so taken but not drained it would land
+            // behind the health eval `run_due` queues, and L1 would judge exposure on progress
+            // the mailbox already had. A drain can stall in turn (a slow barrier fsync, D10's
+            // row), so the mailbox is read again after every drain, until a read finds nothing.
             // At most `MAIL_BEFORE_DUTIES` letters, so a busy mailbox cannot starve the duties.
-            for _ in 0..MAIL_BEFORE_DUTIES {
-                match rx.try_recv() {
-                    Ok(Msg::Stop) | Err(TryRecvError::Disconnected) => break 'run,
-                    Ok(msg) => self.handle(msg),
-                    Err(TryRecvError::Empty) => break,
+            let mut taken = 0;
+            loop {
+                if self.fault.is_none() {
+                    self.drain();
+                }
+                let before = taken;
+                while taken < MAIL_BEFORE_DUTIES {
+                    match rx.try_recv() {
+                        Ok(Msg::Stop) | Err(TryRecvError::Disconnected) => break 'run,
+                        Ok(msg) => {
+                            self.handle(msg);
+                            taken += 1;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                    }
+                }
+                if taken == before || taken == MAIL_BEFORE_DUTIES {
+                    break;
                 }
             }
             if self.fault.is_none() {
+                self.drain();
                 self.run_due();
                 self.drain();
             }
@@ -1458,6 +1505,39 @@ impl Host {
             frames = self.frames_received,
             "node_stopped"
         );
+    }
+
+    /// [`STALL_LOOP`]: sleep once, armed for this copy, when its own copy of partition 1 is
+    /// durable through the armed `Seq` and further than the primary's floor.
+    #[cfg(test)]
+    fn stall_loop(&mut self) {
+        let partition = PartitionId(1);
+        let mut armed = STALL_LOOP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = armed
+            .iter()
+            .position(|(dir, _, _)| self.engine.path().starts_with(dir))
+        else {
+            return;
+        };
+        let Some(primary) = self.replication.primary(self.node, partition) else {
+            return;
+        };
+        let floor = primary.tracker().min_required_durable().0;
+        let own = self
+            .engine
+            .durable(partition, self.adopted(partition).generation)
+            .0;
+        let through = armed[at].1;
+        if own < through.0 || own <= floor {
+            return;
+        }
+        let (_, _, pause) = armed.remove(at);
+        drop(armed);
+        let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(node = self.node.0, own, floor, millis, "test_loop_stalled");
+        std::thread::sleep(pause);
     }
 
     /// How long to wait for mail: until the next due duty, at most [`IDLE_WAIT`].

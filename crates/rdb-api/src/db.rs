@@ -6840,6 +6840,63 @@ mod tests {
         );
     }
 
+    /// D18 (A-R206): a stall of node 1's run loop alone, past L1's pause age, with its own copy
+    /// durable and the peers' acks waiting in its mailbox, does not pause writes. The loop drains
+    /// the mail it took before it runs the due duties, so the peers' `DurableAdvanced` reaches L1
+    /// before the overdue health eval. Node 1 sleeps 1 s (the pause age is 400 ms) at the top of
+    /// a loop once its copy is durable past the primary's floor. Cut: `run_due` before that
+    /// drain, and L1 pauses on stale progress. Integration (~3 s): one open, puts until the stall
+    /// fires, then twice the pause age.
+    #[config_log::retcd_test]
+    fn m10_d18_a_stall_of_node_1_alone_does_not_pause_writes_its_peers_made_durable() {
+        const METHOD: &str =
+            "m10_d18_a_stall_of_node_1_alone_does_not_pause_writes_its_peers_made_durable";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the open");
+        let node_1 = dir.path().join("nodes").join("1");
+        let pause_age = Duration::from_millis(fast().pause_age_millis);
+        let stall = Duration::from_millis(1_000);
+        crate::host::stall_loop_once(&node_1, Seq(2), stall);
+        // The stall waits for node 1's own fsync to beat the peers' acks, which a put need not
+        // give; each put is another chance.
+        for i in 0..40u32 {
+            if !crate::host::stall_loop_armed(&node_1) {
+                break;
+            }
+            db.put(format!("k{i}").as_bytes(), b"v", None)
+                .expect("a put before the stall");
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        assert!(
+            !crate::host::stall_loop_armed(&node_1),
+            "node 1's own copy never got ahead of the floor"
+        );
+        // The window the pause would fall in; the log, read below, is what is judged.
+        std::thread::sleep(stall + 2 * pause_age);
+        admits(&db, "after the stall");
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let stalled = lines
+            .iter()
+            .position(|line| line["@m"] == "test_loop_stalled" && line["node"] == 1)
+            .expect("node 1's loop stalled");
+        let paused: Vec<_> = lines[stalled..]
+            .iter()
+            .filter(|line| {
+                line["@m"] == "set_admission" && line["node"] == 1 && line["allow"] == false
+            })
+            .collect();
+        assert!(
+            paused.is_empty(),
+            "node 1 paused on progress its mailbox held: {:?} then {paused:?}",
+            lines[stalled]
+        );
+    }
+
     /// D10 (A-R196(1)): a reopen whose owner syncs slowly still completes its barrier. Node 1's
     /// own barrier sync sleeps a second past the discovery window, as a slow fsync under load
     /// did. Its asks to nodes 2 and 3 leave before its own sync, and the run loop reads their
