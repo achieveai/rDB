@@ -428,3 +428,71 @@ fn m10_w2_a_metadata_key_with_a_garbled_namespace_byte_is_refused_at_open() {
     }
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
+
+/// Review-s1 F-008: both synced metadata writes go through one helper. Each sync is seen by
+/// RocksDB's own WAL-sync count, and only then does the engine count every write synced, which
+/// is what lets the flush duty skip its next fsync (A-R214). An armed `SyncedPut` fails the
+/// write: nothing is written, nothing counts as synced, and the copy stays unbound. Cut: drop
+/// `set_sync(true)` from `put_metadata_synced`; the count stays put and the row is red.
+/// Debug builds only, as the fault point and the count are. Unit, under a second.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_a_synced_metadata_write_syncs_the_wal_before_it_counts_as_synced() {
+    use rdb_storage::InjectedFault;
+    let dir = data_dir("synced-put");
+    let lineage = Lineage {
+        partition: PartitionId(1),
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+    };
+    let mut batches = canonical_history(lineage, ConfigVersion(1), 2)
+        .expect("canonical history")
+        .batches
+        .into_iter();
+    {
+        let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+        engine
+            .commit(batches.next().expect("batch 1"))
+            .expect("commit");
+        assert!(!engine.wal_synced_through_latest(), "a commit is unsynced");
+
+        engine.inject_fault(InjectedFault::SyncedPut);
+        let before = engine.wal_syncs();
+        assert!(
+            matches!(engine.bind_instance(X), Err(BindError::WriteFailed { .. })),
+            "the armed put fails the bind"
+        );
+        assert_eq!(
+            engine.armed_fault(),
+            None,
+            "the bind reached the fault point"
+        );
+        assert_eq!(engine.instance(), None, "the copy stays unbound");
+        assert_eq!(engine.wal_syncs(), before, "nothing was synced");
+        assert!(
+            !engine.wal_synced_through_latest(),
+            "nothing counts as synced"
+        );
+
+        engine.bind_instance(X).expect("bind X");
+        assert_eq!(engine.wal_syncs(), before + 1, "the bind synced the WAL");
+        assert!(
+            engine.wal_synced_through_latest(),
+            "the bind counts as synced"
+        );
+
+        engine
+            .commit(batches.next().expect("batch 2"))
+            .expect("commit");
+        assert!(!engine.wal_synced_through_latest(), "a commit is unsynced");
+        engine
+            .put_publish_marks(PartitionId(1), &[])
+            .expect("put the publish marks");
+        assert_eq!(engine.wal_syncs(), before + 2, "the marks synced the WAL");
+        assert!(
+            engine.wal_synced_through_latest(),
+            "the marks count as synced"
+        );
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}

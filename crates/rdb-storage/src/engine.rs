@@ -182,6 +182,10 @@ pub struct RocksEngine {
     /// `None` until then, so a fresh open counts as unsynced. A write after it, synced or not,
     /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`].
     synced_seq: Option<u64>,
+    /// Debug builds: the options a writable open used, kept for their WAL-sync counter
+    /// ([`Self::wal_syncs`]); `None` on a read-only open.
+    #[cfg(debug_assertions)]
+    options: Option<Options>,
 }
 
 /// A storage fault the engine reports at the next matching call instead of calling RocksDB, so
@@ -203,6 +207,10 @@ pub enum InjectedFault {
     /// before it have landed, the switch has not (rows #15, #19). Not reached by a linked
     /// switch or a copy with no keys.
     CopyBatch,
+    /// The next synced metadata put ([`RocksEngine::bind_instance`],
+    /// [`RocksEngine::put_publish_marks`]): nothing is written and nothing counts as synced
+    /// (review-s1 F-008). Not reached by a bind of the id the copy already holds.
+    SyncedPut,
 }
 
 impl InjectedFault {
@@ -216,6 +224,7 @@ impl InjectedFault {
             Self::MarkWrite => "mark-write",
             Self::Switch => "switch",
             Self::CopyBatch => "copy-batch",
+            Self::SyncedPut => "synced-put",
         }
     }
 }
@@ -245,6 +254,31 @@ impl RocksEngine {
     #[must_use]
     pub const fn armed_fault(&self) -> Option<InjectedFault> {
         self.injected
+    }
+
+    /// Debug builds only: how many times RocksDB has synced this engine's WAL since it opened,
+    /// by its own count (`rocksdb.wal.synced`). A synced write adds one; an unsynced write adds
+    /// none (review-s1 F-008). Zero on a read-only open.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn wal_syncs(&self) -> u64 {
+        self.options.as_ref().map_or(0, |options| {
+            options.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced)
+        })
+    }
+
+    /// The one synced write of a metadata key (review-s1 F-008): a put with `sync` set, and
+    /// only once it returns `Ok` does [`Self::wal_synced_through_latest`] count it, so the
+    /// flush duty may skip its next fsync. Fault point [`InjectedFault::SyncedPut`].
+    fn put_metadata_synced(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.fire(InjectedFault::SyncedPut)?;
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .put_cf_opt(self.cf(CF_METADATA), key, value, &opts)
+            .map_err(|e| e.to_string())?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        Ok(())
     }
 
     /// `Err` once, if [`Self::inject_fault`] armed `at`. The `fault_injected` line is
@@ -305,7 +339,8 @@ impl RocksEngine {
             // open replays, flushes and rotates before the marker can be read.
             read_only(&path)?;
         }
-        let db = DB::open_cf_descriptors(&db_options(!existed), &path, descriptors())
+        let options = db_options(!existed);
+        let db = DB::open_cf_descriptors(&options, &path, descriptors())
             .map_err(|e| backend(&path, &e))?;
         let created = ensure_format(&db, &path, existed)?;
         let instance = read_instance(&db, &path)?;
@@ -341,6 +376,8 @@ impl RocksEngine {
             injected: None,
             claim: Some(Arc::new(claim)),
             synced_seq: None,
+            #[cfg(debug_assertions)]
+            options: Some(options),
         })
     }
 
@@ -379,6 +416,8 @@ impl RocksEngine {
             injected: None,
             claim: None,
             synced_seq: None,
+            #[cfg(debug_assertions)]
+            options: None,
         })
     }
 
@@ -435,19 +474,11 @@ impl RocksEngine {
             }
             None => {}
         }
-        let mut opts = WriteOptions::default();
-        opts.set_sync(true);
-        if let Err(e) = self
-            .db
-            .put_cf_opt(self.cf(CF_METADATA), INSTANCE_KEY, id, &opts)
-        {
-            tracing::error!(target: LOG_TARGET, error = %e, "instance_bind_failed");
-            return Err(BindError::WriteFailed {
-                detail: e.to_string(),
-            });
+        if let Err(detail) = self.put_metadata_synced(INSTANCE_KEY, &id) {
+            tracing::error!(target: LOG_TARGET, error = %detail, "instance_bind_failed");
+            return Err(BindError::WriteFailed { detail });
         }
         self.instance = Some(id);
-        self.synced_seq = Some(self.db.latest_sequence_number());
         tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
         Ok(())
     }
@@ -465,14 +496,9 @@ impl RocksEngine {
         partition: PartitionId,
         marks: &[PublishMark],
     ) -> Result<(), StorageFault> {
-        let mut opts = WriteOptions::default();
-        opts.set_sync(true);
-        if let Err(e) = self.db.put_cf_opt(
-            self.cf(CF_METADATA),
-            publish_marks_key(partition),
-            encode_publish_marks(marks),
-            &opts,
-        ) {
+        let written =
+            self.put_metadata_synced(&publish_marks_key(partition), &encode_publish_marks(marks));
+        if let Err(e) = written {
             tracing::error!(
                 target: LOG_TARGET,
                 partition = partition.0,
@@ -481,7 +507,6 @@ impl RocksEngine {
             );
             return Err(StorageFault::WriteFailed);
         }
-        self.synced_seq = Some(self.db.latest_sequence_number());
         tracing::debug!(
             target: LOG_TARGET,
             partition = partition.0,
@@ -1221,6 +1246,13 @@ fn db_options(create: bool) -> Options {
     opts.set_manual_wal_flush(false);
     opts.set_enable_pipelined_write(false);
     opts.set_unordered_write(false);
+    // Review-s1 F-008: debug builds count WAL syncs ([`RocksEngine::wal_syncs`]), so a row can
+    // see that a synced write synced. Tickers only, the cheapest level that keeps them.
+    #[cfg(debug_assertions)]
+    {
+        opts.enable_statistics();
+        opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptHistogramOrTimers);
+    }
     opts
 }
 

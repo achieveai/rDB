@@ -84,16 +84,20 @@ pub(crate) fn decode_copying(raw: &[u8]) -> Option<(Generation, Seq)> {
 /// The engine-wide format marker key in `metadata`. Shorter than [`PREFIX_LEN`] on purpose.
 pub(crate) const FORMAT_KEY: &[u8] = b"format";
 /// The engine-wide instance marker key in `metadata` (M10, arch R3b): the 16-byte instance id
-/// this copy is bound to. Shorter than [`PREFIX_LEN`], like [`FORMAT_KEY`], so a format-1 build
-/// that predates it skips it as it skips the format marker: no format bump. Absent means unbound.
+/// this copy is bound to. Absent means unbound. Shorter than [`PREFIX_LEN`], like
+/// [`FORMAT_KEY`], so a format-1 build from before M10 skips it as it skips the format marker,
+/// and it needed no format bump. That does not hold for the next key: this build refuses a short
+/// `metadata` key it does not define (A-R184), so a new key needs a [`FORMAT_VERSION`] bump.
 pub(crate) const INSTANCE_KEY: &[u8] = b"instance";
 /// Length of a stored instance id.
 pub const INSTANCE_LEN: usize = 16;
 /// The per-partition publish-mark key in `metadata` starts with these bytes; the partition id
 /// (u32 BE) follows (M10 S1-6, lead ruling A-R183). 11 bytes in all: shorter than
-/// [`PREFIX_LEN`], like [`FORMAT_KEY`] and [`INSTANCE_KEY`], so every format-1 open skips it
-/// and it needs no format bump. A lineage-shaped private record would not do: an open refuses a
-/// private record name it does not define, so every build before this one would refuse the copy.
+/// [`PREFIX_LEN`], like [`FORMAT_KEY`] and [`INSTANCE_KEY`], so a format-1 build from before
+/// M10 skips it, and it needed no format bump. A lineage-shaped private record would not do: an
+/// open refuses a private record name it does not define, so every build before this one would
+/// refuse the copy. This build refuses an undefined short key too (A-R184), so a key added after
+/// it needs a [`FORMAT_VERSION`] bump (review-s1 F-010).
 pub(crate) const PUBLISH_MARKS_PREFIX: &[u8] = b"publish";
 /// Length of one stored [`PublishMark`]: generation, seq and tick, each u64 BE.
 pub(crate) const PUBLISH_MARK_LEN: usize = 24;

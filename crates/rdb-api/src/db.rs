@@ -445,17 +445,27 @@ pub enum OpenError {
         /// Why it is not rolled forward.
         detail: String,
     },
-    /// The open counter refused (M10, arch R3b).
+    /// The open counter refused for good: it counted the most opens, or holds a value this
+    /// build does not write (M10, arch R3b). A store failure while counting is `Control`.
     #[error(transparent)]
     Counter(#[from] admin::CounterError),
-    /// The control store failed a read the open needs.
+    /// The control store failed, or did not answer, a read or a count the open needs. Nothing was
+    /// changed for good. When the store was unreachable, or failed a count, the text ends with
+    /// the step to open again.
     #[error("control store: {0}")]
     Control(String),
-    /// A node did not start.
-    #[error("node start: {0}")]
+    /// A node did not start: a copy's storage refused to open (a newer format, a corrupt
+    /// record, a disk error), or binding or linking a copy failed. Nothing was removed. The text
+    /// ends with the step (review-s1 F-006).
+    #[error(
+        "node start: {0}. Nothing was removed. If this names a newer format, open the folder \
+         with the build that wrote it; if it names a disk or permission error, fix that, then \
+         open again; otherwise, or if it repeats, stop and report it with this message"
+    )]
     Node(String),
-    /// The bootstrap was refused.
-    #[error(transparent)]
+    /// The bootstrap of a new folder was refused. Nothing was served yet, and the next open
+    /// reads what the store holds then (review-s1 F-006).
+    #[error("{0}. Check that rEtcd is running and reachable, then open the folder again")]
     Bootstrap(#[from] admin::BootstrapError),
     /// [`DbConfig::dedup_cap`] is above the cap P1's status index holds. Nothing was started.
     #[error(
@@ -468,8 +478,11 @@ pub enum OpenError {
         /// The largest allowed, [`RETENTION_CAP_ENTRIES`].
         max: usize,
     },
-    /// The filesystem refused.
-    #[error("{0}")]
+    /// The filesystem refused (review-s1 F-006).
+    #[error(
+        "the filesystem refused: {0}. Check that the folder's path is right and that this \
+         process may write there, then open again"
+    )]
     Io(#[from] std::io::Error),
 }
 
@@ -558,10 +571,12 @@ pub enum ReadyError {
         note: String,
     },
     /// Node 1's recovery ended `Blocked` before it took writes. It does not try again in this
-    /// open (ruling F-a), so no wait helps (A-R196).
+    /// open (ruling F-a), so no wait helps (A-R196). A new open usually gets past it; one that
+    /// is blocked again is not a slow host, so the text says to stop then (review-s1 F-007).
     #[error(
         "the open's recovery stopped before node 1 took writes ({reason}), and it does not try \
-         again in this open: shut this Db down and open the folder again"
+         again in this open. If the last open of this folder stopped the same way, stop and \
+         report it with this message; otherwise shut this Db down and open the folder again"
     )]
     Blocked {
         /// The block's reason, as node 1's recovery phase names it.
@@ -772,17 +787,11 @@ impl Db {
             created: created.then(|| nodes_dir.clone()),
         };
         let found = Self::check(&mut claim.engines, &store).await?;
-        let absent = |error| match error {
-            admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
-                "the copies name instance {}, but {key} is absent",
-                admin::instance_hex(&found.instance)
-            )),
-            other => OpenError::Counter(other),
-        };
+        let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
             None => admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
                 .await
-                .map_err(absent)?,
+                .map_err(refused)?,
             // Ruling A-R184: count at exactly the revision the decision read, so a host that
             // activated the generation since then makes this open Stale, then link the copies.
             Some(roll) => {
@@ -799,7 +808,7 @@ impl Db {
                         generation: roll.to.0,
                         detail: format!("not rolled forward: {moved}"),
                     },
-                    other => absent(other),
+                    other => refused(other),
                 })?;
                 for node in &roll.copies {
                     claim
@@ -935,10 +944,7 @@ impl Db {
                 // One step fits both an rEtcd nobody reached and one that answered without a
                 // leader because most of its nodes are down (A-R210).
                 let step = match error {
-                    config_core::ConfigError::Unavailable { .. } => {
-                        ". Check that rEtcd is running and reachable from this process, and \
-                         that a majority of its nodes is up, then open again"
-                    }
+                    config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
                     _ => "",
                 };
                 OpenError::Control(format!("get partitions/1: {error}{step}"))
@@ -1001,16 +1007,9 @@ impl Db {
             .any(|engine| engine.lineages().contains(&(PARTITION, record.generation)));
         if !holds {
             // Ruling A-R184: roll forward only what the open counter proves no host activated.
-            let (count, revision) =
-                admin::read_count(&**store, &instance)
-                    .await
-                    .map_err(|error| match error {
-                        admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
-                            "the copies name instance {}, but {key} is absent",
-                            admin::instance_hex(&instance)
-                        )),
-                        other => OpenError::Counter(other),
-                    })?;
+            let (count, revision) = admin::read_count(&**store, &instance)
+                .await
+                .map_err(|error| counter_refused(&instance, error))?;
             return match roll_forward_copies(engines, record.generation, &root, count) {
                 Ok(copies) => Ok(Found {
                     instance,
@@ -2482,6 +2481,29 @@ fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
          rEtcd",
         admin::instance_hex(ours)
     )
+}
+
+/// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
+const RETCD_STEP: &str = ". Check that rEtcd is running and reachable from this process, and \
+                          that a majority of its nodes is up, then open again";
+
+/// The open counter's refusal, as the open reports it. `Absent` is a store that is not this
+/// folder's. `Control`, a store that failed or did not answer, is the same passing failure as
+/// the open's read of `partitions/1`, with the same step (ruling A-R218, review-s1 F-002):
+/// a lost count reply can waste a number but never hands one out twice, and a roll-forward
+/// links nothing before its count lands, so opening again is safe. Only `Exhausted` and
+/// `Unreadable` stay `Counter`; a roll-forward's `Moved` is its caller's.
+fn counter_refused(instance: &[u8; INSTANCE_LEN], error: admin::CounterError) -> OpenError {
+    match error {
+        admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
+            "the copies name instance {}, but {key} is absent",
+            admin::instance_hex(instance)
+        )),
+        admin::CounterError::Control(detail) => {
+            OpenError::Control(format!("open counter: {detail}{RETCD_STEP}"))
+        }
+        other => OpenError::Counter(other),
+    }
 }
 
 /// How long the heal may wait for old grants to clear: a whole grant, its clock error and
@@ -5130,8 +5152,9 @@ mod tests {
         assert_eq!(
             answer.expect_err("blocked").to_string(),
             "the open's recovery stopped before node 1 took writes (BarrierIncomplete { missing: \
-             [CopyId(1), CopyId(2)] }), and it does not try again in this open: shut this Db down \
-             and open the folder again"
+             [CopyId(1), CopyId(2)] }), and it does not try again in this open. If the last open \
+             of this folder stopped the same way, stop and report it with this message; \
+             otherwise shut this Db down and open the folder again"
         );
         drop(db);
         node_1.join().expect("the stub");
@@ -7718,6 +7741,51 @@ mod tests {
             "{rolled:?}"
         );
         ready_and_reads_back(&db, "after the roll-forward");
+        db.shutdown();
+    }
+
+    /// Ruling A-R218 (review-s1 F-002): a reopen whose read of the open counter fails once,
+    /// as in an rEtcd leader change, is `Control` with the step to open again, never the
+    /// `Counter` refusal an app must treat as final. The roll-forward's read is the one with no
+    /// retry, so the row cuts a reopen short at its commit (as the row above) to reach it. Then
+    /// opening the same folder again, with the store back, rolls forward and reads back: the
+    /// step is one this build can run. Cut: `counter_refused` maps `Control` to `Counter`, and
+    /// the first match fails. Integration (~12 s): a fresh open, a reopen cut short, a refused
+    /// open, a rolled-forward open until ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_whose_counter_read_fails_once_says_open_again_and_opens_again() {
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen cut short");
+        until_stored(&rt, &store, 2);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+
+        // The open's first read, `partitions/1`, passes; its second, the counter, fails.
+        scripted.rescript(Script {
+            pass_gets: 1,
+            fail_gets: 1,
+            ..Script::default()
+        });
+        let error = match open_fast(&rt, dir.path(), &store) {
+            Err(error @ OpenError::Control(_)) => error,
+            Err(other) => panic!("the open fails with Control, not: {other:?}"),
+            Ok(_) => panic!("the open fails while the counter read fails"),
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("control store: open counter: get ") && text.ends_with(RETCD_STEP),
+            "{text}"
+        );
+
+        scripted.rescript(Script::default());
+        let mut db = open_fast(&rt, dir.path(), &store).expect("opening again rolls forward");
+        ready_and_reads_back(&db, "after opening again");
         db.shutdown();
     }
 

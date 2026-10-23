@@ -3442,8 +3442,11 @@ impl Host {
         // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
         // generation now, before `Recovered` re-anchors its receiver, so it never carries an
         // unlinked generation into the next open.
+        // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is.
         let caught_up = if first && !barrier {
-            self.land_link(partition, &result)
+            let caught_up = self.land_link(partition, &result);
+            self.sync_link(partition, result.new_generation)?;
+            caught_up
         } else {
             None
         };
@@ -3676,7 +3679,35 @@ impl Host {
                     "inherit p{} to g{}: {e}",
                     partition.0, result.new_generation.0
                 ))
-            })
+            })?;
+        self.sync_link(partition, result.new_generation)
+    }
+
+    /// Ruling A-R217 (review-s1 F-001): a generation's link is durable before anything can
+    /// follow it. `inherit` writes the link unsynced, and [`Self::schedule_acquire`] may next
+    /// ask the open counter to mark the generation activated. A power loss between the two
+    /// would leave the counter naming a generation no copy holds, and every later open would
+    /// be `Stale`. One sync per generation change; none when every write is synced already.
+    /// A failed sync faults the node, so nothing follows the link.
+    fn sync_link(&mut self, partition: PartitionId, generation: Generation) -> Result<(), Fault> {
+        if self.engine.wal_synced_through_latest() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.engine.sync_wal_through(Vec::new()).map_err(|fault| {
+            Fault::from(format!(
+                "sync the link of p{} g{}: {fault:?}",
+                partition.0, generation.0
+            ))
+        })?;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            millis = millis(started),
+            "link_synced"
+        );
+        Ok(())
     }
 
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
@@ -6791,6 +6822,65 @@ mod tests {
         assert_next_duty_syncs(&mut host, "a dedup delete");
     }
 
+    /// Review-s1 F-003 (D10's cap): a mailbox holding more than `MAIL_BEFORE_DUTIES` letters,
+    /// then `Stop`, with the flush duty due. `Host::run` takes exactly that many, runs the due
+    /// duties, and only then reads on to `Stop`, so steady mail cannot starve them. Each letter
+    /// is a stale-boot `Activated`, which logs one line and changes nothing. Cut: the read's
+    /// bound `taken < MAIL_BEFORE_DUTIES` lifted; the run reads every letter and `Stop` before
+    /// any duty, and no flush line is logged, red. Dropping `|| taken == MAIL_BEFORE_DUTIES`
+    /// alone stays green, and rightly: `taken` counts across passes, so the next pass reads
+    /// nothing and the loop ends at the same letter. That clause saves one drain. Unit, under
+    /// a second.
+    #[config_log::retcd_test]
+    fn a_full_mailbox_runs_the_due_duties_after_the_cap_before_reading_on() {
+        const METHOD: &str = "a_full_mailbox_runs_the_due_duties_after_the_cap_before_reading_on";
+        const LETTERS: usize = MAIL_BEFORE_DUTIES + 44;
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition: PartitionId(2),
+                generation: Generation(1),
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit");
+        host.next_flush = host.clock.now();
+        let stale = BootId(host.boot.0 + 1);
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..LETTERS {
+            tx.send(Msg::Activated {
+                boot: stale,
+                partition: PartitionId(2),
+                generation: Generation(1),
+            })
+            .expect("send");
+        }
+        tx.send(Msg::Stop).expect("send");
+        host.run(&rx);
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let letters = lines
+            .iter()
+            .filter(|line| line["@m"] == "control_stale_boot_dropped")
+            .count();
+        assert_eq!(letters, LETTERS, "every letter was read");
+        let flush = lines
+            .iter()
+            .position(|line| line["@m"] == "host_duty" && line["kind"] == "flush")
+            .expect("the flush duty ran before Stop");
+        let before = lines[..flush]
+            .iter()
+            .filter(|line| line["@m"] == "control_stale_boot_dropped")
+            .count();
+        assert_eq!(
+            before, MAIL_BEFORE_DUTIES,
+            "the duty ran right after the cap"
+        );
+    }
+
     /// A-R214 row 2: an inherit at base 0 (a landing at cutoff 0) writes the link and the
     /// seal, and leaves both lineages applied and durable at 0. The duty syncs it. Cut
     /// (durable == applied alone): the fault stays armed, red.
@@ -8154,6 +8244,125 @@ mod tests {
         result.selected.cutoff_digest = digest;
         result.retained_status_map.predecessor_generation = Generation(1);
         result
+    }
+
+    /// A-R217 rows: node 1's host, the pinned primary of [`landing_at`]'s commit, over the engine
+    /// at `path`, with an open bound, so a landing it links can go on to `activate`.
+    fn primary_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
+        let engine = RocksEngine::open(path).expect("open engine");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
+        let mut host = Host::new(NodeId(1), engine, links, control, HostClock::start());
+        host.instance = Some([7_u8; INSTANCE_LEN]);
+        host
+    }
+
+    /// The newest generation `host` asked the open counter to mark activated for partition 1.
+    fn asked(host: &Host) -> Generation {
+        host.activation
+            .get(&PartitionId(1))
+            .map_or(Generation::default(), |activation| activation.asked)
+    }
+
+    /// Ruling A-R217 (review-s1 F-001), row 1: the path through `inherit`, which `recovered`
+    /// takes on the copy that ran F1 and `land` takes on a barrier copy. The link is synced
+    /// before `activate` may run: with the WAL sync failing, `recovered` faults and nothing
+    /// asks the open counter to mark generation 2. Without the fault the same landing reaches
+    /// `activate`, so the refusal is the sync's doing. Cut: `sync_link` returns before syncing;
+    /// the armed landing is `Ok` and asks for generation 2, red. Unit, under a second.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_link_that_cannot_be_synced_never_reaches_activate_through_inherit() {
+        let rt = current_thread();
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(0),
+        };
+        for armed in [true, false] {
+            let dir = config_testkit::fs::temp_dir();
+            let path = dir.path().join("node");
+            let digests = write_chain(
+                &mut RocksEngine::open(&path).expect("open engine"),
+                Generation(1),
+                2,
+            );
+            let result = landing_at(2, digests[1]);
+            let mut host = primary_over(&path, &rt);
+            if armed {
+                host.engine
+                    .inject_fault(rdb_storage::InjectedFault::WalFlush);
+                let outcome = host.recovered(&result, site);
+                assert!(
+                    outcome
+                        .as_ref()
+                        .is_err_and(|fault| fault.detail.contains("sync the link")),
+                    "a failed link sync faults the node: {outcome:?}"
+                );
+                assert_eq!(asked(&host), Generation::default(), "activate never ran");
+            } else {
+                host.recovered(&result, site).expect("recovered");
+                assert_eq!(asked(&host), Generation(2), "the landing reaches activate");
+            }
+        }
+    }
+
+    /// Ruling A-R217 (review-s1 F-001), row 2: the path through `land_link`, which `land` takes
+    /// on a copy outside the barrier. That link is synced before `activate` may run too. The
+    /// pinned primary lands here outside an empty barrier, so `schedule_acquire` would ask
+    /// for generation 2 next. Cut: the `sync_link` after `land_link` is dropped; the armed
+    /// landing is `Ok` and asks for generation 2, red. Unit, under a second.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_link_that_cannot_be_synced_never_reaches_activate_through_land_link() {
+        let rt = current_thread();
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(0),
+        };
+        for armed in [true, false] {
+            let dir = config_testkit::fs::temp_dir();
+            let path = dir.path().join("node");
+            let digests = write_chain(
+                &mut RocksEngine::open(&path).expect("open engine"),
+                Generation(1),
+                2,
+            );
+            let mut result = landing_at(2, digests[1]);
+            result.barrier = rdb_core::contracts::recovery::RecoveryBarrier::try_new(
+                &[],
+                &BTreeSet::new(),
+                Seq(2),
+                digests[1],
+            )
+            .expect("an empty barrier");
+            assert!(!in_barrier(&result, NodeId(1)), "node 1 is outside it");
+            let mut host = primary_over(&path, &rt);
+            if armed {
+                host.engine
+                    .inject_fault(rdb_storage::InjectedFault::WalFlush);
+                let outcome = host.land(Box::new(result), site, NodeId(3));
+                assert!(
+                    outcome
+                        .as_ref()
+                        .is_err_and(|fault| fault.detail.contains("sync the link")),
+                    "a failed link sync faults the node: {outcome:?}"
+                );
+                assert_eq!(asked(&host), Generation::default(), "activate never ran");
+            } else {
+                host.land(Box::new(result), site, NodeId(3)).expect("land");
+                assert_eq!(
+                    host.engine.link(PartitionId(1), Generation(2)),
+                    Some(rdb_storage::Link {
+                        parent: Generation(1),
+                        base: Seq(2),
+                        copied: false,
+                    }),
+                    "land_link linked generation 2"
+                );
+                assert_eq!(asked(&host), Generation(2), "the landing reaches activate");
+            }
+        }
     }
 
     /// Ruling A-R185 (critic-d7fix (c)): a copy that lands a commit outside its barrier while it
