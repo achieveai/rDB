@@ -563,6 +563,17 @@ pub enum ReadyError {
         /// The block's reason, as node 1's recovery phase names it.
         reason: String,
     },
+    /// Node 1's recovery found copies whose histories diverged and quarantined them. That is
+    /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
+    /// wait nor a reopen helps (A-R196(2a)). The step is ADR-rdb-0004's for
+    /// `DIVERGENCE_REQUIRES_OPERATOR`; this crate has no command for it yet.
+    #[error(
+        "the open's recovery found copies whose histories diverged and quarantined them, so node \
+         1 takes no writes, and opening the folder again keeps the same copies: an operator must \
+         remove the diverged copies from membership and fence again (node 1's recovery_fact log \
+         line names them)"
+    )]
+    Quarantined,
 }
 
 /// The next step once node 1 has restarted: nothing it served comes back in this open
@@ -1046,13 +1057,15 @@ impl Db {
     /// node 1 itself each time, never at what an earlier look saw. Once node 1 has restarted,
     /// or its restart failed, answers at once: it does not rejoin in this open (#42). So does a
     /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
-    /// one fence only (ruling F-a, A-R196).
+    /// one fence only (ruling F-a, A-R196). So does a quarantined one, which nothing in an open
+    /// leaves (A-R196(2a)).
     ///
     /// # Errors
     ///
     /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, and
     /// [`ReadyError::Blocked`] once its recovery is blocked, whose texts say to shut this `Db`
-    /// down and open the folder again (A-R188, A-R196).
+    /// down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
+    /// recovery is quarantined, whose text gives the operator's step instead.
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from("unknown");
@@ -1077,6 +1090,10 @@ impl Db {
                     return Err(ReadyError::Blocked {
                         reason: reason.to_owned(),
                     });
+                }
+                if phase == "Quarantined" {
+                    tracing::warn!("ready_quarantined");
+                    return Err(ReadyError::Quarantined);
                 }
             }
             if std::time::Instant::now() >= deadline {
@@ -5014,6 +5031,63 @@ mod tests {
             "the open's recovery stopped before node 1 took writes (BarrierIncomplete { missing: \
              [CopyId(1), CopyId(2)] }), and it does not try again in this open: shut this Db down \
              and open the folder again"
+        );
+        drop(db);
+        node_1.join().expect("the stub");
+    }
+
+    /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
+    /// open leaves, so `wait_ready` answers at once with `Quarantined`, whose text gives the
+    /// operator's step and not a reopen. Node 1 is a stub that answers every look with that
+    /// phase, spelled as the host spells it. Cut: `wait_ready` does not stop on `Quarantined`,
+    /// and it polls out its bound to `TimedOut`.
+    /// Unit (~50 ms): no node thread.
+    #[test]
+    fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_quarantined() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: Some(format!(
+                "{:?}",
+                rdb_core::recovery::RecoveryPhase::Quarantined
+            )),
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        let node_1 = std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                if let Msg::Inspect { reply, .. } = msg {
+                    let _ = reply.send(status.clone());
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_secs(3));
+        let took = started.elapsed();
+        assert_eq!(answer, Err(ReadyError::Quarantined));
+        assert!(took < Duration::from_secs(1), "answered after {took:?}");
+        let text = answer.expect_err("quarantined").to_string();
+        assert_eq!(
+            text,
+            "the open's recovery found copies whose histories diverged and quarantined them, so \
+             node 1 takes no writes, and opening the folder again keeps the same copies: an \
+             operator must remove the diverged copies from membership and fence again (node 1's \
+             recovery_fact log line names them)"
         );
         drop(db);
         node_1.join().expect("the stub");

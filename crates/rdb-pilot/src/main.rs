@@ -389,7 +389,8 @@ fn open_ready(
         Err(
             error @ (ReadyError::TimedOut { .. }
             | ReadyError::Stopped { .. }
-            | ReadyError::Blocked { .. }),
+            | ReadyError::Blocked { .. }
+            | ReadyError::Quarantined),
         ) => {
             tracing::error!(%error, "pilot_not_ready");
             println!("not ready: {error}");
