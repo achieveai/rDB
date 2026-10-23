@@ -1782,6 +1782,22 @@ impl Host {
                     partition,
                     correlation,
                 };
+                // A-R266: a promote's plan and fence come this way, from whichever process ran
+                // it; logged as `inject` lines are, so a row can see both arrive, in order.
+                let admin = match &kind {
+                    KernelEvent::Recovery(RecoveryEvent::Plan(_)) => Some("plan"),
+                    KernelEvent::Recovery(RecoveryEvent::FenceProven(_)) => Some("fence_proven"),
+                    _ => None,
+                };
+                if let Some(event) = admin {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        correlation = correlation.0,
+                        event,
+                        "routed_admin_event"
+                    );
+                }
                 self.push(site, EventKind::Kernel(kind), true, None);
                 Ok(())
             }
