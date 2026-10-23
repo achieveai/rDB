@@ -5373,6 +5373,60 @@ fn dedup_older_answers_the_newest_older_generation_holding_that_identity() {
     assert_eq!(older(&index, 7, AFF, identity(2)), None);
 }
 
+/// A-R209 (for the cap retry hint, A-R187): `holds_through(g, s)` is whether a trim of `g` below
+/// `s + 1` would drop an entry. It counts only `g` itself, counts `s` and not `s + 1`, and a
+/// generation with no entries, or one trimmed or retired away, holds nothing. The zero identity
+/// sits at a generation's first key and `u64::MAX` is the last generation, where a range bound
+/// would slip.
+#[retcd_test]
+fn dedup_holds_through_counts_only_its_generation_up_to_and_including_the_seq() {
+    let zero = RequestIdentity {
+        tenant: TenantId(0),
+        client: ClientId(0),
+        request: RequestId(0),
+    };
+    let mut index = DedupIndex::default();
+    // g4 holds seqs 40 and 45; its neighbours hold lower seqs that must not count for g4.
+    index.insert(Generation(3), AFF, identity(1), retained_at(1));
+    index.insert(Generation(4), AffinityId(0), zero, retained_at(45));
+    index.insert(Generation(4), AFF, identity(2), retained_at(40));
+    index.insert(Generation(5), AffinityId(0), zero, retained_at(2));
+    index.insert(Generation(u64::MAX), AFF, identity(3), retained_at(7));
+
+    let holds = |index: &DedupIndex, g: u64, s: u64| index.holds_through(Generation(g), Seq(s));
+    // Seq 40 is through + 1 here, and g3's seq 1 and g5's seq 2 are both below 39.
+    assert!(
+        !holds(&index, 4, 39),
+        "seq == through + 1 does not count, nor do g3's and g5's lower seqs"
+    );
+    assert!(holds(&index, 4, 40), "seq == through counts");
+    assert!(holds(&index, 4, 45), "the first key of g4 is in g4");
+    assert!(holds(&index, 4, u64::MAX));
+    assert!(
+        !holds(&index, 6, u64::MAX),
+        "an empty generation holds nothing"
+    );
+    assert!(
+        !holds(&index, 0, u64::MAX),
+        "an empty generation holds nothing"
+    );
+    assert!(holds(&index, 3, 1));
+    assert!(holds(&index, 5, 2));
+    assert!(holds(&index, u64::MAX, 7), "the last generation");
+    assert!(!holds(&index, u64::MAX, 6));
+
+    // A trim below 41 drops seq 40 and keeps 45; a retire drops the rest.
+    index.trim(Generation(4), Seq(41));
+    assert!(!holds(&index, 4, 44), "trimmed");
+    assert!(holds(&index, 4, 45));
+    index.retire(Generation(4));
+    assert!(!holds(&index, 4, u64::MAX), "retired");
+    assert!(
+        holds(&index, 3, 1) && holds(&index, 5, 2),
+        "neighbours untouched"
+    );
+}
+
 /// M7A-178 (plan §8.1, lead ledger L-R177gf; the reask livelock inv-publish-path found). An A1
 /// that cannot move — here `Unheld`, answering every check `Deny(NoGrant)` at `authority_seq` 0
 /// while T1 holds the recovery's view at 1 — answers every check stale. Before the fix each stale

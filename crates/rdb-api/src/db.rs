@@ -6994,6 +6994,69 @@ mod tests {
         );
     }
 
+    /// A-R187, the tester's m8g20 walk (k210): a client that waits out the cap's not-before hint
+    /// is not refused again for the same reason with a later hint. Cap 2, retention 3 s. Puts a
+    /// and b fill the cap and the process quits cleanly, so final marks cover them (A-R186). The
+    /// reopen comes once they aged, so its restore trims generation 1 before it admits (A-R193),
+    /// and the retire it schedules one retention after the landing frees nothing. Puts c and
+    /// d, a second after the reopen admits, fill the cap again, and put e is `OVERLOADED`.
+    /// Before A-R187 its hint named that empty retire: e waited as told and was refused again
+    /// with a later hint. Now the hint names c's publish one retention on, and e lands after it.
+    /// Integration (~9 s): two opens and two real retentions.
+    #[config_log::retcd_test]
+    fn m10_r187_a_client_that_waits_out_the_cap_hint_is_not_refused_again() {
+        let retention = Duration::from_secs(3);
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(2),
+                    dedup_retention: Some(retention),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.put(b"b", b"1", None).expect("put b");
+        let published = std::time::Instant::now();
+        db.shutdown();
+        drop(db);
+        let aged = published + retention + Duration::from_millis(fast().clock_error_millis + 500);
+        std::thread::sleep(aged.saturating_duration_since(std::time::Instant::now()));
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        // Generation 2's publishes come well after its landing, so its empty retire is due
+        // first: that is the hint the old rule named.
+        std::thread::sleep(Duration::from_secs(1));
+        db.put(b"c", b"1", None)
+            .expect("the restore trimmed generation 1, so the cap has room");
+        db.put(b"d", b"1", None).expect("put d");
+        let refused = db.put(b"e", b"1", None).expect_err("c and d fill the cap");
+        assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}");
+        let hint = refused
+            .error
+            .retry_after()
+            .expect("c's publish frees room, so there is a hint");
+        std::thread::sleep(hint + crate::host::test_patience(Duration::from_millis(300)));
+        if let Err(again) = db.put(b"e", b"1", None) {
+            panic!(
+                "waited out the hint {hint:?} and was refused again, now not before {:?}: \
+                 {again:?}",
+                again.error.retry_after()
+            );
+        }
+        db.shutdown();
+    }
+
     /// D18 (A-R206): a stall of node 1's run loop alone, past L1's pause age, with its own copy
     /// durable and the peers' acks waiting in its mailbox, does not pause writes. The loop drains
     /// the mail it took before it runs the due duties, so the peers' `DurableAdvanced` reaches L1
