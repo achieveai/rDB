@@ -154,6 +154,14 @@ impl RocksSnapshot {
         self.faulted.get().copied()
     }
 
+    /// How many levels a read through this view walks, fixed when it was taken: what
+    /// [`RocksEngine::chain_depth`] said then. O(1), so it suits a per-step log line, unlike
+    /// [`Self::len`]. At most [`MAX_CHAIN_DEPTH`].
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.levels.len()
+    }
+
     /// How many records the view holds, across every namespace. **Reads the whole view**: O(the
     /// lineage), for tests and tools, never for a per-step log line. Under a read fault the
     /// count stops short; check [`Self::fault`].

@@ -929,6 +929,16 @@ fn m10_w2_reopens_past_the_depth_ceiling_flatten_and_agree_with_the_oracle() {
             DEEP_REOPENS + 1 - MAX_CHAIN_DEPTH,
             "seed={seed}: the flattened child starts again at depth 1"
         );
+        let view = run
+            .rocks()
+            .snapshot(id, active, SnapshotHandle(0))
+            .expect("view");
+        assert_eq!(
+            view.depth(),
+            DEEP_REOPENS + 1 - MAX_CHAIN_DEPTH,
+            "seed={seed}: a view reports the depth its reads walk"
+        );
+        drop(view);
         run.verify_all();
         drop(run.rocks.take());
         let seed_dir = run
