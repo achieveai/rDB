@@ -256,13 +256,25 @@ pub struct DbConfig {
     pub hold: Vec<(NodeId, NodeId)>,
     /// Call timeouts.
     pub timeouts: Timeouts,
-    /// T1's dedup cap: retained answers allowed before a new write is `OVERLOADED`. `None` is
-    /// the spec's [`RETENTION_CAP_ENTRIES`]; a value above it is refused at open, since P1's
-    /// status index holds no more than that. A dev budget, to reach a full index by hand.
+    /// T1's dedup cap: retained answers allowed per partition before a new write is
+    /// `OVERLOADED`. `None` is the spec's [`RETENTION_CAP_ENTRIES`] (65,536); a value above it
+    /// is refused at open, since P1's status index holds no more than that.
+    ///
+    /// The cap and [`Self::dedup_retention`] together set the write rate a partition sustains:
+    /// about `cap / retention`. At the default cap that is 0.76 writes/s at 24 h, 18/s at 1 h
+    /// and 109/s at 10 min. A burst may use the whole cap at once; once it is full, a new write
+    /// is `OVERLOADED` until trimming frees entries. Each retained entry costs about 1.8 KB of
+    /// memory (measured on a debug build).
     pub dedup_cap: Option<usize>,
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
-    /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
+    /// ([`Budgets::dedup_retention_millis`]). A supported app option (ruling A-R181): a shorter
+    /// window frees the cap sooner, so a partition sustains more writes (see
+    /// [`Self::dedup_cap`] for the rates).
+    ///
+    /// The cost of a shorter window: a resend or a status query made after it can no longer be
+    /// settled (spec §5.3).
+    ///
     /// A `CONDITION_FAILED` answer is kept as long, counted from when it was given, since nothing
     /// need publish after it (ruling A-R108).
     /// A retry of a trimmed request is no longer recognised: it is submitted afresh (spec §5.3).
