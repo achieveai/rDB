@@ -2090,6 +2090,10 @@ fn m10_s2_a_node_process_on_an_unformed_folder_says_to_form_it_first() {
         "{text}"
     );
     assert!(
+        !(text.contains('/') && text.contains('\\')),
+        "one separator style (A-R230): {text}"
+    );
+    assert!(
         !dir.path().join("nodes").join("2").exists(),
         "no copy was created"
     );

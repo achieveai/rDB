@@ -845,7 +845,7 @@ impl Db {
                     return Err(OpenError::Config(format!(
                         "{} holds no copy of node {}: form the database first (lr up), then \
                          start node {} again",
-                        dir.display(),
+                        one_separator(&dir).display(),
                         node.0,
                         node.0
                     )));
@@ -2498,10 +2498,17 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
             partition,
             grant: GrantId(0),
         },
-        ErrorKind::UnknownOutcome => RdbError::UnknownOutcome {
-            partition,
-            identity,
-        },
+        // A read writes nothing and has no request to ask `status` about, so the kernel's
+        // QueryStatus does not fit it: the step is to read again (ruling A-R230(1)).
+        ErrorKind::UnknownOutcome => {
+            return ApiError {
+                kind,
+                retry: RetryRule::BoundedJitter,
+                no_mutation: true,
+                detail: "the read was refused".to_owned(),
+                retry_after: None,
+            }
+        }
         ErrorKind::GenerationChanged => RdbError::GenerationChanged {
             expected: Generation(0),
             current: Generation(0),
@@ -2748,6 +2755,12 @@ fn local_nodes(local: &[NodeId]) -> Result<bool, OpenError> {
     Ok(named.len() < ALL_NODES.len())
 }
 
+/// `path` written with one separator: a folder given with `/` and joined with `nodes` and a node
+/// number reads in a refusal as one path, not in two styles (A-R230).
+fn one_separator(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 /// Open the copies of `local` under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
 /// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
 /// missing copy is created only while no copy holds data. On error, says whether node 1's
@@ -2757,7 +2770,7 @@ fn open_engines(
     local: &[NodeId],
 ) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
-        rdb_storage::OpenError::Locked { .. } => OpenError::InUse(dir.to_path_buf()),
+        rdb_storage::OpenError::Locked { .. } => OpenError::InUse(one_separator(dir)),
         rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(dir.to_path_buf()),
         other => OpenError::Node(format!("open {}: {other}", dir.display())),
     };
@@ -3814,11 +3827,20 @@ mod tests {
             .partition(Result::is_ok);
         assert_eq!((won.len(), lost.len()), (1, 1), "{won:?} {lost:?}");
         match lost.pop() {
-            Some(Err(OpenError::InUse(path))) => assert!(
-                path.starts_with(dir.path().join("nodes")),
-                "{}",
-                path.display()
-            ),
+            Some(Err(error @ OpenError::InUse(_))) => {
+                let OpenError::InUse(path) = &error else {
+                    unreachable!()
+                };
+                assert!(
+                    path.starts_with(dir.path().join("nodes")),
+                    "{}",
+                    path.display()
+                );
+                // One separator style in the text (A-R230): a data root given with `/`
+                // joined with `nodes\N` read as two.
+                let text = error.to_string();
+                assert!(!(text.contains('/') && text.contains('\\')), "{text}");
+            }
             other => panic!("the loser is refused at the claim, not: {other:?}"),
         }
         let mut db = won.pop().expect("one winner").expect("the winner's Db");
@@ -8420,5 +8442,18 @@ mod tests {
             format!("{}\n", restarted.0)
         );
         db.shutdown();
+    }
+
+    /// Ruling A-R230(1): a read refused `UNKNOWN_OUTCOME` wrote nothing and has no request to
+    /// ask `status` about, so its rule is to read again (`BoundedJitter`, no mutation), never
+    /// the put's `QueryStatus`. Unit.
+    #[test]
+    fn m10_s2_a_read_refused_unknown_outcome_says_read_again_not_query_status() {
+        let refused = refused_read(ErrorKind::UnknownOutcome);
+        assert_eq!(
+            (refused.kind, refused.retry, refused.no_mutation),
+            (ErrorKind::UnknownOutcome, RetryRule::BoundedJitter, true),
+            "{refused:?}"
+        );
     }
 }
