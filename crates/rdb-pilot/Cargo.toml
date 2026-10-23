@@ -24,7 +24,3 @@ tracing = "0.1"
 [[bin]]
 name = "pilot_kv"
 path = "src/main.rs"
-
-# Only for `examples/did_it_land.rs`: `ErrorKind`, `TxnRequest` and `TxnStatus` (embed.md).
-[dev-dependencies]
-rdb-core = { path = "../rdb-core" }

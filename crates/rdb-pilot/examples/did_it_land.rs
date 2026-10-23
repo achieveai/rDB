@@ -5,8 +5,7 @@
 //! It needs a running rEtcd and a saved request to do anything, so `main` only names it.
 
 // embed.md begin
-use rdb_api::{ApiError, Db};
-use rdb_core::{ErrorKind, TxnRequest, TxnStatus};
+use rdb_api::{ApiError, Db, ErrorKind, TxnRequest, TxnStatus};
 
 /// `true`: it landed. `false`: not known yet, which is not proof that it did not land.
 fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {

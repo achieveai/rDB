@@ -159,12 +159,10 @@ You saved a write's request before the process stopped: from `ok.sent` on succes
   with `get` to decide.
 - **A kill before any answer leaves you no request to ask about.** Read the data with `get`.
 
-Add `rdb-core = { path = "<checkout>/crates/rdb-core" }` to `Cargo.toml` for these types.
 `crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
 
 ```rust
-use rdb_api::{ApiError, Db};
-use rdb_core::{ErrorKind, TxnRequest, TxnStatus};
+use rdb_api::{ApiError, Db, ErrorKind, TxnRequest, TxnStatus};
 
 /// `true`: it landed. `false`: not known yet, which is not proof that it did not land.
 fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
