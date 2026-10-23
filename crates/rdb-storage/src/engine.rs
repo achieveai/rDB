@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
@@ -157,8 +158,12 @@ pub(crate) struct Marks {
 /// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). The write-order mutex is `&mut self`:
 /// a capture and its sync cannot interleave with a commit. When M9 adds IO workers it becomes a
 /// real `Mutex`.
+///
+/// A [`crate::RocksSnapshot`] shares the database (M10 decision 2): dropping the engine closes
+/// RocksDB and releases its `LOCK` only once every view taken from it has been dropped too.
 pub struct RocksEngine {
-    pub(crate) db: DB,
+    /// Shared with every live [`crate::RocksSnapshot`], which pins a RocksDB snapshot on it.
+    pub(crate) db: Arc<DB>,
     path: PathBuf,
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
     /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
@@ -309,7 +314,7 @@ impl RocksEngine {
             "storage_open"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
             instance,
@@ -345,7 +350,7 @@ impl RocksEngine {
             "storage_open_read_only"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
             instance,

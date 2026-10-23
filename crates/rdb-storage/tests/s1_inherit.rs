@@ -19,7 +19,7 @@ use rdb_core::contracts::ids::{
     AffinityId, AppliedSeq, ConfigVersion, DurableSeq, Generation, OwnerEpoch, PartitionId, Seq,
     SnapshotHandle, TenantId,
 };
-use rdb_core::contracts::storage::{CapturedPrefix, Namespace, StorageFault, Write};
+use rdb_core::contracts::storage::{CapturedPrefix, Namespace, SnapshotRead, StorageFault, Write};
 use rdb_core::contracts::trace::Version;
 use rdb_core::contracts::txn::scoped_key;
 use rdb_core::replication::append::PROGRESS_KEY;
@@ -274,7 +274,7 @@ fn m8s_10_late_write_is_copied_as_of_base_and_history_falls_through() {
     assert_eq!(history_from(&engine, G2, 11), None);
     verify_lineage(&engine, P, G2).expect("g2 verifies");
     let seen = engine.snapshot(P, G2, SnapshotHandle(1)).expect("snapshot");
-    for (ns, key, _, version, from) in seen.entries() {
+    for (ns, key, _, version, from) in seen.entries().expect("entries") {
         assert!(version <= 10, "{ns:?} {key:?} at v{version} is above base");
         assert!(
             ns == Namespace::History || from == G2,
@@ -757,7 +757,10 @@ fn m8s_32_a_two_level_copy_takes_the_state_as_of_base() {
     assert_eq!(history_from(&engine, G3, 13), None);
     let seen = engine.snapshot(P, G3, SnapshotHandle(1)).expect("snapshot");
     assert!(
-        seen.entries().all(|(_, _, _, version, _)| version <= 12),
+        seen.entries()
+            .expect("entries")
+            .iter()
+            .all(|(_, _, _, version, _)| *version <= 12),
         "seq 13 reached g3"
     );
     verify_lineage(&engine, P, G3).expect("g3 verifies over three levels");
@@ -777,7 +780,7 @@ fn m8s_33_base_zero_copies_nothing() {
     );
 
     let seen = engine.snapshot(P, G2, SnapshotHandle(1)).expect("snapshot");
-    assert!(seen.is_empty(), "{:?}", seen.entries().collect::<Vec<_>>());
+    assert!(seen.is_empty(), "{:?}", seen.entries());
     assert_eq!(
         engine
             .get(P, G2, Namespace::Progress, PROGRESS_KEY)
@@ -854,7 +857,7 @@ fn m8s_t2_inherit_from_a_staging_parent_is_refused() {
     assert!(
         seen.is_empty(),
         "g4 sees staged bytes: {:?}",
-        seen.entries().collect::<Vec<_>>()
+        seen.entries()
     );
     assert_eq!(engine.link(P, g4), None, "the refusal wrote a link");
     assert_eq!(engine.sealed_by(P, G2), None, "the refusal sealed g2");
@@ -940,8 +943,11 @@ fn m8s_24_a_history_record_claiming_another_seq_is_missing() {
     assert_history_missing("24-wrong-seq", patch, "history:5");
 }
 
-/// A value whose frame does not decode fails a snapshot taken through
-/// the chain as `Corrupt`, logged as `snapshot_unframe_failed`; it is never skipped.
+/// A value whose frame does not decode fails a read of the view taken through the chain: logged
+/// as `snapshot_unframe_failed`, never skipped. Since M10 decision 2 the view is lazy, so the
+/// fault surfaces when the view reads the key, not when it is built. `entries` returns
+/// `Corrupt`; a `SnapshotRead` get, which has no error path, answers `None`, never panics, and
+/// records the fault so `fault()` names it (lead ruling A-R164).
 #[retcd_test]
 fn m8s_26_c07_an_unframed_parent_value_fails_the_childs_snapshot() {
     let dir = data_dir("26-c07");
@@ -959,19 +965,37 @@ fn m8s_26_c07_an_unframed_parent_value_fails_the_childs_snapshot() {
             .expect("raw put");
     }
     let engine = RocksEngine::open(&db).expect("reopen");
+    let view = engine
+        .snapshot(P, G2, SnapshotHandle(1))
+        .expect("a lazy view builds without reading values");
+    assert_eq!(view.fault(), None, "nothing read yet");
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        view.get(Namespace::User, b"c07")
+    }));
     assert_eq!(
-        engine.snapshot(P, G2, SnapshotHandle(1)).err(),
-        Some(StorageFault::Corrupt)
+        read.ok(),
+        Some(None),
+        "a corrupt value reads as None, never a panic"
     );
+    assert_eq!(
+        view.fault(),
+        Some(StorageFault::Corrupt),
+        "the get recorded its fault"
+    );
+    assert_eq!(view.entries().err(), Some(StorageFault::Corrupt));
     let lines = config_testkit::logs::lines_for_current_test(
         module_path!(),
         "m8s_26_c07_an_unframed_parent_value_fails_the_childs_snapshot",
     );
+    // `c07` is 63 30 37: the key is logged as hex, never as text.
     assert!(
         lines
             .iter()
-            .any(|row| row["@m"] == "snapshot_unframe_failed"),
-        "no snapshot_unframe_failed line: {lines:?}"
+            .any(|row| row["@m"] == "snapshot_unframe_failed"
+                && row["key_hex"]
+                    .as_str()
+                    .is_some_and(|hex| hex.ends_with("633037"))),
+        "no snapshot_unframe_failed line naming the key as hex: {lines:?}"
     );
 }
 

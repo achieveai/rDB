@@ -277,7 +277,9 @@ impl RocksEngine {
             .snapshot(partition, from, SnapshotHandle(0))
             .map_err(InheritError::Storage)?;
         let mut copy: BTreeMap<(Namespace, Bytes), (Version, Bytes)> = BTreeMap::new();
-        for (ns, key, value, version, _) in view.entries() {
+        let entries = view.entries().map_err(InheritError::Storage)?;
+        for (ns, key, value, version, _) in &entries {
+            let (ns, version) = (*ns, *version);
             if ns == Namespace::History || (ns == Namespace::Progress && key == PROGRESS_KEY) {
                 continue;
             }

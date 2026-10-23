@@ -26,6 +26,13 @@ every link crossed. Other namespaces stop at a `copied` link. `snapshot` leaves 
 decision 2): it grew by one record per write, and no kernel module reads it through a view. Read
 it with `read --ns history`.
 
+A `RocksSnapshot` is lazy (M10 decision 2): taking one pins a RocksDB snapshot and copies
+nothing, and each read walks the chain under that pin. So a get costs one point read per level
+until a hit, and a miss reads every level: chain depth, not key count, sets read speed. A read
+that meets a corrupt value answers `None` or an empty page, logs `snapshot_unframe_failed`,
+and records the fault; `RocksSnapshot::fault()` returns it, and the host fails the node on it
+(lead ruling A-R164). A view keeps the database open until it is dropped.
+
 ## Entry point
 
 ```sh
