@@ -1952,7 +1952,7 @@ fn m10_s2_h2_not_primary_refreshes_the_app_route() {
 
     let links = Arc::new(Links::default());
     let (stand_in, calls) = std::sync::mpsc::channel();
-    links.register(NodeId(2), stand_in);
+    links.register(NodeId(2), stand_in, crate::host::BOOT);
     let answering = std::thread::spawn(move || {
         let mut answered = 0;
         while let Ok(msg) = calls.recv() {
