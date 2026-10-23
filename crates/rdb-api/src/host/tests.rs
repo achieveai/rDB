@@ -1420,7 +1420,8 @@ fn a_stall_line_never_says_writes_are_paused_while_they_are_admitted() {
 /// written for a `DegradedRf2` watch set by hand, as the K1 row above does, and it says
 /// writes stay paused. After the heal L1 resumes, and that watch never activates. Once L1
 /// admits writes, the line must stop saying they are paused. Status names the held put as
-/// the write the owner's queue waits on (`waits_on`, U1), and nothing once it publishes.
+/// applied and unpublished (`in_flight`), and nothing once it publishes. The queue is not
+/// frozen on it (A-R252), so `waits_on` stays `None` throughout.
 /// Integration (~1 s): three hosts stepped by hand, through a real L1 pause and resume.
 #[test]
 fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
@@ -1435,10 +1436,12 @@ fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
         let status = trio.status(0);
         (status.admits == Some(false)).then_some(status)
     });
+    // The queue stays open behind an applied, unpublished put (A-R252), so nothing is frozen
+    // for `waits_on` to name; `in_flight` names the put.
     assert_eq!(
-        paused.waits_on,
-        Some(Seq(2)),
-        "waits_on names the applied, unpublished put: {paused:?}"
+        (paused.in_flight, paused.waits_on),
+        (Some(RequestId(1)), None),
+        "in_flight names the applied, unpublished put: {paused:?}"
     );
 
     let partition = PartitionId(1);
@@ -1487,8 +1490,9 @@ fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
         (status.published.map(|(_, seq)| seq) == Some(Seq(2))).then_some(status)
     });
     assert_eq!(
-        published.waits_on, None,
-        "waits_on once the put published: {published:?}"
+        (published.in_flight, published.waits_on),
+        (None, None),
+        "nothing in flight once the put published: {published:?}"
     );
     drop(unacknowledged);
 }

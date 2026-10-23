@@ -51,6 +51,7 @@ use crate::contracts::txn::{
     Condition, ConditionOutcome, Durability, Mutation, Outcome, TxnRequest, TxnResult,
 };
 use crate::contracts::version::{API_VERSION, ENVELOPE_VERSION};
+use crate::publication::POST_APPLY_DEADLINE_MILLIS;
 use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS, PROGRESS_KEY};
 
 pub use crate::contracts::publication::{AppliedCandidate, FreezeCause};
@@ -467,6 +468,10 @@ pub struct TxnKernel {
     /// What the queue's lost-authority freeze waits for (lead rulings A-R96, A-R97); `None` until
     /// one freezes it.
     lost: Option<LostAuthority>,
+    /// When storage answered the `Dispatched` transaction, so T1 freezes when P1's post-apply
+    /// deadline passes ([`Self::expire_unresolved`]). `None` while nothing is completed and
+    /// unpublished.
+    completed_at: Option<Tick>,
 }
 
 impl TxnKernel {
@@ -692,6 +697,7 @@ impl TxnKernel {
             start_sent_under: None,
             start_refused_at: None,
             lost: None,
+            completed_at: None,
         }
     }
 
@@ -734,12 +740,15 @@ impl TxnKernel {
         // answered like any refusal (rule 4). It never enters the queue, so a `Submit` row
         // carries no refusal of the kernel's record, and every other row's does.
         let submit = matches!(event, TxnEvent::Submit(_));
+        // Before the row, so check 7 of a submit at the deadline sees the freeze (A-R252).
+        let expired = self.expire_unresolved(ctx.now);
+        let mut out = self.quiet(ctx.now, expired);
         let row = self.row(ctx, event);
-        let mut out = if submit {
+        out.extend(if submit {
             row
         } else {
             self.quiet(ctx.now, row)
-        };
+        });
         let started = self.start_if_due(ctx);
         out.extend(self.quiet(ctx.now, started));
         out
@@ -846,7 +855,9 @@ impl TxnKernel {
         match event {
             TxnEvent::Submit(req) => self.on_submit(ctx, &req),
             TxnEvent::AuthorityAnswer(answer) => self.on_answer(ctx, &answer),
-            TxnEvent::BatchCompleted { batch, outcome } => self.on_completed(batch, outcome),
+            TxnEvent::BatchCompleted { batch, outcome } => {
+                self.on_completed(ctx.now, batch, outcome)
+            }
             TxnEvent::Published {
                 lineage,
                 seq,
@@ -1272,7 +1283,7 @@ impl TxnKernel {
         out
     }
 
-    fn on_completed(&mut self, batch: BatchId, outcome: BatchOutcome) -> Vec<TxnEffect> {
+    fn on_completed(&mut self, now: Tick, batch: BatchId, outcome: BatchOutcome) -> Vec<TxnEffect> {
         let Some(Inflight::Dispatched {
             admitted,
             batch: ours,
@@ -1330,17 +1341,20 @@ impl TxnKernel {
                 )],
             ),
         };
-        // The cause is written only from `Open` (K-A-46); `unresolved` always.
-        self.mode = match self.mode {
-            QueueMode::Open => QueueMode::Frozen {
-                cause,
-                unresolved: Some(seq),
-            },
-            QueueMode::Frozen { cause, .. } => QueueMode::Frozen {
+        // The cause is written only from `Open` (K-A-46); `unresolved` always, once frozen. A
+        // good batch leaves an open queue open (lead ruling A-R252; spec §5.2 steps 2 and 6): the
+        // next request waits in the queue, and `pump` serves it only after `Published` clears
+        // `inflight`. The queue freezes when this transaction's deadline or P1's post-apply
+        // deadline passes ([`Self::expire_unresolved`]), which is when §5.3's `UNKNOWN_OUTCOME`
+        // reaches the client.
+        self.mode = match (self.mode, cause) {
+            (QueueMode::Open, FreezeCause::UnresolvedTransaction) => QueueMode::Open,
+            (QueueMode::Open, cause) | (QueueMode::Frozen { cause, .. }, _) => QueueMode::Frozen {
                 cause,
                 unresolved: Some(seq),
             },
         };
+        self.completed_at = Some(now);
         if cause == FreezeCause::LocalStorageFenced {
             // A storage failure fences the partition (spec §5.2 step 3), and nothing reopens it
             // in this generation, so the queue is answered now, as a fence answers it (A-R71,
@@ -1363,22 +1377,30 @@ impl TxnKernel {
         record_digest: Digest,
         request: RequestIdentity,
     ) -> Vec<TxnEffect> {
-        let QueueMode::Frozen {
-            cause,
-            unresolved: Some(unresolved),
-        } = self.mode
-        else {
-            return vec![ignored(AuthorityIgnoreReason::UnmatchedCompletion)];
-        };
+        // The match is on the dispatched, completed transaction, in an open queue or one frozen
+        // on it (A-R252): a good batch no longer freezes the queue, so the mode alone no longer
+        // says a transaction awaits `Published`.
         let Some(Inflight::Dispatched {
             admitted,
+            seq: dispatched_seq,
             record_digest: dispatched,
+            completed: true,
             ..
         }) = &self.inflight
         else {
             return vec![ignored(AuthorityIgnoreReason::UnmatchedCompletion)];
         };
-        if unresolved != seq
+        let cause = match self.mode {
+            QueueMode::Open => None,
+            QueueMode::Frozen {
+                cause,
+                unresolved: Some(unresolved),
+            } if unresolved == seq => Some(cause),
+            QueueMode::Frozen { .. } => {
+                return vec![ignored(AuthorityIgnoreReason::UnmatchedCompletion)];
+            }
+        };
+        if *dispatched_seq != seq
             || lineage != self.lineage
             || record_digest != *dispatched
             || request != admitted.req.identity
@@ -1402,15 +1424,19 @@ impl TxnKernel {
             );
         }
         self.inflight = None;
-        if cause == FreezeCause::UnresolvedTransaction {
-            self.mode = QueueMode::Open;
-            self.pump(ctx)
-        } else {
-            // The transaction resolved. The queue reopens only if the authority came back under
-            // a new grant (A-R96); otherwise only `Recovered` reopens.
-            self.mode = frozen(cause);
-            self.thaw(ctx)
-                .unwrap_or_else(|| vec![ignored(AuthorityIgnoreReason::PublishedWhileFrozen)])
+        self.completed_at = None;
+        match cause {
+            None | Some(FreezeCause::UnresolvedTransaction) => {
+                self.mode = QueueMode::Open;
+                self.pump(ctx)
+            }
+            Some(cause) => {
+                // The transaction resolved. The queue reopens only if the authority came back
+                // under a new grant (A-R96); otherwise only `Recovered` reopens.
+                self.mode = frozen(cause);
+                self.thaw(ctx)
+                    .unwrap_or_else(|| vec![ignored(AuthorityIgnoreReason::PublishedWhileFrozen)])
+            }
         }
     }
 
@@ -1467,6 +1493,54 @@ impl TxnKernel {
         view.lineage == self.lineage
             && lost.lifts_under(view.grant_id)
             && now <= view.valid_through_tick
+    }
+
+    /// Spec §5.3's freeze, at the moment it applies (lead ruling A-R252): an open queue holding a
+    /// dispatched, unpublished transaction freezes `Frozen{UnresolvedTransaction}` once that
+    /// transaction's own deadline passes (the host then answers it `UNKNOWN_OUTCOME`), or P1's
+    /// post-apply deadline does (P1 then answers it `Unknown`), whichever is first. Everything
+    /// queued is answered as a freeze answers it; nothing queued was written. Until then a
+    /// request that arrives waits in the queue (spec §5.2 steps 2 and 6). Run at the top of every
+    /// step, so a submit's check 7 sees it.
+    fn expire_unresolved(&mut self, now: Tick) -> Vec<TxnEffect> {
+        if self.mode != QueueMode::Open {
+            return Vec::new();
+        }
+        let Some(Inflight::Dispatched {
+            admitted,
+            seq,
+            completed,
+            ..
+        }) = &self.inflight
+        else {
+            return Vec::new();
+        };
+        let p1_due = *completed
+            && self
+                .completed_at
+                .is_some_and(|at| now >= at.plus_millis(POST_APPLY_DEADLINE_MILLIS));
+        if !(p1_due || admitted.expired_at(now)) {
+            return Vec::new();
+        }
+        let seq = *seq;
+        self.mode = QueueMode::Frozen {
+            cause: FreezeCause::UnresolvedTransaction,
+            unresolved: Some(seq),
+        };
+        tracing::info!(
+            partition = self.lineage.partition.0,
+            generation = self.lineage.generation.0,
+            seq = seq.0,
+            queued = self.queue.len(),
+            p1_due,
+            "t1.unresolved_freeze"
+        );
+        self.drain(|k, identity| {
+            freeze_error(
+                FreezeCause::UnresolvedTransaction,
+                &k.deny_context(identity, k.lineage.generation),
+            )
+        })
     }
 
     fn on_freeze(&mut self, scope: FenceScope, cause: FreezeCause) -> Vec<TxnEffect> {
@@ -2161,6 +2235,7 @@ mod tests {
             start_sent_under: None,
             start_refused_at: None,
             lost: None,
+            completed_at: None,
         }
     }
 

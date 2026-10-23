@@ -672,8 +672,14 @@ fn freeze_while_dispatched(source: FenceSource) {
 /// `Committed`. T1 holds requests 12 and 13 queued behind request 11 (dispatched, unpublished:
 /// B is cut from its copies), and P1 holds two `Fresh` reads waiting at the barrier. When the
 /// last view's horizon passes, A1 fences `Node/Expired` at `valid_through_tick + 1` and pushes a
-/// superseding view already past its horizon; in that same tick T1's queue drains
-/// `LEASE_EXPIRED` and P1's waiters are answered.
+/// superseding view already past its horizon; in that same tick T1's queue drains and P1's
+/// waiters are answered `LEASE_EXPIRED`.
+///
+/// **T1's queue drains `PROTECTION_PAUSED{paused_after: 11}`, not `LEASE_EXPIRED`** (lead
+/// rulings A-R252, A-R255). Request 11 has passed its own deadline unpublished by then, so T1's
+/// first step in the fence tick freezes on it and drains the queue before the fence lands: the
+/// writer fix's trigger. Before A-R252 the queue froze when request 11 applied, and the fence's
+/// cause picked the code. The drain still happens in the fence tick, and nothing else replies.
 ///
 /// **The waiters' code is `LEASE_EXPIRED`, not the row's `UNKNOWN_OUTCOME`.** Lead rulings A-R72
 /// and A-R72a (P1's `deny_kind`): a refused read wrote nothing, so it has no outcome to be unknown
@@ -758,12 +764,11 @@ fn m7a_163_dropped_control_operation_drains_both_consumers() {
         (Tick(fence_tick - 1), DenyReason::Expired),
         "already past its horizon: valid_through == fence_tick - 1, past_horizon Expired"
     );
-    let grant = superseding.grant_id;
-    let lease_expired = |request| ReplyEffect::Failed {
+    let paused = |request| ReplyEffect::Failed {
         identity: identity(request),
-        error: RdbError::LeaseExpired {
+        error: RdbError::ProtectionPaused {
             partition: PART,
-            grant,
+            paused_after: Seq(WRITE),
         },
     };
     let refused = |who| ReplyEffect::Read {
@@ -774,8 +779,8 @@ fn m7a_163_dropped_control_operation_drains_both_consumers() {
     let mut got: Vec<_> = at_fence.iter().map(|(_, reply)| reply.clone()).collect();
     got.sort_by_key(|reply| format!("{reply:?}"));
     let mut want = vec![
-        lease_expired(12),
-        lease_expired(13),
+        paused(12),
+        paused(13),
         refused(reader(1)),
         refused(reader(2)),
     ];
@@ -810,7 +815,10 @@ fn m7a_163_dropped_control_operation_drains_both_consumers() {
     for request in [12, 13] {
         assert_eq!(
             outcomes(&trace.events, request, None),
-            vec![(fence_tick, ClientOutcome::Error(ErrorKind::LeaseExpired))],
+            vec![(
+                fence_tick,
+                ClientOutcome::Error(ErrorKind::ProtectionPaused)
+            )],
             "request {request} is refused once, at the fence tick"
         );
     }

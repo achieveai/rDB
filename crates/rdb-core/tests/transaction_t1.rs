@@ -43,6 +43,7 @@ use rdb_core::contracts::trace::{CapabilityState, Version};
 use rdb_core::contracts::txn::{
     scoped_key, Condition, Durability, Mutation, Outcome, TxnRequest, TxnResult, KEY_SCOPE_LEN,
 };
+use rdb_core::publication::POST_APPLY_DEADLINE_MILLIS;
 use rdb_core::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
 use rdb_core::transaction::admission::{MAX_CONDITIONS, MAX_REQUEST_MUTATIONS};
 use rdb_core::transaction::dedup::{
@@ -662,21 +663,12 @@ fn submit_check_batch_apply_publish_then_retry_replays() {
         ),
         (Seq(1), before, digest)
     );
-    assert_eq!(
-        h.k().mode(),
-        &QueueMode::Frozen {
-            cause: FreezeCause::UnresolvedTransaction,
-            unresolved: Some(Seq(1))
-        }
-    );
+    // Applied but not yet published, the queue stays open: a next submit waits behind it
+    // (spec §5.2 step 2; lead ruling A-R252). Only a deadline freezes it, as
+    // `an_unpublished_write_past_its_deadline_freezes_and_drains_the_queue` pins.
+    assert_eq!(h.k().mode(), &QueueMode::Open);
 
-    // While unresolved, the queue is frozen.
-    assert_eq!(
-        failed(&h.step(submit(put(2, b"k", b"w")))),
-        ErrorKind::ProtectionPaused
-    );
-
-    // Published -> [] and the queue reopens; the identity is retained.
+    // Published -> [] and the identity is retained.
     assert_eq!(h.step(published(1, digest, 1)), vec![]);
     assert_eq!(h.k().mode(), &QueueMode::Open);
     assert_eq!(h.k().dedup().len(), 1);
@@ -1427,17 +1419,18 @@ fn a_retry_of_a_published_request_answers_paused_while_l1_pauses_f1() {
 /// of R(1):
 /// - awaiting its `StorageDispatch` check (nothing written);
 /// - dispatched, storage not yet answered;
-/// - applied, not yet published (the queue is frozen on it, so check 7 answers before check 8).
+/// - applied, not yet published (the queue stays open on it, A-R252).
 ///
 /// Every stage answers one `Failed` reply, `PROTECTION_PAUSED`, and leaves R(1)'s in-flight state
-/// and the queue mode as they were. The first two come from check 8, so `paused_after` is L1's
-/// paused prefix (4); the third from check 7, so it is the unresolved seq (1).
+/// and the queue mode as they were. All three come from check 8, so `paused_after` is L1's
+/// paused prefix (4). Before A-R252 an applied R(1) froze the queue, and the third came from
+/// check 7 with the unresolved seq (1).
 #[retcd_test]
 fn a_retry_of_a_request_not_yet_final_answers_paused_while_l1_pauses() {
     for (stage, paused_after) in [
         ("awaiting check", Seq(4)),
         ("dispatched", Seq(4)),
-        ("applied", Seq(1)),
+        ("applied", Seq(4)),
     ] {
         let mut h = H::live();
         match stage {
@@ -1508,20 +1501,26 @@ fn m7a_69_admit_mode_frozen_protection_paused_and_admission_state_reason_passthr
     assert_eq!(h.step(committed(batch, seq)).len(), 2);
     assert_eq!(
         h.k().mode(),
+        &QueueMode::Open,
+        "applied: the queue stays open"
+    );
+    // (a) R(1) passes its own deadline unpublished (A-R252): the step freezes T1 and drains the
+    // queue before check 7 sees R(3). A freeze always drains, so the queue is no longer at its
+    // cap here; what (a) still pins is that check 7 answers, not an L1 or a capacity check.
+    let paused = RdbError::ProtectionPaused {
+        partition: PARTITION,
+        paused_after: Seq(seq),
+    };
+    h.now += 1_000;
+    let mut both = fail(2, paused.clone());
+    both.extend(fail(3, paused));
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), both);
+    assert_eq!(
+        h.k().mode(),
         &QueueMode::Frozen {
             cause: FreezeCause::UnresolvedTransaction,
             unresolved: Some(Seq(seq))
         }
-    );
-    assert_eq!(
-        h.step(submit(put(3, b"c", b"3"))),
-        fail(
-            3,
-            RdbError::ProtectionPaused {
-                partition: PARTITION,
-                paused_after: Seq(seq)
-            }
-        )
     );
 
     let passed_through = [
@@ -4432,14 +4431,23 @@ fn applied_unpublished() -> (H, Digest, u64) {
     (h, digest, seq)
 }
 
-/// M7A-161. (a) `Frozen{UnresolvedTransaction, Some(s)}`: `Published{s}` retains R(1), reopens,
-/// and pumps the queue (R(2)'s check is the step's only effect). (b) One fact apart, the cause is
+/// M7A-161. (a) `Frozen{UnresolvedTransaction, Some(s)}`, reached when R(1) passes its own
+/// deadline unpublished (A-R252), which also drained R(2): `Published{s}` retains R(1), reopens,
+/// and the next submit gets its check. (b) One fact apart, the cause is
 /// `AuthorityLost(Expired)`: `Published{s}` still retains, answers `PublishedWhileFrozen`, clears
 /// `unresolved`, keeps the cause, and the next `Submit` is `LEASE_EXPIRED`: the kept cause picks
 /// the code.
 #[retcd_test]
 fn m7a_161_published_while_frozen_reopens_only_for_unresolved_transaction() {
     let (mut h, digest, seq) = applied_unpublished();
+    assert_eq!(h.k().mode(), &QueueMode::Open, "applied: still open");
+    h.now += 1_000;
+    let drained = h.step(submit(put(3, b"c", b"3")));
+    assert_eq!(
+        drained.len(),
+        2,
+        "R(2) drained and R(3) refused: {drained:?}"
+    );
     assert_eq!(
         h.k().mode(),
         &QueueMode::Frozen {
@@ -4447,9 +4455,10 @@ fn m7a_161_published_while_frozen_reopens_only_for_unresolved_transaction() {
             unresolved: Some(Seq(seq))
         }
     );
-    let _ = only_check(&h.step(published(seq, digest, 1)));
+    assert_eq!(h.step(published(seq, digest, 1)), vec![]);
     assert_eq!(h.k().mode(), &QueueMode::Open);
     assert!(h.k().dedup().get(GEN, AFF, identity(1)).is_some());
+    let _ = h.admit(put(4, b"d", b"4"));
 
     let (mut h, digest, seq) = applied_unpublished();
     let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
@@ -4469,6 +4478,74 @@ fn m7a_161_published_while_frozen_reopens_only_for_unresolved_transaction() {
     assert_eq!(
         failed(&h.step(submit(put(3, b"c", b"3")))),
         ErrorKind::LeaseExpired
+    );
+}
+
+/// Lead ruling A-R252 (writer fix). An applied, unpublished R(1) keeps the queue open: R(2) and
+/// R(3) wait behind it with no answer (spec §5.2 step 2). When R(1) passes its own deadline
+/// unpublished, the next step freezes T1 on it and drains the queue with `PROTECTION_PAUSED`,
+/// before that step's own submit reaches check 7.
+#[retcd_test]
+fn an_unpublished_write_past_its_deadline_freezes_and_drains_the_queue() {
+    let (mut h, _, seq) = applied_unpublished();
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), vec![], "R(3) waits");
+    assert_eq!(h.k().queue_len(), 2);
+    let paused = RdbError::ProtectionPaused {
+        partition: PARTITION,
+        paused_after: Seq(seq),
+    };
+    // `put` carries 1,000 ms from `now` 10: R(1) expires at 1,010.
+    h.now = 1_009;
+    assert_eq!(
+        h.step(submit(put(4, b"d", b"4"))),
+        vec![],
+        "R(4) still waits"
+    );
+    h.now = 1_010;
+    let mut drained = fail(2, paused.clone());
+    drained.extend(fail(3, paused.clone()));
+    drained.extend(fail(4, paused.clone()));
+    drained.extend(fail(5, paused));
+    assert_eq!(h.step(submit(put(5, b"e", b"5"))), drained);
+    assert_eq!(h.k().queue_len(), 0);
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::UnresolvedTransaction,
+            unresolved: Some(Seq(seq))
+        }
+    );
+}
+
+/// Lead ruling A-R252 (writer fix). A long deadline does not hold the queue open past P1's own:
+/// `POST_APPLY_DEADLINE_MILLIS` after R(1) applied, T1 freezes on it and drains R(2), whatever
+/// time R(1)'s own deadline has left.
+#[retcd_test]
+fn an_unpublished_write_freezes_at_the_publish_deadline_with_time_left() {
+    let mut h = H::live();
+    let mut long = put(1, b"a", b"1");
+    long.remaining_millis = 30_000;
+    let (batch, _, seq) = h.dispatch(long);
+    assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![]);
+    h.now = 100;
+    assert_eq!(h.step(committed(batch, seq)).len(), 2);
+    h.now = 100 + POST_APPLY_DEADLINE_MILLIS - 1;
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), vec![], "R(3) waits");
+    h.now = 100 + POST_APPLY_DEADLINE_MILLIS;
+    let paused = RdbError::ProtectionPaused {
+        partition: PARTITION,
+        paused_after: Seq(seq),
+    };
+    let mut drained = fail(2, paused.clone());
+    drained.extend(fail(3, paused.clone()));
+    drained.extend(fail(4, paused));
+    assert_eq!(h.step(submit(put(4, b"d", b"4"))), drained);
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::UnresolvedTransaction,
+            unresolved: Some(Seq(seq))
+        }
     );
 }
 
@@ -4539,26 +4616,23 @@ fn modes_a() -> [QueueMode; 3] {
 
 fn modes_b() -> [QueueMode; 3] {
     [
-        frozen_with(FreezeCause::UnresolvedTransaction, Some(1)),
+        QueueMode::Open,
         frozen_with(LOST, Some(1)),
         frozen_with(LOST, None),
     ]
 }
 
 fn modes_c() -> [QueueMode; 3] {
-    [
-        frozen_with(FreezeCause::UnresolvedTransaction, Some(1)),
-        QueueMode::Open,
-        frozen_with(LOST, None),
-    ]
+    [QueueMode::Open, QueueMode::Open, frozen_with(LOST, None)]
 }
 
 /// M7A-168. The three orders of freeze, completion and publication for one dispatched batch,
 /// with the whole mode compared after every event. A: the completion under the freeze sets
-/// `unresolved` and leaves the cause. B: the completion in `Open` writes both, and the freeze
-/// then overwrites the cause and keeps `unresolved`. C: the publication reopens, and the freeze
-/// then writes `unresolved: None`. The final mode is `Frozen{AuthorityLost(Expired), None}` in
-/// all three, and R(1) is retained exactly at the publication in all three.
+/// `unresolved` and leaves the cause. B: the completion in `Open` leaves it open (A-R252), and the
+/// freeze then writes the cause and `unresolved` from the dispatched batch. C: the publication
+/// keeps it open, and the freeze then writes `unresolved: None`. The final mode is
+/// `Frozen{AuthorityLost(Expired), None}` in all three, and R(1) is retained exactly at the
+/// publication in all three.
 #[retcd_test]
 fn m7a_168_freeze_keeps_its_cause_across_the_batch_completion_in_three_orderings() {
     for (events, modes) in [

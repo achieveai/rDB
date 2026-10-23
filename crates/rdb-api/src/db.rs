@@ -3869,6 +3869,47 @@ mod tests {
         db.shutdown();
     }
 
+    /// Lead ruling A-R252 (spec §5.2 steps 2 and 6). Writers on one partition wait in its queue
+    /// behind the transaction in flight; none is refused. 2 and then 4 threads each put 20 keys
+    /// at once through one `Db`, and every put succeeds. Before the fix T1 froze its queue at
+    /// every local apply until the publish, so a put that arrived in that window was refused
+    /// `PROTECTION_PAUSED` (290 a minute with 2 writers at 100 puts a second in `rdb_bench`).
+    /// Integration (~1 s): three node threads, 120 puts.
+    #[test]
+    fn concurrent_writers_wait_behind_the_unpublished_write_and_none_is_refused() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        for writers in [2_usize, 4] {
+            let refused = std::sync::Mutex::new(Vec::new());
+            std::thread::scope(|scope| {
+                for writer in 0..writers {
+                    let (db, refused) = (&db, &refused);
+                    scope.spawn(move || {
+                        for i in 0..20 {
+                            let key = format!("w{writers}/{writer}/{i}");
+                            if let Err(e) = db.put(key.as_bytes(), b"v", None) {
+                                refused.lock().expect("lock").push(e.error.kind);
+                            }
+                        }
+                    });
+                }
+            });
+            let refused = refused.into_inner().expect("lock");
+            assert!(refused.is_empty(), "{writers} writers: refused {refused:?}");
+        }
+        db.shutdown();
+    }
+
     /// S1 contract, scenario 3b, and guard G14. With links 1-2 and 1-3 held, a txn with a
     /// 100 ms deadline applies on node 1 and waits for an acknowledgement. The host's expiry
     /// answers it `UNKNOWN_OUTCOME` at deadline plus one margin, before the `Db`'s own wait of
