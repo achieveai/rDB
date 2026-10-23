@@ -16,6 +16,9 @@ fn config(dir: &Path) -> DbConfig {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        local: ALL_NODES.to_vec(),
+        links: None,
+        client: DEFAULT_CLIENT,
     }
 }
 
