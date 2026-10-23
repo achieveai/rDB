@@ -1346,3 +1346,170 @@ fn m10_r189_a_generation_changed_refusal_says_to_look_the_request_up_with_status
     );
     db.shutdown();
 }
+
+/// `partitions/1`'s generation now, `None` with no record.
+fn stored_generation(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> Option<u64> {
+    rt.block_on(store.get(config_core::GetRequest {
+        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+    }))
+    .expect("get partitions/1")
+    .record
+    .and_then(|found| PartitionRecord::decode(&found.value))
+    .map(|record| record.generation.0)
+}
+
+/// review-r184 M1 (k220): a layout-1 open counter (`[1]` then N, written before A-R184) leaves
+/// the activated generation unknown, and unknown never rolls forward. A reopen cut short right
+/// after its commit leaves `partitions/1` at a generation no copy holds; with the counter put
+/// back to layout-1 bytes, the next open is `Stale` naming the unknown mark, rolls nothing
+/// forward, and counts nothing. Cut: both unknown arms (`roll_forward_copies`'s by-name guard and
+/// `Count::may_have_admitted`'s) answer "never activated", and the open rolls forward.
+/// Integration (~5 s): a fresh open, a reopen cut short at its commit, a refused open.
+#[config_log::retcd_test]
+fn m10_m1_a_layout_1_open_counter_never_rolls_forward() {
+    const METHOD: &str = "m10_m1_a_layout_1_open_counter_never_rolls_forward";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen cut short");
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + patience;
+    while stored_generation(&rt, &store) != Some(2) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "partitions/1 never named generation 2: {:?}",
+            stored_generation(&rt, &store)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    db.shutdown();
+    drop(db);
+    crate::host::set_after_commit(dir.path(), None);
+
+    let instance = marker(dir.path(), 1).expect("the copies are bound");
+    let key = admin::instance_key(&instance);
+    let (count, revision) = rt
+        .block_on(admin::read_count(&*store, &instance))
+        .expect("the counter");
+    let mut layout_1 = vec![1_u8];
+    layout_1.extend_from_slice(&count.n.to_le_bytes());
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(key.clone()),
+        value: Bytes::from(layout_1),
+        expected_mod_revision: Some(revision),
+        dedup: None,
+    }))
+    .expect("the counter as layout 1");
+    let (seeded, seeded_at) = rt
+        .block_on(admin::read_count(&*store, &instance))
+        .expect("layout 1 reads");
+    assert_eq!(
+        (seeded.n, seeded.activated),
+        (count.n, admin::ACTIVATED_UNKNOWN)
+    );
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::Stale { generation: 2, .. }) => error,
+        other => panic!("a layout-1 counter is Stale, not {:?}", other.map(|_| "Db")),
+    };
+    assert!(
+        refused
+            .to_string()
+            .contains("the open counter predates activation marks, so it may have admitted writes"),
+        "{refused}"
+    );
+    let rolled: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "db_open_rolled_forward")
+        .collect();
+    assert!(rolled.is_empty(), "{rolled:?}");
+    assert_eq!(
+        rt.block_on(admin::read_count(&*store, &instance))
+            .expect("the counter"),
+        (seeded, seeded_at),
+        "the refused open counted nothing"
+    );
+}
+
+/// review-r184 A3 (k220): open counter bytes this build does not write are `Unreadable`, never
+/// a count. Layout 2 is exactly 17 bytes and layout 1 exactly 9; any other length, or any other
+/// version byte, is refused by both the read a reopen decides on and the count an open makes,
+/// and neither writes. An older build reads layout 2 by the same rule: its decoder knows only
+/// version byte 1. Cuts: layout 2 accepts 16 or more bytes after its version byte; layout 1
+/// accepts any version byte.
+/// Unit (~1 ms): `MemStore`.
+#[test]
+fn m10_a3_open_counter_bytes_this_build_does_not_write_are_unreadable() {
+    let rt = runtime();
+    let n = 5_u64.to_le_bytes();
+    let activated = 3_u64.to_le_bytes();
+    let bytes = |version: u8, parts: &[&[u8]]| {
+        let mut out = vec![version];
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        out
+    };
+    let cases = [
+        ("layout 2, one byte short", bytes(2, &[&n, &activated[..7]])),
+        ("layout 2, one byte long", bytes(2, &[&n, &activated, &[0]])),
+        ("layout 2, N only", bytes(2, &[&n])),
+        ("layout 1, one byte short", bytes(1, &[&n[..7]])),
+        (
+            "layout 1, with an activated generation",
+            bytes(1, &[&n, &activated]),
+        ),
+        ("version 3, layout 2's length", bytes(3, &[&n, &activated])),
+        ("version 3, layout 1's length", bytes(3, &[&n])),
+        ("version 0", bytes(0, &[&n])),
+        ("empty", Vec::new()),
+    ];
+    for (case, value) in cases {
+        let store = config_testkit::MemStore::new();
+        let instance = [0x55; INSTANCE_LEN];
+        let key = admin::instance_key(&instance);
+        let written = rt
+            .block_on(store.put(config_core::PutRequest {
+                key: Bytes::from(key.clone()),
+                value: Bytes::from(value.clone()),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .expect("seed")
+            .revision;
+        let unreadable = admin::CounterError::Unreadable {
+            key: key.clone(),
+            revision: written,
+        };
+        assert_eq!(
+            rt.block_on(admin::read_count(&store, &instance)),
+            Err(unreadable.clone()),
+            "{case}: read_count"
+        );
+        assert_eq!(
+            rt.block_on(admin::count_open(
+                &store,
+                &instance,
+                false,
+                admin::COUNT_WITHIN
+            )),
+            Err(unreadable),
+            "{case}: count_open"
+        );
+        let after = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(key),
+            }))
+            .expect("get")
+            .record
+            .expect("still there");
+        assert_eq!(
+            (after.mod_revision, after.value.to_vec()),
+            (written, value),
+            "{case}: nothing was written"
+        );
+    }
+}
