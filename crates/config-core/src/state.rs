@@ -1102,15 +1102,18 @@ impl KvState {
     }
 }
 
-/// Render a key as lowercase hex, truncated to [`KEY_HEX_MAX_BYTES`] so a log line can never
-/// carry a full large key (ADR-0013). Values are never rendered at all.
 /// Render a 16-byte client id as lowercase hex. A `client_id` is caller-chosen opaque bytes,
 /// never a key or a value, so it is logged in full (ADR-0025 verification rows, Q-24).
 pub(crate) fn hex16(client_id: &[u8; 16]) -> String {
     key_hex(client_id)
 }
 
-pub(crate) fn key_hex(key: &[u8]) -> String {
+/// Render a key as lowercase hex of at most its first 32 bytes (`KEY_HEX_MAX_BYTES`), so a log
+/// line can never carry a full large key (ADR-0013). Values are never rendered at all.
+///
+/// The one copy: config-engine and config-storage log keys through this too, so the
+/// redaction rule has one place to be right.
+pub fn key_hex(key: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
     for byte in key.iter().take(KEY_HEX_MAX_BYTES) {
