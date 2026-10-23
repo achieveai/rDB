@@ -1373,6 +1373,10 @@ struct Host {
     /// be, so P1 withholds the reply (F-014 rows).
     #[cfg(test)]
     deny_reply_checks: bool,
+    /// Each module offer, and the final marks of a clean stop, first sleep this long, so a row
+    /// can see a slow step logged (PR #60 review F8, F9).
+    #[cfg(test)]
+    step_pause: Duration,
 }
 
 impl Host {
@@ -1451,6 +1455,8 @@ impl Host {
             fail_step_view: false,
             #[cfg(test)]
             deny_reply_checks: false,
+            #[cfg(test)]
+            step_pause: Duration::ZERO,
         }
     }
 
@@ -1516,7 +1522,13 @@ impl Host {
         // reopen ages every write this process published from its publish tick, not from its
         // landing. A crash or kill writes none; that tail keeps the landing plus the retention.
         if self.fault.is_none() {
-            if let Err(fault) = self.mark_duty(self.clock.now(), 0, "final_marks") {
+            // PR #60 review F8: a synced write, timed like every other duty.
+            let started = Instant::now();
+            #[cfg(test)]
+            std::thread::sleep(self.step_pause);
+            let marked = self.mark_duty(self.clock.now(), 0, "final_marks");
+            self.slow_step("duty", || "final_marks".to_owned(), started);
+            if let Err(fault) = marked {
                 self.set_fault(fault);
             }
         }
@@ -2691,33 +2703,34 @@ impl Host {
         self.answering = self.statuses.remove(&event.id);
         for module in offers {
             let started = Instant::now();
-            match self.offer(module, &event) {
+            let stepped = match self.offer(module, &event) {
                 Ok(effects) => {
                     tracing::trace!(node = self.node.0, module = ?module, event = event_name(&event.kind), effects = effects.len(), "step");
-                    let delivered = self.deliver(&effects);
-                    self.slow_step(
-                        "module",
-                        || format!("{module:?} on {}", event_name(&event.kind)),
-                        started,
-                    );
-                    delivered?;
+                    self.deliver(&effects)
                 }
                 Err(StepError::Module(error @ RdbError::Unavailable { .. })) => {
                     if (routed && route::edge(arm, module) == Edge::Named) || addressed.is_some() {
-                        return Err(Fault::from(format!(
+                        Err(Fault::from(format!(
                             "{module:?} declined {} it must answer: {error}",
                             event_name(&event.kind)
-                        )));
+                        )))
+                    } else {
+                        Ok(())
                     }
                 }
-                Err(StepError::Module(error)) => {
-                    return Err(Fault::from(format!(
-                        "{module:?} failed on {}: {error}",
-                        event_name(&event.kind)
-                    )));
-                }
-                Err(StepError::Host(detail)) => return Err(detail),
-            }
+                Err(StepError::Module(error)) => Err(Fault::from(format!(
+                    "{module:?} failed on {}: {error}",
+                    event_name(&event.kind)
+                ))),
+                Err(StepError::Host(detail)) => Err(detail),
+            };
+            // PR #60 review F9: timed whatever the offer answered, a decline or a failure too.
+            self.slow_step(
+                "module",
+                || format!("{module:?} on {}", event_name(&event.kind)),
+                started,
+            );
+            stepped?;
         }
         // P1 answers a status query in the step that takes it, START_RECORD included.
         if let Some((identity, reply)) = self.answering.take() {
@@ -2748,6 +2761,8 @@ impl Host {
 
     /// Step `module` with the adopted triple, and T1 and P1 with the step view.
     fn offer(&mut self, module: ModuleName, event: &Event) -> Result<Vec<Effect>, StepError> {
+        #[cfg(test)]
+        std::thread::sleep(self.step_pause);
         let partition = event.partition;
         let adopted = self.adopted(partition);
         let reads_storage = matches!(module, ModuleName::Transaction | ModuleName::Publication);
@@ -6982,6 +6997,70 @@ mod tests {
             host.status(PartitionId(2)).fault.as_deref(),
             Some("the first"),
             "the first fault is kept"
+        );
+    }
+
+    /// PR #60 review F8: the final marks a clean stop writes are a synced write, timed like
+    /// every other duty, so a slow one logs `host_slow_step`. Cut: the write untimed, and no
+    /// such line, red. Unit, about 0.3 s: the write is held past the 250 ms threshold.
+    #[config_log::retcd_test]
+    fn a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow() {
+        const METHOD: &str = "a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow";
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Stop).expect("send");
+        host.run(&rx);
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let slow: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "host_slow_step")
+            .map(|line| (line["step"].clone(), line["what"].clone()))
+            .collect();
+        assert_eq!(
+            slow,
+            [(serde_json::json!("duty"), serde_json::json!("final_marks"))],
+            "the final marks were timed"
+        );
+    }
+
+    /// PR #60 review F9: an offer is timed whatever it answers. Here the step view fails
+    /// (`fail_step_view`), so Transaction's offer of an injected timer ends in a host error,
+    /// after a pause past the threshold. Cut: only an offer that delivers is timed, and no
+    /// `Transaction` line, red. Unit, about 0.6 s: Authority's offer is held too.
+    #[config_log::retcd_test]
+    fn a_slow_offer_that_fails_is_logged_as_slow() {
+        const METHOD: &str = "a_slow_offer_that_fails_is_logged_as_slow";
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
+        host.fail_step_view = true;
+        host.handle(Msg::Inject {
+            partition: PartitionId(2),
+            correlation: CorrelationId::default(),
+            kind: EventKind::Timer(TimerFired {
+                id: HEALTH_EVAL_TIMER,
+                version: TimerVersion(0),
+                scheduled_at: host.clock.now(),
+            }),
+        });
+        host.drain();
+        let fault = host.fault.clone().expect("the offer failed");
+        assert!(fault.detail.contains("injected"), "{fault:?}");
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let slow: Vec<String> = lines
+            .iter()
+            .filter(|line| line["@m"] == "host_slow_step" && line["step"] == "module")
+            .filter_map(|line| line["what"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            slow.iter().any(|what| what.starts_with("Transaction on")),
+            "the failed offer was timed: {slow:?}"
         );
     }
 
