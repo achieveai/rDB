@@ -909,7 +909,18 @@ impl Db {
                 key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
             })
             .await
-            .map_err(|error| OpenError::Control(format!("get partitions/1: {error}")))?;
+            .map_err(|error| {
+                // Nothing was written, so opening again is safe; say so when the store was
+                // simply not reachable (M10 D14). `config-client` names each endpoint it tried.
+                let step = match error {
+                    config_core::ConfigError::Unavailable { .. } => {
+                        ". Check that rEtcd is running and reachable from this process, then \
+                         open again"
+                    }
+                    _ => "",
+                };
+                OpenError::Control(format!("get partitions/1: {error}{step}"))
+            })?;
         let root = read
             .record
             .as_ref()
@@ -5094,6 +5105,50 @@ mod tests {
         );
         drop(db);
         node_1.join().expect("the stub");
+    }
+
+    /// M10 D14: the open's control read finds the store unreachable. The error says to check
+    /// that rEtcd is running and to open again, and opening the same folder again with the
+    /// store back does succeed, so the step it names is one this build can run. Cut: drop the
+    /// step from the text, and the first assertion fails.
+    /// Integration (~3 s): real node threads and RocksDB on the second open.
+    #[test]
+    fn m10_d14_an_open_whose_control_read_is_unavailable_says_to_check_retcd_and_open_again() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_gets: 1,
+            ..Script::default()
+        }));
+        let error = match rt.block_on(Db::open(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+        )) {
+            Err(error @ OpenError::Control(_)) => error,
+            Err(other) => panic!("the open fails with Control, not: {other}"),
+            Ok(_) => panic!("the open fails while the store is unreachable"),
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("control store: get partitions/1: ")
+                && text.ends_with(
+                    ". Check that rEtcd is running and reachable from this process, then open \
+                     again"
+                ),
+            "{text}"
+        );
+
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("opening the same folder again, with the store back, succeeds");
+        admits(&db, "after the second open");
+        db.shutdown();
     }
 
     /// M9 S5-2 (G3, G4). A change of any op-carrying kind with 256 ops, and a txn of 256 puts,
