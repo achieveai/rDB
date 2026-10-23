@@ -23,6 +23,9 @@
 //! F holds keys and values, so it is not a log; use one F per `--dir`. A write still in
 //! flight when the process dies is not in F. Past the dedup retention a request is no longer
 //! recognised (`--dedup-retention-ms`).
+//! A line of F that does not read, such as a last line a kill cut short, is skipped with a
+//! `warn` naming its line; the other requests still retry. An append to F that fails is said
+//! with `err`, and the run exits 1.
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
@@ -1198,10 +1201,13 @@ fn repl<'scope, 'env>(
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
         // Nothing to retry is an answer, not a mistyped line: no `usage:`, and no exit 1.
         if let ["retry", rest @ ..] = words.as_slice() {
-            if let Err(e) = sent.adopt(rest) {
-                say(&format!("err {e}"));
-                bad = true;
-                continue;
+            match sent.adopt(rest) {
+                Ok(warnings) => warnings.iter().for_each(|w| say(&format!("warn {w}"))),
+                Err(e) => {
+                    say(&format!("err {e}"));
+                    bad = true;
+                    continue;
+                }
             }
             if let Some(nothing) = sent.nothing_to_retry(rest) {
                 say(&nothing);
@@ -1404,7 +1410,12 @@ fn repl<'scope, 'env>(
             bad = true;
         }
     }
-    if bad {
+    exit_code(bad, &sent)
+}
+
+/// How a REPL run ends: 1 when a line was bad or an append to `--requests F` failed (k214).
+fn exit_code(bad: bool, sent: &Sent) -> ExitCode {
+    if bad || sent.save_failed.get() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -2724,6 +2735,8 @@ struct Sent {
     /// `--requests F`: each recorded request is appended here, and an id this run did not send
     /// is looked up here.
     file: Option<PathBuf>,
+    /// An append to `--requests F` failed: the run exits 1 (k214).
+    save_failed: std::cell::Cell<bool>,
 }
 
 /// What `retry <rest>` names, its `--payload V` or `--deadline-ms N` aside.
@@ -2820,32 +2833,51 @@ impl Sent {
 
     /// Take request `id` from `--requests F` when this run did not send it, so `retry` resends
     /// an earlier run's request unchanged. F's last line for `id` wins: a retry appends what it
-    /// sent. A missing F holds nothing; an F that cannot be read or parsed is an error.
-    fn adopt(&mut self, rest: &[&str]) -> Result<(), String> {
+    /// sent. A missing F holds nothing; an F that cannot be read is an error. A line that does
+    /// not parse is skipped, and the answer names it among the warnings, by line only.
+    fn adopt(&mut self, rest: &[&str]) -> Result<Vec<String>, String> {
         let (Some(path), RetryTarget::Id(id)) = (&self.file, retry_target(rest)) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if self.by_id.contains_key(&id) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("--requests {}: {e}", path.display())),
         };
         let mut found = None;
+        let mut warnings = Vec::new();
+        let last = text.lines().count();
         for (at, line) in text.lines().enumerate() {
-            // Where and what class of error, never serde's message: that quotes the text it
-            // met, and a line holds keys and values.
-            let entry: (TxnRequest, Kind) = serde_json::from_str(line).map_err(|e| {
-                format!(
-                    "--requests {} line {}: not a saved request ({:?} error at column {})",
-                    path.display(),
-                    at + 1,
-                    e.classify(),
-                    e.column()
-                )
-            })?;
+            let entry: (TxnRequest, Kind) = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                // Skipped, so one bad line never blocks the other ids (k214). Where and what
+                // class of error, never serde's message: that quotes the text it met, and a
+                // line holds keys and values.
+                Err(e) => {
+                    let line = at + 1;
+                    let torn = line == last && !text.ends_with('\n') && e.is_eof();
+                    tracing::warn!(line, torn, class = ?e.classify(), "requests_file_line_skipped");
+                    warnings.push(if torn {
+                        format!(
+                            "--requests {} line {line}: cut short, as a kill during its write \
+                             leaves it; skipped",
+                            path.display()
+                        )
+                    } else {
+                        format!(
+                            "--requests {} line {line}: not a saved request ({:?} error at \
+                             column {}); skipped",
+                            path.display(),
+                            e.classify(),
+                            e.column()
+                        )
+                    });
+                    continue;
+                }
+            };
             if entry.0.identity.request.0 == id {
                 found = Some(entry);
             }
@@ -2853,11 +2885,11 @@ impl Sent {
         if let Some(entry) = found {
             self.by_id.insert(id, entry);
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Append `request` to `--requests F`, synced, when there is an F. A failed write is said
-    /// on the run's output and logged, never skipped quietly: a later run could not retry it.
+    /// on the run's output, logged, and makes the run exit 1: a later run could not retry it.
     fn save(&self, request: &TxnRequest, kind: &Kind) {
         let Some(path) = &self.file else {
             return;
@@ -2877,6 +2909,7 @@ impl Sent {
         if let Err(e) = saved {
             let request = request.identity.request.0;
             tracing::error!(error = %e, request, "requests_file_write_failed");
+            self.save_failed.set(true);
             say(&format!(
                 "err --requests {}: {e}; a later run cannot retry request {request}",
                 path.display()
@@ -5155,8 +5188,8 @@ mod tests {
     /// and a fresh compile cannot: it reads the object's moved version, so the walk at 57da754
     /// answered `REQUEST_ID_REUSE` to the same object and value. `--requests F` carries each
     /// recorded request to a later run: that run adopts request 7 from F with the same digest,
-    /// the last line for an id wins, an id F lacks is a plain `nothing to retry`, and a damaged
-    /// line is an error naming its line, never its text. Unit (~5 ms, one temp file).
+    /// the last line for an id wins, and an id F lacks is a plain `nothing to retry`. A damaged
+    /// line is the next row's. Unit (~5 ms, one temp file).
     #[test]
     fn a_later_run_adopts_an_earlier_runs_request_from_requests_file_unchanged() {
         use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
@@ -5199,7 +5232,7 @@ mod tests {
             file: Some(path.clone()),
             ..Sent::default()
         };
-        assert_eq!(later.adopt(&["7"]), Ok(()));
+        assert_eq!(later.adopt(&["7"]), Ok(Vec::new()));
         assert_eq!(later.nothing_to_retry(&["--id", "7"]), None);
         let (adopted, kind) = later.pick(&["7"]).expect("request 7 adopted");
         assert_eq!(
@@ -5208,20 +5241,87 @@ mod tests {
             "the last line for 7 is resent unchanged"
         );
         assert!(matches!(kind, Kind::Value), "{kind:?}");
-        assert_eq!(later.adopt(&["9"]), Ok(()));
+        assert_eq!(later.adopt(&["9"]), Ok(Vec::new()));
         let said = later.nothing_to_retry(&["9"]).expect("F holds no 9");
         assert!(said.ends_with("holds no request 9"), "{said}");
-
-        std::fs::write(&path, "[\"zqsecret\"\n").expect("damage F");
-        let mut damaged = Sent {
-            file: Some(path),
-            ..Sent::default()
-        };
-        let error = damaged.adopt(&["7"]).expect_err("a damaged F is an error");
-        assert!(error.contains("line 1: "), "{error}");
-        assert!(!error.contains("zq"), "{error}");
     }
 
+    /// Tester k214 (A-R189). A damaged line in `--requests F` blocked every retry, and a failed
+    /// append to F printed `err` yet exited 0. Now a line that does not read is skipped with a
+    /// warning that names its line, never its text, and the other ids still retry; a last line
+    /// a kill cut short is said as such. A failed append makes the run exit 1. Unit (~5 ms).
+    #[test]
+    fn a_damaged_or_torn_line_in_requests_file_is_skipped_and_a_failed_append_exits_1() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        use rdb_core::contracts::txn::Mutation;
+        let request = |id, value: &'static [u8]| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(id),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![Mutation::Put {
+                key: Bytes::from_static(b"zqkey"),
+                value: Bytes::from_static(value),
+                expected_version: None,
+            }],
+        };
+        let root = {
+            let _env = ENV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            config_testkit::fs::temp_dir()
+        };
+        let path = root.path().join("requests.json");
+        let line = |id, value| {
+            serde_json::to_string(&(request(id, value), Kind::Txn)).expect("a request line")
+        };
+        let torn = line(8, b"zqeight");
+        let text = format!(
+            "{}\n[\"zqsecret\"\n{}\n{}",
+            line(6, b"zqsix"),
+            line(7, b"zqseven"),
+            &torn[..torn.len() / 2]
+        );
+        std::fs::write(&path, text).expect("write F");
+        let mut later = Sent {
+            file: Some(path.clone()),
+            ..Sent::default()
+        };
+        let warnings = later
+            .adopt(&["7"])
+            .expect("a bad line does not block a retry");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains(" line 2: not a saved request"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].ends_with("; skipped"), "{warnings:?}");
+        assert!(warnings[1].contains(" line 4: cut short"), "{warnings:?}");
+        assert!(warnings.iter().all(|w| !w.contains("zq")), "{warnings:?}");
+        let (adopted, _) = later.pick(&["7"]).expect("request 7 adopted past line 2");
+        assert_eq!(
+            adopted.request_digest(),
+            request(7, b"zqseven").request_digest()
+        );
+        later.adopt(&["6"]).expect("6 too");
+        assert!(later.pick(&["6"]).is_ok());
+        assert_eq!(exit_code(false, &later), ExitCode::SUCCESS);
+
+        // F is a folder: the append fails, and the run exits 1 though every line was fine.
+        let mut unwritable = Sent {
+            file: Some(root.path().to_path_buf()),
+            ..Sent::default()
+        };
+        unwritable.record(Some(request(9, b"nine")), Kind::Txn);
+        assert_eq!(exit_code(false, &unwritable), ExitCode::from(1));
+        assert_eq!(exit_code(true, &later), ExitCode::from(1));
+    }
     /// Tester S1-9 paper cut (k151): on a reopen whose heal failed, `wait ready 30` sat out
     /// all 30 s and printed a bare timeout, though the open could never become ready. `wait
     /// ready` and `wait recovered` end as soon as the heal has failed, and say so with the heal's
