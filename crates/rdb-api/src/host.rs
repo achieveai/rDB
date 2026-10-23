@@ -1373,8 +1373,8 @@ struct Host {
     /// be, so P1 withholds the reply (F-014 rows).
     #[cfg(test)]
     deny_reply_checks: bool,
-    /// Each module offer, and the final marks of a clean stop, first sleep this long, so a row
-    /// can see a slow step logged (PR #60 review F8, F9).
+    /// Each module offer, and the synced write of a clean stop's final marks, first sleep this
+    /// long, so a row can see a slow step logged (PR #60 review F8, F9).
     #[cfg(test)]
     step_pause: Duration,
 }
@@ -1524,8 +1524,6 @@ impl Host {
         if self.fault.is_none() {
             // PR #60 review F8: a synced write, timed like every other duty.
             let started = Instant::now();
-            #[cfg(test)]
-            std::thread::sleep(self.step_pause);
             let marked = self.mark_duty(self.clock.now(), 0, "final_marks");
             self.slow_step("duty", || "final_marks".to_owned(), started);
             if let Err(fault) = marked {
@@ -2166,6 +2164,10 @@ impl Host {
         }
         for (partition, marks, changed) in due {
             if changed {
+                #[cfg(test)]
+                if kind == "final_marks" {
+                    std::thread::sleep(self.step_pause);
+                }
                 self.engine
                     .put_publish_marks(partition, &publish_marks(&marks))
                     .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
@@ -7001,30 +7003,63 @@ mod tests {
     }
 
     /// PR #60 review F8: the final marks a clean stop writes are a synced write, timed like
-    /// every other duty, so a slow one logs `host_slow_step`. Cut: the write untimed, and no
-    /// such line, red. Unit, about 0.3 s: the write is held past the 250 ms threshold.
+    /// every other duty, so a slow one logs `host_slow_step`. The host restored its marks and
+    /// published seq 6 of generation 1, so the stop has marks to write; that write is held past
+    /// the 250 ms threshold (`step_pause`, inside the write only). The row checks the write ran
+    /// (`host_duty` `final_marks`, the mark on disk) and was logged slow, after it. Cut: the
+    /// `slow_step` call removed, and no such line, red. Unit, about 0.3 s.
     #[config_log::retcd_test]
     fn a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow() {
         const METHOD: &str = "a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow";
-        let rt = current_thread();
         let dir = config_testkit::fs::temp_dir();
-        let mut host = host_over(&dir.path().join("node"), &rt);
-        host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
-        let (tx, rx) = mpsc::channel();
-        tx.send(Msg::Stop).expect("send");
-        host.run(&rx);
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let published = (Generation(1), Seq(6), Tick(HostClock::start().now().0 - 10));
+        {
+            let mut host = host_over(&path, &rt);
+            host.restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            host.published_at
+                .entry(PartitionId(1))
+                .or_default()
+                .push_back(published);
+            host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
+            let (tx, rx) = mpsc::channel();
+            tx.send(Msg::Stop).expect("send stop");
+            host.run(&rx);
+        }
 
         let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let wrote = lines
+            .iter()
+            .position(|line| line["@m"] == "host_duty" && line["kind"] == "final_marks")
+            .expect("the clean stop wrote its final marks");
         let slow: Vec<_> = lines
             .iter()
-            .filter(|line| line["@m"] == "host_slow_step")
-            .map(|line| (line["step"].clone(), line["what"].clone()))
+            .enumerate()
+            .filter(|(_, line)| line["@m"] == "host_slow_step")
+            .map(|(at, line)| (at, line["step"].clone(), line["what"].clone()))
             .collect();
         assert_eq!(
-            slow,
-            [(serde_json::json!("duty"), serde_json::json!("final_marks"))],
-            "the final marks were timed"
+            slow.iter()
+                .map(|(_, step, what)| (step, what))
+                .collect::<Vec<_>>(),
+            [(
+                &serde_json::json!("duty"),
+                &serde_json::json!("final_marks")
+            )],
+            "the slow final write was logged as slow"
         );
+        assert!(slow[0].0 > wrote, "logged once the write had run");
+        let marks: Vec<Mark> = RocksEngine::open(&path)
+            .expect("open engine")
+            .publish_marks(PartitionId(1))
+            .expect("read marks")
+            .into_iter()
+            .map(|mark| (mark.generation, mark.seq, mark.tick))
+            .collect();
+        assert_eq!(marks, [published], "the final write reached the disk");
     }
 
     /// PR #60 review F9: an offer is timed whatever it answers. Here the step view fails
