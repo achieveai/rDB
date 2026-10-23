@@ -1547,12 +1547,17 @@ fn commit(
     };
     let mut authority_view = plan.authority_view;
     authority_view.lineage = selected.root;
-    let rebuild = (mode != PartitionMode::Active).then(|| {
-        Rebuild::new(
-            plan.rebuild_required.clone(),
-            (cutoff, selected.cutoff_digest),
-        )
-    });
+    // Only regulars count, whatever the plan names, and a rebuild that cannot reach `Active`
+    // is never armed: a `Shadow` or a two-copy promote never activates (arch-s2 R2-M2).
+    let rebuild_required: BTreeSet<CopyId> = plan
+        .rebuild_required
+        .iter()
+        .copied()
+        .filter(|&copy| is_regular(&plan.config, copy))
+        .collect();
+    let rebuild = (mode != PartitionMode::Active
+        && mode_for(rebuild_required.len()) == PartitionMode::Active)
+        .then(|| Rebuild::new(rebuild_required, (cutoff, selected.cutoff_digest)));
     let result = RecoveryResult {
         fenced_prior: proof,
         inventories,

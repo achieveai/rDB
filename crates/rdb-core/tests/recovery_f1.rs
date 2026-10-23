@@ -7343,3 +7343,78 @@ fn m10_s2_retry_a_newer_fence_supersedes_a_retry_in_progress() {
         vec![ign(ReplicaIgnoreReason::StaleTimer)]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// M10 S2 W9: R2-M2 backstop (arch-s2 Rev 3, ruling A-R225). The rebuild counts only regular
+// members of the pinned config, whatever `rebuild_required` names, and is armed only when they
+// are enough for `Active`. So a `Shadow` caught up never activates a partition, and neither does
+// a two-copy promote: it stays `DegradedRf2` until a new generation re-adds the third copy.
+// ---------------------------------------------------------------------------------------------
+
+/// No activation CAS was sent and nothing reported `Active`.
+fn never_activated(f1: &F1) {
+    assert_eq!(f1.cas_count(), 1, "no activation CAS: {:?}", f1.log);
+    assert!(
+        !f1.log.iter().any(|e| matches!(
+            e,
+            EffectKind::Kernel(KernelEffect::Recovered(r)) if r.mode == PartitionMode::Active
+        )),
+        "nothing reports Active: {:?}",
+        f1.log
+    );
+}
+
+/// The plan builder's mistake, caught in the kernel: `rebuild_required` names the shadow D
+/// beside the survivors A and B, and C is gone. Only two regulars are left in it, which can
+/// never be `Active`, so the commit arms no rebuild, and D's catch-up and proof activate nothing.
+#[retcd_test]
+fn m10_s2_m2_a_shadow_in_rebuild_required_never_activates() {
+    let mut p = plan(&[member(D, ReplicaRole::Shadow)]);
+    p.rebuild_required = [A, B, D].into_iter().collect();
+    let mut f1 = fenced_on(p);
+    for inventory in [inv(A, 20), inv(B, 20), inv(D, 20)] {
+        f1.report(10, inventory);
+    }
+    f1.rec(WINDOW, RecoveryEvent::InventoryFailed { copy: C });
+    if f1.phase() != RecoveryPhase::Barrier {
+        f1.step(WINDOW, fired(1));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    for copy in [A, B] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.mode, PartitionMode::DegradedRf2);
+    assert_eq!(
+        f1.module.rebuild_required(),
+        None,
+        "the shadow is never counted"
+    );
+    for copy in [A, B, D] {
+        f1.rec(4_000, caught_up(copy, 20, dg(0, 20)));
+        f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    never_activated(&f1);
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+}
+
+/// A two-copy promote never reports `Active`. Its pinned config has two regulars and
+/// `rebuild_required` names both; both prove the cutoff after the commit, and nothing activates.
+#[retcd_test]
+fn m10_s2_m2_a_two_copy_promote_never_activates() {
+    let mut f1 = fenced_on(rf2_plan(B, C));
+    f1.report(10, inv(B, 20));
+    f1.report(WINDOW, inv(C, 20));
+    for copy in [B, C] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.mode, PartitionMode::DegradedRf2);
+    assert_eq!(f1.module.rebuild_required(), None, "nothing to rebuild to");
+    for copy in [B, C] {
+        f1.rec(4_000, caught_up(copy, 20, dg(0, 20)));
+        f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    never_activated(&f1);
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+}
