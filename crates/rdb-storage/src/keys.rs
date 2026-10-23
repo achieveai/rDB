@@ -20,9 +20,12 @@
 //!   engine-wide format marker is the key `format`, which is shorter than the 13-byte lineage
 //!   prefix and so can never be mistaken for a lineage key. The engine-wide instance marker
 //!   (M10) is the key `instance`, 16 bytes, written once by `bind_instance`; absent means
-//!   unbound. It is short for the same reason, so it needs no format bump. Each partition's
-//!   publish marks (M10 S1-6, A-R183) are the key `publish` then the partition id (u32 BE),
-//!   11 bytes, also short: see [`PublishMark`].
+//!   unbound. It is short for the same reason, so a format-1 build from before M10 skips it,
+//!   and it needed no format bump. Each partition's publish marks (M10 S1-6, A-R183) are the
+//!   key `publish` then the partition id (u32 BE), 11 bytes, also short: see [`PublishMark`].
+//!   That no longer holds for the next key: this build refuses a short `metadata` key it does
+//!   not define (A-R184), so a key added after these needs a [`FORMAT_VERSION`] bump
+//!   (review-s1 F-010).
 
 use rdb_core::contracts::ids::{Generation, PartitionId, Seq};
 use rdb_core::contracts::storage::Namespace;

@@ -392,6 +392,15 @@ report it with the message.
 |---|---|---|
 | `ReadyError::Quarantined` | The copies' histories disagree, so node 1 takes no writes. The acknowledged data is kept | Do not delete the folder, and do not keep opening it. This build has no repair command yet: stop and report it with the message |
 
+**Fix the cause first.** Opening again unchanged gives the same error; the "what to do"
+column says what to change before the next open.
+
+| Error | When | What to do |
+|---|---|---|
+| `OpenError::Io` | The filesystem refused: a wrong path, no permission, or a full disk | Fix what the message names, then open again |
+| `OpenError::DedupCap` | `DbConfig::dedup_cap` is above the most allowed; nothing was started | Set it to at most the number the message names, or leave it unset |
+| `OpenError::Node` | A node did not start: a copy's storage refused to open, or a copy could not be bound or linked. Nothing was removed | A newer format: open the folder with the build that wrote it. A disk or permission error: fix it, then open again. Anything else, or the same error again: stop and report it with the message |
+
 **Worth retrying.**
 
 | Error | When | What to do |
@@ -399,9 +408,6 @@ report it with the message.
 | `OpenError::InUse` | Another open, in this process or another, holds the folder | Shut that one down first |
 | `OpenError::Control` | rEtcd did not answer, or failed, a read or the open count the open needs (a leader change, say) | Open again once rEtcd is up |
 | `OpenError::Bootstrap` | A new folder's first open could not set it up in rEtcd | Check that rEtcd is running and reachable, then open again |
-| `OpenError::Io` | The filesystem refused: a wrong path, no permission, or a full disk | Fix what the message names, then open again |
-| `OpenError::DedupCap` | `DbConfig::dedup_cap` is above the most allowed; nothing was started | Set it to at most the number the message names, or leave it unset |
-| `OpenError::Node` | A node did not start: a copy's storage refused to open, or a copy could not be bound or linked. Nothing was removed | A newer format: open the folder with the build that wrote it. A disk or permission error: fix it, then open again. Anything else, or the same error again: stop and report it with the message |
 | `ReadyError::TimedOut` | Node 1 did not admit writes in time; the message names the recovery phase | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
