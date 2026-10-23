@@ -154,7 +154,8 @@
 //!                                         running process has
 //! node restart <n>                        stop node n and start it again on its data at its
 //!                                         boot plus one; prints `node n boot b`. The new
-//!                                         process holds no role and stays out until M10. So
+//!                                         process holds no role and stays out until the folder is
+//!                                         opened again (#42). So
 //!                                         any restart stops writes, safely, for the life of
 //!                                         this run: after a secondary's, L1 pauses within
 //!                                         about 2 s of the next write (`PROTECTION_PAUSED`)
@@ -254,6 +255,9 @@
 //!                                         or `link heal all`; the sender is never told. A
 //!                                         hold delays, a drop loses. `links` prints both
 //! wait recovered|ready [<seconds>]        block until the partition gets there
+//!                                         (default 30). `wait ready` asks Db::wait_ready: after
+//!                                         node 1 restarted, or a failed heal, it stops at once,
+//!                                         says the next step, and the run exits 1
 //! sleep <millis>
 //! quit
 //! ```
@@ -1388,9 +1392,13 @@ fn repl<'scope, 'env>(
                 let secs = rest.first().map_or(Ok(30), |s| s.parse::<u64>());
                 match secs {
                     Ok(secs) => {
-                        match wait_for(progress, what, Duration::from_secs(secs), || {
-                            db.heal_state()
-                        }) {
+                        let within = Duration::from_secs(secs);
+                        let waited = if *what == "ready" {
+                            wait_ready_line(within, |within| db.wait_ready(within))
+                        } else {
+                            wait_recovered(progress, within, || db.heal_state())
+                        };
+                        match waited {
                             Ok(line) => say(&line),
                             // A script must see that this open will never be ready (A-R191).
                             Err(line) => {
@@ -3552,43 +3560,79 @@ fn start_voter(rt: &tokio::runtime::Runtime, cluster: &Arc<Cluster>, voter: Vote
     }
 }
 
-/// `wait recovered|ready`: the line it ends with. `Err` when the wait stopped because the open can
-/// never get there (a failed heal): the run then exits 1.
-fn wait_for(
+/// `wait recovered`: the line it ends with. `Err` when the wait stopped because the open can never
+/// get there (a failed heal): the run then exits 1.
+fn wait_recovered(
     progress: &Progress,
-    what: &str,
     limit: Duration,
     heal: impl Fn() -> rdb_api::db::HealState,
 ) -> Result<String, String> {
     let started = Instant::now();
     loop {
-        let seen = progress.seen();
-        let reached = match what {
-            "recovered" => seen.recovered.is_some(),
-            _ => seen.ready,
-        };
-        if reached {
+        if progress.seen().recovered.is_some() {
             return Ok(format!(
-                "reached {what} in {}ms",
+                "reached recovered in {}ms",
                 started.elapsed().as_millis()
             ));
         }
-        // A failed heal never becomes ready: say why now, not after the whole wait (k151).
-        // Node 1 recovers only from the plan the heal hands it, so neither wait can end well.
+        // A failed heal never recovers: say why now, not after the whole wait (k151). Node 1
+        // recovers only from the plan the heal hands it.
         if let rdb_api::db::HealState::Failed(error) = heal() {
             return Err(format!(
-                "stopped waiting for {what}: {}; this open will not become ready",
+                "stopped waiting for recovered: {}; this open will not become ready",
                 rdb_api::db::ReadyError::Heal(error)
             ));
         }
         if started.elapsed() >= limit {
             return Ok(format!(
-                "timeout waiting for {what} after {}s",
+                "timeout waiting for recovered after {}s",
                 limit.as_secs()
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `wait ready`: the line it ends with, from `Db::wait_ready`, which answers the present rather
+/// than rdb_dev's own latch (w3a03: after `node restart 1` the latch still said ready). `Err` when
+/// this open can never be ready again: a failed heal, or node 1 restarted (`Stopped`, whose text
+/// gives the next step). The run then exits 1. A timeout is said, and is not an error.
+fn wait_ready_line(
+    within: Duration,
+    wait: impl FnOnce(Duration) -> Result<(), rdb_api::db::ReadyError>,
+) -> Result<String, String> {
+    use rdb_api::db::ReadyError;
+    let started = Instant::now();
+    let answer = wait(within);
+    let millis = started.elapsed().as_millis();
+    let (outcome, line) = match &answer {
+        Ok(()) => ("reached", Ok(format!("reached ready in {millis}ms"))),
+        Err(e @ ReadyError::TimedOut { .. }) => (
+            "timed_out",
+            Ok(format!(
+                "timeout waiting for ready after {}s: {e}",
+                within.as_secs()
+            )),
+        ),
+        Err(e @ ReadyError::Heal(_)) => (
+            "stopped",
+            Err(format!(
+                "stopped waiting for ready: {e}; this open will not become ready"
+            )),
+        ),
+        Err(e @ ReadyError::Stopped { .. }) => {
+            ("stopped", Err(format!("stopped waiting for ready: {e}")))
+        }
+    };
+    let error = answer.err().map(|e| e.to_string());
+    tracing::info!(
+        what = "ready",
+        outcome,
+        millis = u64::try_from(millis).unwrap_or(u64::MAX),
+        error = error.as_deref(),
+        "repl_wait"
+    );
+    line
 }
 
 #[cfg(test)]
@@ -3709,7 +3753,8 @@ mod tests {
         fenced.authority = "fenced(Expired)".to_owned();
         fenced.fence = Some(DenyReason::Expired);
         fenced.fence_polling = true;
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let mut seen = Seen {
             ready: true,
             ..Seen::default()
@@ -3851,7 +3896,8 @@ mod tests {
         .skip(2)
         .collect();
         assert_eq!(lines, [blocked]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let stuck = with("held(grant 2)", "Blocked(ControlUnknown)", None);
         let mut healthy = stuck.clone();
         healthy.protection = Some("healthy".to_owned());
@@ -3910,7 +3956,8 @@ mod tests {
         );
 
         let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[], &[]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
         healthy.protection = Some("healthy".to_owned());
         assert_eq!(
@@ -4009,7 +4056,8 @@ mod tests {
         // fenced with its poll live, then `unheld` with its self-replace stopped
         // (`replace_stopped`, kernel `self_replace_stopped`), then a later poll that changes
         // nothing. With and without a restart, the stuck line, once.
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let gave_up = "node 1's grant is unheld and node 1 stopped trying for one: its grant \
                        record is frozen or not its own; nothing in M9 replaces it, so writes \
                        stay stopped for this run: to write again, quit and start rdb_dev again";
@@ -4323,7 +4371,8 @@ mod tests {
     /// a copy out stays unsafe and pauses at L1's pause age (r3: 2.02 s).
     #[test]
     fn ready_after_a_restart_says_writes_pause_soon_not_only_after_the_next_write() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let mut paused = owner(None, false);
         paused.protection = Some("paused".to_owned());
         let mut seen = Seen::default();
@@ -4360,11 +4409,12 @@ mod tests {
     /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
     #[test]
     fn every_ready_line_matches_the_state_that_decides_it() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
+                    is opened again (#42)";
         let failed = "node 2 stopped: its restart as boot 2 failed; a restarted node stays out \
-                      until M10 (#42)";
+                      until the folder is opened again (#42)";
         let owner_note = "the owner, node 1, restarted (now boot 2); a restarted node stays out \
-                          until M10 (#42)";
+                          until the folder is opened again (#42)";
         let stuck = "writes stay stopped for this run: to write again, quit and start rdb_dev \
                      again";
         let pause = |note: &str| {
@@ -4652,7 +4702,7 @@ mod tests {
     #[test]
     fn a_failed_owner_restart_says_not_ready_and_nodes_names_the_stopped_node() {
         let note = "the owner, node 1, stopped: its restart as boot 2 failed; a restarted node \
-                    stays out until M10 (#42)";
+                    stays out until the folder is opened again (#42)";
         let mut seen = Seen::default();
         lines_ready(&mut seen);
         assert_eq!(
@@ -5368,19 +5418,24 @@ mod tests {
     /// waited on. A stopped wait is an error, so the run exits 1 (A-R191). Unit (~150 ms).
     #[test]
     fn a_wait_ends_at_once_with_the_heal_error_when_the_heal_failed() {
-        use rdb_api::db::HealState;
+        use rdb_api::db::{HealState, ReadyError};
         let progress = Progress::default();
-        for what in ["ready", "recovered"] {
-            let started = Instant::now();
-            let line = wait_for(&progress, what, Duration::from_secs(2), || {
-                HealState::Failed(admin::HealError::NodeStopped)
-            })
-            .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
-            assert!(
-                started.elapsed() < Duration::from_millis(500),
-                "waited {:?}: {line}",
-                started.elapsed()
-            );
+        let started = Instant::now();
+        let recovered = wait_recovered(&progress, Duration::from_secs(2), || {
+            HealState::Failed(admin::HealError::NodeStopped)
+        })
+        .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "waited {:?}: {recovered}",
+            started.elapsed()
+        );
+        // `wait ready` asks Db::wait_ready, which ends at once on a failed heal itself.
+        let ready = wait_ready_line(Duration::from_secs(2), |_| {
+            Err(ReadyError::Heal(admin::HealError::NodeStopped))
+        })
+        .expect_err("a failed heal is a failed wait: exit 1 (A-R191)");
+        for (what, line) in [("recovered", recovered), ("ready", ready)] {
             assert_eq!(
                 line,
                 format!(
@@ -5389,11 +5444,9 @@ mod tests {
                 )
             );
         }
-        let line = wait_for(&progress, "ready", Duration::from_millis(100), || {
-            HealState::Running
-        })
-        .expect("a timeout is said, as before");
-        assert_eq!(line, "timeout waiting for ready after 0s");
+        let line = wait_recovered(&progress, Duration::from_millis(100), || HealState::Running)
+            .expect("a timeout is said, as before");
+        assert_eq!(line, "timeout waiting for recovered after 0s");
     }
 
     /// Tester D8 (aa3b82e): from a folder's second open on, the request floor `(n-1)<<40` puts
@@ -5438,5 +5491,50 @@ mod tests {
         let issued = damage_request();
         assert!(is_damage_request(issued), "{issued:?}");
         assert!(!is_damage_request(RequestId(issued.0 + (1 << 20))));
+    }
+
+    /// Tester w3a03 (A-R191, k227): `wait ready` read rdb_dev's own latch, so after `node
+    /// restart 1` it said "reached ready in 0ms" and exited 0, while node 1 will not admit a
+    /// write again in this open. It now asks `Db::wait_ready`, which answers the present:
+    /// `Stopped`, with the next step, and the run exits 1. Integration (~10 s): three real
+    /// rEtcd voters, an open, and a real restart of node 1.
+    #[config_log::retcd_test]
+    fn wait_ready_after_node_1_restarts_says_the_next_step_and_exits_1() {
+        const METHOD: &str = "wait_ready_after_node_1_restarts_says_the_next_step_and_exits_1";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("run");
+        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
+        let script = root.path().join("script.txt");
+        std::fs::write(&script, "wait ready 60\nnode restart 1\nwait ready 10\n")
+            .expect("write the script");
+        let args = Args {
+            dir,
+            log_dir: root.path().join("logs"),
+            script: Some(script),
+            keep: false,
+            hold: Vec::new(),
+            put_timeout: None,
+            dedup_cap: None,
+            dedup_retention: None,
+            control: None,
+            requests: None,
+        };
+        let code = run(&args, Db::open);
+        let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "repl_wait")
+            .collect();
+        assert_eq!(waits.len(), 2, "{waits:#?}");
+        assert_eq!(waits[0]["outcome"], "reached", "{waits:#?}");
+        assert_eq!(waits[1]["outcome"], "stopped", "{waits:#?}");
+        let said = waits[1]["error"].as_str().unwrap_or_default();
+        assert!(
+            said.contains("node 1, restarted") && said.ends_with("open the folder again"),
+            "{said}"
+        );
+        assert_eq!(code, ExitCode::from(1), "a stopped wait exits 1");
     }
 }
