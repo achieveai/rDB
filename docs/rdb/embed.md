@@ -151,11 +151,13 @@ To ask later, you need something saved before the process stopped. There are two
   `UNKNOWN_OUTCOME`. A `TxnRequest` serializes with `serde_json`. Write it to a file, and sync
   the file (`File::sync_data`) before you rely on it. This does not cover a kill before the
   answer: `put` builds its request inside `Db`, so there is nothing to save until it returns.
-- **Save the id before the send.** For a put you must be able to settle after a kill, choose its
-  request id yourself. Save the id, synced, then send with `db.put_as(id, ..)` (`put_saved`
-  below). Never use an id twice. In that folder, do not also use `put`, `txn` or `write`: they
-  choose ids of their own, and one could match yours. In this release this works for single
-  puts only.
+- **Save the id before the send.** For a write you must be able to settle after a kill, choose
+  its request id yourself. Save the id, synced, then send with `db.put_as(id, ..)`,
+  `db.txn_as(id, ..)` or `db.write_as(id, ..)` (`put_saved` below does it for a put). Never use
+  an id twice. In that folder, do not also use `put`, `txn` or `write`: they choose ids of their
+  own, and one could match yours. A send refused before it went out, and `write_as`'s
+  `Ok(None)` (the change came to nothing), say nothing about an earlier send under that id:
+  ask `status`.
 
 With neither, a kill before any answer leaves nothing to ask about. Read the data with `get`.
 
