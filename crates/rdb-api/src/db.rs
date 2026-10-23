@@ -2789,6 +2789,27 @@ mod tests {
         }
     }
 
+    /// Wait until node 1 has published `seq` and holds nothing applied unpublished (D13).
+    ///
+    /// Not [`admits`]: that is L1 and A1 only, and stays true while T1 is still frozen on an
+    /// unpublished txn and refuses new writes `PROTECTION_PAUSED`. `Msg::Inspect` is answered
+    /// between drains, so once `published` shows `seq`, the publish's thaw has run too.
+    fn publishes(db: &Db, seq: Seq, phase: &str) {
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while !db.node_status().first().is_some_and(|node| {
+            node.published.map(|(_, at)| at) == Some(seq) && node.in_flight.is_none()
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase}: node 1 has not published {seq:?} with nothing in flight within \
+                 {patience:?}: {:?}",
+                db.node_status().first()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The spec's budgets with L1's waits cut short, so a fresh partition admits writes within
     /// [`admits`]'s patience (the spec holds a resume for 5 s).
     fn fast() -> Budgets {
@@ -3849,7 +3870,9 @@ mod tests {
         let second = paused.request.expect("a kernel refusal keeps its request");
 
         db.links().heal_all();
-        admits(&db, "after the heal");
+        // D13: wait for the publish this row is named after, not for `admits`, which is true
+        // through the whole hold.
+        publishes(&db, Seq(3), "after the heal");
         let first = db.resend(*first).expect("the first publishes");
         assert_eq!((first.request, first.seq), (RequestId(2), Seq(3)));
         let second = db.resend(*second).expect("3b: admitted after the publish");
@@ -3874,7 +3897,7 @@ mod tests {
             "the host's expiry answers a resend, not the put timeout: {unknown:?}"
         );
         db.links().heal_all();
-        admits(&db, "after the second heal");
+        publishes(&db, Seq(5), "after the second heal");
         assert_eq!(
             db.resend(late).expect("published after the heal").seq,
             Seq(5)
