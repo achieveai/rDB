@@ -694,17 +694,34 @@ mod tests {
         assert_eq!(args.log_dir, PathBuf::from("D.logs"));
     }
 
+    /// The marked span of an example, as embed.md's code block for it must read.
+    fn embed_block(example: &str) -> String {
+        let example = example.replace("\r\n", "\n");
+        let begin = example.find("// embed.md begin\n").expect("begin marker") + 18;
+        let end = example.find("// embed.md end\n").expect("end marker");
+        format!("```rust\n{}```\n", &example[begin..end])
+    }
+
+    const GUIDE: &str = include_str!("../../../docs/rdb/embed.md");
+
     /// Lead k212: embed.md's "did my write land?" code block must be code that compiles. It is
     /// the marked span of `examples/did_it_land.rs`, which clippy and the build compile; this
     /// row fails when the two differ, so the doc cannot drift from the compiled copy.
     #[test]
     fn the_did_it_land_snippet_in_embed_md_is_the_one_that_compiles() {
-        let example = include_str!("../examples/did_it_land.rs").replace("\r\n", "\n");
-        let guide = include_str!("../../../docs/rdb/embed.md").replace("\r\n", "\n");
-        let begin = example.find("// embed.md begin\n").expect("begin marker") + 18;
-        let end = example.find("// embed.md end\n").expect("end marker");
-        let block = format!("```rust\n{}```\n", &example[begin..end]);
+        let block = embed_block(include_str!("../examples/did_it_land.rs"));
         assert!(block.contains("fn did_it_land"), "{block}");
+        let guide = GUIDE.replace("\r\n", "\n");
+        assert!(guide.contains(&block), "embed.md lacks, verbatim:\n{block}");
+    }
+
+    /// Tester k156: section 4's sample was checked only by a hand build outside the tree. It is
+    /// now the marked span of `examples/embed_sample.rs`, built with the workspace.
+    #[test]
+    fn the_open_sample_in_embed_md_is_the_one_that_compiles() {
+        let block = embed_block(include_str!("../examples/embed_sample.rs"));
+        assert!(block.contains("fn main"), "{block}");
+        let guide = GUIDE.replace("\r\n", "\n");
         assert!(guide.contains(&block), "embed.md lacks, verbatim:\n{block}");
     }
 }
