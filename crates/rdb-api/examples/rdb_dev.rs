@@ -209,7 +209,9 @@
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
 //! admin clear <o>                        clear a damaged object: prove it damaged, then
-//!                                         delete one batch of its records, each at the version
+//!                                         delete all of it, healthy entries too (copy those out
+//!                                         first with `members`; one-entry repair comes later):
+//!                                         one batch of its records per call, each at the version
 //!                                         it was read at (`clear ok ...`). Repeat until `clear
 //!                                         unchanged (nothing to clear; nothing sent)`. A
 //!                                         healthy object answers `CONDITION_FAILED`, a newer
