@@ -33,10 +33,10 @@ use bytes::Bytes;
 use rdb_core::contracts::ids::{Generation, PartitionId, Seq, SnapshotHandle};
 use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageFault};
 use rdb_core::contracts::trace::Version;
-use rocksdb::{ColumnFamily, ReadOptions, SnapshotWithThreadMode, DB};
+use rocksdb::ReadOptions;
 
 use crate::engine::{RocksEngine, LOG_TARGET};
-use crate::keys::{self, encode_key, unframe, Frame, PREFIX_LEN};
+use crate::keys::{encode_key, unframe, Frame, PREFIX_LEN};
 
 /// The namespaces a view shows, in the order [`RocksSnapshot::entries`] lists them. Not
 /// `History` (M10 decision 2, quick fix): no kernel module reads it through [`SnapshotRead`].
@@ -50,45 +50,70 @@ const NAMESPACES: [Namespace; 4] = [
 /// One record of a view: namespace, key, value, version, and the generation that holds it.
 pub type SnapshotEntry = (Namespace, Bytes, Bytes, Version, Generation);
 
-/// A RocksDB snapshot that owns a handle on its database.
-///
-/// The `rocksdb` crate ties a snapshot to a borrow of the database, and the host keeps its views
-/// next to the engine they came from, so a borrowed snapshot cannot be stored there (M10 W2
-/// spike, `teams/m10/dev-w2.md`). This type owns an [`Arc`] of the database instead, and
-/// holds the snapshot under a `'static` borrow of it.
-struct Pinned {
-    /// Declared before `db`, so it is dropped first: the snapshot is released while the
-    /// database it borrows is still open.
-    snapshot: SnapshotWithThreadMode<'static, DB>,
-    db: Arc<DB>,
-}
+/// The one place that holds a RocksDB snapshot under a `'static` borrow. Its fields are private
+/// to this module, so the rest of the crate reaches the snapshot only through
+/// [`Pinned::snap`], which shortens the borrow to `&self`.
+mod pinned {
+    use std::sync::Arc;
 
-impl Pinned {
-    fn new(db: &Arc<DB>) -> Self {
-        let db = Arc::clone(db);
-        let snapshot = SnapshotWithThreadMode::new(&*db);
-        // SAFETY: only the lifetime changes. The snapshot borrows the `DB` inside the `Arc`'s
-        // heap allocation, which does not move when the `Arc` moves and is not freed while
-        // `self.db` holds a count. `snapshot` is declared before `db`, so it is dropped (and
-        // released) first. Nothing hands the `'static` borrow out: every method below borrows
-        // `&self`, and the iterators it makes are bounded by that borrow.
-        let snapshot = unsafe {
-            std::mem::transmute::<SnapshotWithThreadMode<'_, DB>, SnapshotWithThreadMode<'static, DB>>(
-                snapshot,
-            )
-        };
-        Self { snapshot, db }
+    use rdb_core::contracts::storage::Namespace;
+    use rocksdb::{ColumnFamily, SnapshotWithThreadMode, DB};
+
+    use crate::keys;
+
+    /// A RocksDB snapshot that owns a handle on its database.
+    ///
+    /// The `rocksdb` crate ties a snapshot to a borrow of the database, and the host keeps its
+    /// views next to the engine they came from, so a borrowed snapshot cannot be stored there
+    /// (M10 W2 spike, `teams/m10/dev-w2.md`). This type owns an [`Arc`] of the database instead,
+    /// and holds the snapshot under a `'static` borrow of it.
+    pub(super) struct Pinned {
+        /// Declared before `db`, so it is dropped first: the snapshot is released while the
+        /// database it borrows is still open. **Never read this field except in [`Self::snap`]**:
+        /// `rocksdb` 0.23's `iterator` and `iterator_opt` return iterators with the snapshot's
+        /// own lifetime, which here is `'static`, so the compiler would let one outlive `db`.
+        snapshot: SnapshotWithThreadMode<'static, DB>,
+        db: Arc<DB>,
     }
 
-    fn cf(&self, ns: Namespace) -> &ColumnFamily {
-        let name = keys::cf_for(ns);
-        // The engine verified or created every column family at open, and a view never outlives
-        // its database, so a missing handle is a bug in this crate, not a state of the disk.
-        self.db
-            .cf_handle(name)
-            .unwrap_or_else(|| panic!("column family {name} missing after a verified open"))
+    impl Pinned {
+        pub(super) fn new(db: &Arc<DB>) -> Self {
+            let db = Arc::clone(db);
+            let snapshot = SnapshotWithThreadMode::new(&*db);
+            // SAFETY: only the lifetime changes. The snapshot borrows the `DB` inside the
+            // `Arc`'s heap allocation, which does not move when the `Arc` moves and is not freed
+            // while `self.db` holds a count. `snapshot` is declared before `db`, so it is
+            // dropped (and released) first. The `'static` borrow never leaves this module: the
+            // field is private, and `snap` hands it out shortened to `&self` (the type is
+            // covariant in its lifetime), so every iterator or pinned slice made from it,
+            // `iterator`'s included, is bounded by a borrow of this `Pinned`.
+            let snapshot = unsafe {
+                std::mem::transmute::<
+                    SnapshotWithThreadMode<'_, DB>,
+                    SnapshotWithThreadMode<'static, DB>,
+                >(snapshot)
+            };
+            Self { snapshot, db }
+        }
+
+        /// The snapshot, borrowed no longer than `self`. The only way to reach it.
+        pub(super) fn snap(&self) -> &SnapshotWithThreadMode<'_, DB> {
+            &self.snapshot
+        }
+
+        pub(super) fn cf(&self, ns: Namespace) -> &ColumnFamily {
+            let name = keys::cf_for(ns);
+            // The engine verified or created every column family at open, and a view never
+            // outlives its database, so a missing handle is a bug in this crate, not a state of
+            // the disk.
+            self.db
+                .cf_handle(name)
+                .unwrap_or_else(|| panic!("column family {name} missing after a verified open"))
+        }
     }
 }
+
+use pinned::Pinned;
 
 /// A lazy, isolated view of one lineage of a [`RocksEngine`]. A commit after it was taken does
 /// not reach into it. Cloning shares the pinned snapshot.
@@ -185,7 +210,7 @@ impl RocksSnapshot {
             let raw = encode_key(self.partition, level, ns, key);
             let found = self
                 .pinned
-                .snapshot
+                .snap()
                 .get_pinned_cf(cf, &raw)
                 .map_err(|e| read_failed(e.as_ref()))?;
             let Some(found) = found else {
@@ -220,7 +245,7 @@ impl RocksSnapshot {
             let prefix = encode_key(self.partition, level, ns, &[]);
             let mut opts = ReadOptions::default();
             opts.set_iterate_upper_bound(prefix_end(&prefix));
-            let mut it = self.pinned.snapshot.raw_iterator_cf_opt(cf, opts);
+            let mut it = self.pinned.snap().raw_iterator_cf_opt(cf, opts);
             it.seek(encode_key(self.partition, level, ns, from));
             cursors.push((level, it));
         }
