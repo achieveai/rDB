@@ -12,6 +12,8 @@
 //!   read [--partition P] [--generation G] [--ns NS] [--key-hex H]
 //!   verify
 //!   dump
+//!   revoke --partition P --epoch E [--inject synced-put]
+//!   damage [--partition P] [--generation G] --ns NS --key-hex H   (debug builds only)
 //! ```
 //!
 //! See `crates/rdb-storage/README.md` for the scenario, the exit-code table and the log events.
@@ -76,6 +78,12 @@ usage: rocks_scenario --dir <D> [--log-dir <L>] <command>
   --inject  debug builds only: that storage call fails as RocksDB would (exit 8)
   verify  open, then check every lineage's chain; exit 0 only if all pass
   dump    list every stored record, read-only (does not flush the WAL)
+  revoke --partition P --epoch E [--inject synced-put]
+          persist epoch E of partition P as revoked (one synced write; a format-1 copy
+          moves to format 2 with it), then print every revocation the copy holds
+  damage [--partition P] [--generation G] --ns NS --key-hex H
+          debug builds only: flip the last byte of one stored record of (P, G), so the next
+          check of it fails (exit 2 if no value is stored there)
 exit codes: 0 ok, 2 usage, 3 lineage fault, 4 durable>applied, 5 locked,
             6 layout refused (column families / format marker / engine record), 7 backend,
             8 storage fault, 9 no database at --dir (all but write),
@@ -122,6 +130,17 @@ enum Command {
     },
     Verify,
     Dump,
+    Revoke {
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        inject: Option<InjectedFault>,
+    },
+    Damage {
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: Vec<u8>,
+    },
 }
 
 impl Command {
@@ -135,6 +154,8 @@ impl Command {
             Self::Read { .. } => "read",
             Self::Verify => "verify",
             Self::Dump => "dump",
+            Self::Revoke { .. } => "revoke",
+            Self::Damage { .. } => "damage",
         }
     }
 }
@@ -162,6 +183,7 @@ struct Flags {
     base: Option<u64>,
     ns: Option<Namespace>,
     key: Option<Vec<u8>>,
+    epoch: Option<u64>,
     abort: bool,
     inject: Option<InjectedFault>,
 }
@@ -177,6 +199,7 @@ impl Flags {
             ("--base", self.base.is_some()),
             ("--ns", self.ns.is_some()),
             ("--key-hex", self.key.is_some()),
+            ("--epoch", self.epoch.is_some()),
             ("--abort", self.abort),
             ("--inject", self.inject.is_some()),
         ];
@@ -234,9 +257,11 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--base" => f.base = Some(number(&value("--base")?, "--base")?),
             "--ns" => f.ns = Some(namespace(&value("--ns")?)?),
             "--key-hex" => f.key = Some(unhex(&value("--key-hex")?)?),
+            "--epoch" => f.epoch = Some(number(&value("--epoch")?, "--epoch")?),
             "--abort" => f.abort = true,
             "--inject" => f.inject = Some(fault(&value("--inject")?)?),
             "write" | "flush" | "inherit" | "delete" | "snapshot" | "read" | "verify" | "dump"
+            | "revoke" | "damage"
                 if command.is_none() =>
             {
                 command = Some(arg);
@@ -358,8 +383,31 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             f.allow("dump", &[])?;
             Command::Dump
         }
+        Some("revoke") => {
+            f.allow("revoke", &["--partition", "--epoch", "--inject"])?;
+            Command::Revoke {
+                partition,
+                epoch: OwnerEpoch(f.epoch.ok_or("revoke needs --epoch E")?),
+                inject: f.inject_for("revoke", &[InjectedFault::SyncedPut])?,
+            }
+        }
+        Some("damage") => {
+            if cfg!(not(debug_assertions)) {
+                return Err("damage needs a debug build".to_string());
+            }
+            f.allow(
+                "damage",
+                &["--partition", "--generation", "--ns", "--key-hex"],
+            )?;
+            Command::Damage {
+                partition,
+                generation: Generation(f.generation.unwrap_or(1)),
+                ns: f.ns.ok_or("damage needs --ns NS")?,
+                key: f.key.ok_or("damage needs --key-hex H")?,
+            }
+        }
         _ => return Err(
-            "a command is required: write, flush, inherit, delete, snapshot, read, verify or dump"
+            "a command is required: write, flush, inherit, delete, snapshot, read, verify, dump,              revoke or damage"
                 .to_string(),
         ),
     };
@@ -389,8 +437,9 @@ fn fault(raw: &str) -> Result<InjectedFault, String> {
         "mark-write" => Ok(InjectedFault::MarkWrite),
         "switch" => Ok(InjectedFault::Switch),
         "copy-batch" => Ok(InjectedFault::CopyBatch),
+        "synced-put" => Ok(InjectedFault::SyncedPut),
         other => Err(format!(
-            "--inject takes commit, wal-flush, mark-write, switch or copy-batch, got {other:?}"
+            "--inject takes commit, wal-flush, mark-write, switch, copy-batch or synced-put,              got {other:?}"
         )),
     }
 }
@@ -567,6 +616,17 @@ fn run(args: &Args, guard: config_log::LogGuard) -> (u8, config_log::LogGuard) {
         } => (read(&args.dir, *partition, *generation, *ns, key), guard),
         Command::Verify => (verify(&args.dir), guard),
         Command::Dump => (dump_all(&args.dir), guard),
+        Command::Revoke {
+            partition,
+            epoch,
+            inject,
+        } => (revoke(&args.dir, *partition, *epoch, *inject), guard),
+        Command::Damage {
+            partition,
+            generation,
+            ns,
+            key,
+        } => (damage(&args.dir, *partition, *generation, *ns, key), guard),
     }
 }
 
@@ -1036,6 +1096,85 @@ fn verify(dir: &Path) -> u8 {
         }
     }
     code
+}
+
+/// `revoke`: one synced write of the partition's revoked epochs (A-R225), then every
+/// revocation the copy holds, read back from the engine.
+fn revoke(
+    dir: &Path,
+    partition: PartitionId,
+    epoch: OwnerEpoch,
+    inject: Option<InjectedFault>,
+) -> u8 {
+    let mut engine = match open(dir, "revoke") {
+        Ok(engine) => engine,
+        Err(code) => return code,
+    };
+    arm(&mut engine, inject);
+    let line = format!("revoke partition={} epoch={}", partition.0, epoch.0);
+    if let Err(fault) = engine.persist_epoch_revocation(partition, epoch) {
+        println!("{line} FAILED {fault:?}");
+        return exit::STORAGE_FAULT;
+    }
+    match engine.epoch_revocations() {
+        Ok(all) => {
+            let held: Vec<String> = all
+                .iter()
+                .map(|(p, e)| format!("p{}e{}", p.0, e.0))
+                .collect();
+            println!("{line} OK revoked=[{}]", held.join(" "));
+            exit::OK
+        }
+        Err(fault) => {
+            println!("{line} written, read back FAILED {fault:?}");
+            exit::STORAGE_FAULT
+        }
+    }
+}
+
+/// `damage` (debug builds only): flip one stored record of one lineage (A-R230), so the next
+/// check of it fails. The release arm is unreachable: `parse` refuses `damage` there.
+fn damage(
+    dir: &Path,
+    partition: PartitionId,
+    generation: Generation,
+    ns: Namespace,
+    key: &[u8],
+) -> u8 {
+    let line = format!(
+        "damage partition={} generation={} ns={} key={}",
+        partition.0,
+        generation.0,
+        ns_name(ns),
+        hex(key)
+    );
+    #[cfg(debug_assertions)]
+    {
+        let mut engine = match open(dir, "damage") {
+            Ok(engine) => engine,
+            Err(code) => return code,
+        };
+        match engine.damage_record(partition, generation, ns, key) {
+            Ok(()) => {
+                println!("{line} OK");
+                exit::OK
+            }
+            Err(refused @ rdb_storage::DamageRefused::NoValue { .. }) => {
+                println!("{line} REFUSED {refused}");
+                exit::USAGE
+            }
+            Err(refused) => {
+                println!("{line} FAILED {refused}");
+                exit::STORAGE_FAULT
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = dir;
+        println!("{line} REFUSED needs a debug build");
+        exit::USAGE
+    }
 }
 
 fn dump_all(dir: &Path) -> u8 {

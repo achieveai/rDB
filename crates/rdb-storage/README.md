@@ -98,6 +98,8 @@ $B --dir <D> [--log-dir <L>] <command>
 | `write ... --inject commit`, `flush --inject wal-flush|mark-write`, `inherit --inject switch|copy-batch` | **Debug builds only** (usage error in release). That storage call fails as RocksDB would: same error branch, log event and exit 8; nothing is written. `mark-write` fails after the WAL sync, the state a crash between the two leaves. `switch` fails the switch batch; `copy-batch` fails the **last** key batch of a full copy, so a copy needs more than 1024 keys for earlier batches to land. |
 | `verify` | Opens the engine, then checks every lineage (below). Prints `parent= base= mode=root|linked|copied sealed_by= staging=`. Exit 0 only if all pass. |
 | `dump` | Every stored record, every column family, key order. **Read-only**: no lock, no WAL flush. |
+| `revoke --partition P --epoch E [--inject synced-put]` | Persists epoch E of partition P as revoked: one synced write, and a format-1 copy moves to format 2 in the same write (A-R225). Prints `OK revoked=[p<P>e<E> ...]`, every revocation the copy holds, read back. Same epoch again: no change. `--inject synced-put` (debug only) fails the write, exit 8, nothing stored. |
+| `damage [--partition P] [--generation G] --ns NS --key-hex H` | **Debug builds only** (usage error in release). Flips the last byte of one stored record of (P, G), so its next check fails (A-R230). A History record: `verify` then exits 3 with `history record at Seq(N) carries a digest that does not recompute`. No value at that key: `REFUSED`, exit 2, nothing written. |
 
 Data and logs go under `C:/rdb_test_data/m8/...`, never `C:/` root or `%TEMP%`.
 
@@ -167,6 +169,8 @@ invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (t
 | `rdb_storage` | `lineage_verified` / `lineage_verify_failed` | `partition, generation, applied, durable` / `fault` |
 | `rdb_storage` | `storage_open_refused_*` (level ERROR, one per refusal, field `error`) | suffix `locked`, `column_families`, `format`, `durable_above_applied`, `corrupt_record`, `no_database`, `backend`. Logged by `open`, `open_existing`, `open_read_only` and `dump` alike. |
 | `rdb_storage` | `dump_open` | `path, records` |
+| `rdb_storage` | `epoch_revocation_persisted` / `epoch_revocation_write_failed` (ERROR) | `partition, epoch` + `revoked, from_format, format` / `error` |
+| `rdb_storage` | `record_damaged` (WARN, debug builds only) | `partition, generation, ns, key_hex, offset` |
 | `rdb_storage` | `batch_commit_failed`, `wal_sync_failed`, `wal_sync_mark_write_failed` (ERROR) | `error` |
 | `rdb_storage` | `fault_injected` (WARN, debug builds; written when the fault fires, never at arming) | `fault`, `point` (the `--inject` spelling, as `fault_not_reached` uses) |
 | `rocks_scenario` | `fault_not_reached` (WARN; stdout says `inject point <p> not reached`, exit 0) | `point` |
