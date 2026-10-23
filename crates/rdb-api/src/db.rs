@@ -13,7 +13,8 @@
 //! only [`Db::status`] with the same id settles it, and only inside the dedup retention window;
 //! a definitive answer to a later resend covers that resend alone.
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,6 +22,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::ConfigStore;
+use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
@@ -30,6 +33,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
+use rdb_storage::RocksEngine;
 use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
 use rdb_value::value::Value;
@@ -361,10 +365,40 @@ impl std::fmt::Display for PutError {
 /// Why [`Db::open`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
-    /// `nodes/` already exists: it holds node data, or another open has claimed it. Nothing was
-    /// started and nothing was removed.
-    #[error("{0} already exists: it holds node data or another open has claimed it; M9 opens only a directory without one")]
-    NotEmpty(PathBuf),
+    /// Another open, in this process or another, holds this copy's lock. Nothing was started and
+    /// nothing was removed.
+    #[error("{0} is in use by another open")]
+    InUse(PathBuf),
+    /// A copy is missing or holds no database while another copy holds data. Nothing was started
+    /// and nothing was removed.
+    #[error(
+        "{0} is missing or empty while another copy holds data; this directory cannot be opened"
+    )]
+    CopyMissing(PathBuf),
+    /// The copies hold data but name no rDB instance: an M9 directory, which this build does not
+    /// open. Nothing was started and nothing was removed.
+    #[error(
+        "{0} holds data but names no rDB instance (an M9 directory); this build does not open it"
+    )]
+    Unbound(PathBuf),
+    /// The copies and the control store do not belong together: the copies name different
+    /// instances, or the store's `partitions/1` or open counter does not name this one.
+    #[error("this directory and the control store do not belong together: {0}")]
+    Mismatch(String),
+    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward.
+    #[error("no copy holds generation {generation} that partitions/1 names: {detail}")]
+    Stale {
+        /// The record's generation.
+        generation: u64,
+        /// Why it is not rolled forward.
+        detail: String,
+    },
+    /// The open counter refused (M10, arch R3b).
+    #[error(transparent)]
+    Counter(#[from] admin::CounterError),
+    /// The control store failed a read the open needs.
+    #[error("control store: {0}")]
+    Control(String),
     /// A node did not start.
     #[error("node start: {0}")]
     Node(String),
@@ -407,6 +441,71 @@ pub struct Db {
     /// removes it after the nodes have stopped, whether the open failed or was cancelled
     /// (F-001, F-003). `None` once the open succeeds, so a served `Db` never removes its data.
     unwind: Option<PathBuf>,
+    /// What this open is: its boots and its heal.
+    opened: Opened,
+}
+
+/// What one open of a directory is (M10, arch R3b).
+#[derive(Debug)]
+struct Opened {
+    /// The boot every node started at: `((N - 1) << 16) + 1` for the directory's N-th open.
+    base_boot: BootId,
+    /// How the reopen's heal stands. `NotNeeded` for a fresh open.
+    heal: Arc<Mutex<HealState>>,
+    /// The heal's task, aborted at shutdown.
+    heal_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Default for Opened {
+    fn default() -> Self {
+        Self {
+            base_boot: host::BOOT,
+            heal: Arc::new(Mutex::new(HealState::NotNeeded)),
+            heal_task: None,
+        }
+    }
+}
+
+/// How a reopen's heal stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealState {
+    /// A fresh open: there was nothing to heal.
+    NotNeeded,
+    /// Clearing old grants and proving the takeover.
+    Running,
+    /// Node 1 has its plan and fence.
+    Handed(admin::Healed),
+    /// It stopped; the open will not become ready.
+    Failed(admin::HealError),
+}
+
+/// Why [`Db::wait_ready`] returned without node 1 admitting writes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReadyError {
+    /// The reopen's heal failed.
+    #[error("the reopen's heal failed: {0}")]
+    Heal(admin::HealError),
+    /// Node 1 did not admit writes in time.
+    #[error("node 1 did not admit writes within {within_ms} ms; recovery phase {phase}")]
+    TimedOut {
+        /// The bound asked for.
+        within_ms: u128,
+        /// Node 1's last recovery phase, in words.
+        phase: String,
+    },
+}
+
+/// The largest restart count one open gives a node, so it never reaches the next open's boots.
+const MAX_RESTARTS: u64 = 65_534;
+
+/// The boot every node of a directory's `n`-th open starts at (arch R3b).
+const fn base_boot(n: u64) -> BootId {
+    BootId(((n - 1) << 16) + 1)
+}
+
+/// The request id floor of a directory's `n`-th open: its ids are above it (arch R3b).
+const fn request_floor(n: u64) -> u64 {
+    (n - 1) << 40
 }
 
 impl std::fmt::Debug for Db {
@@ -430,29 +529,32 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Db {
-    /// Start three nodes on `config.dir` against `store`, then bootstrap partition 1.
+    /// Open `config.dir` against `store`: start three nodes on it and serve partition 1.
     ///
-    /// Returns once the bootstrap's events are queued, not when the partition is ready: watch
-    /// [`Self::node_status`] for that.
+    /// A directory with no copies is a **fresh** open: it names a new rDB instance, binds it
+    /// into all three copies, counts the open in `rdb/instances/{instance}`, and bootstraps
+    /// partition 1. A directory whose copies hold data is a **reopen**: it checks that the copies
+    /// and `store` belong together, counts the open, starts the nodes at this open's boots, and
+    /// heals partition 1 in the background (M10, arch R3a, R3b). Returns once the bootstrap's
+    /// events are queued or the heal has started, not when the partition is ready: call
+    /// [`Self::wait_ready`].
     ///
     /// # Errors
     ///
-    /// [`OpenError`]. [`OpenError::NotEmpty`] when `config.dir` already has a `nodes/`: this
-    /// open claims the directory by creating it, so of two opens racing on one directory one
-    /// is refused, starts nothing, and removes nothing. Once claimed, when a node fails to
-    /// start, the bootstrap fails, or the returned future is dropped unfinished, every node
-    /// started has stopped and `nodes/` is removed, so the same open can run again.
+    /// [`OpenError`]. Every check runs before a node starts, and a refused check removes
+    /// nothing: [`OpenError::InUse`] when another open holds a copy's lock,
+    /// [`OpenError::CopyMissing`], [`OpenError::Unbound`] for an M9 directory,
+    /// [`OpenError::Mismatch`] when the copies and `store` do not belong together, and
+    /// [`OpenError::Stale`] when no copy holds the generation `partitions/1` names. An open that
+    /// created `nodes/` and then fails, or whose future is dropped unfinished, stops every node
+    /// it started and removes `nodes/`, so the same open can run again.
     ///
-    /// The bootstrap refuses a `partitions/1` that has a history
-    /// ([`admin::BootstrapError::AlreadyExists`]). An untouched record this bootstrap would
-    /// write is adopted instead, so an open whose create committed but whose reply was lost
-    /// can be run again against the same store. A store error is
-    /// [`admin::BootstrapError::Control`]; the next open adopts the record if it was written.
-    ///
-    /// S0 supports one `Db` per control store. Every `Db` starts nodes 1-3 at [`host::BOOT`], so
-    /// a second `Db` on the same store is refused with [`admin::BootstrapError::AlreadyExists`]
-    /// or, if it opens before the first has committed generation 1, opens but never becomes
-    /// ready.
+    /// A fresh open against a store whose `partitions/1` belongs to another database is
+    /// [`OpenError::Mismatch`], in words that name both databases and what to do (tester D1).
+    /// An untouched generation-0 record is adopted instead, so an open whose create committed
+    /// but whose reply was lost can be run again against the same store;
+    /// [`admin::BootstrapError::AlreadyExists`] is left for a record that changes between that
+    /// check and the bootstrap.
     pub async fn open(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
@@ -491,17 +593,9 @@ impl Db {
             config,
             store,
             rt,
-            move |node, dir, links, control, clock| {
-                host::spawn_with(
-                    node,
-                    dir,
-                    links,
-                    control,
-                    clock,
-                    budgets,
-                    limits,
-                    host::BOOT,
-                )
+            budgets,
+            move |node, engine, links, control, clock, boot| {
+                host::spawn_on(node, engine, links, control, clock, budgets, limits, boot)
             },
         )
         .await?;
@@ -510,39 +604,78 @@ impl Db {
     }
 
     /// [`Self::open_with`] with `spawn` starting each node, so a crate test can fail one.
+    /// `budgets` are the ones the heal judges grants with.
     async fn open_spawning(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
         rt: Handle,
+        budgets: Budgets,
         spawn: impl Fn(
             NodeId,
-            PathBuf,
+            RocksEngine,
             Arc<Links>,
             Arc<ControlAdapter>,
             HostClock,
+            BootId,
         ) -> Result<NodeHandle, String>,
     ) -> Result<Self, OpenError> {
-        // F-001: creating `nodes/` is the claim, and it is atomic, so of two opens racing on one
-        // directory exactly one gets it. The other is refused before it starts a node, and
-        // removes nothing.
         std::fs::create_dir_all(&config.dir)?;
         let nodes_dir = config.dir.join("nodes");
-        if let Err(error) = std::fs::create_dir(&nodes_dir) {
-            return Err(match error.kind() {
-                std::io::ErrorKind::AlreadyExists => OpenError::NotEmpty(nodes_dir),
-                _ => OpenError::Io(error),
-            });
-        }
+        let created = match std::fs::create_dir(&nodes_dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(OpenError::Io(error)),
+        };
+        // Opening the engines takes their `LOCK`s, so of two opens racing on one directory one
+        // is refused `InUse` here (F-001). Only an open that created `nodes/` and holds node 1's
+        // `LOCK` may remove it.
+        let engines = match open_engines(&nodes_dir) {
+            Ok(engines) => engines,
+            Err((error, held_owner)) => {
+                if created && held_owner {
+                    remove_claim(&nodes_dir);
+                }
+                return Err(error);
+            }
+        };
+        // Until `db` takes them over, an open that fails or is dropped while it waits on the
+        // control store closes the engines and removes the `nodes/` it created.
+        let mut claim = Claim {
+            engines,
+            created: created.then(|| nodes_dir.clone()),
+        };
+        let found = Self::check(&mut claim.engines, &store).await?;
+        let n = admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
+            .await
+            .map_err(|error| match error {
+                admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
+                    "the copies name instance {}, but {key} is absent",
+                    admin::instance_hex(&found.instance)
+                )),
+                other => OpenError::Counter(other),
+            })?;
+        let engines = std::mem::take(&mut claim.engines);
+        let unwind = claim.created.take();
+        drop(claim);
+        let boot = base_boot(n);
+        tracing::info!(
+            instance_hex = %admin::instance_hex(&found.instance),
+            fresh = found.fresh,
+            n,
+            boot = boot.0,
+            request_floor = request_floor(n),
+            "db_open_found"
+        );
         let clock = HostClock::start();
         let links = Links::new();
-        let control = ControlAdapter::new(Arc::clone(&store), rt, Arc::clone(&links));
+        let control = ControlAdapter::new(Arc::clone(&store), rt.clone(), Arc::clone(&links));
         for (a, b) in &config.hold {
             links.hold(*a, *b);
         }
-        // Built before any node starts and armed with the claim, so an open that fails below, or
-        // is dropped while it waits, drops it: its `Drop` stops and joins the nodes started so
-        // far, shuts the control adapter down, then removes `nodes/` (F-004, F-005, F-003). So
-        // the same open can run again.
+        // Built before any node starts and armed with the claim when this open made it, so an
+        // open that fails below, or is dropped while it waits, drops it: its `Drop` stops and
+        // joins the nodes started so far, shuts the control adapter down, then removes `nodes/`
+        // (F-004, F-005, F-003). So the same open can run again.
         let mut db = Self {
             nodes: Mutex::new(Vec::with_capacity(3)),
             respawn: None,
@@ -550,46 +683,231 @@ impl Db {
             control,
             clock,
             timeouts: config.timeouts,
-            next_request: AtomicU64::new(1),
+            next_request: AtomicU64::new(request_floor(n) + 1),
             ready_seen: AtomicBool::new(false),
-            unwind: Some(nodes_dir.clone()),
+            unwind,
+            opened: Opened {
+                base_boot: boot,
+                ..Opened::default()
+            },
         };
-        db.start(&nodes_dir, &store, spawn).await?;
+        let mut failed = None;
+        for (node, engine) in engines {
+            match spawn(
+                node,
+                engine,
+                Arc::clone(&db.links),
+                Arc::clone(&db.control),
+                db.clock,
+                boot,
+            ) {
+                Ok(handle) => lock(&db.nodes).push(handle),
+                Err(detail) => {
+                    failed = Some(detail);
+                    break;
+                }
+            }
+        }
+        // The engines not started were dropped with the loop, before `db` can unwind.
+        if let Some(detail) = failed {
+            return Err(OpenError::Node(detail));
+        }
+        if found.fresh {
+            admin::bootstrap_at(&store, db.clock.now(), boot, |msg| db.send_to(OWNER, msg)).await?;
+        } else {
+            db.start_heal(&store, &rt, budgets, boot)?;
+        }
         db.unwind = None;
         Ok(db)
     }
 
-    /// Start the three nodes under `nodes_dir`, then bootstrap partition 1 through node 1.
-    async fn start(
-        &mut self,
-        nodes_dir: &std::path::Path,
+    /// The reopen checks of arch R3b, all before anything is counted or started: one instance in
+    /// every copy, bound now on a fresh directory; and on a directory with data, a
+    /// `partitions/1` and counter of that instance, and a copy that holds the generation the
+    /// record names.
+    async fn check(
+        engines: &mut BTreeMap<NodeId, RocksEngine>,
         store: &Arc<dyn ConfigStore>,
-        spawn: impl Fn(
-            NodeId,
-            PathBuf,
-            Arc<Links>,
-            Arc<ControlAdapter>,
-            HostClock,
-        ) -> Result<NodeHandle, String>,
+    ) -> Result<Found, OpenError> {
+        let bound: BTreeSet<[u8; INSTANCE_LEN]> =
+            engines.values().filter_map(RocksEngine::instance).collect();
+        if bound.len() > 1 {
+            let named: Vec<String> = bound.iter().map(admin::instance_hex).collect();
+            return Err(OpenError::Mismatch(format!(
+                "the copies name different instances: {}",
+                named.join(", ")
+            )));
+        }
+        let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
+        if holds_data {
+            if let Some((node, _)) = engines.iter().find(|(_, e)| e.instance().is_none()) {
+                return Err(OpenError::Unbound(PathBuf::from(format!(
+                    "nodes/{}",
+                    node.0
+                ))));
+            }
+        }
+        let instance = bound
+            .first()
+            .copied()
+            .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
+        for (node, engine) in engines.iter_mut() {
+            engine
+                .bind_instance(instance)
+                .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+        }
+        let read = store
+            .get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            })
+            .await
+            .map_err(|error| OpenError::Control(format!("get partitions/1: {error}")))?;
+        let root = read
+            .record
+            .as_ref()
+            .and_then(|found| Some((PartitionRecord::decode(&found.value)?, found)))
+            .map(|(record, found)| (record, PartitionRoot::decode(&found.value)));
+        let fresh = Found {
+            instance,
+            fresh: true,
+        };
+        let untouched = read
+            .record
+            .as_ref()
+            .is_some_and(|found| found.create_revision == found.mod_revision);
+        let (record, root) = match (holds_data, root) {
+            // Nothing written yet: the bootstrap creates `partitions/1`, or adopts an untouched
+            // generation-0 one, its own whose reply was lost.
+            (false, None) => return Ok(fresh),
+            (false, Some((record, None))) if untouched && record.generation == Generation(0) => {
+                return Ok(fresh)
+            }
+            // Another database's history (tester D1).
+            (false, Some((_, None))) => {
+                return Err(OpenError::Mismatch(another_database(
+                    &instance,
+                    "an older database that names no instance",
+                )))
+            }
+            (false, Some((_, Some(root)))) if root.instance != instance => {
+                return Err(OpenError::Mismatch(another_database(
+                    &instance,
+                    &format!("instance {}", admin::instance_hex(&root.instance)),
+                )))
+            }
+            (true, None) => {
+                return Err(OpenError::Mismatch(
+                    "the copies hold data, but the store has no partitions/1".to_owned(),
+                ))
+            }
+            (true, Some((_, None))) => {
+                return Err(OpenError::Mismatch(
+                    "the copies hold data, but partitions/1 names no instance".to_owned(),
+                ))
+            }
+            (_, Some((record, Some(root)))) => (record, root),
+        };
+        if root.instance != instance {
+            return Err(OpenError::Mismatch(format!(
+                "the copies name instance {}, partitions/1 names {}",
+                admin::instance_hex(&instance),
+                admin::instance_hex(&root.instance)
+            )));
+        }
+        let holds = engines
+            .values()
+            .any(|engine| engine.lineages().contains(&(PARTITION, record.generation)));
+        if !holds {
+            return Err(OpenError::Stale {
+                generation: record.generation.0,
+                detail: format!(
+                    "partitions/1 is {:?} at generation {}, the copies hold {:?}",
+                    root.mode,
+                    record.generation.0,
+                    engines
+                        .values()
+                        .flat_map(RocksEngine::lineages)
+                        .map(|(_, generation)| generation.0)
+                        .collect::<BTreeSet<_>>()
+                ),
+            });
+        }
+        Ok(Found {
+            instance,
+            fresh: false,
+        })
+    }
+
+    /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends.
+    fn start_heal(
+        &mut self,
+        store: &Arc<dyn ConfigStore>,
+        rt: &Handle,
+        budgets: Budgets,
+        boot: BootId,
     ) -> Result<(), OpenError> {
-        for n in 1..=3u32 {
-            let node = NodeId(n);
-            let dir = nodes_dir.join(n.to_string());
-            let handle = spawn(
-                node,
-                dir,
-                Arc::clone(&self.links),
-                Arc::clone(&self.control),
-                self.clock,
-            )
-            .map_err(OpenError::Node)?;
-            lock(&self.nodes).push(handle);
-        }
-        if !lock(&self.nodes).iter().any(|handle| handle.node == OWNER) {
-            return Err(OpenError::Node("no owner node".into()));
-        }
-        admin::bootstrap(store, self.clock.now(), |msg| self.send_to(OWNER, msg)).await?;
+        let owner = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == OWNER)
+            .map(NodeHandle::sender)
+            .ok_or_else(|| OpenError::Node("no owner node".into()))?;
+        let ctx = admin::HealCtx {
+            store: Arc::clone(store),
+            boot,
+            budgets,
+            clock: self.clock,
+            owner,
+            within: heal_within(&budgets),
+        };
+        let state = Arc::clone(&self.opened.heal);
+        *lock(&state) = HealState::Running;
+        self.opened.heal_task = Some(rt.spawn(async move {
+            let ended = admin::heal(ctx).await;
+            if let Err(error) = &ended {
+                tracing::error!(%error, "heal_failed");
+            }
+            *lock(&state) = match ended {
+                Ok(healed) => HealState::Handed(healed),
+                Err(error) => HealState::Failed(error),
+            };
+        }));
         Ok(())
+    }
+
+    /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at
+    /// node 1 itself each time, never at what an earlier look saw.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadyError`].
+    pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
+        let deadline = std::time::Instant::now() + within;
+        let mut phase = String::from("unknown");
+        loop {
+            if let HealState::Failed(error) = &*lock(&self.opened.heal) {
+                return Err(ReadyError::Heal(error.clone()));
+            }
+            if let Some(owner) = self.inspect(OWNER) {
+                if owner.admits == Some(true) {
+                    self.ready_seen.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                phase = owner.recovery.unwrap_or_else(|| "none".to_owned());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ReadyError::TimedOut {
+                    within_ms: within.as_millis(),
+                    phase,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// How the reopen's heal stands now.
+    #[must_use]
+    pub fn heal_state(&self) -> HealState {
+        lock(&self.opened.heal).clone()
     }
 
     /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
@@ -1173,7 +1491,7 @@ impl Db {
     pub fn restart_note(&self) -> Option<String> {
         let restarted: Vec<String> = lock(&self.nodes)
             .iter()
-            .filter(|handle| handle.boot != host::BOOT)
+            .filter(|handle| handle.boot != self.opened.base_boot)
             .map(|handle| {
                 let (node, boot) = (handle.node.0, handle.boot.0);
                 let who = if handle.node == OWNER {
@@ -1291,6 +1609,11 @@ impl Db {
         )
     }
 
+    /// The clock every node of this `Db` runs on.
+    pub(crate) const fn clock(&self) -> HostClock {
+        self.clock
+    }
+
     /// The budgets every node runs with, or `None` in a `Db` a crate test builds by hand.
     pub(crate) fn budgets(&self) -> Option<Budgets> {
         self.respawn.as_ref().map(|respawn| respawn.budgets)
@@ -1322,6 +1645,7 @@ impl Db {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         }
     }
 
@@ -1354,6 +1678,7 @@ impl Db {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
         for n in 1..=3u32 {
             let handle = host::spawn_with(
@@ -1438,6 +1763,14 @@ impl Db {
             )));
         };
         let old_boot = handle.boot;
+        // One open never reaches the next open's boots (arch R3b).
+        if old_boot.0 - self.opened.base_boot.0 >= MAX_RESTARTS {
+            return Err(ApiError::invalid(format!(
+                "node {} not restarted: it has restarted {MAX_RESTARTS} times, the most one open \
+                 allows; reopen the directory",
+                node.0
+            )));
+        }
         let boot = BootId(old_boot.0 + 1);
         handle.stop();
         self.control.forget_node(node, old_boot);
@@ -1481,6 +1814,9 @@ impl Db {
 
     /// Stop every node and every control call. The control store stays the caller's.
     pub fn shutdown(&mut self) {
+        if let Some(task) = self.opened.heal_task.take() {
+            task.abort();
+        }
         for handle in self
             .nodes
             .get_mut()
@@ -1594,6 +1930,114 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         retry: kernel.retry_rule(),
         no_mutation: kernel.proves_no_mutation(),
         detail: "the read was refused".to_owned(),
+    }
+}
+
+/// What [`Db::check`] found: the instance the copies name now, and whether nothing was written
+/// under it yet.
+#[derive(Debug, Clone, Copy)]
+struct Found {
+    instance: [u8; INSTANCE_LEN],
+    fresh: bool,
+}
+
+/// The words for a new folder against a store that serves another database (tester D1): both
+/// databases, and what to do instead.
+fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
+    format!(
+        "this control store already holds another database ({theirs}); this folder is instance {}. \
+         To use that database, open its original folder; for a new database, start a separate \
+         rEtcd",
+        admin::instance_hex(ours)
+    )
+}
+
+/// How long the heal may wait for old grants to clear: a whole grant, its clock error and
+/// dispatch margin, and 10 s of slack for the store.
+fn heal_within(budgets: &Budgets) -> Duration {
+    Duration::from_millis(
+        budgets
+            .grant_millis
+            .saturating_add(budgets.clock_error_millis)
+            .saturating_add(budgets.dispatch_margin_millis)
+            .saturating_add(10_000),
+    )
+}
+
+/// Open the three copies under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
+/// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
+/// missing copy is created only while no copy holds data. On error, says whether node 1's
+/// `LOCK` was held, which is what lets a claim be removed; every engine is closed by then.
+fn open_engines(nodes_dir: &Path) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
+    let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
+        rdb_storage::OpenError::Locked { .. } => OpenError::InUse(dir.to_path_buf()),
+        rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(dir.to_path_buf()),
+        other => OpenError::Node(format!("open {}: {other}", dir.display())),
+    };
+    let mut engines = BTreeMap::new();
+    let mut missing = Vec::new();
+    for n in 1..=3u32 {
+        let dir = nodes_dir.join(n.to_string());
+        if !dir.join("CURRENT").exists() {
+            missing.push((NodeId(n), dir));
+            continue;
+        }
+        match RocksEngine::open_existing(&dir) {
+            Ok(engine) => {
+                engines.insert(NodeId(n), engine);
+            }
+            Err(error) => {
+                let held = engines.contains_key(&OWNER);
+                return Err((refused(&dir, error), held));
+            }
+        }
+    }
+    if let Some((_, dir)) = missing.first() {
+        if engines.values().any(|engine| !engine.lineages().is_empty()) {
+            let held = engines.contains_key(&OWNER);
+            return Err((OpenError::CopyMissing(dir.clone()), held));
+        }
+    }
+    for (node, dir) in missing {
+        match RocksEngine::open(&dir) {
+            Ok(engine) => {
+                engines.insert(node, engine);
+            }
+            Err(error) => {
+                let held = engines.contains_key(&OWNER);
+                return Err((refused(&dir, error), held));
+            }
+        }
+    }
+    Ok(engines)
+}
+
+/// An open's engines and the `nodes/` it created, between opening the engines and handing them
+/// to the nodes. Dropped, it closes every engine first, releasing their `LOCK`s, then removes
+/// `nodes/` when this open created it.
+struct Claim {
+    engines: BTreeMap<NodeId, RocksEngine>,
+    created: Option<PathBuf>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.engines.clear();
+        if let Some(dir) = self.created.take() {
+            remove_claim(&dir);
+        }
+    }
+}
+
+/// Remove a `nodes/` this open created, once every engine in it is closed.
+fn remove_claim(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => tracing::info!(dir = %dir.display(), "open_unwound"),
+        Err(error) => tracing::error!(
+            dir = %dir.display(),
+            error = %error,
+            "open_unwind_remove_failed"
+        ),
     }
 }
 
@@ -2058,6 +2502,7 @@ mod tests {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
 
         let refused = db
@@ -2255,6 +2700,7 @@ mod tests {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
 
         let started = std::time::Instant::now();
@@ -2299,6 +2745,7 @@ mod tests {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
         let cases = [
             (ErrorKind::ProtectionPaused, RetryRule::RetryAfterRecovery),
@@ -2338,34 +2785,28 @@ mod tests {
         db.shutdown();
     }
 
-    /// M9 opens only a directory without a `nodes/`: node data already there is refused before
-    /// any node starts, and left as it was, so a second open never bootstraps over a first
-    /// one's history.
+    /// M10 arch R3b (replaces M9's `NotEmpty` row, whose contract M10 retires): a `nodes/` an
+    /// earlier open left with no database in it, killed before its first engine opened, is
+    /// opened fresh again, not refused.
+    /// Integration (~2 s): real node threads and RocksDB; waits for generation 1.
     #[test]
-    fn open_refuses_a_directory_that_already_holds_node_data() {
+    fn an_open_over_copies_that_hold_no_database_opens_fresh() {
         let dir = config_testkit::fs::temp_dir();
         std::fs::create_dir_all(dir.path().join("nodes").join("1")).expect("node dir");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let config = DbConfig {
-            dir: dir.path().to_path_buf(),
-            hold: Vec::new(),
-            timeouts: Timeouts::default(),
-            dedup_cap: None,
-            dedup_retention: None,
-        };
-        match rt.block_on(Db::open(config, store, rt.handle().clone())) {
-            Err(OpenError::NotEmpty(path)) => assert_eq!(path, dir.path().join("nodes")),
-            Err(other) => panic!("open over node data: {other}"),
-            Ok(_) => panic!("open over node data succeeded"),
-        }
-        assert!(
-            dir.path().join("nodes").join("1").exists(),
-            "the refusal removed nothing"
-        );
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("an empty nodes/1 opens fresh");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("ready");
+        assert_eq!(db.heal_state(), HealState::NotNeeded);
+        db.shutdown();
     }
 
     /// F-004, F-005: an open that fails part-way leaves nothing running and nothing on disk, so
@@ -2382,19 +2823,19 @@ mod tests {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let fail_node_2 = |node: NodeId, dir, links, control, clock| {
+        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot| {
             if node == NodeId(2) {
                 return Err("node 2: injected".to_owned());
             }
-            host::spawn_with(
+            host::spawn_on(
                 node,
-                dir,
+                engine,
                 links,
                 control,
                 clock,
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
-                host::BOOT,
+                boot,
             )
         };
 
@@ -2402,6 +2843,7 @@ mod tests {
             config(dir.path()),
             Arc::clone(&store),
             rt.handle().clone(),
+            Budgets::SPEC_DEFAULTS,
             fail_node_2,
         ));
         match failed {
@@ -2430,9 +2872,10 @@ mod tests {
             Arc::clone(&store),
             rt.handle().clone(),
         )) {
-            Err(OpenError::Bootstrap(admin::BootstrapError::AlreadyExists { .. })) => {}
-            Err(other) => panic!("(b) the bootstrap is refused, not: {other}"),
-            Ok(_) => panic!("(b) the bootstrap is refused: partitions/1 exists"),
+            // Tester D1: another database's partitions/1 is a mismatch, not a bootstrap race.
+            Err(OpenError::Mismatch(_)) => {}
+            Err(other) => panic!("(b) the open is refused as another database's, not: {other}"),
+            Ok(_) => panic!("(b) the open is refused: partitions/1 is another database's"),
         }
         assert!(
             !second.path().join("nodes").exists(),
@@ -2445,7 +2888,8 @@ mod tests {
     /// start waits until the other has reached its own node-1 start or returned, so neither
     /// starts a node before both are past the claim. The winner's node-3 start then waits until
     /// the loser has returned, so the loser runs to its end while the winner's nodes are live.
-    /// Exactly one wins. The loser is refused `NotEmpty` and removes nothing: every node's
+    /// Exactly one wins. The loser is refused `InUse` at a copy's `LOCK` (M10 arch R3b; M9 refused
+    /// it `NotEmpty` at `nodes/`) and removes nothing: every node's
     /// `CURRENT` file is still there, and the winner serves a put and a get.
     /// Integration (~3 s): real node threads and RocksDB; the winner waits for generation 1.
     #[test]
@@ -2484,22 +2928,22 @@ mod tests {
                 let race = Arc::clone(&race);
                 std::thread::spawn(move || {
                     let other = 1 - me;
-                    let spawn = |node: NodeId, dir, links, control, clock| {
+                    let spawn = |node: NodeId, engine, links, control, clock, boot| {
                         if node == NodeId(1) {
                             race.mark(me, |state| state.0 = true);
                             race.wait("the other opener reaches node 1 or returns", other, |s| {
                                 s.0 || s.1
                             });
                         }
-                        let started = host::spawn_with(
+                        let started = host::spawn_on(
                             node,
-                            dir,
+                            engine,
                             links,
                             control,
                             clock,
                             fast(),
                             Limits::default(),
-                            host::BOOT,
+                            boot,
                         )?;
                         if node == NodeId(3) {
                             race.wait("the loser returns while these nodes run", other, |s| s.1);
@@ -2510,6 +2954,7 @@ mod tests {
                         config(&path),
                         store,
                         handle.clone(),
+                        fast(),
                         spawn,
                     ));
                     race.mark(me, |state| state.1 = true);
@@ -2523,7 +2968,11 @@ mod tests {
             .partition(Result::is_ok);
         assert_eq!((won.len(), lost.len()), (1, 1), "{won:?} {lost:?}");
         match lost.pop() {
-            Some(Err(OpenError::NotEmpty(path))) => assert_eq!(path, dir.path().join("nodes")),
+            Some(Err(OpenError::InUse(path))) => assert!(
+                path.starts_with(dir.path().join("nodes")),
+                "{}",
+                path.display()
+            ),
             other => panic!("the loser is refused at the claim, not: {other:?}"),
         }
         let mut db = won.pop().expect("one winner").expect("the winner's Db");
@@ -2557,8 +3006,11 @@ mod tests {
         let cases = [
             (
                 "(a) applied",
+                // M10: the open reads partitions/1 and its counter, and puts the counter, first.
                 Script {
+                    pass_puts: 1,
                     lose_put_replies: 1,
+                    pass_gets: 2,
                     fail_gets: 1,
                     ..Script::default()
                 },
@@ -2567,6 +3019,7 @@ mod tests {
             (
                 "(c) never applied",
                 Script {
+                    pass_puts: 1,
                     drop_puts: 1,
                     ..Script::default()
                 },
@@ -2615,37 +3068,49 @@ mod tests {
     /// removed; on Windows the removal is also the proof of the join, as above. Once the store
     /// lets puts through, the same open on the same directory and store succeeds. That open's
     /// claim was disarmed: dropping its `Db` leaves its node data.
-    /// Integration (~0.5 s): real node threads and RocksDB, no partition traffic.
+    /// M10: the open counter's put comes first, before any node starts, and an open dropped
+    /// while it waits there removes `nodes/` too, with the engines it opened closed first.
+    /// Integration (~1 s): real node threads and RocksDB, no partition traffic.
     #[test]
     fn an_open_dropped_while_its_bootstrap_put_waits_stops_its_nodes_and_removes_nodes() {
-        let dir = config_testkit::fs::temp_dir();
-        let nodes = dir.path().join("nodes");
         let rt = runtime();
-        let scripted = Arc::new(Scripted::gated());
-        let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
-        let opened = rt.block_on(async {
-            tokio::select! {
-                opened = Db::open(config(dir.path()), Arc::clone(&store), rt.handle().clone()) => {
-                    Some(opened)
+        // (case, puts let through before the one the open is dropped at)
+        for (case, ahead) in [("the counter put", 0), ("the bootstrap put", 1)] {
+            let dir = config_testkit::fs::temp_dir();
+            let nodes = dir.path().join("nodes");
+            let scripted = Arc::new(match ahead {
+                0 => Scripted::gated(),
+                pass_gate => Scripted::gated_with(Script {
+                    pass_gate,
+                    ..Script::default()
+                }),
+            });
+            let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+            let opened = rt.block_on(async {
+                tokio::select! {
+                    opened = Db::open(config(dir.path()), Arc::clone(&store), rt.handle().clone()) => {
+                        Some(opened)
+                    }
+                    () = scripted.put_arrived.notified() => None,
                 }
-                () = scripted.put_arrived.notified() => None,
-            }
-        });
-        assert!(opened.is_none(), "the open was dropped: {opened:?}");
-        assert!(
-            !nodes.exists(),
-            "the dropped open removed nodes/ and its nodes released their locks"
-        );
+            });
+            assert!(opened.is_none(), "{case}: the open was dropped: {opened:?}");
+            assert!(
+                !nodes.exists(),
+                "{case}: the dropped open removed nodes/ and released every lock"
+            );
 
-        scripted.release();
-        let db = rt
-            .block_on(Db::open(config(dir.path()), store, rt.handle().clone()))
-            .expect("the same open on the same directory succeeds");
-        drop(db);
-        assert!(
-            nodes.join("1").join("CURRENT").exists(),
-            "an open that succeeded never removes its node data"
-        );
+            // A permit returns to the gate after each put, so one lets every later put through.
+            scripted.release();
+            let db = rt
+                .block_on(Db::open(config(dir.path()), store, rt.handle().clone()))
+                .unwrap_or_else(|error| panic!("{case}: the same open succeeds: {error}"));
+            drop(db);
+            assert!(
+                nodes.join("1").join("CURRENT").exists(),
+                "{case}: an open that succeeded never removes its node data"
+            );
+        }
     }
 
     /// Open a `Db` on three real node threads with [`fast`] budgets and wait until it admits.
@@ -3249,6 +3714,7 @@ mod tests {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
         (db, mailbox, rt)
     }
@@ -4265,6 +4731,128 @@ mod tests {
         partition_revision: rdb_core::contracts::ids::Revision,
         /// The fence's `control_revision`.
         control_revision: rdb_core::contracts::ids::Revision,
+    }
+
+    /// Tester D1 (lead ruling on D1): a new folder opened against a control store that already
+    /// serves another folder is refused `Mismatch`, in words an app author can act on: both
+    /// instance ids, "this control store already holds another database", and what to do.
+    /// Nothing is left behind: the new folder's `nodes/` is removed.
+    /// Integration (~2 s): folder A must commit generation 1 first.
+    #[config_log::retcd_test]
+    fn m10_d1_a_new_folder_on_a_store_that_serves_another_is_refused_in_plain_words() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let a = config_testkit::fs::temp_dir();
+        let mut first = rt
+            .block_on(Db::open_with(
+                config(a.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("folder A opens");
+        admits(&first, "folder A");
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        let theirs = PartitionRoot::decode(&found.value)
+            .expect("layout 3")
+            .instance;
+
+        let b = config_testkit::fs::temp_dir();
+        let refused = rt.block_on(Db::open_with(
+            config(b.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ));
+        let error = match refused {
+            Err(error) => error,
+            Ok(_) => panic!("folder B opened on a store that serves folder A"),
+        };
+        let text = error.to_string();
+        tracing::info!(?error, %text, "d1_refusal");
+        assert!(matches!(error, OpenError::Mismatch(_)), "{error:?}");
+        assert!(
+            text.contains("this control store already holds another database"),
+            "{text}"
+        );
+        assert!(text.contains(&admin::instance_hex(&theirs)), "{text}");
+        assert!(
+            text.contains("open its original folder") && text.contains("a separate rEtcd"),
+            "{text}"
+        );
+        assert!(!b.path().join("nodes").exists(), "folder B left nothing");
+        first.shutdown();
+    }
+
+    /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a
+    /// row, and a folder that was opened and closed empty reopens empty. Each reopen heals
+    /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again.
+    /// Integration (~10 s): each reopen waits out the last run's grant on wall-clock time.
+    #[config_log::retcd_test]
+    fn m10_s1_1_a_reopen_reads_back_every_acknowledged_write() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        for (case, writes) in [
+            ("empty", &[][..]),
+            (
+                "written",
+                &[(&b"a"[..], &b"hello"[..]), (b"b", b"world")][..],
+            ),
+        ] {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let dir = config_testkit::fs::temp_dir();
+            let open = || {
+                rt.block_on(Db::open_with(
+                    config(dir.path()),
+                    Arc::clone(&store),
+                    rt.handle().clone(),
+                    fast(),
+                ))
+            };
+            let mut db = open().unwrap_or_else(|e| panic!("{case}: the first open: {e}"));
+            admits(&db, case);
+            for (key, value) in writes {
+                db.put(key, value, None)
+                    .unwrap_or_else(|e| panic!("{case}: put: {e}"));
+            }
+            db.shutdown();
+            drop(db);
+
+            for round in 1..=2 {
+                let mut db = open().unwrap_or_else(|e| panic!("{case}: reopen {round}: {e}"));
+                db.wait_ready(patience)
+                    .unwrap_or_else(|e| panic!("{case}: reopen {round} ready: {e}"));
+                assert!(
+                    matches!(db.heal_state(), HealState::Handed(_)),
+                    "{case}: reopen {round} healed: {:?}",
+                    db.heal_state()
+                );
+                for (key, value) in writes {
+                    let read = db.get(key).expect("get");
+                    assert_eq!(
+                        read.value.map(|(_, bytes)| bytes),
+                        Some(Bytes::copy_from_slice(value)),
+                        "{case}: reopen {round} reads back an acknowledged write"
+                    );
+                }
+                if writes.is_empty() {
+                    assert_eq!(
+                        db.get(b"a").expect("get").value,
+                        None,
+                        "{case}: reopen {round} of an empty folder is empty"
+                    );
+                }
+                db.put(b"after", b"x", None)
+                    .unwrap_or_else(|e| panic!("{case}: reopen {round} takes writes: {e}"));
+                db.shutdown();
+            }
+        }
     }
 
     /// M10 W1 day-1 spike (ruling A-R163): bootstrap, write, stop, start the same `nodes/` again

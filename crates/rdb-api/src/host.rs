@@ -708,6 +708,11 @@ impl NodeHandle {
         self.tx.send(msg).map_err(|_| NodeStopped(self.node))
     }
 
+    /// The node's mailbox, for a task that outlives this borrow (the reopen's heal).
+    pub(crate) fn sender(&self) -> Sender<Msg> {
+        self.tx.clone()
+    }
+
     /// A node with no thread: what is sent to it queues in the returned mailbox and is never
     /// answered. Crate tests only.
     #[cfg(test)]
@@ -777,6 +782,23 @@ pub(crate) fn spawn_with(
 ) -> Result<NodeHandle, String> {
     let engine = RocksEngine::open(&dir)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
+    spawn_on(node, engine, links, control, clock, budgets, limits, boot)
+}
+
+/// [`spawn_with`] on an engine the caller already opened (M10, arch R3b): `Db::open` opens all
+/// three first, which takes their `LOCK`s and reads their instance, and only then knows the
+/// boot to start them at.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_on(
+    node: NodeId,
+    engine: RocksEngine,
+    links: Arc<Links>,
+    control: Arc<ControlAdapter>,
+    clock: HostClock,
+    budgets: Budgets,
+    limits: Limits,
+    boot: BootId,
+) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone());
     let mut host = Host::new(node, engine, links, control, clock);
@@ -1841,10 +1863,11 @@ impl Host {
                 None => self.publication.step(&ctx, event),
             },
             ModuleName::Protection => step_l1(&mut self.l1, &ctx, event),
+            // F1 writes layout 3 for the instance this copy is bound to (M10, arch R3b).
             ModuleName::Recovery => self
                 .recoveries
                 .entry(partition)
-                .or_default()
+                .or_insert_with(|| Recovery::bound_to(self.engine.instance()))
                 .step(&ctx, event),
         };
         answer.map_err(StepError::Module)
@@ -5712,7 +5735,9 @@ mod tests {
     /// M9 serves only an empty copy, so a copy that holds anything must answer
     /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
     /// drops what the copy holds. Two ways to hold something: an anchor past the root, and a
-    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root.
+    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root of the
+    /// bootstrap's generation-0 anchor. M10: a later generation is a reopen's, answered only
+    /// from what the copy stores, so an empty copy asked for one answers `InventoryFailed`.
     #[test]
     fn a_copy_that_holds_anything_never_reports_an_empty_inventory() {
         let dir = config_testkit::fs::temp_dir();
@@ -5730,20 +5755,6 @@ mod tests {
             base_seq: Seq(1),
             ..root
         };
-        let report =
-            |trio: &Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
-
-        assert!(
-            matches!(report(&trio, root), RecoveryEvent::InventoryReported(_)),
-            "an empty copy reports the root"
-        );
-        assert_eq!(
-            report(&trio, past_root),
-            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "an anchor past the root"
-        );
-        trio.bootstrap();
-        trio.ready();
         let bootstrap = LineageAnchor {
             lineage: Lineage {
                 generation: Generation(0),
@@ -5752,6 +5763,34 @@ mod tests {
             },
             ..root
         };
+        let report =
+            |trio: &Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
+
+        assert!(
+            matches!(
+                report(&trio, bootstrap),
+                RecoveryEvent::InventoryReported(_)
+            ),
+            "an empty copy reports the root"
+        );
+        assert_eq!(
+            report(
+                &trio,
+                LineageAnchor {
+                    base_seq: Seq(1),
+                    ..bootstrap
+                }
+            ),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "an anchor past the root"
+        );
+        assert_eq!(
+            report(&trio, root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "an empty copy asked for a reopen's generation 1"
+        );
+        trio.bootstrap();
+        trio.ready();
         assert_eq!(
             report(&trio, bootstrap),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },

@@ -535,7 +535,12 @@ where
             return ExitCode::from(1);
         }
     };
-    say("bootstrap: partition 1 recovery started");
+    // A fresh folder bootstraps; a folder with data takes over from its last run (M10 S1-1).
+    if db.heal_state() == rdb_api::db::HealState::NotNeeded {
+        say("bootstrap: partition 1 recovery started");
+    } else {
+        say("reopen: partition 1 takes over from the last run (heal started)");
+    }
     let progress = Progress::default();
     let stop = AtomicBool::new(false);
     let control = local.as_ref().map(|(cluster, hostile)| Control {
@@ -550,7 +555,6 @@ where
     });
     db.shutdown();
     drop(db);
-    drop(control);
     close(store, local, rt, args, existed);
     code
 }
