@@ -66,6 +66,10 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// How long a handshake may take before the link is dropped.
 const HANDSHAKE: Duration = Duration::from_secs(5);
 
+/// How long one dial may take to connect, TCP and TLS together. A listener that accepts and
+/// never answers the TLS hello would otherwise hold the dial forever.
+const CONNECT: Duration = Duration::from_secs(2);
+
 /// Frames kept for a node whose link is not up yet, before the oldest is dropped.
 const QUEUE_CAP: usize = 10_000;
 
@@ -897,11 +901,28 @@ async fn dial_once(
         .map_err(|error| format!("bad address {address}: {error}"))?
         .tls_config(tls.client_tls_config_for(&certs::node_domain(node)))
         .map_err(|error| format!("tls config: {error}"))?
-        .connect_timeout(Duration::from_secs(2));
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|error| format!("connect: {}", error_chain(&error)))?;
+        .connect_timeout(CONNECT);
+    let Ok(connected) = tokio::time::timeout(CONNECT, endpoint.connect()).await else {
+        return Err(format!(
+            "no TLS answer from {address} in {CONNECT:?}; is {address} node-{} of this run?",
+            node.0
+        ));
+    };
+    let channel = match connected {
+        Ok(channel) => channel,
+        Err(error) if tls_refused(&error) => {
+            let reason = format!(
+                "TLS handshake with {address} failed: {}; is {address} node-{} of this run, \
+                 with certificates from the same CA?",
+                error_chain(&error),
+                node.0
+            );
+            tracing::warn!(peer = node.0, %reason, "net_handshake_refused");
+            refuse(shared, node, &reason);
+            return Err(format!("refused: {reason}"));
+        }
+        Err(error) => return Err(format!("connect: {}", error_chain(&error))),
+    };
     let mut client = RdbNetClient::new(channel)
         .max_decoding_message_size(MAX_FRAME)
         .max_encoding_message_size(MAX_FRAME);
@@ -950,6 +971,24 @@ async fn dial_once(
     let reason = read(Arc::clone(shared), Arc::clone(&conn), inbound).await;
     close(shared, &conn, &reason);
     Ok(reason)
+}
+
+/// Whether a failed connect was a TLS failure: a certificate one side rejects, or an address
+/// that does not speak TLS. rustls reports both as `io::ErrorKind::InvalidData`; nobody
+/// listening is `ConnectionRefused` and a slow peer `TimedOut`, which waiting can heal. A TLS
+/// failure is a refusal: the dial goes on, and a link that later comes up clears it.
+fn tls_refused(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 fn refuse(shared: &Shared, node: NodeId, reason: &str) {

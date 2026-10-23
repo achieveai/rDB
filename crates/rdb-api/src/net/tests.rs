@@ -887,7 +887,8 @@ async fn a_newer_protocol_version_is_refused_naming_both_sides() {
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
-/// link, and the dialler says why. Integration (~2 s: waits out a link that must not come up).
+/// link: the dialler is refused at once, naming the certificate (arch-s2 S2-1: "wrong cert
+/// refused at handshake"; tester-s2 found it waited, then said "not reachable"). Integration.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_certificate_from_another_ca_gets_no_link() {
     let dir = config_testkit::fs::temp_dir();
@@ -900,10 +901,18 @@ async fn a_certificate_from_another_ca_gets_no_link() {
     let stranger = side(Spec::node(2, &other, &[1]).dialling(1, addr), false).await;
     let error = stranger
         .net
-        .wait_up(&[NodeId(1)], Duration::from_secs(2))
+        .wait_up(&[NodeId(1)], PATIENCE)
         .await
         .expect_err("no link");
-    assert!(error.contains("node 1: not reachable"), "{error}");
+    assert!(error.contains("node 1: refused"), "{error}");
+    assert!(
+        error.contains("certificate"),
+        "names the certificate: {error}"
+    );
+    assert!(
+        matches!(stranger.net.states()[&NodeId(1)], LinkState::Refused(_)),
+        "a certificate the peer rejects does not heal by waiting"
+    );
     assert!(!matches!(one.net.states()[&NodeId(2)], LinkState::Up(_)));
 }
 
@@ -986,5 +995,71 @@ async fn a_node_dials_only_once_its_node_can_take_messages() {
         format!("{got:?}"),
         format!("{:?}", ask()),
         "delivered, not dropped"
+    );
+}
+
+/// tester-s2 S2-1 F: a handshake that cannot succeed is refused at once, saying why, instead of
+/// waiting out `--ready-secs` as "not reachable". Node 1 dialled at node 3's address meets a
+/// certificate for another name; an address held by something that does not speak TLS answers
+/// garbage. Both name the address and ask whether it is that node of this run.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_that_cannot_succeed_is_refused_naming_the_address() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2, 3]);
+    let three = side(Spec::node(3, dir.path(), &[2]), true).await;
+    let wrong = three.net.addr().expect("listening");
+    let (plain, foreign) = config_testkit::ports::ephemeral_listener().await;
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        // Held open after the answer: dropping a socket with the hello unread resets it on
+        // Windows (os error 10053), and the dialler may see the reset before the garbage.
+        let mut held = Vec::new();
+        while let Ok((mut socket, _)) = plain.accept().await {
+            let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            held.push(socket);
+        }
+    });
+    for (addr, names) in [(wrong, "certificate"), (foreign, "InvalidContentType")] {
+        let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+        let error = two
+            .net
+            .wait_up(&[NodeId(1)], PATIENCE)
+            .await
+            .expect_err("no link");
+        assert!(error.contains("node 1: refused"), "{error}");
+        assert!(error.contains(names), "says why ({names}): {error}");
+        assert!(
+            error.contains(&addr.to_string()) && error.contains("node-1 of this run"),
+            "names the address and what was expected there: {error}"
+        );
+    }
+}
+
+/// Walking the row above by hand: an address whose listener accepts and never answers (rEtcd's
+/// plain HTTP health port) left the dial waiting forever, so the pilot waited out `--ready-secs`
+/// and said only "not reachable yet". A connect now ends after `CONNECT`, naming the address.
+/// Not a refusal: a slow node may answer next time. Integration (~2 s, the connect bound).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_address_that_never_answers_the_tls_hello_says_so() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let (silent, addr) = config_testkit::ports::ephemeral_listener().await;
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    let error = two
+        .net
+        .wait_up(&[NodeId(1)], Duration::from_secs(4))
+        .await
+        .expect_err("no link");
+    assert!(
+        error.contains("node 1: not reachable: ")
+            && error.contains("no TLS answer")
+            && error.contains(&addr.to_string()),
+        "{error}"
     );
 }

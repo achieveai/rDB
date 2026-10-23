@@ -24,7 +24,9 @@
 //!
 //! Every open prints `ready ms=<open-to-ready> heal=<HealState>` (`reopen i ready ...` for a
 //! reopen). Exits: 0 done; 1 a write or read failed; 2 bad arguments or setup; 3 the folder was
-//! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`); 4 `--verify`
+//! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`), or with
+//! `--nodes` a node refused the link (`links down: node N: refused: ...`: another CA, the
+//! wrong node at that address, something that is not TLS, a newer protocol); 4 `--verify`
 //! found a journalled key missing or wrong; 5 not ready in time.
 //!
 //! Logs go to `L/pilot_kv.jsonl` (default `D` with `.logs` appended) and never carry key or
