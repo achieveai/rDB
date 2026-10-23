@@ -1911,7 +1911,7 @@ impl Host {
             partition = partition.0,
             generation = generation.0,
             applied = applied.0,
-            records = view.len(),
+            // No record count: a lazy view's `len` reads the whole lineage (dev-w2, 9531f6a).
             millis = millis(started),
             "step_view"
         );
