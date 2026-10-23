@@ -4659,6 +4659,7 @@ mod tests {
             retry,
             no_mutation,
             detail: "control store: list partitions/: x; nothing deleted".to_owned(),
+            retry_after: None,
         };
         assert_eq!(
             admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter, true)),
@@ -4694,6 +4695,7 @@ mod tests {
             detail: "control store: delete grants/1 at revision 5: permission denied; the \
                      delete may have applied; run it again to read where it stands"
                 .to_owned(),
+            retry_after: None,
         };
         let permanent = admin_error_line(NodeId(1), &error(RetryRule::NotWired));
         assert_eq!(

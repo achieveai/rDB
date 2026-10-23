@@ -20,10 +20,13 @@
 //!   engine-wide format marker is the key `format`, which is shorter than the 13-byte lineage
 //!   prefix and so can never be mistaken for a lineage key. The engine-wide instance marker
 //!   (M10) is the key `instance`, 16 bytes, written once by `bind_instance`; absent means
-//!   unbound. It is short for the same reason, so it needs no format bump.
+//!   unbound. It is short for the same reason, so it needs no format bump. Each partition's
+//!   publish marks (M10 S1-6, A-R183) are the key `publish` then the partition id (u32 BE),
+//!   11 bytes, also short: see [`PublishMark`].
 
 use rdb_core::contracts::ids::{Generation, PartitionId, Seq};
 use rdb_core::contracts::storage::Namespace;
+use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::Version;
 
 /// The on-disk format this build writes and accepts (ADR-rdb-0010 decision 11). `0` was S0's
@@ -86,6 +89,70 @@ pub(crate) const FORMAT_KEY: &[u8] = b"format";
 pub(crate) const INSTANCE_KEY: &[u8] = b"instance";
 /// Length of a stored instance id.
 pub const INSTANCE_LEN: usize = 16;
+/// The per-partition publish-mark key in `metadata` starts with these bytes; the partition id
+/// (u32 BE) follows (M10 S1-6, lead ruling A-R183). 11 bytes in all: shorter than
+/// [`PREFIX_LEN`], like [`FORMAT_KEY`] and [`INSTANCE_KEY`], so every format-1 open skips it
+/// and it needs no format bump. A lineage-shaped private record would not do: an open refuses a
+/// private record name it does not define, so every build before this one would refuse the copy.
+pub(crate) const PUBLISH_MARKS_PREFIX: &[u8] = b"publish";
+/// Length of one stored [`PublishMark`]: generation, seq and tick, each u64 BE.
+pub(crate) const PUBLISH_MARK_LEN: usize = 24;
+
+/// One publish mark (M10 S1-6, lead ruling A-R183): every seq at or below [`Self::seq`] of
+/// [`Self::generation`] was published at or before [`Self::tick`]. The host copies it verbatim
+/// from the publish times it holds, and restores it after a reopen so a retained request's
+/// window runs from a time it is proven published by. The engine stores and returns the list
+/// as given; what the marks mean is the host's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishMark {
+    /// The generation the mark is for.
+    pub generation: Generation,
+    /// Every seq at or below this one was published by [`Self::tick`].
+    pub seq: Seq,
+    /// The publish tick, never a later one.
+    pub tick: Tick,
+}
+
+/// The publish-mark key of `partition`.
+pub(crate) fn publish_marks_key(partition: PartitionId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PUBLISH_MARKS_PREFIX.len() + 4);
+    out.extend_from_slice(PUBLISH_MARKS_PREFIX);
+    out.extend_from_slice(&partition.0.to_be_bytes());
+    out
+}
+
+/// The partition a publish-mark key names, or `None` when `raw` is not one.
+pub(crate) fn decode_publish_marks_key(raw: &[u8]) -> Option<PartitionId> {
+    let id = raw.strip_prefix(PUBLISH_MARKS_PREFIX)?;
+    Some(PartitionId(u32::from_be_bytes(id.try_into().ok()?)))
+}
+
+/// Encode a publish-mark list, in the order given.
+pub(crate) fn encode_publish_marks(marks: &[PublishMark]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(marks.len() * PUBLISH_MARK_LEN);
+    for mark in marks {
+        out.extend_from_slice(&mark.generation.0.to_be_bytes());
+        out.extend_from_slice(&mark.seq.0.to_be_bytes());
+        out.extend_from_slice(&mark.tick.0.to_be_bytes());
+    }
+    out
+}
+
+/// Decode a publish-mark list; `None` when its length is not a whole number of marks.
+pub(crate) fn decode_publish_marks(raw: &[u8]) -> Option<Vec<PublishMark>> {
+    if !raw.len().is_multiple_of(PUBLISH_MARK_LEN) {
+        return None;
+    }
+    raw.chunks_exact(PUBLISH_MARK_LEN)
+        .map(|mark| {
+            Some(PublishMark {
+                generation: Generation(decode_mark(&mark[0..8])?),
+                seq: Seq(decode_mark(&mark[8..16])?),
+                tick: Tick(decode_mark(&mark[16..24])?),
+            })
+        })
+        .collect()
+}
 /// The value frame's kind byte for a value.
 pub(crate) const FRAME_VALUE: u8 = 0;
 /// The value frame's kind byte for a tombstone (no bytes follow the version).
@@ -153,7 +220,7 @@ fn raw_key(partition: PartitionId, generation: Generation, ns: u8, key: &[u8]) -
 }
 
 /// Split a lineage key into `(partition, generation, ns byte, key)`; `None` when it is shorter
-/// than the prefix (the format marker is the only such key).
+/// than the prefix (only the engine-wide keys: format, instance and publish marks).
 pub(crate) fn decode_key(raw: &[u8]) -> Option<(PartitionId, Generation, u8, &[u8])> {
     if raw.len() < PREFIX_LEN {
         return None;

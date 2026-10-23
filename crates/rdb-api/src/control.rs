@@ -185,6 +185,50 @@ impl ControlAdapter {
         calls.push(task);
     }
 
+    /// Ruling A-R184: mark `generation` activated in `instance`'s open counter for `node`,
+    /// running at `boot`, before its first acquire under that generation. Answers
+    /// [`Msg::Activated`] once the mark is durable, or faults the node when it cannot be made.
+    /// Tracked with the node's calls, so a restart abandons it.
+    pub fn activate(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        instance: [u8; rdb_core::authority::partition::INSTANCE_LEN],
+        generation: rdb_core::contracts::ids::Generation,
+    ) {
+        let site = Site {
+            node,
+            boot,
+            partition,
+            correlation: CorrelationId::default(),
+        };
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                match crate::admin::activate(&*store, &instance, generation).await {
+                    Ok(_) => {
+                        let msg = Msg::Activated {
+                            boot,
+                            partition,
+                            generation,
+                        };
+                        if links.post(node, msg).is_err() {
+                            tracing::debug!(node = node.0, "control_completion_unclaimed");
+                        }
+                    }
+                    Err(error) => fault(&links, site, "activate", error.to_string()),
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
     /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
     /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
     /// puts its count back to 0 before it answers, and the only reloads ever stopped early are

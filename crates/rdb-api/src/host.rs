@@ -26,11 +26,12 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rdb_core::authority::partition::INSTANCE_LEN;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
     AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
@@ -71,7 +72,7 @@ use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-use rdb_storage::{Inherited, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
+use rdb_storage::{Inherited, PublishMark, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
@@ -105,6 +106,43 @@ pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
 /// period: a quarter of the retention, and never less often than once a minute.
 fn trim_delete_period(retention_millis: u64) -> u64 {
     (retention_millis / 4).min(60_000)
+}
+
+/// A-R183 C2 (critic-d6b): the most publish marks a partition keeps, besides the newest of each
+/// generation. 64 marks of 24 bytes span the whole retention in about 1.5 KB.
+const PUBLISH_MARKS: usize = 64;
+
+/// A publish mark as the host holds it: `(generation, seq, tick)`, a `published_at` entry.
+type Mark = (Generation, Seq, Tick);
+
+/// A-R183 C2: the publish marks of one partition's `published_at`, oldest first: every
+/// `step`-th entry, so at most [`PUBLISH_MARKS`] of them span the whole queue, and the newest
+/// entry of each generation, since a mark covers the seqs of one generation only.
+fn sample_marks(published: &VecDeque<Mark>) -> Vec<Mark> {
+    let step = published.len().div_ceil(PUBLISH_MARKS).max(1);
+    published
+        .iter()
+        .enumerate()
+        .filter(|&(at, &(generation, _, _))| {
+            (at + 1) % step == 0
+                || published
+                    .get(at + 1)
+                    .is_none_or(|&(next, _, _)| next != generation)
+        })
+        .map(|(_, entry)| *entry)
+        .collect()
+}
+
+/// The marks as storage keeps them.
+fn publish_marks(marks: &[Mark]) -> Vec<PublishMark> {
+    marks
+        .iter()
+        .map(|&(generation, seq, tick)| PublishMark {
+            generation,
+            seq,
+            tick,
+        })
+        .collect()
 }
 
 /// How long after a recovery the primary's A1 is first woken to acquire its grant, when the
@@ -231,6 +269,16 @@ pub enum Msg {
         kind: &'static str,
         /// Its detail.
         detail: String,
+    },
+    /// Ruling A-R184: the open counter marks `generation` activated, so this node may acquire
+    /// under it and admit writes. Dropped unless `boot` is the node's own, as [`Msg::Control`].
+    Activated {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// The generation now marked.
+        generation: Generation,
     },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
@@ -885,6 +933,60 @@ pub(crate) fn spawn_on(
     })
 }
 
+/// A partition's activation marks on one node (ruling A-R184).
+#[derive(Debug, Default, Clone, Copy)]
+struct Activation {
+    /// The newest generation this process asked the open counter to mark.
+    asked: Generation,
+    /// The newest generation the open counter is known to mark.
+    marked: Generation,
+    /// The first acquire, waiting on the mark of its generation: when it is due.
+    acquire: Option<(Generation, Site, Tick)>,
+}
+
+/// What a node does when F1 reports a commit, set by [`after_commit`] for its data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterCommit {
+    /// Abort the process: the commit is in the control store and nothing after it ran.
+    Abort,
+    /// Fault the node instead, so a crate row can go on in the same process.
+    #[cfg(test)]
+    Fault,
+}
+
+/// The data directories whose nodes act on a commit report, and how.
+static AFTER_COMMIT: Mutex<Vec<(PathBuf, AfterCommit)>> = Mutex::new(Vec::new());
+
+/// The `--abort-after-commit` hook (ruling A-R184): every node started afterwards on a copy
+/// under `dir`, spelled as the `DbConfig::dir` the open is given, aborts the whole process as
+/// soon as F1 reports a recovery committed, before the node links the new generation or marks
+/// it activated. So the reopen finds `partitions/1` at a generation no copy holds. A dev and
+/// test hook; never call it in an app.
+#[doc(hidden)]
+pub fn abort_after_commit(dir: &std::path::Path) {
+    set_after_commit(dir, Some(AfterCommit::Abort));
+}
+
+/// Set or clear what nodes under `dir` do on a commit report.
+pub(crate) fn set_after_commit(dir: &std::path::Path, what: Option<AfterCommit>) {
+    let mut hooks = AFTER_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hooks.retain(|(at, _)| at != dir);
+    if let Some(what) = what {
+        hooks.push((dir.to_path_buf(), what));
+    }
+}
+
+fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
+    AFTER_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(dir, _)| path.starts_with(dir))
+        .map(|(_, what)| *what)
+}
+
 /// The triple the next step for a partition carries.
 #[derive(Debug, Default, Clone, Copy)]
 struct Adopted {
@@ -1091,10 +1193,12 @@ struct Host {
     published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
     /// [`HOST_TRIM_EVERY_MILLIS`]; crate tests lower it.
     trim_every_millis: u64,
-    /// D6 (A-R170 D, A-R172): per partition, the newest trim floor `(generation, below)` not yet
-    /// deleted on disk, and when the last durable delete ran. One delete per
-    /// [`trim_delete_period`] at most, with the latest floor.
-    trim_floors: BTreeMap<PartitionId, (Generation, Seq)>,
+    /// D6 (A-R170 D, A-R172): per partition and generation, the newest trim floor `below` not yet
+    /// deleted on disk (critic-d6b C6: a restored older floor must not overwrite the newer
+    /// generation's), and per partition when the last durable delete ran. One delete per
+    /// [`trim_delete_period`] at most, with the latest floor. Each floor keeps the publish tick
+    /// of its last seq, so [`Host::mark_duty`] marks the rows it covers until they are deleted.
+    trim_floors: BTreeMap<(PartitionId, Generation), (Seq, Tick)>,
     trim_deleted_at: BTreeMap<PartitionId, Tick>,
     /// How many trims the duty sent and how many durable deletes ran, for the rows.
     trims_sent: u64,
@@ -1102,6 +1206,13 @@ struct Host {
     /// D6 (A-R170 A, critic-d6 C1): per committed generation this node landed, when the Dedup
     /// rows of every older generation it holds retire: one retention after the landing.
     retire_due: BTreeMap<(PartitionId, Generation), Tick>,
+    /// A-R183 (S1-6, critic-d6b): the partitions whose durable publish marks this process has
+    /// restored, at its first landing. Marks are written only for these, so a process never
+    /// overwrites the marks an earlier one left before it has read them.
+    marks_restored: BTreeSet<PartitionId>,
+    /// A-R183 C2: per partition, the publish marks last written (or read, at the restore) and
+    /// when.
+    marks_written: BTreeMap<PartitionId, (Tick, Vec<Mark>)>,
     flushed_once: bool,
     /// Per partition, the step view and the `(generation, applied)` it was built at. Per
     /// partition, because the flusher's completions arrive on partition 0 and would otherwise
@@ -1133,6 +1244,14 @@ struct Host {
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    /// The instance this node's engine is bound to when it started, whose open counter holds
+    /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
+    /// is marked, and nothing waits on a mark.
+    instance: Option<[u8; INSTANCE_LEN]>,
+    /// Per partition, the activation marks this node asked for and has (ruling A-R184).
+    activation: BTreeMap<PartitionId, Activation>,
+    /// Set by [`after_commit`] for this node's data directory: what to do on a commit report.
+    after_commit: Option<AfterCommit>,
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
     /// The stall line, per partition, once reported, up to its effect, with the mode it names;
     /// cleared when the partition activates. [`Self::status`] adds the effect as it reads the
@@ -1171,6 +1290,8 @@ impl Host {
         clock: HostClock,
     ) -> Self {
         let now = clock.now();
+        let engine_instance = engine.instance();
+        let after_commit = after_commit_for(engine.path());
         Self {
             node,
             boot: BOOT,
@@ -1202,6 +1323,8 @@ impl Host {
             trims_sent: 0,
             trim_deletes: 0,
             retire_due: BTreeMap::new(),
+            marks_restored: BTreeSet::new(),
+            marks_written: BTreeMap::new(),
             flushed_once: false,
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -1216,6 +1339,9 @@ impl Host {
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
+            instance: engine_instance,
+            activation: BTreeMap::new(),
+            after_commit,
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
             rebuild_pin_wait_millis: REBUILD_PIN_WAIT_MILLIS,
@@ -1293,6 +1419,7 @@ impl Host {
         let what = match msg {
             Msg::Control { event, .. } => format!("control/{}", head(&format!("{event:?}"))),
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
+            Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
             _ => "other".to_owned(),
         };
         tracing::info!(
@@ -1310,7 +1437,9 @@ impl Host {
             return;
         }
         let outcome = match msg {
-            Msg::Control { boot, .. } | Msg::Fault { boot, .. } if boot != self.boot => {
+            Msg::Control { boot, .. } | Msg::Fault { boot, .. } | Msg::Activated { boot, .. }
+                if boot != self.boot =>
+            {
                 self.drop_stale(&msg, boot);
                 Ok(())
             }
@@ -1329,6 +1458,14 @@ impl Host {
             }
             Msg::Fault { kind, detail, .. } => {
                 Err(format!("control adapter: {kind}: {detail}").into())
+            }
+            Msg::Activated {
+                partition,
+                generation,
+                ..
+            } => {
+                self.activated(partition, generation);
+                Ok(())
             }
             Msg::Inject {
                 partition,
@@ -1654,9 +1791,15 @@ impl Host {
     /// does not seed it again. The delete runs at most once per [`trim_delete_period`], with
     /// the latest floor; a reopen may seed what the trims since the last delete dropped.
     ///
-    /// Publish times live in this process only, so the rows a reopen seeds are aged from the
-    /// landing instead: [`Self::retire_duty`] retires every older generation one retention
-    /// after this node landed the new one (A-R170 A). A fault in either delete fails the node.
+    /// A-R183 (S1-6): a coarse copy of the publish times outlives the process as publish marks
+    /// ([`Self::mark_duty`]), and a reopen ages what they cover from its publish
+    /// ([`Self::restore_marks`]). The rest of what a reopen seeds is aged from the landing:
+    /// [`Self::retire_duty`] retires every older generation one retention after this node
+    /// landed the new one (A-R170 A). A fault in any delete or mark write fails the node.
+    ///
+    /// Ticks are the wall clock sampled once per process ([`HostClock`]). A forward step of the
+    /// wall clock between a quit and a reopen shortens a restored mark's window by the step,
+    /// less `clock_error_millis` (critic-d6b; the same assumption as the heal's guard 2).
     fn trim_duty(&mut self, now: Tick) -> Result<(), Fault> {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
@@ -1664,19 +1807,19 @@ impl Host {
             let Some(&(generation, _, _)) = published.front() else {
                 continue;
             };
-            let mut last = None;
+            let mut last: Option<(Seq, Tick)> = None;
             while let Some(&(g, seq, at)) = published.front() {
                 if g != generation || at.plus_millis(retention) > now {
                     break;
                 }
-                last = Some(seq);
+                last = Some((seq, at));
                 published.pop_front();
             }
-            if let Some(last) = last {
-                trims.push((*partition, generation, Seq(last.0 + 1)));
+            if let Some((last, at)) = last {
+                trims.push((*partition, generation, Seq(last.0 + 1), at));
             }
         }
-        for (partition, generation, below) in trims {
+        for (partition, generation, below, at) in trims {
             tracing::info!(
                 node = self.node.0,
                 kind = "trim",
@@ -1703,28 +1846,129 @@ impl Host {
                 None,
             );
             self.trims_sent += 1;
-            self.trim_floors.insert(partition, (generation, below));
+            self.trim_floors
+                .insert((partition, generation), (below, at));
         }
         self.trim_delete_duty(now)?;
+        self.mark_duty(now)?;
         self.retire_duty(now)
     }
 
-    /// D6 D: the latest trim floor of each partition, deleted on disk once per
+    /// A-R183 (S1-6, critic-d6b): durable publish marks. A mark `(generation, seq, tick)` is a
+    /// `published_at` entry copied verbatim, so every seq of `generation` up to `seq` was
+    /// published by `tick` (C1). At most [`PUBLISH_MARKS`] plus the newest of each generation
+    /// ([`sample_marks`]), plus one per floor trimmed but not yet deleted on disk, whose rows
+    /// would otherwise lose their mark until the delete. Checked at most once per
+    /// [`trim_delete_period`] and written, synced,
+    /// only when they changed (C2), and only for a partition whose marks this process has
+    /// restored. A lost or late write only frees less. Only the owner publishes, so the other
+    /// copies write none and keep the landing plus the retention (C7).
+    fn mark_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        let period = trim_delete_period(self.budgets.dedup_retention_millis);
+        let mut due = Vec::new();
+        for partition in &self.marks_restored {
+            let last = self.marks_written.get(partition);
+            if last.is_some_and(|(at, _)| at.plus_millis(period) > now) {
+                continue;
+            }
+            // Trimmed but not yet deleted rows are still on disk, so they keep a mark: their
+            // floor's last seq, at its publish tick (lead k205).
+            let mut marks: Vec<Mark> = self
+                .trim_floors
+                .range((*partition, Generation(0))..=(*partition, Generation(u64::MAX)))
+                .map(|(&(_, generation), &(below, at))| (generation, Seq(below.0 - 1), at))
+                .collect();
+            marks.extend(
+                self.published_at
+                    .get(partition)
+                    .map(sample_marks)
+                    .unwrap_or_default(),
+            );
+            let changed = last.is_none_or(|(_, written)| *written != marks);
+            due.push((*partition, marks, changed));
+        }
+        for (partition, marks, changed) in due {
+            if changed {
+                self.engine
+                    .put_publish_marks(partition, &publish_marks(&marks))
+                    .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
+                tracing::info!(
+                    node = self.node.0,
+                    kind = "marks",
+                    partition = partition.0,
+                    marks = marks.len(),
+                    newest = ?marks.last().map(|(g, seq, at)| (g.0, seq.0, at.0)),
+                    period_ms = period,
+                    "host_duty"
+                );
+            }
+            self.marks_written.insert(partition, (now, marks));
+        }
+        Ok(())
+    }
+
+    /// A-R183 (S1-6, critic-d6b): at this process's first landing on `partition`, the publish
+    /// marks an earlier process left go back to the front of `published_at`, oldest first, so
+    /// the trim duty ages what they cover from its publish. Only generations below `serving`,
+    /// and only lineages the engine holds, or the durable delete would fault the node (C3).
+    /// Each tick gains `clock_error_millis`: it was read on another process's clock (C5). Rows
+    /// above the newest mark keep the landing plus the retention ([`Self::retire_duty`]).
+    fn restore_marks(&mut self, partition: PartitionId, serving: Generation) -> Result<(), Fault> {
+        if !self.marks_restored.insert(partition) {
+            return Ok(());
+        }
+        let read = self
+            .engine
+            .publish_marks(partition)
+            .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
+        let read: Vec<Mark> = read
+            .into_iter()
+            .map(|mark| (mark.generation, mark.seq, mark.tick))
+            .collect();
+        let held = self.engine.lineages();
+        let epsilon = self.budgets.clock_error_millis;
+        let mut restored: Vec<Mark> = read
+            .iter()
+            .filter(|(generation, _, _)| {
+                *generation < serving && held.contains(&(partition, *generation))
+            })
+            .map(|&(generation, seq, at)| (generation, seq, at.plus_millis(epsilon)))
+            .collect();
+        restored.sort_unstable_by_key(|&(generation, seq, _)| (generation, seq));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            serving = serving.0,
+            read = read.len(),
+            restored = restored.len(),
+            newest = ?restored.last().map(|(g, seq, at)| (g.0, seq.0, at.0)),
+            "publish_marks_restored"
+        );
+        let published = self.published_at.entry(partition).or_default();
+        for entry in restored.into_iter().rev() {
+            published.push_front(entry);
+        }
+        self.marks_written
+            .insert(partition, (self.clock.now(), read));
+        Ok(())
+    }
+
+    /// D6 D: the latest trim floor of each partition and generation, deleted on disk once per
     /// [`trim_delete_period`] at most (A-R172). Local and unreplicated; synced by storage.
     fn trim_delete_duty(&mut self, now: Tick) -> Result<(), Fault> {
         let period = trim_delete_period(self.budgets.dedup_retention_millis);
-        let due: Vec<(PartitionId, (Generation, Seq))> = self
+        let due: Vec<((PartitionId, Generation), Seq)> = self
             .trim_floors
             .iter()
-            .filter(|(partition, _)| {
+            .filter(|((partition, _), _)| {
                 self.trim_deleted_at
                     .get(partition)
                     .is_none_or(|last| last.plus_millis(period) <= now)
             })
-            .map(|(partition, floor)| (*partition, *floor))
+            .map(|(key, &(below, _))| (*key, below))
             .collect();
-        for (partition, (generation, below)) in due {
-            self.trim_floors.remove(&partition);
+        for ((partition, generation), below) in due {
+            self.trim_floors.remove(&(partition, generation));
             self.trim_deleted_at.insert(partition, now);
             let deleted = self
                 .engine
@@ -1850,6 +2094,51 @@ impl Host {
         }
         view_whole(&view, "retire scan")?;
         Ok(found)
+    }
+
+    /// A kernel refusal for its caller. An `OVERLOADED` from a full dedup index (admission check
+    /// 9) also says when the trim duty can first free room, as a "not before" hint
+    /// ([`ApiError::with_retry_after`]; A-R183). Its kind and retry rule stay the kernel's:
+    /// `BoundedJitter` promises safety, not timing.
+    fn refusal(&self, partition: PartitionId, error: &RdbError) -> ApiError {
+        let refused = ApiError::from_kernel(error);
+        if !matches!(error, RdbError::Overloaded { .. }) {
+            return refused;
+        }
+        let full = self
+            .transaction
+            .kernel(self.node, partition)
+            .is_some_and(|kernel| {
+                let unanswered = kernel.queue_len() + usize::from(kernel.inflight().is_some());
+                kernel.dedup().len() + unanswered >= kernel.limits().dedup_cap
+            });
+        match full.then(|| self.cap_frees_in(partition, self.clock.now())) {
+            Some(Some(after)) => refused.with_retry_after(after),
+            _ => refused,
+        }
+    }
+
+    /// A-R183 (critic-d6b candidate 3): how long until the trim duty can first free a dedup
+    /// entry of `partition`: the earliest scheduled free (the first retire due, or the oldest
+    /// publish one retention on), at the trim tick that runs it. A lower bound, "not before":
+    /// an admitted write may take the room first. `None` when nothing is scheduled to free.
+    fn cap_frees_in(&self, partition: PartitionId, now: Tick) -> Option<Duration> {
+        let retention = self.budgets.dedup_retention_millis;
+        let retire = self
+            .retire_due
+            .iter()
+            .filter(|((p, _), _)| *p == partition)
+            .map(|(_, at)| *at);
+        let aged = self
+            .published_at
+            .get(&partition)
+            .and_then(VecDeque::front)
+            .map(|&(_, _, at)| at.plus_millis(retention));
+        let due = retire.chain(aged).min()?;
+        let every = self.trim_every_millis.max(1);
+        let ticks = due.0.saturating_sub(self.next_trim.0).div_ceil(every);
+        let runs = self.next_trim.plus_millis(ticks.saturating_mul(every));
+        Some(Duration::from_millis(runs.0.saturating_sub(now.0)))
     }
 
     /// D6 A: this node landed committed generation `generation` for the first time, so the
@@ -2557,6 +2846,27 @@ impl Host {
     /// F1 committed a recovery here: inherit, tell the other members, wake A1 if primary.
     fn recovered(&mut self, result: &RecoveryResult, site: Site) -> Result<(), Fault> {
         let partition = site.partition;
+        if let Some(what) = self.after_commit {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = result.new_generation.0,
+                what = ?what,
+                "after_commit_hook"
+            );
+            match what {
+                AfterCommit::Abort => {
+                    std::process::abort();
+                }
+                #[cfg(test)]
+                AfterCommit::Fault => {
+                    return Err(Fault::from(format!(
+                        "after-commit hook: generation {} committed and not linked",
+                        result.new_generation.0
+                    )))
+                }
+            }
+        }
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -2570,6 +2880,7 @@ impl Host {
         if self.landed.insert((partition, result.new_generation)) {
             self.stamp_retirement(partition, result.new_generation);
         }
+        self.restore_marks(partition, result.new_generation)?;
         // In-process fan-out (lead ruling, 2026-10-07, under Decision 1): the result reaches the
         // other members as the control plane's watch of `partitions/{id}` would. M10 replaces it
         // with that watch.
@@ -2825,6 +3136,7 @@ impl Host {
         if first {
             self.stamp_retirement(partition, result.new_generation);
         }
+        self.restore_marks(partition, result.new_generation)?;
         self.answer_deferred_syncs(partition, result.new_generation);
         self.schedule_acquire(&result, site);
         self.committed.insert(partition, result.clone());
@@ -2895,6 +3207,11 @@ impl Host {
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
     /// prior owner acquiring would put its fenced identity back). Sooner after an `Active`
     /// commit: [`ACQUIRE_AFTER_ACTIVE_MILLIS`], else [`ACQUIRE_AFTER_RECOVERED_MILLIS`].
+    ///
+    /// Ruling A-R184: first the primary marks each newly committed generation activated in the
+    /// open counter, every one this process hears, not only the first; the first acquire waits
+    /// for its mark ([`Msg::Activated`]), and [`Self::unactivated`] refuses writes under a
+    /// generation not yet marked, so a second recovery in one open is gated too.
     fn schedule_acquire(&mut self, result: &RecoveryResult, site: Site) {
         let primary = result
             .committed
@@ -2902,7 +3219,27 @@ impl Host {
             .members
             .iter()
             .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
-        if !primary || !self.acquire_scheduled.insert(site.partition) {
+        if !primary {
+            return;
+        }
+        let generation = result.new_generation;
+        if let Some(instance) = self.instance {
+            let activation = self.activation.entry(site.partition).or_default();
+            if activation.asked < generation {
+                activation.asked = generation;
+                tracing::info!(
+                    node = self.node.0,
+                    partition = site.partition.0,
+                    kind = "activate",
+                    generation = generation.0,
+                    marked = activation.marked.0,
+                    "host_duty"
+                );
+                self.control
+                    .activate(self.node, self.boot, site.partition, instance, generation);
+            }
+        }
+        if !self.acquire_scheduled.insert(site.partition) {
             return;
         }
         let wait = if result.mode == PartitionMode::Active {
@@ -2911,6 +3248,71 @@ impl Host {
             ACQUIRE_AFTER_RECOVERED_MILLIS
         };
         let at = self.clock.now().plus_millis(wait);
+        if self.instance.is_some() {
+            let activation = self.activation.entry(site.partition).or_default();
+            if activation.marked < generation {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = site.partition.0,
+                    generation = generation.0,
+                    "acquire_waits_on_activation"
+                );
+                activation.acquire = Some((generation, site, at));
+                return;
+            }
+        }
+        self.acquire_at(site, at, wait);
+    }
+
+    /// Ruling A-R184: the open counter marks `generation` activated for `partition`. Starts the
+    /// acquire that waited on it.
+    fn activated(&mut self, partition: PartitionId, generation: Generation) {
+        let activation = self.activation.entry(partition).or_default();
+        activation.marked = activation.marked.max(generation);
+        let marked = activation.marked;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            marked = marked.0,
+            "host_activated"
+        );
+        let due = match activation.acquire {
+            Some((waits_for, _, _)) if waits_for <= marked => activation.acquire.take(),
+            _ => None,
+        };
+        if let Some((_, site, at)) = due {
+            let now = self.clock.now();
+            self.acquire_at(site, at.max(now), HostClock::millis_until(now, at));
+        }
+    }
+
+    /// Ruling A-R184: why a write to `partition` is refused here, when this primary has not yet
+    /// heard that the open counter marks its adopted generation activated. `None` on an
+    /// unbound engine, and on a node that is not the partition's primary, whose writes the
+    /// kernel refuses on its own.
+    fn unactivated(&self, partition: PartitionId) -> Option<ApiError> {
+        self.instance?;
+        self.replication.primary(self.node, partition)?;
+        let generation = self.adopted(partition).generation;
+        let marked = self
+            .activation
+            .get(&partition)
+            .map_or(Generation(0), |activation| activation.marked);
+        (generation.0 != 0 && marked < generation).then(|| ApiError {
+            kind: ErrorKind::Unavailable,
+            retry: rdb_core::RetryRule::BoundedJitter,
+            no_mutation: true,
+            detail: format!(
+                "generation {} of partition {} on node {} is not yet marked activated in the                  open counter; nothing was sent",
+                generation.0, partition.0, self.node.0
+            ),
+            retry_after: None,
+        })
+    }
+
+    /// A1's first `AcquireDue` at `at`, `wait` from when it was asked for.
+    fn acquire_at(&mut self, site: Site, at: Tick, wait: u64) {
         tracing::info!(
             node = self.node.0,
             partition = site.partition.0,
@@ -4052,6 +4454,7 @@ impl Host {
             call,
             reply,
         } = client;
+        let was_resend = matches!(call, ClientCall::Resend { .. });
         let (identity, kind, pending) = match call {
             ClientCall::Put {
                 identity,
@@ -4167,6 +4570,22 @@ impl Host {
                 None,
             ),
         };
+        // Ruling A-R184: no write goes out under a generation not yet marked activated.
+        if let EventKind::Client(ClientEvent::Submit(request)) = &kind {
+            if let Some(error) = self.unactivated(partition) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    request = identity.request.0,
+                    "client_call_refused_unactivated"
+                );
+                let _ = reply.send(Answer::Error {
+                    error,
+                    request: was_resend.then(|| request.clone()),
+                });
+                return Ok(());
+            }
+        }
         // The fence every sent put carries, so a log can show none goes out unfenced.
         let expected_generation = match &kind {
             EventKind::Client(ClientEvent::Submit(request)) => {
@@ -4521,7 +4940,7 @@ impl Host {
             // No request on a refusal: the only product client, the `Db`, sends a put as a
             // `Resend` and already holds what it sent (mutant W3 guards that side).
             (ReplyEffect::Failed { error, .. }, _) => Answer::Error {
-                error: ApiError::from_kernel(error),
+                error: self.refusal(partition, error),
                 request: None,
             },
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
@@ -4757,9 +5176,12 @@ impl Host {
                 .and_then(Protection::mode)
                 .map(|mode| mode_name(mode).to_owned()),
             // A faulted node answers every call with its fault, so it admits nothing (S1-8).
-            admits: l1
-                .and_then(|l1| l1.admission_state(now))
-                .map(|state| state.allow && granted && self.fault.is_none()),
+            admits: l1.and_then(|l1| l1.admission_state(now)).map(|state| {
+                state.allow
+                    && granted
+                    && self.fault.is_none()
+                    && self.unactivated(partition).is_none()
+            }),
             published: self
                 .publication
                 .kernel(self.node, partition)
@@ -8568,6 +8990,353 @@ mod tests {
         );
     }
 
+    /// A-R183 rows: the `(generation, below)` of every `DedupTrim` the host queued.
+    fn dedup_trims_queued(host: &Host) -> Vec<(u64, u64)> {
+        host.queue
+            .iter()
+            .filter_map(|queued| match queued.event.kind {
+                EventKind::Kernel(KernelEvent::DedupTrim { generation, below }) => {
+                    Some((generation.0, below.0))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A-R183 rows: a reopened copy of partition 1 that served generation 1 through seq 7 and
+    /// now serves generation `serving`, linked onto it, with `marks` left by an earlier process.
+    fn reopened_with_marks(path: &std::path::Path, serving: u64, marks: &[Mark]) {
+        let mut engine = RocksEngine::open(path).expect("open engine");
+        if engine.lineages().is_empty() {
+            write_chain(&mut engine, Generation(1), 7);
+        }
+        for to in 2..=serving {
+            if !engine
+                .lineages()
+                .contains(&(PartitionId(1), Generation(to)))
+            {
+                engine
+                    .inherit(PartitionId(1), Generation(to - 1), Generation(to), Seq(7))
+                    .expect("inherit");
+            }
+        }
+        engine
+            .put_publish_marks(PartitionId(1), &publish_marks(marks))
+            .expect("put marks");
+    }
+
+    /// A-R183 row 1, the tail (critic-d6b F1/F3): marks left by an earlier process reach seq 5
+    /// of generation 1, published two retentions ago. The reopen's first trim takes seqs 1-5
+    /// and nothing above: rows 6 and 7 were never marked, so they wait for the landing plus
+    /// the retention, as before.
+    #[test]
+    fn a_reopen_trims_what_the_marks_cover_on_its_first_tick_and_spares_the_tail() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let old = Tick(now.0 - 2 * retention);
+        reopened_with_marks(
+            &path,
+            2,
+            &[
+                (Generation(1), Seq(3), old),
+                (Generation(1), Seq(5), old.plus_millis(10)),
+            ],
+        );
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(2))
+            .expect("restore");
+        let epsilon = Budgets::SPEC_DEFAULTS.clock_error_millis;
+        assert_eq!(
+            host.published_at[&PartitionId(1)],
+            [
+                (Generation(1), Seq(3), old.plus_millis(epsilon)),
+                (Generation(1), Seq(5), old.plus_millis(10 + epsilon)),
+            ],
+            "restored oldest first, each tick read as later by the clock error (C5)"
+        );
+        host.trim_duty(host.clock.now()).expect("trim");
+        assert_eq!(dedup_trims_queued(&host), [(1, 6)], "one trim, below seq 6");
+        assert_eq!(host.trim_deletes, 1, "the floor is deleted on disk too");
+    }
+
+    /// A-R183 row 2: a store with no marks (a crash before the first write of marks, or data
+    /// from an older build) restores nothing, and the first trim takes nothing.
+    #[test]
+    fn a_reopen_with_no_marks_trims_nothing_on_its_first_tick() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(2))
+            .expect("restore");
+        host.trim_duty(host.clock.now()).expect("trim");
+        assert_eq!(dedup_trims_queued(&host), [], "nothing trimmed");
+    }
+
+    /// A-R183 row 3, the daily restart (critic-d6b F2): a middle process restores generation
+    /// 1's marks, publishes nothing, writes its marks and quits before they age. The next
+    /// reopen still holds them and, once they age, trims generation 1 at once. A process that
+    /// wrote only what it published itself would erase them, and generation 1 would wait for
+    /// a landing plus the retention after every restart.
+    #[test]
+    fn publish_marks_outlive_a_process_that_published_nothing() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let period = trim_delete_period(retention);
+        let young = Tick(now.0 - retention / 2);
+        reopened_with_marks(&path, 2, &[(Generation(1), Seq(5), young)]);
+        {
+            let mut middle = host_over(&path, &rt);
+            // A trim tick before the landing writes nothing: no marks were read yet.
+            middle.trim_duty(now).expect("a tick before the landing");
+            middle
+                .restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            middle.trim_duty(now).expect("trim");
+            middle
+                .trim_duty(now.plus_millis(period + 1_000))
+                .expect("a mark write");
+            assert_eq!(
+                dedup_trims_queued(&middle),
+                [],
+                "not aged in the middle process"
+            );
+        }
+        RocksEngine::open(&path)
+            .expect("open engine")
+            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(7))
+            .expect("inherit");
+        let mut next = host_over(&path, &rt);
+        next.restore_marks(PartitionId(1), Generation(3))
+            .expect("restore");
+        next.trim_duty(young.plus_millis(retention + 1_000))
+            .expect("trim");
+        assert_eq!(
+            dedup_trims_queued(&next),
+            [(1, 6)],
+            "generation 1 trimmed at once"
+        );
+    }
+
+    /// A-R183, lead k205: rows trimmed in memory but not yet deleted on disk keep their mark. A
+    /// process trims generation 1 below 6 and quits inside the delete period, so seqs 1-5 are
+    /// still on disk. The next reopen trims them on its first tick, from their publish, not a
+    /// retention after its landing. Marks taken from the in-memory queue alone dropped them.
+    #[test]
+    fn rows_trimmed_but_not_yet_deleted_keep_their_mark_across_a_reopen() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let period = trim_delete_period(retention);
+        let old = Tick(now.0 - 2 * retention);
+        reopened_with_marks(&path, 2, &[(Generation(1), Seq(5), old)]);
+        {
+            let mut first = host_over(&path, &rt);
+            first
+                .restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            // The last delete ran just now, so this process quits before the next one.
+            first
+                .trim_deleted_at
+                .insert(PartitionId(1), now.plus_millis(1_000));
+            first.trim_duty(now).expect("trim");
+            first
+                .trim_duty(now.plus_millis(period + 500))
+                .expect("a mark write");
+            assert_eq!(dedup_trims_queued(&first), [(1, 6)], "trimmed in memory");
+            assert_eq!(first.trim_deletes, 0, "seqs 1-5 are still on disk");
+        }
+        RocksEngine::open(&path)
+            .expect("open engine")
+            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(7))
+            .expect("inherit");
+        let mut next = host_over(&path, &rt);
+        next.restore_marks(PartitionId(1), Generation(3))
+            .expect("restore");
+        next.trim_duty(next.clock.now()).expect("trim");
+        assert_eq!(
+            dedup_trims_queued(&next),
+            [(1, 6)],
+            "generation 1 trimmed on the first tick"
+        );
+    }
+
+    /// A-R183 row 4 (critic-d6b C3): a mark of a lineage the engine does not hold, or of a
+    /// generation not below the one served, is not restored, and the node does not fault. A
+    /// restored mark of generation 1 here would send a durable delete for a lineage the engine
+    /// does not hold, which faults the node.
+    #[test]
+    fn publish_marks_of_a_lineage_not_held_or_not_older_are_not_restored() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let old = Tick(now.0 - 2 * Budgets::SPEC_DEFAULTS.dedup_retention_millis);
+        {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            write_chain(&mut engine, Generation(2), 2);
+            engine
+                .put_publish_marks(
+                    PartitionId(1),
+                    &publish_marks(&[
+                        (Generation(1), Seq(5), old),
+                        (Generation(2), Seq(1), old),
+                        (Generation(3), Seq(1), old),
+                    ]),
+                )
+                .expect("put marks");
+        }
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(2))
+            .expect("restore");
+        host.trim_duty(host.clock.now())
+            .expect("no mark restored, so no delete to fault on");
+        assert_eq!(dedup_trims_queued(&host), [], "nothing trimmed");
+    }
+
+    /// critic-d6b C6: floors of two generations of one partition trimmed inside one delete
+    /// period are both deleted on disk when the period ends. Keyed by partition alone, the
+    /// newer floor overwrote the older, and the older generation's rows stayed on disk.
+    #[test]
+    fn two_generations_trimmed_in_one_delete_period_are_both_deleted() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let mut host = host_over(&path, &rt);
+        let now = host.clock.now();
+        let retention = host.budgets.dedup_retention_millis;
+        let old = Tick(now.0 - 2 * retention);
+        host.published_at.insert(
+            PartitionId(1),
+            VecDeque::from([(Generation(1), Seq(3), old), (Generation(2), Seq(9), old)]),
+        );
+        host.trim_deleted_at.insert(PartitionId(1), now);
+        host.trim_duty(now).expect("trim generation 1");
+        host.trim_duty(now).expect("trim generation 2");
+        assert_eq!(dedup_trims_queued(&host), [(1, 4), (2, 10)]);
+        assert_eq!(host.trim_deletes, 0, "inside the period");
+        host.trim_duty(now.plus_millis(trim_delete_period(retention)))
+            .expect("the period ends");
+        assert_eq!(host.trim_deletes, 2, "both floors deleted");
+    }
+
+    /// A-R183 row 5 (critic-d6b candidate 3): an `OVERLOADED` from a full dedup index says when
+    /// the trim duty can first free room: not before the first retire due or the oldest publish
+    /// one retention on, at the trim tick that runs it. Kind and retry rule stay the kernel's.
+    /// Trio (~2 s): a cap of 2 and a 5-minute retention, so nothing frees while it runs.
+    #[config_log::retcd_test]
+    fn a_dedup_cap_overload_says_when_the_cap_can_first_free() {
+        const RETENTION: u64 = 300_000;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = RETENTION;
+            host.transaction = Transaction::with_limits(Limits {
+                dedup_cap: 2,
+                ..Limits::default()
+            });
+        });
+        trio.bootstrap();
+        trio.ready();
+        for (request, key) in [(1, b"a"), (2, b"b")] {
+            match trio.ask(put(request, key, b"1", None)) {
+                Answer::Txn { .. } => {}
+                other => panic!("put {request}: {other:?}"),
+            }
+        }
+        let error = match trio.ask(put(3, b"c", b"1", None)) {
+            Answer::Error { error, .. } => error,
+            other => panic!("put 3 on a full cap: {other:?}"),
+        };
+        let answered = trio.clock.now();
+        assert_eq!(
+            (error.kind, error.retry),
+            (ErrorKind::Overloaded, RetryRule::BoundedJitter),
+            "{error:?}"
+        );
+        let owner = &trio.nodes[0].0;
+        let due = owner
+            .retire_due
+            .values()
+            .copied()
+            .chain(
+                owner
+                    .published_at
+                    .get(&PartitionId(1))
+                    .and_then(VecDeque::front)
+                    .map(|&(_, _, at)| at.plus_millis(RETENTION)),
+            )
+            .min()
+            .expect("a free is scheduled");
+        let after = error.retry_after().expect("a not-before hint");
+        assert!(
+            answered.plus_millis(u64::try_from(after.as_millis()).expect("millis")) >= due,
+            "the hint {after:?} names a time before the earliest free {due:?}"
+        );
+        assert!(
+            after <= Duration::from_millis(RETENTION + owner.trim_every_millis),
+            "the hint {after:?} is past one retention and a trim tick"
+        );
+        assert!(error.detail.contains("not before ~"), "{error:?}");
+    }
+
+    /// A-R183 with A-R164: publish marks that do not decode fault the restore, so the landing
+    /// faults the node. They are never read as "no marks", which would hide the damage.
+    #[test]
+    fn undecodable_publish_marks_fault_the_restore() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        {
+            let raw = rocksdb::DB::open_cf(
+                &rocksdb::Options::default(),
+                &path,
+                rdb_storage::keys::COLUMN_FAMILIES,
+            )
+            .expect("raw open");
+            let cf = raw.cf_handle(rdb_storage::keys::CF_METADATA).expect("cf");
+            let mut key = b"publish".to_vec();
+            key.extend_from_slice(&1_u32.to_be_bytes());
+            raw.put_cf(cf, &key, [1, 2, 3]).expect("raw put");
+        }
+        let mut host = host_over(&path, &rt);
+        let fault = host
+            .restore_marks(PartitionId(1), Generation(2))
+            .expect_err("a fault, not an empty list");
+        assert_eq!(fault.detail, "publish marks of p1: Corrupt", "{fault:?}");
+    }
+
+    /// A-R183 C2: the marks of a long queue are at most [`PUBLISH_MARKS`] spread along it, plus
+    /// the newest entry of each generation, in order.
+    #[test]
+    fn publish_marks_sample_the_queue_and_keep_each_generations_newest() {
+        let mut published: VecDeque<(Generation, Seq, Tick)> = (1..=1_000)
+            .map(|seq| (Generation(1), Seq(seq), Tick(seq)))
+            .collect();
+        published.extend((1_001..=1_003).map(|seq| (Generation(2), Seq(seq), Tick(seq))));
+        let marks = sample_marks(&published);
+        assert!(marks.len() <= PUBLISH_MARKS + 2, "{} marks", marks.len());
+        assert!(marks.len() >= PUBLISH_MARKS / 2, "{} marks", marks.len());
+        assert!(marks.contains(&(Generation(1), Seq(1_000), Tick(1_000))));
+        assert_eq!(
+            marks.last(),
+            Some(&(Generation(2), Seq(1_003), Tick(1_003)))
+        );
+        assert!(marks.windows(2).all(|pair| pair[0] < pair[1]), "in order");
+        assert_eq!(sample_marks(&VecDeque::new()), []);
+    }
+
     /// M9 S3-5c, guard 1: a write ages from its publication, never from its commit. Node 1
     /// applies request 3 with both links held, so it is committed and unpublished. Past the
     /// retention it is still held, and the trim spares it. Once healed it publishes, and a
@@ -10411,5 +11180,56 @@ mod tests {
             ),
             "once the repair is published the map is not damaged"
         );
+    }
+    /// Ruling A-R184, the write gate: the lead asked that a second recovery in one open go
+    /// through the gate too, so a write is refused, and nothing is sent, while the primary has
+    /// not heard that the open counter marks its adopted generation activated, even with a grant
+    /// held. `admits` says false meanwhile, so `wait_ready` waits for the mark. Here the mark
+    /// is taken back by hand, which is what a second recovery's commit leaves until its own mark
+    /// lands. Cut: `unactivated` answers `None`, and the put publishes. Trio, about 1 s.
+    #[test]
+    fn a_write_under_a_generation_not_marked_activated_is_refused_and_sends_nothing() {
+        let dir = config_testkit::fs::temp_dir();
+        let instance = [7_u8; INSTANCE_LEN];
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.instance = Some(instance);
+        });
+        trio.rt
+            .block_on(crate::admin::count_open(
+                &*trio.store,
+                &instance,
+                true,
+                crate::admin::COUNT_WITHIN,
+            ))
+            .expect("the open counter");
+        trio.bootstrap();
+        trio.ready();
+        let add = |n| Change::Set(vec![ElemOp::Add(int(n))]);
+        assert_eq!(
+            trio.write(compile_change(1, b"s", add(1), Some(Expected::Absent))),
+            Ok(2),
+            "a write once the mark is heard"
+        );
+        let marked = trio.nodes[0]
+            .0
+            .activation
+            .get_mut(&PartitionId(1))
+            .expect("node 1 asked for a mark");
+        assert_eq!(marked.marked, Generation(1), "{marked:?}");
+        marked.marked = Generation(0);
+        assert!(
+            trio.status(0).authority.starts_with("held"),
+            "{:?}",
+            trio.status(0)
+        );
+        assert_eq!(trio.status(0).admits, Some(false), "{:?}", trio.status(0));
+        let head = trio.head();
+        assert_eq!(
+            trio.write(compile_change(2, b"s", add(2), None)),
+            Err(Refused::ByKernel(ErrorKind::Unavailable)),
+            "refused before it is sent"
+        );
+        assert_eq!(trio.head(), head, "nothing was sent");
     }
 }
