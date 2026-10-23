@@ -1230,7 +1230,13 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
 
     match &healed {
         Err(crate::admin::HealError::NotCleared { node: 1, last, .. }) => {
-            assert_eq!(last, "Current", "{healed:?}");
+            assert_eq!(
+                last,
+                "it names the boot this open runs node 1 at, so another open of this folder's \
+                 data may be running now, for example a live copy of this folder: shut it down, \
+                 then open again",
+                "{healed:?}"
+            );
         }
         other => panic!("expected NotCleared for node 1: {other:?}"),
     }
@@ -1241,6 +1247,125 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         .record
         .expect("the live grant is still there");
     assert_eq!(kept.mod_revision, granted, "the live grant was not touched");
+}
+
+/// A-R191b (tester w3a03 `heal/walk.out` c1): a reopen whose heal meets the last run's grant
+/// still in force, because a live copy of the folder renews it, fails in plain words. The text
+/// gives the wait in seconds, the time of day the grant may stay in use until and how far off
+/// that is, and the next step: shut the other open down, then open again. Before, it was Rust
+/// Debug: `Refused { refusal: NotProvenExpired, until_utc_ms: .. }`. Cut: `clear_until` keeps
+/// `format!("{clearance:?}")`. Unit (~300 ms): `MemStore`, the heal's own bound.
+#[test]
+fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words() {
+    use config_core::PutRequest;
+    use rdb_core::authority::grant::GrantRecord;
+    use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+    use rdb_core::contracts::control::ControlKey;
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::ids::{
+        AuthorityGeneration, BootId, Generation, GrantId, OwnerEpoch, Revision, Seq,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let record = PartitionRecord {
+        partition: crate::admin::PARTITION,
+        owner: crate::admin::OWNER,
+        generation: Generation(3),
+        owner_epoch: OwnerEpoch(3),
+        config_version: crate::admin::CONFIG_VERSION,
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    let root = PartitionRoot {
+        mode: rdb_core::authority::partition::RecordMode::Active,
+        owner_boot: BootId(1),
+        base_seq: Seq(7),
+        base_digest: Digest::ROOT,
+        predecessor_generation: Generation(2),
+        predecessor_cutoff: Seq(7),
+        instance: [7; INSTANCE_LEN],
+        run: Revision(1),
+    };
+    rt.block_on(store.put(PutRequest {
+        key: Bytes::from(ControlKey::Partition(crate::admin::PARTITION).encode()),
+        value: record.encode_with(&root),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("put partitions/1");
+    // The last run's grant, renewed a moment ago by the live copy: in force for 90 s more.
+    let clock = crate::clock::HostClock::start();
+    let expiry_utc_ms = i64::try_from(clock.now().0).expect("a UTC time") + 90_000;
+    let held = GrantRecord {
+        grant: GrantId(4),
+        node: crate::admin::OWNER,
+        boot: BootId(1),
+        authority_generation: AuthorityGeneration(0),
+        expiry_utc_ms,
+        frozen: false,
+    };
+    rt.block_on(store.put(PutRequest {
+        key: Bytes::from(ControlKey::Grant(crate::admin::OWNER).encode()),
+        value: held.encode(),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("put grants/1");
+
+    let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
+    let (owner, _mailbox) = std::sync::mpsc::channel();
+    let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        store: Arc::clone(&store),
+        boot: BootId((1 << 16) + 1),
+        budgets,
+        clock,
+        owner,
+        within: Duration::from_millis(300),
+    }));
+    let error = healed.expect_err("a grant still in use is not cleared");
+    assert!(
+        matches!(error, crate::admin::HealError::NotCleared { node: 1, .. }),
+        "{error:?}"
+    );
+
+    // The guard's until-time: the expiry plus clock error and dispatch margin, as a time of day.
+    let until = expiry_utc_ms
+        + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("a margin");
+    let of_day = until.div_euclid(1000).rem_euclid(86_400);
+    let at = format!(
+        "{:02}:{:02}:{:02}",
+        of_day / 3600,
+        of_day / 60 % 60,
+        of_day % 60
+    );
+    let text = error.to_string();
+    let head = format!(
+        "the last run's grant for node 1 (grants/1) was still held after 0.3 seconds of trying: \
+         it may still be in use until {at} UTC (about "
+    );
+    let tail = " seconds from now), and later if its holder keeps renewing it; another open may \
+                hold this folder's data, for example a live copy of this folder: shut it down, \
+                then open again";
+    let seconds = text
+        .strip_prefix(&head)
+        .and_then(|rest| rest.strip_suffix(tail))
+        .unwrap_or_else(|| panic!("the text differs:\n{text}\nexpected:\n{head}<seconds>{tail}"));
+    let seconds: f64 = seconds
+        .parse()
+        .unwrap_or_else(|_| panic!("{seconds:?} is not a number of seconds: {text}"));
+    let margin_s = f64::from(
+        u32::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("a margin"),
+    ) / 1000.0;
+    assert!(
+        (85.0 + margin_s..=90.0 + margin_s).contains(&seconds),
+        "about {seconds} s from now, not about {} s: {text}",
+        90.0 + margin_s
+    );
 }
 
 /// A-R188 (tester r8 `nr`): once node 1 has restarted, it does not rejoin in this open (#42).
