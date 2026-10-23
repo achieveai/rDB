@@ -5072,6 +5072,104 @@ mod tests {
         db.shutdown();
     }
 
+    /// A-R173 F5 (critic-d7): a copy that missed a commit. The first reopen holds node 2's links,
+    /// so its commit pins generation 2 on nodes 1 and 3 alone, and node 2 keeps generation 1.
+    /// Neither reopen writes. The second reopen finds node 2 a generation behind the record: it
+    /// must end with node 1 admitting writes and reading the write back, or in a named
+    /// `Blocked`. Never a host fault, and never a failed heal.
+    /// Integration (~10 s): three opens, two discovery windows.
+    #[config_log::retcd_test]
+    #[ignore = "owed: A-R177 option (1), a missed writeless link inherited at inventory"]
+    fn m10_d7_a_copy_that_missed_a_commit_ends_caught_up_or_named_blocked() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = |hold: Vec<(NodeId, NodeId)>| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    hold,
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        // How a reopen ended: node 1's recovered generation and phase, once it admits writes, its
+        // F1 blocks, or (with `committed`) it has committed and holds a grant, so the next open
+        // heals case A, not case B (critic-d7 F5). Any fault or failed heal fails the row.
+        let settle = |db: &Db, what: &str, committed: bool| -> (Option<Generation>, String, bool) {
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                if let HealState::Failed(error) = db.heal_state() {
+                    panic!("{what}: the heal failed: {error}");
+                }
+                for node in db.node_status() {
+                    assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
+                }
+                let owner = db.node_status().into_iter().next().expect("node 1");
+                let phase = owner.recovery.clone().unwrap_or_default();
+                if owner.admits == Some(true)
+                    || phase.starts_with("Blocked")
+                    || (committed
+                        && owner.recovered.is_some()
+                        && owner.authority.starts_with("held("))
+                {
+                    return (owner.recovered, phase, owner.admits == Some(true));
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: neither admits nor Blocked within {patience:?}; phase {phase}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let mut db = open(Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))]);
+        let (first, phase, _) = settle(&db, "the reopen without node 2", true);
+        assert_eq!(
+            first,
+            Some(Generation(2)),
+            "the first reopen commits generation 2 without node 2; phase {phase}"
+        );
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(Vec::new());
+        let (second, phase, admits) = settle(&db, "the reopen with node 2 behind", false);
+        assert!(
+            matches!(
+                db.heal_state(),
+                HealState::Handed(admin::Healed {
+                    cleared: admin::GrantCleared::Deleted(_),
+                    ..
+                })
+            ),
+            "the second reopen heals case A: the first reopen held a grant"
+        );
+        if admits {
+            let read = db.get(b"a").expect("get a");
+            assert_eq!(
+                read.value.map(|(_, bytes)| bytes),
+                Some(Bytes::from_static(b"1")),
+                "the second reopen reads the write back; generation {second:?}"
+            );
+        } else {
+            assert!(
+                phase.starts_with("Blocked(") && phase.len() > "Blocked()".len(),
+                "a named Blocked, not {phase}"
+            );
+        }
+        db.shutdown();
+    }
+
     /// M10 W1 day-1 spike (ruling A-R163): bootstrap, write, stop, start the same `nodes/` again
     /// at boot 2, clear `grants/1` by its exact revision once it is proven expired, read
     /// `partitions/1` after the delete's reply, hand node 1 a second recovery's `Plan` and an

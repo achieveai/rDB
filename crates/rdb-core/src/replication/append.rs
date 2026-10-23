@@ -146,6 +146,10 @@ pub struct AppendReceiver {
     /// generation is adopted, every frame is fenced and no ACK leaves, until a `Recovered` pins
     /// this copy a serving member again.
     retired: bool,
+    /// Restored by the host from what its engine holds after a process restart, before any
+    /// `Recovered` (lead ruling A-R173): it serves recovery appends and catch-up sourcing only,
+    /// and fences every plain append. `Recovered` drops it and builds today's side instead.
+    dormant: bool,
 }
 
 /// What the ladder decided. Only `Accept` and `Quarantine` write state.
@@ -206,7 +210,105 @@ impl AppendReceiver {
             last_partition_revision: Revision(0),
             authority_seq: 0,
             retired: false,
+            dormant: false,
         })
+    }
+
+    /// A dormant receiver (lead ruling A-R173): the side a host restores for its own copy after
+    /// a process restart, so that F1's catch-up has a source and a target before `Recovered`.
+    ///
+    /// Unlike [`Self::new`], `own` may be the configuration's primary: the old primary's copy is
+    /// often the longest, and it can lag too. `init.lineage` and `revision` must come from the
+    /// same `partitions/{id}` read as the fence proof, never from the engine, which stores no
+    /// owner epoch (critic-d7 F4). The ladder holds the genesis rung and the head; the source
+    /// side's dense ladder is added by [`Self::restore_history`] when a catch-up needs it.
+    ///
+    /// A dormant receiver refuses every plain append `NotAMember` without a reply (critic-d7 F1);
+    /// only a recovery append under a credential reaches its rows.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] when `own` is not a member of `config`, when `config` and
+    /// `lineage` name different partitions, or when `durable` is above the head.
+    pub fn dormant(init: ReceiverInit, revision: Revision) -> Result<Self, RdbError> {
+        let own = *init
+            .config
+            .member(init.own)
+            .ok_or(RdbError::InvalidArgument { field: "own" })?;
+        if init.config.partition != init.lineage.partition {
+            return Err(RdbError::InvalidArgument { field: "partition" });
+        }
+        if init.durable.0 > init.head.seq.0 {
+            return Err(RdbError::InvalidArgument { field: "durable" });
+        }
+        let mut history = DigestLadder::new();
+        history.insert(Seq::ZERO, Digest::ROOT);
+        history.insert(init.head.seq, init.head.digest);
+        Ok(Self {
+            own,
+            lineage: init.lineage,
+            config: init.config,
+            applied_head: init.head,
+            staged: None,
+            received: ReceivedSeq(init.head.seq.0),
+            durable: init.durable,
+            history,
+            quarantine: None,
+            next_batch: BatchId(0),
+            root: HistoryRoot {
+                floor: Seq::ZERO,
+                base_digest: Digest::ROOT,
+                predecessor: None,
+            },
+            last_partition_revision: revision,
+            authority_seq: 0,
+            retired: false,
+            dormant: true,
+        })
+    }
+
+    /// Give a dormant receiver the digests its engine verified, `(0, ROOT)` through its applied
+    /// head, so it can source a catch-up (critic-d7 F2): the cursor looks up the target's head
+    /// and every ACK in this ladder. Built when the first catch-up asks, not at open.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] when this receiver is not dormant, when a rung is above
+    /// the applied head or disagrees with a rung already held, or when the rungs leave a gap
+    /// between 0 and the head. Nothing is written then.
+    pub fn restore_history(&mut self, rungs: &[(Seq, Digest)]) -> Result<(), RdbError> {
+        let invalid = |field| Err(RdbError::InvalidArgument { field });
+        if !self.dormant {
+            return invalid("dormant");
+        }
+        let head = self.applied_head.seq.0;
+        let dense = rungs.len() as u64 == head + 1
+            && rungs
+                .iter()
+                .enumerate()
+                .all(|(at, (seq, _))| seq.0 == at as u64);
+        if !dense {
+            return invalid("rungs");
+        }
+        let disagrees = rungs.iter().any(|&(seq, digest)| {
+            self.history
+                .digest_at(seq)
+                .is_some_and(|held| held != digest)
+        });
+        if disagrees {
+            return invalid("rungs");
+        }
+        for &(seq, digest) in rungs {
+            self.history.insert(seq, digest);
+        }
+        Ok(())
+    }
+
+    /// Whether this is a dormant receiver (lead ruling A-R173): restored after a restart and
+    /// not yet replaced by `Recovered`.
+    #[must_use]
+    pub const fn is_dormant(&self) -> bool {
+        self.dormant
     }
 
     /// The partition this receiver serves.
@@ -353,6 +455,15 @@ impl AppendReceiver {
         if !from.authenticated {
             return vec![ignored(KernelIgnoredReason::AppendRejected(
                 AppendReject::Unauthenticated,
+            ))];
+        }
+        // A dormant receiver's lineage is the stored one, so the old primary's plain append
+        // would pass every row; only a credential reaches them (A-R173, critic-d7 F1). Refused
+        // without a reply, as a process holding no receiver drops it: a reply would stop the new
+        // primary's cursor before this node hears `Recovered`, which replaces this receiver.
+        if self.dormant && !recovery {
+            return vec![ignored(KernelIgnoredReason::AppendRejected(
+                AppendReject::NotAMember,
             ))];
         }
         let request = frame.id;
