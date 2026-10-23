@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceScope, Lineage, PartitionMode,
-    Verdict,
+    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
+    PartitionMode, Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -49,6 +49,7 @@ use rdb_core::contracts::ids::{
     Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId,
     RequestIdentity, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
+use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
@@ -66,7 +67,7 @@ use rdb_core::contracts::version::{API_VERSION, ENVELOPE_VERSION};
 use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
-use rdb_core::replication::Replication;
+use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
@@ -254,6 +255,23 @@ pub enum Msg {
         correlation: CorrelationId,
         /// What it asks.
         ask: PeerAsk,
+    },
+    /// F1's `CatchUp` or `CatchUpBeforeGrant`, routed to the node holding the source copy (D7).
+    CatchUp {
+        /// The node whose F1 asked: where the source's `CopyCaughtUp` goes.
+        asker: NodeId,
+        /// The partition.
+        partition: PartitionId,
+        /// The asking effect's correlation.
+        correlation: CorrelationId,
+        /// The source copy.
+        from: CopyId,
+        /// The copy to catch up.
+        to: CopyId,
+        /// Through this sequence.
+        through: Seq,
+        /// F1's credential for this transfer.
+        credential: FenceCredential,
     },
     /// A kernel event routed here from another node: a recovery answer.
     Routed {
@@ -1021,6 +1039,10 @@ struct Host {
     /// not landed. Answered right after the landing's inherit, so the proof is of a generation
     /// this copy holds; the latest ask wins.
     deferred_syncs: BTreeMap<(PartitionId, Generation), (NodeId, CorrelationId, PeerAsk)>,
+    /// D7: each recovery catch-up this node sources, by `(partition, target copy)`: the node
+    /// and correlation of the F1 that asked, where R1's `CopyCaughtUp` for that copy goes (the
+    /// sim's `catch_ups`, B-R59). A newer ask for the same copy replaces it, as R1's cursor does.
+    catch_ups: BTreeMap<(PartitionId, CopyId), (NodeId, CorrelationId)>,
     acquire_scheduled: BTreeSet<PartitionId>,
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
     /// The stall line, per partition, once reported, up to its effect, with the mode it names;
@@ -1096,6 +1118,7 @@ impl Host {
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
             deferred_syncs: BTreeMap::new(),
+            catch_ups: BTreeMap::new(),
             acquire_scheduled: BTreeSet::new(),
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
@@ -1257,6 +1280,22 @@ impl Host {
                 ask,
             } => {
                 self.answer_peer(asker, partition, correlation, &ask);
+                Ok(())
+            }
+            Msg::CatchUp {
+                asker,
+                partition,
+                correlation,
+                from,
+                to,
+                through,
+                credential,
+            } => {
+                let site = Site {
+                    partition,
+                    correlation,
+                };
+                self.source_catch_up(asker, site, (from, to, through), credential);
                 Ok(())
             }
             Msg::Routed {
@@ -2106,6 +2145,9 @@ impl Host {
         match kernel {
             KernelEffect::Ignored { reason } => {
                 tracing::debug!(node, from = ?from, ?reason, "ignored");
+                if from == ModuleName::Replication {
+                    self.forget_refused_catch_ups(site, reason);
+                }
             }
             KernelEffect::Alert { reason } => {
                 tracing::warn!(node, from = ?from, ?reason, "alert");
@@ -2164,11 +2206,46 @@ impl Host {
                 from: first,
                 through,
             } => return self.send_envelopes(*copy, *first, *through, site),
-            KernelEffect::SendRecoveryEnvelopes { .. } => {
-                return Err(unsupported(self.node, "send_recovery_envelopes"));
-            }
-            KernelEffect::CopyCaughtUp { copy, head, .. } => {
+            KernelEffect::SendRecoveryEnvelopes {
+                copy,
+                from: first,
+                through,
+                credential,
+            } => return self.send_recovery_envelopes(*copy, (*first, *through), credential, site),
+            KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+                // A catch-up this node sourced for another node's F1 reports there (B-R59).
+                if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
+                {
+                    if asker != self.node {
+                        let msg = Msg::Routed {
+                            partition: site.partition,
+                            correlation,
+                            kind: KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp {
+                                copy: *copy,
+                                head: *head,
+                                digest: *digest,
+                            }),
+                        };
+                        if let Err(fault) = self.links.send(self.node, asker, msg) {
+                            tracing::warn!(
+                                node,
+                                asker = asker.0,
+                                ?fault,
+                                "peer_answer_unreachable"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let site = Site {
+                        partition: site.partition,
+                        correlation,
+                    };
+                    if let Some(event) = route::event_for(kernel) {
+                        self.push(site, EventKind::Kernel(event), true, None);
+                    }
+                    return Ok(());
+                }
             }
             // Recorded for the trim duty, then routed to T1 below.
             KernelEffect::Published { lineage, seq, .. } => {
@@ -2665,6 +2742,72 @@ impl Host {
         Ok(())
     }
 
+    /// R1's `SendRecoveryEnvelopes` (the sim's `send_recovery_envelopes`): this node's stored
+    /// records of its receiver's generation, checked, each wrapped in the fence and unicast in
+    /// order to `copy`'s member; nothing past a gap. The frame names the credential's prior
+    /// lineage as its sender and the receiver's configuration.
+    fn send_recovery_envelopes(
+        &mut self,
+        copy: CopyId,
+        (first, through): (Seq, Seq),
+        credential: &FenceCredential,
+        site: Site,
+    ) -> Result<(), String> {
+        let partition = site.partition;
+        let Some(receiver) = self.replication.receiver(self.node, partition) else {
+            return Err(format!(
+                "send_recovery_envelopes with no receiver for p{}",
+                partition.0
+            ));
+        };
+        let stored = receiver.lineage();
+        let config = receiver.config().config_version;
+        let to = receiver
+            .config()
+            .members
+            .iter()
+            .find(|member| member.copy == copy)
+            .map(|member| member.node)
+            .ok_or_else(|| {
+                format!(
+                    "send_recovery_envelopes to copy {} not in the config",
+                    copy.0
+                )
+            })?;
+        let sender = Lineage {
+            partition: credential.partition,
+            generation: credential.prior_generation,
+            owner_epoch: credential.prior_owner_epoch,
+        };
+        let mut sent = 0u64;
+        for seq in first.0..=through.0 {
+            let Some(record) = self.stored_record(stored, Seq(seq)) else {
+                break;
+            };
+            let frame = Frame {
+                id: MessageId(self.next_frame),
+                protocol: ENVELOPE_VERSION,
+                config,
+                sender,
+                body: wire::encode_recovery_append(credential, &record),
+            };
+            self.next_frame = self.next_frame.wrapping_add(1).max(1);
+            self.send(to, frame, site);
+            sent += 1;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            to = to.0,
+            from = first.0,
+            through = through.0,
+            sent,
+            "recovery_envelopes_sent"
+        );
+        Ok(())
+    }
+
     /// A send that repeats the previous one to the same copy (same record, the copy's acked
     /// progress unmoved) while the copy's acked applied position is below this primary's applied
     /// head is a re-send to a copy that is behind. After `stuck_resends` of them the copy is not
@@ -2875,8 +3018,20 @@ impl Host {
                 self.ask(holder, site, ask);
                 Ok(())
             }
-            RecoveryEffect::CatchUp { .. } | RecoveryEffect::CatchUpBeforeGrant { .. } => {
-                Err(unsupported(self.node, "recovery_catch_up"))
+            RecoveryEffect::CatchUp {
+                from,
+                to,
+                through,
+                credential,
+            }
+            | RecoveryEffect::CatchUpBeforeGrant {
+                from,
+                to,
+                through,
+                credential,
+            } => {
+                self.route_catch_up(site, (*from, *to, *through), *credential);
+                Ok(())
             }
             RecoveryEffect::ProbeDigestAt { .. } => {
                 Err(unsupported(self.node, "recovery_probe_digest"))
@@ -2937,6 +3092,113 @@ impl Host {
             if let PeerAsk::Inventory { copy, .. } = ask {
                 self.answer_here(site, RecoveryEvent::InventoryFailed { copy });
             }
+        }
+    }
+
+    /// F1's catch-up, to the node holding `from` in the plan's configuration (B-R59: the sim's
+    /// `catch_up`). Unroutable is logged and left to F1's own deadline, which re-asks.
+    fn route_catch_up(
+        &mut self,
+        site: Site,
+        (from, to, through): (CopyId, CopyId, Seq),
+        credential: FenceCredential,
+    ) {
+        let holder = self
+            .plans
+            .get(&site.partition)
+            .and_then(|plan| holder_of(&plan.config.members, from));
+        let Some(holder) = holder else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = site.partition.0,
+                from = from.0,
+                to = to.0,
+                reason = "not_placed",
+                "catch_up_unroutable"
+            );
+            return;
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = site.partition.0,
+            from = from.0,
+            to = to.0,
+            through = through.0,
+            holder = holder.0,
+            "catch_up_routed"
+        );
+        if holder == self.node {
+            self.source_catch_up(self.node, site, (from, to, through), credential);
+            return;
+        }
+        let msg = Msg::CatchUp {
+            asker: self.node,
+            partition: site.partition,
+            correlation: site.correlation,
+            from,
+            to,
+            through,
+            credential,
+        };
+        if let Err(fault) = self.links.send(self.node, holder, msg) {
+            tracing::warn!(
+                node = self.node.0,
+                partition = site.partition.0,
+                holder = holder.0,
+                ?fault,
+                reason = "link",
+                "catch_up_unroutable"
+            );
+        }
+    }
+
+    /// A catch-up this node sources: remember who asked, then hand R1 `KernelEvent::CatchUp`.
+    fn source_catch_up(
+        &mut self,
+        asker: NodeId,
+        site: Site,
+        (from, to, through): (CopyId, CopyId, Seq),
+        credential: FenceCredential,
+    ) {
+        self.catch_ups
+            .insert((site.partition, to), (asker, site.correlation));
+        let kind = KernelEvent::CatchUp {
+            from,
+            to,
+            through,
+            credential,
+        };
+        self.push(site, EventKind::Kernel(kind), true, None);
+    }
+
+    /// R1 answered under a catch-up's correlation and runs no source for its copy: it refused
+    /// the catch-up, or its cursor stopped. Forget the asker, as the sim does, so a later
+    /// `CopyCaughtUp` for that copy never reaches a stale F1; the asker's own deadline re-asks.
+    fn forget_refused_catch_ups(&mut self, site: Site, reason: &KernelIgnoredReason) {
+        let (node, partition) = (self.node, site.partition);
+        let refused: Vec<CopyId> = self
+            .catch_ups
+            .iter()
+            .filter(|(&(p, to), &(_, correlation))| {
+                p == partition
+                    && correlation == site.correlation
+                    && self.replication.source(node, partition, to).is_none()
+            })
+            .map(|(&(_, to), _)| to)
+            .collect();
+        for to in refused {
+            let asker = self
+                .catch_ups
+                .remove(&(partition, to))
+                .map(|(asker, _)| asker);
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                to = to.0,
+                asker = asker.map(|asker| asker.0),
+                ?reason,
+                "catch_up_refused"
+            );
         }
     }
 
@@ -6139,6 +6401,110 @@ mod tests {
         assert!(
             *left > ACQUIRE_AFTER_ACTIVE_MILLIS && *left <= ACQUIRE_AFTER_RECOVERED_MILLIS,
             "ReadOnly: due in {left} ms"
+        );
+    }
+
+    /// D7 host wiring (B-R59, the sim's `catch_up`): F1's `CatchUp` on node 1 goes to node 2,
+    /// which holds the source copy; R1 there sends its stored records to node 3 as recovery
+    /// appends, and its `CopyCaughtUp` comes back to node 1, the node that asked. Live receivers
+    /// stand in for the sides a reopen does not have yet (A-R173 rules on those).
+    /// Integration (~3 s): bootstrap's discovery window, then one catch-up.
+    #[config_log::retcd_test]
+    fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
+        use rdb_core::contracts::ids::Revision;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let receivers = |trio: &Trio| {
+            [1usize, 2].map(|i| {
+                let host = &trio.nodes[i].0;
+                host.replication
+                    .receiver(host.node, PartitionId(1))
+                    .map(|receiver| (receiver.lineage(), receiver.applied_head().seq))
+            })
+        };
+        let (lineage, through) = trio.until("nodes 2 and 3 hold node 1's head", |trio| {
+            let head = trio.head()?;
+            match receivers(trio) {
+                [Some((lineage, a)), Some((_, b))] if a.0 == head && b.0 == head && head > 0 => {
+                    Some((lineage, a))
+                }
+                _ => None,
+            }
+        });
+        let credential = FenceCredential {
+            partition: PartitionId(1),
+            prior_generation: lineage.generation,
+            prior_owner_epoch: lineage.owner_epoch,
+            control_revision: Revision(u64::MAX),
+            sender: CopyId(1),
+        };
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(u64::MAX),
+        };
+        let effect = RecoveryEffect::CatchUp {
+            from: CopyId(1),
+            to: CopyId(2),
+            through,
+            credential,
+        };
+        trio.nodes[0]
+            .0
+            .recovery_effect(&effect, site)
+            .expect("routed");
+
+        // Node 1's mail is read here before it is handled, to see the report arrive.
+        let patience = test_patience(Trio::PATIENCE);
+        let deadline = Instant::now() + patience;
+        let reported = loop {
+            let mut reported = None;
+            for (host, _, rx) in &mut trio.nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    if let Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp { copy, head, .. }),
+                        correlation,
+                        ..
+                    } = &msg
+                    {
+                        reported = Some((host.node, *copy, *head, *correlation));
+                    }
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+            if let Some(reported) = reported {
+                break reported;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no CopyCaughtUp reached node 1 within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            reported,
+            (NodeId(1), CopyId(2), through, CorrelationId(u64::MAX)),
+            "node 2's report reaches node 1 under the asking correlation"
+        );
+        assert!(
+            trio.nodes[1].0.catch_ups.is_empty(),
+            "the source forgets the asker once it has reported"
+        );
+        let sent: Vec<_> = config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            "d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked",
+        )
+        .into_iter()
+        .filter(|line| line["@m"] == "recovery_envelopes_sent")
+        .map(|line| (line["node"].clone(), line["to"].clone()))
+        .collect();
+        assert!(
+            sent.contains(&(serde_json::json!(2), serde_json::json!(3))),
+            "node 2 sent recovery appends to node 3: {sent:?}"
         );
     }
 

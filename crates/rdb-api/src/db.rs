@@ -5027,6 +5027,51 @@ mod tests {
         }
     }
 
+    /// D7 (tester s1-4/onecopy): one copy lagging at a clean quit must not brick the folder. The
+    /// link 1-2 is held for the last two puts, so node 2 stops at the first write while nodes 1
+    /// and 3 hold all three. The reopen selects the longer prefix and must catch node 2 up, then
+    /// become ready and read every acknowledged write back.
+    /// Integration (~5 s): one open, one reopen with a full discovery window.
+    #[config_log::retcd_test]
+    fn m10_d7_a_reopen_catches_up_a_copy_that_lagged_at_the_quit() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let written: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(written[0].0, written[0].1, None).expect("put a");
+        db.links().hold(NodeId(1), NodeId(2));
+        for (key, value) in &written[1..] {
+            db.put(key, value, None).expect("put while 1-2 is held");
+        }
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        db.wait_ready(patience)
+            .unwrap_or_else(|e| panic!("the reopen catches node 2 up and is ready: {e}"));
+        for (key, value) in written {
+            let read = db.get(key).expect("get");
+            assert_eq!(
+                read.value.map(|(_, bytes)| bytes),
+                Some(Bytes::copy_from_slice(value)),
+                "the reopen reads back an acknowledged write"
+            );
+        }
+        db.shutdown();
+    }
+
     /// M10 W1 day-1 spike (ruling A-R163): bootstrap, write, stop, start the same `nodes/` again
     /// at boot 2, clear `grants/1` by its exact revision once it is proven expired, read
     /// `partitions/1` after the delete's reply, hand node 1 a second recovery's `Plan` and an
