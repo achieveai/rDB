@@ -36,7 +36,7 @@ fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<bool, A
     Ok(matches!(db.status(id, sent_in)?, TxnStatus::Resolved(_)))
 }
 
-/// The same question for a request saved after its answer (`ok.sent` or `refused.request`).
+/// The same question for a request saved after its answer: `*ok.sent`, or `refused.request`'s.
 fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
     let (id, sent_in) = (saved.identity.request, saved.expected_generation);
     match db.resend(saved) {

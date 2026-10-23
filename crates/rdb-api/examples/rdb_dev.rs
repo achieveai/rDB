@@ -164,7 +164,8 @@
 //!                                         Without `--offset`/`--len` it reads the manifest
 //!                                         only, so a damaged chunk shows on a range read only
 //! get <object>                         read at the publication barrier: `value=` for a byte
-//!                                         string, `doc=<json>` for any other document
+//!                                         string, `doc=<json>` for any other document; another
+//!                                         kind is refused, naming `members`, `items` or `read`
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
@@ -209,8 +210,12 @@
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
 //! admin clear <o>                        clear a damaged object: prove it damaged, then
-//!                                         delete all of it, healthy entries too (copy those out
-//!                                         first with `members`; one-entry repair comes later):
+//!                                         delete all of it, healthy entries too. A bad map
+//!                                         entry or set member is repaired by a `map put`/`del`
+//!                                         or `set del` of its key instead; clear is for a
+//!                                         damaged root, a byte 0/3 or newer build's entry
+//!                                         (copy the healthy entries out first with `members`;
+//!                                         one-entry repair for those comes later). It deletes
 //!                                         one batch of its records per call, each at the version
 //!                                         it was read at (`clear ok ...`). Repeat until `clear
 //!                                         unchanged (nothing to clear; nothing sent)`. A
@@ -1387,7 +1392,7 @@ fn repl<'scope, 'env>(
                 put_line(db, answer, None);
             }),
             ["get", object] => {
-                read_line(db.read(object.as_bytes(), Look::Doc));
+                read_line(db.read(object.as_bytes(), Look::Doc).map_err(get_hint));
                 Ok(())
             }
             ["blob", "upload", object, rest @ ..] => blob_upload(db, object, rest, &mut sent),
@@ -2649,6 +2654,26 @@ fn parse_range(rest: &[&str]) -> Result<Look, String> {
 
 /// A `Db::read` answer as lines. A byte-string document prints as `get` always has; any other
 /// document as JSON.
+/// `get` reads a document. On another kind the read says only `a Map does not take this op`
+/// (tester, embed.md walk), so the verb that reads that kind is named after it.
+fn get_hint(mut error: ApiError) -> ApiError {
+    let verb = [
+        ("a Map does not take this op", "members <object>"),
+        ("a Set does not take this op", "members <object>"),
+        ("a List does not take this op", "items <object>"),
+        ("a Blob does not take this op", "read <object>"),
+    ]
+    .into_iter()
+    .find_map(|(said, verb)| (error.detail == said).then_some(verb));
+    if let Some(verb) = verb {
+        error.detail = format!(
+            "{}; `get` reads a document, read this one with `{verb}`",
+            error.detail
+        );
+    }
+    error
+}
+
 fn read_line(answer: Result<ReadOk, ApiError>) {
     let ok = match answer {
         Ok(ok) => ok,
@@ -6065,6 +6090,32 @@ mod tests {
             assert_eq!((slices, said.len()), (1, 0), "{answer:?}: {line}");
             assert!(line.contains(&answer.to_string()), "{answer:?}: {line}");
         }
+    }
+
+    /// Tester, embed.md walk at 6ed41b8: `get m1` on a map answered only `a Map does not take
+    /// this op`. It now names the verb that reads that kind; any other error is left as it is.
+    /// Unit.
+    #[test]
+    fn get_on_another_kind_names_the_verb_that_reads_it() {
+        use rdb_core::contracts::errors::ErrorKind;
+        let refused = |detail: &str| ApiError::new(ErrorKind::InvalidArgument, detail);
+        for (kind, verb) in [
+            ("Map", "members"),
+            ("Set", "members"),
+            ("List", "items"),
+            ("Blob", "read"),
+        ] {
+            let said = get_hint(refused(&format!("a {kind} does not take this op"))).detail;
+            assert_eq!(
+                said,
+                format!(
+                    "a {kind} does not take this op; `get` reads a document, read this one with \
+                     `{verb} <object>`"
+                )
+            );
+        }
+        let other = refused("object id 2000 bytes, over the 1024-byte limit");
+        assert_eq!(get_hint(other.clone()), other, "left as it is");
     }
 
     /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
