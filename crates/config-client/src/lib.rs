@@ -897,6 +897,11 @@ impl GrpcClient {
                     moved = false;
                     last_error = Some(error);
                 }
+                // A server's own answer ends the operation as it is, naming where it came
+                // from and what was passed over to reach it (A-R208).
+                _ if is_server_rejection(&status) => {
+                    return Err(unreached.answered(&endpoint, error));
+                }
                 _ => return Err(error),
             }
         }
@@ -1025,6 +1030,32 @@ impl Unreached {
             None => self.failed.push((endpoint.to_owned(), reason)),
         }
         self.ended_on_connect = true;
+    }
+
+    /// A server's `Unavailable` answer from `endpoint`, after this operation moved past
+    /// connect failures at other endpoints: the answer is kept, with the endpoint that gave it
+    /// and each one that could not be reached, with its reason (A-R208). Only the reason grows;
+    /// the class, and so the retry rule, is the server's. Any other answer, or one reached
+    /// without passing over another endpoint, is returned as it is.
+    fn answered(&self, endpoint: &str, error: ConfigError) -> ConfigError {
+        let ConfigError::Unavailable { reason } = error else {
+            return error;
+        };
+        let passed: Vec<&str> = self
+            .failed
+            .iter()
+            .filter(|(e, _)| e != endpoint)
+            .map(|(_, r)| r.as_str())
+            .collect();
+        if passed.is_empty() {
+            return ConfigError::Unavailable { reason };
+        }
+        ConfigError::Unavailable {
+            reason: format!(
+                "{reason} (answered by {endpoint}; could not reach: {})",
+                passed.join("; ")
+            ),
+        }
     }
 
     /// The first configured endpoint after `from`, in ring order, not dialled in this

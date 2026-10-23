@@ -263,3 +263,65 @@ async fn m10_d14_a_follower_that_answers_with_its_leader_down_says_no_leader_was
     );
     follower.shutdown().await;
 }
+
+/// A-R208: control's nodes 1 and 2 are down, and follower 3, having lost quorum, answers
+/// `Unavailable` "leader unknown". The answer is kept, it names the endpoint that gave it, and
+/// it lists both endpoints that could not be reached, each with its reason. The class stays
+/// `Unavailable`, and "unavailable:" is said once.
+/// Cut: drop the could-not-reach list, and the two down endpoints are missing.
+#[retcd_test]
+async fn m10_r208_a_follower_that_answers_leader_unknown_names_itself_and_each_unreached_endpoint()
+{
+    const BUDGET: Duration = Duration::from_millis(3000);
+    let down = [dead_endpoint().await, dead_endpoint().await];
+    let follower = Node::start().await;
+    follower.store.set_error(Some(ConfigError::Unavailable {
+        reason: "leader unknown".to_owned(),
+    }));
+    let client = GrpcClient::connect(
+        vec![down[0].clone(), down[1].clone(), follower.endpoint.clone()],
+        options(BUDGET),
+    )
+    .expect("client connects");
+
+    let error = client
+        .get(GetRequest {
+            key: Bytes::from_static(b"/app/a"),
+        })
+        .await
+        .expect_err("no leader is known");
+    let ConfigError::Unavailable { reason } = &error else {
+        panic!("the follower's answer keeps its class: {error:?}");
+    };
+    let (answer, rest) = reason
+        .split_once(" (answered by ")
+        .unwrap_or_else(|| panic!("the endpoint that answered is named: {reason}"));
+    assert_eq!(
+        answer, "leader unknown",
+        "the server's answer comes first: {reason}"
+    );
+    let (answered_by, unreached) = rest
+        .split_once("; could not reach: ")
+        .unwrap_or_else(|| panic!("the endpoints that could not be reached are listed: {reason}"));
+    assert_eq!(answered_by, follower.endpoint, "{reason}");
+    for endpoint in &down {
+        assert!(
+            unreached.contains(&format!("cannot connect to {endpoint}"))
+                || unreached.contains(&format!("connecting to {endpoint} ")),
+            "{endpoint} is listed with its reason: {reason}"
+        );
+    }
+    let text = error.to_string();
+    assert_eq!(
+        text.matches("unavailable:").count(),
+        1,
+        "\"unavailable:\" once: {text}"
+    );
+    let stats = client.stats();
+    assert_eq!(
+        (stats.sends, stats.reconnects, follower.store.call_count()),
+        (1, 2, 1),
+        "{stats:?}"
+    );
+    follower.shutdown().await;
+}
