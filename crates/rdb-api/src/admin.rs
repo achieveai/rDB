@@ -1161,9 +1161,11 @@ fn kept_in_words(clearance: Clearance, node: NodeId, now: Tick) -> String {
         Clearance::Refused {
             refusal: ClearRefusal::Frozen,
             ..
-        } => "it is frozen for a takeover that has not finished, so another open may be taking \
-              over this folder's data: let it finish or shut it down, then open again"
-            .to_owned(),
+        } => format!(
+            "a takeover from node {} is unfinished; run `admin promote <the node you chose>` \
+             again",
+            node.0
+        ),
         Clearance::Refused {
             refusal: ClearRefusal::PartitionInTransfer(partition),
             ..
@@ -1330,8 +1332,10 @@ async fn judge(
     })?;
     // R3a; M10 arch R5 row 9: A1's one minting site counts from 1, so a record holding 0 was
     // not written by A1. Refused before anything is deleted; a heal's proof carrying it would
-    // read as `NoGrantHeld`'s "none held".
-    if record.grant == GrantId(0) {
+    // read as `NoGrantHeld`'s "none held". A frozen grant 0 is a promote's (PR #41: it froze an
+    // owner that held no grant), so it goes on to the `Frozen` verdict, which never clears it
+    // and says to finish the takeover (A-R265).
+    if record.grant == GrantId(0) && !record.frozen {
         tracing::warn!(
             node = node.0,
             revision = found.mod_revision,
@@ -1796,16 +1800,19 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         control_revision: Revision(control_revision),
         decision_tick: decided,
     };
+    // A-R265/A-R266: as `Routed`, the one kernel-event message that crosses the wire, so a
+    // promote run from another process reaches `to` (an `Inject` never leaves its process). Both
+    // go the same way, in this order, as in one process.
     for event in [
         RecoveryEvent::Plan(Box::new(plan)),
         RecoveryEvent::FenceProven(Box::new(fence)),
     ] {
         (ctx.send)(
             ctx.to,
-            Msg::Inject {
+            Msg::Routed {
                 partition: PARTITION,
                 correlation: PROMOTE,
-                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+                kind: KernelEvent::Recovery(event),
             },
         )
         .map_err(|_| PromoteError::Unreachable { node: ctx.to.0 })?;
@@ -3095,17 +3102,24 @@ mod tests {
                 nodes.iter().all(|node| *node == NodeId(2)),
                 "sent to node 2 only"
             );
-            let plan = msgs
+            // A-R266: both as `Routed`, Plan first, so they cross the wire in one-process order.
+            let events: Vec<&RecoveryEvent> = msgs
                 .iter()
-                .find_map(|msg| match msg {
-                    Msg::Inject {
-                        kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))),
+                .map(|msg| match msg {
+                    Msg::Routed {
+                        kind: KernelEvent::Recovery(event),
+                        correlation: PROMOTE,
                         ..
-                    } => Some((**plan).clone()),
-                    _ => None,
+                    } => event,
+                    other => panic!("a promote sends Routed recovery events only: {other:?}"),
                 })
-                .expect("a plan");
-            (fence_sent(&msgs).expect("a fence"), plan)
+                .collect();
+            match events.as_slice() {
+                [RecoveryEvent::Plan(plan), RecoveryEvent::FenceProven(fence)] => {
+                    ((**fence).clone(), (**plan).clone())
+                }
+                other => panic!("Plan then FenceProven, once each: {other:?}"),
+            }
         };
         let within = Duration::from_millis(600);
         let (answer, sent) =
@@ -3197,6 +3211,86 @@ mod tests {
             (fence.control_revision, GrantId(0)),
             "the second run picks up the record and grant the first left"
         );
+    }
+
+    /// A-R265 (W7's walk `lr kill 1; lr promote 2; lr restart 1`): a promote that wrote, then
+    /// could not reach node 2, leaves `partitions/1` fencing and `grants/1` frozen. A reopen's
+    /// heal of node 1 cannot clear that grant, and its text says what does, in words: the
+    /// takeover is unfinished, run the promote again. The re-run then sends node 2 both events.
+    /// Both ways a promote freezes: node 1 held grant 4 (the walk), or held none and the promote
+    /// created grant 0 frozen (PR #41), which the heal once refused as "no grant issuer writes".
+    /// Cuts: the text loses its step, red; a frozen grant 0 refused as unwritten again, red.
+    /// Unit (~3 s): `MemStore`, a 500 ms heal per case.
+    #[test]
+    fn m10_s2_a_heal_after_a_promote_that_could_not_reach_its_node_says_to_promote_again() {
+        let rt = runtime();
+        for held in [Some(GrantId(4)), None] {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            rooted(&*store, &rt, BootId(5));
+            if let Some(grant) = held {
+                old_grant(&*store, &rt, grant);
+            }
+            let ctx = PromoteCtx {
+                store: Arc::clone(&store),
+                budgets: Budgets::SPEC_DEFAULTS,
+                clock: HostClock::start(),
+                to: NodeId(2),
+                drop: None,
+                within: Duration::from_millis(600),
+                members: members(),
+                member_boot: all_known(),
+                send: Arc::new(|node, _| Err(NodeStopped(node))),
+            };
+            let refused = rt
+                .block_on(promote(ctx))
+                .expect_err("node 2 is unreachable");
+            assert!(
+                matches!(refused, PromoteError::Unreachable { node: 2 }),
+                "{held:?}: {refused:?}"
+            );
+            assert!(!refused.no_mutation(), "it wrote Fencing and the freeze");
+
+            let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+            let stuck = healed.expect_err("grants/1 stays frozen");
+            assert_eq!(
+                stuck.to_string(),
+                "the last run's grant for node 1 (grants/1) was still held after 0.5 seconds of \
+                 trying: a takeover from node 1 is unfinished; run `admin promote <the node you \
+                 chose>` again",
+                "{held:?}"
+            );
+            assert!(sent.is_empty(), "the heal sent node 1 nothing");
+
+            let (again, resent) = promote_once(
+                &store,
+                &rt,
+                NodeId(2),
+                None,
+                members(),
+                all_known(),
+                Duration::from_millis(600),
+            );
+            again.expect_err("nothing commits here");
+            let resent: Vec<_> = resent
+                .iter()
+                .map(|(node, msg)| match msg {
+                    Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::Plan(_)),
+                        ..
+                    } => (node.0, "plan"),
+                    Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::FenceProven(_)),
+                        ..
+                    } => (node.0, "fence"),
+                    other => panic!("not a routed plan or fence: {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                resent,
+                [(2, "plan"), (2, "fence")],
+                "{held:?}: the re-run sends node 2 its plan and fence"
+            );
+        }
     }
 
     /// A-R260: after a promote the owner is node 2, so a heal whose owner's thread is gone

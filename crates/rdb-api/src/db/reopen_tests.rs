@@ -2550,3 +2550,355 @@ fn m10_s2_g_an_app_only_db_promotes_node_2_while_node_1_is_stopped() {
     app.shutdown();
     nodes.shutdown();
 }
+
+use rdb_core::contracts::event::KernelEvent;
+use rdb_core::contracts::ids::{CorrelationId, PartitionId};
+
+/// A promote's re-run, as the rows below drive it: `admin::promote` over `links` with this
+/// `Db`'s budgets and clock, every `Routed` it sends kept in `sent` and posted on. Once the
+/// fence has gone, both are posted again, as a re-run after a lost answer would send them.
+fn promote_redelivering(
+    rt: &tokio::runtime::Runtime,
+    db: &Db,
+    store: &Arc<dyn ConfigStore>,
+    links: &Arc<Links>,
+    sent: &Arc<Mutex<Vec<KernelEvent>>>,
+) -> Result<admin::Promoted, admin::PromoteError> {
+    let (send_links, boot_links, seen) = (Arc::clone(links), Arc::clone(links), Arc::clone(sent));
+    let send = move |node: NodeId, msg: Msg| -> Result<(), NodeStopped> {
+        let Msg::Routed {
+            partition,
+            correlation,
+            kind,
+        } = msg
+        else {
+            panic!("a promote sends Routed events only: {msg:?}");
+        };
+        let post = |kind: KernelEvent| {
+            send_links
+                .post(
+                    node,
+                    Msg::Routed {
+                        partition,
+                        correlation,
+                        kind,
+                    },
+                )
+                .map_err(|_| NodeStopped(node))
+        };
+        let mut seen = lock(&seen);
+        seen.push(kind.clone());
+        post(kind)?;
+        if seen.len() == 2 {
+            for kind in seen.clone() {
+                post(kind)?;
+            }
+        }
+        Ok(())
+    };
+    let ctx = admin::PromoteCtx {
+        store: Arc::clone(store),
+        budgets: fast(),
+        clock: db.clock,
+        to: NodeId(2),
+        drop: None,
+        within: heal_within(&fast()),
+        members: admin::members(),
+        member_boot: Arc::new(move |node| boot_links.boot_of(node)),
+        send: Arc::new(send),
+    };
+    rt.block_on(admin::promote(ctx))
+}
+
+/// `partitions/1`'s owner and generation, read now.
+fn partition_owner(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+) -> (NodeId, Generation) {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record
+        .expect("partitions/1");
+    let record = PartitionRecord::decode(&read.value).expect("a partition record");
+    (record.owner, record.generation)
+}
+
+/// A-R265/A-R266 (W7's walk G, condition 3): a promote that cannot reach node 2 is refused
+/// `UNAVAILABLE` after it wrote, and says to promote again. Node 2 then runs again, and the re-run
+/// finishes: node 2 owns partition 1 one generation on. Its plan and fence reach node 2 twice in
+/// the re-run, as a re-run after a lost answer sends them, and once more after the commit. Node 2
+/// steps all six without a fault and commits one generation, not two, and a put lands on it.
+/// Cut: the re-run posts each event once (no re-delivery); node 2 logs four, not six, red.
+/// Integration (~19 s): one fresh open, two promotes that each wait node 1's grant out.
+#[config_log::retcd_test]
+fn m10_s2_a_promote_that_could_not_reach_node_2_finishes_when_run_again_and_redelivery_is_a_no_op()
+{
+    const METHOD: &str = "m10_s2_a_promote_that_could_not_reach_node_2_finishes_when_run_again_and_redelivery_is_a_no_op";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut nodes = open(&rt, dir.path(), &store).expect("the fresh open");
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    nodes.wait_ready(patience).expect("the fresh open is ready");
+    nodes.put(b"a", b"1", None).expect("a put");
+    let (_, before) = partition_owner(&rt, &store);
+    for node in [crate::admin::OWNER, NodeId(2)] {
+        lock(&nodes.nodes)
+            .iter_mut()
+            .find(|handle| handle.node == node)
+            .expect("runs here")
+            .stop();
+    }
+
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let refused = app.promote(NodeId(2), None).expect_err("node 2 is stopped");
+    assert_eq!(
+        (refused.kind, refused.retry, refused.no_mutation),
+        (ErrorKind::Unavailable, RetryRule::BoundedJitter, false),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .detail
+            .starts_with("node 2 could not be sent the new plan;")
+            && refused.detail.ends_with("promote again"),
+        "{refused:?}"
+    );
+    assert_eq!(partition_owner(&rt, &store), (crate::admin::OWNER, before));
+
+    assert_eq!(
+        nodes.restart_node(NodeId(2)).expect("node 2 runs again"),
+        BootId(2)
+    );
+    let sent: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let promoted = promote_redelivering(&rt, &app, &store, nodes.links(), &sent)
+        .unwrap_or_else(|error| panic!("the re-run finishes: {error}"));
+    assert_eq!(
+        (promoted.owner, promoted.generation),
+        (NodeId(2), Generation(before.0 + 1)),
+        "{promoted:?}"
+    );
+    for kind in lock(&sent).clone() {
+        nodes
+            .links()
+            .post(
+                NodeId(2),
+                Msg::Routed {
+                    partition: PartitionId(1),
+                    correlation: CorrelationId(4),
+                    kind,
+                },
+            )
+            .expect("node 2 runs");
+    }
+
+    app.route.owner.store(2, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + patience;
+    let put = loop {
+        match app.put(b"b", b"2", None) {
+            Ok(put) => break put,
+            Err(refused) => assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed on node 2 within {patience:?}: {refused:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(put.generation, promoted.generation, "{put:?}");
+    let events: Vec<String> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "routed_admin_event" && line["node"] == 2)
+        .map(|line| line["event"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "plan",
+            "fence_proven",
+            "plan",
+            "fence_proven",
+            "plan",
+            "fence_proven"
+        ],
+        "node 2 took each, in order"
+    );
+    let two = nodes
+        .node_status()
+        .into_iter()
+        .find(|status| status.node == NodeId(2))
+        .expect("node 2 answers a look");
+    assert_eq!(two.fault, None, "{two:?}");
+    assert_eq!(
+        partition_owner(&rt, &store),
+        (NodeId(2), promoted.generation),
+        "one generation, not two"
+    );
+    app.shutdown();
+    nodes.shutdown();
+}
+
+/// A-R265/A-R266 (W7's walk G, condition 5): a promote over a real `Net`. Each node runs in its
+/// own `Db` with its own links and a TLS link to the others, as three `rdb_node` processes do,
+/// and node 1's is shut down. An app reaching nodes 2 and 3 only over its own `Net` runs
+/// `promote 2` and is answered: node 2 owns partition 1, took the plan and then the fence over
+/// the wire with no fault, and a put from the app lands on it.
+/// Cut: the promote sends `Inject` again; `Net` refuses it (`net_send_refused`) and the promote
+/// is `UNAVAILABLE`, red.
+/// Integration (~8 s): one fresh open, three node opens until node 1 is ready, a promote that
+/// waits node 1's grant out.
+#[config_log::retcd_test]
+fn m10_s2_a_promote_over_the_net_reaches_node_2_in_another_process_and_writes_land_on_it() {
+    use crate::net::{certs, faults::Faults, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
+    const METHOD: &str =
+        "m10_s2_a_promote_over_the_net_reaches_node_2_in_another_process_and_writes_land_on_it";
+    let rt = runtime();
+    let _entered = rt.enter();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let cert_dir = config_testkit::fs::temp_dir();
+    let app_label = Label::App("w5-promote".to_owned());
+    let labels: Vec<Label> = ALL_NODES
+        .iter()
+        .map(|node| Label::Node(*node))
+        .chain([app_label.clone()])
+        .collect();
+    certs::generate(cert_dir.path(), &labels).expect("certs");
+    written_and_closed(&rt, dir.path(), &store);
+
+    let listeners: Vec<tokio::net::TcpListener> = ALL_NODES
+        .iter()
+        .map(|_| rt.block_on(config_testkit::ports::ephemeral_listener()).0)
+        .collect();
+    let addrs: BTreeMap<NodeId, String> = ALL_NODES
+        .iter()
+        .zip(&listeners)
+        .map(|(node, listener)| (*node, listener.local_addr().expect("bound").to_string()))
+        .collect();
+    let mut processes: Vec<(Db, Arc<Net>, Arc<Links>)> = ALL_NODES
+        .iter()
+        .zip(listeners)
+        .map(|(node, listener)| {
+            let node = *node;
+            let boot = next_boot(dir.path()).expect("a boot");
+            let label = Label::Node(node);
+            let links = Links::new();
+            let net = Net::start(
+                NetConfig {
+                    tls: certs::load(cert_dir.path(), &label).expect("node certs"),
+                    label,
+                    boot,
+                    peers: ALL_NODES.iter().copied().filter(|n| *n != node).collect(),
+                    dial: NetConfig::dial_lower(node, &addrs),
+                    protocol_version: PROTOCOL_VERSION,
+                    faults: Faults::new(),
+                },
+                &links,
+                Some(listener),
+            )
+            .expect("the node's net starts");
+            let db = rt
+                .block_on(Db::open_with(
+                    DbConfig {
+                        local: vec![node],
+                        links: Some(Arc::clone(&links)),
+                        boot: Some(boot),
+                        ..config(dir.path())
+                    },
+                    Arc::clone(&store),
+                    rt.handle().clone(),
+                    fast(),
+                ))
+                .unwrap_or_else(|e| panic!("node {}'s process opens: {e}", node.0));
+            (db, net, links)
+        })
+        .collect();
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    processes[0]
+        .0
+        .wait_ready(patience)
+        .expect("node 1's process heals over the net and is ready");
+    processes[0]
+        .0
+        .put(b"b", b"2", None)
+        .expect("a put on node 1");
+
+    // `lr kill 1`: node 1's process goes, with its links.
+    let (mut one, one_net, one_links) = processes.remove(0);
+    one.shutdown();
+    drop((one_net, one_links));
+
+    let app_links = Links::new();
+    let app_net = Net::start(
+        NetConfig {
+            tls: certs::load(cert_dir.path(), &app_label).expect("app certs"),
+            label: app_label,
+            boot: BootId(0),
+            peers: ALL_NODES.iter().copied().collect(),
+            dial: addrs.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            faults: Faults::new(),
+        },
+        &app_links,
+        None,
+    )
+    .expect("the app's net starts");
+    rt.block_on(app_net.wait_up(&[NodeId(2), NodeId(3)], patience))
+        .expect("the app reaches nodes 2 and 3");
+    let mut app = open_app(&rt, &store, &app_links, ClientId(2));
+    let promoted = app
+        .promote(NodeId(2), None)
+        .unwrap_or_else(|error| panic!("the promote over the net is answered: {error}"));
+    assert_eq!(
+        (promoted.owner, promoted.prior_owner),
+        (NodeId(2), crate::admin::OWNER),
+        "{promoted:?}"
+    );
+    assert_eq!(app.route.owner(), NodeId(2), "the app's calls go to node 2");
+    let deadline = std::time::Instant::now() + patience;
+    let put = loop {
+        match app.put(b"c", b"3", None) {
+            Ok(put) => break put,
+            Err(refused) => assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed on node 2 within {patience:?}: {refused:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(put.generation, promoted.generation, "{put:?}");
+    assert_eq!(
+        app.get(b"a").expect("get a").value.map(|(_, v)| v),
+        Some(Bytes::from_static(b"1")),
+        "the write made before reads back from node 2"
+    );
+
+    let events: Vec<String> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "routed_admin_event" && line["node"] == 2)
+        .map(|line| line["event"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        events,
+        ["plan", "fence_proven"],
+        "node 2 took each over the wire, in order"
+    );
+    let two = processes[0]
+        .0
+        .node_status()
+        .into_iter()
+        .find(|status| status.node == NodeId(2))
+        .expect("node 2 answers a look");
+    assert_eq!(two.fault, None, "{two:?}");
+    assert_eq!(
+        partition_owner(&rt, &store),
+        (NodeId(2), promoted.generation)
+    );
+    app.shutdown();
+    drop((app_net, app_links));
+    for (db, _, _) in &mut processes {
+        db.shutdown();
+    }
+}
