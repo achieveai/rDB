@@ -25,7 +25,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -196,6 +196,9 @@ const AFFINITY: AffinityId = AffinityId(1);
 
 /// The longest the thread sleeps with nothing due, so a missed wake costs at most this.
 const IDLE_WAIT: Duration = Duration::from_millis(1_000);
+
+/// D10: the most letters `Host::run` takes from its mailbox before it runs the due duties.
+const MAIL_BEFORE_DUTIES: usize = 256;
 
 /// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
 /// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
@@ -1001,6 +1004,21 @@ pub(crate) fn pause_before_inventory(node_dir: &std::path::Path, pause: Duration
         .push((node_dir.to_path_buf(), pause));
 }
 
+/// Test-only: node directories whose host sleeps once, for the time given, before its next
+/// barrier sync (a `SyncWalThrough` before the commit), as a slow fsync would (D10).
+#[cfg(test)]
+static PAUSE_BEFORE_SYNC: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+/// Test-only: the host on the copy at `node_dir` sleeps `pause` before its next barrier sync,
+/// once.
+#[cfg(test)]
+pub(crate) fn pause_before_sync(node_dir: &std::path::Path, pause: Duration) {
+    PAUSE_BEFORE_SYNC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), pause));
+}
+
 fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
     AFTER_COMMIT
         .lock()
@@ -1297,6 +1315,9 @@ struct Host {
     /// Peer frames this process took from its mailbox, for `node_stopped`: what a restarted
     /// node is still sent, though it holds no role (M9 S2b, critic A5).
     frames_received: u64,
+    /// D10 (A-R196(1)): asks F1 put to a copy this node holds, answered once every effect of the
+    /// step that made them is out, so the asks to peers leave before this node's own fsync.
+    own_asks: Vec<(Site, PeerAsk)>,
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
@@ -1377,6 +1398,7 @@ impl Host {
             stepped_at: now,
             authority_views: BTreeMap::new(),
             frames_received: 0,
+            own_asks: Vec::new(),
             #[cfg(test)]
             fail_step_view: false,
             #[cfg(test)]
@@ -1393,7 +1415,17 @@ impl Host {
             count = 0,
             "host_duty"
         );
-        loop {
+        'run: loop {
+            // D10 (A-R196(1)): mail already here is taken before the due duties, so a deadline
+            // that came due during a stall is judged after the answers that beat it, not before.
+            // At most `MAIL_BEFORE_DUTIES` letters, so a busy mailbox cannot starve the duties.
+            for _ in 0..MAIL_BEFORE_DUTIES {
+                match rx.try_recv() {
+                    Ok(Msg::Stop) | Err(TryRecvError::Disconnected) => break 'run,
+                    Ok(msg) => self.handle(msg),
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
             if self.fault.is_none() {
                 self.run_due();
                 self.drain();
@@ -1403,6 +1435,14 @@ impl Host {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(msg) => self.handle(msg),
                 Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+        // A-R186: a clean stop writes one final synced mark set, whatever the period, so a
+        // reopen ages every write this process published from its publish tick, not from its
+        // landing. A crash or kill writes none; that tail keeps the landing plus the retention.
+        if self.fault.is_none() {
+            if let Err(fault) = self.mark_duty(self.clock.now(), 0, "final_marks") {
+                self.set_fault(fault);
             }
         }
         tracing::info!(
@@ -1827,6 +1867,21 @@ impl Host {
     /// wall clock between a quit and a reopen shortens a restored mark's window by the step,
     /// less `clock_error_millis` (critic-d6b; the same assumption as the heal's guard 2).
     fn trim_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        self.trim_aged(now, "trim");
+        self.trim_delete_duty(now)?;
+        self.mark_duty(
+            now,
+            trim_delete_period(self.budgets.dedup_retention_millis),
+            "marks",
+        )?;
+        self.retire_duty(now)
+    }
+
+    /// The trim duty's sweep in memory: per partition, the `published_at` entries of its oldest
+    /// generation at least a retention old go, as one `DedupTrim` and one `StatusTrim` below
+    /// the last of them plus one, and that floor is kept for the delete. `kind` names the
+    /// `host_duty` line.
+    fn trim_aged(&mut self, now: Tick, kind: &'static str) {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
         for (partition, published) in &mut self.published_at {
@@ -1848,7 +1903,7 @@ impl Host {
         for (partition, generation, below, at) in trims {
             tracing::info!(
                 node = self.node.0,
-                kind = "trim",
+                kind,
                 partition = partition.0,
                 generation = generation.0,
                 below = below.0,
@@ -1875,9 +1930,6 @@ impl Host {
             self.trim_floors
                 .insert((partition, generation), (below, at));
         }
-        self.trim_delete_duty(now)?;
-        self.mark_duty(now)?;
-        self.retire_duty(now)
     }
 
     /// A-R183 (S1-6, critic-d6b): durable publish marks. A mark `(generation, seq, tick)` is a
@@ -1885,12 +1937,13 @@ impl Host {
     /// published by `tick` (C1). At most [`PUBLISH_MARKS`] plus the newest of each generation
     /// ([`sample_marks`]), plus one per floor trimmed but not yet deleted on disk, whose rows
     /// would otherwise lose their mark until the delete. Checked at most once per
-    /// [`trim_delete_period`] and written, synced,
+    /// `period` (the trim duty passes [`trim_delete_period`]; a clean stop passes 0, A-R186)
+    /// and written, synced,
     /// only when they changed (C2), and only for a partition whose marks this process has
     /// restored. A lost or late write only frees less. Only the owner publishes, so the other
-    /// copies write none and keep the landing plus the retention (C7).
-    fn mark_duty(&mut self, now: Tick) -> Result<(), Fault> {
-        let period = trim_delete_period(self.budgets.dedup_retention_millis);
+    /// copies write none and keep the landing plus the retention (C7). `kind` names the
+    /// `host_duty` line.
+    fn mark_duty(&mut self, now: Tick, period: u64, kind: &'static str) -> Result<(), Fault> {
         let mut due = Vec::new();
         for partition in &self.marks_restored {
             let last = self.marks_written.get(partition);
@@ -1920,7 +1973,7 @@ impl Host {
                     .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
                 tracing::info!(
                     node = self.node.0,
-                    kind = "marks",
+                    kind,
                     partition = partition.0,
                     marks = marks.len(),
                     newest = ?marks.last().map(|(g, seq, at)| (g.0, seq.0, at.0)),
@@ -1976,6 +2029,10 @@ impl Host {
         }
         self.marks_written
             .insert(partition, (self.clock.now(), read));
+        // A-R193: what the marks show already aged is trimmed now, before this landing's
+        // `Recovered` and so before the host admits, not on the first trim tick up to
+        // [`HOST_TRIM_EVERY_MILLIS`] later. T1 and P1 keep a trim that comes before the seed.
+        self.trim_aged(self.clock.now(), "pre_trim");
         Ok(())
     }
 
@@ -2619,6 +2676,13 @@ impl Host {
                     }
                 }
                 EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site)?,
+            }
+        }
+        // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
+        // its own fsync never delays theirs.
+        for (site, ask) in std::mem::take(&mut self.own_asks) {
+            if let Some(answer) = self.answer(site.partition, &ask) {
+                self.answer_here(site, answer);
             }
         }
         self.report_unproven();
@@ -3929,9 +3993,8 @@ impl Host {
     /// Ask `holder` over the peer link (a hold delays it), or answer here when it is us.
     fn ask(&mut self, holder: NodeId, site: Site, ask: PeerAsk) {
         if holder == self.node {
-            if let Some(answer) = self.answer(site.partition, &ask) {
-                self.answer_here(site, answer);
-            }
+            // D10: answered by `deliver` after the step's other effects, peer asks included.
+            self.own_asks.push((site, ask));
             return;
         }
         let msg = Msg::PeerAsk {
@@ -4550,6 +4613,22 @@ impl Host {
         post_commit: bool,
     ) -> Option<RecoveryEvent> {
         let node = self.node.0;
+        #[cfg(test)]
+        if !post_commit {
+            let pause = {
+                let mut pauses = PAUSE_BEFORE_SYNC
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = pauses
+                    .iter()
+                    .position(|(dir, _)| self.engine.path().starts_with(dir));
+                at.map(|at| pauses.remove(at).1)
+            };
+            if let Some(pause) = pause {
+                tracing::info!(node, millis = pause.as_millis(), "test_sync_paused");
+                std::thread::sleep(pause);
+            }
+        }
         let captured = vec![CapturedPrefix {
             partition,
             generation,
@@ -9362,12 +9441,14 @@ mod tests {
             .expect("put marks");
     }
 
-    /// A-R183 row 1, the tail (critic-d6b F1/F3): marks left by an earlier process reach seq 5
-    /// of generation 1, published two retentions ago. The reopen's first trim takes seqs 1-5
-    /// and nothing above: rows 6 and 7 were never marked, so they wait for the landing plus
-    /// the retention, as before.
+    /// A-R183 row 1, the tail (critic-d6b F1/F3), and A-R193: marks left by an earlier process
+    /// reach seq 5 of generation 1, published two retentions ago. The restore itself trims
+    /// seqs 1-5, before the landing's `Recovered`, with no trim tick, and nothing above: rows 6
+    /// and 7 were never marked, so they wait for the landing plus the retention, as before. The
+    /// floor keeps seq 5's tick read as later by the clock error (C5); restored out of order, the
+    /// trim would stop below seq 4.
     #[test]
-    fn a_reopen_trims_what_the_marks_cover_on_its_first_tick_and_spares_the_tail() {
+    fn a_reopen_trims_what_the_marks_cover_at_restore_and_spares_the_tail() {
         let dir = config_testkit::fs::temp_dir();
         let path = dir.path().join("node");
         let rt = current_thread();
@@ -9387,15 +9468,21 @@ mod tests {
             .expect("restore");
         let epsilon = Budgets::SPEC_DEFAULTS.clock_error_millis;
         assert_eq!(
-            host.published_at[&PartitionId(1)],
-            [
-                (Generation(1), Seq(3), old.plus_millis(epsilon)),
-                (Generation(1), Seq(5), old.plus_millis(10 + epsilon)),
-            ],
-            "restored oldest first, each tick read as later by the clock error (C5)"
+            dedup_trims_queued(&host),
+            [(1, 6)],
+            "one trim at restore, below seq 6"
+        );
+        assert_eq!(
+            host.trim_floors[&(PartitionId(1), Generation(1))],
+            (Seq(6), old.plus_millis(10 + epsilon)),
+            "the floor is seq 5's tick read as later by the clock error (C5)"
+        );
+        assert!(
+            host.published_at[&PartitionId(1)].is_empty(),
+            "nothing marked is left to age"
         );
         host.trim_duty(host.clock.now()).expect("trim");
-        assert_eq!(dedup_trims_queued(&host), [(1, 6)], "one trim, below seq 6");
+        assert_eq!(dedup_trims_queued(&host), [(1, 6)], "the tick adds no trim");
         assert_eq!(host.trim_deletes, 1, "the floor is deleted on disk too");
     }
 
@@ -9460,6 +9547,43 @@ mod tests {
             [(1, 6)],
             "generation 1 trimmed at once"
         );
+    }
+
+    /// A-R186: a clean stop writes the publish marks at once, inside the mark period. The host
+    /// restored its marks (none), then published seqs 6 and 7 of generation 1. Its stop through
+    /// `run` leaves both on disk, ticks verbatim (C1), with no trim tick in between. Without the
+    /// final write the disk keeps the empty set and a reopen ages them from its landing.
+    #[test]
+    fn a_clean_stop_writes_the_publish_marks_at_once() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let now = HostClock::start().now();
+        let published = [
+            (Generation(1), Seq(6), Tick(now.0 - 20)),
+            (Generation(1), Seq(7), Tick(now.0 - 10)),
+        ];
+        {
+            let mut host = host_over(&path, &rt);
+            host.restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            host.published_at
+                .entry(PartitionId(1))
+                .or_default()
+                .extend(published);
+            let (tx, rx) = mpsc::channel();
+            tx.send(Msg::Stop).expect("send stop");
+            host.run(&rx);
+        }
+        let marks: Vec<Mark> = RocksEngine::open(&path)
+            .expect("open engine")
+            .publish_marks(PartitionId(1))
+            .expect("read marks")
+            .into_iter()
+            .map(|mark| (mark.generation, mark.seq, mark.tick))
+            .collect();
+        assert_eq!(marks, published, "the stop wrote both marks verbatim");
     }
 
     /// A-R183, lead k205: rows trimmed in memory but not yet deleted on disk keep their mark. A

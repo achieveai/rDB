@@ -3673,6 +3673,10 @@ fn wait_ready_line(
         Err(e @ ReadyError::Stopped { .. }) => {
             ("stopped", Err(format!("stopped waiting for ready: {e}")))
         }
+        // A-R196: its text ends "shut this Db down and open the folder again".
+        Err(e @ ReadyError::Blocked { .. }) => {
+            ("blocked", Err(format!("stopped waiting for ready: {e}")))
+        }
     };
     let error = answer.err().map(|e| e.to_string());
     tracing::info!(

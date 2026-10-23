@@ -386,7 +386,11 @@ fn open_ready(
             db.shutdown();
             return Err(ExitCode::from(3));
         }
-        Err(error @ (ReadyError::TimedOut { .. } | ReadyError::Stopped { .. })) => {
+        Err(
+            error @ (ReadyError::TimedOut { .. }
+            | ReadyError::Stopped { .. }
+            | ReadyError::Blocked { .. }),
+        ) => {
             tracing::error!(%error, "pilot_not_ready");
             println!("not ready: {error}");
             db.shutdown();

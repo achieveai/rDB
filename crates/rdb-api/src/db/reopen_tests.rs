@@ -1049,9 +1049,11 @@ fn m10_cut_two_opens_counting_at_once_never_get_one_number() {
     assert_eq!(next, 4);
 }
 
-/// Survivor 6 (`MAX_OPENS`): the 2^24-th open is counted, and the one after it is refused
-/// `Exhausted` with the counter left as it was. The counter is seeded with layout 1's bytes
-/// (`[1]` then N as a little-endian u64), which this build reads.
+/// Survivor 6 (`MAX_OPENS`): the 2^23-th open is counted, and the one after it is refused
+/// `Exhausted` with the counter left as it was. 2^23 is the cap because the last counted open
+/// numbers its own writes below 2^63, the first id `app_request_id` builds (A-R195). The
+/// counter is seeded with layout 1's bytes (`[1]` then N as a little-endian u64), which this
+/// build reads.
 /// Unit (~1 ms): `count_open` against a `MemStore`.
 #[test]
 fn m10_cut_the_open_after_max_opens_is_refused_and_counts_nothing() {
@@ -1099,7 +1101,7 @@ fn m10_cut_the_open_after_max_opens_is_refused_and_counts_nothing() {
     );
     assert_eq!(
         refused.expect_err("refused").to_string(),
-        format!("{key} has counted 16777216 opens, the most one directory may have")
+        format!("{key} has counted 8388608 opens, the most one directory may have")
     );
     let after = read();
     assert_eq!(
@@ -1107,6 +1109,11 @@ fn m10_cut_the_open_after_max_opens_is_refused_and_counts_nothing() {
         (at_cap.mod_revision, at_cap.value),
         "the refused open wrote nothing"
     );
+    assert!(
+        request_floor(admin::MAX_OPENS) + (1 << 40) <= 1 << 63,
+        "the last counted open numbers its writes below every app id"
+    );
+    assert_eq!(app_request_id(0), Some(RequestId(1 << 63)));
 }
 
 /// Survivor 7 (`MAX_RESTARTS`): one open restarts a node at most `MAX_RESTARTS` times, so its
@@ -1647,8 +1654,11 @@ fn ready_db(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStor
     db
 }
 
-/// The id an app chose and kept before sending: far from any id this `Db` draws itself.
-const CHOSEN: RequestId = RequestId(0x00AB_CDEF);
+/// The id an app chose and kept before sending, built as an app builds it (A-R195).
+const CHOSEN: RequestId = match app_request_id(0x00AB_CDEF) {
+    Some(id) => id,
+    None => panic!("below 2^63"),
+};
 
 /// A-R194: `txn_as` sends under the id the app chose, so the app can keep that id before it
 /// sends and ask `status(id, gen)` afterwards, after a crash included. The answer names the
@@ -1730,5 +1740,63 @@ fn m10_r194_a_write_sent_under_a_chosen_id_is_found_by_status_under_that_id() {
         db.get(b"a").expect("get a").value.map(|(_, value)| value),
         Some(Bytes::from_static(b"1"))
     );
+    db.shutdown();
+}
+
+/// Ruling A-R195 (D11): an app's id never names a write this `Db` numbered itself. A put draws
+/// its own id k. `put_as` under the bare number k is refused `INVALID_ARGUMENT` with nothing
+/// sent, its next step naming `app_request_id`; under `app_request_id(k)` it is a write of its
+/// own, and status finds each id at its own position, with both values read back. Cut: the
+/// `_as` check is dropped, and the bare k meets the put's own request (not `INVALID_ARGUMENT`).
+/// Integration (~2 s): one fresh open until ready, three puts.
+#[config_log::retcd_test]
+fn m10_r195_an_app_id_never_names_a_write_this_db_numbered_itself() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = ready_db(&rt, dir.path(), &store);
+
+    let auto = db.put(b"a", b"1", None).expect("put a=1");
+    let k = auto.request.0;
+    let bare = db
+        .put_as(RequestId(k), b"b", b"2", None)
+        .expect_err("the Db's own id");
+    assert_eq!(
+        (bare.error.kind, bare.request.is_none()),
+        (ErrorKind::InvalidArgument, true),
+        "{bare:?}"
+    );
+    assert!(
+        bare.error
+            .detail
+            .ends_with("nothing was sent: build the id with rdb_api::app_request_id(n)"),
+        "{bare:?}"
+    );
+    assert_eq!(db.get(b"b").expect("get b").value, None, "nothing was sent");
+
+    let app = app_request_id(k).expect("k is below 2^63");
+    assert_ne!(app, auto.request);
+    let mine = db
+        .put_as(app, b"b", b"2", None)
+        .expect("put b=2 under the app's id");
+    assert_eq!(mine.request, app);
+    for (id, ok) in [(auto.request, &auto), (app, &mine)] {
+        match db.status(id, Some(ok.generation)).expect("status") {
+            TxnStatus::Resolved(result) => assert_eq!(
+                (result.generation, result.seq),
+                (ok.generation, ok.seq),
+                "request {}: {result:?}",
+                id.0
+            ),
+            other => panic!("status of request {}: {other:?}", id.0),
+        }
+    }
+    assert_ne!(auto.seq, mine.seq, "two writes, not one replayed");
+    for (object, value) in [(b"a", b"1"), (b"b", b"2")] {
+        assert_eq!(
+            db.get(object).expect("get").value.map(|(_, value)| value),
+            Some(Bytes::copy_from_slice(value))
+        );
+    }
     db.shutdown();
 }
