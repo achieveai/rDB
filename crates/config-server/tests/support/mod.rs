@@ -752,9 +752,12 @@ impl PolicyFixture {
 
     /// Write a document at `version` granting [`PRINCIPAL`] read and write on each prefix.
     ///
-    /// The signature is written **first** so the pair is never observed as "new document, old
-    /// signature": the poller reads the document then the signature, and the reverse order would
-    /// hand it a `hash_mismatch` on every rotation for one tick.
+    /// The two files are two renames, and a poll can land between them. A missing file is
+    /// written **last**, so that poll finds the same file missing as before the write and is
+    /// refused for the same reason, not a new one (#58). When both files exist (a rotation), no
+    /// order hides the change: one poll can see the new signature beside the old document and
+    /// refuse it as `version_binding` or `hash_mismatch`. A row that counts `policy_rejected`
+    /// lines across a rotation must allow for that.
     pub fn write(&self, version: u64, prefixes: &[&str], admins: &[&str]) {
         use config_core::policy::{document_hash, grant, signature_payload, PolicySignature};
         use ed25519_dalek::Signer;
@@ -790,8 +793,16 @@ impl PolicyFixture {
         }
         .encode()
         .expect("an envelope encodes");
-        write_atomically(&self.signature_file, &envelope);
-        write_atomically(&self.policy_file, &bytes);
+        let signature_pair = (&self.signature_file, &envelope);
+        let document_pair = (&self.policy_file, &bytes);
+        let signature_missing = self.policy_file.exists() && !self.signature_file.exists();
+        let (first, last) = if signature_missing {
+            (document_pair, signature_pair)
+        } else {
+            (signature_pair, document_pair)
+        };
+        write_atomically(first.0, first.1);
+        write_atomically(last.0, last.1);
     }
 
     /// Remove both files, which is how a node starts with no valid policy at all.

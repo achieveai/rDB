@@ -29,6 +29,7 @@ use config_core::{
     WatchRequest, WatchStream,
 };
 use futures::Stream;
+use tracing::Instrument;
 use rdb_core::contracts::ids::NodeId;
 
 use super::wire::Label;
@@ -201,7 +202,8 @@ impl Faults {
                 }
                 tokio::time::sleep(POLL).await;
             }
-        })
+        }
+        .instrument(tracing::Span::current()))
     }
 }
 
