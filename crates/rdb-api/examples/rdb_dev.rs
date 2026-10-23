@@ -6032,6 +6032,41 @@ mod tests {
         assert_eq!(said.len(), 1, "{said:?}");
     }
 
+    /// Lead, on 5eeca8a: only `TimedOut` asks for another slice. An answer no wait changes
+    /// (a failed heal, node 1 restarted, `Blocked`, `Quarantined`) ends the wait on the slice
+    /// that gave it, with nothing said in between, and the run exits 1. Unit.
+    #[test]
+    fn wait_ready_ends_on_the_first_final_answer_without_another_slice() {
+        use rdb_api::db::ReadyError;
+        let finals = [
+            ReadyError::Heal(admin::HealError::NodeStopped),
+            ReadyError::Stopped {
+                note: "node 1 restarted".to_owned(),
+            },
+            ReadyError::Blocked {
+                reason: "BarrierIncomplete".to_owned(),
+            },
+            ReadyError::Quarantined,
+        ];
+        let progress = Progress::default();
+        for answer in finals {
+            let (mut slices, mut said) = (0, Vec::<String>::new());
+            let line = wait_ready_line(
+                &progress,
+                Duration::from_secs(60),
+                Duration::from_secs(10),
+                |_| {
+                    slices += 1;
+                    Err(answer.clone())
+                },
+                |line| said.push(line.to_owned()),
+            )
+            .expect_err("a final answer exits 1");
+            assert_eq!((slices, said.len()), (1, 0), "{answer:?}: {line}");
+            assert!(line.contains(&answer.to_string()), "{answer:?}: {line}");
+        }
+    }
+
     /// Tester k237 (e3b1e30): `wait ready` printed "reached ready", and the poller printed a
     /// second bare `ready` line inside the next command's output. One transition is said once:
     /// a wait that reached ready records it as printed, so the poller says nothing more until
