@@ -5645,7 +5645,7 @@ fn compile_error(error: &ValueError) -> ApiError {
         // write and clear. Ahead of `CORRUPT_BLOB`, which also matches a chunk that does not open.
         ValueError::Corrupt(corrupt) if corrupt.is_newer_build() => ApiError::new(
             ErrorKind::IncompatibleVersion,
-            format!("written by a newer build: {corrupt}"),
+            format!("written by a newer build: {corrupt}; open the folder with the newer build"),
         ),
         ValueError::Apply(
             ApplyError::VersionConflict { .. }
@@ -11390,7 +11390,8 @@ mod tests {
         };
         assert_eq!(trio.sent(damage), Ok(3));
 
-        let named = "op 0: written by a newer build: map entry \"b\": unknown codec version 0x02";
+        let named = "op 0: written by a newer build: map entry \"b\": unknown codec version 0x02; \
+                     open the folder with the newer build";
         for (request, ops) in [
             (
                 3,
@@ -11475,7 +11476,7 @@ mod tests {
                 ErrorKind::IncompatibleVersion,
                 format!(
                     "op 0: written by a newer build: map entry \"{ENTRY}\": unknown codec \
-                     version 0x02"
+                     version 0x02; open the folder with the newer build"
                 ),
             ),
             (
