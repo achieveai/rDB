@@ -3712,6 +3712,11 @@ fn wait_ready_line(
         Err(e @ ReadyError::Blocked { .. }) => {
             ("blocked", Err(format!("stopped waiting for ready: {e}")))
         }
+        // A-R196(2a): its text gives the operator's step; a reopen does not clear it.
+        Err(e @ ReadyError::Quarantined) => (
+            "quarantined",
+            Err(format!("stopped waiting for ready: {e}")),
+        ),
     };
     let error = answer.err().map(|e| e.to_string());
     tracing::info!(
