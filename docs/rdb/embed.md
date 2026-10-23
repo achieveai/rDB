@@ -295,6 +295,8 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
   missing value instead. Moving to a clean copy comes with a later release (rejoin and recovery).
 - **A restarted node stays out until the folder is opened again.** See section 5.
+- **On a very slow or overloaded machine, an open can fail with a "blocked" error** when a
+  copy answers too late. Open the folder again. An automatic retry is planned.
 
 ## 6. When an open is refused
 
