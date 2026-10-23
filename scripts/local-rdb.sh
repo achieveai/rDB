@@ -338,7 +338,7 @@ EOF
     UP_DONE=1
     [ "$ok" = 1 ] || say "some node is not ready; 'lr status' shows each, 'lr down' stops them"
     say "up. control=$CONTROL nodes=$(peers)"
-    say "pilot: $PILOT_BIN --nodes $(peers) --control $CONTROL --cert-dir $RUN/certs"
+    say "pilot: $PILOT_BIN --dir $RUN/pilot --control $CONTROL --nodes $(peers) --cert-dir $RUN/certs --put k=v --get k"
 }
 
 down() {
