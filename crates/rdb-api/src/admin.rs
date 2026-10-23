@@ -767,6 +767,15 @@ pub enum HealError {
         /// Why the last answer kept the grant, and the next step, in words (A-R191b).
         last: String,
     },
+    /// The grant is frozen for a takeover that has not finished. Only a promote settles it, so
+    /// the heal stops at its first look instead of waiting out its time (A-R266 follow-up).
+    #[error("the last run's grant for node {node} (grants/{node}) is frozen: {step}")]
+    Frozen {
+        /// The node.
+        node: u32,
+        /// The next step, in words.
+        step: String,
+    },
     /// The `partitions/1` read was served before the grant delete it must follow.
     #[error("partitions/1 was read at revision {read}, before the grant delete at {deleted}")]
     ReadBeforeDelete {
@@ -1108,6 +1117,20 @@ async fn clear_until(
                 return Ok(Gone::Deleted(revision, record));
             }
             Ok((Clearance::Absent, None, read)) => return Ok(Gone::Absent(read)),
+            // Waiting never clears a frozen grant: only the promote that froze it, run again.
+            Ok((
+                clearance @ Clearance::Refused {
+                    refusal: ClearRefusal::Frozen,
+                    ..
+                },
+                ..,
+            )) => {
+                tracing::warn!(node = node.0, "heal_grant_frozen");
+                return Err(HealError::Frozen {
+                    node: node.0,
+                    step: kept_in_words(clearance, node, ctx.clock.now()),
+                });
+            }
             Ok((clearance, ..)) => last = kept_in_words(clearance, node, ctx.clock.now()),
             // A lost delete reply is read again next time round, as `clear_grant` advises.
             Err(error)
@@ -2492,6 +2515,15 @@ mod tests {
         store: Arc<dyn ConfigStore>,
         rt: &tokio::runtime::Runtime,
     ) -> (Result<Healed, HealError>, Vec<Msg>) {
+        heal_once_within(store, rt, Duration::from_millis(500))
+    }
+
+    /// [`heal_once`] with the heal's time set to `within`.
+    fn heal_once_within(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+    ) -> (Result<Healed, HealError>, Vec<Msg>) {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
             store,
@@ -2499,7 +2531,7 @@ mod tests {
             budgets: Budgets::SPEC_DEFAULTS,
             clock: HostClock::start(),
             owner,
-            within: Duration::from_millis(500),
+            within,
             member_boot: Arc::new(|_| Some(OPEN_2)),
             owner_node: OWNER,
         };
@@ -3219,10 +3251,14 @@ mod tests {
     /// takeover is unfinished, run the promote again. The re-run then sends node 2 both events.
     /// Both ways a promote freezes: node 1 held grant 4 (the walk), or held none and the promote
     /// created grant 0 frozen (PR #41), which the heal once refused as "no grant issuer writes".
-    /// Cuts: the text loses its step, red; a frozen grant 0 refused as unwritten again, red.
-    /// Unit (~3 s): `MemStore`, a 500 ms heal per case.
+    /// Waiting never clears a frozen grant, so the heal answers at its first look, well inside
+    /// its 10 s, not when its time runs out.
+    /// Cuts: the text loses its step, red; a frozen grant 0 refused as unwritten again, red; the
+    /// heal waits out its time on a frozen grant, as before, red.
+    /// Unit (~2 s): `MemStore`, two promotes of 600 ms per case and a heal that answers at once.
     #[test]
     fn m10_s2_a_heal_after_a_promote_that_could_not_reach_its_node_says_to_promote_again() {
+        const HEAL_WITHIN: Duration = Duration::from_secs(10);
         let rt = runtime();
         for held in [Some(GrantId(4)), None] {
             let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -3250,14 +3286,21 @@ mod tests {
             );
             assert!(!refused.no_mutation(), "it wrote Fencing and the freeze");
 
-            let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+            let started = std::time::Instant::now();
+            let (healed, sent) = heal_once_within(Arc::clone(&store), &rt, HEAL_WITHIN);
+            let took = started.elapsed();
             let stuck = healed.expect_err("grants/1 stays frozen");
             assert_eq!(
                 stuck.to_string(),
-                "the last run's grant for node 1 (grants/1) was still held after 0.5 seconds of \
-                 trying: a takeover from node 1 is unfinished; run `admin promote <the node you \
-                 chose>` again",
+                "the last run's grant for node 1 (grants/1) is frozen: a takeover from node 1 is \
+                 unfinished; run `admin promote <the node you chose>` again",
                 "{held:?}"
+            );
+            let at_once = Duration::from_secs(1) * config_testkit::poll::deadline_scale();
+            assert!(
+                took < at_once,
+                "{held:?}: the heal answered after {took:?}, not at its first look (its time is \
+                 {HEAL_WITHIN:?})"
             );
             assert!(sent.is_empty(), "the heal sent node 1 nothing");
 
