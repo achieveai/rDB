@@ -600,6 +600,48 @@ fn m10_s2_epoch_revocations_survive_a_reopen_and_move_a_format_1_copy_to_2() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
+/// Found by the guard-deletion pass, not guessed: a lineage-scoped `metadata` key can start with
+/// the bytes `revoked` (partition `0x7265766f` is "revo", a generation whose first bytes are
+/// "ked"), and the revocation scan read it as an undecodable revocation, so a legal copy's
+/// `epoch_revocations` came back `Corrupt`. The scan now skips a key the lineage layout decodes,
+/// as open does. A lineage of the highest partition id sorts after every revocation and is
+/// never reached. Cut: return `Corrupt` for a lineage-shaped key again (this row reads
+/// `Err(Corrupt)`). Unit, under a second.
+#[retcd_test]
+fn m10_s2_a_lineage_whose_key_starts_like_a_revocation_is_not_one() {
+    let dir = data_dir("revoked-lookalike");
+    let db = dir.join("db");
+    let lookalike = Lineage {
+        partition: PartitionId(u32::from_be_bytes(*b"revo")),
+        generation: Generation(u64::from_be_bytes(*b"ked\0\0\0\0\x01")),
+        owner_epoch: OwnerEpoch(1),
+    };
+    let last = Lineage {
+        partition: PartitionId(u32::MAX),
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+    };
+    let held = vec![(PartitionId(1), OwnerEpoch(2))];
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        for lineage in [lookalike, last] {
+            let history =
+                canonical_history(lineage, ConfigVersion(1), 2).expect("canonical history");
+            for batch in history.batches {
+                engine.commit(batch).expect("commit");
+            }
+        }
+        engine
+            .persist_epoch_revocation(PartitionId(1), OwnerEpoch(2))
+            .expect("revoke");
+        assert_eq!(engine.epoch_revocations(), Ok(held.clone()));
+    }
+    let engine = RocksEngine::open(&db).expect("a reopen");
+    assert_eq!(engine.epoch_revocations(), Ok(held), "after a reopen");
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
 /// A revocation's write is synced and counts as synced (A-R214). An armed `SyncedPut` fails it:
 /// nothing is written, the copy stays format 1, and nothing counts as synced. Debug builds only,
 /// as the fault point and the count are. Unit, under a second.

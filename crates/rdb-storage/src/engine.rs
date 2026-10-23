@@ -652,9 +652,15 @@ impl RocksEngine {
             if !key.starts_with(keys::REVOKED_PREFIX) {
                 break;
             }
+            // A lineage-scoped key can start with these bytes too (partition "revo", a
+            // generation starting "ked"). It is that lineage's, not a revocation: open reads it
+            // as a lineage key first, and so does this scan.
+            if decode_key(&key).is_some() {
+                continue;
+            }
             let Some(partition) = decode_revoked_key(&key) else {
                 // Open refuses an undefined short key, so this is not reached on a copy open
-                // accepted; a key that only starts like one is still not a revocation.
+                // accepted. Kept: a short key that is not a revocation is never read as none.
                 tracing::error!(
                     target: LOG_TARGET,
                     key_hex = hex(&key),
