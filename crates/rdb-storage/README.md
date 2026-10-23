@@ -34,7 +34,7 @@ and records the fault; `RocksSnapshot::fault()` returns it, and the host fails t
 (lead ruling A-R164). A view keeps the database open until it is dropped.
 
 **Chain-depth ceiling: 32 levels.** Each reopen that links adds one level. Measured with
-`snapshot_bench` (dev profile, 1k keys, 2026-10-22, commit 9531f6a + bench page metric):
+`snapshot_bench` (dev profile, 1k keys, 2026-10-22, commit 9531f6a + bench page metric). Rows 100 and 200 were measured before the flatten below; no lineage reaches them now:
 
 | depth | get p50 / p99 | miss p50 / p99 | page of 10 p50 / p99 |
 |---|---|---|---|
@@ -46,8 +46,21 @@ and records the fault; `RocksSnapshot::fault()` returns it, and the host fails t
 
 A get costs about 1 us per level and a page about 5 us per level; key count barely
 moves them (depth 1, get p50 2 us at 1k keys and 4 us at 100k). Past 32 levels a page read passes 0.3 ms at p99.
-Nothing enforces the ceiling yet: a lineage deeper than 32 should be re-based by a full copy,
-which stops the chain.
+
+**Enforced since A-R166 (2026-10-22): the flatten.** A reopen whose parent is already 32 levels
+deep copies instead of linking: the child is re-based on a full copy of the parent's merged
+view (values only, tombstones dropped, versions kept) and starts again at depth 1. It is the
+existing `Copied` inherit, so the parents stay on disk and `History` still falls through to them
+for `seq <= base`; only the read chain for the other namespaces is cut. `chain_depth` never passes
+32 (depth 40 reads as 8, depth 100 as 4). The one-time cost, dev profile, 2026-10-22:
+
+| keys | flatten | records copied | get p50 after |
+|---|---|---|---|
+| 1k | 40 ms | 2 311 | 3.0 us |
+| 10k | 356 ms | 20 311 | 2.6 us |
+| 100k | 3.05 s | 200 311 | 4.6 us |
+
+About 15 us per record copied (User and Dedup). The reopen that flattens blocks for that long.
 
 ## Entry point
 
@@ -60,7 +73,7 @@ $B --dir <D> [--log-dir <L>] <command>
 | Command | Does |
 |---|---|
 | `write --records N [--partition P] [--generation G] [--abort]` | Commits the next N (1..=1000000) canonical batches of lineage (P, G), default (1, 1). Resumes after the lineage's applied seq and head digest (read through the chain), so a second run never re-commits seq 1. Refused (exit 8) on a sealed or staging lineage. |
-| `inherit --partition P --from G1 --to G2 --base B [--abort]` | (P, G2) starts at (P, G1)'s state at seq B. Linked when G1's applied is B; copied when it is above B (a late write). Same args again: no-op (`inherit_noop`). |
+| `inherit --partition P --from G1 --to G2 --base B [--abort]` | (P, G2) starts at (P, G1)'s state at seq B. Linked when G1's applied is B; copied when it is above B (a late write), or when G1 already reads through 32 levels (the flatten, A-R166). Same args again: no-op (`inherit_noop`). |
 | `delete [--partition P] [--generation G]` | Commits the next seq as a delete of the canonical user key `k`, with its chained History record. A tombstone in a linked lineage. |
 | `read [--partition P] [--generation G] [--ns user|dedup|history|progress|meta] [--key-hex H]` | One record as (P, G) sees it through the chain: `version=` and `from=<generation>`. Default key: `k` (user) or the progress key. **Read-only** (`open_read_only`): no lock, writes no file, so it works while a writer holds the database. |
 | `snapshot [--partition P] [--generation G]` | Every record of (P, G)'s `RocksSnapshot`, through the chain. **Read-only** like `read`: no lock, writes no file. |
@@ -93,8 +106,8 @@ Data and logs go under `C:/rdb_test_data/m8/...`, never `C:/` root or `%TEMP%`.
 | 2 | Usage error, including a flag given twice |
 | 3 | Lineage fault (`verify ... FAULT <reason>`; `read`/`snapshot` of a staging lineage; `flush` of a lineage the database does not hold) |
 | 4 | durable > applied, refused at open |
-| 5 | Locked: another process holds the database |
-| 6 | Layout refused: column-family set, format marker, or a corrupt record (the message says what is wrong with it). Every open refusal (exits 4, 6) is decided on a read-only open, so a refused command changes no file in `--dir` |
+| 5 | Locked: another open holds the directory's `CLAIM` file (A-R168) or RocksDB's `LOCK` |
+| 6 | Layout refused: column-family set, format marker, or a corrupt record (the message says what is wrong with it). Every open refusal (exits 4, 6) is decided on a read-only open, so a refused command changes no file in `--dir`, except an empty `CLAIM` file (A-R168, 2026-10-22) |
 | 7 | Other RocksDB / IO error |
 | 8 | Storage fault on commit or flush (reach it by hand with `--inject`). A write or delete into a sealed or staging generation ends its `FAILED` line with `refused: generation G is sealed by C` or `... is staging a copy from generation P at base B` |
 | 9 | No database at `--dir` (`verify`, `flush`, `dump` never create one; only `write` does) |
