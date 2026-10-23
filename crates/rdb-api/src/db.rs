@@ -6527,14 +6527,16 @@ mod tests {
     /// A-R177 row 9 (critic-f5 residual): a copy below the base in its own generation. Node 2
     /// misses `b` while 1-2 is held, so it stops at seq 1 of generation 1 while nodes 1 and 3
     /// hold 2; the next reopen runs without node 2 and commits generation 2 at base 2. The
-    /// reopen after that cannot link generation 2 for node 2 (its head is below the base), and
-    /// a cross-generation catch-up does not exist yet: it is owed to slice 2. This row guards
-    /// slice 1's bar until then (A-R179): no host fault, and the stall is named
-    /// (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line). It waits for that line, not
-    /// a fixed time.
-    /// Integration (~20 s): the stall only shows after three real opens and the rebuild watch.
+    /// reopen after that cannot link generation 2 for node 2 (its head is below the base).
+    /// Re-cut 2026-10-23 (M10 S2, issue #59, K1/K2): node 2 now catches up across the two
+    /// generations. Generation 3 commits, F1 proves node 2 durable in it
+    /// (`sync_proven node=2 generation=3 durable=3`), node 1 admits writes, and nothing stalls
+    /// or faults. Slice 1's bar was no fault and a named stall (A-R179); the stall is gone now.
+    /// Cut: undo K1/K2's catch-up, and node 2 stalls again, so this row goes red.
+    /// Integration (~20 s): three real opens, and the catch-up needs the third one's recovery.
     #[config_log::retcd_test]
-    fn m10_d7_below_the_base_a_copy_has_no_fault_and_its_stall_is_named() {
+    fn m10_d7_below_the_base_a_copy_catches_up() {
+        const METHOD: &str = "m10_d7_below_the_base_a_copy_catches_up";
         let rt = runtime();
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -6588,14 +6590,30 @@ mod tests {
         drop(db);
 
         let mut db = open(Vec::new());
-        let stalled = settle(&db, "the reopen with node 2 below the base", &|owner| {
-            owner.stalled.is_some()
+        let proven = |line: &serde_json::Value| {
+            line["@m"] == "sync_proven" && line["node"] == 2 && line["generation"] == 3
+        };
+        settle(&db, "the reopen with node 2 below the base", &|owner| {
+            owner.admits == Some(true)
+                && config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                    .iter()
+                    .any(proven)
         });
-        let line = stalled.stalled.clone().unwrap_or_default();
+        let durable: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .filter(|line| proven(line))
+            .map(|line| line["durable"].as_u64())
+            .collect();
         assert!(
-            line.starts_with("recovery_rebuild_stalled") && line.contains("gen=3"),
-            "the stall names generation 3's rebuild: {line}"
+            !durable.is_empty() && durable.iter().all(|seq| *seq == Some(3)),
+            "F1 proves node 2 durable at 3 in generation 3: {durable:?}"
         );
+        let stalled: Vec<_> = db
+            .node_status()
+            .into_iter()
+            .filter(|node| node.stalled.is_some())
+            .collect();
+        assert!(stalled.is_empty(), "nothing stalls: {stalled:?}");
         db.shutdown();
     }
 
