@@ -361,7 +361,7 @@ use rdb_api::{
     Op, OpenError, Path, PutError, ReadOk, Timeouts, Token, TxnPut, Value,
 };
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord, PartitionRoot};
 use rdb_core::contracts::authority::DenyReason;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::RetryRule;
@@ -3693,7 +3693,11 @@ fn set_lifecycle(
     rewrite(rt, cluster, &key, |body| {
         let mut record = PartitionRecord::decode(body)?;
         record.lifecycle = lifecycle;
-        Some((record.encode(), format!("{:?}", record.lifecycle)))
+        // A rooted body (layout 3) stays rooted: `encode` alone writes layout 2 and drops the
+        // `PartitionRoot` the open wrote (review F-004).
+        let bytes = PartitionRoot::decode(body)
+            .map_or_else(|| record.encode(), |root| record.encode_with(&root));
+        Some((bytes, format!("{:?}", record.lifecycle)))
     })
 }
 
@@ -6465,6 +6469,63 @@ mod tests {
             .expect("opens");
         db.wait_ready(Duration::from_secs(60)).expect("ready");
         (rt, cluster, db)
+    }
+
+    /// Review F-004 (A-R219): `control lifecycle` rewrote `partitions/1` with
+    /// `PartitionRecord::encode`, layout 2, so a fencing then serving round trip dropped the
+    /// `PartitionRoot` the open wrote. The rewrite keeps the root: after the round trip it reads
+    /// back unchanged, and the next open on the same folder becomes ready. Integration (~5 s):
+    /// three real rEtcd voters and two opens.
+    #[test]
+    fn a_lifecycle_round_trip_keeps_the_partition_root_and_the_next_open_succeeds() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
+        db.shutdown();
+        let key = ControlKey::Partition(PartitionId(1)).encode();
+        let partition_root = || {
+            let leader = cluster.leader_now().expect("a control leader");
+            let read = rt
+                .block_on(cluster.client(leader).get(GetRequest {
+                    key: Bytes::from(key.clone()),
+                }))
+                .expect("partitions/1 reads");
+            PartitionRoot::decode(&read.record.expect("partitions/1 is present").value)
+        };
+        let before = partition_root();
+        assert!(before.is_some(), "the open wrote a root");
+        for (lifecycle, says) in [
+            (PartitionLifecycle::Fencing, "Fencing"),
+            (PartitionLifecycle::Serving, "Serving"),
+        ] {
+            let line = set_lifecycle(&rt, &cluster, PartitionId(1), lifecycle);
+            assert!(line.ends_with(says), "{line}");
+        }
+        assert_eq!(partition_root(), before, "the round trip keeps the root");
+
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                cluster.client_endpoints(),
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            dir: root.path().join("run"),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+        };
+        let mut db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("the next open succeeds");
+        db.wait_ready(Duration::from_secs(60))
+            .expect("the next open becomes ready");
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
     }
 
     /// A-R211: `admin damage <set> --element K` with `--as newer` or `--as kind0` is refused

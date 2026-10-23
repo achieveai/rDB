@@ -2,7 +2,7 @@
 name = "rdb-pilot"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 publish = false
 description = "pilot_kv: a small app that keeps its data in rDB, written the way docs/rdb/embed.md says an outside crate does it"

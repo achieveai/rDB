@@ -541,6 +541,13 @@ fn m10_d3_slice1_guard_a_copy_behind_two_writeless_reopens_stalls_named_and_lose
         admitted.iter().all(|(_, allow)| !allow),
         "writes stay paused from the first reopen on: {admitted:?}"
     );
+    // Review F-009 (A-R219): `all` holds on an empty list, so the row also needs B to have
+    // said, last, that writes are paused.
+    assert_eq!(
+        admitted.last().map(|(_, allow)| *allow),
+        Some(false),
+        "B's last admission change pauses writes: {admitted:?}"
+    );
     let durable = [A_NODE, B_NODE, C_NODE].map(|node| {
         runner
             .dispatcher()

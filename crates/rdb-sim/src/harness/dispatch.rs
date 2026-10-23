@@ -2166,6 +2166,10 @@ impl Dispatcher {
     /// routing. The host sends the target `Msg::Restore`, and the source restores when its
     /// `Msg::CatchUp` arrives.
     ///
+    /// **A second difference (review F-011):** neither restore passes through the scripted
+    /// network, so a dropped or held link to the target neither stops nor delays it. The host's
+    /// `Msg::Restore` travels the link and honours both.
+    ///
     /// # Errors
     ///
     /// `harness::dispatch::deliver::recovery` when no holder was placed for `source`: F1 selected
@@ -2236,6 +2240,9 @@ impl Dispatcher {
     /// Never faults: a copy that cannot be restored is logged `dormant_restore_refused{reason}`
     /// and holds no receiver, so R1 refuses its catch-up `NotASource` and F1's deadline ends
     /// the recovery `Blocked`. A down node has no process to restore.
+    ///
+    /// Called directly, never delivered: no link drop or hold applies to it, unlike the host's
+    /// `Msg::Restore` (review F-011; see [`Self::catch_up`]).
     fn restore_dormant(
         &mut self,
         node: NodeId,
