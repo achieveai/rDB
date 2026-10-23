@@ -213,12 +213,14 @@
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
 //! admin clear <o>                        clear a damaged object: prove it damaged, then
-//!                                         delete all of it, healthy entries too. A bad map
-//!                                         entry or set member is repaired by a `map put`/`del`
-//!                                         or `set del` of its key instead; clear is for a
-//!                                         damaged root (copy the healthy entries out first
-//!                                         with `members --after`, carrying on past a bad key
-//!                                         with `--after` that key). A byte 0/3 or newer
+//!                                         delete all of it, healthy entries too. Its root
+//!                                         or any one entry being damaged is enough. To keep
+//!                                         the rest, write over a bad map entry or set member
+//!                                         first (`map put`/`del` or `set del` of its key);
+//!                                         to keep the rest under a damaged root, copy the
+//!                                         healthy entries out first with `members --after`,
+//!                                         carrying on past a bad key with `--after` that
+//!                                         key. A byte 0/3 or newer
 //!                                         build's record anywhere in the object refuses the
 //!                                         clear: open it with the newer build. It deletes
 //!                                         one batch of its records per call, each at the version
@@ -239,7 +241,11 @@
 //!                                         whose digest fails (`digest`, the default), whose
 //!                                         kind is 0x00 (`kind0`), or whose codec is 0x02,
 //!                                         digest correct (`newer`: a newer build's record). A
-//!                                         set member holding any bytes is damage too. With
+//!                                         set member holding any bytes is damage too. A set
+//!                                         member has no envelope, so on a set --element takes
+//!                                         `digest` only; `kind0` and `newer` are refused, and
+//!                                         nothing is written. For a newer build's set, damage
+//!                                         the root with --as newer. With
 //!                                         --element the root's own bytes are written again
 //!                                         in the same write, so a read meets that fault and
 //!                                         a `map put`/`del` of K repairs a `digest` entry. A
@@ -2588,7 +2594,14 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
     // version read: both carry the write's version (lead, on the 8e083a9 walk).
     if element.is_some() {
         match root_rewrite(db, object, &root, &what) {
-            Ok(put) => mutations.push(put),
+            // A-R211: a set member has no envelope, so a sealed one there is only bytes, which
+            // reads as damage whatever `--as` says. Refused before anything is written.
+            Ok((_, CollectionKind::Set)) if matches!(how, "newer" | "kind0") => {
+                return Err(format!(
+                    "admin damage: {SET_MEMBER_AS}; not a member with --as {how}"
+                ));
+            }
+            Ok((put, _)) => mutations.push(put),
             Err(said) => {
                 say(&format!("err admin damage: {said}"));
                 return Ok(());
@@ -2638,7 +2651,7 @@ fn root_rewrite(
     object: &str,
     root: &rdb_value::keys::RootKey,
     what: &str,
-) -> Result<rdb_core::contracts::txn::Mutation, String> {
+) -> Result<(rdb_core::contracts::txn::Mutation, CollectionKind), String> {
     use rdb_core::contracts::errors::ErrorKind;
     use rdb_value::collection::KEY_PROFILE_V1;
     use rdb_value::value::{Map, MapKey};
@@ -2675,12 +2688,19 @@ fn root_rewrite(
     let payload = rdb_value::cbor::encode(&Value::Map(fields)).expect("a two-field map encodes");
     let sealed = rdb_value::envelope::seal(found.kind.kind(), &payload)
         .expect("a root payload is a few bytes");
-    Ok(rdb_core::contracts::txn::Mutation::Put {
-        key: root.to_bytes(),
-        value: sealed,
-        expected_version: Some(found.version),
-    })
+    Ok((
+        rdb_core::contracts::txn::Mutation::Put {
+            key: root.to_bytes(),
+            value: sealed,
+            expected_version: Some(found.version),
+        },
+        found.kind,
+    ))
 }
+
+/// Why `admin damage <set> --element K` takes only `--as digest` (A-R211).
+const SET_MEMBER_AS: &str = "a set member holds no envelope, so any bytes in it are damage; \
+     damage a set member with --as digest, or a newer build's set with the root and --as newer";
 
 const DAMAGE_RECORD_USAGE: &str = "admin damage <object> [--element K | --item P] \
      [--as digest|kind0|newer] [--api-version N]; K is a map key or set member, P a list \
@@ -6411,18 +6431,9 @@ mod tests {
         rt.block_on(cluster.shutdown());
     }
 
-    /// k325 P2 (k326): a put and an `admin clear` refused for a newer build's record say the
-    /// next step, `open the folder with the newer build`, as embed.md does. Before, the put said
-    /// only what it met and the clear only `not cleared`. Kind, retry and `no_mutation` are
-    /// unchanged (A-R200). Integration (~3 s): three real rEtcd voters and one open.
-    #[test]
-    fn a_newer_build_s_refusal_names_the_next_step() {
-        use rdb_core::contracts::errors::ErrorKind;
-        const STEP: &str = "; open the folder with the newer build";
-        let _env = ENV
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = config_testkit::fs::temp_dir();
+    /// Three real rEtcd voters, and one `Db` on them at `<dir>/run`, ready. The caller holds the
+    /// `ENV` lock and shuts down the Db, then the cluster, on the runtime returned.
+    fn ready_on_voters(dir: &std::path::Path) -> (tokio::runtime::Runtime, Cluster, Db) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -6443,16 +6454,105 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
-            dir: root.path().join("run"),
+            dir: dir.join("run"),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
         };
-        let mut db = rt
+        let db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
             .expect("opens");
         db.wait_ready(Duration::from_secs(60)).expect("ready");
+        (rt, cluster, db)
+    }
+
+    /// A-R211: `admin damage <set> --element K` with `--as newer` or `--as kind0` is refused
+    /// before anything is written. A set member has no envelope, so the sealed record the flag
+    /// names would only be bytes in it, which reads as damage (CORRUPT_HISTORY), never as a newer
+    /// build's record: the echo `as=newer` over member-bytes damage misled the tester. The REPL
+    /// prints the refusal as `usage: ...` and the run exits 1, as for any refused line. `--as
+    /// digest` still damages the member. The help says both. Integration (~3 s): three real
+    /// rEtcd voters and one open.
+    #[test]
+    fn damage_a_set_member_as_newer_or_kind0_is_refused_and_writes_nothing() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let help = usage();
+        for says in [
+            "or any one entry being damaged is enough",
+            "on a set --element takes",
+            "`digest` only; `kind0` and `newer` are refused, and",
+        ] {
+            assert!(help.contains(says), "help lacks {says:?}");
+        }
+        assert!(
+            !help.contains("clear is for a"),
+            "the stricter wording is gone"
+        );
+
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
+        let x = || Value::Text("x".to_owned());
+        db.write(
+            b"s",
+            Change::Set(vec![
+                ElemOp::Add(x()),
+                ElemOp::Add(Value::Text("y".to_owned())),
+            ]),
+            Some(Expected::Absent),
+        )
+        .expect("the set is written");
+        let members = || Look::Members {
+            after: None,
+            limit: 10,
+        };
+        let version = |db: &Db| match db.read(b"s", members()) {
+            Ok(ReadOk {
+                seen: rdb_api::Seen::Members(page),
+                ..
+            }) => (page.collection.version, page.members.len()),
+            other => panic!("the set reads: {other:?}"),
+        };
+        let before = version(&db);
+        for how in ["newer", "kind0"] {
+            let refused =
+                damage_record(&db, &format!(r#"admin damage s --element "x" --as {how}"#))
+                    .expect_err(how);
+            assert_eq!(
+                refused,
+                format!(
+                    "admin damage: a set member holds no envelope, so any bytes in it are \
+                     damage; damage a set member with --as digest, or a newer build's set with \
+                     the root and --as newer; not a member with --as {how}"
+                )
+            );
+            assert_eq!(version(&db), before, "{how}: nothing was written");
+        }
+        damage_record(&db, r#"admin damage s --element "x""#).expect("digest is the default");
+        let damaged = db.read(b"s", members()).expect_err("x holds bytes");
+        assert!(
+            damaged.detail.contains("set member record holds"),
+            "{damaged:?}"
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// k325 P2 (k326): a put and an `admin clear` refused for a newer build's record say the
+    /// next step, `open the folder with the newer build`, as embed.md does. Before, the put said
+    /// only what it met and the clear only `not cleared`. Kind, retry and `no_mutation` are
+    /// unchanged (A-R200). Integration (~3 s): three real rEtcd voters and one open.
+    #[test]
+    fn a_newer_build_s_refusal_names_the_next_step() {
+        use rdb_core::contracts::errors::ErrorKind;
+        const STEP: &str = "; open the folder with the newer build";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
         db.put(b"x", b"1", None).expect("x is written");
         damage_record(&db, "admin damage x --as newer").expect("the line parses");
 
@@ -6493,36 +6593,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        let cluster = rt.block_on(
-            Cluster::builder()
-                .nodes(3)
-                .storage(StorageKind::ROCKS)
-                .timers(CONTROL_TIMERS)
-                .start(),
-        );
-        rt.block_on(cluster.leader());
-        let store: Arc<dyn ConfigStore> = Arc::new(
-            config_client::GrpcClient::connect(
-                cluster.client_endpoints(),
-                config_client::GrpcClientOptions::default(),
-            )
-            .expect("a control client"),
-        );
-        let config = DbConfig {
-            dir: root.path().join("run"),
-            hold: Vec::new(),
-            timeouts: Timeouts::default(),
-            dedup_cap: None,
-            dedup_retention: None,
-        };
-        let mut db = rt
-            .block_on(Db::open(config, store, rt.handle().clone()))
-            .expect("opens");
-        db.wait_ready(Duration::from_secs(60)).expect("ready");
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
         let int = |n: u64| Value::Integer(Int::from(n));
         let text = |t: &str| Value::Text(t.to_owned());
         let entries = (1..=3).map(|n| ElemOp::Put(int(n), text(&n.to_string())));
