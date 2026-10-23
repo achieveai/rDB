@@ -6310,17 +6310,18 @@ mod tests {
         db.shutdown();
     }
 
-    /// A-R186, the tester's clean quit: a quit right after the puts that fill the cap still
-    /// leaves their publish marks. Cap 2, retention 4 s: puts a and b fill it and the process
-    /// quits at once, inside the mark period. Two retentions later a reopen lands a put within
-    /// one trim tick plus slack of admitting, not a retention after its landing. Node 1's
-    /// final mark comes back on the reopen at the same generation and seq, its tick plus the
-    /// clock error only (C1). Without the final write nothing marks a or b, and the put waits
-    /// for the landing plus the 4 s retention.
+    /// A-R186 and A-R193, the tester's clean quit: a quit right after the puts that fill the
+    /// cap still leaves their publish marks, and a reopen trims what they cover before it
+    /// admits. Cap 2, retention 4 s: puts a and b fill it and the process quits at once, inside
+    /// the mark period. Two retentions later the first two puts after the reopen admits both
+    /// land, with no OVERLOADED and no wait for a trim tick. Node 1's final mark comes back on
+    /// the reopen at the same generation and seq, its tick plus the clock error only (C1), and
+    /// its restore trims generation 1 through it. Without the final write nothing marks a or
+    /// b; without the trim at restore the first put waits up to a trim tick.
     /// Integration (~11 s): two opens with two real retentions between them.
     #[config_log::retcd_test]
-    fn m10_a_clean_quit_at_the_cap_reopens_writable_within_a_trim_tick() {
-        const METHOD: &str = "m10_a_clean_quit_at_the_cap_reopens_writable_within_a_trim_tick";
+    fn m10_a_clean_quit_at_the_cap_reopens_writable_at_once() {
+        const METHOD: &str = "m10_a_clean_quit_at_the_cap_reopens_writable_at_once";
         let retention = Duration::from_secs(4);
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -6353,19 +6354,12 @@ mod tests {
 
         let mut db = open();
         admits(&db, "the reopen");
-        let admitted = std::time::Instant::now();
-        let bound = Duration::from_millis(crate::host::HOST_TRIM_EVERY_MILLIS + 1_500);
-        loop {
-            match db.put(b"c", b"1", None) {
-                Ok(_) => break,
-                Err(refused) => assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}"),
-            }
-            assert!(
-                admitted.elapsed() < bound,
-                "a and b were not trimmed within {bound:?} of admitting"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // A-R193: the restore trimmed a and b before admitting, so both free slots are there
+        // at once, with no OVERLOADED and no wait for a trim tick.
+        db.put(b"c", b"1", None)
+            .expect("the first put after the reopen lands at once");
+        db.put(b"d", b"1", None)
+            .expect("the second put after the reopen lands at once");
         db.shutdown();
         drop(db);
 
@@ -6404,6 +6398,17 @@ mod tests {
             restored,
             [written[0], written[1], written[2] + epsilon],
             "the reopen restores the final mark verbatim, plus the clock error"
+        );
+        let pre_trims: Vec<_> = lines
+            .iter()
+            .filter(node_1)
+            .filter(|line| line["@m"] == "host_duty" && line["kind"] == "pre_trim")
+            .map(|line| (line["generation"].clone(), line["below"].clone()))
+            .collect();
+        assert_eq!(
+            pre_trims,
+            [(serde_json::json!(1), serde_json::json!(written[1] + 1))],
+            "node 1 trimmed generation 1 through the final mark at the restore"
         );
     }
 
