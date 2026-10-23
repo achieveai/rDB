@@ -68,6 +68,10 @@
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
+//! put --as <n> <object> <value> [--if-version N]
+//!                                         the same put under request id app_request_id(n),
+//!                                         your own number n below 2^63, used once; recorded
+//!                                         for `retry` like any put
 //! put& <object> <value> [--if-version N]  the same put in the background: prints `bg
 //!                                         <object>: queued` and returns at once, and `bg
 //!                                         <object>: <answer>` when it lands; not remembered
@@ -90,7 +94,9 @@
 //! retry [<request>] --deadline-ms N       the same request with a fresh deadline of N ms
 //! retry [<request>] --payload <value>     the same put and request id with another value,
 //!                                         compiled afresh (REQUEST_ID_REUSE); not remembered.
-//!                                         A put's only, never a txn's
+//!                                         A `put --as` put's only: under an id this Db
+//!                                         numbered it is refused and nothing is sent
+//!                                         (A-R195), and never a txn's
 //! doc <object> [--absent | --expect V] <op>...
 //!                                         change a JSON document, ops in order, as one write.
 //!                                         An op is `--json J` (the whole document), `set
@@ -1292,6 +1298,17 @@ fn repl<'scope, 'env>(
         }
         let outcome = match words.as_slice() {
             ["quit" | "exit"] => break,
+            ["put", "--as", n, object, value, rest @ ..] => parse_app_id(n).and_then(|id| {
+                let if_version = parse_if_version(rest)?;
+                let answer = db.put_as(id, object.as_bytes(), value.as_bytes(), if_version);
+                let kind = Kind::Put {
+                    object: object.as_bytes().to_vec(),
+                    if_version,
+                };
+                put_line(db, answer, Some((&mut sent, kind)));
+                Ok(())
+            }),
+            ["put", "--as", ..] => Err("put --as <n> <object> <value> [--if-version N]".to_owned()),
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
                 Ok(if_version) => {
                     let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
@@ -1617,7 +1634,8 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
         "sleep", "quit", "exit", "blob",
     ];
-    const SUBVERBS: [&str; 18] = [
+    const SUBVERBS: [&str; 19] = [
+        "put --as",
         "blob upload",
         "blob chunk",
         "blob publish",
@@ -1652,6 +1670,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "put" | "put&" | "get" | "read" | "doc" | "map" | "set" | "members" | "list" | "items" => 1,
         "blob upload" | "blob chunk" | "blob publish" | "blob gc" | "admin damage-chunk"
         | "admin damage" | "admin clear" => 2,
+        "put --as" => 3,
         _ => return (verb, None),
     };
     let object = split_words(line)
@@ -2786,6 +2805,20 @@ fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Whether `request` is an app's id, one `app_request_id` built, which `put_as` takes.
+fn is_app_id(request: RequestId) -> bool {
+    let bit = rdb_api::app_request_id(0).expect("0 is below 2^63").0;
+    request.0 & bit != 0
+}
+
+/// The request id `put --as <n>` sends under: `app_request_id(n)` (A-R195a).
+fn parse_app_id(n: &str) -> Result<RequestId, String> {
+    n.parse::<u64>()
+        .ok()
+        .and_then(rdb_api::app_request_id)
+        .ok_or_else(|| format!("put --as N: N is a number below 2^63, not {n}"))
+}
+
 fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
     match rest {
         [] => Ok(None),
@@ -2799,9 +2832,16 @@ fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
 
 /// What `retry <id> --payload` re-puts: the object and condition of the put `request` was
 /// sent as. A txn has no single object, so it is refused (S1 guard G10).
+/// Only under an app id: `put_as` refuses one this Db numbered (A-R195a).
 fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>), String> {
     match kind {
-        Kind::Put { object, if_version } => Ok((object, if_version)),
+        Kind::Put { object, if_version } if is_app_id(request) => Ok((object, if_version)),
+        Kind::Put { .. } => Err(format!(
+            "retry --payload sends a new value under request {}, an id this Db numbered itself, \
+             and the Db refuses that: nothing was sent. Send the write under an id of your own \
+             instead: put --as <n> <object> <value>, then retry it with --payload",
+            request.0
+        )),
         Kind::Txn => Err(format!(
             "retry --payload changes a put's value; request {} was a txn",
             request.0
@@ -5165,15 +5205,55 @@ mod tests {
 
     /// S1 ruling A7, guard G10: `retry <id> --payload` re-puts the object and condition of a
     /// put. A txn has no single object, so it is refused with a usage line. Unit (~1 ms).
+    /// A-R195a: the put is one sent under an app id (`put --as`); a Db-numbered one is
+    /// `retry_payload_under_a_db_numbered_id_says_to_put_as`'s.
     #[test]
     fn retry_payload_re_puts_a_put_and_refuses_a_txn() {
         let put = Kind::Put {
             object: b"a".to_vec(),
             if_version: Some(3),
         };
-        assert_eq!(payload_put(put, RequestId(4)), Ok((b"a".to_vec(), Some(3))));
+        let app = rdb_api::app_request_id(4).expect("an app id");
+        assert_eq!(payload_put(put, app), Ok((b"a".to_vec(), Some(3))));
         let refused = payload_put(Kind::Txn, RequestId(5)).expect_err("a txn has no one object");
         assert!(refused.ends_with("request 5 was a txn"), "{refused}");
+    }
+
+    /// A-R195a: `retry <id> --payload` sends the put again with `put_as`, and `put_as` refuses
+    /// an id this Db numbered itself (A-R195). So rdb_dev refuses it first, plainly, naming the
+    /// next step, instead of passing on the API's `app_request_id` advice. Unit.
+    #[test]
+    fn retry_payload_under_a_db_numbered_id_says_to_put_as() {
+        let put = Kind::Put {
+            object: b"a".to_vec(),
+            if_version: None,
+        };
+        let refused = payload_put(put, RequestId(4)).expect_err("a Db-numbered put");
+        assert!(
+            refused.contains("request 4")
+                && refused.contains("put --as <n> <object> <value>")
+                && refused.contains("nothing was sent"),
+            "{refused}"
+        );
+        // The walk's first build printed this over three lines (an escaped `\n` in the source).
+        assert!(
+            !refused.contains('\n'),
+            "one line, as the REPL prints it: {refused:?}"
+        );
+    }
+
+    /// A-R195a: `put --as <n>` sends under `app_request_id(n)`; a number that is not one, or is
+    /// 2^63 or more, is refused before anything is sent. Unit.
+    #[test]
+    fn put_as_takes_the_app_s_number_and_refuses_one_out_of_range() {
+        assert_eq!(
+            parse_app_id("7"),
+            Ok(rdb_api::app_request_id(7).expect("7"))
+        );
+        for bad in ["x", "-1", "9223372036854775808"] {
+            let refused = parse_app_id(bad).expect_err(bad);
+            assert!(refused.starts_with("put --as N:"), "{bad}: {refused}");
+        }
     }
 
     /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
@@ -5311,6 +5391,7 @@ mod tests {
         const METHOD: &str = "d5_a_typed_line_logs_its_verb_and_key_hex_never_its_text";
         let typed = [
             ("put zqk1 zqv1", "put", Some("zqk1")),
+            ("put --as 7 zqk18 zqv18", "put --as", Some("zqk18")),
             ("put& zqk2 zqv2 --if-version 3", "put&", Some("zqk2")),
             ("txn zqk3=zqv3 2:zqk4=zqv4@1", "txn", None),
             (
