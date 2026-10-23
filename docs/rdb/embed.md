@@ -327,12 +327,15 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   the key you read last (`None` to start). The read that fails is the entry right after the last
   good key. Your app's own record of its keys says which key that is.
 - **What a write does not repair.** An `add` or a `need` on a damaged set member succeeds and
-  leaves it damaged. An entry damaged in header byte 0 or 3 reads as a newer build's, and so
-  does a real newer build's entry: a write that names it is refused `INCOMPATIBLE_VERSION`. For
-  those, and for a damaged root, the only remedy is to clear the object:
+  leaves it damaged. For a damaged root, the remedy is to clear the object:
   `db.write(object, Change::Clear, None)` (rdb_dev `admin clear`). **That deletes the whole map
-  or set, healthy entries too.** If you need them, copy them out first with the walk above, then
-  clear. Repairing one such entry (`repair_element`) comes with a later release.
+  or set, healthy entries too.** If you need them, copy them out first with the walk above. When
+  a read fails, carry on from the next entry with `after` set to the bad key. Then clear.
+- **Nothing in this build repairs a newer build's record.** An entry damaged in header byte 0 or
+  3 reads as a newer build's, and so does a real newer build's entry. A write that names it, a
+  full read of the object, and a clear of it are all refused `INCOMPATIBLE_VERSION`, with
+  nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
+  (`repair_element`) comes with a later release.
 - **A restarted node stays out until the folder is opened again.** See section 5.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. An automatic

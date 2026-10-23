@@ -213,9 +213,11 @@
 //!                                         delete all of it, healthy entries too. A bad map
 //!                                         entry or set member is repaired by a `map put`/`del`
 //!                                         or `set del` of its key instead; clear is for a
-//!                                         damaged root, a byte 0/3 or newer build's entry
-//!                                         (copy the healthy entries out first with `members`;
-//!                                         one-entry repair for those comes later). It deletes
+//!                                         damaged root (copy the healthy entries out first
+//!                                         with `members --after`, carrying on past a bad key
+//!                                         with `--after` that key). A byte 0/3 or newer
+//!                                         build's record anywhere in the object refuses the
+//!                                         clear: open it with the newer build. It deletes
 //!                                         one batch of its records per call, each at the version
 //!                                         it was read at (`clear ok ...`). Repeat until `clear
 //!                                         unchanged (nothing to clear; nothing sent)`. A
@@ -787,59 +789,67 @@ impl Progress {
 /// Print the partition's progress lines as it changes, every 100 ms.
 fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
-        let nodes = db.node_status();
-        let mut seen = progress
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for node in &nodes {
-            if let Some(fault) = &node.fault {
-                let line = format!("fault node={} {fault}", node.node.0);
-                if !seen.faults.contains(&line) {
-                    say(&line);
-                    seen.faults.push(line);
-                }
-            }
-            if let Some(line) = stall_change(seen.stalled.get(&node.node.0), node) {
-                say(&line);
-                match &node.stalled {
-                    Some(stalled) => seen.stalled.insert(node.node.0, stalled.clone()),
-                    None => seen.stalled.remove(&node.node.0),
-                };
-            }
-        }
-        if let Some(owner) = nodes.iter().find(|n| n.node == NodeId(1)) {
-            if owner.recovered.is_some() && owner.recovered != seen.recovered {
-                seen.recovered = owner.recovered;
-                say(&format!(
-                    "recovered gen={}",
-                    owner.recovered.map_or(0, |g| g.0)
-                ));
-            }
-            let admits = owner.admits == Some(true);
-            if let Some(line) = ready_step(
-                &mut seen,
-                owner,
-                db.restart_note().as_deref(),
-                &db.links().held(),
-                &db.links().dropped(),
-            ) {
-                say(&line);
-            }
-            if seen.recovered.is_some() && !admits {
-                let why = waiting_line(owner);
-                if seen.waiting.as_ref() != Some(&why) {
-                    say(&why);
-                    seen.waiting = Some(why);
-                }
-            }
-        } else if db.restart_failed(NodeId(1)) {
-            if let Some(line) = stopped_owner_step(&mut seen, db.restart_note().as_deref()) {
-                say(&line);
-            }
-        }
-        drop(seen);
+        poll_once(db, progress);
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Print each progress line that changed since it was last printed. The poller calls it every
+/// 100 ms, and the REPL before each command, so a change the last command made is said before
+/// the next command's output, not inside it. The status is read under the lock, so a line from
+/// an older reading never prints after a newer one (tester G4: a `not ready` line read while
+/// `admin damage` was in flight printed inside the next `members` listing, after it published).
+fn poll_once(db: &Db, progress: &Progress) {
+    let mut seen = progress
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let nodes = db.node_status();
+    for node in &nodes {
+        if let Some(fault) = &node.fault {
+            let line = format!("fault node={} {fault}", node.node.0);
+            if !seen.faults.contains(&line) {
+                say(&line);
+                seen.faults.push(line);
+            }
+        }
+        if let Some(line) = stall_change(seen.stalled.get(&node.node.0), node) {
+            say(&line);
+            match &node.stalled {
+                Some(stalled) => seen.stalled.insert(node.node.0, stalled.clone()),
+                None => seen.stalled.remove(&node.node.0),
+            };
+        }
+    }
+    if let Some(owner) = nodes.iter().find(|n| n.node == NodeId(1)) {
+        if owner.recovered.is_some() && owner.recovered != seen.recovered {
+            seen.recovered = owner.recovered;
+            say(&format!(
+                "recovered gen={}",
+                owner.recovered.map_or(0, |g| g.0)
+            ));
+        }
+        let admits = owner.admits == Some(true);
+        if let Some(line) = ready_step(
+            &mut seen,
+            owner,
+            db.restart_note().as_deref(),
+            &db.links().held(),
+            &db.links().dropped(),
+        ) {
+            say(&line);
+        }
+        if seen.recovered.is_some() && !admits {
+            let why = waiting_line(owner);
+            if seen.waiting.as_ref() != Some(&why) {
+                say(&why);
+                seen.waiting = Some(why);
+            }
+        }
+    } else if db.restart_failed(NodeId(1)) {
+        if let Some(line) = stopped_owner_step(&mut seen, db.restart_note().as_deref()) {
+            say(&line);
+        }
     }
 }
 
@@ -1261,6 +1271,8 @@ fn repl<'scope, 'env>(
                 return ExitCode::from(2);
             }
         };
+        // What the last command changed is said before this one's output (tester G4).
+        poll_once(db, progress);
         if args.script.is_some() {
             say(&format!("> {line}"));
         }
