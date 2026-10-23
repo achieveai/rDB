@@ -45,7 +45,11 @@ pub struct AppliedCandidate {
     /// (ruling A-R255; design-ackfloor rev 3, A3); `None` on every other. P1 acts on it only
     /// when it publishes this candidate, so it never forgets ahead of the record that makes the
     /// floor durable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Always serialised: a candidate crosses the peer wire in postcard inside
+    /// `KernelEvent::AppliedCandidate`, and a skipped field shifts every byte after it (ruling
+    /// A-R259). `default` lets JSON written before the field still read.
+    #[serde(default)]
     pub ack_floor: Option<AckFloor>,
 }
 
