@@ -1481,8 +1481,14 @@ fn repl<'scope, 'env>(
             }
             ["put-loop", ..] => Err(PUT_LOOP_USAGE.to_owned()),
             ["client", "drop-reply"] => {
+                // One armed drop at a time: arming again does not queue a second (tester-s2).
+                say(if drop_reply {
+                    "client drop-reply: already armed; still only the next put that applies loses \
+                     its reply"
+                } else {
+                    "client drop-reply: the next put that applies loses its reply"
+                });
                 drop_reply = true;
-                say("client drop-reply: the next put that applies loses its reply");
                 Ok(())
             }
             ["client", ..] => Err("client drop-reply".to_owned()),
@@ -1557,6 +1563,7 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["status", request, rest @ ..] => status_line(db, &sent, request, rest),
+            ["status"] => Err(STATUS_USAGE.to_owned()),
             ["nodes"] => {
                 let answered = db.node_status();
                 for node in [1, 2, 3].map(NodeId) {
@@ -2612,7 +2619,7 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
             "err admin damage-chunk: {} retry={:?} request=- ({})",
             error.name(),
             error.retry,
-            error.detail
+            error.explain()
         ),
     });
     Ok(())
@@ -2716,7 +2723,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
                     say(&format!(
                         "err admin damage: --item read {} ({})",
                         error.name(),
-                        error.detail
+                        error.explain()
                     ));
                     return Ok(());
                 }
@@ -2783,7 +2790,7 @@ fn damage_record(db: &Db, line: &str) -> Result<(), String> {
             "err admin damage: {} retry={:?} request=- ({})",
             error.name(),
             error.retry,
-            error.detail
+            error.explain()
         ),
     });
     Ok(())
@@ -2821,7 +2828,7 @@ fn root_rewrite(
             return Err(format!(
                 "--element root read {} ({})",
                 error.name(),
-                error.detail
+                error.explain()
             ))
         }
     };
@@ -2901,7 +2908,7 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
                 "err {} retry={:?} ({})",
                 error.name(),
                 error.retry,
-                error.detail
+                error.explain()
             ));
             return;
         }
@@ -3592,7 +3599,7 @@ fn put_text(answer: &Result<rdb_api::PutOk, PutError>) -> String {
                 error.name(),
                 error.retry,
                 error.no_mutation,
-                error.detail
+                error.explain()
             )
         }
     }
@@ -3610,21 +3617,24 @@ fn get_line(answer: Result<rdb_api::GetOk, rdb_api::ApiError>) {
             )),
             None => say(&format!("absent gen={} at={}", ok.generation.0, ok.at.0)),
         },
-        Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
+        Err(error) => say(&format!("err {} ({})", error.name(), error.explain())),
     }
 }
+
+/// `status`'s words, for a usage error (tester-s2: a bare `status` said "unknown command").
+const STATUS_USAGE: &str = "status <request> [<generation>]";
 
 fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(), String> {
     let request = request
         .parse::<u64>()
-        .map_err(|_| "status <request> [<generation>]".to_owned())?;
+        .map_err(|_| STATUS_USAGE.to_owned())?;
     let generation = match rest {
         [] => None,
         [g] => Some(Generation(
             g.parse()
                 .map_err(|_| "a generation is a number".to_owned())?,
         )),
-        _ => return Err("status <request> [<generation>]".to_owned()),
+        _ => return Err(STATUS_USAGE.to_owned()),
     };
     // The nodes first: a request node 1 holds in flight that publishes between the two looks is
     // then answered by the status, never called not in flight (Msg 8, W6-D1).
@@ -3643,7 +3653,7 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
         }
         Ok(status) => say(&known_status_line(request, &status)),
-        Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
+        Err(error) => say(&format!("err {} ({})", error.name(), error.explain())),
     }
     Ok(())
 }
@@ -3880,6 +3890,8 @@ fn admin_error_line(node: NodeId, error: &ApiError) -> String {
         error.name(),
         error.retry,
         error.no_mutation,
+        // The detail, not `explain`: `{words}` is this line's step, and a second would
+        // contradict it.
         error.detail
     )
 }
