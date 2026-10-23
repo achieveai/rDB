@@ -741,13 +741,17 @@ impl GrantCleared {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HealError {
     /// A grant was still not clearable when the heal's time ran out.
-    #[error("grants/{node} was not cleared within {within_ms} ms; last answer: {last}")]
+    #[error(
+        "the last run's grant for node {node} (grants/{node}) was still held after {secs} \
+         seconds of trying: {last}",
+        secs = seconds_in_words(*.within_ms)
+    )]
     NotCleared {
         /// The node.
         node: u32,
         /// The heal's bound.
         within_ms: u128,
-        /// The last answer, in words.
+        /// Why the last answer kept the grant, and the next step, in words (A-R191b).
         last: String,
     },
     /// The `partitions/1` read was served before the grant delete it must follow.
@@ -974,20 +978,20 @@ async fn clear_until(
     node: NodeId,
     deadline: tokio::time::Instant,
 ) -> Result<Gone, HealError> {
-    let mut last = String::from("nothing answered");
+    let mut last = format!("the control store did not answer; {STORE_STEP}");
     while tokio::time::Instant::now() < deadline {
         match judge(&*ctx.store, node, ctx.boot, &ctx.budgets, ctx.clock).await {
             Ok((Clearance::Cleared(revision), Some(record), _)) => {
                 return Ok(Gone::Deleted(revision, record));
             }
             Ok((Clearance::Absent, None, read)) => return Ok(Gone::Absent(read)),
-            Ok((clearance, ..)) => last = format!("{clearance:?}"),
+            Ok((clearance, ..)) => last = kept_in_words(clearance, node, ctx.clock.now()),
             // A lost delete reply is read again next time round, as `clear_grant` advises.
             Err(error)
                 if error.retry == RetryRule::BoundedJitter
                     || error.kind == ErrorKind::UnknownOutcome =>
             {
-                last = error.detail;
+                last = format!("the control store answered: {}; {STORE_STEP}", error.detail);
             }
             Err(error) => return Err(HealError::Control(error.detail)),
         }
@@ -998,6 +1002,85 @@ async fn clear_until(
         within_ms: ctx.within.as_millis(),
         last,
     })
+}
+
+/// The next step when another process may still hold the grant (A-R191b, tester w3a03).
+const OTHER_OPEN_STEP: &str = "another open may hold this folder's data, for example a live \
+                               copy of this folder: shut it down, then open again";
+
+/// The next step when the control store did not settle an answer.
+const STORE_STEP: &str = "open again once the control store answers";
+
+/// Why `clearance` kept `grants/{node}` in place, with the next step, in words for
+/// [`HealError::NotCleared`] (A-R191b). `now` is the heal's clock, so a guard's until-time reads
+/// as a time of day and a distance from now.
+fn kept_in_words(clearance: Clearance, node: NodeId, now: Tick) -> String {
+    match clearance {
+        Clearance::Refused {
+            refusal: ClearRefusal::NotProvenExpired,
+            until_utc_ms,
+        } => {
+            let left = i128::from(until_utc_ms) - i128::from(now.0);
+            let when = if left > 0 {
+                format!(
+                    "about {} seconds from now",
+                    seconds_in_words(left.unsigned_abs())
+                )
+            } else {
+                "which has just passed".to_owned()
+            };
+            format!(
+                "it may still be in use until {} UTC ({when}), and later if its holder keeps \
+                 renewing it; {OTHER_OPEN_STEP}",
+                clock_in_words(until_utc_ms)
+            )
+        }
+        Clearance::Refused {
+            refusal: ClearRefusal::Frozen,
+            ..
+        } => "it is frozen for a takeover that has not finished, so another open may be taking \
+              over this folder's data: let it finish or shut it down, then open again"
+            .to_owned(),
+        Clearance::Refused {
+            refusal: ClearRefusal::PartitionInTransfer(partition),
+            ..
+        } => format!(
+            "partition {} names node {} as its owner and is not serving yet: let that move \
+             finish, then open again",
+            partition.0, node.0
+        ),
+        Clearance::Current => format!(
+            "it names the boot this open runs node {} at, so another open of this folder's data \
+             may be running now, for example a live copy of this folder: shut it down, then open \
+             again",
+            node.0
+        ),
+        Clearance::Conflict => format!(
+            "it changed while it was being cleared, so something still renews it; \
+             {OTHER_OPEN_STEP}"
+        ),
+        Clearance::Absent | Clearance::Cleared(_) => {
+            format!(
+                "the control store gave an answer that does not fit ({clearance:?}); {STORE_STEP}"
+            )
+        }
+    }
+}
+
+/// Milliseconds as seconds with at most one decimal: 13200 is "13.2", 30000 is "30".
+fn seconds_in_words(ms: u128) -> String {
+    let tenths = ms / 100;
+    if tenths.is_multiple_of(10) {
+        (tenths / 10).to_string()
+    } else {
+        format!("{}.{}", tenths / 10, tenths % 10)
+    }
+}
+
+/// UTC milliseconds as a time of day, `HH:MM:SS`.
+fn clock_in_words(utc_ms: i64) -> String {
+    let secs = utc_ms.div_euclid(1000).rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 /// What [`clear_grant`] did with `grants/{node}`. The simulator's service answers the same way
