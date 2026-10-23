@@ -6,6 +6,7 @@
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
 //!                                           [--control host:port[,host:port...]] [--requests F]
 //!                                           [--abort-after-commit] [--pause-before-sync N=MS]
+//!                                           [--nodes N=E[,N=E...] --cert-dir D [--app NAME]]
 //! cargo run -p rdb-api --example rdb_dev -- --help
 //! ```
 //!
@@ -32,8 +33,17 @@
 //! `warn` naming its line; the other requests still retry. An append to F that fails is said
 //! with `err`, and the run exits 1.
 //!
-//! `--nodes E` and `--client-id N` are slice 2 flags this build does not run yet: either one is
-//! refused with `not built yet: <flag>; nothing was started`, and the run exits 2.
+//! `--nodes 1=E1,2=E2,3=E3 --cert-dir D [--app NAME]` is app-only mode (A-R245), for node
+//! processes such as `scripts/local-rdb.sh up` starts: this process runs no node and opens its
+//! `Db` with links that dial node N at peer address EN, as app NAME (default `admin`,
+//! certificate `D/app-NAME.*`). It needs `--control`, and refuses `--hold`, `--dedup-cap`,
+//! `--dedup-retention-ms`, `--abort-after-commit` and `--pause-before-sync`, which set up a
+//! node this process runs. It waits up to 5 s for every link, then says one line per node,
+//! `link node=N up boot=B` or `link node=N down: <last dial error>`, and goes on either way: a
+//! dead node is what an admin run replaces. `admin status` says the records and those lines.
+//!
+//! `--client-id N` is a slice 2 flag this build does not run yet: it is refused with
+//! `not built yet: --client-id N; nothing was started`, and the run exits 2.
 //!
 //! `--abort-after-commit` is a dev and test hook (A-R184): the process aborts as soon as a
 //! recovery commits, before the new generation is linked or marked activated. With `--control`
@@ -210,6 +220,9 @@
 //!                                         are M10 (achieveai/rDB#42). To write again,
 //!                                         quit and start rdb_dev again. Refused until the
 //!                                         first `ready`
+//! admin status                            read-only: the partitions/ and grants/ records
+//!                                         through this Db's store, as `control` prints them,
+//!                                         then each `--nodes` link's `link node=N ..` line
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
 //!                                         and it may go: `absent`, `current` (the running
 //!                                         process's own), `cleared rev=R`, `conflict`, or
@@ -388,6 +401,10 @@ use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::TestTimers;
 use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
+use rdb_api::net::faults::Faults;
+use rdb_api::net::wire::Label;
+use rdb_api::net::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
+use rdb_api::transport::Links;
 use rdb_api::{
     ApiError, Change, CollectionKind, Db, DbConfig, Delta, ElemOp, Expected, Int, ListEdit, Look,
     Op, OpenError, Path, PutError, ReadOk, Timeouts, Token, TxnPut, Value,
@@ -437,6 +454,13 @@ struct Args {
     /// `--pause-before-sync <node>=<ms>`, repeatable: that node's next barrier sync sleeps
     /// `ms` before it fsyncs, once (A-R198).
     pause_before_sync: Vec<(NodeId, Duration)>,
+    /// `--nodes N=E,..`: app-only mode (A-R245). This process runs no node; it reaches node N
+    /// at peer address E over mTLS links, as app `--app`. Empty: the three nodes run here.
+    nodes: std::collections::BTreeMap<NodeId, String>,
+    /// `--cert-dir D`: the run's certificates, read for `--nodes`.
+    cert_dir: Option<PathBuf>,
+    /// `--app NAME`: the app certificate `--nodes` dials as.
+    app: String,
     /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
     help: bool,
 }
@@ -475,6 +499,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         requests: None,
         abort_after_commit: false,
         pause_before_sync: Vec::new(),
+        nodes: std::collections::BTreeMap::new(),
+        cert_dir: None,
+        app: "admin".to_owned(),
         help: false,
     };
     while let Some(arg) = args.next() {
@@ -531,19 +558,63 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     parsed.hold.push(parse_pair(pair)?);
                 }
             }
-            // Slice 2 flags this build does not run yet (W7 day 1): refused by name before
+            "--nodes" => {
+                for pair in value("--nodes")?
+                    .split(',')
+                    .filter(|p| !p.trim().is_empty())
+                {
+                    let (node, addr) = pair
+                        .trim()
+                        .split_once('=')
+                        .ok_or_else(|| format!("--nodes: {pair:?} is not N=host:port"))?;
+                    let node = parse_node(node).map_err(|e| format!("--nodes: {e}"))?;
+                    parsed.nodes.insert(node, addr.trim().to_owned());
+                }
+            }
+            "--cert-dir" => parsed.cert_dir = Some(PathBuf::from(value("--cert-dir")?)),
+            "--app" => parsed.app = value("--app")?,
+            // A slice 2 flag this build does not run yet (W7 day 1): refused by name before
             // anything starts, never as an unknown argument.
-            flag @ ("--nodes" | "--client-id") => {
+            flag @ "--client-id" => {
                 value(flag)?;
-                let shape = if flag == "--nodes" { "E" } else { "N" };
-                return Err(format!(
-                    "not built yet: {flag} {shape}; nothing was started"
-                ));
+                return Err(format!("not built yet: {flag} N; nothing was started"));
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
+    app_only_check(&parsed)?;
     Ok(parsed)
+}
+
+/// `--nodes` needs `--cert-dir` and `--control`, and refuses each flag that sets up a node this
+/// process runs: with `--nodes` it runs none, so such a flag would do nothing (A-R245).
+fn app_only_check(args: &Args) -> Result<(), String> {
+    if args.nodes.is_empty() {
+        return match (&args.cert_dir, args.app.as_str()) {
+            (Some(_), _) => Err("--cert-dir is read only with --nodes".to_owned()),
+            (None, "admin") => Ok(()),
+            (None, _) => Err("--app is read only with --nodes".to_owned()),
+        };
+    }
+    if args.cert_dir.is_none() {
+        return Err("--nodes needs --cert-dir: the run's certificates".to_owned());
+    }
+    if args.control.is_none() {
+        return Err("--nodes needs --control: the rEtcd the nodes use".to_owned());
+    }
+    let local_only = [
+        ("--hold", !args.hold.is_empty()),
+        ("--dedup-cap", args.dedup_cap.is_some()),
+        ("--dedup-retention-ms", args.dedup_retention.is_some()),
+        ("--abort-after-commit", args.abort_after_commit),
+        ("--pause-before-sync", !args.pause_before_sync.is_empty()),
+    ];
+    match local_only.iter().find(|(_, set)| *set) {
+        Some((flag, _)) => Err(format!(
+            "{flag} sets up a node this process runs; with --nodes it runs none"
+        )),
+        None => Ok(()),
+    }
 }
 
 fn parse_node(text: &str) -> Result<NodeId, String> {
@@ -631,6 +702,18 @@ where
             return ExitCode::from(1);
         }
     };
+    // App-only (A-R245): links to the node processes, up before the open, as pilot_kv's are.
+    let links = if args.nodes.is_empty() {
+        None
+    } else {
+        match connect_app(&rt, args) {
+            Ok(links) => Some(links),
+            Err(e) => {
+                eprintln!("rdb_dev: --nodes: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    };
     let config = DbConfig {
         dir: args.dir.clone(),
         hold: args.hold.clone(),
@@ -640,8 +723,12 @@ where
         },
         dedup_cap: args.dedup_cap,
         dedup_retention: args.dedup_retention,
-        local: rdb_api::db::ALL_NODES.to_vec(),
-        links: None,
+        local: if links.is_some() {
+            Vec::new()
+        } else {
+            rdb_api::db::ALL_NODES.to_vec()
+        },
+        links,
         client: rdb_api::db::DEFAULT_CLIENT,
         boot: None,
     };
@@ -730,7 +817,13 @@ where
         }
     };
     // A fresh folder bootstraps; a folder with data takes over from its last run (M10 S1-1).
-    if db.heal_state() == rdb_api::db::HealState::NotNeeded {
+    // App-only, the open starts no recovery: the node processes run partition 1.
+    if !args.nodes.is_empty() {
+        say(&format!(
+            "app-only: this process runs no node; it reaches partition 1's nodes as app {:?}",
+            args.app
+        ));
+    } else if db.heal_state() == rdb_api::db::HealState::NotNeeded {
         say("bootstrap: partition 1 recovery started");
     } else {
         say("reopen: partition 1 takes over from the last run (heal started)");
@@ -804,6 +897,46 @@ fn close(
     if !existed {
         remove(&args.dir);
     }
+}
+
+/// How long `--nodes` waits for every link to come up before it goes on with those that are.
+const LINK_WAIT: Duration = Duration::from_secs(5);
+
+/// `--nodes`: links that dial every node as app `--app`, modelled on pilot_kv's `connect`
+/// (A-R245). Unlike the pilot, a node that is not up is no failure: an admin run is how a dead
+/// owner is replaced, so each link's state is said and the run goes on. `Err` only when the
+/// certificates cannot be read or the links cannot start.
+fn connect_app(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, String> {
+    let label = Label::App(args.app.clone());
+    let cert_dir = args
+        .cert_dir
+        .as_deref()
+        .ok_or("--nodes needs --cert-dir: the run's certificates")?;
+    let tls = certs::load(cert_dir, &label).map_err(|e| format!("--cert-dir: {e}"))?;
+    let peers: Vec<NodeId> = args.nodes.keys().copied().collect();
+    let links = Links::new();
+    let net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label,
+                boot: BootId(0),
+                tls,
+                peers: peers.iter().copied().collect(),
+                dial: args.nodes.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+            },
+            &links,
+            None,
+        )
+        .map_err(|e| format!("links: {e}"))?
+    };
+    let waited = rt.block_on(net.wait_up(&peers, LINK_WAIT));
+    let lines = link_lines(&net.states());
+    tracing::info!(app = %args.app, all_up = waited.is_ok(), links = ?lines, "rdb_dev_links");
+    lines.iter().for_each(|line| say(line));
+    Ok(links)
 }
 
 /// What the REPL's `control` verbs reach: the voters, and the Db's store over them.
@@ -1597,8 +1730,15 @@ fn repl<'scope, 'env>(
                 );
                 Ok(())
             }
+            ["admin", "status"] => {
+                admin_status_lines(rt, db, store)
+                    .iter()
+                    .for_each(|l| say(l));
+                Ok(())
+            }
             ["admin", ..] => Err(format!(
-                "admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | {DAMAGE_USAGE} | \
+                "admin status | admin clear-grant <n>: n is 1, 2 or 3 | admin clear <object> | \
+                 {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
             )),
             ["control", ..] => match control {
@@ -3813,6 +3953,15 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
     };
     // Only this thread stops a voter, so the leader is still running here.
     let store = cluster.client(leader);
+    for line in record_lines(rt, &*store, "control") {
+        say(&line);
+    }
+}
+
+/// The `partitions/` and `grants/` records `store` holds, one line each, as `control` and
+/// `admin status` print them. A list that fails is one `err <verb> list <prefix>: ..` line.
+fn record_lines(rt: &tokio::runtime::Runtime, store: &dyn ConfigStore, verb: &str) -> Vec<String> {
+    let mut lines = Vec::new();
     for prefix in ["partitions/", "grants/"] {
         let listed = rt.block_on(store.list(ListRequest {
             prefix: Bytes::from_static(prefix.as_bytes()),
@@ -3828,16 +3977,46 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
                     } else {
                         GrantRecord::decode(&record.value).map(|r| format!("{r:?}"))
                     };
-                    say(&format!(
+                    lines.push(format!(
                         "{key} rev={} {}",
                         record.mod_revision,
                         body.unwrap_or_else(|| "<undecodable>".to_owned())
                     ));
                 }
             }
-            Err(e) => say(&format!("err control list {prefix}: {e}")),
+            Err(e) => lines.push(format!("err {verb} list {prefix}: {e}")),
         }
     }
+    lines
+}
+
+/// `admin status`, read-only (A-R245): the records through this Db's own store, as an admin
+/// sees them, then each link when the nodes run in other processes (`--nodes`).
+fn admin_status_lines(
+    rt: &tokio::runtime::Runtime,
+    db: &Db,
+    store: &dyn ConfigStore,
+) -> Vec<String> {
+    let mut lines = record_lines(rt, store, "admin status");
+    match db.links().net() {
+        Some(net) => lines.extend(link_lines(&net.states())),
+        None => lines.push("links: the three nodes run in this process".to_owned()),
+    }
+    lines
+}
+
+/// One line per node `--nodes` dials, saying whether its link is up (A-R245). A node that is
+/// down, such as one `lr kill` stopped, is said with the last dial error, not refused.
+fn link_lines(states: &std::collections::BTreeMap<NodeId, LinkState>) -> Vec<String> {
+    states
+        .iter()
+        .map(|(node, state)| match state {
+            LinkState::Up(boot) => format!("link node={} up boot={}", node.0, boot.0),
+            LinkState::Waiting(None) => format!("link node={} down: not reached yet", node.0),
+            LinkState::Waiting(Some(error)) => format!("link node={} down: {error}", node.0),
+            LinkState::Refused(why) => format!("link node={} refused: {why}", node.0),
+        })
+        .collect()
 }
 
 /// A `partitions/` body as `control` prints it: the record, then `root=` and the root a
@@ -4202,6 +4381,21 @@ fn wait_recovered(
     }
 }
 
+/// `wait ready`'s line after a slice that ran out, from [`ReadyError::TimedOut`]'s documented
+/// `phase`: "unknown" is node 1 answering no status look in that slice, which the line says in
+/// words rather than as a fault (A-R245, #59); "none" is node 1 running no recovery.
+///
+/// [`ReadyError::TimedOut`]: rdb_api::db::ReadyError::TimedOut
+fn still_waiting_line(phase: &str) -> String {
+    match phase {
+        "unknown" => "still waiting for ready: node 1 answered no status look in that time (it \
+                      may be busy, for example syncing its copies, or down)"
+            .to_owned(),
+        "none" => "still waiting for ready: node 1 runs no recovery".to_owned(),
+        phase => format!("still waiting for ready: recovery phase {phase}"),
+    }
+}
+
 /// How often `wait ready` says it is still waiting.
 const WAIT_PROGRESS_EVERY: Duration = Duration::from_secs(10);
 
@@ -4240,7 +4434,7 @@ fn wait_ready_line(
                     waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "repl_wait_progress"
                 );
-                said(&format!("still waiting for ready: recovery phase {phase}"));
+                said(&still_waiting_line(&phase));
             }
             Err(ReadyError::TimedOut { phase, .. }) => {
                 break Err(ReadyError::TimedOut {
@@ -5508,6 +5702,9 @@ mod tests {
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
+            nodes: std::collections::BTreeMap::new(),
+            cert_dir: None,
+            app: "admin".to_owned(),
             help: false,
         };
         let voters_under_dir = AtomicBool::new(false);
@@ -5663,6 +5860,9 @@ mod tests {
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
+            nodes: std::collections::BTreeMap::new(),
+            cert_dir: None,
+            app: "admin".to_owned(),
             help: false,
         };
         let opened = AtomicBool::new(false);
@@ -6341,6 +6541,9 @@ mod tests {
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
+            nodes: std::collections::BTreeMap::new(),
+            cert_dir: None,
+            app: "admin".to_owned(),
             help: false,
         };
         let code = run(&args, Db::open);
@@ -6361,7 +6564,8 @@ mod tests {
 
     /// M10 S2 day 1 (W7): each slice-2 verb this build does not run answers `not built yet` by
     /// its name, so the tester's walk goes red by name, not as `unknown command`; the verbs it
-    /// sits beside still run. The two slice-2 flags are refused by name before anything starts.
+    /// sits beside still run. `--client-id`, the slice-2 flag not built yet, is refused by name
+    /// before anything starts.
     /// Cut: drop a line of `not_built` and its verb reads as a usage error. Unit.
     #[test]
     fn slice_2_verbs_and_flags_answer_not_built_yet_by_name() {
@@ -6387,18 +6591,11 @@ mod tests {
             assert_eq!(not_built(&words), None, "{line} still runs");
         }
         let args = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
-        for (words, said) in [
-            (
-                ["--nodes", "127.0.0.1:1"],
-                "not built yet: --nodes E; nothing was started",
-            ),
-            (
-                ["--client-id", "2"],
-                "not built yet: --client-id N; nothing was started",
-            ),
-        ] {
-            assert_eq!(args(&words).expect_err("refused").as_str(), said);
-        }
+        // `--nodes` is built (A-R245): `app_only_flags_parse_and_refuse_what_they_cannot_use`.
+        assert_eq!(
+            args(&["--client-id", "2"]).expect_err("refused").as_str(),
+            "not built yet: --client-id N; nothing was started"
+        );
         assert!(usage().contains("not built yet: <verb>; nothing was done"));
     }
 
@@ -6672,6 +6869,174 @@ mod tests {
         .expect("ready");
         assert!(line.starts_with("reached ready in "), "{line}");
         assert_eq!(said.len(), 1, "{said:?}");
+    }
+
+    /// A-R245: a slice in which node 1 gave no status answer said `recovery phase unknown`,
+    /// which read as a fault. Each slice now says what node 1 answered: nothing, no recovery,
+    /// or its phase. Cut: print `recovery phase {phase}` for every phase and the first two
+    /// lines go red. Unit.
+    #[test]
+    fn still_waiting_says_what_node_1_answered() {
+        use rdb_api::db::ReadyError;
+        let phases = ["unknown", "none", "ProposalUnresolved"];
+        let (mut slices, mut said) = (0, Vec::new());
+        wait_ready_line(
+            &Progress::default(),
+            Duration::from_secs(40),
+            Duration::from_secs(10),
+            |slice| {
+                slices += 1;
+                match phases.get(slices - 1) {
+                    Some(phase) => Err(ReadyError::TimedOut {
+                        within_ms: slice.as_millis(),
+                        phase: (*phase).to_owned(),
+                    }),
+                    None => Ok(()),
+                }
+            },
+            |line| said.push(line.to_owned()),
+        )
+        .expect("ready in the fourth slice");
+        assert_eq!(
+            said,
+            [
+                "still waiting for ready: node 1 answered no status look in that time (it may be \
+                 busy, for example syncing its copies, or down)",
+                "still waiting for ready: node 1 runs no recovery",
+                "still waiting for ready: recovery phase ProposalUnresolved",
+            ]
+        );
+    }
+
+    /// A-R245: `--nodes` is app-only mode. It parses `N=host:port` pairs and defaults `--app`
+    /// to `admin`; it needs `--cert-dir` and `--control`; and each flag that sets up a node this
+    /// process runs is refused by name, as is `--cert-dir` or `--app` without `--nodes`. Cut:
+    /// skip `app_only_check` and every refusal below goes green-to-red. Unit.
+    #[test]
+    fn app_only_flags_parse_and_refuse_what_they_cannot_use() {
+        let with = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        let base = [
+            "--nodes",
+            "1=127.0.0.1:41, 2=127.0.0.1:42,3=127.0.0.1:43",
+            "--cert-dir",
+            "C",
+            "--control",
+            "127.0.0.1:9",
+        ];
+        let args = with(&base).expect("parses");
+        assert_eq!(
+            args.nodes
+                .iter()
+                .map(|(n, e)| (n.0, e.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (1, "127.0.0.1:41"),
+                (2, "127.0.0.1:42"),
+                (3, "127.0.0.1:43")
+            ]
+        );
+        assert_eq!(args.cert_dir, Some(PathBuf::from("C")));
+        assert_eq!(args.app, "admin");
+        let ops = with(&[&base[..], &["--app", "ops"]].concat()).expect("parses");
+        assert_eq!(ops.app, "ops");
+        for (words, said) in [
+            (
+                vec!["--nodes", "1=a:1", "--control", "c:1"],
+                "--nodes needs --cert-dir: the run's certificates",
+            ),
+            (
+                vec!["--nodes", "1=a:1", "--cert-dir", "C"],
+                "--nodes needs --control: the rEtcd the nodes use",
+            ),
+            (
+                vec!["--cert-dir", "C"],
+                "--cert-dir is read only with --nodes",
+            ),
+            (vec!["--app", "ops"], "--app is read only with --nodes"),
+            (
+                vec!["--nodes", "4=a:1"],
+                "--nodes: \"4\": a node is 1, 2 or 3",
+            ),
+            (
+                vec!["--nodes", "1:a"],
+                "--nodes: \"1:a\" is not N=host:port",
+            ),
+        ] {
+            assert_eq!(with(&words).expect_err("refused"), said, "{words:?}");
+        }
+        for (flag, value) in [
+            ("--hold", Some("1-2")),
+            ("--dedup-cap", Some("8")),
+            ("--dedup-retention-ms", Some("8")),
+            ("--abort-after-commit", None),
+            ("--pause-before-sync", Some("1=5")),
+        ] {
+            let words = [&base[..], &[flag], value.as_slice()].concat();
+            assert_eq!(
+                with(&words).expect_err("refused"),
+                format!("{flag} sets up a node this process runs; with --nodes it runs none"),
+            );
+        }
+    }
+
+    /// A-R245: each `--nodes` link is said as up, down with its last dial error, or refused,
+    /// so `lr kill 1` then an admin run reads `link node=1 down: ..`, not a failure. Unit.
+    #[test]
+    fn link_lines_say_each_node_up_down_or_refused() {
+        let states = std::collections::BTreeMap::from([
+            (
+                NodeId(1),
+                LinkState::Waiting(Some("connection refused".to_owned())),
+            ),
+            (NodeId(2), LinkState::Up(BootId(7))),
+            (NodeId(3), LinkState::Refused("unknown label".to_owned())),
+        ]);
+        assert_eq!(
+            link_lines(&states),
+            [
+                "link node=1 down: connection refused",
+                "link node=2 up boot=7",
+                "link node=3 refused: unknown label",
+            ]
+        );
+        let never = std::collections::BTreeMap::from([(NodeId(1), LinkState::Waiting(None))]);
+        assert_eq!(link_lines(&never), ["link node=1 down: not reached yet"]);
+    }
+
+    /// A-R245: `admin status` lists both prefixes through the store it is given, the Db's own,
+    /// with the revision, and says `<undecodable>` for a body it cannot read. Cut: list only
+    /// `partitions/` and the grants line goes red. Unit.
+    #[test]
+    fn admin_status_lists_partitions_and_grants_through_the_given_store() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = config_testkit::memstore::MemStore::new();
+        for key in ["partitions/1", "grants/2", "other/3"] {
+            rt.block_on(store.put(PutRequest {
+                key: Bytes::from(key),
+                value: Bytes::from_static(b"x"),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .expect("put");
+        }
+        assert_eq!(
+            record_lines(&rt, &store, "admin status"),
+            [
+                "partitions/1 rev=1 <undecodable>",
+                "grants/2 rev=2 <undecodable>"
+            ]
+        );
+        store.failing_with(config_core::ConfigError::Unavailable {
+            reason: "down".to_owned(),
+        });
+        let failed = record_lines(&rt, &store, "admin status");
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert!(
+            failed[0].starts_with("err admin status list partitions/: "),
+            "{failed:?}"
+        );
     }
 
     /// Lead, on 5eeca8a: only `TimedOut` asks for another slice. An answer no wait changes
