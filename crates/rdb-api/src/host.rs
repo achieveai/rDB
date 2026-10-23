@@ -57,7 +57,7 @@ use rdb_core::contracts::recovery::{
     SurvivorInventory,
 };
 use rdb_core::contracts::storage::{
-    CapturedPrefix, Namespace, SnapshotRead, StorageEvent, StoreEffect,
+    CapturedPrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
 };
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -100,6 +100,12 @@ pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 /// older than [`Budgets::dedup_retention_millis`] and lets T1 and P1 drop their retained
 /// answers (achieveai/rDB#34).
 pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
+
+/// D6 (ruling A-R172): the trim duty deletes trimmed Dedup rows on disk at most once per this
+/// period: a quarter of the retention, and never less often than once a minute.
+fn trim_delete_period(retention_millis: u64) -> u64 {
+    (retention_millis / 4).min(60_000)
+}
 
 /// How long after a recovery the primary's A1 is first woken to acquire its grant, when the
 /// recovery did not commit `Active`. The same value as the lowering's
@@ -989,10 +995,39 @@ enum PendingKind {
     Previous(RootKey),
 }
 
+/// Why a node faulted, typed (A-R178): every waiter, and every call after, is refused with
+/// [`Fault::error`]. A view that read stored damage refuses as `CORRUPT_HISTORY` (retry
+/// `Quarantine`), as a compile that decodes damage does; any other fault is [`ApiError::host`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fault {
+    /// The kind of stored damage the node read, when that is why it faulted.
+    damage: Option<ErrorKind>,
+    detail: String,
+}
+
+impl Fault {
+    fn error(&self) -> ApiError {
+        match self.damage {
+            Some(kind) => ApiError::new(kind, format!("host fault: {}", self.detail)),
+            None => ApiError::host(&self.detail),
+        }
+    }
+}
+
+/// A fault that names no stored damage: [`ApiError::host`], as before A-R178.
+impl From<String> for Fault {
+    fn from(detail: String) -> Self {
+        Self {
+            damage: None,
+            detail,
+        }
+    }
+}
+
 /// Why a step produced no effects.
 enum StepError {
     Module(RdbError),
-    Host(String),
+    Host(Fault),
 }
 
 /// An empty view, for the four modules that do not read storage.
@@ -1054,6 +1089,19 @@ struct Host {
     /// first, until the trim duty ages it out. Only the owner's P1 publishes, so only the owner
     /// fills it.
     published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
+    /// [`HOST_TRIM_EVERY_MILLIS`]; crate tests lower it.
+    trim_every_millis: u64,
+    /// D6 (A-R170 D, A-R172): per partition, the newest trim floor `(generation, below)` not yet
+    /// deleted on disk, and when the last durable delete ran. One delete per
+    /// [`trim_delete_period`] at most, with the latest floor.
+    trim_floors: BTreeMap<PartitionId, (Generation, Seq)>,
+    trim_deleted_at: BTreeMap<PartitionId, Tick>,
+    /// How many trims the duty sent and how many durable deletes ran, for the rows.
+    trims_sent: u64,
+    trim_deletes: u64,
+    /// D6 (A-R170 A, critic-d6 C1): per committed generation this node landed, when the Dedup
+    /// rows of every older generation it holds retire: one retention after the landing.
+    retire_due: BTreeMap<(PartitionId, Generation), Tick>,
     flushed_once: bool,
     /// Per partition, the step view and the `(generation, applied)` it was built at. Per
     /// partition, because the flusher's completions arrive on partition 0 and would otherwise
@@ -1095,7 +1143,7 @@ struct Host {
     resends: BTreeMap<(PartitionId, CopyId), Resends>,
     /// [`STUCK_RESENDS`]; crate tests lower it.
     stuck_resends: u32,
-    fault: Option<String>,
+    fault: Option<Fault>,
     /// The tick the step being carried out was offered at, its `StepCtx::now`: the tick a
     /// module judged at, which a line about one of its effects names.
     stepped_at: Tick,
@@ -1148,6 +1196,12 @@ impl Host {
             next_ticket: 1,
             next_trim: now.plus_millis(HOST_TRIM_EVERY_MILLIS),
             published_at: BTreeMap::new(),
+            trim_every_millis: HOST_TRIM_EVERY_MILLIS,
+            trim_floors: BTreeMap::new(),
+            trim_deleted_at: BTreeMap::new(),
+            trims_sent: 0,
+            trim_deletes: 0,
+            retire_due: BTreeMap::new(),
             flushed_once: false,
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -1273,7 +1327,9 @@ impl Host {
                 self.push(site, EventKind::Control(event), false, None);
                 Ok(())
             }
-            Msg::Fault { kind, detail, .. } => Err(format!("control adapter: {kind}: {detail}")),
+            Msg::Fault { kind, detail, .. } => {
+                Err(format!("control adapter: {kind}: {detail}").into())
+            }
             Msg::Inject {
                 partition,
                 correlation,
@@ -1385,16 +1441,16 @@ impl Host {
             }
             Msg::Stop => Ok(()),
         };
-        if let Err(detail) = outcome {
-            self.set_fault(detail);
+        if let Err(fault) = outcome {
+            self.set_fault(fault);
         }
     }
 
-    fn answer_faulted(&self, msg: Msg, fault: &str) {
+    fn answer_faulted(&self, msg: Msg, fault: &Fault) {
         match msg {
             Msg::Client(client) => {
                 let _ = client.reply.send(Answer::Error {
-                    error: ApiError::host(fault),
+                    error: fault.error(),
                     request: None,
                 });
             }
@@ -1405,8 +1461,8 @@ impl Host {
         }
     }
 
-    fn set_fault(&mut self, detail: String) {
-        tracing::error!(node = self.node.0, %detail, "host_fault");
+    fn set_fault(&mut self, fault: Fault) {
+        tracing::error!(node = self.node.0, detail = %fault.detail, damage = ?fault.damage, "host_fault");
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
@@ -1418,7 +1474,7 @@ impl Host {
                 "pending_failed_by_fault"
             );
             let _ = pending.reply.send(Answer::Error {
-                error: ApiError::host(&detail),
+                error: fault.error(),
                 request,
             });
         }
@@ -1430,7 +1486,7 @@ impl Host {
                     "queued_failed_by_fault"
                 );
                 let _ = client.reply.send(Answer::Error {
-                    error: ApiError::host(&detail),
+                    error: fault.error(),
                     request: None,
                 });
             }
@@ -1443,7 +1499,7 @@ impl Host {
                 "status_failed_by_fault"
             );
             let _ = reply.send(Answer::Error {
-                error: ApiError::host(&detail),
+                error: fault.error(),
                 request: None,
             });
         }
@@ -1451,7 +1507,7 @@ impl Host {
             self.drop_deferred_sync(key, asker, "fault");
         }
         self.queue.clear();
-        self.fault = Some(detail);
+        self.fault = Some(fault);
     }
 
     // ------------------------------------------------------------------ duties
@@ -1499,14 +1555,17 @@ impl Host {
         }
         if self.next_flush <= now {
             self.next_flush = now.plus_millis(HOST_FLUSH_EVERY_MILLIS);
-            if let Err(detail) = self.flush_duty() {
-                self.set_fault(detail);
+            if let Err(fault) = self.flush_duty() {
+                self.set_fault(fault);
                 return;
             }
         }
         if self.next_trim <= now {
-            self.next_trim = now.plus_millis(HOST_TRIM_EVERY_MILLIS);
-            self.trim_duty(now);
+            self.next_trim = now.plus_millis(self.trim_every_millis);
+            if let Err(fault) = self.trim_duty(now) {
+                self.set_fault(fault);
+                return;
+            }
         }
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -1530,15 +1589,15 @@ impl Host {
                 }
                 Delayed::TxnExpiry { identity, event } => self.expire_txn(identity, event, now),
             };
-            if let Err(detail) = outcome {
-                self.set_fault(detail);
+            if let Err(fault) = outcome {
+                self.set_fault(fault);
                 return;
             }
         }
     }
 
     /// The host flusher: every lineage the engine holds, through its applied prefix.
-    fn flush_duty(&mut self) -> Result<(), String> {
+    fn flush_duty(&mut self) -> Result<(), Fault> {
         let captured: Vec<CapturedPrefix> = self
             .engine
             .lineages()
@@ -1591,10 +1650,14 @@ impl Host {
     /// last aged seq plus one, so no younger entry goes. A write ages from its publish, never
     /// its commit, so a write still held unpublished is never trimmed. A sweep, not a waiter.
     ///
-    /// Publish times live in this process only. A new owner, promoted or restarted, has none
-    /// for the rows it seeds, so it must age them itself (for example, stamp them at its own
-    /// activation) and retire the old generation; M10 owes that (ruling A-R105).
-    fn trim_duty(&mut self, now: Tick) {
+    /// D6 (A-R170 D, A-R172): what a trim drops from memory is deleted on disk too, so a reopen
+    /// does not seed it again. The delete runs at most once per [`trim_delete_period`], with
+    /// the latest floor; a reopen may seed what the trims since the last delete dropped.
+    ///
+    /// Publish times live in this process only, so the rows a reopen seeds are aged from the
+    /// landing instead: [`Self::retire_duty`] retires every older generation one retention
+    /// after this node landed the new one (A-R170 A). A fault in either delete fails the node.
+    fn trim_duty(&mut self, now: Tick) -> Result<(), Fault> {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
         for (partition, published) in &mut self.published_at {
@@ -1639,7 +1702,165 @@ impl Host {
                 false,
                 None,
             );
+            self.trims_sent += 1;
+            self.trim_floors.insert(partition, (generation, below));
         }
+        self.trim_delete_duty(now)?;
+        self.retire_duty(now)
+    }
+
+    /// D6 D: the latest trim floor of each partition, deleted on disk once per
+    /// [`trim_delete_period`] at most (A-R172). Local and unreplicated; synced by storage.
+    fn trim_delete_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        let period = trim_delete_period(self.budgets.dedup_retention_millis);
+        let due: Vec<(PartitionId, (Generation, Seq))> = self
+            .trim_floors
+            .iter()
+            .filter(|(partition, _)| {
+                self.trim_deleted_at
+                    .get(partition)
+                    .is_none_or(|last| last.plus_millis(period) <= now)
+            })
+            .map(|(partition, floor)| (*partition, *floor))
+            .collect();
+        for (partition, (generation, below)) in due {
+            self.trim_floors.remove(&partition);
+            self.trim_deleted_at.insert(partition, now);
+            let deleted = self
+                .engine
+                .delete_dedup_trimmed(partition, generation, below)
+                .map_err(|fault| {
+                    format!(
+                        "dedup trim delete of p{} g{} below {}: {fault:?}",
+                        partition.0, generation.0, below.0
+                    )
+                })?;
+            self.trim_deletes += 1;
+            tracing::info!(
+                node = self.node.0,
+                kind = "trim_delete",
+                partition = partition.0,
+                generation = generation.0,
+                below = below.0,
+                deleted,
+                period_ms = period,
+                "host_duty"
+            );
+        }
+        Ok(())
+    }
+
+    /// D6 A (A-R170, critic-d6 C1 and critic-f5 C6): one retention after this node landed a
+    /// committed generation `g`, every older generation whose Dedup rows it holds retires. T1
+    /// and P1 drop them (`RetireGeneration`), and storage deletes them at every level `g` reads
+    /// (`delete_dedup_below`, `end` = the newest retired generation plus one, never `g`).
+    ///
+    /// The generations are read from disk, never from what this node landed: a copy can hold a
+    /// generation it never landed (a missed link, A-R177). A generation this node did not
+    /// inherit retires nothing here; a later landing it does hold covers it.
+    fn retire_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        let due: Vec<(PartitionId, Generation)> = self
+            .retire_due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        for (partition, serving) in due {
+            self.retire_due.remove(&(partition, serving));
+            if !self.engine.lineages().contains(&(partition, serving)) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    serving = serving.0,
+                    "dedup_retire_not_held"
+                );
+                continue;
+            }
+            let retired = self.dedup_generations_below(partition, serving)?;
+            let Some(newest) = retired.last().copied() else {
+                continue;
+            };
+            let site = Site {
+                partition,
+                correlation: CorrelationId::default(),
+            };
+            for generation in &retired {
+                self.push(
+                    site,
+                    EventKind::Kernel(KernelEvent::RetireGeneration {
+                        generation: *generation,
+                    }),
+                    false,
+                    None,
+                );
+            }
+            self.engine
+                .delete_dedup_below(partition, serving, &(newest.0 + 1).to_be_bytes())
+                .map_err(|fault| {
+                    format!(
+                        "dedup retire delete of p{} g{} through g{}: {fault:?}",
+                        partition.0, serving.0, newest.0
+                    )
+                })?;
+            tracing::info!(
+                node = self.node.0,
+                kind = "retire",
+                partition = partition.0,
+                serving = serving.0,
+                retired = ?retired.iter().map(|g| g.0).collect::<Vec<_>>(),
+                "host_duty"
+            );
+        }
+        Ok(())
+    }
+
+    /// The generations below `serving` that hold a Dedup row lineage `(partition, serving)`
+    /// reads, oldest first. A `dedup_key` leads with its generation, so one seek finds each.
+    fn dedup_generations_below(
+        &self,
+        partition: PartitionId,
+        serving: Generation,
+    ) -> Result<Vec<Generation>, Fault> {
+        let view = self
+            .engine
+            .snapshot(partition, serving, STEP_VIEW)
+            .map_err(|fault| {
+                format!("retire view of p{} g{}: {fault:?}", partition.0, serving.0)
+            })?;
+        let mut found = Vec::new();
+        let mut from = 0_u64.to_be_bytes().to_vec();
+        while let Some((key, _)) = view.scan(Namespace::Dedup, &from, 1).into_iter().next() {
+            let Some(generation) = key
+                .get(..8)
+                .and_then(|head| <[u8; 8]>::try_from(head).ok())
+                .map(u64::from_be_bytes)
+            else {
+                return Err(Fault::from(format!(
+                    "retire scan of p{} g{}: a dedup key of {} bytes",
+                    partition.0,
+                    serving.0,
+                    key.len()
+                )));
+            };
+            if generation >= serving.0 {
+                break;
+            }
+            found.push(Generation(generation));
+            from = (generation + 1).to_be_bytes().to_vec();
+        }
+        view_whole(&view, "retire scan")?;
+        Ok(found)
+    }
+
+    /// D6 A: this node landed committed generation `generation` for the first time, so the
+    /// older generations' Dedup rows retire one retention from now (A-R170; "stamp now" is
+    /// accepted, critic-d6 F2).
+    fn stamp_retirement(&mut self, partition: PartitionId, generation: Generation) {
+        let at = self
+            .clock
+            .now()
+            .plus_millis(self.budgets.dedup_retention_millis);
+        self.retire_due.insert((partition, generation), at);
     }
 
     /// F-014: the put sent as `event` still waits at its deadline plus the margin, so P1 has
@@ -1650,7 +1871,7 @@ impl Host {
         identity: RequestIdentity,
         event: EventId,
         now: Tick,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         let Entry::Occupied(waiter) = self.pending.entry(identity) else {
             return Ok(());
         };
@@ -1835,15 +2056,15 @@ impl Host {
 
     fn drain(&mut self) {
         while let Some(queued) = self.queue.pop_front() {
-            if let Err(detail) = self.process(queued) {
-                self.set_fault(detail);
+            if let Err(fault) = self.process(queued) {
+                self.set_fault(fault);
                 return;
             }
         }
     }
 
     /// Offer one event, as the sim's `Runner::run` does.
-    fn process(&mut self, queued: Queued) -> Result<(), String> {
+    fn process(&mut self, queued: Queued) -> Result<(), Fault> {
         let Queued {
             event,
             routed,
@@ -1872,17 +2093,17 @@ impl Host {
                 }
                 Err(StepError::Module(error @ RdbError::Unavailable { .. })) => {
                     if (routed && route::edge(arm, module) == Edge::Named) || addressed.is_some() {
-                        return Err(format!(
+                        return Err(Fault::from(format!(
                             "{module:?} declined {} it must answer: {error}",
                             event_name(&event.kind)
-                        ));
+                        )));
                     }
                 }
                 Err(StepError::Module(error)) => {
-                    return Err(format!(
+                    return Err(Fault::from(format!(
                         "{module:?} failed on {}: {error}",
                         event_name(&event.kind)
-                    ));
+                    )));
                 }
                 Err(StepError::Host(detail)) => return Err(detail),
             }
@@ -1980,13 +2201,13 @@ impl Host {
         &mut self,
         partition: PartitionId,
         generation: Generation,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_step_view) {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "step view of p{} g{}: injected",
                 partition.0, generation.0
-            ));
+            )));
         }
         let applied = self.engine.buffered_applied(partition, generation);
         let key = (generation, applied);
@@ -2010,6 +2231,8 @@ impl Host {
             generation = generation.0,
             applied = applied.0,
             // No record count: a lazy view's `len` reads the whole lineage (dev-w2, 9531f6a).
+            // The depth instead (S1-8 D2): the levels each read walks, O(1).
+            depth = view.depth(),
             millis = millis(started),
             "step_view"
         );
@@ -2019,7 +2242,7 @@ impl Host {
 
     // ------------------------------------------------------------------ effects
 
-    fn deliver(&mut self, effects: &[Effect]) -> Result<(), String> {
+    fn deliver(&mut self, effects: &[Effect]) -> Result<(), Fault> {
         for effect in effects {
             let site = Site {
                 partition: effect.partition,
@@ -2067,10 +2290,10 @@ impl Host {
                 EffectKind::Timer(TimerEffect::Arm { id, version, at }) => {
                     if let Some((armed, _, _)) = self.timers.get(id) {
                         if version <= armed {
-                            return Err(format!(
+                            return Err(Fault::from(format!(
                                 "{:?} armed timer {} at version {} over version {}",
                                 effect.from, id.0, version.0, armed.0
-                            ));
+                            )));
                         }
                     }
                     self.timers.insert(*id, (*version, *at, site));
@@ -2106,7 +2329,7 @@ impl Host {
         }
     }
 
-    fn store(&mut self, from: ModuleName, store: &StoreEffect, site: Site) -> Result<(), String> {
+    fn store(&mut self, from: ModuleName, store: &StoreEffect, site: Site) -> Result<(), Fault> {
         let kind = match store {
             StoreEffect::Commit(batch) => {
                 if from == ModuleName::Transaction {
@@ -2147,10 +2370,10 @@ impl Host {
             // A handle still bound is refused, never rebound (the sim's rule).
             StoreEffect::Snapshot { handle, partition } => {
                 if self.bound.contains_key(handle) {
-                    return Err(format!(
+                    return Err(Fault::from(format!(
                         "{from:?} asked to bind snapshot {} twice",
                         handle.0
-                    ));
+                    )));
                 }
                 let generation = self.adopted(*partition).generation;
                 let view = self
@@ -2167,11 +2390,9 @@ impl Host {
                 return Ok(());
             }
             StoreEffect::Release { handle } => {
-                return self
-                    .bound
-                    .remove(handle)
-                    .map(drop)
-                    .ok_or_else(|| format!("{from:?} released unbound snapshot {}", handle.0));
+                return self.bound.remove(handle).map(drop).ok_or_else(|| {
+                    format!("{from:?} released unbound snapshot {}", handle.0).into()
+                });
             }
             StoreEffect::PersistEpochRevocation { .. } => {
                 return Err(unsupported(self.node, "persist_epoch_revocation"));
@@ -2182,12 +2403,7 @@ impl Host {
     }
 
     /// One kernel effect: recorded, routed, served, or refused by name (the sim's `kernel`).
-    fn kernel(
-        &mut self,
-        from: ModuleName,
-        kernel: &KernelEffect,
-        site: Site,
-    ) -> Result<(), String> {
+    fn kernel(&mut self, from: ModuleName, kernel: &KernelEffect, site: Site) -> Result<(), Fault> {
         let node = self.node.0;
         match kernel {
             KernelEffect::Ignored { reason } => {
@@ -2339,7 +2555,7 @@ impl Host {
     }
 
     /// F1 committed a recovery here: inherit, tell the other members, wake A1 if primary.
-    fn recovered(&mut self, result: &RecoveryResult, site: Site) -> Result<(), String> {
+    fn recovered(&mut self, result: &RecoveryResult, site: Site) -> Result<(), Fault> {
         let partition = site.partition;
         tracing::info!(
             node = self.node.0,
@@ -2351,7 +2567,9 @@ impl Host {
         );
         self.inherit(partition, result)?;
         self.committed.insert(partition, Box::new(result.clone()));
-        self.landed.insert((partition, result.new_generation));
+        if self.landed.insert((partition, result.new_generation)) {
+            self.stamp_retirement(partition, result.new_generation);
+        }
         // In-process fan-out (lead ruling, 2026-10-07, under Decision 1): the result reaches the
         // other members as the control plane's watch of `partitions/{id}` would. M10 replaces it
         // with that watch.
@@ -2588,7 +2806,7 @@ impl Host {
         result: Box<RecoveryResult>,
         site: Site,
         emitter: NodeId,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         let partition = site.partition;
         let first = self.landed.insert((partition, result.new_generation));
         let barrier = in_barrier(&result, self.node);
@@ -2603,6 +2821,9 @@ impl Host {
         );
         if first && barrier {
             self.inherit(partition, &result)?;
+        }
+        if first {
+            self.stamp_retirement(partition, result.new_generation);
         }
         self.answer_deferred_syncs(partition, result.new_generation);
         self.schedule_acquire(&result, site);
@@ -2653,7 +2874,7 @@ impl Host {
         );
     }
 
-    fn inherit(&mut self, partition: PartitionId, result: &RecoveryResult) -> Result<(), String> {
+    fn inherit(&mut self, partition: PartitionId, result: &RecoveryResult) -> Result<(), Fault> {
         self.views.remove(&partition);
         self.engine
             .inherit(
@@ -2664,10 +2885,10 @@ impl Host {
             )
             .map(drop)
             .map_err(|e| {
-                format!(
+                Fault::from(format!(
                     "inherit p{} to g{}: {e}",
                     partition.0, result.new_generation.0
-                )
+                ))
             })
     }
 
@@ -2738,13 +2959,13 @@ impl Host {
         first: Seq,
         through: Seq,
         site: Site,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         let partition = site.partition;
         let Some(primary) = self.replication.primary(self.node, partition) else {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "send_envelopes with no primary for p{}",
                 partition.0
-            ));
+            )));
         };
         let tracker = primary.tracker();
         let sender = tracker.lineage();
@@ -2799,13 +3020,13 @@ impl Host {
         (first, through): (Seq, Seq),
         credential: &FenceCredential,
         site: Site,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         let partition = site.partition;
         let Some(receiver) = self.replication.receiver(self.node, partition) else {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "send_recovery_envelopes with no receiver for p{}",
                 partition.0
-            ));
+            )));
         };
         let stored = receiver.lineage();
         let config = receiver.config().config_version;
@@ -2985,7 +3206,7 @@ impl Host {
 
     // ------------------------------------------------------------------ recovery providers
 
-    fn recovery_effect(&mut self, effect: &RecoveryEffect, site: Site) -> Result<(), String> {
+    fn recovery_effect(&mut self, effect: &RecoveryEffect, site: Site) -> Result<(), Fault> {
         let node = self.node.0;
         match effect {
             RecoveryEffect::RecordSourceUnavailable { .. }
@@ -3003,10 +3224,10 @@ impl Host {
             }
             RecoveryEffect::QueryInventory { copies } => {
                 let Some(plan) = self.plans.get(&site.partition) else {
-                    return Err(format!(
+                    return Err(Fault::from(format!(
                         "QueryInventory for p{} with no plan",
                         site.partition.0
-                    ));
+                    )));
                 };
                 let anchor = plan.anchor;
                 let holders: Vec<(CopyId, Option<NodeId>)> = copies
@@ -3674,6 +3895,8 @@ impl Host {
         }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, base) {
+            // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
+            // generation is held, so `survivor` never calls here. Kept as success (A-R179).
             Ok(Inherited::Linked | Inherited::AlreadyInherited) => {
                 tracing::info!(
                     node = self.node.0,
@@ -3770,7 +3993,7 @@ impl Host {
 
     // ------------------------------------------------------------------ clients
 
-    fn client(&mut self, client: Client) -> Result<(), String> {
+    fn client(&mut self, client: Client) -> Result<(), Fault> {
         // One waiter per identity (F-002): a call under an identity whose earlier call still
         // waits is sent once that one is answered, never in its place. A compile waits on
         // nothing, so it never queues. Nor does a status query (F-014): P1 answers it in the
@@ -4011,7 +4234,7 @@ impl Host {
         identity: RequestIdentity,
         puts: &[PutOp],
         remaining_millis: u64,
-    ) -> Result<Result<Option<TxnRequest>, ApiError>, String> {
+    ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
         let compiled = self.compile_unchecked(partition, identity, puts, remaining_millis);
         if let Some((_, view)) = self.views.get(&partition) {
             view_whole(view, "compile")?;
@@ -4025,7 +4248,7 @@ impl Host {
         identity: RequestIdentity,
         puts: &[PutOp],
         remaining_millis: u64,
-    ) -> Result<Result<Option<TxnRequest>, ApiError>, String> {
+    ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
         let generation = self.adopted(partition).generation;
         // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
         // Refused here and never sent (lead ruling on D1, 2026-10-07).
@@ -4034,14 +4257,15 @@ impl Host {
         }
         self.refresh_view(partition, generation)?;
         let Some((_, view)) = self.views.get(&partition) else {
-            return Err("step view missing after refresh".into());
+            return Err(Fault::from("step view missing after refresh".to_owned()));
         };
         // What P1 has published here, as `status` reads it: a publish answers unchanged only
-        // at or below it (C-3).
+        // at or below it (C-3). Read from the kernel, never its whole view: that clones the
+        // status index on every put (A-R174).
         let published = self
             .publication
-            .view(self.node, partition)
-            .map(|view| (view.published.generation, view.published.seq));
+            .kernel(self.node, partition)
+            .map(|kernel| (kernel.published().generation, kernel.published().seq));
         // The first put's group is the request's affinity. A put in another group is refused
         // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
         let affinity = puts.first().map_or(AFFINITY, |put| put.group);
@@ -4241,7 +4465,7 @@ impl Host {
         }
     }
 
-    fn reply(&mut self, partition: PartitionId, reply: &ReplyEffect) -> Result<(), String> {
+    fn reply(&mut self, partition: PartitionId, reply: &ReplyEffect) -> Result<(), Fault> {
         let identity = match reply {
             ReplyEffect::Transaction { identity, .. }
             | ReplyEffect::Status { identity, .. }
@@ -4276,10 +4500,10 @@ impl Host {
             return Ok(());
         }
         if let ReplyEffect::Status { .. } = reply {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "a status answer for request {} with no status query being stepped",
                 identity.request.0
-            ));
+            )));
         }
         let Some(pending) = self.pending.remove(&identity) else {
             tracing::debug!(
@@ -4331,7 +4555,7 @@ impl Host {
     /// the one after it follows at once. A queued call whose caller has given up is still
     /// sent: its caller holds `UNKNOWN_OUTCOME` or `UNAVAILABLE`, which allow that, and the
     /// kernel de-duplicates a request sent twice.
-    fn release_queued(&mut self, identity: RequestIdentity) -> Result<(), String> {
+    fn release_queued(&mut self, identity: RequestIdentity) -> Result<(), Fault> {
         loop {
             if self.pending.contains_key(&identity) {
                 return Ok(());
@@ -4363,7 +4587,7 @@ impl Host {
         &mut self,
         identity: RequestIdentity,
         handle: Result<SnapshotHandle, ErrorKind>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         tracing::info!(
             node = self.node.0,
             request = identity.request.0,
@@ -4424,9 +4648,9 @@ impl Host {
         value: Option<(u64, Digest)>,
         root: &RootKey,
         look: &Look,
-    ) -> Result<Answer, String> {
+    ) -> Result<Answer, Fault> {
         let Some((_, view)) = self.views.get(&partition) else {
-            return Err("read reply with no step view".into());
+            return Err(Fault::from("read reply with no step view".to_owned()));
         };
         let (generation, at) = (view.generation(), view.at());
         let Some((version, digest)) = value else {
@@ -4447,12 +4671,14 @@ impl Host {
         // this view, and the fault is sticky, so the check after its step fails the node first.
         view_whole(view, "read reply check")?;
         if !matches {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "read reply v{version} does not match the step view it came from"
-            ));
+            )));
         }
         if matches!(rdb_value::read(view, root), Ok(None)) {
-            return Err("read reply names a value the step view does not decode".into());
+            return Err(Fault::from(
+                "read reply names a value the step view does not decode".to_owned(),
+            ));
         }
         object_answer(self.node, view, root, look, outcome)
     }
@@ -4510,7 +4736,7 @@ impl Host {
         NodeStatus {
             node: self.node,
             boot: self.boot,
-            fault: self.fault.clone(),
+            fault: self.fault.as_ref().map(|fault| fault.detail.clone()),
             holds,
             authority,
             fence: fence_of(self.authority.state()),
@@ -4530,13 +4756,14 @@ impl Host {
             protection: l1
                 .and_then(Protection::mode)
                 .map(|mode| mode_name(mode).to_owned()),
+            // A faulted node answers every call with its fault, so it admits nothing (S1-8).
             admits: l1
                 .and_then(|l1| l1.admission_state(now))
-                .map(|state| state.allow && granted),
+                .map(|state| state.allow && granted && self.fault.is_none()),
             published: self
                 .publication
-                .view(self.node, partition)
-                .map(|view| (view.published.generation, view.published.seq)),
+                .kernel(self.node, partition)
+                .map(|kernel| (kernel.published().generation, kernel.published().seq)),
             in_flight: match self
                 .transaction
                 .kernel(self.node, partition)
@@ -4639,20 +4866,21 @@ fn in_barrier(result: &RecoveryResult, node: NodeId) -> bool {
         .is_some_and(|member| result.barrier.required().contains(&member.copy))
 }
 
-fn unsupported(node: NodeId, kind: &str) -> String {
+fn unsupported(node: NodeId, kind: &str) -> Fault {
     tracing::error!(node = node.0, kind, "host_unsupported");
-    format!("host_unsupported: {kind}")
+    format!("host_unsupported: {kind}").into()
 }
 
-/// Tell a call's waiter, now, that the node faults on `detail`, as `set_fault` tells every
+/// Tell a call's waiter, now, that the node faults on `fault`, as `set_fault` tells every
 /// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
-/// `detail`, for the fault.
-fn fail_waiter(reply: &Sender<Answer>, detail: String) -> String {
+/// `fault`, for the node.
+fn fail_waiter(reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
+    let fault = fault.into();
     let _ = reply.send(Answer::Error {
-        error: ApiError::host(&detail),
+        error: fault.error(),
         request: None,
     });
-    detail
+    fault
 }
 
 /// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
@@ -4949,7 +5177,7 @@ fn object_answer(
     root: &RootKey,
     look: &Look,
     outcome: ReadServiceOutcome,
-) -> Result<Answer, String> {
+) -> Result<Answer, Fault> {
     let answer = object_answer_unchecked(node, view, root, look, outcome);
     view_whole(view, "read")?;
     answer
@@ -4958,14 +5186,18 @@ fn object_answer(
 /// A view read that met a storage fault answered `None` or a short page, which is never an
 /// answer (A-R164): checked after every read through a view and before anything the read
 /// produced is sent. A fault fails the node through its `Err` path; what the read produced is
-/// dropped, and every waiter is answered with the error.
-fn view_whole(view: &RocksSnapshot, what: &str) -> Result<(), String> {
+/// dropped, and every waiter is answered with the error. A `Corrupt` read is stored damage,
+/// `CORRUPT_HISTORY` (A-R178): storage names no blob, so never `CORRUPT_BLOB`.
+fn view_whole(view: &RocksSnapshot, what: &str) -> Result<(), Fault> {
     view.fault().map_or(Ok(()), |fault| {
-        Err(format!(
-            "{what}: storage read fault {fault:?} in the view of generation {} at seq {}",
-            view.generation().0,
-            view.at().0
-        ))
+        Err(Fault {
+            damage: (fault == StorageFault::Corrupt).then_some(ErrorKind::CorruptHistory),
+            detail: format!(
+                "{what}: storage read fault {fault:?} in the view of generation {} at seq {}",
+                view.generation().0,
+                view.at().0
+            ),
+        })
     })
 }
 
@@ -4975,7 +5207,7 @@ fn object_answer_unchecked(
     root: &RootKey,
     look: &Look,
     outcome: ReadServiceOutcome,
-) -> Result<Answer, String> {
+) -> Result<Answer, Fault> {
     let (generation, at) = (view.generation(), view.at());
     // A range read's upload, from the manifest it opened, for a damaged chunk's log (A-R132).
     let mut upload = None;
@@ -5022,9 +5254,9 @@ fn object_answer_unchecked(
     Ok(match seen {
         // P1 found a root record, so the view holds one: its absence here is not an answer (A-4).
         Err(ValueError::Apply(ApplyError::ObjectAbsent)) => {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "the read view holds no root record for an object P1 answered as present ({look:?})"
-            ));
+            )));
         }
         Ok(seen) => Answer::Read {
             outcome,
@@ -6586,6 +6818,37 @@ mod tests {
         }
     }
 
+    /// S1-8 D2: each `step_view` line names the depth of the view it built, the levels a read
+    /// through it walks (O(1), never a walk of the lineage). Generation 1 holds its own
+    /// writes, one level; generation 2 inherited onto it reads through two.
+    #[config_log::retcd_test]
+    fn the_step_view_line_names_the_view_depth() {
+        const METHOD: &str = "the_step_view_line_names_the_view_depth";
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 2);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(2))
+            .expect("inherit");
+        drop(engine);
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        for generation in [Generation(1), Generation(2)] {
+            host.refresh_view(PartitionId(1), generation)
+                .expect("step view");
+        }
+        let depths: Vec<_> = logged!(METHOD, "step_view")
+            .into_iter()
+            .map(|line| (line["generation"].clone(), line["depth"].clone()))
+            .collect();
+        assert_eq!(
+            depths,
+            [(1, 1), (2, 2)].map(|(g, d)| (serde_json::json!(g), serde_json::json!(d))),
+            "the step_view lines"
+        );
+    }
+
     /// A-R177 row 6 (critic-f5 C1): a link onto a parent already at the chain ceiling would be
     /// a multi-batch flatten inside the discovery window, so it is refused, nothing staged.
     #[test]
@@ -7409,7 +7672,10 @@ mod tests {
                 },
             )
             .expect_err("a forged digest faults the node");
-        assert!(fault.contains("does not match the step view"), "{fault}");
+        assert!(
+            fault.detail.contains("does not match the step view"),
+            "{fault:?}"
+        );
         // The waiting read is told the host faulted, at once, not left to time out as "no read
         // answer in 1s" (lead ruling 3, 2026-10-07).
         match answer.try_recv() {
@@ -7418,7 +7684,7 @@ mod tests {
                 request: None,
             }) => {
                 assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
-                assert_eq!(error.detail, format!("host fault: {fault}"));
+                assert_eq!(error.detail, format!("host fault: {}", fault.detail));
             }
             other => panic!("the waiting read is answered with the fault: {other:?}"),
         }
@@ -7456,18 +7722,78 @@ mod tests {
                 reply,
             }));
             let fault = host.fault.clone().expect("the node faulted");
-            assert!(fault.contains("injected"), "{name}: {fault}");
+            assert!(fault.detail.contains("injected"), "{name}: {fault:?}");
             match answered_now(&answer) {
                 Some(Answer::Error {
                     error,
                     request: None,
                 }) => assert_eq!(
                     (error.retry, error.detail),
-                    (RetryRule::NotWired, format!("host fault: {fault}")),
+                    (RetryRule::NotWired, format!("host fault: {}", fault.detail)),
                     "{name}"
                 ),
                 other => panic!("{name}: the caller is told the host faulted: {other:?}"),
             }
+        }
+    }
+
+    /// S1-8, admits at fault: a faulted node answers every call with its fault, so its status
+    /// never says it admits writes, though L1 still allows and A1 still holds its grant.
+    /// Before, `admits` read only L1 and A1 and said `true` beside `fault`.
+    #[test]
+    fn a_faulted_node_does_not_say_it_admits_writes() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let host = &mut trio.nodes[0].0;
+        host.fail_step_view = true;
+        let (reply, _answer) = mpsc::channel();
+        host.handle(Msg::Client(Client {
+            partition: PartitionId(1),
+            call: put(1, b"a", b"1", None),
+            reply,
+        }));
+        let status = trio.status(0);
+        assert!(status.fault.is_some(), "the node faulted: {status:?}");
+        assert_eq!(status.admits, Some(false), "{status:?}");
+    }
+
+    /// A-R178, the pending loop: a put already dispatched, waiting on its copies, when the
+    /// node faults on stored damage, is answered with that damage: `CORRUPT_HISTORY`, retry
+    /// `Quarantine`, its request named, and `no_mutation` false as before, since it was sent.
+    /// Only node 1 steps, so no copy acks and the put stays pending.
+    #[test]
+    fn a_dispatched_put_is_refused_with_the_damage_its_node_faulted_on() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let answer = trio.call(put(1, b"a", b"1", None));
+        let (host, _, rx) = &mut trio.nodes[0];
+        let deadline = Instant::now() + test_patience(Duration::from_secs(5));
+        while host.pending.is_empty() {
+            assert!(Instant::now() < deadline, "the put was never dispatched");
+            while let Ok(msg) = rx.try_recv() {
+                host.handle(msg);
+            }
+            host.drain();
+        }
+        assert!(answer.try_recv().is_err(), "the put is still waiting");
+        host.set_fault(Fault {
+            damage: Some(ErrorKind::CorruptHistory),
+            detail: "a damaged read".to_owned(),
+        });
+        match answer.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: Some(_),
+            }) => assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, false),
+                "{error:?}"
+            ),
+            other => panic!("the pending put is answered with the damage: {other:?}"),
         }
     }
 
@@ -7522,7 +7848,7 @@ mod tests {
                     request: None,
                 }) => assert_eq!(
                     (error.retry, error.detail),
-                    (RetryRule::NotWired, format!("host fault: {fault}")),
+                    (RetryRule::NotWired, format!("host fault: {}", fault.detail)),
                     "{name}"
                 ),
                 other => panic!("{name}: the caller is told the host faulted: {other:?}"),
@@ -8179,6 +8505,66 @@ mod tests {
                 .iter()
                 .all(|line| line["node"] == 1 && line["partition"] == 1),
             "nothing trimmed for the idle partition: {trims:?}"
+        );
+    }
+
+    /// D6 (ruling A-R172): the trim duty deletes trimmed Dedup rows on disk at most once per a
+    /// quarter of the retention, with the latest floor. Trim ticks every 50 ms and a 400 ms
+    /// retention make a 100 ms period; puts about 40 ms apart give a trim on most ticks. So
+    /// the deletes run, but on fewer ticks than the trims, and node 1's disk keeps fewer
+    /// generation-1 Dedup rows than it wrote. A delete on every trim fails the count.
+    /// Trio (~3 s): a 1.5 s run of puts on real trim ticks.
+    #[config_log::retcd_test]
+    fn the_durable_trim_delete_runs_at_most_once_per_period() {
+        use rdb_core::transaction::dedup::parse_dedup_key;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.trim_every_millis = 50;
+            host.budgets.dedup_retention_millis = 400;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let until = trio.clock.now().plus_millis(1_500);
+        let mut request = 1;
+        let mut landed = 0_usize;
+        while trio.clock.now() < until {
+            match trio.ask(put(request, b"a", b"1", None)) {
+                Answer::Txn { .. } => landed += 1,
+                Answer::Error { error, .. } => {
+                    assert_ne!(
+                        error.kind,
+                        ErrorKind::Overloaded,
+                        "put {request}: {error:?}"
+                    );
+                }
+                other => panic!("put {request}: {other:?}"),
+            }
+            request += 1;
+            let next = trio.clock.now().plus_millis(40);
+            trio.until("40 ms", |trio| (trio.clock.now() >= next).then_some(()));
+        }
+        let owner = &trio.nodes[0].0;
+        let (trims, deletes) = (owner.trims_sent, owner.trim_deletes);
+        assert!(trims >= 4, "trims {trims}, deletes {deletes}");
+        assert!(
+            deletes >= 1 && deletes < trims,
+            "trims {trims}, deletes {deletes}: at most one delete per period"
+        );
+        let view = owner
+            .engine
+            .snapshot(PartitionId(1), Generation(1), STEP_VIEW)
+            .expect("view");
+        let held = view
+            .scan(Namespace::Dedup, &[], usize::MAX)
+            .into_iter()
+            .filter(|(key, _)| {
+                parse_dedup_key(key).is_some_and(|key| key.generation == Generation(1))
+            })
+            .count();
+        assert!(
+            held < landed,
+            "node 1 holds {held} generation-1 Dedup rows of {landed} puts that landed"
         );
     }
 

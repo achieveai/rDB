@@ -6588,7 +6588,11 @@ fn route_l1s_admission_reaches_r1_whose_keepalive_runs_exactly_while_paused() {
             rounds.push((*tick, *after, targets));
         }
     }
-    assert!(rounds.len() >= 2, "the keepalive runs: {rounds:?}");
+    // One round on the spine: the answers to the first round let L1 resume 100 ms after the
+    // pause, before a second round is due, because a generation's first resume skips the 5 s
+    // hold (ruling A-R165). The 100 ms cadence over many rounds is pinned in rdb-core's
+    // `replication_append` tests, against `KEEPALIVE_MS`.
+    assert!(!rounds.is_empty(), "the keepalive runs: {rounds:?}");
     assert!(
         rounds[0].0 >= paused && rounds[0].0 - paused < 5,
         "the first round is the pause itself: paused at {paused}, {rounds:?}"

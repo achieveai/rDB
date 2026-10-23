@@ -26,9 +26,10 @@ struct Predicate {
     config_version: ConfigVersion,
     /// The primary plus the regular secondaries. Never shadows (K-B-48).
     copies: BTreeSet<CopyId>,
-    /// The highest seq durable on every copy of this predicate, as R1 last reported it.
-    /// Zero until R1 reports: resume needs R1's evidence, never an assumption.
-    durable_through: DurableSeq,
+    /// The highest seq durable on every copy of this predicate, as R1 last reported it in this
+    /// generation. `None` until R1 reports: an unreported predicate is durable through nothing,
+    /// barrier 0 included (ruling A-R167). Resume needs R1's evidence, never an assumption.
+    durable_through: Option<DurableSeq>,
 }
 
 impl Predicate {
@@ -36,7 +37,7 @@ impl Predicate {
         Self {
             config_version: config.config_version,
             copies: required_members(config).map(|member| member.copy).collect(),
-            durable_through: DurableSeq::default(),
+            durable_through: None,
         }
     }
 }
@@ -86,6 +87,13 @@ pub(super) struct State {
     peer_progress: BTreeMap<CopyId, Tick>,
     lost: BTreeSet<CopyId>,
     blocked: Option<BlockReason>,
+    /// Whether the next resume is this generation's first: set at construction, cleared by every
+    /// pause (ruling A-R165, ADR-0006 amendment 2026-10-23). The first resume still passes
+    /// through `Reprotecting` and still needs the exact barrier, a qualifying secondary and lag
+    /// below `resume_lag_millis`; it skips only the hold. The instance starts `Paused` because no
+    /// copy qualifies yet, not because anything oscillated, so there is nothing to damp. Every
+    /// later resume holds the full `resume_hold_millis`.
+    first_resume: bool,
 }
 
 impl State {
@@ -124,6 +132,7 @@ impl State {
             peer_progress: BTreeMap::new(),
             lost: BTreeSet::new(),
             blocked: None,
+            first_resume: true,
         }))
     }
 
@@ -229,7 +238,8 @@ impl State {
     }
 
     /// The hysteresis: `replication_lag` below `resume_lag_millis`, continuously, for
-    /// `resume_hold_millis`. A lag at or above the threshold restarts the hold.
+    /// `resume_hold_millis`. A lag at or above the threshold restarts the hold. The generation's
+    /// first resume skips the hold but not the lag test (`first_resume`, ruling A-R165).
     ///
     /// A completed hold resumes only while the oldest unsafe record is younger than
     /// `pause_age_millis`; otherwise it pauses at the head, because that exposure is the state a
@@ -246,7 +256,7 @@ impl State {
             return ReplicaIgnoreReason::ResumeHeld;
         }
         let since = below_since.unwrap_or(now);
-        if since.millis_until(now) < self.budgets.resume_hold_millis {
+        if !self.first_resume && since.millis_until(now) < self.budgets.resume_hold_millis {
             self.mode = Mode::Reprotecting {
                 below_since: Some(since),
             };
@@ -355,7 +365,7 @@ impl State {
         let mut recorded = false;
         for (version, durable) in per_predicate {
             if let Some(index) = self.predicate(*version) {
-                self.predicates[index].durable_through = *durable;
+                self.predicates[index].durable_through = Some(*durable);
                 recorded = true;
             } else if *version > self.config.config_version {
                 self.pending_durable.insert(*version, *durable);
@@ -374,7 +384,7 @@ impl State {
     fn floor(&self) -> u64 {
         self.predicates
             .iter()
-            .map(|p| p.durable_through.0)
+            .map(|p| p.durable_through.map_or(0, |durable| durable.0))
             .min()
             .unwrap_or(0)
     }
@@ -425,7 +435,7 @@ impl State {
         }
         let mut predicate = Predicate::of(config);
         if let Some(durable) = self.pending_durable.remove(&config.config_version) {
-            predicate.durable_through = durable;
+            predicate.durable_through = Some(durable);
         }
         self.pending_durable
             .retain(|version, _| *version > config.config_version);
@@ -447,7 +457,12 @@ impl State {
     ) -> ReplicaIgnoreReason {
         match self.predicate(version) {
             None | Some(0) => ReplicaIgnoreReason::InvalidConfig,
-            Some(index) if self.predicates[index].durable_through.0 < through_seq.0 => {
+            Some(index)
+                if self.predicates[index]
+                    .durable_through
+                    .map_or(0, |durable| durable.0)
+                    < through_seq.0 =>
+            {
                 ReplicaIgnoreReason::BarrierNotDurable
             }
             Some(index) => {
@@ -467,14 +482,16 @@ impl State {
     /// `* -> Paused { paused_prefix = highest_applied, resume_barrier = highest_applied }`.
     fn pause_at_head(&mut self) {
         self.mode = Mode::Paused;
+        self.first_resume = false;
         self.paused_prefix = self.highest_applied;
         self.resume_barrier = self.highest_applied;
     }
 
     fn barrier_durable(&self) -> bool {
-        self.predicates
-            .iter()
-            .all(|p| p.durable_through.0 >= self.resume_barrier.0)
+        self.predicates.iter().all(|p| {
+            p.durable_through
+                .is_some_and(|durable| durable.0 >= self.resume_barrier.0)
+        })
     }
 
     /// `(allow, reason)`: the part of [`AdmissionState`] whose change is an admission edge.

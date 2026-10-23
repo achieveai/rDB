@@ -4951,6 +4951,38 @@ mod tests {
         db.shutdown();
     }
 
+    /// A-R178 (S1-8): a node that faulted on a corrupt read refuses as stored damage, not as
+    /// a host fault. The put whose condition read the corrupt value, and a later put of another
+    /// object to the faulted node, both answer `CORRUPT_HISTORY` with retry `Quarantine`, and
+    /// with `no_mutation` as a compile refusal sets it today: nothing was sent.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_s1_8_a_corrupt_read_faults_the_node_and_its_puts_answer_quarantine() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        for (what, key, expected) in [
+            (
+                "the put whose condition read it",
+                b"c07".as_slice(),
+                Some(2),
+            ),
+            ("a later put to the faulted node", b"z".as_slice(), None),
+        ] {
+            let refused = match db.put(key, b"again", expected) {
+                Err(refused) => refused.error,
+                Ok(put) => panic!("{what}: a faulted node answers no put: {put:?}"),
+            };
+            assert_eq!(
+                (refused.kind, refused.retry, refused.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, true),
+                "{what}: {refused:?}"
+            );
+            names_the_fault(&refused);
+        }
+        db.shutdown();
+    }
+
     fn names_the_fault(error: &ApiError) {
         assert!(
             error.detail.contains("storage read fault"),
@@ -5265,12 +5297,13 @@ mod tests {
     /// misses `b` while 1-2 is held, so it stops at seq 1 of generation 1 while nodes 1 and 3
     /// hold 2; the next reopen runs without node 2 and commits generation 2 at base 2. The
     /// reopen after that cannot link generation 2 for node 2 (its head is below the base), and
-    /// a cross-generation catch-up does not exist yet. Slice 1's bar: no host fault, and the
-    /// stall is named (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line).
-    /// Integration (~20 s): three opens and the rebuild watch's wait.
+    /// a cross-generation catch-up does not exist yet: it is owed to slice 2. This row guards
+    /// slice 1's bar until then (A-R179): no host fault, and the stall is named
+    /// (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line). It waits for that line, not
+    /// a fixed time.
+    /// Integration (~20 s): the stall only shows after three real opens and the rebuild watch.
     #[config_log::retcd_test]
-    #[ignore = "owed: cross-gen catch-up (A-R177)"]
-    fn m10_d7_a_copy_below_the_base_of_a_missed_generation_is_named_stalled() {
+    fn m10_d7_below_the_base_a_copy_has_no_fault_and_its_stall_is_named() {
         let rt = runtime();
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -5331,6 +5364,315 @@ mod tests {
         assert!(
             line.starts_with("recovery_rebuild_stalled") && line.contains("gen=3"),
             "the stall names generation 3's rebuild: {line}"
+        );
+        db.shutdown();
+    }
+
+    /// A-R174: a put's compile reads only P1's published position, so its cost does not grow
+    /// with the status index. Generation 1 gets one more record on every copy, written straight
+    /// to disk, whose batch holds 50,000 dedup rows; the reopen seeds them into node 1's status
+    /// index (M7A-194). Then 100 compiles take under 50 ms in all (times the deadline scale). A
+    /// compile that copies P1's whole view copies that index each time: 7.6 s for the 100 in a
+    /// debug build, against 19 ms reading the kernel's position (2026-10-23).
+    /// Integration (~5 s): two real opens, and the seed needs a recovery to land.
+    #[config_log::retcd_test]
+    fn a_compile_beside_a_50k_status_index_does_not_copy_it() {
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::envelope::ReplicationEnvelope;
+        use rdb_core::contracts::ids::BatchId;
+        use rdb_core::contracts::storage::{Batch, Namespace, Write};
+        use rdb_core::transaction::dedup::{dedup_key, dedup_value};
+        const SEEDED: u64 = 50_000;
+        const FIRST: u64 = 1_000_000;
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        for n in 1..=3 {
+            let mut engine =
+                RocksEngine::open(dir.path().join("nodes").join(n.to_string())).expect("engine");
+            let head = Seq(engine.buffered_applied(PARTITION, Generation(1)).0);
+            let (bytes, _) = engine
+                .history_at(PARTITION, Generation(1), head)
+                .expect("read")
+                .expect("the head record");
+            let last = ReplicationEnvelope::decode(&bytes).expect("decode");
+            let seq = Seq(head.0 + 1);
+            let mut env = last.clone();
+            env.header.seq = seq;
+            env.prev_digest = last.record_digest;
+            env.request_identity.request = RequestId(FIRST - 1);
+            env.mutations = Vec::new();
+            env.record_digest = env.compute_record_digest().expect("digest");
+            let mut progress = seq.0.to_le_bytes().to_vec();
+            progress.extend_from_slice(&env.record_digest.0);
+            let mut writes: Vec<Write> = (FIRST..FIRST + SEEDED)
+                .map(|request| Write {
+                    ns: Namespace::Dedup,
+                    key: dedup_key(
+                        Generation(1),
+                        GROUP,
+                        RequestIdentity {
+                            tenant: TENANT,
+                            client: CLIENT,
+                            request: RequestId(request),
+                        },
+                    ),
+                    value: Some(dedup_value(Digest::ROOT, seq, env.header.owner_epoch)),
+                })
+                .collect();
+            writes.push(Write {
+                ns: Namespace::History,
+                key: Bytes::copy_from_slice(&seq.0.to_be_bytes()),
+                value: Some(env.encode().expect("encode")),
+            });
+            writes.push(Write {
+                ns: Namespace::Progress,
+                key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+                value: Some(Bytes::from(progress)),
+            });
+            engine
+                .commit(Batch {
+                    id: BatchId(seq.0),
+                    partition: PARTITION,
+                    generation: Generation(1),
+                    seq,
+                    writes,
+                })
+                .expect("commit");
+        }
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        for request in [FIRST, FIRST + SEEDED - 1] {
+            loop {
+                match db.status(RequestId(request), Some(Generation(1))) {
+                    Ok(TxnStatus::Resolved(result))
+                        if result.outcome == Outcome::RecoveredApplied =>
+                    {
+                        break
+                    }
+                    other => assert!(
+                        std::time::Instant::now() < deadline,
+                        "request {request} not seeded within {patience:?}: {other:?}"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let compile = |request: u64| ClientCall::Compile {
+            identity: RequestIdentity {
+                tenant: TENANT,
+                client: CLIENT,
+                request: RequestId(request),
+            },
+            puts: vec![PutOp {
+                group: GROUP,
+                object: Bytes::from_static(b"a"),
+                change: byte_doc(b"2"),
+                expect: None,
+            }],
+            remaining_millis: 5_000,
+        };
+        let wait = Duration::from_secs(5);
+        match db.call(compile(1), wait) {
+            Some(Answer::Compiled(_)) => {}
+            other => panic!("the warm-up compile: {other:?}"),
+        }
+        let bar = crate::host::test_patience(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        for request in 2..=101 {
+            match db.call(compile(request), wait) {
+                Some(Answer::Compiled(_)) => {}
+                other => panic!("compile {request}: {other:?}"),
+            }
+        }
+        let took = started.elapsed();
+        tracing::info!(
+            took_micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+            "a_r174_compiles"
+        );
+        assert!(took < bar, "100 compiles took {took:?}, over {bar:?}");
+        db.shutdown();
+    }
+
+    /// D6 (A-R170 rows): the generations of node `n`'s Dedup rows, read from its newest held
+    /// lineage of partition 1 after the `Db` has shut down. A `dedup_key` leads with its
+    /// generation, so one seek per generation finds them.
+    fn dedup_generations(dir: &std::path::Path, n: u32) -> (Generation, Vec<u64>) {
+        use rdb_core::contracts::storage::{Namespace, SnapshotRead};
+        let engine = RocksEngine::open(dir.join("nodes").join(n.to_string())).expect("open engine");
+        let newest = engine
+            .lineages()
+            .into_iter()
+            .filter(|(partition, _)| *partition == PARTITION)
+            .map(|(_, generation)| generation)
+            .max()
+            .expect("a held lineage");
+        let view = engine
+            .snapshot(PARTITION, newest, crate::host::STEP_VIEW)
+            .expect("view");
+        let mut found = Vec::new();
+        let mut from = 0_u64.to_be_bytes().to_vec();
+        while let Some((key, _)) = view.scan(Namespace::Dedup, &from, 1).into_iter().next() {
+            let head: [u8; 8] = key[..8].try_into().expect("a dedup key leads with 8 bytes");
+            let generation = u64::from_be_bytes(head);
+            found.push(generation);
+            from = (generation + 1).to_be_bytes().to_vec();
+        }
+        assert_eq!(view.fault(), None, "node {n}: the scan met a fault");
+        (newest, found)
+    }
+
+    /// D6, the tester's walk (A-R170 A + B): a full dedup cap frees up after a reopen once one
+    /// retention has passed, on every copy. Cap 2, retention 300 ms: two puts fill the cap. The
+    /// reopen seeds both, so a put is OVERLOADED until node 1 retires generation 1, one
+    /// retention after it landed generation 2; then a put lands. A second reopen with no wait
+    /// writes at once: generation 1's rows are gone from disk, not only from memory. Every copy
+    /// retires them, secondaries too (F3): no node still holds a generation-1 row.
+    /// Integration (~6 s): three opens, and the retirement waits a real retention.
+    #[config_log::retcd_test]
+    fn m10_d6_a_full_dedup_cap_frees_up_after_a_reopen_once_retention_passes() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(2),
+                    dedup_retention: Some(Duration::from_millis(300)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.put(b"b", b"1", None).expect("put b");
+        let refused = db.put(b"c", b"1", None).expect_err("a full cap");
+        assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            match db.put(b"c", b"1", None) {
+                Ok(_) => break,
+                Err(refused) => assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation 1's two entries were not retired within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Every copy retires one retention after it landed generation 2.
+        std::thread::sleep(Duration::from_millis(
+            crate::host::HOST_TRIM_EVERY_MILLIS + 500,
+        ));
+        db.shutdown();
+        drop(db);
+        for n in 1..=3 {
+            let (newest, found) = dedup_generations(dir.path(), n);
+            assert!(
+                !found.contains(&1),
+                "node {n} still holds generation 1's rows at generation {newest:?}: {found:?}"
+            );
+        }
+
+        let mut db = open();
+        admits(&db, "the second reopen");
+        db.put(b"d", b"1", None)
+            .expect("generation 1's rows are gone from disk, so the cap has room at once");
+        db.shutdown();
+    }
+
+    /// D6, critic-d6 F1 (A-R170 D): writes spread over more than the retention fill the cap
+    /// several times over, and a reopen writes at once. Cap 5, retention 300 ms, seven puts
+    /// 800 ms apart: at most two are retained at a time, so each passes. The trim duty deletes
+    /// what it trims on disk too, so the reopen seeds at most the last few, not all seven.
+    /// Without that delete the seed holds seven entries against a cap of five, and the put is
+    /// OVERLOADED until one retention after the reopen.
+    /// Integration (~8 s): seven puts across real trim ticks, then two opens.
+    #[config_log::retcd_test]
+    fn m10_d6_writes_over_more_than_the_retention_reopen_writable_at_once() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(5),
+                    dedup_retention: Some(Duration::from_millis(300)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        // A put lands, or fails at once if it is OVERLOADED. A host-load refusal such as a
+        // lapsed grant's LEASE_EXPIRED is retried; CONDITION_FAILED means an earlier try landed.
+        let land = |db: &Db, key: &[u8], what: &str| {
+            let patience = crate::host::test_patience(Duration::from_secs(5));
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                match db.put(key, b"1", None) {
+                    Ok(_) => return,
+                    Err(refused) => match refused.error.name().as_str() {
+                        "OVERLOADED" => panic!("{what}: {refused:?}"),
+                        "CONDITION_FAILED" => return,
+                        _ => assert!(
+                            std::time::Instant::now() < deadline,
+                            "{what}: not landed within {patience:?}: {refused:?}"
+                        ),
+                    },
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        for n in 0..7_u8 {
+            if n > 0 {
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            land(&db, &[b'k', b'0' + n], &format!("put {n}"));
+        }
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        land(
+            &db,
+            b"after",
+            "the reopen seeds only what the last trims had not deleted",
         );
         db.shutdown();
     }
