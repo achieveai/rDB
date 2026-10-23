@@ -31,7 +31,10 @@ use crate::contracts::storage::{Namespace, SnapshotRead};
 use crate::contracts::time::Tick;
 use crate::contracts::txn::{Durability, Outcome as TxnOutcome, TxnResult};
 use crate::replication::progress::DigestLookup;
-use crate::transaction::dedup::{parse_dedup_key, parse_dedup_value, SEED_PAGE};
+use crate::transaction::dedup::{
+    floor_of_value, is_floor_record_id, parse_dedup_key, parse_dedup_value, FLOOR_AFFINITY,
+    SEED_PAGE,
+};
 use crate::transaction::{LostAuthority, RETENTION_CAP_ENTRIES};
 
 use super::status::{recovered_outcome, StatusIndex};
@@ -750,6 +753,16 @@ impl PubKernel {
         // proves nonexecution (K-A-12).
         let mut refused = 0_usize;
         for (key, value) in found {
+            // T1's ack-floor record is not a request: it carries its open's floor, and the ids
+            // under it whose rows are gone answer `StatusExpired`, as before the restart (A1).
+            if key.affinity == FLOOR_AFFINITY && is_floor_record_id(key.identity.request) {
+                let floor = RequestIdentity {
+                    request: floor_of_value(&value),
+                    ..key.identity
+                };
+                self.status.set_floor(key.generation, floor);
+                continue;
+            }
             let lineage = Lineage {
                 partition: seed.partition,
                 generation: key.generation,
@@ -1206,7 +1219,12 @@ impl PubKernel {
         let cand = pending.cand;
         // 1. The published position. Nothing is ever handed out above it.
         self.published_seq = cand.seq;
-        // 2. Status.
+        // 2. Status. The candidate's ack floor first (A-R255): the same ids T1 drops from dedup at
+        //    this `Published` leave the status index, so it stays as flat as dedup does.
+        if let Some(floor) = &cand.ack_floor {
+            self.status
+                .forget_below(cand.lineage.generation, cand.request, floor);
+        }
         let mut effects: Vec<PubEffect> = self
             .write_status(
                 now,

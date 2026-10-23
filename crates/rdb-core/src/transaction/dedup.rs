@@ -946,7 +946,7 @@ pub fn floor_value(below: RequestId, seq: Seq, owner_epoch: OwnerEpoch) -> Bytes
 }
 
 /// The floor a decoded [`floor_value`] carries.
-fn floor_of_value(value: &DedupValue) -> RequestId {
+pub fn floor_of_value(value: &DedupValue) -> RequestId {
     let mut below = [0; 8];
     below.copy_from_slice(&value.request_digest.0[..8]);
     RequestId(u64::from_le_bytes(below))
