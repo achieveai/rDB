@@ -138,7 +138,7 @@ Crash injection is not enough: M5-01/M5-02 must hold a build *open* while applie
 
 ```rust
 pub enum SnapshotHook {
-    AfterViewCaptured,     // inside get_snapshot_builder, view taken, build not started
+    AfterViewCaptured,     // inside build_snapshot, checkpoint taken, export not started (A-R286)
     AfterHeaderWritten,
     BeforeTrailer,
     AfterInstallValidated, // header+checksum ok, nothing written yet
@@ -358,7 +358,7 @@ config unless stated: `SnapshotPolicy::LogsSinceLast(16)`, `max_in_snapshot_log_
 
 | ID | Name | Setup | Expected | Notes |
 |---|---|---|---|---|
-| M5-01 | `m5_01_builder_view_captured_before_the_build` (config-testkit) | `start(3, Rocks)`; 50 puts applied (revisions 1..50); `hooks.pause_at(AfterViewCaptured)`; trigger a build; `wait_paused`; apply 50 more puts (51..100) and wait for them applied; release | the published snapshot's header reports `cluster_revision == 50`, `last_applied.index` == the index at capture; decoding the record stream yields exactly the 50 keys; revisions 51..100 are **absent** | A2 overrides D5.1: the view must be taken inside `get_snapshot_builder()`, which openraft serializes with `apply`; taking it inside `build_snapshot` races and yields contents newer than `meta.last_log_id` (silent follower corruption) |
+| M5-01 | `m5_01_builder_view_captured_before_the_build` (config-testkit) | `start(3, Rocks)`; 50 puts applied (revisions 1..50); `hooks.pause_at(AfterViewCaptured)`; trigger a build; `wait_paused`; apply 50 more puts (51..100) and wait for them applied; release | the published snapshot's header reports `cluster_revision == 50`, `last_applied.index` == the index at capture; decoding the record stream yields exactly the 50 keys; revisions 51..100 are **absent** | A2: the export must read a captured view, never live state, or it yields contents newer than `meta.last_log_id` (silent follower corruption). Since A-R286 the view is a checkpoint taken at the top of each `build_snapshot` attempt, with `meta` read from that checkpoint; a capture in `get_snapshot_builder()` stalled `apply`, which openraft makes wait for it (ADR-0022, 2026-10-24 Note) |
 | M5-02 | `m5_02_apply_is_not_blocked_by_a_running_build` (config-testkit) | same; pause at `AfterViewCaptured` | while the build is paused, ≥ 20 further puts return `APPLIED` and `last_applied` advances; `applied_commands` (TA-24) increases; no put observes a latency dependent on the pause (assert *progress*, not wall clock) | T3 — a mutex shared with `apply` also satisfies openraft's doc but stalls the node; this row is what distinguishes the two designs |
 | M5-03 | m5_03_transient_build_error_is_absorbed_not_returned (store level; partial) | arm `Fail(Io)` once on `BeforeSnapshotTmpSync`; trigger a build | `SnapshotCounters::build_retries() >= 1`, `builds() == 1`, `build_failures() == 0`; the node stays `Running` (never `Fatal`); a `warn` line `snapshot_build_retried{attempt}` | T5 / research §1.5 — `build_snapshot` returning `Err` is fatal to RaftCore with no retry and no degraded mode |
 | M5-04 | m5_04_unrecoverable_build_error_leaves_no_partial_publication (partial) | poison the store (TA-14) during a build | the node becomes `Fatal`; `state_meta/current_snapshot` is unchanged from before the build; no `.snap` file was published; exactly one `storage_fatal` line; after `reopen_store` + `restart` the node recovers using the **previous** snapshot | asserts the failure mode is documented and non-corrupting, not that it is avoided |
@@ -1070,7 +1070,7 @@ neither is a review blocker.
 |---|---|---|
 | T1 | Follower install purges the log without waiting for the snapshot to be installed | M5-24 (hard guard), M5-25 (crash in the window), M5-29 (the setup that makes install reachable), E2E-33 |
 | T2 | Purge assumes a snapshot durability openraft never confirms | M5-13, M5-20, Q-21, M5-10 (publication ordering) |
-| T3 | The builder runs concurrently with `apply`; blocking it stalls the node | M5-01 (view captured in `get_snapshot_builder`), M5-02 (apply not blocked), M5-17 (synchronous startup build) |
+| T3 | The builder runs concurrently with `apply`; blocking it stalls the node | M5-01 (view is a checkpoint taken in `build_snapshot`, not in `get_snapshot_builder`), M5-02 (apply not blocked), M5-17 (synchronous startup build) |
 | T4 | `Cursor<Vec<u8>>` holds the whole snapshot in RAM repeatedly | M5-18 (`SnapshotData = tokio::fs::File`, loose RSS bound). Precise measurement deferred to M6 §D6.5 — see U4 |
 | T5 | `build_snapshot` returning `Err` kills the node | M5-03 (transient absorbed), M5-04 (unrecoverable is fatal, non-corrupting) |
 | T6 | `replication_lag_threshold` does not select snapshot replication; purging does | M5-29 (install reachable only after purge, with a no-purge control run); M5-56/M5-57 use `promote_max_lag`, a rEtcd config, not openraft's |
