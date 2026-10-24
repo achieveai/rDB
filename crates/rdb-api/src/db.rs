@@ -1328,7 +1328,7 @@ impl Db {
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
         self.opened.heal_task = Some(rt.spawn(async move {
-            let ended = admin::heal(ctx).await;
+            let ended = admin::heal_retrying(ctx).await;
             if let Err(error) = &ended {
                 tracing::error!(%error, "heal_failed");
             }
@@ -2167,6 +2167,54 @@ impl Db {
             .collect()
     }
 
+    /// **Dev tool only**, debug builds (ruling A-R230; `rdb_dev admin damage-copy`): damage the
+    /// record at `key` in `ns` of partition 1's lineage `generation` in `node`'s own copy only,
+    /// with [`rdb_storage::RocksEngine::damage_record`] on that node's thread. The other copies
+    /// keep the good record. `generation` is the one `node` holds: [`NodeStatus::holds`].
+    ///
+    /// # Errors
+    ///
+    /// The engine's refusal, as text (nothing was written); `node` not run by this process (a
+    /// copy is damaged from its own process); or `node` not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn damage_record(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        ns: rdb_core::contracts::storage::Namespace,
+        key: &[u8],
+    ) -> Result<(), String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::Damage {
+            partition: PARTITION,
+            generation,
+            ns,
+            key: key.to_vec(),
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: damage its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
     /// The peer links, to hold and heal.
     #[must_use]
     pub fn links(&self) -> &Arc<Links> {
@@ -2203,13 +2251,18 @@ impl Db {
     /// Which nodes of this `Db` have restarted or failed to restart; `None` while every node runs
     /// its first boot. Names each restarted node and its boot, and says when the restart failed
     /// and the node stays stopped (F-013), in one short clause, because it rides on every refused
-    /// answer (tester walk 5). A restarted copy does not rejoin in this open (achieveai/rDB#42):
-    /// it takes part again once the folder is opened again (M10 A-R188).
+    /// answer (tester walk 5). Then what is true now (A-R275): a restarted secondary rejoins by
+    /// itself once the owner re-plans (A-R256(2)), while a restarted owner stays out until the
+    /// folder is opened again (A-R188). A failed restart adds nothing more: its node stays stopped.
     #[must_use]
     pub fn restart_note(&self) -> Option<String> {
-        let restarted: Vec<String> = lock(&self.nodes)
+        let nodes = lock(&self.nodes);
+        let moved: Vec<&NodeHandle> = nodes
             .iter()
             .filter(|handle| handle.boot != self.opened.base_boot)
+            .collect();
+        let restarted: Vec<String> = moved
+            .iter()
             .map(|handle| {
                 let (node, boot) = (handle.node.0, handle.boot.0);
                 let who = if handle.node == OWNER {
@@ -2224,11 +2277,16 @@ impl Db {
                 }
             })
             .collect();
-        (!restarted.is_empty()).then(|| {
-            format!(
-                "{}; a restarted node stays out until the folder is opened again (#42)",
-                restarted.join(", ")
-            )
+        let tail = if moved.iter().any(|handle| handle.node == OWNER) {
+            Some("the owner stays out until the folder is opened again")
+        } else if moved.iter().any(|handle| !handle.start_failed) {
+            Some("a restarted copy rejoins by itself once the owner re-plans")
+        } else {
+            None
+        };
+        (!restarted.is_empty()).then(|| match tail {
+            Some(tail) => format!("{}; {tail}", restarted.join(", ")),
+            None => restarted.join(", "),
         })
     }
 
@@ -2682,6 +2740,13 @@ impl Db {
                     boot = boot.0,
                     "node_restarted"
                 );
+                // #42 (A-R249): the other nodes hear the new boot as a net handshake tells a
+                // node process; the record owner then re-plans to link this copy again.
+                for other in nodes.iter().filter(|other| other.node != node) {
+                    if other.send(Msg::PeerBooted { node, boot }).is_err() {
+                        tracing::warn!(node = node.0, peer = other.node.0, "peer_booted_unsent");
+                    }
+                }
                 Ok(boot)
             }
             Err(detail) => {
@@ -3438,19 +3503,44 @@ mod tests {
         admits_within(db, phase, Duration::from_secs(5));
     }
 
-    /// [`admits`] with its own patience, scaled the same way.
+    /// [`admits`] with its own patience, scaled the same way. Logs one `admission_wait` line
+    /// when the wait ends, admitted or not, with the owner's last status: a red that left no
+    /// other line still says how long it waited and where node 1 stood (k477).
     fn admits_within(db: &Db, phase: &str, patience: Duration) {
         let patience = crate::host::test_patience(patience);
-        let deadline = std::time::Instant::now() + patience;
-        while owner_of(db, db.node_status()).and_then(|node| node.admits) != Some(true) {
+        let started = std::time::Instant::now();
+        let deadline = started + patience;
+        let mut polls = 0_u32;
+        loop {
+            polls += 1;
+            let owner = owner_of(db, db.node_status());
+            let admitted = owner.as_ref().and_then(|node| node.admits) == Some(true);
+            let timed_out = !admitted && std::time::Instant::now() >= deadline;
+            if admitted || timed_out {
+                tracing::info!(
+                    phase,
+                    admitted,
+                    waited_ms = millis(started.elapsed()),
+                    patience_ms = millis(patience),
+                    polls,
+                    admits = ?owner.as_ref().map(|node| node.admits),
+                    authority = owner.as_ref().map(|node| node.authority.as_str()),
+                    recovery = ?owner.as_ref().and_then(|node| node.recovery.as_deref()),
+                    recovered = ?owner.as_ref().and_then(|node| node.recovered).map(|g| g.0),
+                    protection = ?owner.as_ref().and_then(|node| node.protection.as_deref()),
+                    fault = ?owner.as_ref().and_then(|node| node.fault.as_deref()),
+                    "admission_wait"
+                );
+                assert!(
+                    admitted,
+                    "{phase}: node 1 does not admit writes within {patience:?}"
+                );
+                return;
+            }
             for node in db.node_status() {
                 let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                 crate::host::assert_not_blocked(&node, window);
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{phase}: node 1 does not admit writes within {patience:?}"
-            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -4773,11 +4863,96 @@ mod tests {
         db.shutdown();
     }
 
-    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts, L1 pauses
-    /// writes; a put refused then was refused at admission and never queued, so a retry of it
-    /// must not promise that `status` will show its outcome: status stays `Unknown` for good. A
-    /// retry of the published put keeps the promise, since status shows it (review F-023).
-    /// Integration (~1 s): three node threads, one restart, a 400 ms pause budget.
+    /// #42 (A-R249), S2-2: node 3 restarts under a live owner. Node 1 hears the new boot, drains
+    /// its epoch and commits the next generation pinning it, so writes resume on RF3 with no
+    /// restart of node 1: a put lands and node 3 holds it durably at node 1's generation. Cut:
+    /// no re-plan, and node 1 logs `replication_copy_not_advancing` while node 3 never gets the
+    /// put. Integration (~3 s): three node threads, one restart.
+    #[config_log::retcd_test]
+    fn m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let of = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let before = of(&db, OWNER)
+            .recovered
+            .expect("node 1 recovered at the open");
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        assert_eq!(
+            db.restart_note().as_deref(),
+            Some(
+                "node 3 restarted (now boot 2); a restarted copy rejoins by itself once the owner \
+                 re-plans"
+            ),
+            "A-R275: a refusal says what is true now"
+        );
+
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            let owner = of(&db, OWNER);
+            if owner.recovered > Some(before) && owner.admits == Some(true) {
+                match db.put(b"b", b"2", None) {
+                    Ok(put) => break put,
+                    Err(refused) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no put landed within {patience:?} of the restart: {refused:?}"
+                    ),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 did not re-plan past generation {} and admit within {patience:?}: \
+                 {owner:?}",
+                before.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let owner = of(&db, OWNER);
+        let generation = owner.recovered.expect("node 1 recovered");
+        let target = owner.holds.expect("node 1 holds the partition").durable;
+        loop {
+            let third = of(&db, NodeId(3));
+            let held = third.holds.map(|holds| (holds.generation, holds.durable));
+            if third.boot == BootId(2)
+                && held.is_some_and(|(at, durable)| at == generation && durable >= target)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 holds {held:?}, not generation {} through {target}, within {patience:?} \
+                 (put {put:?})",
+                generation.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+    }
+
+    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts and stops
+    /// advancing, L1 pauses writes; a put refused then was refused at admission and never
+    /// queued, so a retry of it must not promise that `status` will show its outcome: status
+    /// stays `Unknown` for good. A retry of the published put keeps the promise, since status
+    /// shows it (review F-023). Since A-R256(2) node 1 re-plans after the restart and writes
+    /// resume once node 3 syncs, so the published put is made at the re-planned generation and
+    /// node 3's link is then held to bring the pause, and the refusals still name the restart.
+    /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
     #[test]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
         let dir = config_testkit::fs::temp_dir();
@@ -4792,14 +4967,28 @@ mod tests {
             ))
             .expect("open");
         admits(&db, "after the open");
-        let first = db.put(b"a", b"1", None).expect("before the restart");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let before = owner_status(&db, "node 1 before the restart").recovered;
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
-        owner_when(
-            &db,
-            "L1 pauses",
-            crate::host::test_patience(Duration::from_secs(5)),
-            &|node| node.admits == Some(false),
-        );
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        let first = loop {
+            let owner = owner_status(&db, "node 1 re-planning");
+            if owner.recovered > before && owner.admits == Some(true) {
+                if let Ok(put) = db.put(b"a", b"2", None) {
+                    break put;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed after node 1's re-plan within {patience:?}: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        db.links().hold(OWNER, NodeId(3));
+        owner_when(&db, "L1 pauses", patience, &|node| {
+            node.admits == Some(false)
+        });
         let refused = db.put(b"a", b"9", None).expect_err("paused");
         assert_eq!(
             refused.error.kind,
@@ -5045,8 +5234,8 @@ mod tests {
         let note = db.restart_note().expect("the owner restarted");
         assert_eq!(
             note,
-            "the owner, node 1, restarted (now boot 2); a restarted node stays out until the folder \
-             is opened again (#42)"
+            "the owner, node 1, restarted (now boot 2); the owner stays out until the folder is \
+             opened again"
         );
         for kind in kinds {
             let plain = ApiError::new(kind, "d");
@@ -5425,8 +5614,9 @@ mod tests {
     /// carries its look: `Items { at: -1 }` lists the last item. It fails if `write` sends
     /// `expect: None` (the stale write publishes), if `read` forwards `Look::Doc` (the list read
     /// is `INVALID_ARGUMENT`), or if `byte_string` answers a map document as `Ok`.
-    /// Integration (~1 s): three node threads on wall-clock time.
-    #[test]
+    /// Integration (~1 s): three node threads on wall-clock time. A per-test log, so a red at
+    /// its first admission wait can be read (k477: one red under load left no line).
+    #[config_log::retcd_test]
     fn the_public_write_and_read_carry_the_change_its_guard_and_the_look() {
         use crate::host::ListEdit;
         use rdb_value::value::{Int, Map, MapKey};
@@ -5512,6 +5702,99 @@ mod tests {
         let refused = db.get(b"d").expect_err("d holds a map, not bytes");
         assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused:?}");
         assert!(refused.detail.contains("not a byte string"), "{refused:?}");
+        db.shutdown();
+        const METHOD: &str = "the_public_write_and_read_carry_the_change_its_guard_and_the_look";
+        let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "admission_wait")
+            .collect();
+        assert_eq!(waits.len(), 1, "one line for the one wait: {waits:?}");
+        assert_eq!(
+            (&waits[0]["phase"], &waits[0]["admitted"]),
+            (
+                &serde_json::json!("before the first write"),
+                &serde_json::json!(true)
+            ),
+            "{waits:?}"
+        );
+        assert!(waits[0]["waited_ms"].is_u64(), "{waits:?}");
+    }
+
+    /// Ruling A-R230 (k420): `Db::damage_record` reaches one node's own copy through its host,
+    /// for `rdb_dev admin damage-copy`. Damaging node 1's stored `a` makes a read of `a` after
+    /// the next write `CORRUPT_HISTORY` (a read answers from the last step's view, taken before
+    /// the damage); a missing record is refused with nothing written; a `History` record is
+    /// reached by its seq; a node this process does not run is refused by name. It fails if the
+    /// host answers without calling the engine. Integration (~1 s).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn damage_record_damages_one_copy_through_its_host_and_refuses_a_missing_record() {
+        use rdb_core::contracts::storage::Namespace;
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        let put = db.put(b"a", b"1", None).expect("put a");
+        let written = Some((put.seq.0, Bytes::from_static(b"1")));
+        assert_eq!(db.get(b"a").expect("a reads").value, written);
+        let held = |node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .and_then(|status| status.holds)
+                .unwrap_or_else(|| panic!("node {} holds a lineage", node.0))
+                .generation
+        };
+
+        let missing = db
+            .damage_record(OWNER, held(OWNER), Namespace::User, b"zz")
+            .expect_err("nothing is stored at zz");
+        assert!(
+            missing.starts_with("node 1: no stored value at key "),
+            "{missing}"
+        );
+        let elsewhere = db
+            .damage_record(NodeId(9), held(OWNER), Namespace::User, b"a")
+            .expect_err("node 9 is not run here");
+        assert_eq!(
+            elsewhere,
+            "node 9 is not run by this process: damage its copy from its own process"
+        );
+        db.damage_record(
+            NodeId(2),
+            held(NodeId(2)),
+            Namespace::History,
+            &put.seq.0.to_be_bytes(),
+        )
+        .expect("node 2's history record of a is stored");
+
+        // The stored key is the root key, as the host reads it.
+        let root = rdb_value::keys::root_key(TENANT, GROUP, b"a");
+        db.damage_record(OWNER, held(OWNER), Namespace::User, root.as_bytes())
+            .expect("node 1's a is stored");
+        // A read answers from the view of the last step, taken before the damage: the next
+        // write takes a new one.
+        db.put(b"b", b"2", None).expect("put b");
+        let read = db
+            .get(b"a")
+            .expect_err("a's stored bytes no longer match its digest");
+        assert_eq!(
+            (read.kind, read.detail.as_str()),
+            (
+                ErrorKind::CorruptHistory,
+                "object \"a\": header bytes 0..8 and the payload do not hash to the stored digest"
+            ),
+            "{read:?}"
+        );
         db.shutdown();
     }
 
@@ -6033,8 +6316,10 @@ mod tests {
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
-    /// it. Puts landing on node 2 wait for W6's `CopyAheadOnControl` arm (A-R254): until it merges, node 2's host faults on it.
-    /// Cut: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced.
+    /// it. A put then lands on node 2 at the new generation, and the write made before reads
+    /// back there.
+    /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
+    /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -6079,6 +6364,29 @@ mod tests {
         let old = db.put(b"c", b"3", None);
         db.route.owner.store(2, Ordering::Relaxed);
         assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
+
+        // A-R254, A-R256: writes go on at node 2, the write made before reads back there.
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            match db.put(b"b", b"2", None) {
+                Ok(put) => break put,
+                Err(refused) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no put landed on node 2 within {patience:?}: {refused:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(put.generation, promoted.generation, "{put:?}");
+        for (key, value) in [(&b"a"[..], &b"1"[..]), (b"b", b"2")] {
+            assert_eq!(
+                db.get(key).expect("get").value.map(|(_, v)| v),
+                Some(Bytes::copy_from_slice(value)),
+                "{} at node 2",
+                String::from_utf8_lossy(key)
+            );
+        }
         db.shutdown();
     }
 

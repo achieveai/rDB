@@ -205,34 +205,28 @@
 //!                                         (regular or shadow), not reported by this build yet
 //! node restart <n>                        stop node n and start it again on its data at its
 //!                                         boot plus one; prints `node n boot b`. The new
-//!                                         process holds no role and stays out until the folder is
-//!                                         opened again (#42). So
-//!                                         any restart stops writes, safely, for the life of
-//!                                         this run: after a secondary's, L1 pauses within
-//!                                         about 2 s of the next write (`PROTECTION_PAUSED`)
-//!                                         because that copy is never durable again; after
-//!                                         the owner's, no node
-//!                                         holds a grant. Reads: after a secondary's they keep
-//!                                         answering, unless a write was in flight that no
-//!                                         other copy can take yet: then fresh reads answer
-//!                                         `UNKNOWN_OUTCOME` and `get --previous` still
-//!                                         answers. That lasts while no copy that did not
-//!                                         restart can take the write: if the other secondary
-//!                                         was only unreachable, healing its link resolves
-//!                                         it; only with both secondaries restarted does it
-//!                                         wait for M10. After the owner's every read is
-//!                                         `UNAVAILABLE`. Every `PROTECTION_PAUSED`,
-//!                                         `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY`
-//!                                         after it names the restart, and so does a `status`
-//!                                         of `Unknown` for a request this session sent: that
-//!                                         is not evidence of a lost write. After one
-//!                                         secondary's restart it resolves once the other can
-//!                                         take the write; after the owner's, or both
-//!                                         secondaries', it waits for the node to rejoin.
-//!                                         Restarting is not a recovery: catch-up and re-pin
-//!                                         are M10 (achieveai/rDB#42). To write again,
-//!                                         quit and start rdb_dev again. Refused until the
-//!                                         first `ready`
+//!                                         process holds no role at first (A-R275):
+//!                                         - a restarted secondary rejoins by itself once
+//!                                           the owner re-plans: writes pause briefly
+//!                                           (`PROTECTION_PAUSED`), then resume once the
+//!                                           copy syncs. Until then reads keep answering,
+//!                                           unless a write was in flight that no other
+//!                                           copy can take yet: then fresh reads answer
+//!                                           `UNKNOWN_OUTCOME` and `get --previous` still
+//!                                           answers;
+//!                                         - a restarted owner stays out until the folder
+//!                                           is opened again: no node holds a grant and
+//!                                           every read is `UNAVAILABLE`. To write again,
+//!                                           quit and start rdb_dev again.
+//!                                         Every `PROTECTION_PAUSED`, `UNAVAILABLE`,
+//!                                         `UNKNOWN_OUTCOME` or `NOT_PRIMARY` after it names
+//!                                         the restart, and so does a `status` of `Unknown`
+//!                                         for a request this session sent: that is not
+//!                                         evidence of a lost write. After one secondary's
+//!                                         restart it resolves once the other can take the
+//!                                         write; after the owner's, or both secondaries',
+//!                                         it waits for a restarted node to rejoin. Refused
+//!                                         until the first `ready`
 //! admin status                            read-only: the partitions/ and grants/ records
 //!                                         through this Db's store, as `control` prints them,
 //!                                         then each `--nodes` link's `link node=N ..` line
@@ -385,8 +379,9 @@
 //! admits and its A1 holds a grant. `not ready: writes not admitted` when either half stops, the
 //! waiting line then saying which. When node 1's grant is fenced, that line says why. While A1
 //! still polls its own record it adds that writes resume by themselves, so the node is not
-//! restarted (#42); once the poll has stopped, or for a frozen, foreign-boot or other-authority
-//! record, it says nothing in M9 replaces the grant and writes stay stopped for the run. After a secondary restarts,
+//! restarted (a restarted owner stays out until the folder is opened again); once the poll has
+//! stopped, or for a frozen, foreign-boot or other-authority record, it says nothing in M9
+//! replaces the grant and writes stay stopped for the run. After a secondary restarts,
 //! L1 still admits writes for a while, so the line reads `ready for now; writes pause soon, at
 //! the latest about 2 s after the next write, because ..` until they do: about 2 s after the
 //! restart, or, after a fence, about 2 s after the next write (tester q8). A put before `ready`
@@ -1409,14 +1404,14 @@ fn fence_line(
             "node {node}'s grant is {}, l1={mode} and {links}; writes resume only \
              once the old grant's expiry is proven and node {node}'s copies catch up, which needs \
              those links: heal them (link heal all); do not restart node {node}: a restarted \
-             node does not rejoin in M9 (achieveai/rDB#42)",
+             owner stays out until the folder is opened again",
             owner.authority
         )
     } else if fence_lifts(owner, reason) {
         format!(
             "node {node}'s grant is {}; writes resume by themselves once the old grant's expiry \
-             is proven, so do not restart node {node}: a restarted node does not rejoin in M9 \
-             (achieveai/rDB#42)",
+             is proven, so do not restart node {node}: a restarted owner stays out until the \
+             folder is opened again",
             owner.authority
         )
     } else {
@@ -4088,11 +4083,12 @@ fn restarted_nodes(boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
 
 /// `status Unknown`, with the restart note when there is one, unless this session never sent
 /// the request (`ours` false): that outcome is known (tester walk 5). After the owner's
-/// restart its outcome waits for M10. Otherwise it follows what node 1 holds (Msg 8, W6-D1): a
-/// request not `in_flight` there was refused before it was queued, or never arrived, or was
-/// answered and its answer trimmed past retention, so it may have applied (M9 close-out D1:
-/// `Sent` keeps no answer, so the line cannot tell these apart), and nothing will resolve it.
-/// One in flight waits for M10 after both secondaries' restarts, and
+/// restart its outcome waits for a restarted node to rejoin. Otherwise it follows what node 1
+/// holds (Msg 8, W6-D1): a request not `in_flight` there was refused before it was queued, or
+/// never arrived, or was answered and its answer trimmed past retention, so it may have applied
+/// (M9 close-out D1: `Sent` keeps no answer, so the line cannot tell these apart), and nothing
+/// will resolve it.
+/// One in flight waits for a rejoin after both secondaries' restarts, and
 /// after one secondary's resolves once the other can take it, as when a held link heals
 /// (W5-D1). `in_flight` is `None` when node 1 did not answer in time: whether it holds the
 /// request is then not known, so the line promises nothing and says to ask again (F-025).
@@ -4126,7 +4122,8 @@ fn unknown_line(
         ),
         _ => format!(
             "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
-             restarted node rejoins, which is M10; {note})"
+             restarted node rejoins: a restarted secondary does so by itself once the owner \
+             re-plans, a restarted owner only once the folder is opened again; {note})"
         ),
     }
 }
@@ -4331,8 +4328,8 @@ fn clearance_line(clearance: Clearance, node: NodeId, db: &Db) -> String {
     match clearance {
         Clearance::Absent => "absent".to_owned(),
         Clearance::Current => format!(
-            "current: the record is node {}'s running boot {}; in M9 it clears only after that \
-             node restarts, and a restart stops writes for the run (achieveai/rDB#42)",
+            "current: the record is node {}'s running boot {}; it clears only after that node \
+             restarts, and a restarted owner stays out until the folder is opened again",
             node.0,
             db.boot_of(node)
                 .map_or_else(|| "?".to_owned(), |boot| boot.0.to_string())
@@ -4868,8 +4865,8 @@ mod tests {
         fenced.authority = "fenced(Expired)".to_owned();
         fenced.fence = Some(DenyReason::Expired);
         fenced.fence_polling = true;
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let mut seen = Seen {
             ready: true,
             ..Seen::default()
@@ -4891,13 +4888,13 @@ mod tests {
                 "not ready: writes not admitted".to_owned(),
                 "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
                  resume by themselves once the old grant's expiry is proven, so do not restart \
-                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
+                 node 1: a restarted owner stays out until the folder is opened again"
                     .to_owned(),
                 "not ready: writes not admitted".to_owned(),
                 format!(
                     "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
                      resume by themselves once the old grant's expiry is proven, so do not \
-                     restart node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42); \
+                     restart node 1: a restarted owner stays out until the folder is opened again; \
                      once they resume, they pause soon, at the latest about 2 s after the next \
                      write, because {note}"
                 ),
@@ -4925,7 +4922,7 @@ mod tests {
             format!(
                 "not ready: writes not admitted: node 1's grant is fenced({reason}); writes \
                  resume by themselves once the old grant's expiry is proven, so do not restart \
-                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
+                 node 1: a restarted owner stays out until the folder is opened again"
             )
         };
         let stuck = |reason: &str| {
@@ -5011,8 +5008,8 @@ mod tests {
         .skip(2)
         .collect();
         assert_eq!(lines, [blocked]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let stuck = with("held(grant 2)", "Blocked(ControlUnknown)", None);
         let mut healthy = stuck.clone();
         healthy.protection = Some("healthy".to_owned());
@@ -5071,8 +5068,8 @@ mod tests {
         );
 
         let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[], &[]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
         healthy.protection = Some("healthy".to_owned());
         assert_eq!(
@@ -5171,8 +5168,8 @@ mod tests {
         // fenced with its poll live, then `unheld` with its self-replace stopped
         // (`replace_stopped`, kernel `self_replace_stopped`), then a later poll that changes
         // nothing. With and without a restart, the stuck line, once.
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let gave_up = "node 1's grant is unheld and node 1 stopped trying for one: its grant \
                        record is frozen or not its own; nothing in M9 replaces it, so writes \
                        stay stopped for this run: to write again, quit and start rdb_dev again";
@@ -5232,7 +5229,7 @@ mod tests {
             [
                 "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
                  resume by themselves once the old grant's expiry is proven, so do not restart \
-                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)",
+                 node 1: a restarted owner stays out until the folder is opened again",
                 "not ready: writes not admitted",
             ]
         );
@@ -5279,8 +5276,8 @@ mod tests {
                 "not ready: writes not admitted: node 1's grant is fenced(Expired), l1=paused and \
                  links 2->1, 3->1 are dropped; writes resume only once the old grant's expiry is \
                  proven and node 1's copies catch up, which needs those links: heal them (link \
-                 heal all); do not restart node 1: a restarted node does not rejoin in M9 \
-                 (achieveai/rDB#42)",
+                 heal all); do not restart node 1: a restarted owner stays out until the folder \
+                 is opened again",
                 "not ready: writes not admitted: l1=paused and links 2->1, 3->1 are dropped: \
                  writes wait for node 1's copies to catch up, which needs those links: heal them \
                  (link heal all)",
@@ -5391,8 +5388,8 @@ mod tests {
                     "not ready: writes not admitted: node 1's grant is fenced(Expired), \
                      l1={mode} and links 1-2, 1-3 are held; writes resume only once the old \
                      grant's expiry is proven and node 1's copies catch up, which needs those \
-                     links: heal them (link heal all); do not restart node 1: a restarted node \
-                     does not rejoin in M9 (achieveai/rDB#42)"
+                     links: heal them (link heal all); do not restart node 1: a restarted owner \
+                     stays out until the folder is opened again"
                 )),
                 "l1={mode}"
             );
@@ -5402,8 +5399,8 @@ mod tests {
                     Some(
                         "not ready: writes not admitted: node 1's grant is fenced(Expired); \
                          writes resume by themselves once the old grant's expiry is proven, so \
-                         do not restart node 1: a restarted node does not rejoin in M9 \
-                         (achieveai/rDB#42)"
+                         do not restart node 1: a restarted owner stays out until the folder \
+                         is opened again"
                             .to_owned()
                     ),
                     "l1={mode} held={held:?}"
@@ -5468,8 +5465,8 @@ mod tests {
                 "not ready: writes not admitted: node 1's grant is fenced(Expired), l1=paused \
                  and links 1-2, 1-3 are held; writes resume only once the old grant's expiry is \
                  proven and node 1's copies catch up, which needs those links: heal them (link \
-                 heal all); do not restart node 1: a restarted node does not rejoin in M9 \
-                 (achieveai/rDB#42)"
+                 heal all); do not restart node 1: a restarted owner stays out until the folder \
+                 is opened again"
                     .to_owned(),
                 wait.to_owned(),
                 "not ready: writes not admitted".to_owned(),
@@ -5486,8 +5483,8 @@ mod tests {
     /// a copy out stays unsafe and pauses at L1's pause age (r3: 2.02 s).
     #[test]
     fn ready_after_a_restart_says_writes_pause_soon_not_only_after_the_next_write() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let mut paused = owner(None, false);
         paused.protection = Some("paused".to_owned());
         let mut seen = Seen::default();
@@ -5524,12 +5521,12 @@ mod tests {
     /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
     #[test]
     fn every_ready_line_matches_the_state_that_decides_it() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
-        let failed = "node 2 stopped: its restart as boot 2 failed; a restarted node stays out \
-                      until the folder is opened again (#42)";
-        let owner_note = "the owner, node 1, restarted (now boot 2); a restarted node stays out \
-                          until the folder is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
+        let failed = "node 2 stopped: its restart as boot 2 failed";
+        let owner_note =
+            "the owner, node 1, restarted (now boot 2); the owner stays out until the \
+             folder is opened again";
         let stuck = "writes stay stopped for this run: to write again, quit and start rdb_dev \
                      again";
         let pause = |note: &str| {
@@ -5538,8 +5535,8 @@ mod tests {
         let resume = |reason: &str| {
             format!(
                 "node 1's grant is fenced({reason}); writes resume by themselves once the old \
-                 grant's expiry is proven, so do not restart node 1: a restarted node does not \
-                 rejoin in M9 (achieveai/rDB#42)"
+                 grant's expiry is proven, so do not restart node 1: a restarted owner stays out \
+                 until the folder is opened again"
             )
         };
         let fenced_stuck = |reason: &str| {
@@ -5691,7 +5688,8 @@ mod tests {
     }
 
     /// Tester W3-D2 and walk 5: after a restart, `Unknown` for a request this session sent
-    /// carries the note, and promises M10 only after the owner's restart or both secondaries'.
+    /// carries the note, and waits for a rejoin only after the owner's restart or both
+    /// secondaries'.
     /// After one secondary's it names the copy that can still resolve it (W5-D1). A request
     /// never sent, or no restart, stays bare. Msg 8, W6-D1: one node 1 does not hold in flight
     /// promises nothing, unless the owner restarted; the Db row
@@ -5715,18 +5713,20 @@ mod tests {
             "status Unknown (not evidence of a lost write: it resolves once node 2, which did \
              not restart, can take it; NOTE)"
         );
-        let m10 = "status Unknown (not evidence of a lost write: its outcome cannot be known \
-                   until a restarted node rejoins, which is M10; NOTE)";
+        let rejoin = "status Unknown (not evidence of a lost write: its outcome cannot be known \
+                      until a restarted node rejoins: a restarted secondary does so by itself \
+                      once the owner re-plans, a restarted owner only once the folder is opened \
+                      again; NOTE)";
         assert_eq!(
             unknown_line(true, Some(true), &[NodeId(2), NodeId(3)], note),
-            m10
+            rejoin
         );
-        assert_eq!(unknown_line(true, Some(true), &[NodeId(1)], note), m10);
+        assert_eq!(unknown_line(true, Some(true), &[NodeId(1)], note), rejoin);
         assert_eq!(
             unknown_line(true, Some(true), &[NodeId(1), NodeId(2)], note),
-            m10
+            rejoin
         );
-        assert_eq!(unknown_line(true, Some(false), &[NodeId(1)], note), m10);
+        assert_eq!(unknown_line(true, Some(false), &[NodeId(1)], note), rejoin);
         let refused = "status Unknown (node 1 does not hold it in flight, so waiting will not \
                        change this: it was refused before it was queued, or never arrived, or \
                        its answer was trimmed after retention (it may have applied); NOTE)";
@@ -5739,7 +5739,7 @@ mod tests {
 
     /// F-025: `node_status` leaves out a node 1 that does not answer in time, and the line then
     /// read as "not in flight; waiting will not change this", which nothing showed. Without an
-    /// answer it says so and to ask again; after the owner's own restart the M10 line stands.
+    /// answer it says so and to ask again; after the owner's own restart the rejoin line stands.
     /// Unit.
     #[test]
     fn status_unknown_says_try_again_when_node_1_did_not_answer() {
@@ -5758,7 +5758,8 @@ mod tests {
         assert_eq!(
             unknown_line(true, None, &[NodeId(1)], note),
             "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
-             restarted node rejoins, which is M10; NOTE)"
+             restarted node rejoins: a restarted secondary does so by itself once the owner \
+             re-plans, a restarted owner only once the folder is opened again; NOTE)"
         );
     }
 
@@ -5816,8 +5817,8 @@ mod tests {
     /// w12 (r9/walks) shows both on a real run.
     #[test]
     fn a_failed_owner_restart_says_not_ready_and_nodes_names_the_stopped_node() {
-        let note = "the owner, node 1, stopped: its restart as boot 2 failed; a restarted node \
-                    stays out until the folder is opened again (#42)";
+        let note = "the owner, node 1, stopped: its restart as boot 2 failed; the owner stays out \
+                    until the folder is opened again";
         let mut seen = Seen::default();
         lines_ready(&mut seen);
         assert_eq!(

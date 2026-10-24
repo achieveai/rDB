@@ -353,6 +353,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Inject { .. }
         | Msg::PeerBooted { .. }
         | Msg::Stop) => return Err(Box::new((WireError::LocalOnly(local_name(&local)), local))),
+        #[cfg(debug_assertions)]
+        local @ Msg::Damage { .. } => {
+            return Err(Box::new((WireError::LocalOnly("Damage"), local)))
+        }
     };
     Ok(Outbound::Plain(plain))
 }
