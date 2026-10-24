@@ -2123,17 +2123,52 @@ fn a_write_unpublished_at_a_fence_is_what_the_queue_waits_on_until_it_publishes(
 /// its lost authority, and `waits_on` stayed `None` with seq 2 unpublished (the
 /// `a_write_unpublished_at_a_fence...` red, perf and w8 runs 2026-10-23). Here node 1 is held
 /// still past its grant's expiry, then given only the flush duty, which is sited at partition 0.
+///
+/// A-R331: the fan-out set is A1's own fence views, kept to partitions with a T1 or P1. Node 1
+/// also serves partition 2, a `partitions/2` record naming it owner, with no plan, so no T1 or
+/// P1. A1's fence views name 0, 1 and 2; partition 2 gets no fence event, so no P1 slot or T1
+/// kernel is made there and the node does not fault (A-12). Partition 1 freezes (A-13).
 /// Integration (~2 s): bootstrap's discovery window, then one 600 ms grant left to lapse.
 #[config_log::retcd_test]
 fn a_node_fence_sited_at_partition_0_freezes_partition_1s_queue() {
+    use config_core::{ConfigStore as _, MutationOutcome, PutRequest};
+    use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+    use rdb_core::contracts::control::ControlKey;
+
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), |host| {
         Trio::fast(host);
         host.budgets.grant_millis = 600;
         host.budgets.renew_millis = 100;
     });
+    let p2 = PartitionRecord {
+        partition: PartitionId(2),
+        owner: NodeId(1),
+        generation: Generation(0),
+        owner_epoch: OwnerEpoch(0),
+        config_version: crate::admin::CONFIG_VERSION,
+        lifecycle: PartitionLifecycle::Serving,
+    };
+    let seeded = trio
+        .rt
+        .block_on(trio.mem.put(PutRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(2)).encode()),
+            value: p2.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put partitions/2");
+    assert_eq!(seeded.outcome, MutationOutcome::Applied);
+    // Seeded first, so the reload of node 1's first acquisition lists it.
     trio.bootstrap();
     trio.ready();
+    trio.until("node 1's A1 serves partition 2", |trio| {
+        trio.nodes[0]
+            .0
+            .authority_views
+            .contains_key(&PartitionId(2))
+            .then_some(())
+    });
     trio.links.drop_direction(NodeId(2), NodeId(1));
     trio.links.drop_direction(NodeId(3), NodeId(1));
     let unacknowledged = trio.call(put(1, b"a", b"1", None));
@@ -2168,6 +2203,29 @@ fn a_node_fence_sited_at_partition_0_freezes_partition_1s_queue() {
         (status.fence, status.waits_on, status.admits),
         (Some(DenyReason::Expired), Some(Seq(2)), Some(false)),
         "partition 1's queue freezes on the unpublished put: {status:?}"
+    );
+    let p2_view = host.authority_views.get(&PartitionId(2)).copied();
+    assert_eq!(
+        p2_view.map(|view| view.past_horizon),
+        Some(DenyReason::Expired),
+        "A1's fence superseded partition 2's view too: {p2_view:?}"
+    );
+    assert_eq!(
+        (
+            host.publication
+                .kernel(NodeId(1), PartitionId(2))
+                .map(|kernel| kernel.view().mode),
+            host.transaction.kernel(NodeId(1), PartitionId(2)).is_some(),
+            host.fault.as_ref(),
+        ),
+        (
+            Some(rdb_core::contracts::publication::PubMode::Frozen {
+                cause: FreezeCause::AuthorityLost(DenyReason::Expired)
+            }),
+            false,
+            None
+        ),
+        "partition 2's P1 (made by A1's view) took the fence; no T1 was made; no fault"
     );
     let fences: Vec<_> = logged!(
         "a_node_fence_sited_at_partition_0_freezes_partition_1s_queue",

@@ -45,7 +45,7 @@
 //! [`EventKind::Kernel`]: crate::contracts::event::EventKind::Kernel
 
 use crate::contracts::authority::{AuthorityEffect, AuthorityEvent, Checkpoint, FenceScope};
-use crate::contracts::event::{KernelEffect, KernelEvent, ModuleName};
+use crate::contracts::event::{Effect, EffectKind, KernelEffect, KernelEvent, ModuleName};
 use crate::contracts::ids::PartitionId;
 use crate::contracts::recovery::RecoveryEvent;
 
@@ -407,20 +407,26 @@ pub fn event_for(effect: &KernelEffect) -> Option<KernelEvent> {
 }
 
 /// The partitions, besides its own site, that a node-scope [`AuthorityEffect::Fence`] is also
-/// delivered at: each of `held` other than `site`, ascending and once (lead ruling A-R324).
-/// Empty for every other effect, a partition-scope fence included, which is its own partition's.
+/// delivered at (lead rulings A-R324, A-R331): each partition A1 publishes a superseding view
+/// for in the same step (`step`), that `has_kernel` says holds a T1 or P1 on the emitting node,
+/// other than `site`, ascending and once. Empty for every other effect, a partition-scope fence
+/// included, which is its own partition's.
 ///
 /// A1 sites a node fence at the partition of the event that tripped it, which may be one no
-/// T1 or P1 serves (a control answer or a host duty at partition 0). A1 already supersedes
-/// every served partition's view (A-R53.1); this is the twin for the fence itself, so each
-/// served T1 freezes and records its lost authority. `held` is the partitions the dispatcher
-/// holds a T1 or P1 for on the emitting node. The host and the simulator both call this, so
-/// the two dispatchers cannot drift.
+/// T1 or P1 serves (a control answer or a host duty at partition 0). Its fence views name every
+/// served partition and the site (A-R53.1), so the fan-out set is A1's own set, read off its
+/// output: the host and the simulator pass their step's effects and cannot drift.
+///
+/// No partition left out can admit a write. T1 admits only on an A1 view, A1 views only served
+/// partitions and the site, and a partition leaving `served` is fenced with a past view
+/// (A-R54.2). One skipped for having no kernel admits only on a fresh view, which a fenced A1
+/// never publishes.
 #[must_use]
-pub fn node_fence_sites(
+pub fn node_fence_sites<'a>(
     effect: &KernelEffect,
     site: PartitionId,
-    held: impl IntoIterator<Item = PartitionId>,
+    step: impl IntoIterator<Item = &'a Effect>,
+    has_kernel: impl Fn(PartitionId) -> bool,
 ) -> Vec<PartitionId> {
     if !matches!(
         effect,
@@ -431,8 +437,14 @@ pub fn node_fence_sites(
     ) {
         return Vec::new();
     }
-    held.into_iter()
-        .filter(|partition| *partition != site)
+    step.into_iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(
+                view,
+            ))) if effect.from == ModuleName::Authority => Some(view.lineage.partition),
+            _ => None,
+        })
+        .filter(|partition| *partition != site && has_kernel(*partition))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -588,36 +600,79 @@ mod tests {
         assert_eq!(consumers(Arm::CatchUp), [ModuleName::Replication]);
     }
 
-    /// A node fence goes to every other held partition once, ascending, and never twice to its
-    /// own site; a partition fence, or any other effect, goes nowhere else (A-R324).
+    /// A node fence goes to each partition A1 viewed in the same step, other than its own site,
+    /// once and ascending, and only where a T1 or P1 is held. A view from any other module does
+    /// not count; a partition fence, or any other effect, goes nowhere else (A-R324, A-R331).
     #[test]
-    fn a_node_fence_reaches_every_other_held_partition_once() {
+    fn a_node_fence_reaches_each_partition_a1_viewed_in_the_step_once() {
         use super::node_fence_sites;
-        use crate::contracts::authority::{AuthorityEffect, DenyReason, FenceScope};
-        use crate::contracts::event::KernelEffect;
-        use crate::contracts::ids::PartitionId;
+        use crate::contracts::authority::{
+            AuthorityEffect, AuthorityView, DenyReason, FenceScope, Lineage,
+        };
+        use crate::contracts::event::{Effect, EffectKind, KernelEffect};
+        use crate::contracts::ids::{
+            AuthorityGeneration, BootId, ConfigVersion, CorrelationId, Generation, GrantId,
+            OwnerEpoch, PartitionId,
+        };
+        use crate::contracts::time::Tick;
         let fence = |scope| {
             KernelEffect::Authority(AuthorityEffect::Fence {
                 scope,
                 reason: DenyReason::Expired,
             })
         };
-        let held = [3, 1, 0, 3, 2].map(PartitionId);
+        let effect = |from, kernel| Effect {
+            correlation: CorrelationId(0),
+            from,
+            partition: PartitionId(0),
+            kind: EffectKind::Kernel(kernel),
+        };
+        let view = |from, partition| {
+            effect(
+                from,
+                KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(AuthorityView {
+                    lineage: Lineage {
+                        partition: PartitionId(partition),
+                        generation: Generation(1),
+                        owner_epoch: OwnerEpoch(1),
+                    },
+                    grant_id: GrantId(1),
+                    boot_id: BootId(1),
+                    authority_generation: AuthorityGeneration(1),
+                    config_version: ConfigVersion(1),
+                    authority_seq: 2,
+                    valid_through_tick: Tick(0),
+                    past_horizon: DenyReason::Expired,
+                })),
+            )
+        };
+        let mut step = vec![effect(ModuleName::Authority, fence(FenceScope::Node))];
+        step.extend([3, 1, 0, 3, 2].map(|p| view(ModuleName::Authority, p)));
+        step.push(view(ModuleName::Publication, 7));
+        let all = |_| true;
         assert_eq!(
-            node_fence_sites(&fence(FenceScope::Node), PartitionId(0), held),
+            node_fence_sites(&fence(FenceScope::Node), PartitionId(0), &step, all),
             [1, 2, 3].map(PartitionId),
-            "sited at a held partition: the others, ascending, once"
+            "sited at a viewed partition: the others, ascending, once; not another module's 7"
         );
         assert_eq!(
-            node_fence_sites(&fence(FenceScope::Node), PartitionId(9), held),
+            node_fence_sites(&fence(FenceScope::Node), PartitionId(9), &step, all),
             [0, 1, 2, 3].map(PartitionId),
-            "sited where nothing is held: every held partition"
+            "sited at a partition A1 did not view: every viewed partition"
+        );
+        assert_eq!(
+            node_fence_sites(&fence(FenceScope::Node), PartitionId(0), &step, |p| {
+                p != PartitionId(2)
+            }),
+            [1, 3].map(PartitionId),
+            "a viewed partition holding no T1 or P1 is left out"
         );
         assert_eq!(
             node_fence_sites(
                 &fence(FenceScope::Partition(PartitionId(1))),
                 PartitionId(1),
-                held
+                &step,
+                all
             ),
             [],
             "a partition fence stays at its own partition"
@@ -628,7 +683,8 @@ mod tests {
                     copy: crate::contracts::membership::CopyId(1)
                 },
                 PartitionId(0),
-                held
+                &step,
+                all
             ),
             [],
             "not a fence"

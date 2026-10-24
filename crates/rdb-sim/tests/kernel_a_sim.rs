@@ -674,10 +674,25 @@ fn freeze_while_dispatched(source: FenceSource) {
 /// `Dispatch` answer for request 11. The dispatcher delivers the fence at partition 1 too, so
 /// T1 freezes on the dispatched seq 11 with its lost authority, and P1 freezes with it. Before
 /// A-R324 the fence reached partition 0 only, and both stayed open.
+///
+/// A-R331: the fan-out set is A1's own fence views. B also serves partition 2, seeded as a
+/// `partitions/2` record naming B, with no plan: A1 views it, so its P1 takes the fence too,
+/// and no T1 is made there.
 #[retcd_test]
 fn a_node_fence_sited_at_partition_0_freezes_partition_1() {
     support::preamble();
-    let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+    let mut plan = a1p1_plan();
+    let p2 = PartitionRecord {
+        partition: PartitionId(2),
+        owner: B,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+        config_version: rdb_core::contracts::ids::ConfigVersion(1),
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    plan.control_records
+        .push((ControlKey::Partition(PartitionId(2)), p2.encode()));
+    let mut runner = Runner::new(&plan).expect("runner");
     let mut replies = run_to(&mut runner, SUBMIT - 1);
     cut_b(&mut runner);
     while !dispatch_decided(&runner, SUBMIT) {
@@ -712,6 +727,18 @@ fn a_node_fence_sited_at_partition_0_freezes_partition_1() {
         p1(&runner).mode,
         PubMode::Frozen { cause: lost },
         "P1 on partition 1 took the same fence"
+    );
+    let dispatcher = runner.dispatcher();
+    assert_eq!(
+        (
+            dispatcher
+                .publication()
+                .view(B, PartitionId(2))
+                .map(|view| view.mode),
+            dispatcher.transaction().kernel(B, PartitionId(2)).is_some(),
+        ),
+        (Some(PubMode::Frozen { cause: lost }), false),
+        "partition 2's P1 (made by A1's view) took the fence; no T1 was made there"
     );
 }
 
