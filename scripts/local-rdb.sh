@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run rDB as three real processes with one command (M10 S2, W4): `lr`.
 #
-#   scripts/local-rdb.sh up [--base-port P] [--root DIR] [--timeout-sec N]
+#   scripts/local-rdb.sh up [--release] [--base-port P] [--root DIR] [--timeout-sec N]
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
 #   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
 #   scripts/local-rdb.sh suspend N | resume N                     [--run DIR]
@@ -47,7 +47,10 @@
 # discovery run finds N before a fault run names it.
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
-# config-server. Built if missing; `LR_BUILD=1` rebuilds them.
+# config-server. Built if missing; `LR_BUILD=1` rebuilds them. `up --release` uses and builds
+# them under .../release instead, cargo's own folder, so a debug and a release binary are never
+# mixed up. The run records its binaries in run.env, so `start`, `restart` and every other verb
+# use the profile the run was started with; `--release` is refused on any verb but `up`.
 
 set -euo pipefail
 
@@ -62,6 +65,7 @@ WIPE=0
 ARG=""
 FAULT_NODE=1
 DROP=""
+PROFILE=debug
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -72,6 +76,12 @@ while [ $# -gt 0 ]; do
         --wipe) WIPE=1; shift ;;
         --node) FAULT_NODE="$2"; shift 2 ;;
         --drop) DROP="$2"; shift 2 ;;
+        --release)
+            [ "$COMMAND" = up ] || {
+                echo "lr: --release goes with 'up' only; '$COMMAND' uses the binaries its run was started with (run.env)" >&2
+                exit 2
+            }
+            PROFILE=release; shift ;;
         -*) echo "lr: unknown option $1" >&2; exit 2 ;;
         *)
             [ -z "$ARG" ] || { echo "lr: one argument only, got '$ARG' and '$1'" >&2; exit 2; }
@@ -96,16 +106,19 @@ die() { echo "lr: $*" >&2; exit 1; }
 # ------------------------------------------------------------------------------------------
 
 exe() { if [ -f "$1.exe" ]; then printf '%s' "$1.exe"; else printf '%s' "$1"; fi; }
-NODE_BIN="$(exe "$TARGET/debug/examples/rdb_node")"
-PILOT_BIN="$(exe "$TARGET/debug/pilot_kv")"
+NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
+PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
 
 build() {
     if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$NODE_BIN" ] || [ ! -f "$PILOT_BIN" ]; then
-        say "building rdb_node, pilot_kv and config-server into $TARGET"
-        (cd "$REPO" && cargo build -p rdb-api --example rdb_node && cargo build -p rdb-pilot \
-            && cargo build -p config-server) >&2
-        NODE_BIN="$(exe "$TARGET/debug/examples/rdb_node")"
-        PILOT_BIN="$(exe "$TARGET/debug/pilot_kv")"
+        local release=""
+        [ "$PROFILE" = release ] && release=--release
+        say "building rdb_node, pilot_kv and config-server into $TARGET/$PROFILE"
+        # shellcheck disable=SC2086
+        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_node \
+            && cargo build $release -p rdb-pilot && cargo build $release -p config-server) >&2
+        NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
+        PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
     fi
     [ -f "$NODE_BIN" ] || die "rdb_node not found at $NODE_BIN after building"
 }
@@ -342,6 +355,7 @@ up() {
 BASE_PORT=$BASE_PORT
 CONTROL=$CONTROL
 SHA=$sha
+PROFILE=$PROFILE
 NODE_BIN=$NODE_BIN
 PILOT_BIN=$PILOT_BIN
 EOF
@@ -352,7 +366,8 @@ EOF
     trap 'rc=$?; if [ "$UP_DONE" = 0 ]; then echo "lr: up failed or interrupted (exit $rc); bringing the run down" >&2; down || true; fi' EXIT
     trap 'exit 130' INT TERM
     say "run $RUN"
-    "$REPO/scripts/local-cluster.sh" up --dir "$RUN/ctl" --base-port "$BASE_PORT" >"$RUN/out/ctl.out" 2>&1 \
+    RETCD_PROFILE="$PROFILE" "$REPO/scripts/local-cluster.sh" up --dir "$RUN/ctl" \
+        --base-port "$BASE_PORT" >"$RUN/out/ctl.out" 2>&1 \
         || { cat "$RUN/out/ctl.out" >&2; false; }
     local f
     for f in "$RUN"/ctl/node-*/pid; do
