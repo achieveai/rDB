@@ -179,9 +179,16 @@ pub struct DbConfig {
     /// [`next_boot`] of [`Self::dir`], and each restart then takes [`next_boot`] of it too.
     /// `None`: the directory's `n`-th open starts at `((n - 1) << 16) + 1` and a restart adds one.
     pub boot: Option<BootId>,
-    /// The storage engine's options for every node's copy (rulings A-R248, A-R253): today the
-    /// memtable budget per column family. `StorageOptions::default()` is RocksDB's own, 64 MiB.
+    /// The storage engine's options for every node's copy (rulings A-R248, A-R253, A-R300).
     /// A node restarted by [`Db::restart_node`] opens with the same options.
+    ///
+    /// - `storage.memtable_budget_bytes`: the memtable memory of each node's store, all column
+    ///   families together. Writes past it flush to disk, so a node's memtable memory stays
+    ///   flat under a steady write rate. It also bounds the WAL, at 4 times the budget.
+    ///   `None` is 64 MiB per node. A smaller budget means less memory and more, smaller
+    ///   flushes.
+    /// - `storage.write_buffer_bytes`: the budget of one column family, capped by the above.
+    ///   `None` is RocksDB's own, 64 MiB.
     pub storage: StorageOptions,
     /// Whether each write tells the owner which of this open's earlier writes the app already
     /// has its answer for (the client ack floor, M10 S2, rulings A-R252 and A-R267). `true` by
