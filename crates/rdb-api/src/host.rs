@@ -1507,6 +1507,9 @@ struct Host {
     /// tests only (A-R316).
     #[cfg(test)]
     drain_proofs_to_lose: u32,
+    /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
+    /// been linked again (critic-degraded M3).
+    repair_since: BTreeMap<PartitionId, Tick>,
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
@@ -1618,6 +1621,7 @@ impl Host {
             blamed: BTreeMap::new(),
             #[cfg(test)]
             drain_proofs_to_lose: 0,
+            repair_since: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
             instance: engine_instance,
@@ -3824,6 +3828,7 @@ impl Host {
         let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
         for partition in partitions {
             self.retry_blocked_rejoin(partition, now);
+            self.repair_duty(partition, now);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
                 self.blamed.remove(&partition);
                 continue;
@@ -3835,6 +3840,91 @@ impl Host {
                 self.drop_copy(partition, blame, blamed_ms);
             }
         }
+    }
+
+    /// M3's repair half (critic-degraded M3, ruling A-R282): a `ReadOnly` commit whose pinned
+    /// member outside the barrier has been linked again for L1's resume hold is re-planned
+    /// with the same members, so the next generation can take writes. Nothing else ends it:
+    /// the member is pinned at the boot it runs, and a read-only partition holds no write up.
+    /// This only repairs; only [`Self::drop_copy`] drops. A member that is down is left alone.
+    fn repair_duty(&mut self, partition: PartitionId, now: Tick) {
+        let linked: Vec<u32> = self
+            .read_only_outside(partition)
+            .into_iter()
+            .filter(|node| self.linked(*node))
+            .map(|node| node.0)
+            .collect();
+        if linked.is_empty() {
+            self.repair_since.remove(&partition);
+            return;
+        }
+        let since = *self.repair_since.entry(partition).or_insert(now);
+        let linked_ms = HostClock::millis_until(since, now);
+        if linked_ms < self.budgets.resume_hold_millis {
+            return;
+        }
+        self.repair_since.remove(&partition);
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = committed.new_generation.0,
+            epoch = epoch.0,
+            outside = ?linked,
+            linked_ms,
+            "membership_repair_planned"
+        );
+        self.revoke(partition, epoch, None, None);
+    }
+
+    /// The regular secondaries `partition`'s commit pins, while that commit is `ReadOnly`, this
+    /// node is its pinned primary and no re-plan runs for it. Empty otherwise. All of them are
+    /// outside the barrier: a `ReadOnly` commit has one eligible regular copy holding it
+    /// (`recovery::mode_for`), the primary's.
+    fn read_only_outside(&self, partition: PartitionId) -> Vec<NodeId> {
+        if self.rejoins.contains_key(&partition) {
+            return Vec::new();
+        }
+        let Some(result) = self.committed.get(&partition) else {
+            return Vec::new();
+        };
+        let members = &result.committed.pinned_config.members;
+        let owner = members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if result.mode != PartitionMode::ReadOnly || !owner {
+            return Vec::new();
+        }
+        members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::RegularSecondary)
+            .map(|member| member.node)
+            .collect()
+    }
+
+    /// Whether this node can reach `node` now: in this process, registered and neither held
+    /// nor dropped in either direction; otherwise its process link is up.
+    fn linked(&self, node: NodeId) -> bool {
+        if !self.links.knows(node) {
+            return self.links.net().is_some_and(|net| {
+                matches!(net.states().get(&node), Some(crate::net::LinkState::Up(_)))
+            });
+        }
+        let me = self.node;
+        let pair = if me.0 <= node.0 {
+            (me, node)
+        } else {
+            (node, me)
+        };
+        !self.links.held().contains(&pair)
+            && !self
+                .links
+                .dropped()
+                .iter()
+                .any(|&link| link == (me, node) || link == (node, me))
     }
 
     /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
@@ -4134,9 +4224,7 @@ impl Host {
         else {
             return;
         };
-        // K1 ruling, condition 6: a rebuild that never pinned while L1 admits writes is not a
-        // stall anyone waits on, so the line is never printed then.
-        if self.admits(partition) == Some(true) {
+        if rebuild_quiet(&watch.mode, self.admits(partition)) {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -6957,6 +7045,14 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
         .iter()
         .find(|member| member.copy == copy)
         .map(|member| member.node)
+}
+
+/// Whether a rebuild check that found F1 unpinned stays quiet. K1 ruling, condition 6: a
+/// rebuild that never pinned while L1 admits writes is not a stall anyone waits on. A
+/// `ReadOnly` commit takes no write whatever L1 says, so it is never quiet (A-R319, W5's probe:
+/// a read-only promote whose L1 had resumed was silent).
+fn rebuild_quiet(mode: &PartitionMode, admits: Option<bool>) -> bool {
+    *mode != PartitionMode::ReadOnly && admits == Some(true)
 }
 
 /// Whether a plan run by `owner` may leave `holder` out of `members`, with how many copies it
