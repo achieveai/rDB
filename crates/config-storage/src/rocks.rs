@@ -211,6 +211,18 @@ const KEY_CURRENT_SNAPSHOT: &[u8] = b"current_snapshot";
 /// from the retained `.snap` before anything is served (ADR-0022 "Install: two-phase").
 const KEY_INSTALL_IN_PROGRESS: &[u8] = b"install_in_progress";
 
+/// A wait on the state-machine lock this long or longer is logged (`state machine lock
+/// waited`). Readers take that lock on whatever thread calls them, runtime workers included,
+/// so a long hold anywhere stalls them; this is how a log shows it.
+const SM_LOCK_WAIT_LOGGED: std::time::Duration = std::time::Duration::from_millis(100);
+
+std::thread_local! {
+    /// `true` while this thread runs a closure handed to [`RocksShared::run`], i.e. on the
+    /// blocking pool. A lock wait logged with `store_thread = false` stalled some other thread,
+    /// such as a runtime worker.
+    static ON_STORE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The journal key for a revision: big-endian, so lexicographic order is numeric order.
 fn event_key(revision: u64) -> [u8; 8] {
     revision.to_be_bytes()
@@ -555,8 +567,29 @@ impl RocksShared {
         self.log.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The state-machine lock. A wait of [`SM_LOCK_WAIT_LOGGED`] or more is logged with the
+    /// caller's location and whether it waited on the blocking pool.
+    #[track_caller]
     fn sm(&self) -> MutexGuard<'_, SmInner> {
-        self.sm.lock().unwrap_or_else(|e| e.into_inner())
+        match self.sm.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let started = std::time::Instant::now();
+                let guard = self.sm.lock().unwrap_or_else(|e| e.into_inner());
+                let waited = started.elapsed();
+                if waited >= SM_LOCK_WAIT_LOGGED {
+                    let caller = std::panic::Location::caller();
+                    tracing::warn!(
+                        waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                        caller = %format_args!("{}:{}", caller.file(), caller.line()),
+                        store_thread = ON_STORE_THREAD.with(std::cell::Cell::get),
+                        "state machine lock waited"
+                    );
+                }
+                guard
+            }
+        }
     }
 
     fn recv(&self) -> MutexGuard<'_, Option<PathBuf>> {
@@ -817,7 +850,19 @@ impl RocksShared {
     {
         let shared = Arc::clone(self);
         let span = shared.span.clone();
-        match tokio::task::spawn_blocking(move || span.in_scope(|| f(&shared))).await {
+        let on_pool = move || {
+            // Cleared on drop, so a panicking closure does not leave a pooled thread marked.
+            struct Marked;
+            impl Drop for Marked {
+                fn drop(&mut self) {
+                    ON_STORE_THREAD.with(|flag| flag.set(false));
+                }
+            }
+            ON_STORE_THREAD.with(|flag| flag.set(true));
+            let _marked = Marked;
+            span.in_scope(|| f(&shared))
+        };
+        match tokio::task::spawn_blocking(on_pool).await {
             Ok(result) => result,
             Err(join) => Err(io_error(
                 ErrorSubject::Store,
@@ -2984,12 +3029,14 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
 
     /// Capture the view the next [`RocksSnapshotBuilder::build_snapshot`] will export.
     ///
-    /// The capture happens **here**, under the state-machine mutex, and not in
-    /// `build_snapshot` — which OpenRaft runs concurrently with further applies (research §1.3,
-    /// trap T3). `apply` holds this mutex across its entire synced batch, so a view taken while
-    /// holding it can never straddle one: the exported data and the exported `last_applied`
-    /// describe the same instant. A snapshot whose header said index N while its bytes held
-    /// N+5 would install a follower into a state no leader ever had.
+    /// The capture happens **here**, and not in `build_snapshot` — which OpenRaft runs
+    /// concurrently with further applies (research §1.3, trap T3). `apply` writes its records
+    /// and `last_applied` in one batch, and the capture reads `last_applied` back from the
+    /// checkpoint rather than from memory, so a view can never straddle one: the exported data
+    /// and the exported `last_applied` describe the same instant. It does not hold the
+    /// state-machine mutex while the checkpoint is taken (A-R279). A snapshot whose header said
+    /// index N while its bytes held N+5 would install a follower into a state no leader ever
+    /// had.
     ///
     /// The view itself is a [`rocksdb::checkpoint::Checkpoint`] — a directory of hard links,
     /// so its cost is the number of SST files rather than the size of the database — because
@@ -3157,8 +3204,10 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
 
 /// The consistent view one snapshot is exported from.
 ///
-/// Captured under the state-machine mutex in [`RaftStateMachine::get_snapshot_builder`], so the
-/// checkpoint's contents and the metadata below describe the same applied instant.
+/// Captured in [`RaftStateMachine::get_snapshot_builder`]. Every field below is read back from
+/// the checkpoint itself, not from the in-memory state machine, so the checkpoint's contents and
+/// the metadata describe the same applied instant without holding the state-machine lock while
+/// the checkpoint is taken (A-R279).
 struct CapturedView {
     snapshot_id: String,
     created_unix_ms: u64,
@@ -3166,17 +3215,30 @@ struct CapturedView {
     membership: StoredMembership<RaftNodeId, RaftNode>,
     cluster_revision: u64,
     compact_revision: u64,
-    /// The retired-node set at capture (M5-R21). Taken from the in-memory state machine under
-    /// the same lock as the revisions above, so the header describes one applied state rather
-    /// than two moments stitched together.
+    /// The retired-node set at capture (M5-R21). Read from the checkpoint like the revisions
+    /// above, so the header describes one applied state rather than two moments stitched
+    /// together.
     retired_nodes: BTreeSet<NodeId>,
-    /// The activation watermark at capture (M6-R15), taken under the same lock.
+    /// The activation watermark at capture (M6-R15), read from the checkpoint too.
     max_applied_command_schema: u16,
     /// The checkpoint directory. Removed once the export finishes, successfully or not.
     checkpoint: PathBuf,
 }
 
-/// Take a checkpoint of the database together with the applied metadata that describes it.
+/// Names each capture's checkpoint directory before the metadata that gives the snapshot its id
+/// has been read. Process-wide, so two stores capturing in the same millisecond never collide.
+static CAPTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Take a checkpoint of the database, then read the applied metadata that describes it from the
+/// checkpoint.
+///
+/// The state-machine lock is **not** held here (A-R279). The checkpoint flushes the memtable and
+/// queues behind every other store's flush on RocksDB's shared flush thread, and readers take
+/// that lock synchronously from runtime workers, so holding it here stalled them for seconds.
+///
+/// Consistency comes from the data instead of the lock: `apply` writes the records and all of the
+/// metadata below in one write batch, and a checkpoint is one point-in-time image of the
+/// database, so the metadata read back from it describes exactly the records it holds.
 #[allow(clippy::result_large_err)]
 fn capture_view(s: &RocksShared) -> Result<CapturedView, StorageError<RaftNodeId>> {
     s.guard(ErrorSubject::Snapshot(None), ErrorVerb::Write)?;
@@ -3189,13 +3251,14 @@ fn capture_view(s: &RocksShared) -> Result<CapturedView, StorageError<RaftNodeId
         )
     })?;
 
-    let sm = s.sm();
     let created_unix_ms = snapshot::unix_ms();
-    let snapshot_id = snapshot::snapshot_id(sm.last_applied, created_unix_ms);
-    let checkpoint = snapshot::build_view_path(&s.path, &snapshot_id);
-    // A leftover from an interrupted build under the same id: `create_checkpoint` refuses an
-    // existing directory, and keeping it would fail every future build with the same name.
+    let sequence = CAPTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let checkpoint =
+        snapshot::build_view_path(&s.path, &format!("capture-{created_unix_ms}-{sequence}"));
+    // A leftover from an interrupted build under the same name: `create_checkpoint` refuses an
+    // existing directory.
     let _ = std::fs::remove_dir_all(&checkpoint);
+    let started = std::time::Instant::now();
     rocksdb::checkpoint::Checkpoint::new(&s.db)
         .and_then(|c| c.create_checkpoint(&checkpoint))
         .map_err(|e| {
@@ -3205,15 +3268,41 @@ fn capture_view(s: &RocksShared) -> Result<CapturedView, StorageError<RaftNodeId
                 format!("cannot checkpoint into {}: {e}", checkpoint.display()),
             )
         })?;
+    tracing::debug!(
+        checkpoint = %checkpoint.display(),
+        checkpoint_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "snapshot view checkpointed"
+    );
+    s.faults.during_snapshot_capture();
+    view_from_checkpoint(checkpoint.clone(), created_unix_ms).map_err(|detail| {
+        // Hard links: a view nobody will export would pin every SST file it references.
+        let _ = std::fs::remove_dir_all(&checkpoint);
+        io_error(
+            ErrorSubject::Snapshot(None),
+            ErrorVerb::Read,
+            format!("cannot read the build view's metadata: {detail}"),
+        )
+    })
+}
+
+/// Read the applied metadata a checkpoint holds. The defaults are `load_state`'s, so a key an
+/// older build never wrote reads here exactly as it would when the store opens.
+fn view_from_checkpoint(checkpoint: PathBuf, created_unix_ms: u64) -> Result<CapturedView, String> {
+    let opts = Options::default();
+    let cf_names = DB::list_cf(&opts, &checkpoint).map_err(|e| e.to_string())?;
+    let db = DB::open_cf_for_read_only(&opts, &checkpoint, &cf_names, false)
+        .map_err(|e| e.to_string())?;
+    let last_applied: Option<LogId<RaftNodeId>> = read_meta(&db, CF_STATE_META, KEY_LAST_APPLIED)?;
     Ok(CapturedView {
-        snapshot_id,
+        snapshot_id: snapshot::snapshot_id(last_applied, created_unix_ms),
         created_unix_ms,
-        last_applied: sm.last_applied,
-        membership: sm.membership.clone(),
-        cluster_revision: sm.kv.cluster_revision(),
-        compact_revision: sm.kv.compact_revision(),
-        retired_nodes: sm.kv.retired_nodes().clone(),
-        max_applied_command_schema: sm.kv.max_applied_command_schema(),
+        last_applied,
+        membership: read_meta(&db, CF_STATE_META, KEY_MEMBERSHIP)?.unwrap_or_default(),
+        cluster_revision: read_meta(&db, CF_STATE_META, KEY_CLUSTER_REVISION)?.unwrap_or(0),
+        compact_revision: read_meta(&db, CF_STATE_META, KEY_COMPACT_REVISION)?.unwrap_or(0),
+        retired_nodes: read_meta(&db, CF_STATE_META, KEY_RETIRED_NODES)?.unwrap_or_default(),
+        max_applied_command_schema: read_meta(&db, CF_STATE_META, KEY_MAX_COMMAND_SCHEMA)?
+            .unwrap_or(config_core::COMMAND_SCHEMA_V1),
         checkpoint,
     })
 }
