@@ -1105,6 +1105,275 @@ fn m10_s2_b17_a_repair_whose_plan_is_running_is_not_repaired_again() {
     }
 }
 
+/// A stopped node: its host, which nothing steps, and its mailbox, where everything sent to it
+/// waits, as the real link queues it for the next process (`net_link_up queued=1396`).
+type Dead = (Host, Sender<Msg>, Receiver<Msg>);
+
+/// D8's first half, after [`two_down`].
+struct TwoDown {
+    trio: Trio,
+    /// The member the drop kept, stopped, and its node.
+    kept: (Dead, u32),
+    /// The dropped member, stopped for good. Held so its mail still has somewhere to wait.
+    _gone: Dead,
+    /// The `ReadOnly` generation the drop committed.
+    dropped: Generation,
+    /// The plan anchor node 1 asked the kept member about for that generation.
+    asked: LineageAnchor,
+    /// The next request id.
+    request: u64,
+}
+
+/// D8's first half: puts land on all three, then nodes 2 and 3 stop ([`Dead`]). A put lands
+/// on node 1 only, writes stop, and the owner drops one of them: the next generation keeps
+/// node 1 and the other, and commits `ReadOnly`, since that one never answers.
+fn two_down(dir: &std::path::Path) -> TwoDown {
+    let (mut trio, before) = started(dir, tuned);
+    let mut request = 1;
+    for _ in 0..3 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => request += 1,
+            other => panic!("put {request} with all three up: {other:?}"),
+        }
+    }
+    let three = trio.nodes.remove(2);
+    let two = trio.nodes.remove(1);
+    loop {
+        let answer = trio.ask(put_within(request, DROP_AFTER_MILLIS));
+        request += 1;
+        match answer {
+            // The first waits for an ack that never comes. Then L1 pauses, or the grant
+            // lapses around the drop's fence, as the real walk saw (tester-s2 D8).
+            Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {}
+            Answer::Error { error, .. } => {
+                tracing::info!(name = error.name(), "d8_put_refused_with_two_down");
+                break;
+            }
+            other => panic!("put {} with two down: {other:?}", request - 1),
+        }
+    }
+    let (dropped, mode, members) = trio.until("node 1 drops a copy", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(
+        (dropped, mode),
+        (before.next(), PartitionMode::ReadOnly),
+        "one dropped, the other silent: {members:?}"
+    );
+    let (kept, gone) = match members[..] {
+        [1, 2] => ((two, 2), three),
+        [1, 3] => ((three, 3), two),
+        _ => panic!("the drop kept {members:?}"),
+    };
+    let asked = trio.nodes[0].0.plans[&PartitionId(1)].anchor;
+    TwoDown {
+        trio,
+        kept,
+        _gone: gone,
+        dropped,
+        asked,
+        request,
+    }
+}
+
+/// The kept member starts again, as `Db::restart_node` restarts a node: a new host opens its
+/// directory at the next boot and takes the mail that waited, in order, and node 1 hears the
+/// new boot. Returns when.
+fn restart_dead(trio: &mut Trio, ((host, tx, rx), node): (Dead, u32)) -> Tick {
+    let node = NodeId(node);
+    let boot = host.boot;
+    let reboot = BootId(boot.0 + 1);
+    let control = Arc::clone(&host.control);
+    let path = host.engine.path().to_owned();
+    drop(host);
+    control.forget_node(node, boot);
+    let engine = RocksEngine::open(path).expect("reopen the node");
+    let mut host = Host::new(node, engine, Arc::clone(&trio.links), control, trio.clock);
+    host.boot = reboot;
+    tuned(&mut host);
+    trio.links.register(node, tx.clone(), reboot);
+    trio.nodes.push((host, tx, rx));
+    trio.nodes[0]
+        .1
+        .send(Msg::PeerBooted { node, boot: reboot })
+        .expect("node 1 up");
+    trio.clock.now()
+}
+
+/// D8's second half: after `dropped`, node 1 commits `DegradedRf2` with itself and node `kept`
+/// within the bound from `returned`, and a put lands there. That is the rejoin's commit, or,
+/// when the kept copy reached the cutoff only after it answered, the commit of the repair
+/// re-plan that follows the ReadOnly commit (`repair_duty`, A-R319). No answer was read as
+/// `StaleLineage`.
+fn rejoined_and_writes_land(
+    trio: &mut Trio,
+    method: &str,
+    (dropped, kept): (Generation, u32),
+    returned: Tick,
+    request: u64,
+) {
+    let (after, members) = trio.until("node 1 commits DegradedRf2 with both", |trio| {
+        commit_of(trio)
+            .filter(|(generation, mode, _)| {
+                *generation > dropped && *mode == PartitionMode::DegradedRf2
+            })
+            .map(|(generation, _, members)| (generation, members))
+    });
+    let waited = HostClock::millis_until(returned, trio.clock.now());
+    tracing::info!(waited, method, "d8_rf2_after_return_ms");
+    assert_eq!(members, vec![1, kept], "{waited} ms after the return");
+    // At most two runs of the spec's window: the rejoin, and the repair re-plan a ReadOnly
+    // commit gets, each with its fence.
+    let window = trio.nodes[0].0.budgets.discovery_window_millis;
+    assert!(
+        waited <= 2 * window + DROP_AFTER_MILLIS,
+        "DegradedRf2 committed {waited} ms after the return"
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the return: {other:?}"),
+    }
+    let stale: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "recovery_fact")
+        .filter(|line| {
+            line["effect"]
+                .as_str()
+                .is_some_and(|effect| effect.contains("StaleLineage"))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "a late answer was read as stale: {stale:?}"
+    );
+}
+
+/// D8 (S2-5, two down and one back), as the walk saw it: [`two_down`], then the kept member
+/// starts again. Its new host takes the mail that waited, including the dropped generation's
+/// inventory ask, and its new boot starts a rejoin. Writes must land again at `DegradedRf2`
+/// with both. Before the fix the partition stayed `ReadOnly` for good: the late answer was
+/// read as `StaleLineage`, and a copy that reached the cutoff just after its answer had no
+/// way back in.
+/// Cuts: no `inventory_answer_late` check in `process`, red (`StaleLineage`); no
+/// `repair_duty`, red when the ask beats the frames (stays `ReadOnly`).
+/// Integration (~5 s): bootstrap, the drop clock, the drop's window, one or two re-plans.
+#[config_log::retcd_test]
+fn m10_s2_d8_two_down_return_commits_rf2_and_writes_land() {
+    const METHOD: &str = "m10_s2_d8_two_down_return_commits_rf2_and_writes_land";
+    let dir = config_testkit::fs::temp_dir();
+    let mut down = two_down(dir.path());
+    // Fix 3 (A-R337 item 3): the ReadOnly commit set up no rebuild, and its stall line says
+    // so instead of "never pinned". Asked for directly, as host/tests.rs asks for M27's.
+    // Cut: `unpinned_cause` always "never pinned", red.
+    let host = &mut down.trio.nodes[0].0;
+    host.rebuild_check(PartitionId(1), down.dropped);
+    let stalled = host.status(PartitionId(1)).stalled.expect("the stall line");
+    assert!(
+        stalled.contains("phase=Committed: F1 set up no rebuild")
+            && !stalled.contains("host_catch_up")
+            && stalled.ends_with(
+                "F1 set up no rebuild, so the partition stays ReadOnly and does not activate"
+            ),
+        "{stalled}"
+    );
+    host.stalled.remove(&PartitionId(1));
+    let kept = down.kept.1;
+    let returned = restart_dead(&mut down.trio, down.kept);
+    rejoined_and_writes_land(
+        &mut down.trio,
+        METHOD,
+        (down.dropped, kept),
+        returned,
+        down.request,
+    );
+    let late = logged!(METHOD, "inventory_answer_late");
+    assert!(
+        late.iter()
+            .any(|line| line["node"] == 1 && line["seen_gen"] == down.asked.lineage.generation.0),
+        "node 1 dropped the late answer: {late:?}"
+    );
+}
+
+/// D8, critic-d8 finding 1: a late answer that is `InventoryFailed` (a copy answering an old
+/// ask after it linked a newer generation says so) must not drop the copy from the current
+/// run either. [`two_down`], then the kept member starts again with its link to node 1 held.
+/// Once node 1's rejoin plan is in place, an `InventoryFailed` for the dropped generation's
+/// ask reaches it; then the link heals and the copy answers the current ask.
+/// Cut: no `inventory_answer_late` check in `process`, red: F1 drops the copy as a source
+/// (`RecordSourceUnavailable`) before its real answer arrives.
+/// Integration (~5 s): as the row above.
+#[config_log::retcd_test]
+fn m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy() {
+    const METHOD: &str = "m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy";
+    let dir = config_testkit::fs::temp_dir();
+    let mut down = two_down(dir.path());
+    let kept = down.kept.1;
+    let copy = copy_of(&down.trio, kept);
+    down.trio.links.hold(NodeId(1), NodeId(kept));
+    let returned = restart_dead(&mut down.trio, down.kept);
+    let dropped = down.dropped;
+    down.trio.until("node 1 plans the rejoin", |trio| {
+        let plan = trio.nodes[0].0.plans.get(&PartitionId(1))?;
+        (plan.anchor.lineage.generation == dropped).then_some(())
+    });
+    let before = unavailable(METHOD, copy);
+    down.trio.nodes[0]
+        .1
+        .send(Msg::Answered {
+            partition: PartitionId(1),
+            correlation: REJOIN,
+            asked: down.asked,
+            kind: KernelEvent::Recovery(RecoveryEvent::InventoryFailed { copy }),
+        })
+        .expect("node 1 up");
+    pass(&mut down.trio, 50);
+    // The link is still held, so nothing the copy sent has reached node 1: F1 drops no
+    // source on the late Failed alone (critic-d8r M1).
+    assert_eq!(
+        unavailable(METHOD, copy),
+        before,
+        "the late InventoryFailed dropped copy {copy:?} before its real answer"
+    );
+    down.trio.links.heal(NodeId(1), NodeId(kept));
+    rejoined_and_writes_land(
+        &mut down.trio,
+        METHOD,
+        (dropped, kept),
+        returned,
+        down.request,
+    );
+    let late = logged!(METHOD, "inventory_answer_late");
+    assert!(
+        late.iter().any(|line| line["node"] == 1
+            && line["seen_gen"] == down.asked.lineage.generation.0
+            && line["failed"] == true),
+        "node 1 dropped the late InventoryFailed: {late:?}"
+    );
+}
+
+/// How many times node 1's F1 has dropped `copy` as a record source so far in this test.
+fn unavailable(method: &str, copy: CopyId) -> usize {
+    let fact = format!("RecordSourceUnavailable {{ copy: {copy:?},");
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "recovery_fact" && line["node"] == 1)
+        .filter(|line| line["effect"].as_str().is_some_and(|e| e.contains(&fact)))
+        .count()
+}
+
+/// Node `node`'s copy in node 1's last commit.
+fn copy_of(trio: &Trio, node: u32) -> CopyId {
+    trio.nodes[0].0.committed[&PartitionId(1)]
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .find(|member| member.node == NodeId(node))
+        .map(|member| member.copy)
+        .expect("a member")
+}
+
 /// b19 (A-R346 M1): a repair that cannot take its member in is not repeated until that member
 /// moves. b6's read-only commit {1, 2}, node 2 outside, but node 2 now refuses every inventory
 /// F1 asks of it, as a copy that missed a generation below the base does (#59). Once node 2

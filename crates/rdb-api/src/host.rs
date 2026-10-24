@@ -405,6 +405,19 @@ pub enum Msg {
         /// The event.
         kind: KernelEvent,
     },
+    /// A copy's answer to an inventory ask, stamped with the anchor it was asked about. The
+    /// asker drops it when that is not its current plan's anchor: a late answer to an older
+    /// run's ask, queued by the link while the copy was down (D8, A-R337).
+    Answered {
+        /// The partition.
+        partition: PartitionId,
+        /// The correlation.
+        correlation: CorrelationId,
+        /// The anchor of the ask this answers.
+        asked: LineageAnchor,
+        /// The answer: `InventoryReported` or `InventoryFailed`.
+        kind: KernelEvent,
+    },
     /// The control plane's watch of a committed recovery, heard by this member (M10 replaces
     /// the in-process fan-out; lead ruling, 2026-10-07).
     Landed {
@@ -1522,6 +1535,8 @@ struct Host {
     /// Status queries sent and not yet stepped, by their event. Never in `pending`, so never
     /// behind a write (F-014): P1 answers one in the step that takes it.
     statuses: BTreeMap<EventId, (RequestIdentity, Sender<Answer>)>,
+    /// The anchor each queued inventory answer was asked about, by its event (D8, A-R337).
+    answer_stamps: BTreeMap<EventId, LineageAnchor>,
     /// The status query whose event is being stepped, until P1's answer takes it.
     answering: Option<(RequestIdentity, Sender<Answer>)>,
     plans: BTreeMap<PartitionId, RecoveryPlan>,
@@ -1674,6 +1689,7 @@ impl Host {
             pending: BTreeMap::new(),
             queued: BTreeMap::new(),
             statuses: BTreeMap::new(),
+            answer_stamps: BTreeMap::new(),
             answering: None,
             plans: BTreeMap::new(),
             committed: BTreeMap::new(),
@@ -2053,6 +2069,22 @@ impl Host {
                     );
                 }
                 self.push(site, EventKind::Kernel(kind), true, None);
+                Ok(())
+            }
+            Msg::Answered {
+                partition,
+                correlation,
+                asked,
+                kind,
+            } => {
+                let site = Site {
+                    partition,
+                    correlation,
+                };
+                // Checked in `process`, against the plan current when the answer is offered.
+                let queued = self.queued(site, EventKind::Kernel(kind), true, None);
+                self.answer_stamps.insert(queued.event.id, asked);
+                self.queue.push_back(queued);
                 Ok(())
             }
             Msg::Landed {
@@ -3001,6 +3033,28 @@ impl Host {
         };
         if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
             self.plans.insert(event.partition, (**plan).clone());
+        }
+        // D8 (A-R337): an inventory answer to an older run's ask, which the link held while the
+        // copy was down, never reaches F1's current run: as Reported it reads `StaleLineage`,
+        // as Failed it drops the copy, and either shuts out a copy the current ask may admit.
+        if let Some(asked) = self.answer_stamps.remove(&event.id) {
+            let plan = self.plans.get(&event.partition).map(|plan| plan.anchor);
+            if plan != Some(asked) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = event.partition.0,
+                    failed = matches!(
+                        event.kind,
+                        EventKind::Kernel(KernelEvent::Recovery(
+                            RecoveryEvent::InventoryFailed { .. }
+                        ))
+                    ),
+                    seen_gen = asked.lineage.generation.0,
+                    plan_gen = plan.map(|anchor| anchor.lineage.generation.0),
+                    "inventory_answer_late"
+                );
+                return Ok(());
+            }
         }
         let arm = match &event.kind {
             EventKind::Kernel(kernel) => Arm::of(kernel),
@@ -4464,17 +4518,20 @@ impl Host {
             return;
         }
         let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
-        let phase = self
-            .recoveries
-            .get(&partition)
-            .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
+        let f1_phase = self.recoveries.get(&partition).map(|f1| f1.phase());
+        let phase = f1_phase
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |phase| format!("{phase:?}"));
         let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
         let mode = watch.mode.clone();
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
-             waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
-             rebuild, so the partition",
-            partition.0, generation.0, watch.mode, watch.cutoff.0,
+             waited_ms={waited_ms} phase={phase}{}, so the partition",
+            partition.0,
+            generation.0,
+            watch.mode,
+            watch.cutoff.0,
+            unpinned_cause(f1_phase.as_ref()),
         );
         tracing::error!(
             node = self.node.0,
@@ -5973,10 +6030,19 @@ impl Host {
         let Some(answer) = self.answer(partition, ask) else {
             return;
         };
-        let msg = Msg::Routed {
-            partition,
-            correlation,
-            kind: KernelEvent::Recovery(answer),
+        let kind = KernelEvent::Recovery(answer);
+        let msg = match *ask {
+            PeerAsk::Inventory { anchor, .. } => Msg::Answered {
+                partition,
+                correlation,
+                asked: anchor,
+                kind,
+            },
+            PeerAsk::Sync { .. } => Msg::Routed {
+                partition,
+                correlation,
+                kind,
+            },
         };
         if let Err(fault) = self.links.send(self.node, asker, msg) {
             tracing::warn!(
@@ -7317,6 +7383,17 @@ fn rebuild_quiet(mode: &PartitionMode, admits: Option<bool>) -> bool {
     *mode != PartitionMode::ReadOnly && admits == Some(true)
 }
 
+/// Why a watched rebuild is not pinned: the stall line's tail after `phase=`. F1 still
+/// `Committed` set up no rebuild at all: a `ReadOnly` commit whose second copy was not a source
+/// (D8, A-R337 item 3). "Never pinned" would send a reader looking for a rebuild that never
+/// existed, and no catch-up was ever needed, so `host_catch_up` is left out (critic-d8r A4).
+fn unpinned_cause(phase: Option<&RecoveryPhase>) -> &'static str {
+    match phase {
+        Some(RecoveryPhase::Committed) => ": F1 set up no rebuild",
+        _ => " host_catch_up=unsupported: F1 never pinned its rebuild",
+    }
+}
+
 /// Whether a plan run by `owner` may leave `holder` out of `members`, with how many copies it
 /// would keep. Never the owner's own copy, and never fewer than two copies: spec §8.3 has no
 /// one-copy fallback (M10 S2 part (b), A-R290).
@@ -7748,6 +7825,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::CatchUp { .. } => "catch_up",
         Msg::Restore { .. } => "restore",
         Msg::Routed { .. } => "routed",
+        Msg::Answered { .. } => "answered",
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",
         Msg::Inspect { .. } => "inspect",
