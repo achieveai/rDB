@@ -309,6 +309,19 @@ impl ConfigStore for CutStore {
             ended: false,
         }))
     }
+
+    /// Forwarded, not left to the trait's default: that calls `watch`, which opens at the
+    /// inner store's first endpoint only, so a node's control watch re-dialled a follower
+    /// about once a second and never followed its leader hint (A-R284, #57).
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.check("watch_leader")?;
+        let inner = self.inner.watch_leader(request).await?;
+        Ok(Box::pin(CutWatch {
+            inner,
+            faults: Arc::clone(&self.faults),
+            ended: false,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +356,86 @@ mod tests {
         assert!(faults.holds(&Label::App("a".to_owned())));
         faults.apply("");
         assert!(!faults.holds(&Label::Node(NodeId(2))));
+    }
+
+    /// A store whose first endpoint is a follower: `watch` is refused `NotLeader`, and only
+    /// `watch_leader`, which follows the hint, reaches the leader and serves one event.
+    struct FollowerFirst;
+
+    fn event() -> WatchItem {
+        WatchItem::Event(config_core::MutationEvent {
+            revision: 4,
+            key: bytes::Bytes::from_static(b"grants/1"),
+            kind: config_core::MutationEventKind::Delete,
+        })
+    }
+
+    fn unserved() -> ConfigError {
+        ConfigError::Unavailable {
+            reason: "FollowerFirst serves watches only".to_owned(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigStore for FollowerFirst {
+        async fn get(&self, _: GetRequest) -> Result<GetResponse, ConfigError> {
+            Err(unserved())
+        }
+
+        async fn list(&self, _: ListRequest) -> Result<ListResponse, ConfigError> {
+            Err(unserved())
+        }
+
+        async fn put(&self, _: PutRequest) -> Result<MutationResponse, ConfigError> {
+            Err(unserved())
+        }
+
+        async fn delete(&self, _: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+            Err(unserved())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::EPHEMERAL_DEVELOPMENT
+        }
+
+        async fn watch(&self, _: WatchRequest) -> Result<WatchStream, ConfigError> {
+            Err(ConfigError::NotLeader { hint: None })
+        }
+
+        async fn watch_leader(&self, _: WatchRequest) -> Result<WatchStream, ConfigError> {
+            Ok(Box::pin(futures::stream::iter(vec![Ok(event())])))
+        }
+    }
+
+    /// A-R284 (lr, node 1 re-dialled a follower ~66 times a minute after the rEtcd leader
+    /// stepped down): a watch opened at the leader through `CutStore` reaches the leader the
+    /// inner store finds, and a cut still refuses it. Cut: drop `CutStore::watch_leader`, the
+    /// trait default calls `watch`, and the open is refused `NotLeader`. Unit.
+    #[test]
+    fn a_watch_through_the_cut_store_opens_at_the_leader() {
+        use futures::StreamExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let faults = Faults::new();
+        let store = CutStore::new(Arc::new(FollowerFirst), Arc::clone(&faults));
+        let request = || WatchRequest {
+            prefix: bytes::Bytes::from_static(b"grants/"),
+            start_after_revision: 0,
+            progress_interval: None,
+        };
+        rt.block_on(async {
+            let mut stream = match store.watch_leader(request()).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("the watch did not reach the leader: {error}"),
+            };
+            assert_eq!(stream.next().await, Some(Ok(event())));
+            faults.apply("cut-control\n");
+            match store.watch_leader(request()).await {
+                Err(error) => assert_eq!(error, cut()),
+                Ok(_) => panic!("a cut node opened a watch"),
+            }
+        });
     }
 }
