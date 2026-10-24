@@ -1267,9 +1267,31 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         db: mut three_db,
         ..
     } = three;
-    three_db.shutdown();
-    drop(three_db);
-    drop(three_net);
+    // A-R388: the owner's pause clock starts at `before`, which node 3 stops too soon to make
+    // durable, so the away writes have one pause budget (~2 s) from that put. The teardown
+    // after node 3's node thread stops (its RocksDB close, the join, its links) took 2.8 s
+    // beside load and spent all of it. So the teardown runs aside, and the writes start once
+    // node 3's node thread has stopped: node 3 hears nothing from then on.
+    let teardown = std::thread::spawn(move || {
+        three_db.shutdown();
+        drop(three_db);
+        drop(three_net);
+    });
+    let stopped_by = std::time::Instant::now() + patience;
+    loop {
+        config_log::layer::flush_test_logs();
+        let stopped = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .any(|line| line["@m"] == "node_stopped" && line["node"] == 3 && line["boot"] == old.0);
+        if stopped {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < stopped_by,
+            "node 3's node thread did not stop within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // Writes go on with node 3 away until the owner pauses them for the unheard copy (B-R38).
     let mut landed = 0u32;
     let paused_by = std::time::Instant::now() + patience;
@@ -1286,6 +1308,7 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(landed >= 1, "no put landed with node 3 away");
+    teardown.join().expect("node 3's process stops");
     let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
     let mut again = start(3, relisten);
     assert!(
