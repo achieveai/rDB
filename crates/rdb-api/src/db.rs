@@ -5025,9 +5025,29 @@ mod tests {
             .expect("open");
         admits(&db, "after the open");
         db.put(b"a", b"1", None).expect("before the restart");
-        let before = owner_status(&db, "node 1 before the restart").recovered;
-        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        let owner = owner_status(&db, "node 1 before the restart");
+        let before = owner.recovered;
+        let applied = owner.holds.expect("node 1 holds the partition").applied;
         let patience = crate::host::test_patience(Duration::from_secs(5));
+        // A-R301b/A-R305: node 3 durable at a=1 before it stops, so nothing is unsafe while it
+        // restarts and L1 keeps admitting. Otherwise L1 pauses on node 3 for the whole restart,
+        // and a restart slowed past PEER_DROP_AFTER_MILLIS by host load (13 and 26 s in gates
+        // k521 and k513) let node 1 drop node 3, leaving the link hold below nothing to pause.
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
+            let durable = node_3.as_ref().and_then(|n| n.holds).map(|h| h.durable);
+            if durable >= Some(applied) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 not durable at node 1's applied {applied} within {patience:?}: \
+                 {node_3:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
         let deadline = std::time::Instant::now() + patience;
         let first = loop {
             let owner = owner_status(&db, "node 1 re-planning");
@@ -5042,6 +5062,14 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
+        // A re-plan that dropped node 3 leaves the hold below nothing to pause: say so now.
+        let owner = owner_status(&db, "node 1 after the re-plan");
+        let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
+        assert_eq!(
+            node_3.as_ref().and_then(|n| n.recovered),
+            owner.recovered,
+            "node 3 is not in node 1's re-plan (dropped?): owner {owner:?}, node 3 {node_3:?}"
+        );
         db.links().hold(OWNER, NodeId(3));
         owner_when(&db, "L1 pauses", patience, &|node| {
             node.admits == Some(false)
