@@ -274,7 +274,7 @@ Logical event order must never depend on wall clock, random hash-map traversal, 
 
 M1 separates process-visible batches, modeled OS-buffered WAL and verified durable prefixes. A process crash can differ from a host/power crash; a host crash may discard every unflushed suffix. Missing/corrupt durable data is an explicit fault leading to quarantine, not an invented successful recovery.
 
-The storage seam includes `sync_wal_through(captured_prefixes)`. M1 models, and D1 enforces, the per-engine write-order mutex from capture through successful `DB::flush_wal(true)` after captured batches return. No write bypasses this boundary; errors or partial completion advance no durable watermark.
+The storage seam includes `sync_wal_through(captured_prefixes)`. The capture is taken when a sync begins, and the fsync then runs on the node's syncer thread, through a handle of its own on each WAL file (M10 ruling A-R365), not the node thread (M10 ruling A-R317). Commits keep landing while it runs; a commit made after the capture is durable only after the next sync. Only a successful flush publishes the captured prefixes; errors or partial completion advance no durable watermark.
 
 D1 tests concurrent-write attempts, flush errors, crash/reopen and rejection of manual/concurrent/pipelined WAL modes unless separately requalified. Batch atomicity holds across user values, history, dedup and progress metadata. Crash hooks fire before/after the atomic commit and each completion, flush and publication boundary. A test must never use "durable" as an alias for in-memory application.
 
