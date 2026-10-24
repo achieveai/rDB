@@ -756,6 +756,7 @@ where
         }
     };
     let config = DbConfig {
+        ack_floor: true,
         dir: args.dir.clone(),
         hold: args.hold.clone(),
         timeouts: Timeouts {
@@ -7727,6 +7728,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            ack_floor: true,
             dir,
             hold: Vec::new(),
             timeouts: Timeouts::default(),
@@ -7776,6 +7778,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.join("run"),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
@@ -7836,6 +7839,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            ack_floor: true,
             dir: root.path().join("run"),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
