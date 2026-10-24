@@ -4288,17 +4288,20 @@ impl Host {
             return;
         }
         let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
-        let phase = self
-            .recoveries
-            .get(&partition)
-            .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
+        let f1_phase = self.recoveries.get(&partition).map(|f1| f1.phase());
+        let phase = f1_phase
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |phase| format!("{phase:?}"));
         let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
         let mode = watch.mode.clone();
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
-             waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
-             rebuild, so the partition",
-            partition.0, generation.0, watch.mode, watch.cutoff.0,
+             waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: {}, so the partition",
+            partition.0,
+            generation.0,
+            watch.mode,
+            watch.cutoff.0,
+            unpinned_cause(f1_phase.as_ref()),
         );
         tracing::error!(
             node = self.node.0,
@@ -7120,6 +7123,16 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
 /// a read-only promote whose L1 had resumed was silent).
 fn rebuild_quiet(mode: &PartitionMode, admits: Option<bool>) -> bool {
     *mode != PartitionMode::ReadOnly && admits == Some(true)
+}
+
+/// Why a watched rebuild is not pinned, for the stall line. F1 still `Committed` set up no
+/// rebuild at all: a `ReadOnly` commit whose second copy was not a source (D8, A-R337 item 3),
+/// so "never pinned" would send a reader looking for a rebuild that never existed.
+fn unpinned_cause(phase: Option<&RecoveryPhase>) -> &'static str {
+    match phase {
+        Some(RecoveryPhase::Committed) => "F1 set up no rebuild",
+        _ => "F1 never pinned its rebuild",
+    }
 }
 
 /// Whether a plan run by `owner` may leave `holder` out of `members`, with how many copies it

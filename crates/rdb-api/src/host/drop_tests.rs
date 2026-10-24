@@ -1242,7 +1242,10 @@ fn rejoined_and_writes_land(
                 .is_some_and(|effect| effect.contains("StaleLineage"))
         })
         .collect();
-    assert!(stale.is_empty(), "a late answer was read as stale: {stale:?}");
+    assert!(
+        stale.is_empty(),
+        "a late answer was read as stale: {stale:?}"
+    );
 }
 
 /// D8 (S2-5, two down and one back), as the walk saw it: [`two_down`], then the kept member
@@ -1259,6 +1262,20 @@ fn m10_s2_d8_two_down_return_commits_rf2_and_writes_land() {
     const METHOD: &str = "m10_s2_d8_two_down_return_commits_rf2_and_writes_land";
     let dir = config_testkit::fs::temp_dir();
     let mut down = two_down(dir.path());
+    // Fix 3 (A-R337 item 3): the ReadOnly commit set up no rebuild, and its stall line says
+    // so instead of "never pinned". Asked for directly, as host/tests.rs asks for M27's.
+    // Cut: `unpinned_cause` always "never pinned", red.
+    let host = &mut down.trio.nodes[0].0;
+    host.rebuild_check(PartitionId(1), down.dropped);
+    let stalled = host.status(PartitionId(1)).stalled.expect("the stall line");
+    assert!(
+        stalled.contains("phase=Committed")
+            && stalled.ends_with(
+                "F1 set up no rebuild, so the partition stays ReadOnly and does not activate"
+            ),
+        "{stalled}"
+    );
+    host.stalled.remove(&PartitionId(1));
     let kept = down.kept.1;
     let returned = restart(&mut down.trio, down.kept);
     rejoined_and_writes_land(
@@ -1270,8 +1287,8 @@ fn m10_s2_d8_two_down_return_commits_rf2_and_writes_land() {
     );
     let late = logged!(METHOD, "inventory_answer_late");
     assert!(
-        late.iter().any(|line| line["node"] == 1
-            && line["seen_gen"] == down.asked.lineage.generation.0),
+        late.iter()
+            .any(|line| line["node"] == 1 && line["seen_gen"] == down.asked.lineage.generation.0),
         "node 1 dropped the late answer: {late:?}"
     );
 }
