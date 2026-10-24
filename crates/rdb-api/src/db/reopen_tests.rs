@@ -2387,6 +2387,69 @@ fn m10_s2_three_node_processes_on_one_folder_heal_and_serve() {
     );
 }
 
+/// tester-s2 `lr up` race (ruling A-R271): node 1's process opens alone and its heal finds no
+/// boot for nodes 2 and 3 within its window. It does not give up: it logs `heal_retry` and
+/// tries again (that line is logged by the heal task, outside this row's log span), so when
+/// nodes 2 and 3 open after the window, node 1 heals and is ready in the same open, with no
+/// restart. Cut: one attempt only, and node 1's heal fails for good at the window.
+/// Integration (~15 s): the heal's window is the grant budget plus a fixed 10 s
+/// (`heal_within`), and the first attempt must run it out.
+#[config_log::retcd_test]
+fn m10_s2_a_node_whose_peers_start_after_the_heal_window_heals_without_a_restart() {
+    const METHOD: &str =
+        "m10_s2_a_node_whose_peers_start_after_the_heal_window_heals_without_a_restart";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let links = Links::new();
+    let open_one = |node: u32| {
+        rt.block_on(Db::open_with(
+            DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..node_config(dir.path(), &[node])
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .unwrap_or_else(|e| panic!("node {node}'s process opens: {e}"))
+    };
+    let mut one = open_one(1);
+    // The heal starts at the end of the open, so the clock starts when the open returns. Past
+    // the first attempt's window (the product's, not scaled) that attempt has found no boot
+    // for nodes 2 and 3 and ended. The heal must still be running.
+    let opened = std::time::Instant::now();
+    let window = heal_within(&fast());
+    while opened.elapsed() < window + Duration::from_secs(2) {
+        let heal = lock(&one.opened.heal).clone();
+        assert!(
+            matches!(heal, HealState::Running),
+            "node 1's heal gave up at {:?} (window {window:?}): {heal:?}",
+            opened.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut late: Vec<Db> = [2, 3].into_iter().map(open_one).collect();
+    one.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("node 1 heals once nodes 2 and 3 are up, without a restart");
+    reads_back_and_writes(&one, "node 1's process");
+    for db in &mut late {
+        db.shutdown();
+    }
+    one.shutdown();
+
+    let heal = lock(&one.opened.heal).clone();
+    assert!(matches!(heal, HealState::Handed(_)), "{heal:?}");
+    let logged = messages(METHOD);
+    assert_eq!(
+        logged.iter().filter(|m| *m == "db_open_not_owner").count(),
+        2,
+        "nodes 2 and 3 opened as copies: {logged:?}"
+    );
+}
+
 // ---- S2-3 then a reopen (A-R256 follow-up, W5): the heal after a promote ----
 
 /// A-R256 follow-up, arch-s2 B1/B2: after `admin promote 2`, the folder is closed and opened

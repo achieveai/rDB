@@ -1020,6 +1020,48 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     Ok(healed)
 }
 
+/// The first wait between two heal attempts that found a peer's boot unknown.
+const HEAL_RETRY_FIRST: Duration = Duration::from_millis(500);
+/// The longest wait between two such attempts.
+const HEAL_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// [`heal`], again and again while it ends [`HealError::PeersUnknown`], until it ends any other
+/// way; the open's shutdown aborts the task that runs it (tester-s2 `lr up` race, ruling
+/// A-R271). On a slow host a peer's process can start after the first window has passed, and
+/// one attempt left the owner dead until it was opened again. Waiting for boots is the heal's
+/// first step and has done nothing yet, so trying again is safe. Any other error ends the heal
+/// as before. Each miss logs `heal_retry{attempt, missing, error, next_ms}`; the wait doubles
+/// from 0.5 s to 5 s.
+pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
+    let mut backoff = HEAL_RETRY_FIRST;
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
+        let again = HealCtx {
+            store: Arc::clone(&ctx.store),
+            owner: ctx.owner.clone(),
+            member_boot: Arc::clone(&ctx.member_boot),
+            ..ctx
+        };
+        match heal(again).await {
+            Err(HealError::PeersUnknown { nodes, within_ms }) => {
+                let missing = nodes.clone();
+                let error = HealError::PeersUnknown { nodes, within_ms };
+                tracing::warn!(
+                    attempt,
+                    missing = ?missing,
+                    %error,
+                    next_ms = backoff.as_millis(),
+                    "heal_retry"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(HEAL_RETRY_MAX);
+            }
+            ended => return ended,
+        }
+    }
+}
+
 /// The rf3 members of [`members`], each at the boot `ctx.member_boot` names for its node, once
 /// every one is known. Polls until `deadline`: a peer's boot arrives with its handshake.
 async fn member_boots(
