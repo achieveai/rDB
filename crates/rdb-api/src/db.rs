@@ -5293,6 +5293,19 @@ mod tests {
             if !dropped(&lines) {
                 break of(&db, OWNER).recovered.expect("node 1 recovered");
             }
+            // A12: only a drop before the restart is the stall this side is for; a restarted
+            // copy dropped afterwards is a fault, even when the re-add then repairs it.
+            let drop = lines
+                .iter()
+                .position(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3);
+            let restart = lines
+                .iter()
+                .position(|line| line["@m"] == "node_restarted" && line["node"] == 3);
+            assert!(
+                restart.is_some() && drop < restart,
+                "node 1 dropped node 3 after its restart: drop line {drop:?}, restart line \
+                 {restart:?}"
+            );
             let promoted = lines
                 .iter()
                 .position(|line| line["@m"] == "shadow_promote")
