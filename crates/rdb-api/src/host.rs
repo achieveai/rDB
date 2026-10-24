@@ -1568,9 +1568,6 @@ struct Host {
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
-    /// The tick of the node fence an acquire was last scheduled after (A-R378: A1 emits that
-    /// fence once per partition, and it needs one acquire).
-    acquire_after_fence_at: Option<Tick>,
     /// Per partition, the restart re-plan this owner is running (#42, A-R249).
     rejoins: BTreeMap<PartitionId, Rejoin>,
     /// Per partition, each member a drop plan left out, at the boot it was pinned at (A-R329).
@@ -1714,7 +1711,6 @@ impl Host {
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
-            acquire_after_fence_at: None,
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
             revocation_persisted: None,
@@ -3491,14 +3487,8 @@ impl Host {
                     let at = Site { partition, ..site };
                     self.push(at, EventKind::Kernel(event), true, None);
                 }
-                // A1 emits a node fence once per partition (A-R378), and the one fence needs one
-                // acquire: scheduled for the first of them, keyed by the fence's tick.
                 if *scope == FenceScope::Node {
-                    let at = self.authority.state().fenced_at();
-                    if at.is_some() && self.acquire_after_fence_at != at {
-                        self.acquire_after_fence_at = at;
-                        self.schedule_acquire_after_fence(site);
-                    }
+                    self.schedule_acquire_after_fence(site);
                 }
             }
             KernelEffect::SetAdmission(state) => {

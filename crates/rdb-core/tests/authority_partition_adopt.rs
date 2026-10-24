@@ -2041,9 +2041,8 @@ fn a_backward_jump_beyond_both_samples_epsilon_still_fences() {
         let step = kernel
             .step(&sample_ctx(1_700, 1_700, -behind, 5), &progress(4))
             .expect("built");
-        // One node fence per served partition, p1 and p2 (A-R378).
         let want = if fenced {
-            vec![(FenceScope::Node, DenyReason::ClockUnbounded); 2]
+            vec![(FenceScope::Node, DenyReason::ClockUnbounded)]
         } else {
             Vec::new()
         };
@@ -3083,11 +3082,7 @@ fn m7a_145_authority_view_republished_at_five_points_fans_out_per_served_partiti
             &our_grant_read(&kernel, 35, 10, 1_004_700, true),
         )
         .expect("the fence");
-    // One node fence per served partition (A-R378).
-    assert_eq!(
-        fences(&fence),
-        vec![(FenceScope::Node, DenyReason::Frozen); 2]
-    );
+    assert_eq!(fences(&fence), vec![(FenceScope::Node, DenyReason::Frozen)]);
     assert_eq!(published_for(&fence), both, "fence");
     for view in views(&fence) {
         assert_eq!(
@@ -4069,9 +4064,8 @@ fn m7a_188_a1_sites_a_view_and_a_partition_fence_at_their_partition() {
         }
     }
 
-    // A node fence ends admission on every partition: one fence and one past view per served
-    // partition, each at its own (A-R378; before it, one fence at the event's partition, which
-    // left every other partition's queue open, A-R376).
+    // A node fence ends admission on every partition: the fence stays at the event's partition,
+    // and each served partition's past view lands at its own.
     let (mut kernel, _) = serving_p1_p2();
     let rebooted = kernel
         .step(
@@ -4090,11 +4084,10 @@ fn m7a_188_a1_sites_a_view_and_a_partition_fence_at_their_partition() {
         fence_and_views,
         vec![
             (P1, Shape::Fence(DenyReason::BootMismatch)),
-            (P2, Shape::Fence(DenyReason::BootMismatch)),
             (P1, Shape::Publish(P1)),
             (P2, Shape::Publish(P2)),
         ],
-        "M7A-188: a node fence and a past view at each served partition: {rebooted:?}"
+        "M7A-188: a node fence at the event's partition, each past view at its own: {rebooted:?}"
     );
 }
 

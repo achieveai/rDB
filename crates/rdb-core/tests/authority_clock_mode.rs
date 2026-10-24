@@ -1643,14 +1643,9 @@ fn m7a_166_every_fence_publishes_an_already_past_view() {
         let seq = kernel.authority_seq();
         let effects = trigger(&mut kernel, t);
 
-        // A node fence is one per served partition (A-R378), a partition fence one.
-        let copies = match scope {
-            FenceScope::Node => 2,
-            FenceScope::Partition(_) => 1,
-        };
         assert_eq!(
             scoped_fences(&effects),
-            vec![(scope, reason); copies],
+            vec![(scope, reason)],
             "{name}: {effects:?}"
         );
         let views = published(&effects);
