@@ -2,19 +2,20 @@
 //! hold up commits made while it runs?
 //!
 //! ```text
-//! cargo run --release -p rdb-storage --example f4_probe -- <dir> [wal_mb]
+//! cargo run --release -p rdb-storage --example f4_probe -- <dir> [wal_mb] [pace_us]
 //! ```
 //!
 //! It writes `wal_mb` (default 64) of unsynced commits, begins one sync, and runs its
 //! `flush_wal(true)` on a second thread, as a node's syncer does. Meanwhile this thread, the
-//! node thread's stand-in, commits one small batch every 20 ms (50/s) until the sync returns,
-//! then for one more second. A commit's latency counts from when it was due, not when it
-//! started, so a commit thread held by the fsync shows as late commits.
+//! node thread's stand-in, commits one small batch every `pace_us` (default 20 000, 50/s; 1 000
+//! packs the fsync window, critic-f4 P1) until the sync returns, then for one more second. Each
+//! commit issued inside the fsync is printed with its start and end against the sync's.
 //!
-//! Verdict, last line: `PASS` when the sync took over 1 s and no commit was over 500 ms late;
-//! `FAIL` when a commit was over 500 ms late; `NOT_EXERCISED` when the sync took 1 s or less,
-//! so the run proves nothing either way. Exit code 0, 1 and 2 respectively. `<dir>` must not
-//! exist, or be empty; the probe never deletes it.
+//! Verdict, last line: `FAIL` (exit 1) when a commit issued inside the fsync waited on it (took
+//! 2 ms or more and returned no earlier than 2 ms before the fsync did), or any commit returned
+//! over 500 ms after it was due; `NOT_EXERCISED` (exit 2) when fewer than 5 commits were issued
+//! inside the fsync; else `PASS` (exit 0). `<dir>` must not exist, or be empty; the probe never
+//! deletes it.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -24,9 +25,9 @@ use rdb_core::contracts::ids::{BatchId, Generation, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, Namespace, Write};
 use rdb_storage::{RocksEngine, StorageOptions, WalSync};
 
-const PACE: Duration = Duration::from_millis(20);
 const LATE_LIMIT_MILLIS: u128 = 500;
-const SYNC_FLOOR_MILLIS: u128 = 1_000;
+/// Fewer commits than this issued inside the fsync and the run proves nothing.
+const MIN_INSIDE: usize = 5;
 const BIG_VALUE: usize = 64 << 10;
 
 fn batch(seq: u64, value: &Bytes) -> Batch {
@@ -44,10 +45,10 @@ fn batch(seq: u64, value: &Bytes) -> Batch {
 }
 
 /// The fsync on this thread, timed: what a node's syncer runs.
-fn flush_timed(sync: WalSync) -> (WalSync, Result<(), String>, Duration) {
-    let started = Instant::now();
+fn flush_timed(sync: WalSync) -> (WalSync, Result<(), String>, Instant, Instant) {
+    let began = Instant::now();
     let flushed = sync.flush();
-    (sync, flushed, started.elapsed())
+    (sync, flushed, began, Instant::now())
 }
 
 fn wal_bytes(dir: &std::path::Path) -> u64 {
@@ -72,6 +73,9 @@ fn main() {
     let wal_mb: u64 = args
         .next()
         .map_or(64, |text| text.parse().expect("wal_mb: a whole number"));
+    let pace = Duration::from_micros(args.next().map_or(20_000, |text| {
+        text.parse().expect("pace_us: a whole number")
+    }));
 
     // Budgets far above the probe's writes, so no memtable flush or WAL switch syncs anything
     // before the probe's own sync does.
@@ -103,55 +107,86 @@ fn main() {
     let sync = engine.begin_sync(Vec::new());
     let start = Instant::now();
     let handle = std::thread::spawn(move || flush_timed(sync));
-    let mut late = Vec::new();
+    // Per commit: when it was due, when it started, when it returned.
+    let mut commits: Vec<(Instant, Instant, Instant)> = Vec::new();
     let mut returned_at = None;
     for tick in 1u32.. {
-        let due = start + PACE * tick;
-        if let Some(wait) = due.checked_duration_since(Instant::now()) {
-            std::thread::sleep(wait);
+        let due = start + pace * tick;
+        // `sleep` on Windows rounds up to its timer tick, so a pace under 2 ms spins instead.
+        while let Some(wait) = due.checked_duration_since(Instant::now()) {
+            if wait > Duration::from_millis(2) {
+                std::thread::sleep(wait);
+            } else {
+                std::hint::spin_loop();
+            }
         }
         seq += 1;
+        let began = Instant::now();
         engine.commit(batch(seq, &small)).expect("probe commit");
-        let during = returned_at.is_none();
-        late.push((Instant::now().duration_since(due).as_millis(), during));
-        if during && handle.is_finished() {
+        commits.push((due, began, Instant::now()));
+        if returned_at.is_none() && handle.is_finished() {
             returned_at = Some(start.elapsed());
         }
         if returned_at.is_some_and(|at| start.elapsed() > at + Duration::from_secs(1)) {
             break;
         }
     }
-    let (sync, flushed, took) = handle.join().expect("the sync thread");
+    let (sync, flushed, sync_began, sync_ended) = handle.join().expect("the sync thread");
     let ok = flushed.is_ok();
     engine.finish_sync(sync, flushed).expect("finish the sync");
+    let took = sync_ended.duration_since(sync_began);
+    let at = |instant: Instant| instant.saturating_duration_since(sync_began).as_secs_f64() * 1e3;
 
-    let during: Vec<u128> = late.iter().filter(|(_, d)| *d).map(|(l, _)| *l).collect();
-    let mut sorted = during.clone();
-    sorted.sort_unstable();
-    let p99 = sorted
-        .get((sorted.len() * 99 / 100).min(sorted.len().saturating_sub(1)))
-        .copied()
-        .unwrap_or(0);
-    let worst = late.iter().map(|(l, _)| *l).max().unwrap_or(0);
-    let over: Vec<u128> = late
+    // A commit issued inside the fsync, `[sync_began, sync_ended)`, "waited" when it took 2 ms
+    // or more and returned no earlier than 2 ms before the fsync did: its end tracks the sync's.
+    let wait_floor = Duration::from_millis(2);
+    let inside: Vec<&(Instant, Instant, Instant)> = commits
         .iter()
-        .map(|(l, _)| *l)
-        .filter(|l| *l > LATE_LIMIT_MILLIS)
+        .filter(|(_, began, _)| *began >= sync_began && *began < sync_ended)
         .collect();
+    let waited: Vec<&&(Instant, Instant, Instant)> = inside
+        .iter()
+        .filter(|(_, began, ended)| {
+            ended.duration_since(*began) >= wait_floor && *ended + wait_floor >= sync_ended
+        })
+        .collect();
+    let inside_max = inside
+        .iter()
+        .map(|(_, began, ended)| ended.duration_since(*began))
+        .max()
+        .unwrap_or_default();
+    let late_max = commits
+        .iter()
+        .map(|(due, _, ended)| ended.saturating_duration_since(*due))
+        .max()
+        .unwrap_or_default();
     println!(
-        "sync: {} ms over {} MB, ok={ok}",
-        took.as_millis(),
-        unsynced >> 20
+        "sync: {:.1} ms over {} MB, ok={ok}; pace {} us",
+        took.as_secs_f64() * 1e3,
+        unsynced >> 20,
+        pace.as_micros()
     );
+    for (_, began, ended) in &inside {
+        println!(
+            "inside: start {:.3} ms, end {:.3} ms, took {:.3} ms (sync ends {:.3} ms)",
+            at(*began),
+            at(*ended),
+            ended.duration_since(*began).as_secs_f64() * 1e3,
+            at(sync_ended)
+        );
+    }
     println!(
-        "commits: {} total, {} while the sync ran; late p99 {p99} ms, worst {worst} ms, \
-         over {LATE_LIMIT_MILLIS} ms: {over:?}",
-        late.len(),
-        during.len()
+        "commits: {} total, {} issued inside the sync, longest inside {:.3} ms, waited on it {}, \
+         latest return after due {:.3} ms",
+        commits.len(),
+        inside.len(),
+        inside_max.as_secs_f64() * 1e3,
+        waited.len(),
+        late_max.as_secs_f64() * 1e3
     );
-    let (verdict, code) = if !over.is_empty() {
+    let (verdict, code) = if !waited.is_empty() || late_max.as_millis() > LATE_LIMIT_MILLIS {
         ("FAIL", 1)
-    } else if took.as_millis() <= SYNC_FLOOR_MILLIS {
+    } else if inside.len() < MIN_INSIDE {
         ("NOT_EXERCISED", 2)
     } else {
         ("PASS", 0)
