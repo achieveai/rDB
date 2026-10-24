@@ -436,18 +436,21 @@ status() {
 # Failover is a control-plane action (A-R240), so no node process promotes itself: rdb_dev runs
 # as an app with no copy of its own (--nodes, local=[]) and sends `admin promote N [--drop M]`.
 # The surviving rdb_node processes take the new plan from their control watch. rdb_dev's own
-# answer and exit code are passed through.
+# answer and exit code are passed through. rdb_dev is built in the run's profile (run.env), so
+# an `up --release` run promotes with a release rdb_dev too (A-R295).
 promote() {
-    local dev line
-    dev="$(exe "$TARGET/debug/examples/rdb_dev")"
+    local dev line release=""
+    [ "$PROFILE" = release ] && release=--release
+    dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
     if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$dev" ]; then
-        say "building rdb_dev into $TARGET"
-        (cd "$REPO" && cargo build -p rdb-api --example rdb_dev) >&2
-        dev="$(exe "$TARGET/debug/examples/rdb_dev")"
+        say "building rdb_dev into $TARGET/$PROFILE"
+        # shellcheck disable=SC2086
+        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_dev) >&2
+        dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
     fi
     [ -f "$dev" ] || die "rdb_dev not found at $dev after building"
     line="admin promote $ARG${DROP:+ --drop $DROP}"
-    say "$line"
+    say "$line (rdb_dev: $dev)"
     printf '%s\nquit\n' "$line" | "$dev" --dir "$RUN/admin" --log-dir "$RUN/logs/admin" \
         --control "$CONTROL" --nodes "$(peers)" --cert-dir "$RUN/certs" --app admin
 }
