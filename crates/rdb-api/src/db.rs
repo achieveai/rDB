@@ -2203,13 +2203,18 @@ impl Db {
     /// Which nodes of this `Db` have restarted or failed to restart; `None` while every node runs
     /// its first boot. Names each restarted node and its boot, and says when the restart failed
     /// and the node stays stopped (F-013), in one short clause, because it rides on every refused
-    /// answer (tester walk 5). A restarted copy does not rejoin in this open (achieveai/rDB#42):
-    /// it takes part again once the folder is opened again (M10 A-R188).
+    /// answer (tester walk 5). Then what is true now (A-R275): a restarted secondary rejoins by
+    /// itself once the owner re-plans (A-R256(2)), while a restarted owner stays out until the
+    /// folder is opened again (A-R188). A failed restart adds nothing more: its node stays stopped.
     #[must_use]
     pub fn restart_note(&self) -> Option<String> {
-        let restarted: Vec<String> = lock(&self.nodes)
+        let nodes = lock(&self.nodes);
+        let moved: Vec<&NodeHandle> = nodes
             .iter()
             .filter(|handle| handle.boot != self.opened.base_boot)
+            .collect();
+        let restarted: Vec<String> = moved
+            .iter()
             .map(|handle| {
                 let (node, boot) = (handle.node.0, handle.boot.0);
                 let who = if handle.node == OWNER {
@@ -2224,11 +2229,16 @@ impl Db {
                 }
             })
             .collect();
-        (!restarted.is_empty()).then(|| {
-            format!(
-                "{}; a restarted node stays out until the folder is opened again (#42)",
-                restarted.join(", ")
-            )
+        let tail = if moved.iter().any(|handle| handle.node == OWNER) {
+            Some("the owner stays out until the folder is opened again")
+        } else if moved.iter().any(|handle| !handle.start_failed) {
+            Some("a restarted copy rejoins by itself once the owner re-plans")
+        } else {
+            None
+        };
+        (!restarted.is_empty()).then(|| match tail {
+            Some(tail) => format!("{}; {tail}", restarted.join(", ")),
+            None => restarted.join(", "),
         })
     }
 
@@ -2682,6 +2692,13 @@ impl Db {
                     boot = boot.0,
                     "node_restarted"
                 );
+                // #42 (A-R249): the other nodes hear the new boot as a net handshake tells a
+                // node process; the record owner then re-plans to link this copy again.
+                for other in nodes.iter().filter(|other| other.node != node) {
+                    if other.send(Msg::PeerBooted { node, boot }).is_err() {
+                        tracing::warn!(node = node.0, peer = other.node.0, "peer_booted_unsent");
+                    }
+                }
                 Ok(boot)
             }
             Err(detail) => {
@@ -4773,11 +4790,96 @@ mod tests {
         db.shutdown();
     }
 
-    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts, L1 pauses
-    /// writes; a put refused then was refused at admission and never queued, so a retry of it
-    /// must not promise that `status` will show its outcome: status stays `Unknown` for good. A
-    /// retry of the published put keeps the promise, since status shows it (review F-023).
-    /// Integration (~1 s): three node threads, one restart, a 400 ms pause budget.
+    /// #42 (A-R249), S2-2: node 3 restarts under a live owner. Node 1 hears the new boot, drains
+    /// its epoch and commits the next generation pinning it, so writes resume on RF3 with no
+    /// restart of node 1: a put lands and node 3 holds it durably at node 1's generation. Cut:
+    /// no re-plan, and node 1 logs `replication_copy_not_advancing` while node 3 never gets the
+    /// put. Integration (~3 s): three node threads, one restart.
+    #[config_log::retcd_test]
+    fn m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let of = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let before = of(&db, OWNER)
+            .recovered
+            .expect("node 1 recovered at the open");
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        assert_eq!(
+            db.restart_note().as_deref(),
+            Some(
+                "node 3 restarted (now boot 2); a restarted copy rejoins by itself once the owner \
+                 re-plans"
+            ),
+            "A-R275: a refusal says what is true now"
+        );
+
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            let owner = of(&db, OWNER);
+            if owner.recovered > Some(before) && owner.admits == Some(true) {
+                match db.put(b"b", b"2", None) {
+                    Ok(put) => break put,
+                    Err(refused) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no put landed within {patience:?} of the restart: {refused:?}"
+                    ),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 did not re-plan past generation {} and admit within {patience:?}: \
+                 {owner:?}",
+                before.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let owner = of(&db, OWNER);
+        let generation = owner.recovered.expect("node 1 recovered");
+        let target = owner.holds.expect("node 1 holds the partition").durable;
+        loop {
+            let third = of(&db, NodeId(3));
+            let held = third.holds.map(|holds| (holds.generation, holds.durable));
+            if third.boot == BootId(2)
+                && held.is_some_and(|(at, durable)| at == generation && durable >= target)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 holds {held:?}, not generation {} through {target}, within {patience:?} \
+                 (put {put:?})",
+                generation.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+    }
+
+    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts and stops
+    /// advancing, L1 pauses writes; a put refused then was refused at admission and never
+    /// queued, so a retry of it must not promise that `status` will show its outcome: status
+    /// stays `Unknown` for good. A retry of the published put keeps the promise, since status
+    /// shows it (review F-023). Since A-R256(2) node 1 re-plans after the restart and writes
+    /// resume once node 3 syncs, so the published put is made at the re-planned generation and
+    /// node 3's link is then held to bring the pause, and the refusals still name the restart.
+    /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
     #[test]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
         let dir = config_testkit::fs::temp_dir();
@@ -4792,14 +4894,28 @@ mod tests {
             ))
             .expect("open");
         admits(&db, "after the open");
-        let first = db.put(b"a", b"1", None).expect("before the restart");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let before = owner_status(&db, "node 1 before the restart").recovered;
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
-        owner_when(
-            &db,
-            "L1 pauses",
-            crate::host::test_patience(Duration::from_secs(5)),
-            &|node| node.admits == Some(false),
-        );
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        let first = loop {
+            let owner = owner_status(&db, "node 1 re-planning");
+            if owner.recovered > before && owner.admits == Some(true) {
+                if let Ok(put) = db.put(b"a", b"2", None) {
+                    break put;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed after node 1's re-plan within {patience:?}: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        db.links().hold(OWNER, NodeId(3));
+        owner_when(&db, "L1 pauses", patience, &|node| {
+            node.admits == Some(false)
+        });
         let refused = db.put(b"a", b"9", None).expect_err("paused");
         assert_eq!(
             refused.error.kind,
@@ -5045,8 +5161,8 @@ mod tests {
         let note = db.restart_note().expect("the owner restarted");
         assert_eq!(
             note,
-            "the owner, node 1, restarted (now boot 2); a restarted node stays out until the folder \
-             is opened again (#42)"
+            "the owner, node 1, restarted (now boot 2); the owner stays out until the folder is \
+             opened again"
         );
         for kind in kinds {
             let plain = ApiError::new(kind, "d");
@@ -6030,8 +6146,10 @@ mod tests {
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
-    /// it. Puts landing on node 2 wait for W6's `CopyAheadOnControl` arm (A-R254): until it merges, node 2's host faults on it.
-    /// Cut: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced.
+    /// it. A put then lands on node 2 at the new generation, and the write made before reads
+    /// back there.
+    /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
+    /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -6076,6 +6194,29 @@ mod tests {
         let old = db.put(b"c", b"3", None);
         db.route.owner.store(2, Ordering::Relaxed);
         assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
+
+        // A-R254, A-R256: writes go on at node 2, the write made before reads back there.
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            match db.put(b"b", b"2", None) {
+                Ok(put) => break put,
+                Err(refused) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no put landed on node 2 within {patience:?}: {refused:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(put.generation, promoted.generation, "{put:?}");
+        for (key, value) in [(&b"a"[..], &b"1"[..]), (b"b", b"2")] {
+            assert_eq!(
+                db.get(key).expect("get").value.map(|(_, v)| v),
+                Some(Bytes::copy_from_slice(value)),
+                "{} at node 2",
+                String::from_utf8_lossy(key)
+            );
+        }
         db.shutdown();
     }
 

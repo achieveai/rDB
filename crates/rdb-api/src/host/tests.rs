@@ -5426,3 +5426,47 @@ fn a_write_under_a_generation_not_marked_activated_is_refused_and_sends_nothing(
     );
     assert_eq!(trio.head(), head, "nothing was sent");
 }
+
+/// #42 (L-R178e, A-R256 (2)): a revocation an earlier process made durable reaches the new
+/// process's A1 before anything else, so the new A1 keeps it. At start the host reads each from
+/// the store and queues it as `EpochRevocationRestored`; a fresh A1 adds it to its revoked set.
+/// The second host is the real start: `run` replays before it reads any mail. Cuts: the replay
+/// queues nothing, and A1's set is empty, red; `run` never calls it, and no replay line counts
+/// one, red. Unit (~200 ms): two hosts, one after the other, over one store.
+#[config_log::retcd_test]
+fn m10_s2_a_revocation_persisted_before_a_restart_is_restored_to_a1_at_start() {
+    const METHOD: &str =
+        "m10_s2_a_revocation_persisted_before_a_restart_is_restored_to_a1_at_start";
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut host = host_over(&path, &rt);
+        host.engine
+            .persist_epoch_revocation(PartitionId(1), OwnerEpoch(1))
+            .expect("persist");
+        assert!(host.authority.view().revoked_epochs.is_empty());
+        host.restore_revocations();
+        host.drain();
+        assert!(host.fault.is_none(), "{:?}", host.fault);
+        assert_eq!(
+            host.authority.view().revoked_epochs,
+            BTreeSet::from([(PartitionId(1), OwnerEpoch(1))]),
+            "A1 holds the restored revocation"
+        );
+    }
+    let host = host_over(&path, &rt);
+    let (tx, rx) = mpsc::channel();
+    tx.send(Msg::Stop).expect("send");
+    host.run(&rx);
+    let counts: Vec<_> = logged!(METHOD, "host_duty")
+        .into_iter()
+        .filter(|line| line["kind"] == "revocation_replay")
+        .map(|line| line["count"].clone())
+        .collect();
+    assert_eq!(
+        counts,
+        [serde_json::json!(1), serde_json::json!(1)],
+        "the direct call, then `run` at the second start, each replayed the one revocation"
+    );
+}

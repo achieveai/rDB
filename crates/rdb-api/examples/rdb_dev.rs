@@ -4867,8 +4867,8 @@ mod tests {
         fenced.authority = "fenced(Expired)".to_owned();
         fenced.fence = Some(DenyReason::Expired);
         fenced.fence_polling = true;
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let mut seen = Seen {
             ready: true,
             ..Seen::default()
@@ -5010,8 +5010,8 @@ mod tests {
         .skip(2)
         .collect();
         assert_eq!(lines, [blocked]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let stuck = with("held(grant 2)", "Blocked(ControlUnknown)", None);
         let mut healthy = stuck.clone();
         healthy.protection = Some("healthy".to_owned());
@@ -5070,8 +5070,8 @@ mod tests {
         );
 
         let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[], &[]);
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
         healthy.protection = Some("healthy".to_owned());
         assert_eq!(
@@ -5170,8 +5170,8 @@ mod tests {
         // fenced with its poll live, then `unheld` with its self-replace stopped
         // (`replace_stopped`, kernel `self_replace_stopped`), then a later poll that changes
         // nothing. With and without a restart, the stuck line, once.
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let gave_up = "node 1's grant is unheld and node 1 stopped trying for one: its grant \
                        record is frozen or not its own; nothing in M9 replaces it, so writes \
                        stay stopped for this run: to write again, quit and start rdb_dev again";
@@ -5485,8 +5485,8 @@ mod tests {
     /// a copy out stays unsafe and pauses at L1's pause age (r3: 2.02 s).
     #[test]
     fn ready_after_a_restart_says_writes_pause_soon_not_only_after_the_next_write() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
         let mut paused = owner(None, false);
         paused.protection = Some("paused".to_owned());
         let mut seen = Seen::default();
@@ -5523,12 +5523,12 @@ mod tests {
     /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
     #[test]
     fn every_ready_line_matches_the_state_that_decides_it() {
-        let note = "node 2 restarted (now boot 2); a restarted node stays out until the folder \
-                    is opened again (#42)";
-        let failed = "node 2 stopped: its restart as boot 2 failed; a restarted node stays out \
-                      until the folder is opened again (#42)";
-        let owner_note = "the owner, node 1, restarted (now boot 2); a restarted node stays out \
-                          until the folder is opened again (#42)";
+        let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
+                    owner re-plans";
+        let failed = "node 2 stopped: its restart as boot 2 failed";
+        let owner_note =
+            "the owner, node 1, restarted (now boot 2); the owner stays out until the \
+             folder is opened again";
         let stuck = "writes stay stopped for this run: to write again, quit and start rdb_dev \
                      again";
         let pause = |note: &str| {
@@ -5815,8 +5815,8 @@ mod tests {
     /// w12 (r9/walks) shows both on a real run.
     #[test]
     fn a_failed_owner_restart_says_not_ready_and_nodes_names_the_stopped_node() {
-        let note = "the owner, node 1, stopped: its restart as boot 2 failed; a restarted node \
-                    stays out until the folder is opened again (#42)";
+        let note = "the owner, node 1, stopped: its restart as boot 2 failed; the owner stays out \
+                    until the folder is opened again";
         let mut seen = Seen::default();
         lines_ready(&mut seen);
         assert_eq!(

@@ -1394,7 +1394,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     );
 }
 
-/// A-R188 (tester r8 `nr`): once node 1 has restarted, it does not rejoin in this open (#42).
+/// A-R188 (tester r8 `nr`): once node 1 has restarted, it does not rejoin in this open.
 /// `wait_ready` answers at once with `Stopped`, whose text names the restart and says to shut
 /// the `Db` down and open the folder again, rather than waiting out its bound; a put and a get
 /// refused after it carry the same next step. Taking that step works: the reopen reads the write
@@ -1412,8 +1412,9 @@ fn m10_r188_after_node_1_restarts_wait_ready_put_and_get_say_to_open_the_folder_
     db.put(b"a", b"1", None).expect("a put");
     assert_eq!(db.restart_node(OWNER).expect("node 1 restarts"), BootId(2));
 
-    let note = "the owner, node 1, restarted (now boot 2); a restarted node stays out until the \
-                folder is opened again (#42)";
+    let note =
+        "the owner, node 1, restarted (now boot 2); the owner stays out until the folder is \
+         opened again";
     let step = "nothing is served again in this open: to read or write again, shut this Db down \
                 and open the folder again";
     let asked = std::time::Instant::now();
