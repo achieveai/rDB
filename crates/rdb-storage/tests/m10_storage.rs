@@ -24,7 +24,7 @@ use rdb_core::transaction::dedup::{DedupIndex, SeedPending};
 use rdb_sim::storage::history::canonical_history;
 use rdb_storage::{
     dump, BindError, OpenError, PublishMark, RocksEngine, StorageOptions,
-    DEFAULT_WRITE_BUFFER_BYTES, INSTANCE_LEN,
+    DEFAULT_WRITE_BUFFER_BYTES, INSTANCE_LEN, WAL_BUDGETS,
 };
 
 const X: [u8; INSTANCE_LEN] = [0x11; INSTANCE_LEN];
@@ -822,6 +822,7 @@ fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
             &small,
             StorageOptions {
                 write_buffer_bytes: Some(SMALL_BUFFER),
+                memtable_budget_bytes: None,
             },
         )
         .expect("open with a small budget"),
@@ -875,6 +876,7 @@ fn m10_s2_a_small_write_buffer_flushes_where_the_default_keeps_everything_in_mem
     let (small_bytes, small_entries) = active(
         StorageOptions {
             write_buffer_bytes: Some(SMALL_BUFFER),
+            memtable_budget_bytes: None,
         },
         "flush-small",
     );
@@ -885,5 +887,96 @@ fn m10_s2_a_small_write_buffer_flushes_where_the_default_keeps_everything_in_mem
     assert!(
         small_entries < held_entries,
         "entries left memory: {small_entries} active of {held_entries}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// M10 S2 W8, ruling A-R300: one memtable budget for the whole store, and a WAL bounded by it.
+// ---------------------------------------------------------------------------------------------
+
+/// The value of `name` in the `[DBOptions]` section of the newest `OPTIONS-*` file.
+fn db_option(dir: &std::path::Path, name: &str) -> Option<u64> {
+    let newest = std::fs::read_dir(dir)
+        .expect("read the database directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("OPTIONS-") && !name.ends_with(".dbtmp"))
+        })
+        .max()
+        .expect("RocksDB writes an OPTIONS file at open");
+    let text = std::fs::read_to_string(&newest).expect("read the OPTIONS file");
+    let prefix = format!("{name}=");
+    text.lines()
+        .map(str::trim)
+        .skip_while(|line| *line != "[DBOptions]")
+        .take_while(|line| !line.starts_with("[CFOptions"))
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|value| value.parse().expect("a byte count"))
+}
+
+/// A store with a 1 MiB memtable budget takes 10,000 puts of 1 KiB (about 10 MiB), spread over
+/// three column families so no single column family's budget can be what holds memory down.
+/// After every put the store's memtable bytes are at most the budget plus one column family's
+/// buffer (capped to the budget, so 1 MiB). Without the budget the memtables keep all of it.
+/// The budget also sets `max_total_wal_size`.
+#[retcd_test]
+fn a_r300_memtable_memory_stays_within_the_store_budget() {
+    use bytes::Bytes;
+    use rdb_core::contracts::ids::BatchId;
+    use rdb_core::contracts::storage::{Batch, Write};
+
+    const BUDGET: usize = 1 << 20;
+    let dir = data_dir("memtable-budget");
+    let mut engine = RocksEngine::open_with(
+        &dir,
+        StorageOptions {
+            write_buffer_bytes: None,
+            memtable_budget_bytes: Some(BUDGET),
+        },
+    )
+    .expect("open with a 1 MiB budget");
+    let value = Bytes::from(vec![0x5a; 1024]);
+    let spread = [Namespace::User, Namespace::History, Namespace::Dedup];
+    let mut peak = 0;
+    for i in 0..10_000u64 {
+        engine
+            .commit(Batch {
+                id: BatchId(i + 1),
+                partition: PartitionId(1),
+                generation: Generation(1),
+                seq: Seq(i + 1),
+                writes: vec![Write {
+                    ns: spread[usize::try_from(i % 3).expect("small")],
+                    key: Bytes::from(i.to_be_bytes().to_vec()),
+                    value: Some(value.clone()),
+                }],
+            })
+            .expect("commit");
+        peak = peak.max(engine.memtable_bytes().expect("memtable bytes"));
+    }
+    let wal_bytes: u64 = std::fs::read_dir(&dir)
+        .expect("read the database directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
+        .map(|entry| entry.metadata().expect("WAL metadata").len())
+        .sum();
+    tracing::info!(peak, wal_bytes, budget = BUDGET, "a_r300_memtable_peak");
+    let limit = 2 * BUDGET as u64;
+    assert!(
+        peak <= limit,
+        "memtables peaked at {peak} bytes, over the budget plus one buffer ({limit})"
+    );
+    assert_eq!(db_option(&dir, "db_write_buffer_size"), Some(BUDGET as u64));
+    assert_eq!(
+        db_option(&dir, "max_total_wal_size"),
+        Some(WAL_BUDGETS * BUDGET as u64)
+    );
+    assert_eq!(
+        write_buffer_sizes(&dir)[rdb_storage::keys::CF_DATA],
+        BUDGET,
+        "a column family's buffer is capped to the store's budget"
     );
 }

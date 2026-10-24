@@ -281,7 +281,8 @@ fn m10_s2_b3_a_flapping_copy_is_dropped_once_and_only_when_down_past_the_clock()
 
 /// b4 (A-R281 A2): puts sent every 50 ms of host time from node 3's death until writes land
 /// again with two copies. Each one either landed and reads back, was refused having changed
-/// nothing and reads absent, or had an unknown outcome that a status query settles.
+/// nothing and reads absent, or had an unknown outcome (or a generation to reconcile) that a
+/// status query settles.
 /// Integration (~3 s): b1's drop with puts in flight throughout.
 #[config_log::retcd_test]
 fn m10_s2_b4_puts_in_flight_across_the_drop_land_or_are_refused_cleanly() {
@@ -325,10 +326,14 @@ fn m10_s2_b4_puts_in_flight_across_the_drop_land_or_are_refused_cleanly() {
                 false
             }
             Answer::Error { error, .. } => {
+                // `Reconcile` is a put queued behind the re-plan and stranded with
+                // `GENERATION_CHANGED` (spec §8.1): never replayed, settled like the rest.
                 assert!(
                     matches!(
                         error.retry,
-                        RetryRule::QueryStatus | RetryRule::RetryAfterRecovery
+                        RetryRule::QueryStatus
+                            | RetryRule::RetryAfterRecovery
+                            | RetryRule::Reconcile
                     ),
                     "put {request}: {error:?}"
                 );
@@ -431,4 +436,84 @@ fn m10_s2_b8_the_clock_starts_again_while_the_blamed_copy_advances() {
     );
     let other = Blame::next(Some(&advanced), CopyId(2), DurableSeq(6), Tick(1_100));
     assert_eq!((other.copy, other.since), (CopyId(2), Tick(1_100)));
+}
+
+/// b9 (critic-degraded D1): node 2 stays linked and acks everything it is sent, but its
+/// durable sequence never moves (its flush duty is stopped). L1 pauses on it. The owner blames
+/// the regular copy with the lowest durable sequence below the resume barrier, node 2, and
+/// drops it after the clock; writes land again with nodes 1 and 3.
+/// Cut: blame `stalest_copy` alone, red. L1's lag is time since a copy was last heard, not how
+/// far behind it is: node 2 is heard as often as node 3, so `stalest_copy` names node 3 (ties
+/// go to the higher copy) or moves between the two, and node 2 is not the one dropped.
+/// Integration (~3 s): bootstrap's window, the drop clock, the re-plan's window.
+#[config_log::retcd_test]
+fn m10_s2_b9_a_copy_that_acks_but_stays_behind_is_dropped() {
+    const METHOD: &str = "m10_s2_b9_a_copy_that_acks_but_stays_behind_is_dropped";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[1].0.next_flush = Tick(u64::MAX);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    let committed = trio.until("node 1 committed with two copies", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    let after = before.next();
+    let planned = logged!(METHOD, "membership_drop_planned");
+    assert_eq!(
+        committed,
+        (after, PartitionMode::DegradedRf2, vec![1, 3]),
+        "{planned:?}"
+    );
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["dropped"], 2);
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the drop: {other:?}"),
+    }
+}
+
+/// D2 (critic-degraded): L1 blocked for an operator (`DivergenceRequiresOperator`) is never
+/// dropped past, however long it refuses writes and however far a copy is behind. Node 3 is
+/// held and behind when node 1's L1 is blocked; three drop clocks later nothing is planned,
+/// writes are still refused for the operator, and the commit is the one with all three.
+/// Cut: `holding_up` without its `reason != ProtectionPaused` guard, red (node 3 dropped).
+/// Integration (~4 s): bootstrap's window, three drop clocks.
+#[config_log::retcd_test]
+fn m10_s2_d2_a_pause_for_divergence_is_never_dropped_past() {
+    const METHOD: &str = "m10_s2_d2_a_pause_for_divergence_is_never_dropped_past";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    hold_three(&trio);
+    for request in 1..=3 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} with node 3 held: {other:?}"),
+        }
+    }
+    let reason = rdb_core::contracts::authority::BlockReason::DivergenceRequiresOperator {
+        diverged: vec![CopyId(3)],
+    };
+    trio.nodes[0].0.push(
+        Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId::default(),
+        },
+        EventKind::Kernel(KernelEvent::BlockPartition(reason)),
+        false,
+        None,
+    );
+    pass(&mut trio, 3 * DROP_AFTER_MILLIS);
+    assert_eq!(
+        logged!(METHOD, "membership_drop_planned").len(),
+        0,
+        "a partition blocked for an operator was re-planned"
+    );
+    match trio.ask(put(4)) {
+        Answer::Error { error, .. } => assert_eq!(error.name(), "DIVERGENCE_REQUIRES_OPERATOR"),
+        other => panic!("a put while blocked: {other:?}"),
+    }
+    assert_eq!(
+        commit_of(&trio),
+        Some((before, PartitionMode::Active, vec![1, 2, 3]))
+    );
 }

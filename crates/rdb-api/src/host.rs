@@ -3770,9 +3770,10 @@ impl Host {
     }
 
     /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
-    /// sequence, while this node is the partition's pinned primary and runs no re-plan for it.
-    /// `None` while L1 admits, is not live here, or blocks for an operator, which no re-plan
-    /// clears.
+    /// sequence, while this node is the partition's pinned primary and runs no re-plan for it:
+    /// the regular copy with the lowest durable sequence below L1's resume barrier, else L1's
+    /// `stalest_copy`. `None` while L1 admits, is not live here, or blocks for an operator,
+    /// which no re-plan may clear (spec §8.1).
     fn holding_up(&self, partition: PartitionId, now: Tick) -> Option<(CopyId, DurableSeq)> {
         if self.rejoins.contains_key(&partition) {
             return None;
@@ -3792,15 +3793,29 @@ impl Host {
         if state.allow || state.reason != Some(ErrorKind::ProtectionPaused) {
             return None;
         }
-        let copy = state.stalest_copy?;
-        let durable = self
-            .replication
-            .primary(self.node, partition)?
-            .tracker()
-            .peer(copy)
-            .map_or(ReplicaProgress::EMPTY, |peer| peer.progress)
-            .durable;
-        Some((copy, durable))
+        let tracker = self.replication.primary(self.node, partition)?.tracker();
+        let durable = |copy: CopyId| {
+            tracker
+                .peer(copy)
+                .map_or(ReplicaProgress::EMPTY, |peer| peer.progress)
+                .durable
+        };
+        // D1 (critic-degraded): the copy furthest below the barrier, when one is. A copy that
+        // acks keepalives moves `stalest_copy` away from itself at each ACK, so blamed by lag
+        // alone it would never be blamed for long, however far behind it stays.
+        let behind = tracker
+            .config()
+            .members
+            .iter()
+            .filter(|member| {
+                member.role == ReplicaRole::RegularSecondary
+                    && !state.lost_copies.contains(&member.copy)
+            })
+            .map(|member| (member.copy, durable(member.copy)))
+            .filter(|(_, at)| at.0 < state.resume_barrier.0)
+            .min_by_key(|(copy, at)| (at.0, copy.0));
+        let copy = behind.map_or(state.stalest_copy, |(copy, _)| Some(copy))?;
+        Some((copy, durable(copy)))
     }
 
     /// Start the re-plan that drops `blame`'s copy, unless the plan would keep fewer than two
