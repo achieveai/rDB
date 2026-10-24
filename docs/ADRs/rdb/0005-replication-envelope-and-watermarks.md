@@ -448,8 +448,10 @@ makes divergence impossible there.
 The storage seam exposes `sync_wal_through(captured_prefixes)`. **Amended in M10 (ruling A-R317):
 there is no write-order mutex held across the fsync.** The sync has two halves. Begin runs after
 every captured `WriteBatch` call has returned, and fixes what the sync may credit: per prefix, the
-lower of the captured position and what the engine has applied. The fsync, `DB::flush_wal(true)`,
-runs on the node's syncer thread. Finish raises the durable marks to what begin fixed and never
+lower of the captured position and what the engine has applied. The fsync runs on the node's syncer thread,
+and syncs each WAL file through a handle of its own: Windows serializes all I/O on one synchronous
+file handle, so `DB::flush_wal(true)` on RocksDB's handle held every commit for the whole fsync
+(critic-f4 P1, ruling A-R365). Finish raises the durable marks to what begin fixed and never
 lowers them. Only unambiguous success publishes the captured prefixes; error or partial completion
 advances nothing. A memtable flush is not a substitute.
 

@@ -463,7 +463,7 @@ pub enum Msg {
 pub struct SyncDone {
     sync: rdb_storage::WalSync,
     flushed: Result<(), String>,
-    /// How long `flush_wal(true)` took on the syncer, test delay included.
+    /// How long the WAL fsync ([`rdb_storage::WalSync::flush`]) took on the syncer, test delay included.
     millis: u64,
 }
 

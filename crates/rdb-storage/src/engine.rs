@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -263,7 +264,7 @@ pub(crate) struct Marks {
 /// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). Every write and every capture goes
 /// through `&mut self`, so they are ordered. The WAL sync itself is not held under it (ruling
 /// A-R317, spec §6.1): [`Self::begin_sync`] fixes, under `&mut self`, what a sync may credit,
-/// [`WalSync::flush`] runs `flush_wal(true)` on any thread while commits go on, and
+/// [`WalSync::flush`] fsyncs the WAL files on any thread while commits go on, and
 /// [`Self::finish_sync`] moves the durable marks. A sync makes durable exactly the writes that
 /// returned before it began; a write made during it is durable only after the next one.
 ///
@@ -286,7 +287,7 @@ pub struct RocksEngine {
     /// open. Every view holds a clone, so the claim outlives the last handle on `db`.
     pub(crate) claim: Option<Arc<File>>,
     /// A-R214: RocksDB's latest sequence number when the WAL was last known synced through
-    /// it: read when a `flush_wal(true)` that succeeded began, or just after a synced write.
+    /// it: read when a WAL sync that succeeded began, or just after a synced write.
     /// `None` until then, so a fresh open counts as unsynced. A write after it, synced or not,
     /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`]. It never
     /// moves backwards (A-R317): a sync that began before a synced write ends after it.
@@ -298,6 +299,9 @@ pub struct RocksEngine {
     /// A synced write, or another sync, begun meanwhile would wait on that fsync inside
     /// RocksDB, on the caller's thread: each logs an error instead of passing silently.
     sync_in_flight: bool,
+    /// How many times a [`WalSync::flush`] synced the WAL files through its own handles
+    /// (A-R365): RocksDB's `rocksdb.wal.synced` does not see those, so [`Self::wal_syncs`] adds them.
+    wal_flushes: Arc<AtomicU64>,
     /// Debug builds: the options a writable open used, kept for their WAL-sync counter
     /// ([`Self::wal_syncs`]); `None` on a read-only open.
     #[cfg(debug_assertions)]
@@ -312,7 +316,7 @@ pub struct RocksEngine {
 pub enum InjectedFault {
     /// The next [`RocksEngine::commit`]'s write: nothing of the batch is applied.
     Commit,
-    /// The next [`RocksEngine::sync_wal_through`]'s `flush_wal(true)`: no watermark moves.
+    /// The next WAL sync's fsync ([`WalSync::flush`]): no watermark moves.
     WalFlush,
     /// The next [`RocksEngine::sync_wal_through`]'s durable-mark write, after the WAL sync
     /// succeeded: the disk state a crash between the two leaves.
@@ -346,19 +350,24 @@ impl InjectedFault {
 }
 
 /// One WAL sync, begun by [`RocksEngine::begin_sync`] (ruling A-R317). It holds what that
-/// sync may credit, fixed when it began, and a handle on the database, so [`Self::flush`] can
+/// sync may credit, fixed when it began, and the database directory, so [`Self::flush`] can
 /// run on another thread while the engine's owner goes on committing. Hand it back to
 /// [`RocksEngine::finish_sync`] to move the durable marks.
 pub struct WalSync {
-    db: Arc<DB>,
-    /// The directory claim, held while `db` is (A-R168): a sync that outlives its engine, as
+    /// Kept so the database outlives this sync even if its engine drops first.
+    _db: Arc<DB>,
+    /// The directory claim, held while `_db` is (A-R168): a sync that outlives its engine, as
     /// on a node-thread panic, must not let another open take the directory under it. Declared
-    /// after `db`, so it drops after it.
+    /// after `_db`, so it drops after it.
     _claim: Option<Arc<File>>,
+    /// The database directory, where RocksDB keeps its WAL files.
+    dir: PathBuf,
+    /// The engine's count of WAL syncs made here ([`RocksEngine::wal_syncs`]).
+    flushes: Arc<AtomicU64>,
     /// RocksDB's latest sequence number when the sync began (A-R214).
     latest: u64,
     /// Set when an armed [`InjectedFault::WalFlush`] fired at the start: the fsync fails with
-    /// this, without calling RocksDB.
+    /// this, without touching a file.
     failed: Option<String>,
     captured: Vec<CapturedPrefix>,
     /// Per capture, in order: the most it may be credited, `min(captured, applied)` at the
@@ -370,17 +379,50 @@ pub struct WalSync {
 }
 
 impl WalSync {
-    /// The fsync: `flush_wal(true)` over the whole engine WAL. Blocks for as long as the disk
-    /// takes, and takes no engine lock, so commits on the engine's own thread go on meanwhile.
+    /// The fsync of every live WAL file. Blocks for as long as the disk takes, and takes no
+    /// engine lock, so commits on the engine's own thread go on meanwhile.
+    ///
+    /// Each file is synced through a handle of its own, never RocksDB's (critic-f4 P1, A-R365).
+    /// RocksDB opens its WAL as a synchronous handle, and Windows serializes all I/O on one
+    /// synchronous file object, so `flush_wal(true)` (`FlushFileBuffers` on RocksDB's handle)
+    /// held every commit's `WriteFile` for the whole fsync: measured 69 ms and 96 ms waits, one per
+    /// fsync. A second handle is a second file object, and its flush still writes the file's
+    /// cached data, so commits go on. Nothing is buffered inside RocksDB: without
+    /// `manual_wal_flush` each commit reaches the OS before it returns.
     ///
     /// # Errors
     ///
-    /// RocksDB's error, or the injected fault's.
+    /// The file system's error naming the file, the injected fault's, or no WAL file found.
     pub fn flush(&self) -> Result<(), String> {
         if let Some(failed) = &self.failed {
             return Err(failed.clone());
         }
-        self.db.flush_wal(true).map_err(|e| e.to_string())
+        let entries = std::fs::read_dir(&self.dir)
+            .map_err(|e| format!("list the WAL files in {}: {e}", self.dir.display()))?;
+        let mut synced = 0;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| format!("list the WAL files in {}: {e}", self.dir.display()))?
+                .path();
+            if path.extension().is_none_or(|ext| ext != "log") {
+                continue;
+            }
+            // Opened for write so the flush may run, never created or truncated. A WAL that
+            // RocksDB deleted since the listing held nothing unflushed: skip it.
+            let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("open WAL {} to sync it: {e}", path.display())),
+            };
+            file.sync_all()
+                .map_err(|e| format!("sync WAL {}: {e}", path.display()))?;
+            synced += 1;
+        }
+        if synced == 0 {
+            return Err(format!("no WAL file to sync in {}", self.dir.display()));
+        }
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -423,14 +465,16 @@ impl RocksEngine {
         self.injected
     }
 
-    /// Debug builds only: how many times RocksDB has synced this engine's WAL since it opened,
-    /// by its own count (`rocksdb.wal.synced`). A synced write adds one; an unsynced write adds
-    /// none (review-s1 F-008). Zero on a read-only open.
+    /// Debug builds only: how many times this engine's WAL has been synced since it opened:
+    /// RocksDB's own count (`rocksdb.wal.synced`), which a synced write adds one to and an
+    /// unsynced write none (review-s1 F-008), plus each [`WalSync::flush`] that synced the WAL
+    /// files through its own handles (A-R365). Zero on a read-only open.
     #[cfg(debug_assertions)]
     #[must_use]
     pub fn wal_syncs(&self) -> u64 {
         self.options.as_ref().map_or(0, |options| {
             options.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced)
+                + self.wal_flushes.load(Ordering::Relaxed)
         })
     }
 
@@ -607,6 +651,7 @@ impl RocksEngine {
             synced_seq: None,
             storage,
             sync_in_flight: false,
+            wal_flushes: Arc::default(),
             #[cfg(debug_assertions)]
             options: Some(options),
         })
@@ -651,13 +696,14 @@ impl RocksEngine {
             synced_seq: None,
             storage: StorageOptions::default(),
             sync_in_flight: false,
+            wal_flushes: Arc::default(),
             #[cfg(debug_assertions)]
             options: None,
         })
     }
 
     /// A-R214: whether every write so far is synced: no write, synced or not, since the last
-    /// `flush_wal(true)` that succeeded or the last synced write. `false` on a fresh open. A
+    /// WAL sync that succeeded or the last synced write. `false` on a fresh open. A
     /// caller that finds every durable mark at its applied mark still syncs when this is
     /// `false`, because an unsynced write that raises no applied mark (a dedup delete, an
     /// inherit at base 0, a durable-mark write) lives only in the OS cache until a sync.
@@ -1195,7 +1241,7 @@ impl RocksEngine {
     /// Sync the WAL and report which captured prefixes are now durable: [`Self::begin_sync`],
     /// [`WalSync::flush`] and [`Self::finish_sync`] back to back, on this thread.
     ///
-    /// `flush_wal(true)` syncs the whole engine WAL, so each prefix is confirmed through
+    /// [`WalSync::flush`] syncs every WAL file, so each prefix is confirmed through
     /// `min(captured, applied)`. The `durable` marks are written **after** the sync returns, in
     /// a separate unsynced write: on a host crash they can lag, never lead. Writing them first
     /// would make a failed sync a false durable mark. A lineage the engine was never given is
@@ -1254,8 +1300,10 @@ impl RocksEngine {
             credits.push(Some(capture.through.0.min(marks.applied.0)));
         }
         WalSync {
-            db: Arc::clone(&self.db),
+            _db: Arc::clone(&self.db),
             _claim: self.claim.clone(),
+            dir: self.path.clone(),
+            flushes: Arc::clone(&self.wal_flushes),
             latest,
             failed,
             captured,
@@ -1288,7 +1336,7 @@ impl RocksEngine {
                 .map_or(sync.latest, |seen| seen.max(sync.latest)),
         );
         // B-R13: the one sanctioned crossing from applied to durable in this crate. A real
-        // `flush_wal(true)` just returned over the whole WAL, which held every prefix credited
+        // fsync of every WAL file just returned, which held every prefix credited
         // here when the sync began.
         let mut raise: BTreeMap<(PartitionId, Generation), DurableSeq> = BTreeMap::new();
         let wanted = sync.ancestors.iter().copied().chain(
