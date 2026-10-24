@@ -23,7 +23,9 @@
 //! waits for the file: an append that stalls for seconds (2.2-2.8 s were measured on the dev
 //! host, AGENTS.md) would otherwise stop every task that logs. `@t` is still stamped when the
 //! line is logged. A full queue drops the line and counts it, and the writer logs
-//! `log_lines_dropped {count}` once it has drained.
+//! `log_lines_dropped {count}` once it has drained. A batch whose write and flush take 500 ms
+//! or more is logged after it lands as `log_write_slow {ms, lines}`, so a stalled append shows
+//! in the log rather than as a gap in it.
 //!
 //! The daemon's last line is `msg="shutdown_complete"` and E2E-09 reads it from the file after
 //! the process has exited, so [`init`] returns a [`LogGuard`]: `start` drops it after that
@@ -79,6 +81,9 @@ pub enum LogSetupError {
 
 /// Lines the background writer holds before a new line is dropped (A-R309).
 const QUEUE_LINES: usize = 8192;
+
+/// A batch whose write and flush take this long is logged as `log_write_slow`.
+const WRITE_SLOW_OVER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Adds constant fields to the process root span.
 ///
@@ -256,15 +261,20 @@ fn queued(
 fn run_writer(rx: &Receiver<Msg>, mut sink: Box<dyn Write + Send>, dropped: &AtomicU64) {
     let mut scope: Option<(tracing::Span, tracing::Dispatch)> = None;
     while let Ok(first) = rx.recv() {
+        let started = std::time::Instant::now();
+        let mut lines: u64 = 0;
         let mut next = Some(first);
         while let Some(msg) = next.take() {
             match msg {
                 Msg::Line(line) => {
                     let _ = sink.write_all(&line);
+                    lines += 1;
                 }
                 Msg::Attach(span, dispatch) => scope = Some((span, dispatch)),
                 Msg::Stop => {
-                    // The count goes through the queue, so drain once more to write it.
+                    // Both reports go through the queue, so drain once more to write them.
+                    let _ = sink.flush();
+                    report_slow(scope.as_ref(), started.elapsed(), lines);
                     report_dropped(scope.as_ref(), dropped);
                     while let Ok(Msg::Line(line)) = rx.try_recv() {
                         let _ = sink.write_all(&line);
@@ -275,8 +285,25 @@ fn run_writer(rx: &Receiver<Msg>, mut sink: Box<dyn Write + Send>, dropped: &Ato
             }
             next = rx.try_recv().ok();
         }
+        let _ = sink.flush();
+        report_slow(scope.as_ref(), started.elapsed(), lines);
         report_dropped(scope.as_ref(), dropped);
     }
+}
+
+/// Log `log_write_slow {ms, lines}` when writing and flushing one batch of `lines` took
+/// [`WRITE_SLOW_OVER`] or more. It is logged after the write, through the queue, so it never
+/// holds a caller up; without it a stalled append shows only as a gap in the log.
+fn report_slow(
+    scope: Option<&(tracing::Span, tracing::Dispatch)>,
+    took: std::time::Duration,
+    lines: u64,
+) {
+    if took < WRITE_SLOW_OVER {
+        return;
+    }
+    let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+    in_scope(scope, || tracing::warn!(ms, lines, "log_write_slow"));
 }
 
 /// Log `log_lines_dropped {count}` when lines were dropped since the last report.
@@ -285,7 +312,12 @@ fn report_dropped(scope: Option<&(tracing::Span, tracing::Dispatch)>, dropped: &
     if count == 0 {
         return;
     }
-    let log = || tracing::warn!(count, "log_lines_dropped");
+    in_scope(scope, || tracing::warn!(count, "log_lines_dropped"));
+}
+
+/// Run `log` inside the attached span and dispatcher, or through the global one before
+/// [`LogGuard::attach`].
+fn in_scope(scope: Option<&(tracing::Span, tracing::Dispatch)>, log: impl Fn()) {
     match scope {
         Some((span, dispatch)) => {
             tracing::dispatcher::with_default(dispatch, || span.in_scope(log))
@@ -597,5 +629,24 @@ mod tests {
             LINES,
             "every line is written or counted: {text}"
         );
+    }
+
+    /// A-R312: a write that blocks for 1 s is logged once, after it lands, as `log_write_slow`
+    /// with `ms` >= 900 and the one line it held. Without it the stall is only a gap.
+    #[test]
+    fn a_slow_write_is_logged_after_it_lands() {
+        let (dispatch, guard, out) =
+            stalling_daemon_log(std::time::Duration::from_secs(1), QUEUE_LINES);
+        tracing::dispatcher::with_default(&dispatch, || {
+            guard.attach(&tracing::Span::none());
+            tracing::info!("queued_line");
+        });
+        drop(guard);
+        let text = out.text();
+        let slow = lines_named(&text, "log_write_slow");
+        assert_eq!(slow.len(), 1, "one slow batch, one line: {text}");
+        let ms = slow[0]["ms"].as_u64().expect("ms is a number");
+        assert!(ms >= 900, "a 1 s stall reports ms >= 900, got {ms}: {text}");
+        assert_eq!(slow[0]["lines"], 1, "{text}");
     }
 }

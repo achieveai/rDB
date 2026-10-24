@@ -42,6 +42,10 @@ pub fn start(runtime: &tokio::runtime::Handle, span: &tracing::Span) -> std::io:
         .name("stall-watchdog".into())
         .spawn(move || process_clock(&thread_span, TICK, REPORT_OVER, &thread_stop))?;
     runtime.spawn(runtime_clock(TICK, REPORT_OVER, Arc::clone(&stop)).instrument(span.clone()));
+    // A quiet watchdog logs nothing, so this line is what proves "no stalls" rather than "no
+    // watchdog".
+    let (tick_ms, threshold_ms) = (ms(TICK), ms(REPORT_OVER));
+    span.in_scope(|| tracing::info!(tick_ms, threshold_ms, "stall_watchdog_started"));
     Ok(Watchdog(stop))
 }
 
