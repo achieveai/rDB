@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::ConfigStore;
@@ -50,6 +50,7 @@ use crate::host::{
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
 use crate::transport::Links;
+use ack_floor::AckFloor;
 
 /// The node every S0 call goes to: partition 1's owner.
 const OWNER: NodeId = admin::OWNER;
@@ -103,6 +104,7 @@ pub const MAX_KEY: usize = 1_024;
 /// can still be large.
 pub const MAX_PAGE: usize = 1_000;
 
+mod ack_floor;
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
@@ -181,6 +183,31 @@ pub struct DbConfig {
     /// memtable budget per column family. `StorageOptions::default()` is RocksDB's own, 64 MiB.
     /// A node restarted by [`Db::restart_node`] opens with the same options.
     pub storage: StorageOptions,
+    /// Whether each write tells the owner which of this open's earlier writes the app already
+    /// has its answer for (the client ack floor, M10 S2, rulings A-R252 and A-R267). `true` by
+    /// default. The owner then drops their retained answers, dedup entry and status, in the
+    /// same batch as that write, on every copy. So the dedup cap stops filling at a steady
+    /// write rate, and [`Self::dedup_retention`] need not be lowered to keep writing.
+    ///
+    /// - A write answered `UNKNOWN_OUTCOME`, or refused without `no_mutation`, stays: a later
+    ///   [`Db::status`] or [`Db::resend`] still settles it. At most 8 such writes are kept per
+    ///   `Db`, so per partition (A5); the ninth evicts the oldest, which is logged
+    ///   `ack_floor_pin_evicted` and from then on answers `STATUS_EXPIRED`.
+    /// - A request this `Db` resends after a later write was answered may find its own answer
+    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Submit it as new. This holds
+    ///   while an earlier write is still kept (above), and for a request that was answered `Ok`:
+    ///   it is never applied twice (A-R274). After a restart of the owner, a kept write that never
+    ///   applied answers `STATUS_EXPIRED` too.
+    /// - Ids an app chose ([`Db::put_as`], [`Db::txn_as`], [`Db::write_as`]) get no relief:
+    ///   their answers keep the [`Self::dedup_retention`] rule and count against the cap.
+    /// - The floor itself is one dedup entry per open, counted against [`Self::dedup_cap`]: an
+    ///   open writing steadily holds about two (its newest answer and its floor). So with the
+    ///   floor on, a cap below [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`] (3) is refused at open with
+    ///   [`OpenError::Config`]: it would fill and stay full.
+    ///
+    /// `false` sends no floor: every answer is kept for [`Self::dedup_retention`], as before
+    /// M10.
+    pub ack_floor: bool,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -198,8 +225,12 @@ impl DbConfig {
     ///
     /// [`OpenError::DedupCap`] when [`Self::dedup_cap`] is above [`RETENTION_CAP_ENTRIES`];
     /// it is also logged as `db_open_refused` with `kind=DedupCap`, as every refused open is.
+    /// [`OpenError::Config`] when [`Self::ack_floor`] is on and [`Self::dedup_cap`] is below
+    /// [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`].
     pub fn check(&self) -> Result<(), OpenError> {
-        limits(self.dedup_cap).map(|_| ()).map_err(open_refused)
+        limits(self.dedup_cap, self.ack_floor)
+            .map(|_| ())
+            .map_err(open_refused)
     }
 }
 
@@ -398,6 +429,9 @@ pub struct Db {
     clock: HostClock,
     timeouts: Timeouts,
     next_request: AtomicU64,
+    /// This open's ack floor ([`DbConfig::ack_floor`]), and the bound on its write ids. Every
+    /// write id is taken under this lock.
+    ack_floor: Mutex<AckFloor>,
     /// The client this `Db` sends every request as (S2-8): [`DbConfig::client`].
     client: ClientId,
     /// Whether node 1 has been seen admitting writes: by [`Db::node_status`], by a put that
@@ -621,6 +655,23 @@ const fn request_floor(n: u64) -> u64 {
     (n - 1) << 40
 }
 
+/// The ack floor tracker of an open whose first write id is `first` (A-R252): on or off as
+/// [`DbConfig::ack_floor`] says, and carrying a pin for the open's dedup retention.
+fn ack_tracker(config: &DbConfig, budgets: Budgets, first: u64) -> Mutex<AckFloor> {
+    let retention = config
+        .dedup_retention
+        .unwrap_or(Duration::from_millis(budgets.dedup_retention_millis));
+    Mutex::new(AckFloor::new(first, config.ack_floor, retention))
+}
+
+/// The tracker of a `Db` built by hand around nodes, whose ids start at 1: the floor on, as
+/// [`DbConfig::ack_floor`] defaults, with the spec's retention.
+#[cfg(test)]
+fn hand_tracker() -> Mutex<AckFloor> {
+    let retention = Duration::from_millis(Budgets::SPEC_DEFAULTS.dedup_retention_millis);
+    Mutex::new(AckFloor::new(1, true, retention))
+}
+
 /// The file under a process's folder that holds the last boot [`next_boot`] handed out.
 const BOOT_FILE: &str = "boot";
 
@@ -760,7 +811,7 @@ impl Db {
                 .await
                 .map_err(open_refused);
         }
-        let limits = limits(config.dedup_cap).map_err(open_refused)?;
+        let limits = limits(config.dedup_cap, config.ack_floor).map_err(open_refused)?;
         let budgets = Budgets {
             dedup_retention_millis: config
                 .dedup_retention
@@ -836,6 +887,7 @@ impl Db {
             clock: HostClock::start(),
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
+            ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -983,6 +1035,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
+            ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind,
@@ -1275,7 +1328,7 @@ impl Db {
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
         self.opened.heal_task = Some(rt.spawn(async move {
-            let ended = admin::heal(ctx).await;
+            let ended = admin::heal_retrying(ctx).await;
             if let Err(error) = &ended {
                 tracing::error!(%error, "heal_failed");
             }
@@ -1370,6 +1423,48 @@ impl Db {
         }
     }
 
+    /// The identity of a write this `Db` numbers, taken under the ack floor's lock so the floor
+    /// never passes it while it is in flight (A-R252). Refused, with nothing sent, once this
+    /// open's ids are used up: the next is the open's reserved floor record id (A2).
+    fn write_identity(&self) -> Result<RequestIdentity, PutError> {
+        let Some(request) = lock(&self.ack_floor).begin(&self.next_request) else {
+            let mut error = ApiError::new(
+                ErrorKind::Unavailable,
+                "this open's write ids are used up (2^40 per open); nothing was sent: open the \
+                 Db again"
+                    .to_owned(),
+            );
+            error.no_mutation = true;
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        };
+        Ok(RequestIdentity {
+            tenant: TENANT,
+            client: self.client,
+            request: RequestId(request),
+        })
+    }
+
+    /// Record the answer to this `Db`'s own write `request` in the ack floor, and hand it back.
+    /// Held when it says what happened: `Ok`, a refusal with nothing sent (no request handed
+    /// back), or one that claims `no_mutation`. Anything else, `UNKNOWN_OUTCOME` above all, is a
+    /// pin (design-ackfloor rev 3, M3).
+    fn finished<T>(&self, request: RequestId, answer: Result<T, PutError>) -> Result<T, PutError> {
+        let held = match &answer {
+            Ok(_) => true,
+            Err(refused) => refused.request.is_none() || refused.error.no_mutation,
+        };
+        lock(&self.ack_floor).finish(request.0, held, Instant::now());
+        answer
+    }
+
+    /// `request` got a definitive answer by a resend or a status query: it is no longer a pin.
+    fn settled(&self, request: RequestId) {
+        lock(&self.ack_floor).settle(request.0);
+    }
+
     /// The identity an `_as` call sends under, or its refusal when `request` is not an app's id
     /// (A-R195): below 2^63 it could name a write this `Db` numbered itself. Nothing is sent.
     /// The refusal goes through [`Self::retried`], so it never claims `no_mutation`: an id
@@ -1401,9 +1496,17 @@ impl Db {
             call,
             reply,
         });
-        if self.send_to(self.route.owner(), msg).is_err() {
+        let owner = self.route.owner();
+        if self.send_to(owner, msg).is_err() {
+            // An owner in another process with no link up is unavailable, not a host fault:
+            // a retry helps once it is back or promoted away (W7 for W5, tester-s2 G walk).
+            let local = lock(&self.nodes).iter().any(|handle| handle.node == owner);
             return Some(Answer::Error {
-                error: ApiError::host("the owner's node thread has stopped"),
+                error: if local {
+                    ApiError::host("the owner's node thread has stopped")
+                } else {
+                    ApiError::owner_unreachable(owner)
+                },
                 request: None,
             });
         }
@@ -1472,7 +1575,9 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
-        self.put_identified(self.identity(), object, value, if_version)
+        let identity = self.write_identity()?;
+        let answer = self.put_identified(identity, object, value, if_version);
+        self.finished(identity.request, answer)
     }
 
     /// [`Self::put`] under the app's request id `request`, which this client may have used
@@ -1544,7 +1649,9 @@ impl Db {
                 request: None,
             });
         }
-        self.txn_identified(self.identity(), puts, deadline)
+        let identity = self.write_identity()?;
+        let answer = self.txn_identified(identity, puts, deadline);
+        self.finished(identity.request, answer)
     }
 
     /// [`Self::txn`] under the app's request id `request`, which this client may have used
@@ -1682,7 +1789,9 @@ impl Db {
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
-        self.write_identified(self.identity(), object, change, expect)
+        let identity = self.write_identity()?;
+        let answer = self.write_identified(identity, object, change, expect);
+        self.finished(identity.request, answer)
     }
 
     /// [`Self::write`] under the app's request id `request`, which this client may have used
@@ -1771,7 +1880,15 @@ impl Db {
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(call, self.timeouts.put) {
-            Some(Answer::Compiled(request)) => {
+            Some(Answer::Compiled(mut request)) => {
+                // The ack floor rides the first send and every resend of it unchanged; it is
+                // not part of the request's digest (A-R252). Only this `Db`'s own write ids
+                // in flight carry one.
+                let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
+                if let Some(carried) = carried {
+                    request.acked_below = Some(carried.acked_below);
+                    request.pinned = carried.pinned;
+                }
                 self.send(ClientCall::Resend { request }, wait).map(Some)
             }
             Some(Answer::Unchanged) => Ok(None),
@@ -1797,6 +1914,12 @@ impl Db {
     /// may have applied on an earlier send, and the kernel refuses an overloaded or late
     /// request before it looks for that (Q-A). Waits as [`Self::txn`] does, for the deadline
     /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
+    ///
+    /// With [`DbConfig::ack_floor`] on, a refused request resent after a later write answers
+    /// `STATUS_EXPIRED`, with nothing applied: submit it as new (spec §5.3). A request answered
+    /// `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
+    /// Every other request below the floor, answered `Ok` or refused, stays covered while that
+    /// request is unsettled, so a resend never applies one twice (A-R274).
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
         let wait = send_wait(Duration::from_millis(request.remaining_millis));
         let id = request.identity.request;
@@ -1874,6 +1997,13 @@ impl Db {
         };
         if answered.is_ok() {
             self.ready_seen.store(true, Ordering::Relaxed);
+        }
+        // A resend that says what became of the request settles its pin, if it was one.
+        if answered.as_ref().map_or_else(
+            |refused| refused.error.kind == ErrorKind::StatusExpired,
+            |_| true,
+        ) {
+            self.settled(identity);
         }
         answered.map_err(|PutError { error, request }| PutError {
             error: self.explained(reconcile_step(error, request.as_deref())),
@@ -1976,6 +2106,12 @@ impl Db {
     /// of the dedup retention window ([`DbConfig::dedup_retention`]); a resend after that runs
     /// afresh.
     ///
+    /// With [`DbConfig::ack_floor`] on, a write of this `Db`'s that was answered, and that a
+    /// later write of the same open then acknowledged, answers `Expired` when asked with its
+    /// generation: its answer was dropped (spec §5.3). Asked with none it answers `Unknown`, as
+    /// any id without an answer does (A-R63). A write answered `UNKNOWN_OUTCOME` is kept until this call or a resend says
+    /// what became of it, up to 8 such writes.
+    ///
     /// # Errors
     ///
     /// [`ApiError`]: a refusal, or `UNAVAILABLE` when no answer came in time.
@@ -2006,6 +2142,10 @@ impl Db {
                 format!("no status answer in {:?}", self.timeouts.read),
             )),
         };
+        // A definitive answer settles the request's ack floor pin, if it was one.
+        if matches!(answered, Ok(TxnStatus::Resolved(_) | TxnStatus::Expired)) {
+            self.settled(request);
+        }
         answered.map_err(|error| self.explained(error))
     }
 
@@ -2025,6 +2165,54 @@ impl Db {
                 Some(status)
             })
             .collect()
+    }
+
+    /// **Dev tool only**, debug builds (ruling A-R230; `rdb_dev admin damage-copy`): damage the
+    /// record at `key` in `ns` of partition 1's lineage `generation` in `node`'s own copy only,
+    /// with [`rdb_storage::RocksEngine::damage_record`] on that node's thread. The other copies
+    /// keep the good record. `generation` is the one `node` holds: [`NodeStatus::holds`].
+    ///
+    /// # Errors
+    ///
+    /// The engine's refusal, as text (nothing was written); `node` not run by this process (a
+    /// copy is damaged from its own process); or `node` not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn damage_record(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        ns: rdb_core::contracts::storage::Namespace,
+        key: &[u8],
+    ) -> Result<(), String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::Damage {
+            partition: PARTITION,
+            generation,
+            ns,
+            key: key.to_vec(),
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: damage its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
     }
 
     /// The peer links, to hold and heal.
@@ -2063,13 +2251,18 @@ impl Db {
     /// Which nodes of this `Db` have restarted or failed to restart; `None` while every node runs
     /// its first boot. Names each restarted node and its boot, and says when the restart failed
     /// and the node stays stopped (F-013), in one short clause, because it rides on every refused
-    /// answer (tester walk 5). A restarted copy does not rejoin in this open (achieveai/rDB#42):
-    /// it takes part again once the folder is opened again (M10 A-R188).
+    /// answer (tester walk 5). Then what is true now (A-R275): a restarted secondary rejoins by
+    /// itself once the owner re-plans (A-R256(2)), while a restarted owner stays out until the
+    /// folder is opened again (A-R188). A failed restart adds nothing more: its node stays stopped.
     #[must_use]
     pub fn restart_note(&self) -> Option<String> {
-        let restarted: Vec<String> = lock(&self.nodes)
+        let nodes = lock(&self.nodes);
+        let moved: Vec<&NodeHandle> = nodes
             .iter()
             .filter(|handle| handle.boot != self.opened.base_boot)
+            .collect();
+        let restarted: Vec<String> = moved
+            .iter()
             .map(|handle| {
                 let (node, boot) = (handle.node.0, handle.boot.0);
                 let who = if handle.node == OWNER {
@@ -2084,11 +2277,16 @@ impl Db {
                 }
             })
             .collect();
-        (!restarted.is_empty()).then(|| {
-            format!(
-                "{}; a restarted node stays out until the folder is opened again (#42)",
-                restarted.join(", ")
-            )
+        let tail = if moved.iter().any(|handle| handle.node == OWNER) {
+            Some("the owner stays out until the folder is opened again")
+        } else if moved.iter().any(|handle| !handle.start_failed) {
+            Some("a restarted copy rejoins by itself once the owner re-plans")
+        } else {
+            None
+        };
+        (!restarted.is_empty()).then(|| match tail {
+            Some(tail) => format!("{}; {tail}", restarted.join(", ")),
+            None => restarted.join(", "),
         })
     }
 
@@ -2261,6 +2459,7 @@ impl Db {
             clock: HostClock::start(),
             timeouts,
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -2280,7 +2479,7 @@ impl Db {
         boot: BootId,
     ) -> Result<Self, OpenError> {
         let nodes_dir = config.dir.join("nodes");
-        let limits = limits(config.dedup_cap)?;
+        let limits = limits(config.dedup_cap, config.ack_floor)?;
         let clock = HostClock::start();
         let links = Links::new();
         let control = ControlAdapter::new(store, rt, Arc::clone(&links));
@@ -2298,6 +2497,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: config.client,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -2540,6 +2740,13 @@ impl Db {
                     boot = boot.0,
                     "node_restarted"
                 );
+                // #42 (A-R249): the other nodes hear the new boot as a net handshake tells a
+                // node process; the record owner then re-plans to link this copy again.
+                for other in nodes.iter().filter(|other| other.node != node) {
+                    if other.send(Msg::PeerBooted { node, boot }).is_err() {
+                        tracing::warn!(node = node.0, peer = other.node.0, "peer_booted_unsent");
+                    }
+                }
                 Ok(boot)
             }
             Err(detail) => {
@@ -3034,10 +3241,23 @@ fn remove_claim(dir: &Path) {
     }
 }
 
-/// T1's limits for a `dedup_cap` option: the spec's, with only the dedup cap lowered.
-fn limits(dedup_cap: Option<usize>) -> Result<Limits, OpenError> {
+/// The smallest `dedup_cap` an open with [`DbConfig::ack_floor`] on takes: each open keeps its
+/// newest answer and a floor record, and a new write needs one more (A-R274).
+pub const MIN_DEDUP_CAP_WITH_ACK_FLOOR: usize = 3;
+
+/// T1's limits for a `dedup_cap` option: the spec's, with only the dedup cap lowered. With the
+/// ack floor on, a cap below [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`] is refused: it would fill and stay
+/// full.
+fn limits(dedup_cap: Option<usize>, ack_floor: bool) -> Result<Limits, OpenError> {
     let mut limits = Limits::default();
     if let Some(asked) = dedup_cap {
+        if ack_floor && asked < MIN_DEDUP_CAP_WITH_ACK_FLOOR {
+            return Err(OpenError::Config(format!(
+                "dedup_cap must be at least {MIN_DEDUP_CAP_WITH_ACK_FLOOR} when ack_floor is on: \
+                 each open keeps its newest answer and a floor record; dedup_cap {asked} was \
+                 asked, and nothing was started"
+            )));
+        }
         if asked > RETENTION_CAP_ENTRIES {
             // Logged by the caller, as `db_open_refused` (`open_refused`): one event name for
             // every refused open (lead ruling, tester S1-8 walk on 066ab6e).
@@ -3283,19 +3503,44 @@ mod tests {
         admits_within(db, phase, Duration::from_secs(5));
     }
 
-    /// [`admits`] with its own patience, scaled the same way.
+    /// [`admits`] with its own patience, scaled the same way. Logs one `admission_wait` line
+    /// when the wait ends, admitted or not, with the owner's last status: a red that left no
+    /// other line still says how long it waited and where node 1 stood (k477).
     fn admits_within(db: &Db, phase: &str, patience: Duration) {
         let patience = crate::host::test_patience(patience);
-        let deadline = std::time::Instant::now() + patience;
-        while owner_of(db, db.node_status()).and_then(|node| node.admits) != Some(true) {
+        let started = std::time::Instant::now();
+        let deadline = started + patience;
+        let mut polls = 0_u32;
+        loop {
+            polls += 1;
+            let owner = owner_of(db, db.node_status());
+            let admitted = owner.as_ref().and_then(|node| node.admits) == Some(true);
+            let timed_out = !admitted && std::time::Instant::now() >= deadline;
+            if admitted || timed_out {
+                tracing::info!(
+                    phase,
+                    admitted,
+                    waited_ms = millis(started.elapsed()),
+                    patience_ms = millis(patience),
+                    polls,
+                    admits = ?owner.as_ref().map(|node| node.admits),
+                    authority = owner.as_ref().map(|node| node.authority.as_str()),
+                    recovery = ?owner.as_ref().and_then(|node| node.recovery.as_deref()),
+                    recovered = ?owner.as_ref().and_then(|node| node.recovered).map(|g| g.0),
+                    protection = ?owner.as_ref().and_then(|node| node.protection.as_deref()),
+                    fault = ?owner.as_ref().and_then(|node| node.fault.as_deref()),
+                    "admission_wait"
+                );
+                assert!(
+                    admitted,
+                    "{phase}: node 1 does not admit writes within {patience:?}"
+                );
+                return;
+            }
             for node in db.node_status() {
                 let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                 crate::host::assert_not_blocked(&node, window);
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{phase}: node 1 does not admit writes within {patience:?}"
-            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -3338,6 +3583,7 @@ mod tests {
 
     fn config(dir: &std::path::Path) -> DbConfig {
         DbConfig {
+            ack_floor: true,
             dir: dir.to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
@@ -3381,6 +3627,7 @@ mod tests {
             ..Budgets::SPEC_DEFAULTS
         };
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
@@ -3469,6 +3716,7 @@ mod tests {
             ..Budgets::SPEC_DEFAULTS
         };
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts {
@@ -3545,6 +3793,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -3599,6 +3848,7 @@ mod tests {
         };
         let patience = crate::host::test_patience(Duration::from_secs(5));
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts {
@@ -3753,6 +4003,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -3804,6 +4055,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -4190,6 +4442,8 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let config = DbConfig {
             dedup_cap,
+            // A row that sets a cap pins how it fills: the ack floor would empty it (A-R252).
+            ack_floor: dedup_cap.is_none(),
             ..config(dir)
         };
         let db = rt
@@ -4609,11 +4863,96 @@ mod tests {
         db.shutdown();
     }
 
-    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts, L1 pauses
-    /// writes; a put refused then was refused at admission and never queued, so a retry of it
-    /// must not promise that `status` will show its outcome: status stays `Unknown` for good. A
-    /// retry of the published put keeps the promise, since status shows it (review F-023).
-    /// Integration (~1 s): three node threads, one restart, a 400 ms pause budget.
+    /// #42 (A-R249), S2-2: node 3 restarts under a live owner. Node 1 hears the new boot, drains
+    /// its epoch and commits the next generation pinning it, so writes resume on RF3 with no
+    /// restart of node 1: a put lands and node 3 holds it durably at node 1's generation. Cut:
+    /// no re-plan, and node 1 logs `replication_copy_not_advancing` while node 3 never gets the
+    /// put. Integration (~3 s): three node threads, one restart.
+    #[config_log::retcd_test]
+    fn m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let of = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let before = of(&db, OWNER)
+            .recovered
+            .expect("node 1 recovered at the open");
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        assert_eq!(
+            db.restart_note().as_deref(),
+            Some(
+                "node 3 restarted (now boot 2); a restarted copy rejoins by itself once the owner \
+                 re-plans"
+            ),
+            "A-R275: a refusal says what is true now"
+        );
+
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            let owner = of(&db, OWNER);
+            if owner.recovered > Some(before) && owner.admits == Some(true) {
+                match db.put(b"b", b"2", None) {
+                    Ok(put) => break put,
+                    Err(refused) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no put landed within {patience:?} of the restart: {refused:?}"
+                    ),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 did not re-plan past generation {} and admit within {patience:?}: \
+                 {owner:?}",
+                before.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let owner = of(&db, OWNER);
+        let generation = owner.recovered.expect("node 1 recovered");
+        let target = owner.holds.expect("node 1 holds the partition").durable;
+        loop {
+            let third = of(&db, NodeId(3));
+            let held = third.holds.map(|holds| (holds.generation, holds.durable));
+            if third.boot == BootId(2)
+                && held.is_some_and(|(at, durable)| at == generation && durable >= target)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 holds {held:?}, not generation {} through {target}, within {patience:?} \
+                 (put {put:?})",
+                generation.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+    }
+
+    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts and stops
+    /// advancing, L1 pauses writes; a put refused then was refused at admission and never
+    /// queued, so a retry of it must not promise that `status` will show its outcome: status
+    /// stays `Unknown` for good. A retry of the published put keeps the promise, since status
+    /// shows it (review F-023). Since A-R256(2) node 1 re-plans after the restart and writes
+    /// resume once node 3 syncs, so the published put is made at the re-planned generation and
+    /// node 3's link is then held to bring the pause, and the refusals still name the restart.
+    /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
     #[test]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
         let dir = config_testkit::fs::temp_dir();
@@ -4628,14 +4967,28 @@ mod tests {
             ))
             .expect("open");
         admits(&db, "after the open");
-        let first = db.put(b"a", b"1", None).expect("before the restart");
+        db.put(b"a", b"1", None).expect("before the restart");
+        let before = owner_status(&db, "node 1 before the restart").recovered;
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
-        owner_when(
-            &db,
-            "L1 pauses",
-            crate::host::test_patience(Duration::from_secs(5)),
-            &|node| node.admits == Some(false),
-        );
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        let first = loop {
+            let owner = owner_status(&db, "node 1 re-planning");
+            if owner.recovered > before && owner.admits == Some(true) {
+                if let Ok(put) = db.put(b"a", b"2", None) {
+                    break put;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed after node 1's re-plan within {patience:?}: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        db.links().hold(OWNER, NodeId(3));
+        owner_when(&db, "L1 pauses", patience, &|node| {
+            node.admits == Some(false)
+        });
         let refused = db.put(b"a", b"9", None).expect_err("paused");
         assert_eq!(
             refused.error.kind,
@@ -4832,6 +5185,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
             unwind: None,
@@ -4880,8 +5234,8 @@ mod tests {
         let note = db.restart_note().expect("the owner restarted");
         assert_eq!(
             note,
-            "the owner, node 1, restarted (now boot 2); a restarted node stays out until the folder \
-             is opened again (#42)"
+            "the owner, node 1, restarted (now boot 2); the owner stays out until the folder is \
+             opened again"
         );
         for kind in kinds {
             let plain = ApiError::new(kind, "d");
@@ -5169,7 +5523,7 @@ mod tests {
             ..config(dir.path())
         };
         assert!(
-            limits(at_cap.dedup_cap).is_ok(),
+            limits(at_cap.dedup_cap, at_cap.ack_floor).is_ok(),
             "the status cap itself is allowed"
         );
     }
@@ -5189,6 +5543,8 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let config = DbConfig {
             dedup_cap: Some(2),
+            // This row pins how the cap fills: the ack floor would empty it (A-R252).
+            ack_floor: false,
             dedup_retention: Some(Duration::from_millis(300)),
             ..config(dir.path())
         };
@@ -5258,8 +5614,9 @@ mod tests {
     /// carries its look: `Items { at: -1 }` lists the last item. It fails if `write` sends
     /// `expect: None` (the stale write publishes), if `read` forwards `Look::Doc` (the list read
     /// is `INVALID_ARGUMENT`), or if `byte_string` answers a map document as `Ok`.
-    /// Integration (~1 s): three node threads on wall-clock time.
-    #[test]
+    /// Integration (~1 s): three node threads on wall-clock time. A per-test log, so a red at
+    /// its first admission wait can be read (k477: one red under load left no line).
+    #[config_log::retcd_test]
     fn the_public_write_and_read_carry_the_change_its_guard_and_the_look() {
         use crate::host::ListEdit;
         use rdb_value::value::{Int, Map, MapKey};
@@ -5345,6 +5702,99 @@ mod tests {
         let refused = db.get(b"d").expect_err("d holds a map, not bytes");
         assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused:?}");
         assert!(refused.detail.contains("not a byte string"), "{refused:?}");
+        db.shutdown();
+        const METHOD: &str = "the_public_write_and_read_carry_the_change_its_guard_and_the_look";
+        let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "admission_wait")
+            .collect();
+        assert_eq!(waits.len(), 1, "one line for the one wait: {waits:?}");
+        assert_eq!(
+            (&waits[0]["phase"], &waits[0]["admitted"]),
+            (
+                &serde_json::json!("before the first write"),
+                &serde_json::json!(true)
+            ),
+            "{waits:?}"
+        );
+        assert!(waits[0]["waited_ms"].is_u64(), "{waits:?}");
+    }
+
+    /// Ruling A-R230 (k420): `Db::damage_record` reaches one node's own copy through its host,
+    /// for `rdb_dev admin damage-copy`. Damaging node 1's stored `a` makes a read of `a` after
+    /// the next write `CORRUPT_HISTORY` (a read answers from the last step's view, taken before
+    /// the damage); a missing record is refused with nothing written; a `History` record is
+    /// reached by its seq; a node this process does not run is refused by name. It fails if the
+    /// host answers without calling the engine. Integration (~1 s).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn damage_record_damages_one_copy_through_its_host_and_refuses_a_missing_record() {
+        use rdb_core::contracts::storage::Namespace;
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        let put = db.put(b"a", b"1", None).expect("put a");
+        let written = Some((put.seq.0, Bytes::from_static(b"1")));
+        assert_eq!(db.get(b"a").expect("a reads").value, written);
+        let held = |node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .and_then(|status| status.holds)
+                .unwrap_or_else(|| panic!("node {} holds a lineage", node.0))
+                .generation
+        };
+
+        let missing = db
+            .damage_record(OWNER, held(OWNER), Namespace::User, b"zz")
+            .expect_err("nothing is stored at zz");
+        assert!(
+            missing.starts_with("node 1: no stored value at key "),
+            "{missing}"
+        );
+        let elsewhere = db
+            .damage_record(NodeId(9), held(OWNER), Namespace::User, b"a")
+            .expect_err("node 9 is not run here");
+        assert_eq!(
+            elsewhere,
+            "node 9 is not run by this process: damage its copy from its own process"
+        );
+        db.damage_record(
+            NodeId(2),
+            held(NodeId(2)),
+            Namespace::History,
+            &put.seq.0.to_be_bytes(),
+        )
+        .expect("node 2's history record of a is stored");
+
+        // The stored key is the root key, as the host reads it.
+        let root = rdb_value::keys::root_key(TENANT, GROUP, b"a");
+        db.damage_record(OWNER, held(OWNER), Namespace::User, root.as_bytes())
+            .expect("node 1's a is stored");
+        // A read answers from the view of the last step, taken before the damage: the next
+        // write takes a new one.
+        db.put(b"b", b"2", None).expect("put b");
+        let read = db
+            .get(b"a")
+            .expect_err("a's stored bytes no longer match its digest");
+        assert_eq!(
+            (read.kind, read.detail.as_str()),
+            (
+                ErrorKind::CorruptHistory,
+                "object \"a\": header bytes 0..8 and the payload do not hash to the stored digest"
+            ),
+            "{read:?}"
+        );
         db.shutdown();
     }
 
@@ -5863,8 +6313,10 @@ mod tests {
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
-    /// it. Puts landing on node 2 wait for W6's `CopyAheadOnControl` arm (A-R254): until it merges, node 2's host faults on it.
-    /// Cut: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced.
+    /// it. A put then lands on node 2 at the new generation, and the write made before reads
+    /// back there.
+    /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
+    /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -5909,6 +6361,29 @@ mod tests {
         let old = db.put(b"c", b"3", None);
         db.route.owner.store(2, Ordering::Relaxed);
         assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
+
+        // A-R254, A-R256: writes go on at node 2, the write made before reads back there.
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        let put = loop {
+            match db.put(b"b", b"2", None) {
+                Ok(put) => break put,
+                Err(refused) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no put landed on node 2 within {patience:?}: {refused:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(put.generation, promoted.generation, "{put:?}");
+        for (key, value) in [(&b"a"[..], &b"1"[..]), (b"b", b"2")] {
+            assert_eq!(
+                db.get(key).expect("get").value.map(|(_, v)| v),
+                Some(Bytes::copy_from_slice(value)),
+                "{} at node 2",
+                String::from_utf8_lossy(key)
+            );
+        }
         db.shutdown();
     }
 
@@ -7719,6 +8194,8 @@ mod tests {
             rt.block_on(Db::open_with(
                 DbConfig {
                     dedup_cap: Some(2),
+                    // This row pins how the cap fills: the ack floor would empty it (A-R252).
+                    ack_floor: false,
                     dedup_retention: Some(Duration::from_millis(300)),
                     ..config(dir.path())
                 },
@@ -7793,6 +8270,8 @@ mod tests {
             rt.block_on(Db::open_with(
                 DbConfig {
                     dedup_cap: Some(2),
+                    // This row pins how the cap fills: the ack floor would empty it (A-R252).
+                    ack_floor: false,
                     dedup_retention: Some(retention),
                     local: ALL_NODES.to_vec(),
                     links: None,
@@ -7898,6 +8377,8 @@ mod tests {
             rt.block_on(Db::open_with(
                 DbConfig {
                     dedup_cap: Some(2),
+                    // This row pins how the cap fills: the ack floor would empty it (A-R252).
+                    ack_floor: false,
                     dedup_retention: Some(retention),
                     local: ALL_NODES.to_vec(),
                     links: None,
@@ -8868,7 +9349,8 @@ mod tests {
 
     /// Ruling A-R226 h1: a call for a node this process does not run goes over the peer links
     /// (`Links::post`), and with nothing registered for that node it is refused at once as the
-    /// owner's thread stopped, never a wait. Unit: no node thread.
+    /// owner not reachable, never a wait, and never a host fault (W7, tester-s2 G walk: a retry
+    /// helps once it is back). Unit: no node thread.
     #[test]
     fn m10_a_call_for_a_node_this_process_does_not_run_goes_over_the_links() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -8888,7 +9370,8 @@ mod tests {
 
         let refused = db.put(b"a", b"1", None).expect_err("nobody holds node 1");
         assert!(
-            refused.error.detail.contains("has stopped"),
+            refused.error.detail.contains("is not reachable")
+                && refused.error.retry == RetryRule::RetryAfterRecovery,
             "{:?}",
             refused.error
         );
@@ -8978,5 +9461,247 @@ mod tests {
             (ErrorKind::UnknownOutcome, RetryRule::BoundedJitter, true),
             "{refused:?}"
         );
+    }
+
+    // ---- M10 S2: the client ack floor through a running `Db` (A-R252, A-R267) ----------------
+
+    /// The Dedup rows of node `n`'s newest held lineage of partition 1, after the `Db` has shut
+    /// down.
+    fn dedup_rows(dir: &std::path::Path, n: u32) -> usize {
+        use rdb_core::contracts::storage::{Namespace, SnapshotRead};
+        let engine = RocksEngine::open(dir.join("nodes").join(n.to_string())).expect("open engine");
+        let newest = engine
+            .lineages()
+            .into_iter()
+            .filter(|(partition, _)| *partition == PARTITION)
+            .map(|(_, generation)| generation)
+            .max()
+            .expect("a held lineage");
+        let view = engine
+            .snapshot(PARTITION, newest, crate::host::STEP_VIEW)
+            .expect("view");
+        let rows = view.scan(Namespace::Dedup, &[], usize::MAX).len();
+        assert_eq!(view.fault(), None, "node {n}: the scan met a fault");
+        rows
+    }
+
+    /// D2 (design-ackfloor §5): with the floor on, a `Db` writes far past a small dedup cap, and
+    /// every copy keeps on disk only the newest answer and its open's floor record. Cap 3, 150
+    /// puts, none `OVERLOADED`. With the floor off the fourth put is `OVERLOADED`.
+    /// Integration (~1 s): three node threads, 150 puts.
+    #[config_log::retcd_test]
+    fn m10_s2_d2_a_small_cap_never_fills_and_each_copy_keeps_two_dedup_rows() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let config = DbConfig {
+            dedup_cap: Some(3),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "after the open");
+        for n in 0..150_u32 {
+            db.put(b"a", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+        }
+        db.shutdown();
+        drop(db);
+        for n in 1..=3 {
+            assert_eq!(
+                dedup_rows(dir.path(), n),
+                2,
+                "node {n}: the newest answer and the floor record"
+            );
+        }
+    }
+
+    /// A-R252 M3 and D7, on a running `Db`, cap 8. A txn is answered `UNKNOWN_OUTCOME` (links
+    /// held), a pin, and a new put is refused `PROTECTION_PAUSED` behind it with nothing applied,
+    /// which is held. After the heal, 30 puts land: the pin never fills the cap. Under the pin,
+    /// the paused put and the first answered put, resent, are both `STATUS_EXPIRED` with nothing
+    /// applied: an id above the pin stays covered (A-R274). The txn, resent,
+    /// replays its answer, since a pin keeps it, and that settles the pin; its status still
+    /// answers. With no pin left, one more put raises the floor past the paused put, which,
+    /// resent, answers `STATUS_EXPIRED` and applies nothing (submit it as new); its status, asked
+    /// with its generation, is `Expired`.
+    /// Integration (~2 s): three node threads, a real pause and a heal.
+    #[config_log::retcd_test]
+    fn m10_s2_m3_a_pin_replays_and_a_paused_put_resent_later_is_expired() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            dedup_cap: Some(8),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let paused = db
+            .put(b"c", b"1", None)
+            .expect_err("refused while the txn is unpublished");
+        assert_eq!(
+            (paused.error.kind, paused.error.no_mutation),
+            (ErrorKind::ProtectionPaused, true),
+            "{paused:?}"
+        );
+        let pending = unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+        let paused = paused.request.expect("a kernel refusal keeps its request");
+        let (pending_id, paused_id) = (pending.identity.request, paused.identity.request);
+        assert_eq!(
+            lock(&db.ack_floor).pins(),
+            [pending_id.0],
+            "the txn is a pin and the paused put is held"
+        );
+
+        db.links().heal_all();
+        admits(&db, "after the heal");
+        publishes(&db, Seq(2), "after the heal");
+        let mut first = None;
+        for n in 0..30_u32 {
+            let ok = db
+                .put(b"b", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("put {n} under a pin: {refused:?}"));
+            first.get_or_insert(ok);
+        }
+        let first = first.expect("30 puts");
+
+        // A-R274, under the unsettled pin: ids between it and acked_below are still covered. A
+        // held refusal and an answered put, resent, are both STATUS_EXPIRED with nothing applied.
+        let b_before = db.get(b"b").expect("get b").value;
+        let expired = db
+            .resend((*paused).clone())
+            .expect_err("covered, though above the pin");
+        assert_eq!(expired.error.kind, ErrorKind::StatusExpired, "{expired:?}");
+        assert_eq!(db.get(b"c").expect("get c").value, None, "nothing applied");
+        let again = db
+            .resend(*first.sent)
+            .expect_err("an answered put is never applied twice");
+        assert_eq!(again.error.kind, ErrorKind::StatusExpired, "{again:?}");
+        assert_eq!(
+            db.get(b"b").expect("get b").value,
+            b_before,
+            "nothing applied"
+        );
+
+        let replayed = db.resend(*pending).expect("the pin replays");
+        assert_eq!((replayed.request, replayed.seq), (pending_id, Seq(2)));
+        assert!(
+            lock(&db.ack_floor).pins().is_empty(),
+            "the replay settles it"
+        );
+        match db.status(pending_id, None).expect("status of the txn") {
+            TxnStatus::Resolved(result) => assert_eq!(result.seq, Seq(2)),
+            other => panic!("status of the txn: {other:?}"),
+        }
+
+        db.put(b"b", b"last", None)
+            .expect("a put that acks past the paused put");
+        let expired = db
+            .resend(*paused)
+            .expect_err("under the floor, with no pin below it");
+        assert_eq!(expired.error.kind, ErrorKind::StatusExpired, "{expired:?}");
+        assert_eq!(db.get(b"c").expect("get c").value, None, "nothing applied");
+        assert_eq!(
+            db.status(paused_id, Some(replayed.generation))
+                .expect("status of the paused put"),
+            TxnStatus::Expired
+        );
+        assert_eq!(
+            db.status(paused_id, None)
+                .expect("status with no generation"),
+            TxnStatus::Unknown,
+            "A-R63: with no generation, never Expired"
+        );
+        db.shutdown();
+    }
+
+    /// D6 (design-ackfloor §5): a reopen's floor covers only its own open. The first open's
+    /// last put is still answered after the reopen has written past it: its status is its
+    /// outcome, never `Expired`, and never `Unknown` for want of its row.
+    /// Integration (~2 s): two opens.
+    #[config_log::retcd_test]
+    fn m10_s2_d6_a_reopen_s_floor_never_touches_the_earlier_open_s_answers() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        let last = db.put(b"b", b"1", None).expect("put b").request;
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        for n in 0..5_u32 {
+            let ok = db
+                .put(b"c", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+            assert!(ok.request.0 > 1 << 40, "an id of the second open: {ok:?}");
+        }
+        match db
+            .status(last, None)
+            .expect("status of the first open's put")
+        {
+            TxnStatus::Resolved(_) => {}
+            other => panic!("the first open's last put: {other:?}"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R274 F1: with the ack floor on, a dedup cap below 3 is refused before anything starts,
+    /// in words that say why: it would fill and stay full. With the floor off, or at 3, it is
+    /// taken.
+    #[test]
+    fn m10_s2_f1_a_dedup_cap_below_three_is_refused_with_the_floor_on() {
+        let dir = config_testkit::fs::temp_dir();
+        let with = |cap, ack_floor| {
+            DbConfig {
+                dedup_cap: Some(cap),
+                ack_floor,
+                ..config(dir.path())
+            }
+            .check()
+        };
+        match with(2, true) {
+            Err(OpenError::Config(text)) => assert!(
+                text.starts_with(
+                    "dedup_cap must be at least 3 when ack_floor is on: each open keeps its \
+                     newest answer and a floor record"
+                ),
+                "{text}"
+            ),
+            other => panic!("cap 2 with the floor on: {other:?}"),
+        }
+        assert!(with(2, false).is_ok(), "the floor off takes cap 2");
+        assert!(with(3, true).is_ok(), "cap 3 is the least the floor takes");
     }
 }

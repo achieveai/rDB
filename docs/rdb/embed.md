@@ -111,6 +111,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let store: Arc<dyn config_core::ConfigStore> = Arc::new(client);
     let config = DbConfig {
+        ack_floor: true,
         dir: "C:/my-app/data".into(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
@@ -303,6 +304,22 @@ So a partition sustains about `cap / retention` writes per second:
   to 60 s at defaults) count against the cap for one retention after the reopen. A clean quit
   (`Db::shutdown`, or dropping the `Db`) does not have this cost.
 
+**The ack floor lifts that limit (`DbConfig::ack_floor`, on by default).** Each write tells the
+owner which earlier writes of this open already have their answer, and the owner drops those
+answers. An open writing steadily then holds about two entries (its newest answer and its
+floor), so the table above no longer limits it.
+
+- **It keeps up to 8 writes whose outcome is unknown**, so `status` or a resend can still
+  settle them. The ninth drops the oldest, which then answers `STATUS_EXPIRED`.
+- **A dropped answer answers `STATUS_EXPIRED`** on a resend, with nothing applied: submit the
+  write as new. `status` with its generation says `Expired`; with none, `Unknown`.
+- **A write is never applied twice.** A resend of a write that was answered, even `Ok`, answers
+  `STATUS_EXPIRED` once its answer was dropped. After the owner restarts, a kept write that never
+  applied answers `STATUS_EXPIRED` too: submit it as new.
+- **Ids you choose (`put_as`, `txn_as`, `write_as`) get no relief.** The table above applies.
+- **A cap below 3 is refused at open.** The floor and the newest answer would fill it.
+- `ack_floor: false` keeps every answer for the retention, as before.
+
 ### When writes pause
 
 Writes can pause without any error in your code. Most pauses end by themselves, and none
@@ -358,7 +375,8 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   full read of the object, and a clear of it are all refused `INCOMPATIBLE_VERSION`, with
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
-- **A restarted node stays out until the folder is opened again.** See section 5.
+- **A restarted secondary rejoins by itself** once the owner re-plans: writes pause briefly,
+  then resume. **A restarted owner stays out until the folder is opened again.** See section 5.
 - **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`

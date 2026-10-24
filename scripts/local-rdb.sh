@@ -3,7 +3,7 @@
 #
 #   scripts/local-rdb.sh up [--base-port P] [--root DIR] [--timeout-sec N]
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
-#   scripts/local-rdb.sh kill N | start N [--wipe] | restart N    [--run DIR]
+#   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
 #   scripts/local-rdb.sh suspend N | resume N                     [--run DIR]
 #   scripts/local-rdb.sh hold A-B | heal A-B                      [--run DIR]
 #   scripts/local-rdb.sh drop-request N [--node M] | drop-reply N [--node M]   [--run DIR]
@@ -15,6 +15,9 @@
 # database once in one process (rdb_node --form, ruling A-R231), then starts rdb_node 1, 2 and 3,
 # each holding only its own copy, and waits for each to say ready. Ctrl-C or a failed step brings
 # everything it started back down.
+#
+# `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
+# it at once, as a crash. Any other verb is refused with the list of verbs, exit 2.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
 # named <sha>-<base port>-<HHMMSS>. The last `up` is recorded in <root>/current, and every other
@@ -213,18 +216,32 @@ start_node() { # n
     say "node $n started: pid $os, $(head -n1 "$out")"
 }
 
-await_ready() { # n: 0 only on `rdb_node ready`; a `not-ready` line, an exit or a timeout is 1
-    local n="$1" os line
+settled_line() { # file: the last ready or final not-ready line. A not-ready line ending
+    # `(retrying)` is a missed deadline, not an end: the node keeps trying and later prints
+    # `rdb_node ready node=N (after Ns)` (tester-s2 `lr up` race, A-R271).
+    { grep "^rdb_node \(ready\|not-ready\)" "$1" 2>/dev/null || true; } \
+        | { grep -v "(retrying)$" || true; } | tail -n1
+}
+
+await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an exit or a timeout is 1
+    local n="$1" os line deadline out
+    out="$RUN/out/node-$n.out"
     os="$(pid_of "node-$n")"
-    if wait_line "$RUN/out/node-$n.out" "^rdb_node \(ready\|not-ready\)" "$TIMEOUT_SEC" "$os"; then
-        line="$(grep "^rdb_node \(ready\|not-ready\)" "$RUN/out/node-$n.out" | tail -n1)"
+    deadline=$(( $(date +%s) + TIMEOUT_SEC ))
+    while [ "$(date +%s)" -lt "$deadline" ] && os_pid_is "$os" rdb_node; do
+        line="$(settled_line "$out")"
+        [ -n "$line" ] && break
+        sleep 0.2
+    done
+    line="$(settled_line "$out")"
+    if [ -n "$line" ]; then
         say "node $n: $line"
         case "$line" in "rdb_node ready"*) return 0 ;; *) return 1 ;; esac
-    else
-        tail -n 5 "$RUN/out/node-$n.err" >&2 || true
-        say "node $n: no ready line within ${TIMEOUT_SEC}s (see $RUN/out/node-$n.err)"
-        return 1
     fi
+    tail -n 5 "$RUN/out/node-$n.err" >&2 || true
+    line="$(grep "^rdb_node not-ready" "$out" 2>/dev/null | tail -n1 || true)"
+    say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
+    return 1
 }
 
 stop_node() { # n: stop file, then a hard kill after 15 s. Idempotent.
@@ -414,6 +431,9 @@ case "$COMMAND" in
     status) pick_run; status ;;
     env) pick_run; cat "$RUN/run.env"; echo "RUN=$RUN"; echo "PEERS=$(peers)" ;;
     kill) pick_run; check_node_arg "$ARG"; kill_node "$ARG" ;;
+    stop)
+        pick_run; check_node_arg "$ARG"
+        if node_alive "$ARG"; then stop_node "$ARG"; else forget_pid "node-$ARG"; say "node $ARG is not running"; fi ;;
     start)
         pick_run; check_node_arg "$ARG"
         if [ "$WIPE" = 1 ]; then
@@ -440,5 +460,6 @@ case "$COMMAND" in
             [ "$DROP" != "$ARG" ] || die "promote $ARG cannot also drop $ARG"
         fi
         promote ;;
-    *) usage ;;
+    "") usage ;;
+    *) echo "lr: unknown verb '$COMMAND'; the verbs are:" >&2; usage ;;
 esac

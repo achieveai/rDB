@@ -338,6 +338,7 @@ mod tests {
             ..rdb_core::contracts::event::Budgets::SPEC_DEFAULTS
         };
         let config = DbConfig {
+            ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),

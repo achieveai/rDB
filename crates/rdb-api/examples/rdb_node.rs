@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use config_core::ConfigStore;
+use rdb_api::db::ReadyError;
 use rdb_api::db::{next_boot, ALL_NODES, DEFAULT_CLIENT};
 use rdb_api::net::faults::{CutStore, Faults};
 use rdb_api::net::wire::Label;
@@ -239,6 +240,7 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let dir = need(args.dir.as_ref(), "--dir")?;
     let store = control(args)?;
     let config = DbConfig {
+        ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
@@ -263,6 +265,24 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
 }
 
 /// Run node `--node` of the database in `--dir` until `--stop-file` appears.
+/// Prints a wait's outcome. True when it timed out, so `serve` keeps waiting: the
+/// line then ends `(retrying)`, and `lr` reads a not-ready line without it as final.
+fn report_ready(node: NodeId, waited: Result<(), ReadyError>) -> bool {
+    match waited {
+        Ok(()) => {
+            println!("rdb_node ready node={}", node.0);
+            false
+        }
+        Err(e) => {
+            let retrying = matches!(e, ReadyError::TimedOut { .. });
+            tracing::warn!(node = node.0, error = %e, retrying, "rdb_node_not_ready");
+            let tail = if retrying { " (retrying)" } else { "" };
+            println!("rdb_node not-ready node={}: {e}{tail}", node.0);
+            retrying
+        }
+    }
+}
+
 fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let node = NodeId(need(args.node.as_ref(), "--node")?);
     let dir = need(args.dir.as_ref(), "--dir")?;
@@ -308,6 +328,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     );
 
     let config = DbConfig {
+        ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
@@ -324,23 +345,29 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         .map_err(|e| format!("open {} as node {}: {e}", dir.display(), node.0))?;
     println!("rdb_node open node={}", node.0);
     let within = Duration::from_secs(args.ready_secs.unwrap_or(60));
-    match db.wait_ready(within) {
-        Ok(()) => println!("rdb_node ready node={}", node.0),
-        Err(e) => {
-            tracing::warn!(node = node.0, error = %e, "rdb_node_not_ready");
-            println!("rdb_node not-ready node={}: {e}", node.0);
+    let waited = std::time::Instant::now();
+    // A missed deadline is a line, not a stop (tester-s2 `lr up` race, A-R271): only a time-out
+    // keeps waiting, and the late `ready` line says how long it took. Any other refusal ends it.
+    let mut retrying = report_ready(node, db.wait_ready(within));
+    let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
+    while !stopped() {
+        if !retrying {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        match db.wait_ready(Duration::from_secs(1)) {
+            Ok(()) => {
+                let after = waited.elapsed().as_secs();
+                tracing::info!(node = node.0, after_s = after, "rdb_node_ready_late");
+                println!("rdb_node ready node={} (after {after}s)", node.0);
+                retrying = false;
+            }
+            Err(ReadyError::TimedOut { .. }) => {}
+            ended => retrying = report_ready(node, ended),
         }
     }
     if let Some(stop) = &args.stop_file {
-        while !stop.exists() {
-            std::thread::sleep(Duration::from_millis(100));
-        }
         tracing::info!(node = node.0, stop = %stop.display(), "rdb_node_stop_file");
-    } else {
-        // No stop file: run until killed.
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
-        }
     }
     db.shutdown();
     drop(db);

@@ -25,7 +25,7 @@
 //! Every open prints `ready ms=<open-to-ready> heal=<HealState>` (`reopen i ready ...` for a
 //! reopen). Exits: 0 done; 1 a write or read failed; 2 bad arguments or setup; 3 the folder was
 //! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`), or with
-//! `--nodes` a node refused the link (`links down: node N: refused: ...`: another CA, the
+//! `--nodes` a node refused the link (`links down after Ss: node N: refused: ...`: another CA, the
 //! wrong node at that address, something that is not TLS, a newer protocol); 4 `--verify`
 //! found a journalled key missing or wrong; 5 not ready in time.
 //!
@@ -432,6 +432,7 @@ fn run(args: &Args) -> ExitCode {
         }
     };
     let config = DbConfig {
+        ack_floor: true,
         dir: args.dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
@@ -514,6 +515,7 @@ fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, Exit
         })?
     };
     let names = peers.iter().map(|n| n.0.to_string()).collect::<Vec<_>>();
+    let started = std::time::Instant::now();
     match rt.block_on(net.wait_up(&peers, args.ready)) {
         Ok(()) => {
             tracing::info!(nodes = ?names, client = args.client_id, "pilot_links_up");
@@ -526,7 +528,12 @@ fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, Exit
                 .values()
                 .any(|state| matches!(state, LinkState::Refused(_)));
             tracing::error!(%down, refused, "pilot_links_down");
-            println!("links down: {down}");
+            // A node that is not up is redialled until the wait ends (A-R273), so the line
+            // says how long that was; a refusal ends it at once.
+            println!(
+                "links down after {:.1}s: {down}",
+                started.elapsed().as_secs_f64()
+            );
             Err(ExitCode::from(if refused { 3 } else { 5 }))
         }
     }
