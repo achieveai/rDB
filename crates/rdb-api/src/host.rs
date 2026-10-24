@@ -2043,6 +2043,10 @@ impl Host {
 
     fn handle_msg(&mut self, msg: Msg) {
         if let Some(fault) = self.fault.clone() {
+            if let Msg::Synced(done) = msg {
+                self.finish_sync_after_fault(done);
+                return;
+            }
             self.answer_faulted(msg, &fault);
             return;
         }
@@ -2669,6 +2673,33 @@ impl Host {
             at += count;
         }
         Ok(())
+    }
+
+    /// F4 (A-R317): a sync that returns after the node faulted is finished, so the engine counts
+    /// no sync in flight and a later stop finds none to wait for (critic-f4 A2: before this, the
+    /// stop logged a false `sync_lost_at_stop`). What waited on it is dropped: a faulted node
+    /// answers nothing, and a reopen recovers from disk.
+    fn finish_sync_after_fault(&mut self, done: SyncDone) {
+        let Some(flight) = self.syncing.take() else {
+            tracing::error!(node = self.node.0, "synced_with_none_in_flight_after_fault");
+            return;
+        };
+        let SyncDone {
+            sync,
+            flushed,
+            millis: took,
+        } = done;
+        let ok = flushed.is_ok();
+        let finished = self.engine.finish_sync(sync, flushed).is_ok();
+        tracing::info!(
+            node = self.node.0,
+            millis = took,
+            ok,
+            finished,
+            dropped = flight.after.len() + self.sync_next.len(),
+            "sync_finished_after_fault"
+        );
+        self.sync_next.clear();
     }
 
     /// F4 (A-R317): at stop, once the syncer has returned, finish the sync it was running, so

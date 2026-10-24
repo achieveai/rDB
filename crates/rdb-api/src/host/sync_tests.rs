@@ -456,8 +456,9 @@ fn fences(lines: &[Line], from: usize) -> Vec<&Line> {
 
 /// A-R317 (4), b1, once: one 3 s sync on all three nodes, under 50 puts/s on product budgets.
 /// The owner keeps its grant (the same grant id, no `authority_fence`), no node-thread step
-/// goes over 500 ms, and nothing waits on the held sync. L1 may pause while the sync is held
-/// (durability ages past the 2 s pause age); it resumes, and puts publish again, within the
+/// goes over 500 ms, and nothing waits on the held sync. L1 pauses while the sync is held
+/// (durability ages past the 2 s pause age), so some puts are refused: that shows `Flushed`
+/// waited for the held sync (critic-f4 A1). It resumes, and puts publish again, within the
 /// sync (3 s) plus L1's resume hold (5 s) plus 1 s. Durable never runs ahead of a returned
 /// sync: the native rows in `rdb-storage/tests/m10_wal_sync.rs` hold that claim.
 /// Cut: every sync inline on the node thread, red (node 1 lost its grant: grant 1, then 2).
@@ -504,6 +505,10 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
         last_refused = ?last_refused,
         resumed = ?resumed,
         "f4_b1_once_puts"
+    );
+    assert!(
+        !refused.is_empty(),
+        "no put was refused: L1 never paused, so durable never lagged the held sync"
     );
     assert_eq!(
         (
@@ -624,7 +629,8 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
 /// node-wide (`wal_sync_stuck`, then `host_fault`) no sooner than the limit, so A1 renews no
 /// more and the grant lapses. A promote to node 2 then lands writes there within the limit plus
 /// the grant's 2.9 s plus 3 s to find and promote. Node 1 is still faulted after its sync
-/// returns: a late sync does not unfault a node.
+/// returns: a late sync does not unfault a node. That late sync is finished, not reported lost at
+/// stop, and node 1 faults once.
 /// Cut: no stuck check (`stuck_sync` never faults), red (node 1 never faults).
 /// Integration (~12 s): a fresh open, an 8 s held sync, a promote and a put.
 #[config_log::retcd_test]
@@ -699,5 +705,79 @@ fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
         stuck.is_some_and(|stuck| fault.is_some_and(|fault| stuck < fault)),
         "node 1: wal_sync_stuck {stuck:?}, host_fault {fault:?}"
     );
+    // critic-f4 A2: the late sync is finished on the faulted node, so the stop neither reports
+    // it lost nor faults node 1 a second time.
+    let after_fault = next(&lines, armed, "sync_finished_after_fault", &|line| {
+        num(line, "node") == 1
+    });
+    let lost = next(&lines, armed, "sync_lost_at_stop", &|line| {
+        num(line, "node") == 1
+    });
+    let faults = lines[armed..]
+        .iter()
+        .filter(|line| is(line, "host_fault") && num(line, "node") == 1)
+        .count();
+    assert!(
+        after_fault.is_some() && lost.is_none() && faults == 1,
+        "node 1: sync_finished_after_fault {after_fault:?}, sync_lost_at_stop {lost:?}, host_fault lines {faults}"
+    );
     tracing::info!(?fault_after, ?took_over, "f4_b2_checked");
+}
+
+/// critic-f4 R1 (#42, A-R249): a revocation counts only once it is durable, and on the syncer
+/// path that is a sync that began after it was staged. Every sync on node 1 is held 700 ms;
+/// node 3 restarts, so node 1, the owner, revokes the committed epoch to re-plan
+/// (`rejoin_revoke`, then `epoch_revocation_staged`). A1 hears `EpochRevocationPersisted`, and
+/// so gives its `DrainProof`, only after the first held sync begun after the staged write has
+/// returned (`wal_sync_slow`); the host's `epoch_revocation_persisted` line is no earlier.
+/// Cut: the apply arm pushes `EpochRevocationPersisted` when it stages, red (the `DrainProof`
+/// comes before the held sync returns).
+/// Integration (~4 s): a fresh open, one restart of node 3, and the re-plan's revocation.
+#[config_log::retcd_test]
+fn m10_f4_a_revocation_reaches_a1_only_after_a_held_sync_begun_after_it_was_staged() {
+    const METHOD: &str =
+        "m10_f4_a_revocation_reaches_a1_only_after_a_held_sync_begun_after_it_was_staged";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, config(dir.path()), &store, Budgets::SPEC_DEFAULTS);
+    admits_within(&db, "the open", Duration::from_secs(10));
+    db.put(b"a", b"1", None).expect("put a");
+    tracing::info!("f4_slow_armed");
+    let armed = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    slow_sync(&node_dir(dir.path(), 1), Duration::from_millis(700), true);
+    db.restart_node(NodeId(3)).expect("node 3 restarts");
+    let on_one = |line: &Line| line["node"] == 1;
+    let drain = |line: &Line| on_one(line) && line["fact"] == "DrainProof";
+    wait_for_line(
+        METHOD,
+        armed,
+        "authority_fact",
+        &drain,
+        Duration::from_secs(10),
+    );
+    db.shutdown();
+    clear_slow_sync(&node_dir(dir.path(), 1));
+
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let staged = next(&lines, armed, "epoch_revocation_staged", &on_one)
+        .expect("node 1 staged the revocation");
+    let held = held_syncs(&lines, staged, 1);
+    let &(slowed, returned) = held
+        .first()
+        .expect("a held sync on node 1 began after the staged write");
+    // A1 first: a DrainProof on a revocation heard too early is what this row guards.
+    let drained = next(&lines, staged, "authority_fact", &drain).expect("the DrainProof");
+    assert!(
+        returned < drained,
+        "node 1: DrainProof at line {drained}, before its held sync {slowed}..{returned} \
+         (staged at {staged}) returned"
+    );
+    let persisted = next(&lines, staged, "epoch_revocation_persisted", &on_one)
+        .expect("node 1 logged the revocation persisted");
+    tracing::info!(staged, slowed, returned, persisted, drained, "f4_r1_order");
+    assert!(
+        returned < persisted,
+        "node 1: persisted at line {persisted}, before its held sync {slowed}..{returned} returned"
+    );
 }

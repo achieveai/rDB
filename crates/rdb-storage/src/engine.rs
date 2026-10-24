@@ -351,6 +351,10 @@ impl InjectedFault {
 /// [`RocksEngine::finish_sync`] to move the durable marks.
 pub struct WalSync {
     db: Arc<DB>,
+    /// The directory claim, held while `db` is (A-R168): a sync that outlives its engine, as
+    /// on a node-thread panic, must not let another open take the directory under it. Declared
+    /// after `db`, so it drops after it.
+    _claim: Option<Arc<File>>,
     /// RocksDB's latest sequence number when the sync began (A-R214).
     latest: u64,
     /// Set when an armed [`InjectedFault::WalFlush`] fired at the start: the fsync fails with
@@ -928,16 +932,29 @@ impl RocksEngine {
         }
         let from_format = self.format;
         self.format = FORMAT_VERSION;
-        tracing::info!(
-            target: LOG_TARGET,
-            partition = partition.0,
-            epoch = epoch.0,
-            revoked = epochs.len(),
-            from_format,
-            format = self.format,
-            synced = sync,
-            "epoch_revocation_persisted"
-        );
+        // A staged write is not persisted until a sync returns, so it logs its own name: the
+        // host logs `epoch_revocation_persisted` only then (critic-f4 A3).
+        if sync {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                epoch = epoch.0,
+                revoked = epochs.len(),
+                from_format,
+                format = self.format,
+                "epoch_revocation_persisted"
+            );
+        } else {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                epoch = epoch.0,
+                revoked = epochs.len(),
+                from_format,
+                format = self.format,
+                "epoch_revocation_written_unsynced"
+            );
+        }
         Ok(())
     }
 
@@ -1040,6 +1057,9 @@ impl RocksEngine {
         }
         let last = value.len() - 1;
         value[last] ^= 0xFF;
+        // A synced write, debug builds only: named like every other, so one made while a sync
+        // runs is loud (critic-f4 A5).
+        self.note_synced_write("damage");
         let mut write = WriteBatch::default();
         write.put_cf(cf, &raw, &value);
         let mut opts = WriteOptions::default();
@@ -1235,6 +1255,7 @@ impl RocksEngine {
         }
         WalSync {
             db: Arc::clone(&self.db),
+            _claim: self.claim.clone(),
             latest,
             failed,
             captured,
