@@ -585,8 +585,8 @@ pub enum ReadyError {
         /// look in the time, `none` when it runs no recovery.
         phase: String,
     },
-    /// Node 1 restarted, or its restart failed: it does not rejoin in this open (#42), so it
-    /// will not admit writes again whatever the wait (A-R188).
+    /// Node 1 restarted, or its restart failed: the owner stays out until the folder is opened
+    /// again, so it will not admit writes again whatever the wait (A-R188).
     #[error("{note}; {step}", step = REOPEN_STEP)]
     Stopped {
         /// [`Db::restart_note`].
@@ -1342,7 +1342,8 @@ impl Db {
 
     /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at
     /// node 1 itself each time, never at what an earlier look saw. Once node 1 has restarted,
-    /// or its restart failed, answers at once: it does not rejoin in this open (#42). So does a
+    /// or its restart failed, answers at once: the owner stays out until the folder is opened
+    /// again. So does a
     /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
     /// one fence only (ruling F-a, A-R196). So does a quarantined one, which nothing in an open
     /// leaves (A-R196(2a)).
@@ -2096,8 +2097,11 @@ impl Db {
     /// What became of this client's request `request`.
     ///
     /// After a restart ([`Self::restart_note`] is `Some`), `Unknown` is not evidence that a write
-    /// was lost, even one answered `ok`. After the owner's restart, or both secondaries', its
-    /// outcome cannot be known until a restarted node rejoins (M10, achieveai/rDB#42). After one
+    /// was lost, even one answered `ok`. After the owner's restart its outcome cannot be known
+    /// until the folder is opened again: the owner stays out until then. After both
+    /// secondaries', it cannot be known until a restarted secondary rejoins, which it does by
+    /// itself once the owner re-plans (in one process; over the net that rejoin does not work
+    /// yet, achieveai/rDB#42). After one
     /// secondary's, it resolves once the other secondary can take the write: healing a link to
     /// it is enough (tester walk 5, W5-D1). That holds only for a write node 1 holds in flight,
     /// applied and unpublished ([`NodeStatus::in_flight`]). `Unknown` also answers a request
@@ -2343,9 +2347,8 @@ impl Db {
         }
     }
 
-    /// Whether node 1 has restarted, or its restart failed: it then holds nothing and does not
-    /// rejoin in this open (#42), so nothing it served comes back until the folder is opened
-    /// again.
+    /// Whether node 1 has restarted, or its restart failed: it then holds nothing, and the owner
+    /// stays out until the folder is opened again, so nothing it served comes back before then.
     fn owner_restarted(&self) -> bool {
         lock(&self.nodes)
             .iter()
@@ -2636,8 +2639,7 @@ impl Db {
     }
 
     /// Stop `node`'s process and start it again on the same data at its boot plus one, as a
-    /// process supervisor would (M9 S2b; a real supervisor takes over in M10). Returns the new
-    /// boot.
+    /// process supervisor would. Returns the new boot.
     ///
     /// In order: the old thread is stopped and joined, which drops its engine and releases
     /// RocksDB's `LOCK` on `nodes/<n>`; the control adapter forgets the node's watches, reloads
@@ -2645,17 +2647,14 @@ impl Db {
     /// takes over its mailbox. A completion the old process asked for that still arrives carries
     /// the old boot and is dropped (`control_stale_boot_dropped`).
     ///
-    /// The new process holds no role and stays out. Its peers' membership pins the old boot, so
-    /// they refuse its acknowledgements, and nothing in M9 arms it to acquire a grant: rejoining
-    /// takes a re-pin with catch-up, which is M10.
-    ///
-    /// So in M9 restarting **any** node stops writes for the life of the `Db`. A restarted
-    /// secondary's copy is never durable again, so L1 pauses writes within about 2 s of the next
-    /// write (spec §6.2): about 2 s after the restart, or, after a fence, about 2 s after the
-    /// first write that follows it (tester q8, F-015). Nothing un-pauses them before M10. Puts
-    /// already admitted may still land in that window. A restarted owner never takes a grant
-    /// again: its old grant can be cleared ([`crate::admin::clear_grant`]), but nothing acquires
-    /// a new one. Logged as `node_restarted{node, old_boot, boot}`. From then on a
+    /// Then each other node this process runs is told the node's new boot (`Msg::PeerBooted`,
+    /// A-R249). A restarted secondary rejoins by itself once the owner re-plans: the owner's
+    /// pinned membership names the old boot, so it re-plans the partition, and the new process
+    /// catches up and takes acknowledgements again. Until then its copy is not durable, so L1
+    /// may pause writes (spec §6.2). Over the net that rejoin does not work yet: a catch-up is
+    /// refused (achieveai/rDB#42). A restarted owner stays out until the folder is opened again:
+    /// its old grant can be cleared ([`crate::admin::clear_grant`]), but nothing in this open
+    /// acquires a new one. Logged as `node_restarted{node, old_boot, boot}`. From then on a
     /// `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY` answer says so
     /// ([`Self::restart_note`]).
     ///
