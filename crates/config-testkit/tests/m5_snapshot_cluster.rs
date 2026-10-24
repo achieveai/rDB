@@ -485,13 +485,15 @@ async fn wait_for_openraft_to_finish(cluster: &Cluster, snapshot_id: &str, metho
 /// from outside the store: the header's `cluster_revision`/`last_applied` are the capture
 /// instant, and the record stream contains exactly the pre-capture keys.
 ///
-/// **Residual limitation, recorded rather than hidden.** This discriminates a build that reads
-/// *live* state during the export (the corruption A2 exists to prevent: contents newer than
-/// `meta.last_log_id`, silent follower corruption). It cannot discriminate a view captured at
-/// the top of `build_snapshot` from one captured in `get_snapshot_builder`, because no
-/// `Boundary` exists between those two points — every crossing the store offers is already
-/// past the capture. Closing that would need a new product boundary; the exact patch is in
-/// `.claude/scratchpad/conversation_memories/retcd-m4-m6-implementation/dev-harness-notes.md`.
+/// This discriminates a build that reads *live* state during the export (the corruption A2
+/// exists to prevent: contents newer than `meta.last_log_id`, silent follower corruption).
+///
+/// Where the capture happens is no longer A2's question. Since A-R286 the view is a RocksDB
+/// checkpoint taken at the top of each `build_snapshot` attempt, not in `get_snapshot_builder`:
+/// openraft awaits `get_snapshot_builder` before its next apply, so a capture there stalled
+/// apply. The snapshot's `last_applied` and membership are read back from that checkpoint, and
+/// apply writes records and metadata in one batch, so the header always describes the body.
+/// `config-storage/tests/m5_snapshot.rs` row `m5_01c` pins that store-side.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m5_01_builder_view_captured_before_the_build() {
     let (cluster, scripts) = seeded_cluster().await;
