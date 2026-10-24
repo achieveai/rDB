@@ -3146,7 +3146,7 @@ impl Host {
                         self.timers.remove(id);
                     }
                 }
-                EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site)?,
+                EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site, effects)?,
             }
         }
         // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
@@ -3282,7 +3282,13 @@ impl Host {
     }
 
     /// One kernel effect: recorded, routed, served, or refused by name (the sim's `kernel`).
-    fn kernel(&mut self, from: ModuleName, kernel: &KernelEffect, site: Site) -> Result<(), Fault> {
+    fn kernel(
+        &mut self,
+        from: ModuleName,
+        kernel: &KernelEffect,
+        site: Site,
+        step: &[Effect],
+    ) -> Result<(), Fault> {
         let node = self.node.0;
         match kernel {
             KernelEffect::Ignored { reason } => {
@@ -3312,6 +3318,20 @@ impl Host {
                     at = self.stepped_at.0,
                     "authority_fence"
                 );
+                // A node fence is every served partition's, wherever A1 sited it: the ones A1
+                // views in this step and a T1 or P1 serves (A-R324, A-R331).
+                let sites = route::node_fence_sites(kernel, site.partition, step, |partition| {
+                    self.transaction.kernel(self.node, partition).is_some()
+                        || self.publication.kernel(self.node, partition).is_some()
+                });
+                for partition in sites {
+                    let event = KernelEvent::Authority(AuthorityEvent::Fence {
+                        scope: *scope,
+                        reason: *reason,
+                    });
+                    let at = Site { partition, ..site };
+                    self.push(at, EventKind::Kernel(event), true, None);
+                }
                 if *scope == FenceScope::Node {
                     self.schedule_acquire_after_fence(site);
                 }

@@ -1435,14 +1435,15 @@ impl Dispatcher {
         control: &mut ControlStore,
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        let mut effects = effects.into_iter();
-        while let Some(effect) = effects.next() {
-            if self.is_down(node) || (touches_storage(&effect) && self.crash_check(node)?) {
-                let mut rest = vec![effect];
-                rest.extend(effects);
+        let mut effects = effects;
+        // By index, so a node fence can read the views A1 emitted beside it (A-R331).
+        for index in 0..effects.len() {
+            if self.is_down(node) || (touches_storage(&effects[index]) && self.crash_check(node)?) {
+                let rest = effects.split_off(index);
                 self.deliver_while_down(node, boot, rest);
                 return Ok(());
             }
+            let effect = &effects[index];
             let site = (node, effect.partition, effect.correlation);
             match &effect.kind {
                 EffectKind::AdoptAuthority {
@@ -1461,7 +1462,7 @@ impl Dispatcher {
                     );
                 }
                 EffectKind::Control(_) => {
-                    control.submit(node, &effect)?;
+                    control.submit(node, effect)?;
                     self.pump(control, scheduler)?;
                 }
                 EffectKind::Reply(reply) => self.replies.push((node, reply.clone())),
@@ -1480,7 +1481,7 @@ impl Dispatcher {
                     self.clock.cancel(node, *id, *version);
                 }
                 EffectKind::Kernel(kernel) => {
-                    self.kernel(node, effect.from, kernel, site, scheduler)?;
+                    self.kernel(node, effect.from, kernel, site, &effects, scheduler)?;
                 }
             }
         }
@@ -1719,6 +1720,7 @@ impl Dispatcher {
         from: ModuleName,
         kernel: &KernelEffect,
         site: (NodeId, PartitionId, CorrelationId),
+        step: &[Effect],
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
         let note = match kernel {
@@ -1834,6 +1836,17 @@ impl Dispatcher {
             let at = scheduler
                 .now()
                 .plus_millis(hop::delay(&self.hops, node, kernel));
+            // A node fence is every served partition's, wherever A1 sited it: the ones A1
+            // views in this step and a T1 or P1 serves (A-R324, A-R331).
+            let sites = route::node_fence_sites(kernel, site.1, step, |partition| {
+                self.transaction.kernel(node, partition).is_some()
+                    || self.publication.kernel(node, partition).is_some()
+            });
+            for partition in sites {
+                let fanned = EventKind::Kernel(event.clone());
+                let id = self.schedule(scheduler, at, (node, partition, site.2), fanned)?;
+                self.routed.insert(id);
+            }
             let id = self.schedule(scheduler, at, site, EventKind::Kernel(event))?;
             self.routed.insert(id);
             return Ok(());
