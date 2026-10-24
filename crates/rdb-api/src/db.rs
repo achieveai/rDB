@@ -3455,19 +3455,44 @@ mod tests {
         admits_within(db, phase, Duration::from_secs(5));
     }
 
-    /// [`admits`] with its own patience, scaled the same way.
+    /// [`admits`] with its own patience, scaled the same way. Logs one `admission_wait` line
+    /// when the wait ends, admitted or not, with the owner's last status: a red that left no
+    /// other line still says how long it waited and where node 1 stood (k477).
     fn admits_within(db: &Db, phase: &str, patience: Duration) {
         let patience = crate::host::test_patience(patience);
-        let deadline = std::time::Instant::now() + patience;
-        while owner_of(db, db.node_status()).and_then(|node| node.admits) != Some(true) {
+        let started = std::time::Instant::now();
+        let deadline = started + patience;
+        let mut polls = 0_u32;
+        loop {
+            polls += 1;
+            let owner = owner_of(db, db.node_status());
+            let admitted = owner.as_ref().and_then(|node| node.admits) == Some(true);
+            let timed_out = !admitted && std::time::Instant::now() >= deadline;
+            if admitted || timed_out {
+                tracing::info!(
+                    phase,
+                    admitted,
+                    waited_ms = millis(started.elapsed()),
+                    patience_ms = millis(patience),
+                    polls,
+                    admits = ?owner.as_ref().map(|node| node.admits),
+                    authority = owner.as_ref().map(|node| node.authority.as_str()),
+                    recovery = ?owner.as_ref().and_then(|node| node.recovery.as_deref()),
+                    recovered = ?owner.as_ref().and_then(|node| node.recovered).map(|g| g.0),
+                    protection = ?owner.as_ref().and_then(|node| node.protection.as_deref()),
+                    fault = ?owner.as_ref().and_then(|node| node.fault.as_deref()),
+                    "admission_wait"
+                );
+                assert!(
+                    admitted,
+                    "{phase}: node 1 does not admit writes within {patience:?}"
+                );
+                return;
+            }
             for node in db.node_status() {
                 let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                 crate::host::assert_not_blocked(&node, window);
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{phase}: node 1 does not admit writes within {patience:?}"
-            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -5541,8 +5566,9 @@ mod tests {
     /// carries its look: `Items { at: -1 }` lists the last item. It fails if `write` sends
     /// `expect: None` (the stale write publishes), if `read` forwards `Look::Doc` (the list read
     /// is `INVALID_ARGUMENT`), or if `byte_string` answers a map document as `Ok`.
-    /// Integration (~1 s): three node threads on wall-clock time.
-    #[test]
+    /// Integration (~1 s): three node threads on wall-clock time. A per-test log, so a red at
+    /// its first admission wait can be read (k477: one red under load left no line).
+    #[config_log::retcd_test]
     fn the_public_write_and_read_carry_the_change_its_guard_and_the_look() {
         use crate::host::ListEdit;
         use rdb_value::value::{Int, Map, MapKey};
@@ -5629,6 +5655,21 @@ mod tests {
         assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused:?}");
         assert!(refused.detail.contains("not a byte string"), "{refused:?}");
         db.shutdown();
+        const METHOD: &str = "the_public_write_and_read_carry_the_change_its_guard_and_the_look";
+        let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "admission_wait")
+            .collect();
+        assert_eq!(waits.len(), 1, "one line for the one wait: {waits:?}");
+        assert_eq!(
+            (&waits[0]["phase"], &waits[0]["admitted"]),
+            (
+                &serde_json::json!("before the first write"),
+                &serde_json::json!(true)
+            ),
+            "{waits:?}"
+        );
+        assert!(waits[0]["waited_ms"].is_u64(), "{waits:?}");
     }
 
     /// Review F-008: `Db::write` answers a change that compiles to nothing as `Ok(None)`: a gc
