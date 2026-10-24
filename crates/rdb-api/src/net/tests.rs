@@ -826,16 +826,22 @@ async fn a_peer_message_crosses_processes_and_a_call_is_answered_on_its_link() {
     );
 }
 
-/// The reason node 1's dialler holds for node `to`, once it settles.
+/// The reason node 1's dialler holds for node `to`, once it is refused. Polls until the link is
+/// refused or up, within 3 s scaled by `RETCD_TEST_DEADLINE_SCALE`: under load the handshake
+/// alone took longer than a fixed 3 s (A-R257), and the row read `Waiting(None)` as a fault.
 async fn refusal(side: &Side, to: u32) -> String {
-    let error = side
-        .net
-        .wait_up(&[NodeId(to)], Duration::from_secs(3))
-        .await
-        .expect_err("the link must not come up");
-    match side.net.states().get(&NodeId(to)) {
-        Some(LinkState::Refused(reason)) => reason.clone(),
-        other => panic!("not refused: {other:?} ({error})"),
+    let patience = crate::host::test_patience(Duration::from_secs(3));
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        match side.net.states().get(&NodeId(to)) {
+            Some(LinkState::Refused(reason)) => return reason.clone(),
+            Some(LinkState::Up(boot)) => panic!("the link must not come up: up at {boot:?}"),
+            other => assert!(
+                tokio::time::Instant::now() < deadline,
+                "not refused within {patience:?}: {other:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1106,4 +1112,190 @@ async fn an_address_that_never_answers_the_tls_hello_says_so() {
             && error.contains(&addr.to_string()),
         "{error}"
     );
+}
+
+/// A formation config on `dir`: all three nodes, no links, as `rdb_node --form` opens.
+fn db_config(dir: &FsPath) -> crate::db::DbConfig {
+    crate::db::DbConfig {
+        ack_floor: true,
+        dir: dir.to_path_buf(),
+        hold: Vec::new(),
+        timeouts: crate::Timeouts::default(),
+        dedup_cap: None,
+        dedup_retention: None,
+        local: crate::db::ALL_NODES.to_vec(),
+        links: None,
+        client: crate::db::DEFAULT_CLIENT,
+        boot: None,
+        storage: crate::StorageOptions::default(),
+    }
+}
+
+/// One node process of a link row: its links, its `Db` and its boot.
+struct NodeProcess {
+    net: Arc<Net>,
+    db: crate::db::Db,
+    boot: BootId,
+}
+
+/// Start node `node`'s process on the formed folder `dir`, as `rdb_node` does: the links first
+/// (serving on `listener`, dialling the lower nodes in `addrs`), then its `Db` on its own copy at
+/// `next_boot(dir)`.
+fn node_process(
+    rt: &tokio::runtime::Runtime,
+    dir: &FsPath,
+    certs_dir: &FsPath,
+    store: &Arc<dyn config_core::ConfigStore>,
+    node: u32,
+    listener: tokio::net::TcpListener,
+    addrs: &BTreeMap<NodeId, String>,
+) -> NodeProcess {
+    let me = NodeId(node);
+    let boot = crate::db::next_boot(dir).expect("next boot");
+    let links = Links::new();
+    let net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label: Label::Node(me),
+                boot,
+                tls: certs::load(certs_dir, &Label::Node(me)).expect("certs"),
+                peers: crate::db::ALL_NODES
+                    .iter()
+                    .copied()
+                    .filter(|n| *n != me)
+                    .collect(),
+                dial: NetConfig::dial_lower(me, addrs),
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+            },
+            &links,
+            Some(listener),
+        )
+        .expect("net starts")
+    };
+    let config = crate::db::DbConfig {
+        local: vec![me],
+        links: Some(links),
+        boot: Some(boot),
+        ..db_config(dir)
+    };
+    let db = rt
+        .block_on(crate::db::Db::open(
+            config,
+            Arc::clone(store),
+            rt.handle().clone(),
+        ))
+        .unwrap_or_else(|e| panic!("node {node}'s process opens: {e}"));
+    NodeProcess { net, db, boot }
+}
+
+/// #42 caller (rulings A-R251, A-R270): three node processes, each with its own links under
+/// mutual TLS. Node 3's process restarts at a new boot. Node 1's links see a known peer back at
+/// another boot, log `peer_rebooted` and post `PeerBooted` to node 1, whose host logs
+/// `peer_booted` for node 3 and, as the record owner whose plan pinned node 3's old boot,
+/// starts the re-plan (`rejoin_revoke`). Cut: no post, and node 1 never hears of it.
+/// Integration (~3 s): a formation, three node opens until ready, one process restart, real
+/// TLS on loopback.
+#[config_log::retcd_test]
+fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
+    const METHOD: &str = "a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted";
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    let certs_dir = dir.path().join("certs");
+    certs_for(&certs_dir, &[1, 2, 3]);
+    let data = dir.path().join("db");
+    let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    {
+        let mut formed = rt
+            .block_on(crate::db::Db::open(
+                db_config(&data),
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("formation opens");
+        formed.wait_ready(patience).expect("formation is ready");
+        formed.shutdown();
+    }
+
+    let mut listeners: BTreeMap<NodeId, tokio::net::TcpListener> = BTreeMap::new();
+    let mut addrs = BTreeMap::new();
+    for node in crate::db::ALL_NODES {
+        let (listener, addr) = rt.block_on(config_testkit::ports::ephemeral_listener());
+        listeners.insert(node, listener);
+        addrs.insert(node, addr.to_string());
+    }
+    let take = |listeners: &mut BTreeMap<NodeId, tokio::net::TcpListener>, n: u32| {
+        listeners.remove(&NodeId(n)).expect("a listener")
+    };
+    let start = |node: u32, listener: tokio::net::TcpListener| {
+        node_process(&rt, &data, &certs_dir, &store, node, listener, &addrs)
+    };
+    // The copies open before the owner heals, so its plan finds them up (A-R165).
+    let mut two = start(2, take(&mut listeners, 2));
+    let three = start(3, take(&mut listeners, 3));
+    let mut one = start(1, take(&mut listeners, 1));
+    one.db
+        .wait_ready(patience)
+        .expect("node 1's process heals and is ready");
+    let old = three.boot;
+    assert_eq!(one.net.boot_of(NodeId(3)), Some(old), "node 1 links node 3");
+
+    // Node 3's process stops and starts again at a new boot. Nothing dials node 3 (the higher
+    // id dials), so it may listen on a fresh port: its old one can still be held for a moment.
+    let NodeProcess {
+        net: three_net,
+        db: mut three_db,
+        ..
+    } = three;
+    three_db.shutdown();
+    drop(three_db);
+    drop(three_net);
+    let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
+    let mut again = start(3, relisten);
+    assert!(
+        again.boot > old,
+        "a new boot: {:?} after {old:?}",
+        again.boot
+    );
+
+    let deadline = std::time::Instant::now() + patience;
+    let wanted = |line: &serde_json::Value| {
+        let m = line["@m"].as_str().unwrap_or_default();
+        (m == "peer_rebooted" && line["node"] == 3 && line["told"] == "[1]")
+            || (m == "peer_booted" && line["node"] == 1 && line["peer"] == 3)
+            || (m == "rejoin_revoke" && line["node"] == 1)
+    };
+    let seen = loop {
+        config_log::layer::flush_test_logs();
+        let lines: Vec<serde_json::Value> =
+            config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                .into_iter()
+                .filter(|line| wanted(line))
+                .collect();
+        let has = |m: &str| lines.iter().any(|line| line["@m"] == m);
+        if has("peer_rebooted") && has("peer_booted") && has("rejoin_revoke") {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 did not hear node 3's new boot within {patience:?}: {lines:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let rebooted = seen
+        .iter()
+        .find(|line| line["@m"] == "peer_rebooted")
+        .expect("peer_rebooted");
+    assert_eq!(rebooted["old"], old.0, "{rebooted}");
+    assert_eq!(rebooted["boot"], again.boot.0, "{rebooted}");
+
+    again.db.shutdown();
+    one.db.shutdown();
+    two.db.shutdown();
 }

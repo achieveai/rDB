@@ -1328,7 +1328,7 @@ impl Db {
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
         self.opened.heal_task = Some(rt.spawn(async move {
-            let ended = admin::heal(ctx).await;
+            let ended = admin::heal_retrying(ctx).await;
             if let Err(error) = &ended {
                 tracing::error!(%error, "heal_failed");
             }
