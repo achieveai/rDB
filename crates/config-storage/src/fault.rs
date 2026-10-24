@@ -243,6 +243,15 @@ impl fmt::Display for FaultAction {
 pub trait FaultInjector: Send + Sync {
     /// Decide what happens at this crossing.
     fn before(&self, boundary: Boundary) -> FaultAction;
+
+    /// Called once per snapshot capture, on the store's blocking thread, right after it takes
+    /// the checkpoint its build reads from and before it reads what that checkpoint describes.
+    /// Does nothing by default.
+    ///
+    /// Not a [`Boundary`]: nothing is written here and nothing can fail. It exists so a test can
+    /// hold a capture open and show what the capture holds while it runs — that state readers
+    /// do not wait for it (A-R279).
+    fn during_snapshot_capture(&self) {}
 }
 
 /// How many times each [`Boundary`] has been crossed.
