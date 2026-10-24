@@ -124,6 +124,38 @@ fn a_copy_that_missed_a_writeless_generation_links_it_at_inventory() {
     );
 }
 
+/// A-R374 (#59, the host row for the Gs == G-1 jump; critic-f5 row 7): a copy that missed
+/// generations 2 and 3, both written nowhere, holds generation 1 exactly through the anchor's
+/// base. Its inventory for generation 4 links 4 straight onto 1 at the base, skipping the two it
+/// never saw, and reports from it. The simulator cannot reach this: it lands every generation
+/// for a member in order (B-R56a.3).
+#[test]
+fn a_copy_that_missed_two_writeless_generations_links_the_newest_onto_its_own() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        2,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    match host.inventory(PartitionId(1), CopyId(1), anchor_at(4, 2, digests[1])) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(2), digests[1]));
+        }
+        other => panic!("expected a report, got {other:?}"),
+    }
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(4)),
+        Some(rdb_storage::Link {
+            parent: Generation(1),
+            base: Seq(2),
+            copied: false,
+        })
+    );
+}
+
 /// A commit into generation 2 at `(cutoff, digest)`, as node 2 hears it: a trio's
 /// bootstrap commit, moved on a generation. Its pin names node 2 a secondary.
 fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
