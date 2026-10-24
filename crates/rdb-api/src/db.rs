@@ -4690,18 +4690,28 @@ mod tests {
     /// at once through one `Db`, and every put succeeds. Before the fix T1 froze its queue at
     /// every local apply until the publish, so a put that arrived in that window was refused
     /// `PROTECTION_PAUSED` (290 a minute with 2 writers at 100 puts a second in `rdb_bench`).
+    ///
+    /// L1 keeps the spec's ages, scaled as a wait (ruling A-R313). Under `fast()` a 400 ms
+    /// flush on a loaded host pauses L1, which is a correct refusal of another kind and not the
+    /// freeze this row is about (d2 paused that way 3 times in 46 loaded runs). The freeze cut
+    /// still refuses at the first apply, whatever the ages.
     /// Integration (~1 s): three node threads, 120 puts.
     #[test]
     fn concurrent_writers_wait_behind_the_unpublished_write_and_none_is_refused() {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: millis(crate::host::test_patience(Duration::from_secs(1))),
+            pause_age_millis: millis(crate::host::test_patience(Duration::from_secs(2))),
+            ..fast()
+        };
         let mut db = rt
             .block_on(Db::open_with(
                 config(dir.path()),
                 store,
                 rt.handle().clone(),
-                fast(),
+                budgets,
             ))
             .expect("open");
         admits(&db, "after the open");
@@ -4714,14 +4724,21 @@ mod tests {
                         for i in 0..20 {
                             let key = format!("w{writers}/{writer}/{i}");
                             if let Err(e) = db.put(key.as_bytes(), b"v", None) {
-                                refused.lock().expect("lock").push(e.error.kind);
+                                refused
+                                    .lock()
+                                    .expect("lock")
+                                    .push((e.error.kind, e.error.detail));
                             }
                         }
                     });
                 }
             });
             let refused = refused.into_inner().expect("lock");
-            assert!(refused.is_empty(), "{writers} writers: refused {refused:?}");
+            assert!(
+                refused.is_empty(),
+                "{writers} writers: refused {refused:?}; owner now {:?}",
+                owner_of(&db, db.node_status())
+            );
         }
         db.shutdown();
     }
