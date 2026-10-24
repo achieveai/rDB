@@ -6278,9 +6278,10 @@ fn m10_s2_r1_answers_its_shadow_timer_on_every_node() {
 /// durable 10. With the primary alone the catch-up is refused `NotASource` (the host's fault
 /// before the fix). With the dormant receiver beside it, F1's catch-up of C through 15 starts,
 /// and the receiver serves that and nothing else: a plain append to it is refused with no
-/// reply, and neither the catch-up nor the append changes the primary. A flush of A's own
-/// engine raises the primary's durable as it always does; whatever the receiver says to A
-/// about it is refused by the primary as A's own voice (`ForgedIdentity`) and moves nothing.
+/// reply, and neither the catch-up nor the append changes the primary. On a flush of A's own
+/// engine the receiver sends A no ACK and answers `RecoveryOnly` (A-R323 A-8); an ACK in A's
+/// own name is still refused `ForgedIdentity` and moves nothing. Cut: the receiver ACKs its
+/// own node on a flush, red.
 #[retcd_test]
 fn m10_s2_a_dormant_receiver_beside_a_live_primary_sources_the_catch_up_and_nothing_else() {
     let rungs: Vec<(Seq, Digest)> = std::iter::once((Seq::ZERO, Digest::ROOT))
@@ -6358,34 +6359,41 @@ fn m10_s2_a_dormant_receiver_beside_a_live_primary_sources_the_catch_up_and_noth
     );
     assert_eq!(module.primary(A, P), Some(&primary), "the plain append");
 
+    // A-R323 A-8: on A's own flush the receiver sends A nothing. An ACK to its own node is no
+    // evidence, and the primary would refuse one as a forgery on every flush; the receiver
+    // answers `RecoveryOnly` instead.
     let effects = step(&mut module, &on(A, flushed(&[(P, GEN, 15)])));
-    let flushed_primary = module.primary(A, P).cloned().expect("A's primary");
-    let to_self: Vec<Bytes> = effects
-        .iter()
-        .filter_map(|effect| match effect {
-            EffectKind::Send(SendEffect::Unicast { to, frame }) if *to == A => {
-                Some(frame.body.clone())
-            }
-            _ => None,
-        })
-        .collect();
     assert!(
-        !to_self.is_empty(),
-        "the dormant receiver ACKs its flush to A: {effects:?}"
+        effects.contains(&ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::RecoveryOnly
+        ))),
+        "{effects:?}"
     );
-    for body in to_self {
-        let reply = on(A, framed(label(A), authority(GEN, EPOCH), CONFIG, body));
-        assert_eq!(
-            step(&mut module, &reply),
-            vec![ignored(KernelIgnoredReason::AckRejected(
-                AckRejectReason::ForgedIdentity
-            ))],
-            "the primary refuses its own node's ACK"
-        );
-        assert_eq!(
-            module.primary(A, P),
-            Some(&flushed_primary),
-            "the receiver's ACK moved the primary"
-        );
-    }
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            EffectKind::Send(SendEffect::Unicast { to, .. }) if *to == A
+        )),
+        "the dormant receiver ACKed its own node: {effects:?}"
+    );
+    let flushed_primary = module.primary(A, P).cloned().expect("A's primary");
+
+    // A real ACK in A's own name is still a forgery, and moves nothing.
+    let forged = AppendOutcome::Accepted(AppendAck {
+        from: A,
+        boot: BootId(1),
+        ..ack(15, 15, 15)
+    });
+    assert_eq!(
+        step(&mut module, &reply_from_to(label(A), A, &forged)),
+        vec![ignored(KernelIgnoredReason::AckRejected(
+            AckRejectReason::ForgedIdentity
+        ))],
+        "the primary refuses an ACK in its own node's name"
+    );
+    assert_eq!(
+        module.primary(A, P),
+        Some(&flushed_primary),
+        "the forged ACK"
+    );
 }

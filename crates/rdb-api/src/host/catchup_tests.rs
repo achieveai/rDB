@@ -1121,3 +1121,61 @@ fn a_secondary_restarted_behind_a_live_owner_catches_up_from_the_owner_and_rejoi
         "node 1 restores one per rejoin: {sourced:?}"
     );
 }
+
+/// A-R323 A-6 (W6b): beside a serving primary the dormant receiver only sources. Node 1 owns
+/// the partition after bootstrap. A target restore there, `with_history` false as
+/// `route_catch_up` makes when F1 names node 1 the target, installs nothing and is logged
+/// `dormant_restore_refused{serving_primary}`, so no recovery append can reach node 1's store
+/// beside its primary. A source restore with the same seed, `with_history` true, still installs
+/// the dormant receiver with its ladder, so the refusal is the target's. Cut: the target skip
+/// removed; node 1 holds a receiver after the target restore, red.
+/// Integration (~6 s): bootstrap's discovery window.
+#[config_log::retcd_test]
+fn a_target_restore_beside_a_serving_primary_installs_nothing() {
+    const METHOD: &str = "a_target_restore_beside_a_serving_primary_installs_nothing";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    let committed = trio.until("node 1 committed", |trio| {
+        trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+    });
+    let seed = DormantSeed {
+        config: committed.committed.pinned_config.clone(),
+        lineage: Lineage {
+            partition: PartitionId(1),
+            generation: committed.new_generation,
+            owner_epoch: OwnerEpoch(1),
+        },
+        revision: Revision(1),
+    };
+    let one = &mut trio.nodes[0].0;
+    let serving = one
+        .replication
+        .primary(NodeId(1), PartitionId(1))
+        .is_some_and(|primary| !primary.tracker().retired());
+    assert!(serving, "node 1 serves the partition");
+
+    one.restore_dormant(PartitionId(1), &seed, false);
+    assert!(
+        one.replication
+            .receiver(NodeId(1), PartitionId(1))
+            .is_none(),
+        "a target restore installed a receiver beside the primary"
+    );
+    let refused = logged!(METHOD, "dormant_restore_refused");
+    assert!(
+        refused
+            .iter()
+            .any(|line| line["node"] == 1 && line["reason"] == "serving_primary"),
+        "{refused:?}"
+    );
+
+    one.restore_dormant(PartitionId(1), &seed, true);
+    assert!(
+        one.replication
+            .receiver(NodeId(1), PartitionId(1))
+            .is_some_and(AppendReceiver::is_dormant),
+        "a source restore installs the dormant receiver"
+    );
+    assert_eq!(logged!(METHOD, "dormant_ladder_built").len(), 1);
+}

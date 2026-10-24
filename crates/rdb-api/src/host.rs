@@ -5247,10 +5247,11 @@ impl Host {
     /// configuration. A node already running a live receiver keeps it. `with_history` also gives
     /// the receiver its verified ladder, `(0, ROOT)` through its head, once (critic-d7 F2).
     ///
-    /// A live primary is no reason to skip (A-R278, A-R314): a live owner re-planning around a
-    /// restarted copy is F1's catch-up source, and R1 sources a catch-up from a receiver only.
-    /// The dormant receiver sits beside the primary, refuses every plain append, and R1 drops
-    /// it at the next `Recovered`.
+    /// A live primary is no reason to skip a source (A-R278, A-R314): a live owner re-planning
+    /// around a restarted copy is F1's catch-up source, and R1 sources a catch-up from a receiver
+    /// only. The dormant receiver sits beside the primary, refuses every plain append, and R1
+    /// drops it at the next `Recovered`. A target restore (`with_history` false) beside a
+    /// serving primary is refused `serving_primary`: the receiver there only sources (A-R323).
     ///
     /// Nothing here faults the node (critic-d7 F5): a copy that cannot be restored is logged
     /// `dormant_restore_refused{reason}` and holds no receiver, so its catch-up is refused and
@@ -5260,6 +5261,22 @@ impl Host {
         let held = self.replication.receiver(node, partition);
         let dormant = held.map(AppendReceiver::is_dormant);
         if dormant == Some(false) {
+            return;
+        }
+        // Beside a serving primary the receiver only sources (A-R314, A-R323 A-6): a target
+        // restore here would let recovery appends into the primary's own store.
+        let serving = self
+            .replication
+            .primary(node, partition)
+            .is_some_and(|primary| !primary.tracker().retired());
+        if serving && !with_history {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                generation = seed.lineage.generation.0,
+                reason = "serving_primary",
+                "dormant_restore_refused"
+            );
             return;
         }
         if dormant.is_none() {
