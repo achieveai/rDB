@@ -1462,7 +1462,7 @@ impl Dispatcher {
                     );
                 }
                 EffectKind::Control(_) => {
-                    control.submit(node, &effect)?;
+                    control.submit(node, effect)?;
                     self.pump(control, scheduler)?;
                 }
                 EffectKind::Reply(reply) => self.replies.push((node, reply.clone())),
