@@ -386,6 +386,14 @@ impl RdbError {
     /// `LeaseExpired` is also what a deny after apply answers, and `DivergenceRequiresOperator`
     /// keeps `false` by the same lead ruling.
     ///
+    /// `GenerationChanged` proves it too (M10 S2, lead rulings A-R296 and A-R298, ADR-rdb-0004 §5
+    /// amendment of 2026-10-23), though its retry rule is `Reconcile`. Every producer refuses
+    /// before apply: admission checks 5 and 6, the `StorageDispatch` check, the dedup lookup of a
+    /// request an older generation retained (step 11, which never executes it), and a recovery
+    /// stranding the queue and an undispatched check. `DenyReason::GenerationChanged` after apply
+    /// answers `UnknownOutcome` instead. Its classmates `RequestIdReuse` and `StaleContinuation`
+    /// keep `false`.
+    ///
     /// `true` says nothing about other sends of the same request identity (#35). Admission checks
     /// 1–10 run before the dedup lookup (ADR-rdb-0004 §3), so a resend of an identity that has
     /// already applied can be refused here, and `true` is still the right answer for that send.
@@ -401,7 +409,10 @@ impl RdbError {
         matches!(
             self.retry_rule(),
             RetryRule::Definitive | RetryRule::BoundedJitter
-        ) || matches!(self, Self::ProtectionPaused { .. })
+        ) || matches!(
+            self,
+            Self::ProtectionPaused { .. } | Self::GenerationChanged { .. }
+        )
     }
 
     /// Which capability an [`Self::Unavailable`] names, or `None` for every other error.

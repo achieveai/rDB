@@ -134,11 +134,14 @@ impl DenyReason {
     /// lead ruling A-R72a).
     ///
     /// The mapping is written **here and nowhere else**, the way [`BlockReason::client_error_kind`]
-    /// is, so T1 and P1 cannot answer one deny two ways. Only a local storage fence depends on the
-    /// boundary: before apply nothing was handed to storage, so the partition is paused; after it
-    /// the batch may have landed, so the outcome is unknown.
+    /// is, so T1 and P1 cannot answer one deny two ways. Three reasons depend on the boundary.
+    /// Two share one cause: after apply the batch may have landed, so the outcome is unknown.
+    /// Before apply nothing was handed to storage, so a local storage fence pauses the partition
+    /// and a generation change answers `GENERATION_CHANGED`, which proves nothing was written
+    /// ([`crate::contracts::errors::RdbError::proves_no_mutation`]). Mapping the second after
+    /// apply too would be a false "definitely not applied" (lead ruling A-R298).
     ///
-    /// A lost control quorum also depends on it (ruling A-R285). The grant is still held and never
+    /// The third is a lost control quorum (ruling A-R285). The grant is still held and never
     /// fenced, so before apply the refusal is a pause that proves no mutation; after apply it
     /// stays `LEASE_EXPIRED`, which proves nothing.
     ///
@@ -147,7 +150,10 @@ impl DenyReason {
     #[must_use]
     pub const fn client_error_kind(&self, boundary: Boundary) -> ErrorKind {
         match self {
-            Self::GenerationChanged => ErrorKind::GenerationChanged,
+            Self::GenerationChanged => match boundary {
+                Boundary::PreApply => ErrorKind::GenerationChanged,
+                Boundary::PostApply => ErrorKind::UnknownOutcome,
+            },
             Self::LocalStorageFenced => match boundary {
                 Boundary::PreApply => ErrorKind::ProtectionPaused,
                 Boundary::PostApply => ErrorKind::UnknownOutcome,

@@ -233,7 +233,8 @@ allows; it is not a new rule.
 | `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | definitive rejection before mutation; the caller changes the request intentionally | proves no mutation *by this submission* |
 | `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | definitive no-admission; bounded jittered retry | proves no mutation *by this submission* |
 | `UNKNOWN_OUTCOME` | query status with the **same identity**; never generate a new request id | ambiguous |
-| `GENERATION_CHANGED`, `REQUEST_ID_REUSE` | reconcile or fail; never transparent replay | ambiguous / conflicting |
+| `GENERATION_CHANGED` | reconcile or fail; never transparent replay | proves no mutation *by this submission* (amended 2026-10-23, below) |
+| `REQUEST_ID_REUSE` | reconcile or fail; never transparent replay | ambiguous / conflicting |
 | `STATUS_EXPIRED` | retention passed; absence proves nothing | ambiguous |
 | `INCOMPATIBLE_VERSION`, `CORRUPT_HISTORY` | quarantine / reject; operator or rollout action | reject |
 | `DIVERGENCE_REQUIRES_OPERATOR` | the partition is blocked (ADR-rdb-0009, B-R26): no data-path exit; retry after the operator removes the diverged copies and fences; **do not assume an already-admitted request failed** | no admission *for this submission* |
@@ -265,6 +266,20 @@ only.
   `RECOVERY_READ_ONLY` and `DIVERGENCE_REQUIRES_OPERATOR` are unchanged by this ruling.
 - Pinned by `a_failed_batch_answers_the_queue_behind_it` (each answer's proof) and
   `no_deny_reason_after_apply_is_paused_or_proves_no_mutation` in `rdb-core/tests/transaction_t1.rs`.
+
+**Amended 2026-10-23 (M10 S2, lead rulings A-R296 and A-R298; critic-degraded): `GENERATION_CHANGED`
+proves no mutation by this submission.** It keeps its retry rule, reconcile.
+- Why it holds: every producer refuses before apply. They are admission checks 5 and 6, the
+  `StorageDispatch` check, the dedup lookup of a request an older generation retained (§3 step 11,
+  which never executes it), and a recovery stranding the queue and an undispatched check.
+- The boundary: `DenyReason::GenerationChanged` after apply now answers `UNKNOWN_OUTCOME`, as
+  `LocalStorageFenced` does. No caller denies a write after apply this way today; the mapping keeps
+  a future one from claiming a false "definitely not applied".
+- What it does not change: the proof covers this send only (#35, above). A resend still reports no
+  proof to the app (`Db::retried`). `REQUEST_ID_REUSE` keeps no proof.
+- Pinned by `a_queued_put_stranded_by_a_new_generation_proves_no_mutation` and
+  `a_write_applied_before_a_generation_change_never_proves_no_mutation` in
+  `rdb-core/tests/transaction_t1.rs`.
 
 ### 6. The local apply never returns success
 

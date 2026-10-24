@@ -952,9 +952,14 @@ impl ConfigStore for CountRace {
             let read = self.inner.get(request).await?;
             let mut raced = self.raced.lock().await;
             if racing && raced.is_none() {
-                let n = admin::count_open(&self.inner, &self.instance, false, admin::COUNT_WITHIN)
-                    .await
-                    .expect("the racing open counts");
+                let n = admin::count_open(
+                    &self.inner,
+                    &self.instance,
+                    false,
+                    crate::host::test_patience(admin::COUNT_WITHIN),
+                )
+                .await
+                .expect("the racing open counts");
                 *raced = Some(n);
             }
             Ok(read)
@@ -1014,10 +1019,13 @@ impl ConfigStore for CountRace {
 /// write is conditioned on what it read, so A conflicts, reads again and is counted N + 2. Two
 /// opens never get one number, so never one boot range or request floor. An unconditioned write
 /// hands A the number B already has.
-/// Unit (~1 ms): `count_open` against a store that races it.
+/// Unit (~1 ms): `count_open` against a store that races it. `COUNT_WITHIN` is a wait here, not
+/// the claim, so it is scaled: on a starved host A's first read, which runs all of B, and its
+/// conflicted CAS outlasted 10 s, and A gave up before reading again (A-R307).
 #[test]
 fn m10_cut_two_opens_counting_at_once_never_get_one_number() {
     let rt = runtime();
+    let within = crate::host::test_patience(admin::COUNT_WITHIN);
     let instance = [0x33; INSTANCE_LEN];
     let store = CountRace {
         inner: config_testkit::MemStore::new(),
@@ -1026,21 +1034,11 @@ fn m10_cut_two_opens_counting_at_once_never_get_one_number() {
         raced: tokio::sync::Mutex::new(None),
     };
     let first = rt
-        .block_on(admin::count_open(
-            &store.inner,
-            &instance,
-            true,
-            admin::COUNT_WITHIN,
-        ))
+        .block_on(admin::count_open(&store.inner, &instance, true, within))
         .expect("the first open");
     assert_eq!(first, 1);
     let a = rt
-        .block_on(admin::count_open(
-            &store,
-            &instance,
-            false,
-            admin::COUNT_WITHIN,
-        ))
+        .block_on(admin::count_open(&store, &instance, false, within))
         .expect("open A");
     let b = rt
         .block_on(store.raced.lock())
@@ -1051,12 +1049,7 @@ fn m10_cut_two_opens_counting_at_once_never_get_one_number() {
         "B counted in A's gap, so A is counted after it"
     );
     let next = rt
-        .block_on(admin::count_open(
-            &store.inner,
-            &instance,
-            false,
-            admin::COUNT_WITHIN,
-        ))
+        .block_on(admin::count_open(&store.inner, &instance, false, within))
         .expect("the next open");
     assert_eq!(next, 4);
 }
@@ -1488,8 +1481,9 @@ fn m10_r189_a_generation_changed_refusal_says_to_look_the_request_up_with_status
         (
             ErrorKind::GenerationChanged,
             "generation changed: expected Generation(1), current Generation(2); request 1 was \
-             sent under generation 1; look it up with Db::status to see whether it applied; do \
-             not resend it as a new request"
+             sent under generation 1 and this send wrote nothing; if it was sent before, look \
+             it up with Db::status to see whether an earlier send applied it, and do not resend \
+             it as a new request"
         )
     );
     assert_eq!(

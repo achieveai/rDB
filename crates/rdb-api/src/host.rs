@@ -6691,6 +6691,19 @@ fn step_l1(
     event: &Event,
 ) -> Result<Vec<Effect>, RdbError> {
     let mut hosted = table.remove(&ctx.partition).unwrap_or_default();
+    // A-R297: every qualification edge L1 sees, so a pause with no `warn` before it can be
+    // traced to its input (a `Lost` edge pauses at once).
+    if let EventKind::Kernel(KernelEvent::QualificationChanged(edge)) = &event.kind {
+        tracing::debug!(
+            node = ctx.node.0,
+            partition = ctx.partition.0,
+            direction = ?edge.direction,
+            seq = edge.at_seq.0,
+            copies = ?edge.qualified_copies.iter().map(|copy| copy.0).collect::<Vec<_>>(),
+            cause = ?edge.cause,
+            "l1_qualification_edge"
+        );
+    }
     let before = hosted.protection.mode();
     let answer = hosted.protection.step(ctx, event);
     if hosted.protection == Protection::default() {
@@ -6703,6 +6716,7 @@ fn step_l1(
             partition = ctx.partition.0,
             from = before.map_or("inert", mode_name),
             to = after.map_or("inert", mode_name),
+            input = %event_name(&event.kind),
             "protection_mode"
         );
     }
