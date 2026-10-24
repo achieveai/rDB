@@ -77,8 +77,9 @@ pub struct Batch {
 /// A prefix captured for an fsync boundary: "these partitions, through these sequences".
 ///
 /// The argument of spec §6.1's `sync_wal_through(captured_prefixes)`. Capturing is separate from
-/// flushing because the write-order mutex is held from capture until the flush returns, and only
-/// an unambiguous success publishes the captured prefixes.
+/// flushing because the fsync runs on the node's syncer thread, not the node thread (ruling
+/// A-R317). Commits keep landing while it runs; a commit made after the capture is durable only
+/// after the next sync. Only an unambiguous success publishes the captured prefixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CapturedPrefix {
     /// The partition.
@@ -118,7 +119,7 @@ pub enum StoreEffect {
     Flush {
         /// Identity of this flush, for matching its completion.
         ticket: FlushTicket,
-        /// The prefixes captured under the write-order mutex.
+        /// The prefixes captured when the sync began.
         captured: Vec<CapturedPrefix>,
     },
     /// Open an immutable read view at the published prefix.
