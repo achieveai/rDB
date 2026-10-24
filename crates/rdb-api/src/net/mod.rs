@@ -528,7 +528,7 @@ impl Drop for Net {
 /// back at another boot restarted: every node this process runs hears it as
 /// [`Msg::PeerBooted`] (#42, ruling A-R251), so the record owner can re-plan around it.
 fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
-    let (new_boot, previous) = {
+    let (new_boot, previous, replaced) = {
         let mut routes = lock(&shared.routes);
         let Some(route) = routes.get_mut(&node) else {
             tracing::warn!(peer = %conn.peer, "net_link_from_unknown_node");
@@ -537,14 +537,14 @@ fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
         let previous = route.boot.replace(boot);
         route.refused = None;
         route.last_error = None;
-        if let Some(old) = route.conn.replace(Arc::clone(conn)) {
+        let replaced = route.conn.replace(Arc::clone(conn));
+        if let Some(old) = &replaced {
             tracing::info!(
                 node = node.0,
                 old = old.id,
                 new = conn.id,
                 "net_link_replaced"
             );
-            close(shared, &old, "replaced by a newer link");
         }
         let queued = route.queue.len();
         while let Some(frame) = route.queue.pop_front() {
@@ -557,8 +557,13 @@ fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
             queued,
             "net_link_up"
         );
-        (previous != Some(boot), previous)
+        (previous != Some(boot), previous, replaced)
     };
+    // Only once the routes lock is let go: `close` takes it, and a std mutex taken twice on one
+    // thread never returns (A-R313: that runtime worker hung, and the runtime with it).
+    if let Some(old) = replaced {
+        close(shared, &old, "replaced by a newer link");
+    }
     if new_boot {
         tracing::info!(node = node.0, boot = boot.0, "net_peer_booted");
         if let Some(old) = previous {
@@ -615,20 +620,11 @@ fn close(shared: &Shared, conn: &Arc<Conn>, reason: &str) {
     }
     let dropped = std::mem::take(&mut *lock(&conn.pending)).len();
     if let Label::Node(node) = &conn.peer {
-        // `install` holds the routes lock when it replaces a link, so only free a route that
-        // still points here; a replaced link's route is already the new one.
-        if let Ok(mut routes) = shared.routes.try_lock() {
-            if let Some(route) = routes.get_mut(node) {
-                if route.conn.as_ref().is_some_and(|c| c.id == conn.id) {
-                    route.conn = None;
-                }
-            }
-        } else {
-            let mut routes = lock(&shared.routes);
-            if let Some(route) = routes.get_mut(node) {
-                if route.conn.as_ref().is_some_and(|c| c.id == conn.id) {
-                    route.conn = None;
-                }
+        // Only free a route that still points here; a replaced link's route is already the
+        // new one. Never called holding the routes lock: `install` closes after letting it go.
+        if let Some(route) = lock(&shared.routes).get_mut(node) {
+            if route.conn.as_ref().is_some_and(|c| c.id == conn.id) {
+                route.conn = None;
             }
         }
     }

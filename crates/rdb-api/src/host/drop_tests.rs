@@ -516,3 +516,169 @@ fn m10_s2_d2_a_pause_for_divergence_is_never_dropped_past() {
         Some((before, PartitionMode::Active, vec![1, 2, 3]))
     );
 }
+
+/// b10 (A-R306; tester-s2's drop half, step 2): node 3 misses puts, then restarts, so its
+/// link reports a newer boot and the owner re-plans to link it again. Node 3 answers F1's
+/// inventory, so F1 needs it, and is then held: its links stay up but nothing crosses them, so
+/// its catch-up and barrier proof never arrive. This does not lean on W6's `NotASource`
+/// refusal: the hold starts once F1 is synchronizing, whichever way the catch-up would go.
+/// The rejoin is abandoned without node 3: the next generation commits `DegradedRf2` with
+/// nodes 1 and 2 within the later of `peer_drop_after_millis` and F1's
+/// barrier wait (7 windows), plus a margin for the re-plan's own window and CAS, and writes
+/// land again. Every `rejoin_abandoned` names node 3, the copy that never advanced.
+/// Only F1's block ends the rejoin; no clock does (ruling A-R316).
+/// Cut: `rejoin_blocked` returns at once, red (node 1's F1 stays blocked).
+/// Integration (~5 s): bootstrap's window, puts until L1 pauses, F1's sync and barrier
+/// waits, the abandon's re-plan.
+#[config_log::retcd_test]
+fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
+    const METHOD: &str = "m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.short_window_after_commit();
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.links.heal_all();
+    // Its restart: the link reports a newer boot, and nodes 1 and 2 hear it.
+    let reboot = BootId(trio.nodes[2].0.boot.0 + 1);
+    let mailbox = trio.nodes[2].1.clone();
+    trio.links.register(NodeId(3), mailbox, reboot);
+    let rebooted = trio.clock.now();
+    for node in 0..2 {
+        trio.nodes[node]
+            .1
+            .send(Msg::PeerBooted {
+                node: NodeId(3),
+                boot: reboot,
+            })
+            .expect("node up");
+    }
+
+    // Node 3 answered the inventory and is behind, so F1 needs it. From here it hears nothing
+    // and says nothing, but its links stay up: no catch-up, no barrier proof, no `CopyLost`.
+    trio.until("node 1 synchronizes node 3", |trio| {
+        let phase = trio.nodes[0]
+            .0
+            .recoveries
+            .get(&PartitionId(1))
+            .map(Recovery::phase);
+        (phase == Some(RecoveryPhase::Synchronizing)).then_some(())
+    });
+    hold_three(&trio);
+
+    let after = dropped_three(&mut trio, before);
+    let waited = HostClock::millis_until(rebooted, trio.clock.now());
+    let window = test_discovery_window_millis();
+    let bound = DROP_AFTER_MILLIS.max(7 * window) + 4 * window + 1_000;
+    assert!(
+        waited <= bound,
+        "writes held {waited} ms by a rejoin that never completes; bound {bound} ms"
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the abandon: {other:?}"),
+    }
+
+    let plans = logged!(METHOD, "rejoin_plan");
+    assert_eq!(
+        plans[0]["dropped"], "None",
+        "the rejoin links node 3: {plans:?}"
+    );
+    assert_eq!(plans[0]["rejoiner"], "Some(3)", "{plans:?}");
+    assert_eq!(
+        plans.last().map(|plan| plan["dropped"].clone()),
+        Some("Some(3)".into()),
+        "the last plan leaves node 3 out: {plans:?}"
+    );
+    let abandoned = logged!(METHOD, "rejoin_abandoned");
+    assert!(!abandoned.is_empty(), "no rejoin_abandoned");
+    assert!(
+        abandoned.iter().all(|line| line["dropped"] == 3),
+        "only node 3 is blamed: {abandoned:?}"
+    );
+}
+
+/// A-R316 (critic-degraded A-1): a block on a re-plan leaves a member out only when it names
+/// that member's copy. The rejoiner goes when the barrier misses it, among others or alone;
+/// another member goes when its copy is the only one missing; anything else names nobody, so
+/// the plan is retried with the same members. A plan that already leaves node 3 out never
+/// leaves out a second member: the commit's members less node 2 would put node 3 back.
+/// Cuts: `named_by_block` falls back to the rejoiner for every reason, red (`CasContention`);
+/// `block_leaves_out` without its drop check, red (node 2 for the drop plan).
+#[test]
+fn a_block_leaves_out_only_the_member_it_names() {
+    let members: Vec<Member> = (1..=3u8)
+        .map(|n| Member {
+            copy: CopyId(n - 1),
+            node: NodeId(u32::from(n)),
+            boot: BOOT,
+            role: if n == 1 {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::RegularSecondary
+            },
+        })
+        .collect();
+    let barrier = |missing: &[u8]| BlockReason::BarrierIncomplete {
+        missing: missing.iter().map(|copy| CopyId(*copy)).collect(),
+    };
+    let replan = |drop: Option<u32>, rejoiner: Option<u32>| Replan {
+        drop: drop.map(NodeId),
+        rejoiner: rejoiner.map(NodeId),
+        since: Tick(0),
+    };
+    let rejoin = replan(None, Some(3));
+    let out = |reason: &BlockReason, plan: Replan| block_leaves_out(reason, plan, &members);
+    assert_eq!(out(&barrier(&[2]), rejoin), Some(NodeId(3)));
+    assert_eq!(out(&barrier(&[1, 2]), rejoin), Some(NodeId(3)));
+    assert_eq!(out(&barrier(&[1]), rejoin), Some(NodeId(2)));
+    assert_eq!(out(&barrier(&[0, 1]), rejoin), None);
+    assert_eq!(out(&barrier(&[1]), replan(None, None)), Some(NodeId(2)));
+    assert_eq!(out(&barrier(&[1]), replan(Some(3), None)), None);
+    for reason in [
+        BlockReason::CasContention,
+        BlockReason::OvertakenByPeer,
+        BlockReason::ControlUnavailable,
+        BlockReason::ControlUnknown,
+        BlockReason::NoEligibleRegular,
+    ] {
+        assert_eq!(out(&reason, rejoin), None, "{reason:?}");
+    }
+}
+
+/// b11 (A-R316, critic-degraded A-2): A1's `DrainProof` for b1's drop is lost once, as if A1
+/// never answered the revocation. The owner asks again once the revocation is
+/// `peer_drop_after_millis` old, A1 answers the repeated request, and the drop commits; writes
+/// land again.
+/// Cut: `retry_blocked_rejoin` leaves a `Revoking` alone, red (no commit without node 3 within
+/// the patience).
+/// Integration (~4 s): b1's drop, one more drop clock for the second ask.
+#[config_log::retcd_test]
+fn m10_s2_b11_a_revocation_a1_never_answers_is_asked_again() {
+    const METHOD: &str = "m10_s2_b11_a_revocation_a1_never_answers_is_asked_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[0].0.drain_proofs_to_lose = 1;
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the drop: {other:?}"),
+    }
+
+    assert_eq!(logged!(METHOD, "drain_proof_lost_for_test").len(), 1);
+    let retries = logged!(METHOD, "rejoin_revoke_retry");
+    assert_eq!(retries.len(), 1, "asked again once: {retries:?}");
+    assert_eq!(retries[0]["dropped"], "Some(3)");
+    let waited = retries[0]["waited_ms"].as_u64().expect("waited_ms");
+    assert!(
+        (DROP_AFTER_MILLIS..DROP_AFTER_MILLIS + 2 * DROP_CHECK_EVERY_MILLIS).contains(&waited),
+        "asked again after {waited} ms"
+    );
+    assert_eq!(logged!(METHOD, "membership_drop_planned").len(), 1);
+}

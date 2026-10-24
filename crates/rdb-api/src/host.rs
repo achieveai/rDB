@@ -34,8 +34,9 @@ use bytes::Bytes;
 use rdb_core::authority::partition::INSTANCE_LEN;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, Boundary, DenyReason,
-    FenceCredential, FenceScope, FencingProof, Lineage, PartitionMode, Revocation, Verdict,
+    AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, BlockReason, Boundary,
+    DenyReason, FenceCredential, FenceScope, FencingProof, Lineage, PartitionMode, Revocation,
+    Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -1046,14 +1047,26 @@ pub(crate) fn spawn_on(
 /// so the owner drains its own epoch and plans the next generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rejoin {
-    /// `RevokeEpochRequested` for `epoch` is with A1; the plan follows its `DrainProof`. With
-    /// `drop`, the plan leaves that member out (M10 S2 part (b)).
-    Revoking {
-        epoch: OwnerEpoch,
-        drop: Option<NodeId>,
-    },
+    /// `RevokeEpochRequested` for `epoch` is with A1; the plan follows its `DrainProof`.
+    Revoking { epoch: OwnerEpoch, replan: Replan },
     /// The plan and its fence went to F1 for this generation; the commit ends the re-plan.
-    Planned(Generation),
+    Planned {
+        generation: Generation,
+        replan: Replan,
+    },
+}
+
+/// What one re-plan is for, kept from its revocation to its commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Replan {
+    /// The member the plan leaves out (M10 S2 part (b)), if any.
+    drop: Option<NodeId>,
+    /// The restarted member the plan links again at its new boot, if any. When F1 blocks the
+    /// plan on its copy, the plan is replaced without it (rulings A-R306, A-R316), and it stays
+    /// out: nothing links a member that is not pinned until M3's add half lands.
+    rejoiner: Option<NodeId>,
+    /// When the revocation was asked.
+    since: Tick,
 }
 
 /// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
@@ -1485,6 +1498,10 @@ struct Host {
     rejoins: BTreeMap<PartitionId, Rejoin>,
     /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
     blamed: BTreeMap<PartitionId, Blame>,
+    /// How many of A1's next `DrainProof`s this host loses, as if A1 never answered. Crate
+    /// tests only (A-R316).
+    #[cfg(test)]
+    drain_proofs_to_lose: u32,
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
@@ -1593,6 +1610,8 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             blamed: BTreeMap::new(),
+            #[cfg(test)]
+            drain_proofs_to_lose: 0,
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
             instance: engine_instance,
@@ -3277,7 +3296,7 @@ impl Host {
             }
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 tracing::info!(node, ?fact, "authority_fact");
-                if *fact == AuthorityFact::DrainProof {
+                if *fact == AuthorityFact::DrainProof && !self.lose_drain_proof(site) {
                     self.drained(site)?;
                 }
             }
@@ -3592,15 +3611,28 @@ impl Host {
             stale = ?stale,
             "rejoin_revoke"
         );
-        self.revoke(partition, epoch, None);
+        let rejoiner = stale.first().map(|&(node, _, _)| NodeId(node));
+        self.revoke(partition, epoch, None, rejoiner);
         None
     }
 
     /// Ask A1 to revoke `partition`'s committed `epoch`, whose `DrainProof` [`Self::drained`]
-    /// plans the next generation from, without `drop` when one is named.
-    fn revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, drop: Option<NodeId>) {
+    /// plans the next generation from, without `drop` when one is named. `rejoiner` is the
+    /// restarted member the plan links again, if it is for one.
+    fn revoke(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        drop: Option<NodeId>,
+        rejoiner: Option<NodeId>,
+    ) {
+        let replan = Replan {
+            drop,
+            rejoiner,
+            since: self.clock.now(),
+        };
         self.rejoins
-            .insert(partition, Rejoin::Revoking { epoch, drop });
+            .insert(partition, Rejoin::Revoking { epoch, replan });
         let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
         self.push(
             Site {
@@ -3619,7 +3651,7 @@ impl Host {
     /// member the re-plan drops is left out (M10 S2 part (b)).
     fn drained(&mut self, site: Site) -> Result<(), Fault> {
         let partition = site.partition;
-        let Some(Rejoin::Revoking { epoch, drop }) = self.rejoins.get(&partition).copied() else {
+        let Some(Rejoin::Revoking { epoch, replan }) = self.rejoins.get(&partition).copied() else {
             tracing::warn!(
                 node = self.node.0,
                 partition = partition.0,
@@ -3651,7 +3683,7 @@ impl Host {
         let members: Vec<Member> = pinned
             .members
             .iter()
-            .filter(|member| Some(member.node) != drop)
+            .filter(|member| Some(member.node) != replan.drop)
             .map(|member| {
                 let boot = if member.node == self.node {
                     self.boot
@@ -3701,10 +3733,12 @@ impl Host {
             control_revision = revision.0,
             view_source,
             boots = ?boots,
-            dropped = ?drop.map(|node| node.0),
+            dropped = ?replan.drop.map(|node| node.0),
+            rejoiner = ?replan.rejoiner.map(|node| node.0),
             "rejoin_plan"
         );
-        self.rejoins.insert(partition, Rejoin::Planned(generation));
+        self.rejoins
+            .insert(partition, Rejoin::Planned { generation, replan });
         for event in [
             RecoveryEvent::Plan(Box::new(plan)),
             RecoveryEvent::FenceProven(Box::new(fence)),
@@ -3726,7 +3760,11 @@ impl Host {
     /// pinned at its older boot, so the partition is checked once more: a newer boot supersedes
     /// (arch-s2).
     fn rejoin_committed(&mut self, partition: PartitionId, generation: Generation) {
-        let Some(Rejoin::Planned(planned)) = self.rejoins.get(&partition).copied() else {
+        let Some(Rejoin::Planned {
+            generation: planned,
+            ..
+        }) = self.rejoins.get(&partition).copied()
+        else {
             return;
         };
         if generation < planned {
@@ -3756,6 +3794,7 @@ impl Host {
     fn drop_duty(&mut self, now: Tick) {
         let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
         for partition in partitions {
+            self.retry_blocked_rejoin(partition, now);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
                 self.blamed.remove(&partition);
                 continue;
@@ -3774,6 +3813,11 @@ impl Host {
     /// the regular copy with the lowest durable sequence below L1's resume barrier, else L1's
     /// `stalest_copy`. `None` while L1 admits, is not live here, or blocks for an operator,
     /// which no re-plan may clear (spec §8.1).
+    ///
+    /// A re-plan holds nothing up while it runs. F1 ends every run it is given, committed or
+    /// `Blocked`, and [`Self::rejoin_blocked`] and [`Self::retry_blocked_rejoin`] act on a block
+    /// (ruling A-R316). This clock cannot see a rejoiner catch up: its catch-up runs from a
+    /// source with no tracker, so this primary's view of it does not move (critic-degraded M-1).
     fn holding_up(&self, partition: PartitionId, now: Tick) -> Option<(CopyId, DurableSeq)> {
         if self.rejoins.contains_key(&partition) {
             return None;
@@ -3826,18 +3870,9 @@ impl Host {
         };
         let members = &committed.committed.pinned_config.members;
         let holder = holder_of(members, blame.copy);
-        let kept = members
-            .iter()
-            .filter(|member| member.role != ReplicaRole::Shadow && Some(member.node) != holder)
-            .count();
+        let (target, kept) = drop_target(members, holder, self.node);
         let generation = committed.new_generation;
         let epoch = committed.selected.root.owner_epoch;
-        let target = match holder {
-            None => Err("the copy is not in the pinned configuration"),
-            Some(node) if node == self.node => Err("the copy is this node's own"),
-            Some(_) if kept < 2 => Err("a plan keeps at least two copies"),
-            Some(node) => Ok(node),
-        };
         let dropped = match target {
             Ok(node) => node,
             Err(why) => {
@@ -3872,7 +3907,138 @@ impl Host {
             "membership_drop_planned"
         );
         self.blamed.remove(&partition);
-        self.revoke(partition, epoch, Some(dropped));
+        self.revoke(partition, epoch, Some(dropped), None);
+    }
+
+    /// A-R306: F1 ended `Blocked` on this owner's re-plan, so the commit that would end it is
+    /// not coming, and writes and reads stay refused under the revoked epoch until something
+    /// replaces it. When the block names a copy ([`named_by_block`]), the plan is replaced at
+    /// once without that copy's member, never down to one copy or without this node
+    /// ([`drop_target`], A-R290). Otherwise (ruling A-R316) nobody is left out, and
+    /// [`Self::retry_blocked_rejoin`] sends the same plan again after `peer_drop_after_millis`.
+    /// A member left out stays out until M3's add half links it again.
+    fn rejoin_blocked(&mut self, partition: PartitionId, reason: &BlockReason) {
+        let Some(Rejoin::Planned {
+            generation: planned,
+            replan,
+        }) = self.rejoins.get(&partition).copied()
+        else {
+            return;
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let candidate = block_leaves_out(reason, replan, members);
+        let epoch = committed.selected.root.owner_epoch;
+        let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
+        let verdict = candidate.map(|node| drop_target(members, Some(node), self.node).0);
+        let dropped = match verdict {
+            Some(Ok(node)) => node,
+            other => {
+                let why = match other {
+                    Some(Err(why)) => why,
+                    _ => "the block names no member to leave out",
+                };
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    planned = planned.0,
+                    reason = ?reason,
+                    candidate = ?candidate.map(|node| node.0),
+                    why,
+                    waited_ms,
+                    "rejoin_blocked"
+                );
+                return;
+            }
+        };
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            planned = planned.0,
+            rejoiner = ?replan.rejoiner.map(|node| node.0),
+            dropped = dropped.0,
+            waited_ms,
+            reason = ?reason,
+            "rejoin_abandoned"
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(dropped), None);
+    }
+
+    /// Whether this `DrainProof` is lost on purpose ([`Host::drain_proofs_to_lose`]).
+    #[cfg(test)]
+    fn lose_drain_proof(&mut self, site: Site) -> bool {
+        if self.drain_proofs_to_lose == 0 {
+            return false;
+        }
+        self.drain_proofs_to_lose -= 1;
+        tracing::warn!(
+            node = self.node.0,
+            partition = site.partition.0,
+            "drain_proof_lost_for_test"
+        );
+        true
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    fn lose_drain_proof(&mut self, _site: Site) -> bool {
+        false
+    }
+
+    /// A-R303: a re-plan F1 ended `Blocked` on that [`Self::rejoin_blocked`] could not replace
+    /// is sent again with the same members once it is `peer_drop_after_millis` old, so a block
+    /// that clears (a control-store outage, a copy that comes back) does not hold the partition
+    /// for ever.
+    ///
+    /// A revocation A1 has not answered with a `DrainProof` within `peer_drop_after_millis`
+    /// is asked again (ruling A-R316, critic-degraded A-2): A1 persists a repeated request
+    /// again, and answers it with the proof once the revocation is held.
+    fn retry_blocked_rejoin(&mut self, partition: PartitionId, now: Tick) {
+        let (planned, replan) = match self.rejoins.get(&partition).copied() {
+            None => return,
+            Some(Rejoin::Planned { generation, replan }) => (generation, replan),
+            Some(Rejoin::Revoking { epoch, replan }) => {
+                let waited_ms = HostClock::millis_until(replan.since, now);
+                if waited_ms >= self.peer_drop_after_millis {
+                    tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        epoch = epoch.0,
+                        dropped = ?replan.drop.map(|node| node.0),
+                        rejoiner = ?replan.rejoiner.map(|node| node.0),
+                        waited_ms,
+                        "rejoin_revoke_retry"
+                    );
+                    self.revoke(partition, epoch, replan.drop, replan.rejoiner);
+                }
+                return;
+            }
+        };
+        let blocked = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Blocked(_)));
+        let waited_ms = HostClock::millis_until(replan.since, now);
+        if !blocked || waited_ms < self.peer_drop_after_millis {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            planned = planned.0,
+            dropped = ?replan.drop.map(|node| node.0),
+            rejoiner = ?replan.rejoiner.map(|node| node.0),
+            waited_ms,
+            "rejoin_retry"
+        );
+        self.revoke(partition, epoch, replan.drop, replan.rejoiner);
     }
 
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
@@ -4799,13 +4965,12 @@ impl Host {
             // reason alone cannot say: a control-store outage on the activation CAS resolves
             // (A-R102), on a bound F1's recovery CAS too (A-R182), and a held fence may re-enter
             // at once. `Blocked` lasts until a fresh fence, `Quarantined` for good.
-            RecoveryEffect::BlockPromotion { .. } => {
-                let terminal = self.recoveries.get(&site.partition).is_some_and(|f1| {
-                    matches!(
-                        f1.phase(),
-                        RecoveryPhase::Blocked(_) | RecoveryPhase::Quarantined
-                    )
-                });
+            RecoveryEffect::BlockPromotion { reason } => {
+                let phase = self.recoveries.get(&site.partition).map(Recovery::phase);
+                let terminal = matches!(
+                    phase,
+                    Some(RecoveryPhase::Blocked(_) | RecoveryPhase::Quarantined)
+                );
                 tracing::info!(
                     node,
                     partition = site.partition.0,
@@ -4813,6 +4978,10 @@ impl Host {
                     terminal,
                     "recovery_fact"
                 );
+                // A re-plan F1 quarantined stays for the operator (spec §8.1).
+                if matches!(phase, Some(RecoveryPhase::Blocked(_))) {
+                    self.rejoin_blocked(site.partition, reason);
+                }
                 Ok(())
             }
             RecoveryEffect::RebuildStalled { copy } => {
@@ -6759,6 +6928,59 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
         .iter()
         .find(|member| member.copy == copy)
         .map(|member| member.node)
+}
+
+/// Whether a plan run by `owner` may leave `holder` out of `members`, with how many copies it
+/// would keep. Never the owner's own copy, and never fewer than two copies: spec §8.3 has no
+/// one-copy fallback (M10 S2 part (b), A-R290).
+fn drop_target(
+    members: &[Member],
+    holder: Option<NodeId>,
+    owner: NodeId,
+) -> (Result<NodeId, &'static str>, usize) {
+    let kept = members
+        .iter()
+        .filter(|member| member.role != ReplicaRole::Shadow && Some(member.node) != holder)
+        .count();
+    let target = match holder.filter(|node| members.iter().any(|member| member.node == *node)) {
+        None => Err("the copy is not in the pinned configuration"),
+        Some(node) if node == owner => Err("the copy is this node's own"),
+        Some(_) if kept < 2 => Err("a plan keeps at least two copies"),
+        Some(node) => Ok(node),
+    };
+    (target, kept)
+}
+
+/// The member of `members` (the commit's) that F1's block on `replan` names, which
+/// [`Host::rejoin_blocked`] leaves out (ruling A-R316). `None` for a plan that already leaves
+/// one out: it is retried as it is, since leaving out another from the commit's members would
+/// put the first one back.
+fn block_leaves_out(reason: &BlockReason, replan: Replan, members: &[Member]) -> Option<NodeId> {
+    if replan.drop.is_some() {
+        return None;
+    }
+    let rejoiner = replan.rejoiner.and_then(|rejoiner| {
+        members
+            .iter()
+            .find(|member| member.node == rejoiner)
+            .map(|member| member.copy)
+    });
+    named_by_block(reason, rejoiner).and_then(|copy| holder_of(members, copy))
+}
+
+/// The copy F1's block names: the rejoiner's copy when the barrier misses it, else the one
+/// copy the barrier misses. `None` for a barrier missing several copies, none of them the
+/// rejoiner's, and for every other reason (`CasContention`, `OvertakenByPeer`,
+/// `ControlUnknown`, ...): those name no copy, so the plan is retried with the same members.
+fn named_by_block(reason: &BlockReason, rejoiner: Option<CopyId>) -> Option<CopyId> {
+    let BlockReason::BarrierIncomplete { missing } = reason else {
+        return None;
+    };
+    match rejoiner.filter(|copy| missing.contains(copy)) {
+        Some(copy) => Some(copy),
+        None if missing.len() == 1 => Some(missing[0]),
+        None => None,
+    }
 }
 
 /// Whether `node` holds a copy the committed barrier names (the sim's `in_barrier`).
