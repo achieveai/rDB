@@ -643,16 +643,20 @@ impl RocksEngine {
         if must_exist && !path.is_dir() {
             return Err(OpenError::NoDatabase { path });
         }
+        let mut steps = OpenSteps::start(&path);
         let claim = claim(&path)?;
+        steps.done("claim");
         let existed = path.join("CURRENT").exists();
         if must_exist && !existed {
             return Err(OpenError::NoDatabase { path });
         }
         if existed {
             verify_column_families(&path)?;
+            steps.done("verify_column_families");
             // S1-P1: decide every refusal on a read-only open, which writes no file. A writable
             // open replays, flushes and rotates before the marker can be read.
             read_only(&path)?;
+            steps.done("read_only_open");
         }
         // A-R315: one block cache for the store, shared by every column family.
         let cache = Cache::new_lru_cache(storage.effective_block_cache_bytes());
@@ -665,11 +669,16 @@ impl RocksEngine {
             storage.effective_memtable_budget_bytes(),
             true,
         ));
+        steps.done("options");
         let db = DB::open_cf_descriptors(&options, &path, descriptors(storage, &cache))
             .map_err(|e| backend(&path, &e))?;
+        steps.done("db_open");
         let (created, format) = ensure_format(&db, &path, existed)?;
+        steps.done("ensure_format");
         let instance = read_instance(&db, &path)?;
+        steps.done("read_instance");
         let lineages = restore_lineages(&db, &path)?;
+        steps.done("restore_lineages");
         for (&(partition, generation), marks) in &lineages {
             tracing::info!(
                 target: LOG_TARGET,
@@ -684,6 +693,8 @@ impl RocksEngine {
             );
         }
         check_marks(&lineages)?;
+        steps.done("check_marks");
+        steps.finish();
         tracing::info!(
             target: LOG_TARGET,
             path = %path.display(),
@@ -2099,6 +2110,56 @@ fn descriptors(storage: StorageOptions, cache: &Cache) -> Vec<ColumnFamilyDescri
             opts
         })))
         .collect()
+}
+
+/// The time each step of an open takes (A-R377): a reopen was seen to hang 20-40 s with the
+/// step unknown (A-R375). Each step logs `storage_open_step{step, ms}` at Debug; the open ends
+/// with `storage_open_timing{total_ms, slowest, slowest_ms}` at Info.
+struct OpenSteps<'a> {
+    path: &'a Path,
+    began: std::time::Instant,
+    last: std::time::Instant,
+    slowest: (&'static str, f64),
+}
+
+impl<'a> OpenSteps<'a> {
+    fn start(path: &'a Path) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            path,
+            began: now,
+            last: now,
+            slowest: ("none", 0.0),
+        }
+    }
+
+    /// `step` has just finished: log how long it took since the last one did.
+    fn done(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
+        self.last = now;
+        if ms > self.slowest.1 {
+            self.slowest = (step, ms);
+        }
+        tracing::debug!(
+            target: LOG_TARGET,
+            path = %self.path.display(),
+            step,
+            ms,
+            "storage_open_step"
+        );
+    }
+
+    fn finish(self) {
+        tracing::info!(
+            target: LOG_TARGET,
+            path = %self.path.display(),
+            total_ms = self.began.elapsed().as_secs_f64() * 1000.0,
+            slowest = self.slowest.0,
+            slowest_ms = self.slowest.1,
+            "storage_open_timing"
+        );
+    }
 }
 
 /// Refuse a column-family set that is not exactly ours plus RocksDB's `default`.
