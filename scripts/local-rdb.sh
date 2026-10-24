@@ -17,7 +17,9 @@
 # everything it started back down.
 #
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
-# it at once, as a crash. Any other verb is refused with the list of verbs, exit 2.
+# it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
+# each node; when it does not, they print its last not-ready line and exit 1, leaving it running.
+# Any other verb is refused with the list of verbs, exit 2.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
 # named <sha>-<base port>-<HHMMSS>. The last `up` is recorded in <root>/current, and every other
@@ -240,8 +242,19 @@ await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an ex
     fi
     tail -n 5 "$RUN/out/node-$n.err" >&2 || true
     line="$(grep "^rdb_node not-ready" "$out" 2>/dev/null | tail -n1 || true)"
-    say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
+    if os_pid_is "$os" rdb_node; then
+        say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
+    else
+        say "node $n: exited before it was ready${line:+; last: $line} (see $RUN/out/node-$n.err)"
+    fi
     return 1
+}
+
+not_ready() { # n: `start`/`restart` end here when await_ready did not see ready (A-R287 item 4)
+    if node_alive "$1"; then
+        die "node $1 is not ready (why is above); it is left running: 'lr status' shows it, 'lr stop $1' stops it"
+    fi
+    die "node $1 is not ready (why is above) and is not running"
 }
 
 stop_node() { # n: stop file, then a hard kill after 15 s. Idempotent.
@@ -441,8 +454,8 @@ case "$COMMAND" in
             rm -rf "$RUN/db/nodes/$ARG"
             say "node $ARG wiped"
         fi
-        start_node "$ARG"; await_ready "$ARG" || true ;;
-    restart) pick_run; check_node_arg "$ARG"; stop_node "$ARG"; start_node "$ARG"; await_ready "$ARG" || true ;;
+        start_node "$ARG"; await_ready "$ARG" || not_ready "$ARG" ;;
+    restart) pick_run; check_node_arg "$ARG"; stop_node "$ARG"; start_node "$ARG"; await_ready "$ARG" || not_ready "$ARG" ;;
     suspend) pick_run; check_node_arg "$ARG"; fault_add "$ARG" "hold all"; fault_add "$ARG" "cut-control" ;;
     resume) pick_run; check_node_arg "$ARG"; fault_remove "$ARG" "hold all"; fault_remove "$ARG" "cut-control" ;;
     hold) pick_run; read -r a b <<<"$(pair "$ARG")"; fault_add "$a" "hold $b"; fault_add "$b" "hold $a" ;;
