@@ -1947,7 +1947,10 @@ fn m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote() 
 /// the re-add pins node 3 as a shadow, and with node 2 still unheard the commit is `ReadOnly`
 /// {1, 2, 3}. Node 3 catches up and node 1 starts its promote, which waits on node 2. While
 /// that re-plan runs, over three holds, no repair is planned; once node 2 links again, the
-/// promote commits `DegradedRf2` with node 3 regular.
+/// promote commits with node 3 regular. Its mode is `Active` when node 2 proves the cutoff in
+/// that barrier, else `DegradedRf2`. Both are legal: the `ReadOnly` commits took no write, so
+/// node 2 already holds the cutoff, and only timing decides whether its proof is in time
+/// (int gate k648 saw `Active`).
 /// It does not reach the role filter: the running promote masks `read_only_outside`. That
 /// filter's row is `a_read_only_repair_counts_regular_secondaries_only`.
 /// Integration (~6 s): b1's drop, the re-add, three holds, the promote.
@@ -2006,7 +2009,11 @@ fn m10_s2_b24_a_read_only_shadow_commit_is_promoted_not_repaired() {
     let (_, mode, members) = trio.until("node 1 committed once node 2 linked", |trio| {
         commit_of(trio).filter(|(generation, _, _)| *generation > shadowed)
     });
-    assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2, 3]));
+    assert!(
+        matches!(mode, PartitionMode::Active | PartitionMode::DegradedRf2),
+        "{mode:?}"
+    );
+    assert_eq!(members, vec![1, 2, 3]);
     assert_eq!(role_of_three(&trio), Some(ReplicaRole::RegularSecondary));
     let planned = logged!(METHOD, "membership_repair_planned");
     assert!(planned.is_empty(), "{planned:?}");
