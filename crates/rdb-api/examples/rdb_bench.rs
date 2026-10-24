@@ -701,6 +701,7 @@ fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
             boot: None,
             storage: rdb_api::db::StorageOptions {
                 write_buffer_bytes: args.write_buffer_bytes,
+                memtable_budget_bytes: None,
             },
         };
         let opened = Instant::now();
