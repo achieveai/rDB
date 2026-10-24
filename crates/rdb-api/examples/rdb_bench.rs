@@ -4,7 +4,7 @@
 //! ```text
 //! cargo run --release -p rdb-api --example rdb_bench -- --dir D --log-dir L
 //!     [--dataset K] [--rate R] [--writers N] [--minutes M] [--keys K] [--value-bytes B] [--keep]
-//!     [--no-history] [--write-buffer-bytes N]
+//!     [--no-history] [--write-buffer-bytes N] [--memtable-budget-bytes N]
 //! cargo run --release -p rdb-api --example rdb_bench -- --build-dataset K --log-dir L
 //!     [--dataset-root P]
 //! ```
@@ -57,7 +57,9 @@
 //! share (its length times the measured rung cost). The end prints `heap_ex_mb` and the ladder
 //! as slopes per minute over the full minutes. `--write-buffer-bytes N` sets each column
 //! family's memtable budget (`StorageOptions::write_buffer_bytes`), so `rss_mb` is read with
-//! RocksDB's memtables held to `N` rather than its 64 MiB default.
+//! RocksDB's memtables held to `N` rather than its 64 MiB default. `--memtable-budget-bytes N`
+//! sets the whole store's memtable budget (`StorageOptions::memtable_budget_bytes`, default
+//! 64 MiB per node); a small budget shows several flush cycles in a short run (A-R310).
 //!
 //! **Three processes** (lead, A-R280). `--nodes 1=A,2=B,3=C --control E,E,E --cert-dir C` drives
 //! an `lr` run's `rdb_node` processes instead: this process holds no copy (`local=[]`) and
@@ -170,6 +172,7 @@ struct Args {
     keep: bool,
     no_history: bool,
     write_buffer_bytes: Option<usize>,
+    memtable_budget_bytes: Option<usize>,
     dataset: Option<u64>,
     build: Option<u64>,
     root: PathBuf,
@@ -187,7 +190,8 @@ struct Args {
 
 fn usage() -> &'static str {
     "usage: rdb_bench --dir D --log-dir L [--dataset K] [--rate R] [--writers N] [--minutes M] \
-     [--keys K] [--value-bytes B] [--keep] [--no-history] [--write-buffer-bytes N]\n       \
+     [--keys K] [--value-bytes B] [--keep] [--no-history] [--write-buffer-bytes N] \
+     [--memtable-budget-bytes N]\n       \
      rdb_bench --build-dataset K --log-dir L [--dataset-root P]\n       \
      rdb_bench --dir D --log-dir L --nodes 1=A,2=B,3=C --control E,E,E --cert-dir C \
      [--app NAME] [--fill K] [--node-pids P,P,P] [--rate R] [--minutes M] [--keys K]\n  \
@@ -209,6 +213,7 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
         keep: false,
         no_history: false,
         write_buffer_bytes: None,
+        memtable_budget_bytes: None,
         dataset: None,
         build: None,
         root: PathBuf::from("C:/rdb_test_data/bench"),
@@ -247,6 +252,16 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
                 let n = positive(&value("--write-buffer-bytes")?, "--write-buffer-bytes")?;
                 args.write_buffer_bytes = Some(
                     usize::try_from(n).map_err(|_| format!("--write-buffer-bytes {n}: too big"))?,
+                );
+            }
+            "--memtable-budget-bytes" => {
+                let n = positive(
+                    &value("--memtable-budget-bytes")?,
+                    "--memtable-budget-bytes",
+                )?;
+                args.memtable_budget_bytes = Some(
+                    usize::try_from(n)
+                        .map_err(|_| format!("--memtable-budget-bytes {n}: too big"))?,
                 );
             }
             "--dataset" => args.dataset = Some(positive(&value("--dataset")?, "--dataset")?),
@@ -293,10 +308,14 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
         if args.control.is_empty() || args.cert_dir.is_none() {
             return Err("--nodes needs --control and --cert-dir (an lr run's)".into());
         }
-        if args.dataset.is_some() || args.build.is_some() || args.write_buffer_bytes.is_some() {
+        if args.dataset.is_some()
+            || args.build.is_some()
+            || args.write_buffer_bytes.is_some()
+            || args.memtable_budget_bytes.is_some()
+        {
             return Err(
                 "--nodes runs against processes that hold the data: use --fill K, not \
-                 --dataset, --build-dataset or --write-buffer-bytes"
+                 --dataset, --build-dataset, --write-buffer-bytes or --memtable-budget-bytes"
                     .into(),
             );
         }
@@ -701,7 +720,7 @@ fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
             boot: None,
             storage: rdb_api::db::StorageOptions {
                 write_buffer_bytes: args.write_buffer_bytes,
-                memtable_budget_bytes: None,
+                memtable_budget_bytes: args.memtable_budget_bytes,
             },
         };
         let opened = Instant::now();
