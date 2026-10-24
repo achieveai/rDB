@@ -4198,7 +4198,11 @@ const EVERY_DENY_REASON: [DenyReason; 16] = [
 /// [`EVERY_DENY_REASON`], whose length is part of its type.
 fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
     match reason {
-        DenyReason::GenerationChanged => ErrorKind::GenerationChanged,
+        // After apply the batch may have landed (lead ruling A-R298).
+        DenyReason::GenerationChanged => match boundary {
+            Boundary::PreApply => ErrorKind::GenerationChanged,
+            Boundary::PostApply => ErrorKind::UnknownOutcome,
+        },
         DenyReason::LocalStorageFenced => match boundary {
             Boundary::PreApply => ErrorKind::ProtectionPaused,
             Boundary::PostApply => ErrorKind::UnknownOutcome,
@@ -4221,8 +4225,9 @@ fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
 }
 
 /// M7A-71. The mapping is total over every `DenyReason` (16 landed; the plan's "15" predates
-/// `ClockModeUnbounded`) at both boundaries, and checkpoint-sensitive only for
-/// `LocalStorageFenced`: `PROTECTION_PAUSED` before apply, `UNKNOWN_OUTCOME` after. No arm
+/// `ClockModeUnbounded`) at both boundaries, and checkpoint-sensitive for `LocalStorageFenced`
+/// (`PROTECTION_PAUSED` before apply) and, since lead ruling A-R298, `GenerationChanged`
+/// (`GENERATION_CHANGED` before apply): both answer `UNKNOWN_OUTCOME` after. No arm
 /// produces `DIVERGENCE_REQUIRES_OPERATOR`; that code reaches a client only through L1's
 /// `AdmissionState.reason` (M7A-69 (c)). T1's `deny_error` and the contract's
 /// `client_error_kind` agree everywhere (lead ruling A-R72a).
@@ -4279,6 +4284,65 @@ fn no_deny_reason_after_apply_is_paused_or_proves_no_mutation() {
         assert_ne!(error.kind(), ErrorKind::ProtectionPaused, "{reason:?}");
         assert!(!error.proves_no_mutation(), "{reason:?}: {error:?}");
     }
+}
+
+/// Each `Failed` reply in `effects`: its request, its code, and whether it proves no mutation.
+fn proofs(effects: &[EffectKind]) -> Vec<(u64, ErrorKind, bool)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Reply(ReplyEffect::Failed { identity, error }) => {
+                Some((identity.request.0, error.kind(), error.proves_no_mutation()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// M10 S2 (lead rulings A-R296 item 2 and A-R298). A put queued behind an applied write, and
+/// stranded by a recovery to a newer generation on this node, was never admitted: its
+/// `GENERATION_CHANGED` proves it wrote nothing. Before, it answered with no proof, and the
+/// app's ack floor kept it as a pin (`rdb-api`'s drop row b4 met it).
+#[retcd_test]
+fn a_queued_put_stranded_by_a_new_generation_proves_no_mutation() {
+    let (mut h, _, _) = applied_unpublished();
+    let effects = h.step(recovered(Generation(8), 1, NODE_A, PartitionMode::Active));
+    assert_eq!(
+        proofs(&effects),
+        vec![(2, ErrorKind::GenerationChanged, true)],
+        "{effects:?}"
+    );
+    assert!(
+        effects.contains(&fail(2, gen_changed(GEN.0, 8))[0]),
+        "{effects:?}"
+    );
+}
+
+/// M10 S2 (lead ruling A-R298). A write that applied, and then met a generation change before
+/// publish, never answers a proof. A generation deny after apply maps to `UNKNOWN_OUTCOME`, as a
+/// local storage fence's does: the batch may have landed. And the recovery that strands the
+/// queue answers the applied write nothing at all; P1 and a status query settle it.
+#[retcd_test]
+fn a_write_applied_before_a_generation_change_never_proves_no_mutation() {
+    let error = deny_error(
+        DenyReason::GenerationChanged,
+        Boundary::PostApply,
+        &deny_at(),
+    );
+    assert_eq!(
+        error,
+        RdbError::UnknownOutcome {
+            partition: PARTITION,
+            identity: identity(1)
+        }
+    );
+    assert!(!error.proves_no_mutation(), "{error:?}");
+    let (mut h, _, _) = applied_unpublished();
+    let effects = h.step(recovered(Generation(8), 1, NODE_A, PartitionMode::Active));
+    assert!(
+        proofs(&effects).iter().all(|(request, ..)| *request != 1),
+        "the applied write is not answered here: {effects:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -326,15 +326,14 @@ fn m10_s2_b4_puts_in_flight_across_the_drop_land_or_are_refused_cleanly() {
                 false
             }
             Answer::Error { error, .. } => {
-                // `Reconcile` is a put queued behind the re-plan and stranded with
-                // `GENERATION_CHANGED` (spec §8.1): never replayed, settled like the rest.
+                // `Reconcile` only as `GENERATION_CHANGED`: a put queued behind the re-plan and
+                // stranded (spec §8.1), never replayed, settled like the rest (A-R296).
                 assert!(
                     matches!(
                         error.retry,
-                        RetryRule::QueryStatus
-                            | RetryRule::RetryAfterRecovery
-                            | RetryRule::Reconcile
-                    ),
+                        RetryRule::QueryStatus | RetryRule::RetryAfterRecovery
+                    ) || (error.retry == RetryRule::Reconcile
+                        && error.kind == ErrorKind::GenerationChanged),
                     "put {request}: {error:?}"
                 );
                 settled += 1;
