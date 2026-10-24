@@ -1207,8 +1207,8 @@ impl Authority {
     /// lineage's partition and a partition fence at the fenced partition, because the host
     /// delivers each to that partition's T1 and P1. A1 emits both for partitions other than the
     /// one it stepped (an install serving several, a revocation of another). Everything else
-    /// stays at the event's partition: a node fence has no one partition, and a fact or an
-    /// answer goes back where it was asked.
+    /// stays at the event's partition: a fact or an answer goes back where it was asked. A node
+    /// fence is not built here: `fence` emits one per partition, each sited there (A-R378).
     fn authority(event: &Event, kind: AuthorityEffect) -> Effect {
         let partition = match &kind {
             AuthorityEffect::Fence {
@@ -1303,10 +1303,26 @@ impl Authority {
         // One bump for the fence, shared by its views: each names a different partition, and a
         // consumer orders views per partition.
         let authority_seq = self.authority_seq.saturating_add(1);
-        let mut effects = vec![Self::authority(
-            event,
-            AuthorityEffect::Fence { scope, reason },
-        )];
+        // A node fence is emitted once per partition in the same set, each sited at its
+        // partition (A-R378): T1 and P1 freeze only the partition they step, so a single fence
+        // sited at the noticing event's partition left every other partition's queue open
+        // (A-R376). A partition fence names its own partition.
+        let fence = AuthorityEffect::Fence { scope, reason };
+        let mut effects: Vec<Effect> = match scope {
+            FenceScope::Node => partitions
+                .iter()
+                .map(|partition| {
+                    Self::about(
+                        Self::effect(
+                            event,
+                            EffectKind::Kernel(KernelEffect::Authority(fence.clone())),
+                        ),
+                        *partition,
+                    )
+                })
+                .collect(),
+            FenceScope::Partition(_) => vec![Self::authority(event, fence.clone())],
+        };
         effects.extend(partitions.into_iter().map(|partition| {
             let view = Self::past_view(held, ctx, partition, authority_seq, reason);
             Self::authority(event, AuthorityEffect::PublishAuthorityView(view))

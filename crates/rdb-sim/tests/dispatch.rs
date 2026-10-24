@@ -1992,6 +1992,68 @@ fn m7a_192_a_view_and_a_fence_for_p2_reach_p2_not_p1() {
     );
 }
 
+/// A-R378: a node fence noticed on one partition freezes every served partition's queue.
+///
+/// One node, two partitions: the spine, where node 1 serves partition 2 and recovers partition
+/// 1, so T1 holds a queue for partition 1. Late in the run node 1 learns it was suspended past
+/// the tolerance, and that event arrives on partition 2. A node fence is about the node, not the
+/// partition it was noticed on, so partition 1's queue freezes too.
+///
+/// Red when A1 emits a node fence only at the noticing event's partition (the cut in dev-w6.md,
+/// A-R378): partition 1's T1 sees only the already-past view and stays `Open`.
+#[retcd_test]
+fn m10_s2_a_node_fence_noticed_on_partition_2_freezes_partition_1s_queue() {
+    use rdb_core::contracts::authority::DenyReason;
+    use rdb_core::contracts::event::NodeLifecycle;
+    use rdb_core::transaction::{FreezeCause, QueueMode};
+    use rdb_sim::harness::run::StopReason;
+    support::preamble();
+
+    let mode_after = |fence: bool| {
+        let mut plan = spine_plan();
+        if fence {
+            plan.seed.push(spine_seed(
+                2_900,
+                NODE,
+                SERVED,
+                EventKind::Node(NodeLifecycle::Resumed {
+                    suspended_millis: Budgets::SPEC_DEFAULTS.resume_gap_tolerance_millis + 1,
+                }),
+            ));
+        }
+        let mut runner = Runner::new(&plan).expect("a runner");
+        let report = runner.run(plan.limits).expect("the spine runs");
+        assert!(
+            matches!(report.stop, StopReason::DeadlineReached { .. }),
+            "the run reaches its deadline: {:?}",
+            report.stop
+        );
+        runner
+            .dispatcher()
+            .transaction()
+            .kernel(NODE, PartitionId(1))
+            .map(|kernel| *kernel.mode())
+    };
+    let (before, after) = (mode_after(false), mode_after(true));
+    tracing::info!(?before, ?after, "a_r378 partition 1 queue");
+
+    assert_eq!(
+        before,
+        Some(QueueMode::Open),
+        "precondition: without the fence, T1 on node 1 admits for partition 1"
+    );
+    assert!(
+        matches!(
+            after,
+            Some(QueueMode::Frozen {
+                cause: FreezeCause::AuthorityLost(DenyReason::ProcessSuspended),
+                ..
+            })
+        ),
+        "A-R378: a node fence noticed on partition 2 freezes partition 1's queue: {after:?}"
+    );
+}
+
 /// Lead ruling A-R64(b): none of F1's seven requests to the environment is recorded as a
 /// `RecoveryFact`. Two are refused by name for want of a provider. `QueryInventory`,
 /// `SyncWalThrough` and, since 2026-10-02 (team i1), `ProbeDigestAt` answer. `CatchUp` and `CatchUpBeforeGrant` have a provider (B-R59), but no

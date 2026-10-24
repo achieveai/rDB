@@ -1494,6 +1494,9 @@ struct Host {
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    /// The tick of the node fence an acquire was last scheduled after (A-R378: A1 emits that
+    /// fence once per partition, and it needs one acquire).
+    acquire_after_fence_at: Option<Tick>,
     /// Per partition, the restart re-plan this owner is running (#42, A-R249).
     rejoins: BTreeMap<PartitionId, Rejoin>,
     /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
@@ -1608,6 +1611,7 @@ impl Host {
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
+            acquire_after_fence_at: None,
             rejoins: BTreeMap::new(),
             blamed: BTreeMap::new(),
             #[cfg(test)]
@@ -3312,40 +3316,13 @@ impl Host {
                     at = self.stepped_at.0,
                     "authority_fence"
                 );
+                // A1 emits a node fence once per partition (A-R378), and the one fence needs one
+                // acquire: scheduled for the first of them, keyed by the fence's tick.
                 if *scope == FenceScope::Node {
-                    self.schedule_acquire_after_fence(site);
-                    // A-R376: A1 ends admission on every partition (A-R53.1), but its one
-                    // `Fence` carries the partition of the event that noticed it, and T1 and P1
-                    // freeze only the partition they step. So every other partition this node
-                    // holds a view or a commit for gets the fence too; the noticing one gets it
-                    // below. A partition with no T1 instance ignores it (`NotPrimary`).
-                    let others: BTreeSet<PartitionId> = self
-                        .authority_views
-                        .keys()
-                        .chain(self.committed.keys())
-                        .copied()
-                        .filter(|partition| *partition != site.partition)
-                        .collect();
-                    for partition in others {
-                        tracing::info!(
-                            node,
-                            from = site.partition.0,
-                            partition = partition.0,
-                            reason = ?reason,
-                            "authority_fence_fanned"
-                        );
-                        self.push(
-                            Site {
-                                partition,
-                                correlation: site.correlation,
-                            },
-                            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Fence {
-                                scope: *scope,
-                                reason: *reason,
-                            })),
-                            true,
-                            None,
-                        );
+                    let at = self.authority.state().fenced_at();
+                    if at.is_some() && self.acquire_after_fence_at != at {
+                        self.acquire_after_fence_at = at;
+                        self.schedule_acquire_after_fence(site);
                     }
                 }
             }
