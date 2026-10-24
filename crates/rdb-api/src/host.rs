@@ -1918,6 +1918,7 @@ impl Host {
         // never waits behind it on a live node.
         if let Some(syncer) = self.syncer.take() {
             syncer.stop();
+            self.finish_sync_at_stop(rx);
         }
         // A-R186: a clean stop writes one final synced mark set, whatever the period, so a
         // reopen ages every write this process published from its publish tick, not from its
@@ -2665,6 +2666,46 @@ impl Host {
             at += count;
         }
         Ok(())
+    }
+
+    /// F4 (A-R317): at stop, once the syncer has returned, finish the sync it was running, so
+    /// the engine raises its durable marks and counts no sync in flight before the final marks.
+    /// What waited on it is dropped: the node is stopping, and a reopen recovers from disk.
+    /// The syncer sends [`Msg::Synced`] before it exits, so a missing one is a fault.
+    fn finish_sync_at_stop(&mut self, rx: &Receiver<Msg>) {
+        let Some(flight) = self.syncing.take() else {
+            return;
+        };
+        let done = rx.try_iter().find_map(|msg| match msg {
+            Msg::Synced(done) => Some(done),
+            _ => None,
+        });
+        let Some(SyncDone {
+            sync,
+            flushed,
+            millis: took,
+        }) = done
+        else {
+            tracing::error!(node = self.node.0, "sync_lost_at_stop");
+            self.set_fault(Fault::from(
+                "the WAL syncer stopped without returning its sync".to_owned(),
+            ));
+            return;
+        };
+        let ok = flushed.is_ok();
+        let result = self.engine.finish_sync(sync, flushed);
+        tracing::info!(
+            node = self.node.0,
+            millis = took,
+            ok,
+            dropped = flight.after.len() + self.sync_next.len(),
+            "sync_finished_at_stop"
+        );
+        if let Err(fault) = result {
+            self.set_fault(Fault::from(format!(
+                "the WAL sync in flight at stop failed: {fault:?}"
+            )));
+        }
     }
 
     /// F4 (A-R317): a sync in flight past [`Self::sync_stuck_millis`] is a stuck disk. The
@@ -3967,7 +4008,7 @@ impl Host {
                 );
             }
         }
-        self.schedule_acquire(result, site);
+        self.acquire_after_link(result, site);
         self.watch_rebuild(result, partition);
         // A membership commit restarts the drop clock (A-R282 N1).
         self.blamed.remove(&partition);
@@ -4572,20 +4613,7 @@ impl Host {
         }
         self.restore_marks(partition, result.new_generation)?;
         self.answer_deferred_syncs(partition, result.new_generation);
-        if let Some(waiting) = self
-            .link_pending
-            .get_mut(&(partition, result.new_generation))
-        {
-            tracing::info!(
-                node = self.node.0,
-                partition = partition.0,
-                generation = result.new_generation.0,
-                "acquire_waits_on_link_sync"
-            );
-            waiting.push((result.clone(), site));
-        } else {
-            self.schedule_acquire(&result, site);
-        }
+        self.acquire_after_link(&result, site);
         self.committed.insert(partition, result.clone());
         self.committed_correlation
             .insert(partition, site.correlation);
@@ -4860,6 +4888,24 @@ impl Host {
             generation,
             started: Instant::now(),
         })
+    }
+
+    /// A-R217 and A-R326: [`Self::schedule_acquire`] once `result`'s generation is linked
+    /// durably. While [`Self::sync_link`]'s sync is in flight the acquire waits in
+    /// [`Self::link_pending`], and the `Link` continuation schedules it.
+    fn acquire_after_link(&mut self, result: &RecoveryResult, site: Site) {
+        let key = (site.partition, result.new_generation);
+        let Some(waiting) = self.link_pending.get_mut(&key) else {
+            self.schedule_acquire(result, site);
+            return;
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = site.partition.0,
+            generation = result.new_generation.0,
+            "acquire_waits_on_link_sync"
+        );
+        waiting.push((Box::new(result.clone()), site));
     }
 
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
@@ -7940,6 +7986,8 @@ fn head(debug: &str) -> &str {
 mod catchup_tests;
 #[cfg(test)]
 mod drop_tests;
+#[cfg(test)]
+mod sync_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
