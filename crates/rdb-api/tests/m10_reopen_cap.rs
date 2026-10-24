@@ -29,7 +29,9 @@ fn m10_s1_6_a_full_cap_frees_at_the_reopen_once_its_writes_aged_since_their_publ
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     let open = || {
+        // This row pins how the cap fills: the ack floor would empty it (A-R252).
         let config = DbConfig {
+            ack_floor: false,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),

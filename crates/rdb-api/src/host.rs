@@ -1498,15 +1498,47 @@ impl Host {
         }
     }
 
-    fn run(mut self, rx: &Receiver<Msg>) {
-        // §4.1: replay every persisted revocation to A1 before anything else reaches it. M9
-        // persists none (Decision 4: `PersistEpochRevocation` is M10), so the replay is empty.
+    /// Queue `EpochRevocationRestored` for each revocation this node's store holds, in key order
+    /// (the sim's `restore_revocations`). A store that cannot list them faults the node: A1 would
+    /// otherwise start without fences a restart must keep.
+    fn restore_revocations(&mut self) {
+        let restored = match self.engine.epoch_revocations() {
+            Ok(restored) => restored,
+            Err(fault) => {
+                tracing::error!(node = self.node.0, ?fault, "revocation_replay_failed");
+                self.set_fault(Fault::from(format!(
+                    "read epoch revocations at start: {fault:?}"
+                )));
+                return;
+            }
+        };
         tracing::info!(
             node = self.node.0,
             kind = "revocation_replay",
-            count = 0,
+            count = restored.len(),
             "host_duty"
         );
+        for (partition, epoch) in restored {
+            let kind = EventKind::Kernel(KernelEvent::Authority(
+                AuthorityEvent::EpochRevocationRestored { partition, epoch },
+            ));
+            self.push(
+                Site {
+                    partition,
+                    correlation: REJOIN,
+                },
+                kind,
+                false,
+                None,
+            );
+        }
+    }
+
+    fn run(mut self, rx: &Receiver<Msg>) {
+        // §4.1 (L-R178e): replay every persisted revocation to A1 before anything else reaches
+        // it. The queue is empty here and the first `AcquireDue` waits for a recovery, so these
+        // are the first events A1 is offered. A fresh A1 serves nothing, so it fences nothing.
+        self.restore_revocations();
         'run: loop {
             #[cfg(test)]
             self.stall_loop();
@@ -3051,8 +3083,37 @@ impl Host {
                     format!("{from:?} released unbound snapshot {}", handle.0).into()
                 });
             }
-            StoreEffect::PersistEpochRevocation { .. } => {
-                return Err(unsupported(self.node, "persist_epoch_revocation"));
+            // #42 (A-R249): a synced write, then A1 hears it is durable, as the sim routes it.
+            // A failed write faults the node: no `DrainProof` may stand on a revocation that a
+            // restart would forget.
+            StoreEffect::PersistEpochRevocation { partition, epoch } => {
+                if let Err(fault) = self.engine.persist_epoch_revocation(*partition, *epoch) {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        epoch = epoch.0,
+                        ?fault,
+                        "persist_epoch_revocation_failed"
+                    );
+                    return Err(Fault::from(format!(
+                        "persist epoch {} revocation of partition {}: {fault:?}",
+                        epoch.0, partition.0
+                    )));
+                }
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    epoch = epoch.0,
+                    "epoch_revocation_persisted"
+                );
+                let kind = EventKind::Kernel(KernelEvent::Authority(
+                    AuthorityEvent::EpochRevocationPersisted {
+                        partition: *partition,
+                        epoch: *epoch,
+                    },
+                ));
+                self.push(site, kind, true, None);
+                return Ok(());
             }
         };
         self.push(site, EventKind::Storage(kind), false, None);

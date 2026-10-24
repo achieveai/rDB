@@ -117,6 +117,26 @@ impl ApiError {
         }
     }
 
+    /// A call to the owner that runs in another process, refused before it was sent: no link
+    /// to it is up, as when its process was killed (tester-s2 G walk). Not a host fault, so
+    /// never "retrying will not help": a retry helps once that node is back or another node is
+    /// promoted. Nothing was sent, so nothing was mutated.
+    #[must_use]
+    pub fn owner_unreachable(node: NodeId) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: true,
+            detail: format!(
+                "node {}, the owner, is not reachable from this process: no link to it is up \
+                 (its process may have stopped); nothing was sent; a retry can succeed once \
+                 node {} is back or another node is promoted",
+                node.0, node.0
+            ),
+            retry_after: None,
+        }
+    }
+
     /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
     #[must_use]
     pub fn host(detail: &str) -> Self {

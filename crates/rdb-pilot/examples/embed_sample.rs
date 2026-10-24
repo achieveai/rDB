@@ -36,6 +36,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let store: Arc<dyn config_core::ConfigStore> = Arc::new(client);
     let config = DbConfig {
+        ack_floor: true,
         dir: "C:/my-app/data".into(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),

@@ -240,6 +240,7 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let dir = need(args.dir.as_ref(), "--dir")?;
     let store = control(args)?;
     let config = DbConfig {
+        ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
@@ -327,6 +328,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     );
 
     let config = DbConfig {
+        ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),

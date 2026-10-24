@@ -560,6 +560,7 @@ fn run_host(steps: &[Step]) -> (Vec<Reply>, (Generation, Seq)) {
         .build()
         .expect("runtime");
     let config = DbConfig {
+        ack_floor: true,
         dir: dir.path().to_path_buf(),
         hold: Vec::new(),
         timeouts: Timeouts {

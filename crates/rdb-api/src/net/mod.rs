@@ -940,20 +940,30 @@ async fn dial_once(
     address: &str,
     tls: &config_grpc::MtlsConfig,
 ) -> Result<String, String> {
+    /// How long the probe on the failure path waits for a plain TCP connect.
+    const PROBE: Duration = Duration::from_secs(5);
+    /// The OS refused the connect: nothing listens at the address now.
+    fn connection_refused(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut source = Some(error);
+        while let Some(cause) = source {
+            if cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+            {
+                return true;
+            }
+            source = cause.source();
+        }
+        false
+    }
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .map_err(|error| format!("bad address {address}: {error}"))?
         .tls_config(tls.client_tls_config_for(&certs::node_domain(node)))
         .map_err(|error| format!("tls config: {error}"))?
         .connect_timeout(CONNECT);
-    let Ok(connected) = tokio::time::timeout(CONNECT, endpoint.connect()).await else {
-        return Err(format!(
-            "no TLS answer from {address} in {CONNECT:?}; is {address} node-{} of this run?",
-            node.0
-        ));
-    };
-    let channel = match connected {
-        Ok(channel) => channel,
-        Err(error) if tls_refused(&error) => {
+    let failed = match tokio::time::timeout(CONNECT, endpoint.connect()).await {
+        Ok(Ok(channel)) => Ok(channel),
+        Ok(Err(error)) if tls_refused(&error) => {
             let reason = format!(
                 "TLS handshake with {address} failed: {}; is {address} node-{} of this run, \
                  with certificates from the same CA?",
@@ -964,7 +974,56 @@ async fn dial_once(
             refuse(shared, node, &reason);
             return Err(format!("refused: {reason}"));
         }
-        Err(error) => return Err(format!("connect: {}", error_chain(&error))),
+        Ok(Err(error)) if connection_refused(&error) => Err(None),
+        Ok(Err(error)) => Err(Some(error_chain(&error))),
+        Err(_) => Err(Some(String::new())),
+    };
+    let channel = match failed {
+        Ok(channel) => channel,
+        Err(said) => {
+            // Windows answers a closed loopback port only after ~2-3 s of SYN retries, past
+            // `CONNECT`, so a timeout alone cannot tell a closed port from a silent listener.
+            // A plain TCP connect, on this failure path only, says which (tester-s2 F1b/F1c).
+            let probe = match said {
+                None => Err(std::io::ErrorKind::ConnectionRefused.into()),
+                Some(_) => {
+                    match tokio::time::timeout(PROBE, tokio::net::TcpStream::connect(address)).await
+                    {
+                        Ok(probe) => probe.map(drop),
+                        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+                    }
+                }
+            };
+            let said = said.unwrap_or_default();
+            return Err(match probe {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // A closed port is redialled until the caller's wait ends (A-R273: an app
+                    // started beside a cluster still coming up keeps waiting), so each refusal
+                    // is logged.
+                    tracing::debug!(peer = node.0, %address, "net_dial_connection_refused");
+                    format!(
+                        "nothing is listening at {address} (connection refused); is node-{} of \
+                         this run running there?",
+                        node.0
+                    )
+                }
+                // The dial repeats until the caller stops waiting, so the text names no one
+                // wait: "in 2s" read as the whole wait (tester-s2, F1b).
+                Ok(()) if said.is_empty() => format!(
+                    "no TLS answer from {address}: it accepts a connection but never answers the \
+                     TLS hello, dial after dial; is {address} node-{} of this run?",
+                    node.0
+                ),
+                Ok(()) => format!(
+                    "connect to {address} failed: {said}; is {address} node-{} of this run?",
+                    node.0
+                ),
+                Err(error) => format!(
+                    "no answer from {address}: {error}; is node-{} of this run running there?",
+                    node.0
+                ),
+            });
+        }
     };
     let mut client = RdbNetClient::new(channel)
         .max_decoding_message_size(MAX_FRAME)
@@ -1040,12 +1099,18 @@ fn refuse(shared: &Shared, node: NodeId, reason: &str) {
     }
 }
 
+/// `error` and its causes, joined by `: `. A cause whose text the line already ends with is
+/// left out: rustls' and hyper's wrappers print their cause inside their own text, so the chain
+/// read `X: X` and `tcp connect error: tcp connect error` (tester-s2 paper cut, W7).
 fn error_chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
+        let said = cause.to_string();
+        if !text.ends_with(&said) {
+            text.push_str(": ");
+            text.push_str(&said);
+        }
         source = cause.source();
     }
     text

@@ -605,6 +605,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             rt.block_on(restore_control(&*store, records, target))?;
         }
         let config = DbConfig {
+            ack_floor: true,
             dir: args.dir.join("db"),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
