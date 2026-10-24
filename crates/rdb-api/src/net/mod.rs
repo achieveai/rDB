@@ -136,7 +136,9 @@ enum Waiter {
 struct Conn {
     id: u64,
     peer: Label,
-    tx: UnboundedSender<Envelope>,
+    /// The outbound stream; `None` once [`close`] ended it, so the peer sees the link end and
+    /// dials again (A-R320).
+    tx: Mutex<Option<UnboundedSender<Envelope>>>,
     pending: Mutex<BTreeMap<u64, Waiter>>,
     next: AtomicU64,
     /// Frames a hold keeps back, oldest first.
@@ -164,7 +166,10 @@ impl Conn {
 
     fn write(&self, frame: &Frame) {
         let body = wire::encode(frame);
-        if self.tx.send(Envelope { body: body.into() }).is_err() {
+        let sent = lock(&self.tx)
+            .as_ref()
+            .is_some_and(|tx| tx.send(Envelope { body: body.into() }).is_ok());
+        if !sent {
             tracing::debug!(peer = %self.peer, conn = self.id, "net_write_after_close");
         }
     }
@@ -619,6 +624,9 @@ fn close(shared: &Shared, conn: &Arc<Conn>, reason: &str) {
         return;
     }
     let dropped = std::mem::take(&mut *lock(&conn.pending)).len();
+    // End the stream too, not only this side's record of it: a replaced link the peer still
+    // holds up is one it never dials again, and this side keeps no route to it (A-R320).
+    lock(&conn.tx).take();
     if let Label::Node(node) = &conn.peer {
         // Only free a route that still points here; a replaced link's route is already the
         // new one. Never called holding the routes lock: `install` closes after letting it go.
@@ -635,7 +643,7 @@ fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<
     let conn = Arc::new(Conn {
         id: shared.next_conn.fetch_add(1, Ordering::Relaxed) + 1,
         peer,
-        tx,
+        tx: Mutex::new(Some(tx)),
         pending: Mutex::new(BTreeMap::new()),
         next: AtomicU64::new(0),
         held: Mutex::new(VecDeque::new()),
