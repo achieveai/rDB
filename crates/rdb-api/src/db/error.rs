@@ -568,6 +568,26 @@ mod tests {
         }
     }
 
+    /// A-R360 (critic-q3r): a `LEASE_EXPIRED` step never says a later `STATUS_EXPIRED` means
+    /// nothing was written. The step shows on `Db::retried` errors too, whose `no_mutation` is
+    /// false: an earlier send may have applied, and spec §8.1 says `STATUS_EXPIRED` does not
+    /// prove a write never ran. Sending it as new could apply it twice.
+    /// Cut: put the "send it as a new request" clause back and this row goes red.
+    #[test]
+    fn a_lease_expired_step_never_says_to_send_it_as_new() {
+        for retry in every_retry() {
+            let error = ApiError {
+                retry,
+                ..ApiError::new(ErrorKind::LeaseExpired, "lease lapsed")
+            };
+            let text = error.explain();
+            assert!(
+                !text.contains("STATUS_EXPIRED") && !text.contains("as a new request"),
+                "{text}"
+            );
+        }
+    }
+
     /// A host fault (`NotWired`) says no retry helps, whatever its kind.
     #[test]
     fn a_host_fault_says_retrying_will_not_help() {

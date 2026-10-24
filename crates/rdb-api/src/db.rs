@@ -9397,7 +9397,8 @@ mod tests {
             .expect("open")
         };
         // A put lands, or fails at once if it is OVERLOADED. A host-load refusal such as a
-        // lapsed grant's LEASE_EXPIRED is retried; CONDITION_FAILED means an earlier try landed.
+        // lapsed grant's LEASE_EXPIRED wrote nothing and is retried; CONDITION_FAILED means an
+        // earlier try that was not refused (a timeout, say) landed.
         let land = |db: &Db, key: &[u8], what: &str| {
             let patience = crate::host::test_patience(Duration::from_secs(5));
             let deadline = std::time::Instant::now() + patience;
