@@ -175,6 +175,17 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 /// the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
+/// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
+/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282). The clock
+/// starts at the later of the last admit and the last membership commit, and starts again
+/// whenever the blamed copy changes or its durable sequence advances, so a copy still catching
+/// up is never dropped. Longer than a process restart (2-5 s), which rejoins by `PeerBooted`
+/// instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
+pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
+
+/// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
+const DROP_CHECK_EVERY_MILLIS: u64 = 200;
+
 /// How many times R1 may re-send one record to one copy, with that copy's acknowledged
 /// progress unmoved and below the primary's applied head, before the host warns
 /// `replication_copy_not_advancing` (D4 re-sent about 150 times in silence). R1's retransmit
@@ -991,14 +1002,47 @@ pub(crate) fn spawn_on(
 /// so the owner drains its own epoch and plans the next generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rejoin {
-    /// `RevokeEpochRequested` for this epoch is with A1; the plan follows its `DrainProof`.
-    Revoking(OwnerEpoch),
+    /// `RevokeEpochRequested` for `epoch` is with A1; the plan follows its `DrainProof`. With
+    /// `drop`, the plan leaves that member out (M10 S2 part (b)).
+    Revoking {
+        epoch: OwnerEpoch,
+        drop: Option<NodeId>,
+    },
     /// The plan and its fence went to F1 for this generation; the commit ends the re-plan.
     Planned(Generation),
 }
 
 /// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
 const REJOIN: CorrelationId = CorrelationId(3);
+
+/// The copy the owner holds responsible for L1 refusing writes, and since when (M10 S2 part (b)).
+#[derive(Debug, Clone, Copy)]
+struct Blame {
+    copy: CopyId,
+    /// When the clock started: the first check that found writes refused on account of `copy`,
+    /// or the last time its durable sequence advanced.
+    since: Tick,
+    durable: DurableSeq,
+    /// Whether `membership_drop_refused` was logged for this blame, so it is logged once.
+    refused_logged: bool,
+}
+
+impl Blame {
+    /// The blame after a check at `now` found writes refused on account of `copy` at `durable`:
+    /// `prev` kept while it names the same copy at the same durable sequence, a new clock
+    /// otherwise (A-R282 N1: a copy whose durable sequence advances is still catching up).
+    fn next(prev: Option<&Self>, copy: CopyId, durable: DurableSeq, now: Tick) -> Self {
+        match prev {
+            Some(prev) if prev.copy == copy && prev.durable == durable => *prev,
+            _ => Self {
+                copy,
+                since: now,
+                durable,
+                refused_logged: false,
+            },
+        }
+    }
+}
 
 /// A partition's activation marks on one node (ruling A-R184).
 #[derive(Debug, Default, Clone, Copy)]
@@ -1393,6 +1437,11 @@ struct Host {
     acquire_scheduled: BTreeSet<PartitionId>,
     /// Per partition, the restart re-plan this owner is running (#42, A-R249).
     rejoins: BTreeMap<PartitionId, Rejoin>,
+    /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
+    blamed: BTreeMap<PartitionId, Blame>,
+    next_drop_check: Tick,
+    /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
+    peer_drop_after_millis: u64,
     /// The instance this node's engine is bound to when it started, whose open counter holds
     /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
     /// is marked, and nothing waits on a mark.
@@ -1496,6 +1545,9 @@ impl Host {
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
+            blamed: BTreeMap::new(),
+            next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
+            peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
             instance: engine_instance,
             activation: BTreeMap::new(),
             after_commit,
@@ -1659,6 +1711,7 @@ impl Host {
         let due = [
             Some(self.next_flush),
             Some(self.next_trim),
+            Some(self.next_drop_check),
             self.timers.values().map(|(_, at, _)| *at).min(),
             self.l1.values().filter_map(|l1| l1.next_eval).min(),
             self.delayed.keys().next().map(|(at, _)| *at),
@@ -2034,6 +2087,10 @@ impl Host {
                 self.set_fault(fault);
                 return;
             }
+        }
+        if self.next_drop_check <= now {
+            self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
+            self.drop_duty(now);
         }
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -3399,6 +3456,8 @@ impl Host {
         }
         self.schedule_acquire(result, site);
         self.watch_rebuild(result, partition);
+        // A membership commit restarts the drop clock (A-R282 N1).
+        self.blamed.remove(&partition);
         self.rejoin_committed(partition, result.new_generation);
         Ok(())
     }
@@ -3487,7 +3546,15 @@ impl Host {
             stale = ?stale,
             "rejoin_revoke"
         );
-        self.rejoins.insert(partition, Rejoin::Revoking(epoch));
+        self.revoke(partition, epoch, None);
+        None
+    }
+
+    /// Ask A1 to revoke `partition`'s committed `epoch`, whose `DrainProof` [`Self::drained`]
+    /// plans the next generation from, without `drop` when one is named.
+    fn revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, drop: Option<NodeId>) {
+        self.rejoins
+            .insert(partition, Rejoin::Revoking { epoch, drop });
         let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
         self.push(
             Site {
@@ -3498,15 +3565,15 @@ impl Host {
             false,
             None,
         );
-        None
     }
 
     /// A1's `DrainProof`: the epoch the re-plan revoked is durable, so no write is admitted
     /// under it again. Plan the next generation with every member at the boot its link reports
-    /// now, fenced by the drain at the commit's revision (#42; the sim's `reinspect_now`).
+    /// now, fenced by the drain at the commit's revision (#42; the sim's `reinspect_now`). A
+    /// member the re-plan drops is left out (M10 S2 part (b)).
     fn drained(&mut self, site: Site) -> Result<(), Fault> {
         let partition = site.partition;
-        let Some(Rejoin::Revoking(epoch)) = self.rejoins.get(&partition).copied() else {
+        let Some(Rejoin::Revoking { epoch, drop }) = self.rejoins.get(&partition).copied() else {
             tracing::warn!(
                 node = self.node.0,
                 partition = partition.0,
@@ -3538,6 +3605,7 @@ impl Host {
         let members: Vec<Member> = pinned
             .members
             .iter()
+            .filter(|member| Some(member.node) != drop)
             .map(|member| {
                 let boot = if member.node == self.node {
                     self.boot
@@ -3587,6 +3655,7 @@ impl Host {
             control_revision = revision.0,
             view_source,
             boots = ?boots,
+            dropped = ?drop.map(|node| node.0),
             "rejoin_plan"
         );
         self.rejoins.insert(partition, Rejoin::Planned(generation));
@@ -3632,6 +3701,117 @@ impl Host {
                 "rejoin_current"
             );
         }
+    }
+
+    /// M10 S2 part (b): re-plan a partition without the copy L1 has refused its writes on
+    /// account of for `peer_drop_after_millis` (rulings A-R281 M1, A-R282 N1). The clock starts
+    /// again on an admit, a membership commit, a different blamed copy, or that copy's durable
+    /// sequence advancing, so a copy still catching up is never dropped.
+    fn drop_duty(&mut self, now: Tick) {
+        let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
+        for partition in partitions {
+            let Some((copy, durable)) = self.holding_up(partition, now) else {
+                self.blamed.remove(&partition);
+                continue;
+            };
+            let blame = Blame::next(self.blamed.get(&partition), copy, durable, now);
+            self.blamed.insert(partition, blame);
+            let blamed_ms = HostClock::millis_until(blame.since, now);
+            if blamed_ms >= self.peer_drop_after_millis {
+                self.drop_copy(partition, blame, blamed_ms);
+            }
+        }
+    }
+
+    /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
+    /// sequence, while this node is the partition's pinned primary and runs no re-plan for it.
+    /// `None` while L1 admits, is not live here, or blocks for an operator, which no re-plan
+    /// clears.
+    fn holding_up(&self, partition: PartitionId, now: Tick) -> Option<(CopyId, DurableSeq)> {
+        if self.rejoins.contains_key(&partition) {
+            return None;
+        }
+        let owner = self
+            .committed
+            .get(&partition)?
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if !owner {
+            return None;
+        }
+        let state = self.l1.get(&partition)?.protection.admission_state(now)?;
+        if state.allow || state.reason != Some(ErrorKind::ProtectionPaused) {
+            return None;
+        }
+        let copy = state.stalest_copy?;
+        let durable = self
+            .replication
+            .primary(self.node, partition)?
+            .tracker()
+            .peer(copy)
+            .map_or(ReplicaProgress::EMPTY, |peer| peer.progress)
+            .durable;
+        Some((copy, durable))
+    }
+
+    /// Start the re-plan that drops `blame`'s copy, unless the plan would keep fewer than two
+    /// copies: spec §8.3 has no one-copy fallback, so writes stay paused and that is logged once.
+    fn drop_copy(&mut self, partition: PartitionId, blame: Blame, blamed_ms: u64) {
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let holder = holder_of(members, blame.copy);
+        let kept = members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow && Some(member.node) != holder)
+            .count();
+        let generation = committed.new_generation;
+        let epoch = committed.selected.root.owner_epoch;
+        let target = match holder {
+            None => Err("the copy is not in the pinned configuration"),
+            Some(node) if node == self.node => Err("the copy is this node's own"),
+            Some(_) if kept < 2 => Err("a plan keeps at least two copies"),
+            Some(node) => Ok(node),
+        };
+        let dropped = match target {
+            Ok(node) => node,
+            Err(why) => {
+                if !blame.refused_logged {
+                    tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        generation = generation.0,
+                        copy = blame.copy.0,
+                        holder = ?holder.map(|node| node.0),
+                        kept,
+                        blamed_ms,
+                        why,
+                        "membership_drop_refused"
+                    );
+                    if let Some(blame) = self.blamed.get_mut(&partition) {
+                        blame.refused_logged = true;
+                    }
+                }
+                return;
+            }
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            epoch = epoch.0,
+            copy = blame.copy.0,
+            dropped = dropped.0,
+            blamed_ms,
+            durable = blame.durable.0,
+            "membership_drop_planned"
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(dropped));
     }
 
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
@@ -7104,6 +7284,8 @@ fn head(debug: &str) -> &str {
 
 #[cfg(test)]
 mod catchup_tests;
+#[cfg(test)]
+mod drop_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
