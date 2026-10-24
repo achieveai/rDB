@@ -192,6 +192,8 @@ pub struct DbConfig {
     ///   flushes.
     /// - `storage.write_buffer_bytes`: the budget of one column family, capped by the above.
     ///   `None` is RocksDB's own, 64 MiB.
+    /// - `storage.block_cache_bytes`: the block cache of each node's store, one cache that
+    ///   every column family reads through (A-R315). `None` is 64 MiB per node.
     pub storage: StorageOptions,
     /// Whether each write tells the owner which of this open's earlier writes the app already
     /// has its answer for (the client ack floor, M10 S2, rulings A-R252 and A-R267). `true` by
