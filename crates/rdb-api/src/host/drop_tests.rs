@@ -516,3 +516,86 @@ fn m10_s2_d2_a_pause_for_divergence_is_never_dropped_past() {
         Some((before, PartitionMode::Active, vec![1, 2, 3]))
     );
 }
+
+/// b10 (A-R306; tester-s2's drop half, step 2): node 3 misses puts, then restarts, so its
+/// link reports a newer boot and the owner re-plans to link it again. Node 3 answers F1's
+/// inventory, so F1 needs it, and is then held: its links stay up but nothing crosses them, so
+/// its catch-up and barrier proof never arrive. This does not lean on W6's `NotASource`
+/// refusal: the hold starts once F1 is synchronizing, whichever way the catch-up would go.
+/// The rejoin is abandoned without node 3: the next generation commits `DegradedRf2` with
+/// nodes 1 and 2 within the later of `peer_drop_after_millis` and F1's
+/// barrier wait (7 windows), plus a margin for the re-plan's own window and CAS, and writes
+/// land again. Every `rejoin_abandoned` names node 3, the copy that never advanced.
+/// Cut: `holding_up` answers `None` during a rejoin and `rejoin_blocked` returns at once (the
+/// abandon removed), red (no commit without node 3 within the patience).
+/// Integration (~5 s): bootstrap's window, puts until L1 pauses, F1's sync and barrier
+/// waits, the abandon's re-plan.
+#[config_log::retcd_test]
+fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
+    const METHOD: &str = "m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.short_window_after_commit();
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.links.heal_all();
+    // Its restart: the link reports a newer boot, and nodes 1 and 2 hear it.
+    let reboot = BootId(trio.nodes[2].0.boot.0 + 1);
+    let mailbox = trio.nodes[2].1.clone();
+    trio.links.register(NodeId(3), mailbox, reboot);
+    let rebooted = trio.clock.now();
+    for node in 0..2 {
+        trio.nodes[node]
+            .1
+            .send(Msg::PeerBooted {
+                node: NodeId(3),
+                boot: reboot,
+            })
+            .expect("node up");
+    }
+
+    // Node 3 answered the inventory and is behind, so F1 needs it. From here it hears nothing
+    // and says nothing, but its links stay up: no catch-up, no barrier proof, no `CopyLost`.
+    trio.until("node 1 synchronizes node 3", |trio| {
+        let phase = trio.nodes[0]
+            .0
+            .recoveries
+            .get(&PartitionId(1))
+            .map(Recovery::phase);
+        (phase == Some(RecoveryPhase::Synchronizing)).then_some(())
+    });
+    hold_three(&trio);
+
+    let after = dropped_three(&mut trio, before);
+    let waited = HostClock::millis_until(rebooted, trio.clock.now());
+    let window = test_discovery_window_millis();
+    let bound = DROP_AFTER_MILLIS.max(7 * window) + 4 * window + 1_000;
+    assert!(
+        waited <= bound,
+        "writes held {waited} ms by a rejoin that never completes; bound {bound} ms"
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the abandon: {other:?}"),
+    }
+
+    let plans = logged!(METHOD, "rejoin_plan");
+    assert_eq!(
+        plans[0]["dropped"], "None",
+        "the rejoin links node 3: {plans:?}"
+    );
+    assert_eq!(plans[0]["rejoiner"], "Some(3)", "{plans:?}");
+    assert_eq!(
+        plans.last().map(|plan| plan["dropped"].clone()),
+        Some("Some(3)".into()),
+        "the last plan leaves node 3 out: {plans:?}"
+    );
+    let abandoned = logged!(METHOD, "rejoin_abandoned");
+    assert!(!abandoned.is_empty(), "no rejoin_abandoned");
+    assert!(
+        abandoned.iter().all(|line| line["dropped"] == 3),
+        "only node 3 is blamed: {abandoned:?}"
+    );
+}
