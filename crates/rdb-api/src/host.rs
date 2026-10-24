@@ -1496,6 +1496,11 @@ struct Host {
     acquire_scheduled: BTreeSet<PartitionId>,
     /// Per partition, the restart re-plan this owner is running (#42, A-R249).
     rejoins: BTreeMap<PartitionId, Rejoin>,
+    /// The epoch of the `EpochRevocationPersisted` being offered, when that is the event in
+    /// hand. A1 emits `DrainProof` only for that event, and the proof is for that epoch alone:
+    /// a re-asked revocation persists twice, and a late second proof must not plan from a later
+    /// epoch (critic-degraded A-4, ruling A-R321).
+    revocation_persisted: Option<OwnerEpoch>,
     /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
     blamed: BTreeMap<PartitionId, Blame>,
     /// How many of A1's next `DrainProof`s this host loses, as if A1 never answered. Crate
@@ -1609,6 +1614,7 @@ impl Host {
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
+            revocation_persisted: None,
             blamed: BTreeMap::new(),
             #[cfg(test)]
             drain_proofs_to_lose: 0,
@@ -2908,6 +2914,12 @@ impl Host {
         } = queued;
         #[cfg(test)]
         let event = self.deny_reply_check(event);
+        self.revocation_persisted = match &event.kind {
+            EventKind::Kernel(KernelEvent::Authority(
+                AuthorityEvent::EpochRevocationPersisted { epoch, .. },
+            )) => Some(*epoch),
+            _ => None,
+        };
         if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
             self.plans.insert(event.partition, (**plan).clone());
         }
@@ -3297,7 +3309,7 @@ impl Host {
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 tracing::info!(node, ?fact, "authority_fact");
                 if *fact == AuthorityFact::DrainProof && !self.lose_drain_proof(site) {
-                    self.drained(site)?;
+                    self.drained(site, self.revocation_persisted)?;
                 }
             }
             KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
@@ -3648,9 +3660,16 @@ impl Host {
     /// A1's `DrainProof`: the epoch the re-plan revoked is durable, so no write is admitted
     /// under it again. Plan the next generation with every member at the boot its link reports
     /// now, fenced by the drain at the commit's revision (#42; the sim's `reinspect_now`). A
-    /// member the re-plan drops is left out (M10 S2 part (b)).
-    fn drained(&mut self, site: Site) -> Result<(), Fault> {
+    /// member the re-plan drops is left out (M10 S2 part (b)). `proved` is the epoch whose
+    /// persisted revocation A1 answered; a proof for any other epoch plans nothing (A-R321).
+    fn drained(&mut self, site: Site, proved: Option<OwnerEpoch>) -> Result<(), Fault> {
         let partition = site.partition;
+        let Some(proved) = proved else {
+            return Err(Fault::from(format!(
+                "drain proof for partition {} outside an EpochRevocationPersisted step",
+                partition.0
+            )));
+        };
         let Some(Rejoin::Revoking { epoch, replan }) = self.rejoins.get(&partition).copied() else {
             tracing::warn!(
                 node = self.node.0,
@@ -3660,6 +3679,16 @@ impl Host {
             );
             return Ok(());
         };
+        if proved != epoch {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                proved = proved.0,
+                revoking = epoch.0,
+                "drain_proof_stale"
+            );
+            return Ok(());
+        }
         let committed = self.committed.get(&partition).ok_or_else(|| {
             Fault::from(format!(
                 "drain proof for partition {} with no commit to plan from",

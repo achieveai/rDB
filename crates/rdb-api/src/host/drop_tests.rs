@@ -682,3 +682,182 @@ fn m10_s2_b11_a_revocation_a1_never_answers_is_asked_again() {
     );
     assert_eq!(logged!(METHOD, "membership_drop_planned").len(), 1);
 }
+
+/// Node 1's committed owner epoch.
+fn epoch_of(trio: &Trio) -> OwnerEpoch {
+    trio.nodes[0].0.committed[&PartitionId(1)]
+        .selected
+        .root
+        .owner_epoch
+}
+
+/// b12 (A-R321, critic-degraded A-4): a re-asked revocation persists twice, and the second
+/// persist can land after the plan it fed has committed, while the owner revokes the next
+/// epoch. A1 answers it with a `DrainProof` like any other. The row stands that late persist
+/// in by hand: after b1's drop, node 1 hears the first epoch's revocation persisted again just
+/// before it asks A1 to revoke the current one. The stale proof plans nothing; the plan waits
+/// for the current epoch's revocation and its own proof, and commits the next generation.
+/// Cut: `drained` ignores the epoch the proof is for, red (the plan precedes the revocation).
+/// Integration (~3 s): b1's drop, then one re-plan.
+#[config_log::retcd_test]
+fn m10_s2_b12_a_drain_proof_for_an_older_epoch_plans_nothing() {
+    const METHOD: &str = "m10_s2_b12_a_drain_proof_for_an_older_epoch_plans_nothing";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let stale = epoch_of(&trio);
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    trio.ready();
+    let current = epoch_of(&trio);
+    assert_ne!(stale, current, "the drop moved the epoch");
+
+    let host = &mut trio.nodes[0].0;
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: REJOIN,
+    };
+    let late = AuthorityEvent::EpochRevocationPersisted {
+        partition: PartitionId(1),
+        epoch: stale,
+    };
+    host.push(
+        site,
+        EventKind::Kernel(KernelEvent::Authority(late)),
+        true,
+        None,
+    );
+    host.revoke(PartitionId(1), current, None, None);
+    let replanned = trio.until("node 1 re-planned", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > after)
+    });
+    assert_eq!(
+        replanned,
+        (after.next(), PartitionMode::DegradedRf2, vec![1, 2])
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after.next()),
+        other => panic!("a put after the re-plan: {other:?}"),
+    }
+
+    let order: Vec<String> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .filter_map(|line| match line["@m"].as_str() {
+            Some("epoch_revocation_persisted") => Some(format!("revoked {}", line["epoch"])),
+            Some("authority_fact") if line["fact"] == "DrainProof" => Some("drained".to_owned()),
+            Some("drain_proof_stale") => Some("stale".to_owned()),
+            Some("rejoin_plan") => Some("planned".to_owned()),
+            _ => None,
+        })
+        .collect();
+    let (revoked_stale, revoked_current) = (
+        format!("revoked {}", stale.0),
+        format!("revoked {}", current.0),
+    );
+    assert_eq!(
+        order,
+        [
+            revoked_stale.as_str(),
+            "drained",
+            "planned",
+            "drained",
+            "stale",
+            revoked_current.as_str(),
+            "drained",
+            "planned"
+        ],
+        "node 1's two re-plans, in order"
+    );
+    let stale_lines = logged!(METHOD, "drain_proof_stale");
+    assert_eq!(stale_lines.len(), 1, "{stale_lines:?}");
+    assert_eq!(stale_lines[0]["proved"], stale.0);
+    assert_eq!(stale_lines[0]["revoking"], current.0);
+}
+
+/// [`Trio::until`] for a row that waits through an F1 block: steps by hand, so a block does
+/// not fail the row, and still fails on a fault or after [`Trio::PATIENCE`].
+fn until_through_blocks<T>(trio: &mut Trio, what: &str, done: impl Fn(&Trio) -> Option<T>) -> T {
+    let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+    loop {
+        for (host, _, rx) in &mut trio.nodes {
+            host.run_due();
+            host.drain();
+            while let Ok(msg) = rx.try_recv() {
+                host.handle(msg);
+            }
+            assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+        }
+        if let Some(found) = done(trio) {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "not within the patience: {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// b13 (A-R321, critic-degraded A-5): a block that names no member is retried with the same
+/// members. b1's drop is planned, and the control store goes down before F1 can commit it, so
+/// F1 ends `Blocked(ControlUnavailable)`, which names nobody. The store comes back; once the
+/// plan is `peer_drop_after_millis` old the owner sends it again, and it commits without node 3.
+/// Cut: `retry_blocked_rejoin` leaves a blocked `Planned` alone, red (F1 stays blocked).
+/// Integration (~4 s): b1's drop, one more drop clock for the retry.
+#[config_log::retcd_test]
+fn m10_s2_b13_a_plan_blocked_by_a_control_outage_is_sent_again() {
+    const METHOD: &str = "m10_s2_b13_a_plan_blocked_by_a_control_outage_is_sent_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.until("node 1 planned the drop", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Planned { .. })
+        )
+        .then_some(())
+    });
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    let phase = until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        trio.status(0)
+            .recovery
+            .filter(|phase| phase.starts_with("Blocked("))
+    });
+    assert_eq!(phase, "Blocked(ControlUnavailable)");
+    trio.mem.stop_failing();
+
+    let after = until_through_blocks(&mut trio, "node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(
+        after,
+        (before.next(), PartitionMode::DegradedRf2, vec![1, 2])
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after.0),
+        other => panic!("a put after the drop: {other:?}"),
+    }
+
+    let blocked = logged!(METHOD, "rejoin_blocked");
+    assert!(!blocked.is_empty(), "no rejoin_blocked");
+    assert!(
+        blocked
+            .iter()
+            .all(|line| line["why"] == "the block names no member to leave out"),
+        "{blocked:?}"
+    );
+    let retries = logged!(METHOD, "rejoin_retry");
+    assert!(!retries.is_empty(), "never sent again");
+    assert!(
+        retries.iter().all(|line| line["dropped"] == "Some(3)"
+            && line["waited_ms"].as_u64() >= Some(DROP_AFTER_MILLIS)),
+        "{retries:?}"
+    );
+    assert!(logged!(METHOD, "rejoin_abandoned").is_empty());
+}
