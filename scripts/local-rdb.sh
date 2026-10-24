@@ -47,10 +47,12 @@
 # discovery run finds N before a fault run names it.
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
-# config-server. Built if missing; `LR_BUILD=1` rebuilds them. `up --release` uses and builds
-# them under .../release instead, cargo's own folder, so a debug and a release binary are never
-# mixed up. The run records its binaries in run.env, so `start`, `restart` and every other verb
-# use the profile the run was started with; `--release` is refused on any verb but `up`.
+# config-server. Every `up` builds them first (cargo skips what is fresh); `LR_BUILD=0` skips the
+# build and uses them as they are. `promote` builds rdb_dev only when it is missing, or with
+# `LR_BUILD=1`. `up --release` uses and builds them under .../release instead, cargo's own
+# folder, so a debug and a release binary are never mixed up. The run records its binaries in
+# run.env, so `start`, `restart` and every other verb use the profile the run was started
+# with; `--release` is refused on any verb but `up`.
 
 set -euo pipefail
 
@@ -109,17 +111,21 @@ exe() { if [ -f "$1.exe" ]; then printf '%s' "$1.exe"; else printf '%s' "$1"; fi
 NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
 PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
 
-build() {
-    if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$NODE_BIN" ] || [ ! -f "$PILOT_BIN" ]; then
-        local release=""
-        [ "$PROFILE" = release ] && release=--release
-        say "building rdb_node, pilot_kv and config-server into $TARGET/$PROFILE"
-        # shellcheck disable=SC2086
-        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_node \
-            && cargo build $release -p rdb-pilot && cargo build $release -p config-server) >&2
-        NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
-        PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
+build() { # every `up`: a run on a stale binary looks valid and is not; cargo skips what is fresh
+    if [ "${LR_BUILD:-1}" = 0 ]; then
+        [ -f "$NODE_BIN" ] && [ -f "$PILOT_BIN" ] \
+            || die "LR_BUILD=0, but rdb_node or pilot_kv is missing from $TARGET/$PROFILE; drop LR_BUILD=0"
+        say "LR_BUILD=0: not building; using the binaries in $TARGET/$PROFILE as they are"
+        return
     fi
+    local release=""
+    [ "$PROFILE" = release ] && release=--release
+    say "building rdb_node, pilot_kv and config-server into $TARGET/$PROFILE"
+    # shellcheck disable=SC2086
+    (cd "$REPO" && cargo build $release -p rdb-api --example rdb_node \
+        && cargo build $release -p rdb-pilot && cargo build $release -p config-server) >&2
+    NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
+    PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
     [ -f "$NODE_BIN" ] || die "rdb_node not found at $NODE_BIN after building"
 }
 

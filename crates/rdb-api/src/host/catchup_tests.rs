@@ -743,7 +743,7 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
     for (node, copy, barrier) in [(0, 2, head), (0, 2, head), (0, 3, head), (1, 3, head)] {
         let host = &mut trio.nodes[node].0;
         assert_eq!(
-            host.kernel(ModuleName::Replication, &ask(copy, barrier), site),
+            host.kernel(ModuleName::Replication, &ask(copy, barrier), site, &[]),
             Ok(()),
             "node {} asked for copy {copy} at {barrier}",
             host.node.0
@@ -851,7 +851,7 @@ fn h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold() {
         };
         let host = &mut trio.nodes[0].0;
         assert_eq!(
-            host.kernel(ModuleName::Replication, &ahead, site),
+            host.kernel(ModuleName::Replication, &ahead, site, &[]),
             Ok(()),
             "partition {}",
             partition.0
@@ -1010,4 +1010,222 @@ fn a_copy_linked_below_the_anchor_base_reports_only_when_it_holds_the_base() {
         Err("no_record"),
         "linked at 2 and holding only 2"
     );
+}
+
+/// A put of key `r<request>`, as the rejoin rows below make them.
+fn rejoin_put(request: u64) -> ClientCall {
+    use rdb_core::contracts::ids::{ClientId, TenantId};
+    use rdb_value::delta::Op;
+    ClientCall::Put {
+        identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(request),
+        },
+        object: Bytes::from(format!("r{request}")),
+        change: Change::Doc(Delta(vec![Op::Replace(Value::Bytes(b"v".to_vec()))])),
+        expect: None,
+        remaining_millis: 5_000,
+    }
+}
+
+/// Node 3's process dies: nothing crosses its links until [`restart_three`]. Then puts from
+/// `request` on land until L1 pauses on node 3, so node 3 misses them. Returns the next
+/// request id and how many landed.
+fn three_dies_and_misses_puts(trio: &mut Trio, mut request: u64) -> (u64, u64) {
+    for other in [1, 2] {
+        trio.links.drop_direction(NodeId(3), NodeId(other));
+        trio.links.drop_direction(NodeId(other), NodeId(3));
+    }
+    let mut landed = 0;
+    loop {
+        assert!(landed < 2_000, "{landed} puts landed and L1 never paused");
+        let answer = trio.ask(rejoin_put(request));
+        request += 1;
+        match answer {
+            Answer::Txn { .. } => landed += 1,
+            Answer::Error { error, .. } if error.name() == "PROTECTION_PAUSED" => {
+                return (request, landed)
+            }
+            other => panic!("put {}: {other:?}", request - 1),
+        }
+    }
+}
+
+/// Node 3's process starts again, as `Db::restart_node` restarts one: a new host on its own
+/// engine at the next boot, and nodes 1 and 2 told the new boot (`PeerBooted`). Its links heal.
+fn restart_three(trio: &mut Trio, dir: &std::path::Path, tune: impl Fn(&mut Host)) -> BootId {
+    let (old, _, _) = trio.nodes.remove(2);
+    let boot = BootId(old.boot.0 + 1);
+    let control = Arc::clone(&old.control);
+    drop(old);
+    control.forget_node(NodeId(3), BootId(boot.0 - 1));
+    let engine = RocksEngine::open(dir.join("3")).expect("reopen node 3's engine");
+    let (tx, rx) = mpsc::channel();
+    trio.links.heal_all();
+    trio.links.register(NodeId(3), tx.clone(), boot);
+    let mut host = Host::new(
+        NodeId(3),
+        engine,
+        Arc::clone(&trio.links),
+        control,
+        trio.clock,
+    );
+    host.boot = boot;
+    tune(&mut host);
+    trio.nodes.push((host, tx, rx));
+    for node in 0..2 {
+        trio.nodes[node]
+            .1
+            .send(Msg::PeerBooted {
+                node: NodeId(3),
+                boot,
+            })
+            .expect("node up");
+    }
+    boot
+}
+
+/// A-R278 (W6b): a secondary restarted behind a live owner catches up from the owner's own
+/// copy and rejoins, twice. Node 3 dies, misses puts until L1 pauses on it, and restarts. The
+/// owner re-plans (#42) and F1 routes node 3's catch-up to the owner's copy, which the owner
+/// holds as a live primary. The owner restores a dormant receiver beside its primary to source
+/// it (`dormant_restored` on node 1), node 3 catches up, the re-plan commits with all three
+/// (`rejoin_committed`), writes land in the new generation, and node 3 holds it durably through
+/// the owner's head. The dormant receiver is gone at the commit, so the second restart of the
+/// same copy restores a fresh one and rejoins the same way. Nothing is refused (`NotASource`)
+/// and no rejoin is abandoned.
+/// Cut: `restore_dormant` returns early on a node holding a primary, red (F1 blocked:
+/// `BarrierIncomplete`, after `catch_up_refused` `NotASource`).
+/// Integration (~6 s): bootstrap's discovery window, then two rounds of puts until L1 pauses,
+/// a restart and the re-plan's window.
+#[config_log::retcd_test]
+fn a_secondary_restarted_behind_a_live_owner_catches_up_from_the_owner_and_rejoins_twice() {
+    const METHOD: &str =
+        "a_secondary_restarted_behind_a_live_owner_catches_up_from_the_owner_and_rejoins_twice";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast_pause);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    let mut generation = trio.status(0).recovered.expect("bootstrap committed");
+    let mut request = 1;
+    for round in 1..=2u64 {
+        let (next, landed) = three_dies_and_misses_puts(&mut trio, request);
+        assert!(landed >= 1, "round {round}: node 3 missed no put");
+        let boot = restart_three(&mut trio, dir.path(), Trio::fast_pause);
+        let rejoined = trio.until("node 1 commits the rejoin with all three", |trio| {
+            let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+            let nodes: Vec<(u32, BootId)> = committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .map(|member| (member.node.0, member.boot))
+                .collect();
+            (committed.new_generation > generation && nodes.contains(&(3, boot)))
+                .then_some(committed.new_generation)
+        });
+        assert_eq!(rejoined, generation.next(), "round {round}: one re-plan");
+        assert!(
+            trio.nodes[0]
+                .0
+                .replication
+                .receiver(NodeId(1), PartitionId(1))
+                .is_none(),
+            "round {round}: node 1's dormant receiver outlived the commit"
+        );
+        trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+        match trio.ask(rejoin_put(next)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, rejoined),
+            other => panic!("round {round}: a put after the rejoin: {other:?}"),
+        }
+        request = next + 1;
+        let head = trio.head().expect("node 1 holds the partition");
+        trio.until(
+            "node 3 holds the new generation through node 1's head",
+            |trio| {
+                trio.status(2)
+                    .holds
+                    .filter(|held| held.generation == rejoined && held.durable >= head)
+                    .map(|_| ())
+            },
+        );
+        generation = rejoined;
+    }
+
+    let refused = logged!(METHOD, "catch_up_refused");
+    assert!(refused.is_empty(), "a catch-up was refused: {refused:?}");
+    assert_eq!(
+        logged!(METHOD, "rejoin_abandoned").len(),
+        0,
+        "a rejoin was abandoned"
+    );
+    assert_eq!(logged!(METHOD, "rejoin_committed").len(), 2);
+    let sourced: Vec<_> = logged!(METHOD, "dormant_restored")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .collect();
+    assert_eq!(
+        sourced.len(),
+        2,
+        "node 1 restores one per rejoin: {sourced:?}"
+    );
+}
+
+/// A-R323 A-6 (W6b): beside a serving primary the dormant receiver only sources. Node 1 owns
+/// the partition after bootstrap. A target restore there, `with_history` false as
+/// `route_catch_up` makes when F1 names node 1 the target, installs nothing and is logged
+/// `dormant_restore_refused{serving_primary}`, so no recovery append can reach node 1's store
+/// beside its primary. A source restore with the same seed, `with_history` true, still installs
+/// the dormant receiver with its ladder, so the refusal is the target's. Cut: the target skip
+/// removed; node 1 holds a receiver after the target restore, red.
+/// Integration (~6 s): bootstrap's discovery window.
+#[config_log::retcd_test]
+fn a_target_restore_beside_a_serving_primary_installs_nothing() {
+    const METHOD: &str = "a_target_restore_beside_a_serving_primary_installs_nothing";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    let committed = trio.until("node 1 committed", |trio| {
+        trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+    });
+    let seed = DormantSeed {
+        config: committed.committed.pinned_config.clone(),
+        lineage: Lineage {
+            partition: PartitionId(1),
+            generation: committed.new_generation,
+            owner_epoch: OwnerEpoch(1),
+        },
+        revision: Revision(1),
+    };
+    let one = &mut trio.nodes[0].0;
+    let serving = one
+        .replication
+        .primary(NodeId(1), PartitionId(1))
+        .is_some_and(|primary| !primary.tracker().retired());
+    assert!(serving, "node 1 serves the partition");
+
+    one.restore_dormant(PartitionId(1), &seed, false);
+    assert!(
+        one.replication
+            .receiver(NodeId(1), PartitionId(1))
+            .is_none(),
+        "a target restore installed a receiver beside the primary"
+    );
+    let refused = logged!(METHOD, "dormant_restore_refused");
+    assert!(
+        refused
+            .iter()
+            .any(|line| line["node"] == 1 && line["reason"] == "serving_primary"),
+        "{refused:?}"
+    );
+
+    one.restore_dormant(PartitionId(1), &seed, true);
+    assert!(
+        one.replication
+            .receiver(NodeId(1), PartitionId(1))
+            .is_some_and(AppendReceiver::is_dormant),
+        "a source restore installs the dormant receiver"
+    );
+    assert_eq!(logged!(METHOD, "dormant_ladder_built").len(), 1);
 }

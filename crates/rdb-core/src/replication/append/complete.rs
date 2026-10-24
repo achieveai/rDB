@@ -61,6 +61,14 @@ impl AppendReceiver {
         }
         let primary = self.config.primary()?.node;
         self.durable = proved;
+        if self.dormant && primary == self.own.node {
+            // The dormant receiver beside its own node's primary only sources a catch-up
+            // (A-R314). An ACK to itself is no evidence of replication, and the primary would
+            // refuse it as a forgery on every flush (A-R323 A-8).
+            return Some(vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::RecoveryOnly,
+            ))]);
+        }
         Some(vec![self.ack_or_withhold(primary, UNSOLICITED)])
     }
 

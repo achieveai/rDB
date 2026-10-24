@@ -1198,13 +1198,16 @@ fn node_process(
     NodeProcess { net, db, boot }
 }
 
-/// #42 caller (rulings A-R251, A-R270): three node processes, each with its own links under
-/// mutual TLS. Node 3's process restarts at a new boot. Node 1's links see a known peer back at
-/// another boot, log `peer_rebooted` and post `PeerBooted` to node 1, whose host logs
-/// `peer_booted` for node 3 and, as the record owner whose plan pinned node 3's old boot,
-/// starts the re-plan (`rejoin_revoke`). Cut: no post, and node 1 never hears of it.
-/// Integration (~3 s): a formation, three node opens until ready, one process restart, real
-/// TLS on loopback.
+/// #42 caller (rulings A-R251, A-R270), on tester-s2's sequence at 3b676c2: three node
+/// processes, each with its own links under mutual TLS. Node 3's process stops; writes go on
+/// through node 1 until the owner pauses them for the unheard copy. Node 3's process starts
+/// again at a new boot. Node 1's links see a known peer back at another boot, log
+/// `peer_rebooted` and post `PeerBooted` to node 1, whose host logs `peer_booted` and, as the
+/// record owner whose plan pinned node 3's old boot, re-plans (`rejoin_revoke` ..
+/// `rejoin_committed`). Writes then resume, and every write reads back. Cut: no post, so node 1
+/// never hears of it and stays paused.
+/// Integration (~15 s): a formation, three node opens until ready, the owner's pause, one
+/// process restart and the re-plan, real TLS on loopback.
 #[config_log::retcd_test]
 fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     const METHOD: &str = "a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted";
@@ -1253,6 +1256,9 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         .expect("node 1's process heals and is ready");
     let old = three.boot;
     assert_eq!(one.net.boot_of(NodeId(3)), Some(old), "node 1 links node 3");
+    one.db
+        .put(b"before", b"1", None)
+        .expect("a put with every copy up");
 
     // Node 3's process stops and starts again at a new boot. Nothing dials node 3 (the higher
     // id dials), so it may listen on a fresh port: its old one can still be held for a moment.
@@ -1264,6 +1270,22 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     three_db.shutdown();
     drop(three_db);
     drop(three_net);
+    // Writes go on with node 3 away until the owner pauses them for the unheard copy (B-R38).
+    let mut landed = 0u32;
+    let paused_by = std::time::Instant::now() + patience;
+    loop {
+        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+            Ok(_) => landed += 1,
+            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
+            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
+        }
+        assert!(
+            std::time::Instant::now() < paused_by,
+            "writes never paused with node 3 away: {landed} landed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(landed >= 1, "no put landed with node 3 away");
     let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
     let mut again = start(3, relisten);
     assert!(
@@ -1278,6 +1300,7 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         (m == "peer_rebooted" && line["node"] == 3 && line["told"] == "[1]")
             || (m == "peer_booted" && line["node"] == 1 && line["peer"] == 3)
             || (m == "rejoin_revoke" && line["node"] == 1)
+            || (m == "rejoin_committed" && line["node"] == 1)
     };
     let seen = loop {
         config_log::layer::flush_test_logs();
@@ -1287,7 +1310,15 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
                 .filter(|line| wanted(line))
                 .collect();
         let has = |m: &str| lines.iter().any(|line| line["@m"] == m);
-        if has("peer_rebooted") && has("peer_booted") && has("rejoin_revoke") {
+        if [
+            "peer_rebooted",
+            "peer_booted",
+            "rejoin_revoke",
+            "rejoin_committed",
+        ]
+        .iter()
+        .all(|m| has(m))
+        {
             break lines;
         }
         assert!(
@@ -1302,6 +1333,37 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         .expect("peer_rebooted");
     assert_eq!(rebooted["old"], old.0, "{rebooted}");
     assert_eq!(rebooted["boot"], again.boot.0, "{rebooted}");
+
+    // Node 3 rejoined: writes resume on every copy, and nothing written before is lost.
+    let resumed_by = std::time::Instant::now() + patience;
+    loop {
+        match one.db.put(b"after", b"2", None) {
+            Ok(_) => break,
+            Err(e)
+                if e.error.name() == "PROTECTION_PAUSED"
+                    && std::time::Instant::now() < resumed_by =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("writes did not resume after node 3 rejoined: {e}"),
+        }
+    }
+    // A rejoin, not a give-up (A-R278): no catch-up was refused and no re-plan abandoned.
+    config_log::layer::flush_test_logs();
+    let gave_up: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "rejoin_abandoned" || line["@m"] == "catch_up_refused")
+            .collect();
+    assert!(gave_up.is_empty(), "{gave_up:?}");
+    let last = format!("away-{}", landed - 1);
+    for key in ["before", "away-0", last.as_str(), "after"] {
+        let got = one
+            .db
+            .get(key.as_bytes())
+            .unwrap_or_else(|e| panic!("read {key}: {e}"));
+        assert!(got.value.is_some(), "{key} reads back");
+    }
 
     again.db.shutdown();
     one.db.shutdown();

@@ -1435,14 +1435,15 @@ impl Dispatcher {
         control: &mut ControlStore,
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        let mut effects = effects.into_iter();
-        while let Some(effect) = effects.next() {
-            if self.is_down(node) || (touches_storage(&effect) && self.crash_check(node)?) {
-                let mut rest = vec![effect];
-                rest.extend(effects);
+        let mut effects = effects;
+        // By index, so a node fence can read the views A1 emitted beside it (A-R331).
+        for index in 0..effects.len() {
+            if self.is_down(node) || (touches_storage(&effects[index]) && self.crash_check(node)?) {
+                let rest = effects.split_off(index);
                 self.deliver_while_down(node, boot, rest);
                 return Ok(());
             }
+            let effect = &effects[index];
             let site = (node, effect.partition, effect.correlation);
             match &effect.kind {
                 EffectKind::AdoptAuthority {
@@ -1461,7 +1462,7 @@ impl Dispatcher {
                     );
                 }
                 EffectKind::Control(_) => {
-                    control.submit(node, &effect)?;
+                    control.submit(node, effect)?;
                     self.pump(control, scheduler)?;
                 }
                 EffectKind::Reply(reply) => self.replies.push((node, reply.clone())),
@@ -1480,7 +1481,7 @@ impl Dispatcher {
                     self.clock.cancel(node, *id, *version);
                 }
                 EffectKind::Kernel(kernel) => {
-                    self.kernel(node, effect.from, kernel, site, scheduler)?;
+                    self.kernel(node, effect.from, kernel, site, &effects, scheduler)?;
                 }
             }
         }
@@ -1719,6 +1720,7 @@ impl Dispatcher {
         from: ModuleName,
         kernel: &KernelEffect,
         site: (NodeId, PartitionId, CorrelationId),
+        step: &[Effect],
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
         let note = match kernel {
@@ -1834,6 +1836,17 @@ impl Dispatcher {
             let at = scheduler
                 .now()
                 .plus_millis(hop::delay(&self.hops, node, kernel));
+            // A node fence is every served partition's, wherever A1 sited it: the ones A1
+            // views in this step and a T1 or P1 serves (A-R324, A-R331).
+            let sites = route::node_fence_sites(kernel, site.1, step, |partition| {
+                self.transaction.kernel(node, partition).is_some()
+                    || self.publication.kernel(node, partition).is_some()
+            });
+            for partition in sites {
+                let fanned = EventKind::Kernel(event.clone());
+                let id = self.schedule(scheduler, at, (node, partition, site.2), fanned)?;
+                self.routed.insert(id);
+            }
             let id = self.schedule(scheduler, at, site, EventKind::Kernel(event))?;
             self.routed.insert(id);
             return Ok(());
@@ -2420,8 +2433,12 @@ impl Dispatcher {
 
     /// The twin of the host's `restore_dormant` (A-R173): restore R1's dormant receiver for
     /// `node`'s copy of `partition` from its engine's lineage at the seed's generation. A node
-    /// running a live side (a live receiver, or a primary) keeps it. `with_history` also gives
-    /// the receiver its ladder, `(0, ROOT)` through its head, once.
+    /// running a live receiver keeps it. A live primary is no reason to skip a source (A-R278,
+    /// A-R314): R1 sources a catch-up from a receiver only, so the dormant receiver sits beside
+    /// the primary, refuses every plain append, and R1 drops it at the next `Recovered`. A
+    /// target restore (`with_history` false) beside a serving primary is refused
+    /// `serving_primary`: the receiver there only sources (A-R323).
+    /// `with_history` also gives the receiver its ladder, `(0, ROOT)` through its head, once.
     ///
     /// Never faults: a copy that cannot be restored is logged `dormant_restore_refused{reason}`
     /// and holds no receiver, so R1 refuses its catch-up `NotASource` and F1's deadline ends
@@ -2443,11 +2460,8 @@ impl Dispatcher {
             .replication
             .receiver(node, partition)
             .map(AppendReceiver::is_dormant);
-        // A live side is kept. The receiver half is pinned by m7b_136. No row reaches the primary
-        // half yet: that takes a second recovery of a live partition (slice-2 residual, A-R216).
-        if dormant == Some(false)
-            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
-        {
+        // A live receiver is kept; it is pinned by m7b_136.
+        if dormant == Some(false) {
             return;
         }
         let refused = |reason: &str| {
@@ -2459,6 +2473,14 @@ impl Dispatcher {
                 "dormant_restore_refused"
             );
         };
+        let serving = self
+            .replication
+            .primary(node, partition)
+            .is_some_and(|primary| !primary.tracker().retired());
+        if serving && !with_history {
+            refused("serving_primary");
+            return;
+        }
         if dormant.is_none() {
             match self.dormant_receiver(node, partition, seed) {
                 Ok(receiver) => {
@@ -3973,6 +3995,118 @@ mod tests {
                 scheduled_at: Tick(10),
             }),
             "and the armed tick survives on the payload"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dormant_twin_tests {
+    //! A-R323 A-7 (W6b): the simulator's twin of the host's `restore_dormant` beside a serving
+    //! primary. No scenario reaches it: the simulator has no rejoin, so its only catch-ups run
+    //! after a restart of every copy, when no node serves a primary yet.
+
+    use rdb_core::contracts::authority::Lineage;
+    use rdb_core::contracts::envelope::ReplicaProgress;
+    use rdb_core::contracts::ids::{
+        AppliedSeq, BootId, ConfigVersion, DurableSeq, Generation, NodeId, OwnerEpoch, PartitionId,
+        ReceivedSeq, ReplicaRole, Revision, Seq,
+    };
+    use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+    use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
+
+    use super::{Dispatcher, DormantSeed};
+    use crate::storage::history::canonical_history;
+    use crate::storage::memory::MemoryEngine;
+
+    const OWNER: NodeId = NodeId(1);
+    const P: PartitionId = PartitionId(1);
+    const HEAD: u64 = 3;
+
+    /// Node 1 serving generation 1 of `P` at [`HEAD`] as copy 0's primary, its engine holding
+    /// the same records, and the seed a catch-up routed through it carries.
+    fn serving_owner() -> (Dispatcher, DormantSeed) {
+        let lineage = Lineage {
+            partition: P,
+            generation: Generation(1),
+            owner_epoch: OwnerEpoch(1),
+        };
+        let member = |copy: u8, node: u32, role| Member {
+            copy: CopyId(copy),
+            node: NodeId(node),
+            boot: BootId(1),
+            role,
+        };
+        let config = PartitionConfig::new(
+            P,
+            ConfigVersion(1),
+            vec![
+                member(0, 1, ReplicaRole::Primary),
+                member(1, 2, ReplicaRole::RegularSecondary),
+                member(2, 3, ReplicaRole::RegularSecondary),
+            ],
+        );
+        let history = canonical_history(lineage, ConfigVersion(1), HEAD).expect("history");
+        let mut engine = MemoryEngine::new(OWNER);
+        for batch in &history.batches {
+            engine.commit(batch.clone()).expect("commit");
+        }
+        let mut ladder = DigestLadder::new();
+        for seq in 1..=HEAD {
+            ladder.insert(Seq(seq), history.digest(seq));
+        }
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register_node(OWNER, BootId(1));
+        dispatcher.engines.insert(OWNER, engine);
+        dispatcher.replication.install_primary(
+            ProgressTracker::new(TrackerInit {
+                config: config.clone(),
+                own: CopyId(0),
+                lineage,
+                history: ladder,
+                local: ReplicaProgress {
+                    received: ReceivedSeq(HEAD),
+                    buffered_applied: AppliedSeq(HEAD),
+                    durable: DurableSeq(HEAD),
+                },
+            })
+            .expect("node 1's tracker"),
+        );
+        let seed = DormantSeed {
+            config,
+            lineage,
+            revision: Revision(1),
+        };
+        (dispatcher, seed)
+    }
+
+    /// A-R314 and A-R323: beside a serving primary, a source restore (`with_history`) installs
+    /// the dormant receiver at the engine's head with its ladder, so R1 can source the catch-up
+    /// from the owner; a target restore installs nothing. Cuts: the old early return on a
+    /// primary put back, no receiver after the source restore, red; the target skip removed, a
+    /// receiver after the target restore, red. Unit, under a second.
+    #[test]
+    fn beside_a_serving_primary_a_source_restore_installs_and_a_target_restore_does_not() {
+        let (mut dispatcher, seed) = serving_owner();
+        dispatcher.restore_dormant(OWNER, P, &seed, false);
+        assert!(
+            dispatcher.replication.receiver(OWNER, P).is_none(),
+            "a target restore installed a receiver beside the primary"
+        );
+
+        dispatcher.restore_dormant(OWNER, P, &seed, true);
+        let receiver = dispatcher
+            .replication
+            .receiver(OWNER, P)
+            .expect("a source restore installs the dormant receiver beside the primary");
+        assert!(receiver.is_dormant());
+        assert_eq!(receiver.applied_head().seq, Seq(HEAD));
+        assert!(
+            dispatcher.ladders.contains(&(OWNER, P)),
+            "and builds its ladder"
+        );
+        assert!(
+            dispatcher.replication.primary(OWNER, P).is_some(),
+            "the primary stays"
         );
     }
 }

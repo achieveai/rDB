@@ -1910,7 +1910,8 @@ pub struct Transaction {
     /// instance, applied to each instance it creates (lead rulings A-R73 N1, A-R73a).
     trims: BTreeMap<(NodeId, PartitionId), TrimMemory>,
     /// Every `(node, partition)` a storage fence reached in this boot, with or without an
-    /// instance: a fence event, or an instance frozen `LocalStorageFenced` by a failed batch. It
+    /// instance: a fence event, or an instance frozen `LocalStorageFenced` by a failed batch. A
+    /// node fence reaches only partitions holding a T1 or P1 kernel (A-R331). It
     /// is boot-long, as A1's `storage_fenced` is (lead ruling, M9 S2b-E round 10), so an instance
     /// created later in the boot starts `Frozen{LocalStorageFenced}`. Only a restart
     /// ([`Self::forget_node`]) clears it.
@@ -1994,7 +1995,11 @@ impl Transaction {
                 let floor = self.floors.get(&key).copied();
                 self.trims.entry(key).or_default().retire(generation, floor);
             }
-            // Round 10: a storage fence is remembered for the boot, with or without an instance.
+            // Round 10: a storage fence is remembered for the boot, with or without an instance,
+            // at each partition it reaches. A node fence reaches only partitions that hold a T1
+            // or P1 (A-R331), so one held by neither is not marked. It needs no mark: it admits
+            // only on a fresh A1 view, which a fenced A1 never publishes. (A1's storage fence is
+            // partition-scoped; no A1 path emits a node fence for `LocalStorageFenced`.)
             TxnEvent::Freeze {
                 scope,
                 cause: FreezeCause::LocalStorageFenced,
