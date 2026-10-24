@@ -1295,3 +1295,197 @@ async fn f015_a_pinned_node_refuses_a_snapshot_built_by_a_newer_generation() {
     drop(src);
     drop(dst);
 }
+
+// --- capture does not block the state machine (A-R279) -------------------------------------
+
+/// How long a read or an apply may take while a capture is held open. Generous on purpose: with
+/// the capture held, the wrong answer is "never", so the bound only has to tell "now" from that.
+const CAPTURE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Holds the first snapshot capture open at [`FaultInjector::during_snapshot_capture`]: after its
+/// checkpoint exists and before it reads what that checkpoint describes.
+///
+/// The same handshake as [`PauseAt`], on the capture hook rather than a boundary. The release
+/// wait is bounded so a row that fails before releasing ends as a failure rather than a hang.
+struct HoldCapture {
+    seen: AtomicU64,
+    reached_tx: std::sync::mpsc::SyncSender<()>,
+    reached_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    release_tx: std::sync::mpsc::SyncSender<()>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl HoldCapture {
+    fn new() -> Arc<Self> {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        Arc::new(Self {
+            seen: AtomicU64::new(0),
+            reached_tx,
+            reached_rx: Mutex::new(reached_rx),
+            release_tx,
+            release_rx: Mutex::new(release_rx),
+        })
+    }
+
+    /// Wait until the capture is being held.
+    async fn reached(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            me.reached_rx
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("the capture reaches its hook")
+        })
+        .await
+        .expect("wait task joins");
+    }
+
+    fn release(&self) {
+        self.release_tx.send(()).expect("the capture is still held");
+    }
+}
+
+impl FaultInjector for HoldCapture {
+    fn before(&self, _boundary: Boundary) -> FaultAction {
+        FaultAction::Proceed
+    }
+
+    fn during_snapshot_capture(&self) {
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.reached_tx.send(()).expect("the test is still waiting");
+            let _ = self
+                .release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(60));
+        }
+    }
+}
+
+/// M5-01a (A-R279): a state read does not wait for a snapshot capture.
+///
+/// Readers take the state-machine lock synchronously, from runtime workers. When the capture held
+/// that lock across its RocksDB checkpoint — which flushes the memtable, and queues behind every
+/// other store's flush on the shared flush thread — a read waited the whole checkpoint: 2.7-3.7 s
+/// per read in `m5_snapshot_cluster` under load, long enough to stall a cluster's runtime.
+#[retcd_test]
+async fn m5_01a_state_reads_do_not_wait_for_a_snapshot_capture() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let hold = HoldCapture::new();
+        let s = open_at(tmp.path(), hold.clone());
+        seed(&s, 6).await;
+
+        let building = {
+            let s = s.clone();
+            tokio::spawn(async move { build(&s).await })
+        };
+        hold.reached().await;
+
+        // A plain thread, so a read that blocks parks only itself. Nothing is asserted until the
+        // capture is released and the build has joined, so a red row fails instead of hanging.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = {
+            let reader = s.reader();
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let mut revision = 0;
+                reader.with_state(&mut |k| revision = k.cluster_revision());
+                let current = s.snapshot_meta();
+                let _ = tx.send((revision, current.is_none()));
+            })
+        };
+        let answered = tokio::task::spawn_blocking(move || rx.recv_timeout(CAPTURE_PATIENCE))
+            .await
+            .expect("wait task joins");
+
+        hold.release();
+        let meta = building
+            .await
+            .expect("the build task joins")
+            .expect("the build succeeds");
+        probe.join().expect("the probe thread joins");
+
+        let (revision, no_current_yet) =
+            answered.expect("a state read answers while a snapshot capture is held open");
+        assert_eq!(revision, 6, "the read sees the applied state");
+        assert!(
+            no_current_yet,
+            "nothing was published while the capture was held"
+        );
+        assert_eq!(meta.last_log_id, Some(log_id(1, 6)));
+    }
+}
+
+/// M5-01b (A-R279): applies proceed while a capture is held, and the snapshot still describes
+/// exactly its checkpoint.
+///
+/// This is the row that keeps M5-01's guarantee once the capture stops holding the lock: entries
+/// 7..9 apply *after* the checkpoint, so a header that read the live state machine instead of the
+/// checkpoint would claim index 9 and revision 9 over six records.
+#[retcd_test]
+async fn m5_01b_a_capture_describes_its_checkpoint_not_later_applies() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let hold = HoldCapture::new();
+        let s = open_at(tmp.path(), hold.clone());
+        seed(&s, 6).await;
+        let later: Vec<_> = (7..=9)
+            .map(|i| put(1, i, &format!("/m5/{i}"), &format!("v{i}")))
+            .collect();
+        s.log_store()
+            .blocking_append(later.clone())
+            .await
+            .expect("append");
+
+        let building = {
+            let s = s.clone();
+            tokio::spawn(async move { build(&s).await })
+        };
+        hold.reached().await;
+
+        let mut applying = {
+            let s = s.clone();
+            tokio::spawn(async move { s.state_machine().apply(later).await.map(|_| ()) })
+        };
+        let applied_inside = tokio::time::timeout(CAPTURE_PATIENCE, &mut applying).await;
+
+        hold.release();
+        let meta = building
+            .await
+            .expect("the build task joins")
+            .expect("the build succeeds");
+        let finished_inside = applied_inside.is_ok();
+        let joined = match applied_inside {
+            Ok(joined) => joined,
+            Err(_) => applying.await,
+        };
+        joined.expect("the apply task joins").expect("apply");
+
+        assert!(
+            finished_inside,
+            "an apply finishes while a snapshot capture is held open"
+        );
+        assert_eq!(
+            s.reader().cluster_revision(),
+            9,
+            "the later entries applied"
+        );
+
+        assert_eq!(
+            meta.last_log_id,
+            Some(log_id(1, 6)),
+            "the snapshot covers the checkpoint"
+        );
+        let header = read_header(&snap_path(&s, &meta));
+        assert_eq!(header.last_applied, Some(log_id(1, 6)));
+        assert_eq!(header.cluster_revision, 6);
+        assert_eq!(
+            header.counts.get(CF_KV).copied(),
+            Some(6),
+            "six records, as the header says"
+        );
+    }
+}
