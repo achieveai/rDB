@@ -194,14 +194,16 @@ pub struct DbConfig {
     ///   `Db`, so per partition (A5); the ninth evicts the oldest, which is logged
     ///   `ack_floor_pin_evicted` and from then on answers `STATUS_EXPIRED`.
     /// - A request this `Db` resends after a later write was answered may find its own answer
-    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Submit it as new. While an
-    ///   earlier write of this open is still kept (above), the owner cannot tell such a resend
-    ///   from a new write and applies it: resend only a request whose answer you do not hold.
+    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Submit it as new. This holds
+    ///   while an earlier write is still kept (above), and for a request that was answered `Ok`:
+    ///   it is never applied twice (A-R274). After a restart of the owner, a kept write that never
+    ///   applied answers `STATUS_EXPIRED` too.
     /// - Ids an app chose ([`Db::put_as`], [`Db::txn_as`], [`Db::write_as`]) get no relief:
     ///   their answers keep the [`Self::dedup_retention`] rule and count against the cap.
     /// - The floor itself is one dedup entry per open, counted against [`Self::dedup_cap`]: an
-    ///   open writing steadily holds about two (its newest answer and its floor). A cap of 2 or
-    ///   less therefore still fills; use 3 or more.
+    ///   open writing steadily holds about two (its newest answer and its floor). So with the
+    ///   floor on, a cap below [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`] (3) is refused at open with
+    ///   [`OpenError::Config`]: it would fill and stay full.
     ///
     /// `false` sends no floor: every answer is kept for [`Self::dedup_retention`], as before
     /// M10.
@@ -223,8 +225,12 @@ impl DbConfig {
     ///
     /// [`OpenError::DedupCap`] when [`Self::dedup_cap`] is above [`RETENTION_CAP_ENTRIES`];
     /// it is also logged as `db_open_refused` with `kind=DedupCap`, as every refused open is.
+    /// [`OpenError::Config`] when [`Self::ack_floor`] is on and [`Self::dedup_cap`] is below
+    /// [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`].
     pub fn check(&self) -> Result<(), OpenError> {
-        limits(self.dedup_cap).map(|_| ()).map_err(open_refused)
+        limits(self.dedup_cap, self.ack_floor)
+            .map(|_| ())
+            .map_err(open_refused)
     }
 }
 
@@ -805,7 +811,7 @@ impl Db {
                 .await
                 .map_err(open_refused);
         }
-        let limits = limits(config.dedup_cap).map_err(open_refused)?;
+        let limits = limits(config.dedup_cap, config.ack_floor).map_err(open_refused)?;
         let budgets = Budgets {
             dedup_retention_millis: config
                 .dedup_retention
@@ -1904,8 +1910,8 @@ impl Db {
     /// With [`DbConfig::ack_floor`] on, a refused request resent after a later write answers
     /// `STATUS_EXPIRED`, with nothing applied: submit it as new (spec §5.3). A request answered
     /// `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
-    /// Until that request is settled, the owner's floor stays below it, so a resend of a later
-    /// write whose answer was dropped is applied as new: resend only what you hold no answer for.
+    /// Every other request below the floor, answered `Ok` or refused, stays covered while that
+    /// request is unsettled, so a resend never applies one twice (A-R274).
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
         let wait = send_wait(Duration::from_millis(request.remaining_millis));
         let id = request.identity.request;
@@ -2407,7 +2413,7 @@ impl Db {
         boot: BootId,
     ) -> Result<Self, OpenError> {
         let nodes_dir = config.dir.join("nodes");
-        let limits = limits(config.dedup_cap)?;
+        let limits = limits(config.dedup_cap, config.ack_floor)?;
         let clock = HostClock::start();
         let links = Links::new();
         let control = ControlAdapter::new(store, rt, Arc::clone(&links));
@@ -3162,10 +3168,23 @@ fn remove_claim(dir: &Path) {
     }
 }
 
-/// T1's limits for a `dedup_cap` option: the spec's, with only the dedup cap lowered.
-fn limits(dedup_cap: Option<usize>) -> Result<Limits, OpenError> {
+/// The smallest `dedup_cap` an open with [`DbConfig::ack_floor`] on takes: each open keeps its
+/// newest answer and a floor record, and a new write needs one more (A-R274).
+pub const MIN_DEDUP_CAP_WITH_ACK_FLOOR: usize = 3;
+
+/// T1's limits for a `dedup_cap` option: the spec's, with only the dedup cap lowered. With the
+/// ack floor on, a cap below [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`] is refused: it would fill and stay
+/// full.
+fn limits(dedup_cap: Option<usize>, ack_floor: bool) -> Result<Limits, OpenError> {
     let mut limits = Limits::default();
     if let Some(asked) = dedup_cap {
+        if ack_floor && asked < MIN_DEDUP_CAP_WITH_ACK_FLOOR {
+            return Err(OpenError::Config(format!(
+                "dedup_cap must be at least {MIN_DEDUP_CAP_WITH_ACK_FLOOR} when ack_floor is on: \
+                 each open keeps its newest answer and a floor record; dedup_cap {asked} was \
+                 asked, and nothing was started"
+            )));
+        }
         if asked > RETENTION_CAP_ENTRIES {
             // Logged by the caller, as `db_open_refused` (`open_refused`): one event name for
             // every refused open (lead ruling, tester S1-8 walk on 066ab6e).
@@ -5307,7 +5326,7 @@ mod tests {
             ..config(dir.path())
         };
         assert!(
-            limits(at_cap.dedup_cap).is_ok(),
+            limits(at_cap.dedup_cap, at_cap.ack_floor).is_ok(),
             "the status cap itself is allowed"
         );
     }
@@ -9182,7 +9201,9 @@ mod tests {
 
     /// A-R252 M3 and D7, on a running `Db`, cap 8. A txn is answered `UNKNOWN_OUTCOME` (links
     /// held), a pin, and a new put is refused `PROTECTION_PAUSED` behind it with nothing applied,
-    /// which is held. After the heal, 30 puts land: the pin never fills the cap. The txn, resent,
+    /// which is held. After the heal, 30 puts land: the pin never fills the cap. Under the pin,
+    /// the paused put and the first answered put, resent, are both `STATUS_EXPIRED` with nothing
+    /// applied: an id above the pin stays covered (A-R274). The txn, resent,
     /// replays its answer, since a pin keeps it, and that settles the pin; its status still
     /// answers. With no pin left, one more put raises the floor past the paused put, which,
     /// resent, answers `STATUS_EXPIRED` and applies nothing (submit it as new); its status, asked
@@ -9236,10 +9257,32 @@ mod tests {
         db.links().heal_all();
         admits(&db, "after the heal");
         publishes(&db, Seq(2), "after the heal");
+        let mut first = None;
         for n in 0..30_u32 {
-            db.put(b"b", &n.to_le_bytes(), None)
+            let ok = db
+                .put(b"b", &n.to_le_bytes(), None)
                 .unwrap_or_else(|refused| panic!("put {n} under a pin: {refused:?}"));
+            first.get_or_insert(ok);
         }
+        let first = first.expect("30 puts");
+
+        // A-R274, under the unsettled pin: ids between it and acked_below are still covered. A
+        // held refusal and an answered put, resent, are both STATUS_EXPIRED with nothing applied.
+        let b_before = db.get(b"b").expect("get b").value;
+        let expired = db
+            .resend((*paused).clone())
+            .expect_err("covered, though above the pin");
+        assert_eq!(expired.error.kind, ErrorKind::StatusExpired, "{expired:?}");
+        assert_eq!(db.get(b"c").expect("get c").value, None, "nothing applied");
+        let again = db
+            .resend(*first.sent)
+            .expect_err("an answered put is never applied twice");
+        assert_eq!(again.error.kind, ErrorKind::StatusExpired, "{again:?}");
+        assert_eq!(
+            db.get(b"b").expect("get b").value,
+            b_before,
+            "nothing applied"
+        );
 
         let replayed = db.resend(*pending).expect("the pin replays");
         assert_eq!((replayed.request, replayed.seq), (pending_id, Seq(2)));
@@ -9314,5 +9357,33 @@ mod tests {
             other => panic!("the first open's last put: {other:?}"),
         }
         db.shutdown();
+    }
+
+    /// A-R274 F1: with the ack floor on, a dedup cap below 3 is refused before anything starts,
+    /// in words that say why: it would fill and stay full. With the floor off, or at 3, it is
+    /// taken.
+    #[test]
+    fn m10_s2_f1_a_dedup_cap_below_three_is_refused_with_the_floor_on() {
+        let dir = config_testkit::fs::temp_dir();
+        let with = |cap, ack_floor| {
+            DbConfig {
+                dedup_cap: Some(cap),
+                ack_floor,
+                ..config(dir.path())
+            }
+            .check()
+        };
+        match with(2, true) {
+            Err(OpenError::Config(text)) => assert!(
+                text.starts_with(
+                    "dedup_cap must be at least 3 when ack_floor is on: each open keeps its \
+                     newest answer and a floor record"
+                ),
+                "{text}"
+            ),
+            other => panic!("cap 2 with the floor on: {other:?}"),
+        }
+        assert!(with(2, false).is_ok(), "the floor off takes cap 2");
+        assert!(with(3, true).is_ok(), "cap 3 is the least the floor takes");
     }
 }

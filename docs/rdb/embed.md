@@ -313,10 +313,11 @@ floor), so the table above no longer limits it.
   settle them. The ninth drops the oldest, which then answers `STATUS_EXPIRED`.
 - **A dropped answer answers `STATUS_EXPIRED`** on a resend, with nothing applied: submit the
   write as new. `status` with its generation says `Expired`; with none, `Unknown`.
-- **Resend only what you hold no answer for.** While a write is still unknown, the owner cannot
-  tell a resend of a later, answered write from a new one, and applies it.
+- **A write is never applied twice.** A resend of a write that was answered, even `Ok`, answers
+  `STATUS_EXPIRED` once its answer was dropped. After the owner restarts, a kept write that never
+  applied answers `STATUS_EXPIRED` too: submit it as new.
 - **Ids you choose (`put_as`, `txn_as`, `write_as`) get no relief.** The table above applies.
-- **Use a cap of 3 or more.** With 2 or less, the floor and the newest answer fill it.
+- **A cap below 3 is refused at open.** The floor and the newest answer would fill it.
 - `ack_floor: false` keeps every answer for the retention, as before.
 
 ### When writes pause

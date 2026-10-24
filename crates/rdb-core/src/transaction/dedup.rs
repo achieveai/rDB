@@ -181,24 +181,49 @@ pub fn check_floor(
     Ok(())
 }
 
-/// One ack floor: every `Db` id of its open below `below`, except pins, is held by the client.
+/// `pinned` as [`Floor::pinned`] holds it. [`check_floor`] bounds it to [`MAX_PINS`]; any more are
+/// dropped.
+fn pin_slots(pinned: &[RequestId]) -> [Option<RequestId>; MAX_PINS] {
+    let mut slots = [None; MAX_PINS];
+    for (slot, pin) in slots.iter_mut().zip(pinned) {
+        *slot = Some(*pin);
+    }
+    slots
+}
+
+/// One ack floor: every `Db` id of its open below `below`, except `pinned`, is held by the
+/// client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Floor {
-    /// The first id not covered.
+    /// The first id not covered: the highest `acked_below` applied, never lowered to a pin.
     pub below: RequestId,
+    /// The ids below `below` the client has not settled, as the request that set `below` (or
+    /// the newest with the same `below`) carried them. In memory only: a seed from the floor
+    /// record holds none (A-R274).
+    pub pinned: [Option<RequestId>; MAX_PINS],
     /// The sequence of the envelope that last moved it: its age, as an entry's
     /// [`Retained::applied_at_seq`] is.
     pub at_seq: Seq,
 }
 
+impl Floor {
+    /// Whether this floor covers `request`: below it and not pinned.
+    #[must_use]
+    pub fn covers(&self, request: RequestId) -> bool {
+        request < self.below && !self.pinned.contains(&Some(request))
+    }
+}
+
 /// The dedup deletes and floor record one envelope carries (A-R252 A3). Planned at step 13 from
 /// the index as it stands, and applied to it only at that envelope's `Published`.
 ///
-/// The record holds one id, the **effective floor**: `acked_below`, or the lowest pin when one
-/// is lower. A resend below it answers `STATUS_EXPIRED`. A pin stays at or above it, so a pin's
-/// resend takes the normal path: its kept entry replays it, and a pin that never applied applies.
-/// Between the lowest pin and `acked_below` the trimmed ids lose dedup protection. Those are ids
-/// the client holds a definitive answer for, which the `Db` never resends.
+/// The record holds one id, the floor: `acked_below`, never lowered to a pin (A-R274). A resend
+/// the floor covers answers `STATUS_EXPIRED`. A pin is exempt, so a pin's resend takes the
+/// normal path: its kept entry replays it, and a pin that never applied applies. Every other id
+/// below the floor keeps its protection after its entry is trimmed, so an app that resends a
+/// request it holds an answer for (`Db::resend` is public) is answered `STATUS_EXPIRED`, never
+/// applied twice. Pins are not in the record: after a restart a pin that never applied answers
+/// `STATUS_EXPIRED` too, which is true (nothing was applied) and asks the app to submit it anew.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FloorPlan {
     /// The serving generation.
@@ -209,8 +234,13 @@ pub struct FloorPlan {
     pub client: ClientId,
     /// The sender's open.
     pub open: u64,
-    /// The effective floor the record carries.
+    /// The floor the record carries: the higher of the held floor and `acked_below`.
     pub floor: RequestId,
+    /// The request's `acked_below`, which [`DedupIndex::apply_floor`] compares with the floor
+    /// it then holds to choose whose pins to keep.
+    pub acked_below: RequestId,
+    /// The request's pins.
+    pub pinned: [Option<RequestId>; MAX_PINS],
     /// The entries deleted: the sender's open in the serving generation, below `acked_below`, not
     /// pinned, in any group, at most [`TRIM_PER_ENVELOPE`].
     pub deletes: Vec<(Generation, AffinityId, RequestIdentity)>,
@@ -565,7 +595,7 @@ impl DedupIndex {
             !self.retired_generations.contains(&key.3)
                 && state
                     .floor
-                    .is_some_and(|floor| identity.request < floor.below)
+                    .is_some_and(|floor| floor.covers(identity.request))
         })
     }
 
@@ -591,12 +621,7 @@ impl DedupIndex {
             return None;
         }
         let held = self.floor(serving, identity).map(|floor| floor.below);
-        let lowest = pinned
-            .iter()
-            .copied()
-            .min()
-            .map_or(acked_below, |pin| pin.min(acked_below));
-        let floor = held.map_or(lowest, |held| held.max(lowest));
+        let floor = held.map_or(acked_below, |held| held.max(acked_below));
         let base = open_base(identity.request);
         let mut deletes = Vec::new();
         let key = open_key(serving, identity);
@@ -622,6 +647,8 @@ impl DedupIndex {
             client: identity.client,
             open: base,
             floor,
+            acked_below,
+            pinned: pin_slots(pinned),
             deletes,
         })
     }
@@ -632,16 +659,28 @@ impl DedupIndex {
         for key in &plan.deletes {
             self.entries.remove(key);
         }
-        self.set_floor(plan.generation, plan.record_identity(), plan.floor, at_seq);
+        self.set_floor(
+            plan.generation,
+            plan.record_identity(),
+            plan.acked_below,
+            plan.pinned,
+            at_seq,
+        );
     }
 
-    /// Hold `below` as the floor of `identity`'s open in `generation`, unless a higher one is
-    /// held. Its age becomes `at_seq` either way: the record was written again at `at_seq`.
+    /// Hold `below` as the floor of `identity`'s open in `generation`, with `pinned`, unless a
+    /// higher one is held. Its age becomes `at_seq` either way: the record was written again at
+    /// `at_seq`.
+    ///
+    /// Pins follow the highest `below`: a request with a lower one was compiled earlier, so its
+    /// pins are older and are dropped. At an equal `below` only the pins both carry are kept,
+    /// since a client only ever settles pins below a floor it has already sent (A-R274).
     fn set_floor(
         &mut self,
         generation: Generation,
         identity: RequestIdentity,
         below: RequestId,
+        pinned: [Option<RequestId>; MAX_PINS],
         at_seq: Seq,
     ) {
         if self.retired_generations.contains(&generation) {
@@ -651,14 +690,30 @@ impl DedupIndex {
             .opens
             .entry(open_key(generation, identity))
             .or_default();
-        let below = match state.floor {
-            Some(held) => held.below.max(below),
+        let (below, pinned) = match state.floor {
             None => {
                 self.floors += 1;
-                below
+                (below, pinned)
             }
+            Some(held) if held.below < below => (below, pinned),
+            Some(held) if held.below == below => {
+                let mut kept = [None; MAX_PINS];
+                let both = held
+                    .pinned
+                    .into_iter()
+                    .filter(|pin| pin.is_some() && pinned.contains(pin));
+                for (slot, pin) in kept.iter_mut().zip(both) {
+                    *slot = pin;
+                }
+                (below, kept)
+            }
+            Some(held) => (held.below, held.pinned),
         };
-        state.floor = Some(Floor { below, at_seq });
+        state.floor = Some(Floor {
+            below,
+            pinned,
+            at_seq,
+        });
     }
 
     /// Whether nothing is held.
@@ -770,6 +825,7 @@ impl DedupIndex {
                     key.generation,
                     key.identity,
                     floor_of_value(&value),
+                    [None; MAX_PINS],
                     value.seq,
                 );
                 continue;
@@ -1087,7 +1143,8 @@ mod tests {
             below_8,
             "both groups trimmed below 8, pin 4 kept"
         );
-        assert_eq!(plan.floor, pin, "the floor is the lowest pin");
+        // A-R274: the floor is `acked_below`, never lowered to a pin; the pin is exempt.
+        assert_eq!(plan.floor, RequestId(OPEN2 + 8), "the floor is acked_below");
         assert_eq!(plan.record_identity().request, floor_record_id(OPEN2));
         // Planned, not applied: nothing moved yet (A3).
         assert_eq!(index.len(), 10);
@@ -1104,8 +1161,14 @@ mod tests {
         assert!(index.below_floor(G1, id(OPEN2 + 3)));
         assert!(
             !index.below_floor(G1, id(OPEN2 + 4)),
-            "a pin is never below the floor"
+            "a pin is exempt from the floor"
         );
+        for above_the_pin in 5..8 {
+            assert!(
+                index.below_floor(G1, id(OPEN2 + above_the_pin)),
+                "r{above_the_pin}: between the pin and acked_below is still covered (A-R274)"
+            );
+        }
         assert!(!index.below_floor(G1, id(5)), "another open is not covered");
         assert_eq!(index.floor_count(), 1);
     }
@@ -1128,6 +1191,38 @@ mod tests {
             after, None,
             "no deletes and an unchanged floor need no record"
         );
+    }
+
+    /// A-R274: pins follow the floor that carried them. At the same `acked_below` a settled pin
+    /// loses its exemption; a higher `acked_below` takes the newer request's pins whole.
+    #[test]
+    fn a_settled_pin_loses_its_exemption_and_pins_follow_the_highest_floor() {
+        let mut index = filled(G1, 10);
+        let sender = id(OPEN2 + 11);
+        let (four, six) = (RequestId(OPEN2 + 4), RequestId(OPEN2 + 6));
+        let covered = |index: &DedupIndex, n: u64| index.below_floor(G1, id(OPEN2 + n));
+        let plan = index
+            .trim_plan(G1, sender, RequestId(OPEN2 + 8), &[four, six], 64)
+            .expect("a plan");
+        index.apply_floor(&plan, Seq(11));
+        assert_eq!(
+            (covered(&index, 4), covered(&index, 5), covered(&index, 6)),
+            (false, true, false)
+        );
+
+        let settled = index
+            .trim_plan(G1, sender, RequestId(OPEN2 + 8), &[four], 64)
+            .expect("6 settled: its entry goes");
+        index.apply_floor(&settled, Seq(12));
+        assert!(covered(&index, 6), "a settled pin is covered");
+        assert!(!covered(&index, 4), "4 is still pinned");
+
+        let higher = index
+            .trim_plan(G1, sender, RequestId(OPEN2 + 10), &[], 64)
+            .expect("a higher floor");
+        index.apply_floor(&higher, Seq(13));
+        assert!(covered(&index, 4), "the newer request pins nothing");
+        assert!(!covered(&index, 10), "nor reaches its own floor");
     }
 
     #[test]
