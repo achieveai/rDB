@@ -41,9 +41,11 @@
 //!
 //! With `--nodes` the pilot runs no copy itself: it opens its `Db` with `local = []` and links
 //! that dial every node, as the app `NAME` (default `pilot`, certificate `C/app-NAME.*`), under
-//! client id `N` (default 1). It waits until every node's link is up, printing
-//! `links up nodes=1,2,3`, or names each node that is not: a refused handshake exits 3, a node
-//! not reached in time exits 5. `D` then holds only the journal. `--put` writes one value and
+//! client id `N` (default 1). It waits up to 5 s for every node's link, then prints
+//! `link node=N down: <why>` for each node that is not up and `links up nodes=<the rest>`, and
+//! goes on: the open decides whether the nodes that are up can serve, so a node `lr kill`
+//! stopped and promoted away is no failure. A refused handshake exits 3. `D` then holds only
+//! the journal. `--put` writes one value and
 //! prints `put seq=<seq> request=<id>`; `--get` prints `get value=<text>` or `get absent`.
 //! A put that gets no answer prints `put <error> request=<id>: ...` and then the request's
 //! `status ...`; with `--retry-for S` it then sends the same request again until answered,
@@ -477,9 +479,15 @@ fn run(args: &Args) -> ExitCode {
     code
 }
 
-/// `--nodes`: links that dial every node as app `--app`, up before the `Db` opens. Exit 2 when
-/// the certificates cannot be read or the links cannot start, 3 when a node refuses the
-/// handshake, 5 when one is not reached within `--ready-secs`.
+/// How long `--nodes` waits for every link before it goes on with those that are up (as
+/// `rdb_dev` does). Never longer than `--ready-secs`.
+const LINK_WAIT: Duration = Duration::from_secs(5);
+
+/// `--nodes`: links that dial every node as app `--app`, given up to [`LINK_WAIT`] to come up
+/// before the `Db` opens. Exit 2 when the certificates cannot be read or the links cannot
+/// start, 3 when a node refuses the handshake. A node that is not up is no failure (A-R299,
+/// tester-s2 F-T2): a dead owner is promoted away, and the open decides whether the nodes that
+/// are up can serve. Each such link is said, and keeps being redialled.
 fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, ExitCode> {
     let label = Label::App(args.app.clone());
     let cert_dir = args.cert_dir.as_deref().ok_or(ExitCode::from(2))?;
@@ -514,29 +522,55 @@ fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, Exit
             ExitCode::from(2)
         })?
     };
-    let names = peers.iter().map(|n| n.0.to_string()).collect::<Vec<_>>();
     let started = std::time::Instant::now();
-    match rt.block_on(net.wait_up(&peers, args.ready)) {
-        Ok(()) => {
-            tracing::info!(nodes = ?names, client = args.client_id, "pilot_links_up");
-            println!("links up nodes={}", names.join(","));
-            Ok(links)
-        }
-        Err(down) => {
-            let refused = net
-                .states()
-                .values()
-                .any(|state| matches!(state, LinkState::Refused(_)));
-            tracing::error!(%down, refused, "pilot_links_down");
-            // A node that is not up is redialled until the wait ends (A-R273), so the line
-            // says how long that was; a refusal ends it at once.
-            println!(
-                "links down after {:.1}s: {down}",
-                started.elapsed().as_secs_f64()
-            );
-            Err(ExitCode::from(if refused { 3 } else { 5 }))
-        }
+    let waited = rt.block_on(net.wait_up(&peers, args.ready.min(LINK_WAIT)));
+    let lines = link_lines(&net.states()).map_err(|refused| {
+        let down = waited.err().unwrap_or(refused);
+        tracing::error!(%down, refused = true, "pilot_links_down");
+        // A refusal does not heal by waiting, so it ends the run at once.
+        println!(
+            "links down after {:.1}s: {down}",
+            started.elapsed().as_secs_f64()
+        );
+        ExitCode::from(3)
+    })?;
+    tracing::info!(links = ?lines, client = args.client_id, "pilot_links_up");
+    lines.iter().for_each(|line| println!("{line}"));
+    Ok(links)
+}
+
+/// What `--nodes` prints once the link wait ends: `link node=N down: <last dial error>` for
+/// each node that is not up, then `links up nodes=<the nodes that are>`. `Err` with the
+/// refusals when a node refused the handshake: that is the run's exit 3.
+fn link_lines(states: &BTreeMap<NodeId, LinkState>) -> Result<Vec<String>, String> {
+    let refused: Vec<String> = states
+        .iter()
+        .filter_map(|(node, state)| match state {
+            LinkState::Refused(why) => Some(format!("node {}: refused: {why}", node.0)),
+            _ => None,
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Err(refused.join("; "));
     }
+    let mut lines: Vec<String> = states
+        .iter()
+        .filter_map(|(node, state)| match state {
+            LinkState::Waiting(why) => Some(format!(
+                "link node={} down: {}",
+                node.0,
+                why.as_deref().unwrap_or("not reached yet")
+            )),
+            _ => None,
+        })
+        .collect();
+    let up: Vec<String> = states
+        .iter()
+        .filter(|(_, state)| matches!(state, LinkState::Up(_)))
+        .map(|(node, _)| node.0.to_string())
+        .collect();
+    lines.push(format!("links up nodes={}", up.join(",")));
+    Ok(lines)
 }
 
 /// A status answer as one line: `resolved seq=<seq> outcome=<..>`, `unknown`, `expired`.
@@ -1015,6 +1049,42 @@ mod tests {
         let mut file = open_journal(&path).expect("opens");
         writeln!(file, "x").expect("writes");
         assert!(path.is_file());
+    }
+
+    /// A-R299 (tester-s2 F-T2): a node that is down is said and the run goes on with the rest;
+    /// only a refused handshake ends it. Cut: a node not up is an `Err` again (the exit 5 seen
+    /// after `lr kill 1` and `lr promote 2`), and this goes red. Unit.
+    #[test]
+    fn a_node_that_is_down_is_said_and_the_run_goes_on_and_a_refusal_ends_it() {
+        let down = "nothing is listening at 127.0.0.1:18341 (connection refused)";
+        let states = BTreeMap::from([
+            (NodeId(1), LinkState::Waiting(Some(down.to_owned()))),
+            (NodeId(2), LinkState::Up(BootId(7))),
+            (NodeId(3), LinkState::Up(BootId(8))),
+        ]);
+        assert_eq!(
+            link_lines(&states),
+            Ok(vec![
+                format!("link node=1 down: {down}"),
+                "links up nodes=2,3".to_owned()
+            ])
+        );
+        let never = BTreeMap::from([(NodeId(2), LinkState::Waiting(None))]);
+        assert_eq!(
+            link_lines(&never),
+            Ok(vec![
+                "link node=2 down: not reached yet".to_owned(),
+                "links up nodes=".to_owned()
+            ])
+        );
+        let refused = BTreeMap::from([
+            (NodeId(1), LinkState::Refused("another CA".to_owned())),
+            (NodeId(2), LinkState::Up(BootId(7))),
+        ]);
+        assert_eq!(
+            link_lines(&refused),
+            Err("node 1: refused: another CA".to_owned())
+        );
     }
 
     /// M10 S2 (A-R226): `--nodes` names the node processes and needs the run's certificates;

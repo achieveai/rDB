@@ -488,6 +488,9 @@ impl Default for Opened {
     }
 }
 
+/// The least time between two reads of `partitions/1` by one `Db`'s route (A-R299).
+const OWNER_REREAD_GAP: Duration = Duration::from_millis(250);
+
 /// Where a `Db` sends its calls (ruling A-R226 h2): the owner `partitions/1` names, and, for a
 /// `Db` that can look again, the store and runtime it reads the record with.
 struct Route {
@@ -496,6 +499,9 @@ struct Route {
     /// What a `NOT_PRIMARY` answer, or an owner that cannot be reached, re-reads `partitions/1`
     /// with. `None`: the owner is fixed.
     refresh: Option<(Arc<dyn ConfigStore>, Handle)>,
+    /// When `refresh` last read `partitions/1`. A read within [`OWNER_REREAD_GAP`] of it is not
+    /// made: the call goes on with the owner that read named (A-R299).
+    last_read: Mutex<Option<Instant>>,
 }
 
 impl Default for Route {
@@ -503,6 +509,7 @@ impl Default for Route {
         Self {
             owner: std::sync::atomic::AtomicU32::new(OWNER.0),
             refresh: None,
+            last_read: Mutex::new(None),
         }
     }
 }
@@ -899,6 +906,7 @@ impl Db {
             route: Route {
                 owner: std::sync::atomic::AtomicU32::new(owner.0),
                 refresh: Some((store, rt)),
+                last_read: Mutex::new(None),
             },
         })
     }
@@ -1048,6 +1056,7 @@ impl Db {
             route: Route {
                 owner: std::sync::atomic::AtomicU32::new(found.owner.0),
                 refresh: partial.then(|| (Arc::clone(&store), rt.clone())),
+                last_read: Mutex::new(None),
             },
         };
         let mut failed = None;
@@ -1558,12 +1567,23 @@ impl Db {
 
     /// After a `NOT_PRIMARY` answer, or a send the owner could not take (A-R287 P1), read the
     /// owner `partitions/1` names now, so the next call, or the caller's retry that
-    /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout. A `Db` whose owner is fixed reads nothing. A read that fails keeps the
-    /// owner it had and logs why: the next such answer reads again.
+    /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout.
+    /// A `Db` whose owner is fixed reads nothing. At most one read per [`OWNER_REREAD_GAP`]
+    /// (A-R299): an outage is when the control plane is weakest, and every call would read
+    /// otherwise; a call inside the gap goes on with the owner the last read named. A read that
+    /// fails keeps the owner it had and logs why: the next such answer past the gap reads again.
     fn refresh_owner(&self) {
         let Some((store, rt)) = &self.route.refresh else {
             return;
         };
+        {
+            let mut last = lock(&self.route.last_read);
+            let now = Instant::now();
+            if last.is_some_and(|at| now.duration_since(at) < OWNER_REREAD_GAP) {
+                return;
+            }
+            *last = Some(now);
+        }
         let (done, read) = mpsc::channel();
         let store = Arc::clone(store);
         rt.spawn(async move {
@@ -6510,6 +6530,78 @@ mod tests {
             "the write made before the promote reads back at node 2"
         );
         tracing::info!(refused = ?refused, "p1_app_followed");
+        app.shutdown();
+        nodes.shutdown();
+    }
+
+    /// A-R299: while an app's owner is down and not yet promoted, the app re-reads
+    /// `partitions/1` at most once per 250 ms however many calls it makes, so an outage does
+    /// not turn every call into a control read. 200 puts, 5 ms apart, against a stopped owner
+    /// make at most `1 + elapsed / 250 ms` reads (each read logs `db_owner_refreshed` or
+    /// `db_owner_refresh_failed`), about 5 for a second of puts.
+    /// Cut: no gap, one read per put, and this goes red.
+    /// Integration (~3 s: three node threads, then a second of puts).
+    #[config_log::retcd_test]
+    fn m10_s2_an_app_whose_owner_is_down_reads_the_owner_at_most_every_250_ms() {
+        const METHOD: &str =
+            "m10_s2_an_app_whose_owner_is_down_reads_the_owner_at_most_every_250_ms";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut nodes = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("the nodes' open");
+        admits(&nodes, "after the nodes' open");
+        let app_dir = config_testkit::fs::temp_dir();
+        let mut app = rt
+            .block_on(Db::open(
+                DbConfig {
+                    local: Vec::new(),
+                    links: Some(Arc::clone(nodes.links())),
+                    client: ClientId(2),
+                    ..config(app_dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("the app-only open");
+        app.put(b"a", b"1", None)
+            .expect("app A's put while node 1 runs");
+        lock(&nodes.nodes)
+            .iter_mut()
+            .find(|handle| handle.node == OWNER)
+            .expect("node 1 runs here")
+            .stop();
+
+        let began = Instant::now();
+        for _ in 0..200 {
+            let refused = app.put(b"a", b"2", None).expect_err("node 1 has stopped");
+            assert_eq!(refused.error.kind, ErrorKind::Unavailable, "{refused:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = began.elapsed();
+        let reads = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .filter(|line| {
+                line["@m"] == "db_owner_refreshed" || line["@m"] == "db_owner_refresh_failed"
+            })
+            .count();
+        let most = 1 + elapsed.as_millis() / OWNER_REREAD_GAP.as_millis();
+        tracing::info!(
+            reads,
+            most,
+            elapsed_ms = elapsed.as_millis(),
+            "owner_reads_counted"
+        );
+        assert!(
+            reads >= 1 && reads as u128 <= most,
+            "200 puts over {elapsed:?} made {reads} owner reads; at most {most} allowed"
+        );
         app.shutdown();
         nodes.shutdown();
     }
