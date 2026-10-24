@@ -213,6 +213,16 @@ pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
 const DROP_CHECK_EVERY_MILLIS: u64 = 200;
 
+/// How long a repair that ended `ReadOnly` again waits before it runs again with nothing about
+/// its members moved (A-R353, amending A-R346): it doubles at each such retry, up to
+/// [`REPAIR_RETRY_CAP_MILLIS`], so a transient F1 miss never leaves the partition read-only for
+/// good, and a persistent one fences reads at most once a minute. Crate tests set the host
+/// field directly.
+const REPAIR_RETRY_FIRST_MILLIS: u64 = 5_000;
+
+/// The longest wait between two repairs of one partition with nothing moved (A-R353).
+const REPAIR_RETRY_CAP_MILLIS: u64 = 60_000;
+
 /// How many times R1 may re-send one record to one copy, with that copy's acknowledged
 /// progress unmoved and below the primary's applied head, before the host warns
 /// `replication_copy_not_advancing` (D4 re-sent about 150 times in silence). R1's retransmit
@@ -1290,8 +1300,9 @@ struct RebuildWatch {
 }
 
 /// What a repair saw of one member it re-planned for (A-R346 M1): the boot its link reports
-/// and the durable sequence this primary's tracker holds for it. Either moving, or the link
-/// going down and up again, is what lets the next repair run.
+/// and the durable sequence this primary's tracker holds for it. A new boot, a higher durable
+/// sequence, or the link going down and up again lets the next repair run at once
+/// ([`RepairHeld::moved`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RepairMark {
     node: NodeId,
@@ -1301,6 +1312,29 @@ struct RepairMark {
 
 /// One `Inspect` a repair check sent (A-R350): the node, and where its answer arrives.
 type RepairProbe = (NodeId, Receiver<NodeStatus>);
+
+/// The last repair of one partition (A-R346 M1, A-R353): what it saw of its members, when it
+/// ran, how long the next one waits with nothing moved, and whether that wait was logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepairHeld {
+    marks: Vec<RepairMark>,
+    at: Tick,
+    wait_millis: u64,
+    logged: bool,
+}
+
+impl RepairHeld {
+    /// Whether a member moved since this repair: another member set, a new boot, or a higher
+    /// durable sequence. Durable sequences number one partition's records across generations,
+    /// so they compare across the trackers each generation's primary builds; only a rise
+    /// counts, because a new tracker that has not heard a member yet reads it as 0.
+    fn moved(&self, now: &[RepairMark]) -> bool {
+        self.marks.len() != now.len()
+            || self.marks.iter().zip(now).any(|(last, now)| {
+                last.node != now.node || last.boot != now.boot || now.durable > last.durable
+            })
+    }
+}
 
 /// One copy's sends of one record, for the stuck-cursor warning.
 #[derive(Debug)]
@@ -1528,11 +1562,13 @@ struct Host {
     /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
     /// been linked again (critic-degraded M3).
     repair_since: BTreeMap<PartitionId, Tick>,
-    /// Per partition, what the last repair saw of the members it re-planned for (A-R346 M1),
-    /// and whether a held repair was logged. Kept across the generations it makes, until the
-    /// commit is not `ReadOnly` or such a member's link goes down, so a repair that ends
-    /// `ReadOnly` again is not repeated until something about those members moved.
-    repaired: BTreeMap<PartitionId, (Vec<RepairMark>, bool)>,
+    /// Per partition, the last repair ([`RepairHeld`], A-R346 M1, A-R353). Kept across the
+    /// generations it makes, until the commit is not `ReadOnly` or such a member's link goes
+    /// down, so a repair that ends `ReadOnly` again runs again only once a member moved or its
+    /// wait has passed.
+    repaired: BTreeMap<PartitionId, RepairHeld>,
+    /// [`REPAIR_RETRY_FIRST_MILLIS`]; crate tests set it directly.
+    repair_retry_first_millis: u64,
     /// Per partition, the `Inspect` probes the last repair check sent to the members it would
     /// repair for, and when (A-R350): a repair runs only for a member that answered one.
     repair_probes: BTreeMap<PartitionId, (Tick, Vec<RepairProbe>)>,
@@ -1651,6 +1687,7 @@ impl Host {
             refuse_inventories: false,
             repair_since: BTreeMap::new(),
             repaired: BTreeMap::new(),
+            repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
@@ -3880,15 +3917,20 @@ impl Host {
     ///
     /// Bounded (A-R346 M1). A repair whose F1 run cannot take the member in (its inventory
     /// refused, say) commits `ReadOnly` again, and repeating it would fence the partition every
-    /// hold for ever. So once a repair has run, the next one waits until a member it was for
-    /// has moved: a new boot, a higher durable sequence, or its link down and up again. A held
-    /// repair is logged once, `membership_repair_held`. Nothing runs while F1's rebuild is
-    /// pinned, which F1's own deadline bounds.
+    /// hold for ever. So once a repair has run, the next one runs at once only when a member it
+    /// was for has moved: a new boot, a higher durable sequence, or its link down and up again.
+    /// Otherwise it waits (A-R353): [`REPAIR_RETRY_FIRST_MILLIS`] after the repair, doubling at
+    /// each retry up to [`REPAIR_RETRY_CAP_MILLIS`], because F1 can also leave a member out for
+    /// a reason that passes (a late inventory), and a bound with no retry would then keep the
+    /// partition read-only for good. A movement or a commit that is not `ReadOnly` starts the
+    /// wait again from the first. A held repair is logged once per wait,
+    /// `membership_repair_held`. Nothing runs while F1's rebuild is pinned, which F1's own
+    /// deadline bounds.
     ///
     /// Answered (A-R350). Once the hold has passed, a check sends each linked member an
-    /// `Inspect` and the next check reads the answers; the repair runs for the members that
-    /// answered, and is otherwise probed again. A half-open link never repairs, so it never
-    /// fences reads for nothing.
+    /// `Inspect` and the next check reads the answers: an answer must arrive within one check.
+    /// The repair runs for the members that answered, and the rest are probed again. A
+    /// half-open link never repairs, so it never fences reads for nothing.
     fn repair_duty(&mut self, partition: PartitionId, now: Tick) {
         let read_only = self
             .committed
@@ -3930,32 +3972,49 @@ impl Host {
         let generation = committed.new_generation;
         let epoch = committed.selected.root.owner_epoch;
         let marks = self.repair_marks(partition, &linked);
-        if let Some((last, logged)) = self.repaired.get_mut(&partition) {
-            if *last == marks {
-                if !*logged {
-                    *logged = true;
-                    tracing::info!(
-                        node = self.node.0,
-                        partition = partition.0,
-                        generation = generation.0,
-                        marks = ?marks,
-                        "membership_repair_held"
-                    );
+        // A-R353: with nothing moved, the next repair waits out the last one's wait, then runs
+        // with the wait doubled; a movement runs it at once with the first wait.
+        let mut wait_millis = self.repair_retry_first_millis;
+        if let Some(last) = self.repaired.get_mut(&partition) {
+            if !last.moved(&marks) {
+                let waited = HostClock::millis_until(last.at, now);
+                if waited < last.wait_millis {
+                    if !last.logged {
+                        last.logged = true;
+                        tracing::info!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            generation = generation.0,
+                            marks = ?marks,
+                            retry_in_ms = last.wait_millis - waited,
+                            "membership_repair_held"
+                        );
+                    }
+                    return;
                 }
-                return;
+                wait_millis = last
+                    .wait_millis
+                    .saturating_mul(2)
+                    .min(REPAIR_RETRY_CAP_MILLIS);
             }
         }
         // A-R350: a link that is up is not a member that answers. The repair runs only for a
-        // member that answered an `Inspect` this check sent it, read at the next check; one
-        // that did not (a half-open link, a stalled process) is probed again, and nothing is
-        // fenced for it.
+        // member that answered an `Inspect` the previous check sent it; one that did not (a
+        // half-open link, a stalled process) is probed again, and nothing is fenced for it. In
+        // this process the answer comes back over its own channel, not over `Links`, so a member
+        // whose direction back to this node is dropped is counted as not answering (A-R353).
         let answered: Vec<NodeId> = match self.repair_probes.remove(&partition) {
             Some((sent, probes))
                 if HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS =>
             {
+                let dropped = self.links.dropped();
                 probes
                     .into_iter()
-                    .filter(|(node, answer)| linked.contains(node) && answer.try_recv().is_ok())
+                    .filter(|(node, answer)| {
+                        linked.contains(node)
+                            && !dropped.contains(&(*node, self.node))
+                            && answer.try_recv().is_ok()
+                    })
                     .map(|(node, _)| node)
                     .collect()
             }
@@ -3984,7 +4043,15 @@ impl Host {
             return;
         }
         self.repair_since.remove(&partition);
-        self.repaired.insert(partition, (marks, false));
+        self.repaired.insert(
+            partition,
+            RepairHeld {
+                marks,
+                at: now,
+                wait_millis,
+                logged: false,
+            },
+        );
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -3992,6 +4059,7 @@ impl Host {
             epoch = epoch.0,
             outside = ?answered.iter().map(|node| node.0).collect::<Vec<_>>(),
             linked_ms,
+            next_wait_ms = wait_millis,
             "membership_repair_planned"
         );
         self.revoke(partition, epoch, None, None);
