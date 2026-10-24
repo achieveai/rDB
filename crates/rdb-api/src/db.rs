@@ -5033,8 +5033,15 @@ mod tests {
     /// restart of node 1: a put lands and node 3 holds it durably at node 1's generation. Cut:
     /// no re-plan, and node 1 logs `replication_copy_not_advancing` while node 3 never gets the
     /// put. Integration (~3 s): three node threads, one restart.
+    ///
+    /// A-R330: under host stalls node 1 may drop node 3 before it reboots; since A-R329 node 3
+    /// rejoins either way, so the outcome is asserted on both sides of the drop. One
+    /// `rf3_restart_breakdown` line, and every failure message, say whether node 3 was dropped,
+    /// how long the reopen took, and how long until node 3 held the put.
     #[config_log::retcd_test]
     fn m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3() {
+        const METHOD: &str =
+            "m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3";
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -5057,7 +5064,23 @@ mod tests {
         let before = of(&db, OWNER)
             .recovered
             .expect("node 1 recovered at the open");
+        let reopen = std::time::Instant::now();
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        let reopen_ms = u64::try_from(reopen.elapsed().as_millis()).expect("ms fit u64");
+        let restarted = std::time::Instant::now();
+        // Whether node 1 planned node 3's drop, read from this row's own log.
+        let dropped = || {
+            config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                .iter()
+                .any(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3)
+        };
+        let facts = || {
+            format!(
+                "[dropped={}, reopen_ms={reopen_ms}, since_restart_ms={}]",
+                if dropped() { "yes" } else { "no" },
+                restarted.elapsed().as_millis()
+            )
+        };
         assert_eq!(
             db.restart_note().as_deref(),
             Some(
@@ -5076,15 +5099,17 @@ mod tests {
                     Ok(put) => break put,
                     Err(refused) => assert!(
                         std::time::Instant::now() < deadline,
-                        "no put landed within {patience:?} of the restart: {refused:?}"
+                        "no put landed within {patience:?} of the restart: {refused:?} {}",
+                        facts()
                     ),
                 }
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "node 1 did not re-plan past generation {} and admit within {patience:?}: \
-                 {owner:?}",
-                before.0
+                 {owner:?} {}",
+                before.0,
+                facts()
             );
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -5102,11 +5127,20 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "node 3 holds {held:?}, not generation {} through {target}, within {patience:?} \
-                 (put {put:?})",
-                generation.0
+                 (put {put:?}) {}",
+                generation.0,
+                facts()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        let rf3_ms = u64::try_from(restarted.elapsed().as_millis()).expect("ms fit u64");
+        tracing::info!(
+            dropped = dropped(),
+            reopen_ms,
+            rf3_ms,
+            generation = generation.0,
+            "rf3_restart_breakdown"
+        );
         db.shutdown();
     }
 

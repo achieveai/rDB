@@ -2125,9 +2125,9 @@ fn a_write_unpublished_at_a_fence_is_what_the_queue_waits_on_until_it_publishes(
 /// still past its grant's expiry, then given only the flush duty, which is sited at partition 0.
 ///
 /// A-R331: the fan-out set is A1's own fence views, kept to partitions with a T1 or P1. Node 1
-/// also serves partition 2, a `partitions/2` record naming it owner, with no plan, so no T1 or
-/// P1. A1's fence views name 0, 1 and 2; partition 2 gets no fence event, so no P1 slot or T1
-/// kernel is made there and the node does not fault (A-12). Partition 1 freezes (A-13).
+/// also serves partition 2, a `partitions/2` record naming it owner, with no plan, so no T1.
+/// A1's fence views name 0, 1 and 2. Partition 2's P1, made by A1's view, takes the fence; no
+/// T1 is made there and the node does not fault. Partition 1 freezes (A-13).
 /// Integration (~2 s): bootstrap's discovery window, then one 600 ms grant left to lapse.
 #[config_log::retcd_test]
 fn a_node_fence_sited_at_partition_0_freezes_partition_1s_queue() {
