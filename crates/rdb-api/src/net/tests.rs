@@ -1378,3 +1378,161 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
         "a call waiting on the replaced link is let go, not left waiting"
     );
 }
+
+/// A handshake from node 2's certificate that this row holds open, as a dialler that has not
+/// given up yet would; dropping both halves abandons it, as a dialler past `HANDSHAKE` has.
+async fn handshake_as_node_2(
+    certs: &FsPath,
+    addr: std::net::SocketAddr,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<super::pb::Envelope>,
+    tonic::Streaming<super::pb::Envelope>,
+) {
+    let tls = certs::load(certs, &Label::Node(NodeId(2))).expect("certs");
+    let channel = tonic::transport::Endpoint::from_shared(format!("https://{addr}"))
+        .expect("endpoint")
+        .tls_config(tls.client_tls_config_for(&certs::node_domain(NodeId(1))))
+        .expect("tls")
+        .connect()
+        .await
+        .expect("connects");
+    let mut client = super::pb::rdb_net_client::RdbNetClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let hello = Frame::Hello(wire::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        label: Label::Node(NodeId(2)),
+        boot: BootId(22),
+    });
+    tx.send(super::envelope(&hello)).expect("hello");
+    let inbound = client
+        .link(tonic::Request::new(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
+        .await
+        .expect("link")
+        .into_inner();
+    (tx, inbound)
+}
+
+/// The id of the link node `net` routes node 2 by, read on a thread of its own so a lock that
+/// is never let go fails the row instead of hanging it.
+fn route_to_2(net: &Arc<Net>) -> Option<u64> {
+    let net = Arc::clone(net);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let id = super::lock(&net.shared.routes)[&NodeId(2)]
+            .conn
+            .as_ref()
+            .map(|conn| conn.id);
+        let _ = tx.send(id);
+    });
+    rx.recv_timeout(PATIENCE)
+        .expect("the routes answer within PATIENCE")
+}
+
+/// Poll `route_to_2(net)` until `wanted` holds or `PATIENCE` passes.
+fn until_route(net: &Arc<Net>, what: &str, wanted: impl Fn(Option<u64>) -> bool) -> Option<u64> {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        let id = route_to_2(net);
+        if wanted(id) {
+            return id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} within {PATIENCE:?}: node 1 routes node 2 by {id:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A-R320, both install orders of an abandoned handshake beside node 2's live dial (see
+/// [`a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer`]). Whichever installs
+/// second, nodes 1 and 2 end with one live link and a route both ways: a message crosses each
+/// way within `PATIENCE`.
+fn an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(abandoned_first: bool) {
+    let runtime = Bounded(Some(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime"),
+    ));
+    let rt = runtime.0.as_ref().expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = rt.block_on(side(Spec::node(1, dir.path(), &[2]), true));
+    let addr = one.net.addr().expect("listening");
+    let dial_2 = || {
+        rt.block_on(side(
+            Spec::node(2, dir.path(), &[1]).dialling(1, addr),
+            false,
+        ))
+    };
+    let two = if abandoned_first {
+        let abandoned = rt.block_on(handshake_as_node_2(dir.path(), addr));
+        let first = until_route(&one.net, "the held handshake installs", |id| id.is_some());
+        let two = dial_2();
+        until_route(&one.net, "node 2's dial replaces it", |id| {
+            id.is_some_and(|id| id != first.expect("installed"))
+        });
+        drop(abandoned);
+        two
+    } else {
+        let two = dial_2();
+        let live = until_route(&one.net, "node 2's dial installs", |id| id.is_some());
+        let abandoned = rt.block_on(handshake_as_node_2(dir.path(), addr));
+        let held = until_route(&one.net, "the held handshake replaces it", |id| id != live);
+        drop(abandoned);
+        until_route(&one.net, "node 1 has a live route to node 2 again", |id| {
+            id.is_some() && id != held
+        });
+        two
+    };
+
+    let ask = || Msg::Restore {
+        partition: PartitionId(1),
+        seed: seed(),
+    };
+    one.links.send(NodeId(1), NodeId(2), ask()).expect("sent");
+    let got = two
+        .mail
+        .recv_timeout(PATIENCE)
+        .expect("node 1 reaches node 2: it has a route to node 2 again");
+    assert_eq!(format!("{got:?}"), format!("{:?}", ask()));
+    two.links.send(NodeId(2), NodeId(1), ask()).expect("sent");
+    let got = one
+        .mail
+        .recv_timeout(PATIENCE)
+        .expect("node 2 reaches node 1");
+    assert_eq!(format!("{got:?}"), format!("{:?}", ask()));
+}
+
+/// A runtime that, dropped, waits at most a second for its workers: one a cut leaves stuck on
+/// a lock must fail the row, not hang it, panicking or not.
+struct Bounded(Option<tokio::runtime::Runtime>);
+
+impl Drop for Bounded {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_timeout(Duration::from_secs(1));
+        }
+    }
+}
+
+/// The held handshake installs first and node 2's dial replaces it. Cut: close a replaced link
+/// under the routes lock (before 27620de), and the routes never answer again.
+/// Integration (~0.1 s: real TLS on loopback).
+#[config_log::retcd_test]
+fn an_abandoned_handshake_installed_first_leaves_routes_both_ways() {
+    an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(true);
+}
+
+/// L5-3's order: the abandoned handshake installs second and replaces node 2's live link.
+/// Closing the live link ends its stream, so node 2 dials again and node 1 gets a route back.
+/// Cut: close only forgets the link, node 2 still holds it up and never dials, and node 1's
+/// message to node 2 waits for ever. Integration (~0.1 s: real TLS on loopback).
+#[config_log::retcd_test]
+fn an_abandoned_handshake_installed_second_leaves_routes_both_ways() {
+    an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(false);
+}
