@@ -1,13 +1,20 @@
-//! `Cluster::stop_node` and `Cluster::shutdown` are bounded (#31).
+//! `Cluster::stop_node` and `Cluster::shutdown` are bounded (#31), and a socket that never
+//! speaks cannot hold a stop at all.
 //!
 //! On 2026-10-23 one `m4_88` run passed every assertion and then sat in `Cluster::shutdown`
 //! for over ten minutes. Node 1 logged `node stopped`; nodes 2 and 3 never began to stop, so the
 //! wait was in node 1's plane drain. tonic drains a plane by waiting for every connection it
-//! accepted to close, with no timeout, and a connection that never finishes its HTTP/2
-//! handshake never closes. These rows hold one such connection open on purpose.
+//! accepted to close, with no timeout. The connection that held it was a peer's dial that
+//! landed in node 1's backlog during a restart and never sent its HTTP/2 preface; hyper waits
+//! for the preface before it will close. The plaintext listener now hands tonic a socket only
+//! once its client has sent something.
 //!
-//! Cut: replace the `timeout_at` in `StopProgress::step` with a plain `.await` — both rows hang
-//! in the drain instead of failing.
+//! Cuts:
+//! - Replace the `timeout_at` in `StopProgress::step` with a plain `.await`: the two deadline
+//!   rows hang in the drain instead of failing.
+//! - In `config_grpc::server::spawn_first_bytes`, make the `select!` yield `None` at once
+//!   (forward every socket unread): the silent-socket row fails, its `stop_node` panicking
+//!   "still waiting on peer plane drain".
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +22,7 @@ use std::time::Duration;
 use config_core::NodeId;
 use config_testkit::cluster::Cluster;
 use config_testkit::poll::TestTimers;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Fast timers, so a row that waits out a whole stop deadline costs seconds, not tens of them.
@@ -25,15 +32,24 @@ const FAST: TestTimers = TestTimers {
     election_timeout_max: Duration::from_millis(300),
 };
 
-/// Connect to `endpoint` and say nothing.
+/// The HTTP/2 client preface, then an empty SETTINGS frame.
+const PREFACE_AND_SETTINGS: &[u8] =
+    b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+
+/// Open an HTTP/2 connection to `endpoint`, then go silent.
 ///
-/// The server speaks first: an HTTP/2 server sends its SETTINGS before it reads the client's
-/// preface. Reading those bytes proves tonic accepted this connection and is waiting on it,
-/// so a stop that follows cannot race the accept.
-async fn silent_client(cluster: &Cluster, endpoint: &str) -> TcpStream {
+/// It sends the preface and its SETTINGS, so tonic takes the connection, and then never
+/// acknowledges anything — in particular not the PING a graceful shutdown waits on, so the
+/// connection never closes. Reading the server's own SETTINGS proves tonic accepted it, so a
+/// stop that follows cannot race the accept.
+async fn stalled_client(cluster: &Cluster, endpoint: &str) -> TcpStream {
     let mut stream = TcpStream::connect(endpoint)
         .await
         .unwrap_or_else(|e| panic!("connect to {endpoint}: {e}"));
+    stream
+        .write_all(PREFACE_AND_SETTINGS)
+        .await
+        .unwrap_or_else(|e| panic!("write the preface to {endpoint}: {e}"));
     let mut first = [0u8; 9];
     let read = tokio::time::timeout(cluster.deadline(1), stream.read(&mut first))
         .await
@@ -61,7 +77,7 @@ fn panic_text(e: tokio::task::JoinError) -> String {
 async fn stop_node_fails_within_its_deadline_naming_the_stuck_node() {
     let cluster = Arc::new(Cluster::builder().nodes(1).timers(FAST).start().await);
     let id = NodeId(1);
-    let _held = silent_client(&cluster, &cluster.client_endpoint(id)).await;
+    let _held = stalled_client(&cluster, &cluster.client_endpoint(id)).await;
     let bound = cluster.stop_deadline();
 
     let started = tokio::time::Instant::now();
@@ -93,7 +109,7 @@ async fn shutdown_fails_within_its_deadline_and_stops_the_other_nodes() {
         .await
         .expect("a leader elects");
     let stuck = NodeId(2);
-    let _held = silent_client(&cluster, &cluster.client_endpoint(stuck)).await;
+    let _held = stalled_client(&cluster, &cluster.client_endpoint(stuck)).await;
     let bound = cluster.stop_deadline() * 3;
     let slack = cluster.deadline(1);
 
@@ -114,4 +130,74 @@ async fn shutdown_fails_within_its_deadline_and_stops_the_other_nodes() {
         took < bound + slack,
         "shutdown failed after {took:?}; its bound is {bound:?}"
     );
+}
+
+/// A socket that connects to a node's peer plane and never sends a byte does not hold that
+/// node's stop: the listener never hands it to tonic, and shutdown drops it at once.
+///
+/// This is the #31 hang itself. There a peer's abandoned dial sat in a restarting node's
+/// backlog, was accepted when the plane came up, and held the drain forever.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_socket_that_never_speaks_does_not_hold_a_stop() {
+    const METHOD: &str = "a_socket_that_never_speaks_does_not_hold_a_stop";
+    let cluster = Cluster::builder().nodes(1).timers(FAST).start().await;
+    let id = NodeId(1);
+    let endpoint = cluster.peer_endpoint(id);
+    let silent = TcpStream::connect(&endpoint)
+        .await
+        .unwrap_or_else(|e| panic!("connect to {endpoint}: {e}"));
+    let peer = silent
+        .local_addr()
+        .expect("a connected socket has a local address")
+        .to_string();
+    let named = |row: &serde_json::Value, message: &str| {
+        row.get("@m").and_then(serde_json::Value::as_str) == Some(message)
+            && row.get("peer").and_then(serde_json::Value::as_str) == Some(peer.as_str())
+    };
+    cluster
+        .wait_for(
+            "the peer plane to accept the silent socket",
+            cluster.deadline(4),
+            || {
+                config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                    .iter()
+                    .any(|row| named(row, "grpc connection waiting for its first bytes"))
+                    .then_some(())
+            },
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+
+    let started = tokio::time::Instant::now();
+    cluster.stop_node(id).await;
+    let took = started.elapsed();
+    assert!(
+        took < config_grpc::tls::DEFAULT_HANDSHAKE_TIMEOUT,
+        "stop took {took:?}: the silent socket was held until its first-bytes timeout"
+    );
+
+    // The gate task sees the shutdown on its own schedule, so wait for its line.
+    let dropped = cluster
+        .wait_for(
+            "the silent socket to be dropped",
+            cluster.deadline(4),
+            || {
+                let rows: Vec<serde_json::Value> =
+                    config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                        .into_iter()
+                        .filter(|row| named(row, "grpc connection dropped before it sent a byte"))
+                        .collect();
+                (!rows.is_empty()).then_some(rows)
+            },
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+    assert!(
+        dropped.len() == 1
+            && dropped[0].get("cause").and_then(serde_json::Value::as_str) == Some("shutdown")
+            && dropped[0].get("plane").and_then(serde_json::Value::as_str) == Some("peer"),
+        "the silent socket must be dropped once, by the shutdown, on the peer plane: {dropped:?}"
+    );
+    drop(silent);
+    cluster.shutdown().await;
 }
