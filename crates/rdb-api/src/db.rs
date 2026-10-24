@@ -9343,9 +9343,10 @@ mod tests {
     /// durable and the peers' acks waiting in its mailbox, does not pause writes. The loop drains
     /// the mail it took before it runs the due duties, so the peers' `DurableAdvanced` reaches L1
     /// before the overdue health eval. Node 1 sleeps 1 s (the pause age is 400 ms) at the top of
-    /// a loop once its copy is durable past the primary's floor. Cut: `run_due` before that
-    /// drain, and L1 pauses on stale progress. Integration (~3 s): one open, puts until the stall
-    /// fires, then twice the pause age.
+    /// a loop once its copy is durable past the primary's floor and through every put it applied
+    /// (A-R389: a put it had not synced would pause L1 rightly, on its own exposure). Cut:
+    /// `run_due` before that drain, and L1 pauses on stale progress. Integration (~3 s): one
+    /// open, puts until the stall fires, then twice the pause age.
     #[config_log::retcd_test]
     fn m10_d18_a_stall_of_node_1_alone_does_not_pause_writes_its_peers_made_durable() {
         const METHOD: &str =

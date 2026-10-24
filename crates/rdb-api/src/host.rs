@@ -1405,9 +1405,10 @@ struct InFlight {
 }
 
 /// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
-/// an iteration, when its own copy of partition 1 is durable further than the primary's floor
-/// and at least through the `Seq` given. So the peers' answers that would raise the floor land
-/// in its mailbox while it sleeps. Crate tests only.
+/// an iteration, when its own copy of partition 1 is durable further than the primary's floor,
+/// at least through the `Seq` given, and through everything it has applied (A-R389). So the
+/// peers' answers that would raise the floor land in its mailbox while it sleeps, and nothing
+/// but those answers is needed to make every record safe. Crate tests only.
 #[cfg(test)]
 static STALL_LOOP: Mutex<Vec<(PathBuf, Seq, Duration)>> = Mutex::new(Vec::new());
 
@@ -2071,7 +2072,8 @@ impl Host {
     }
 
     /// [`STALL_LOOP`]: sleep once, armed for this copy, when its own copy of partition 1 is
-    /// durable through the armed `Seq` and further than the primary's floor.
+    /// durable through the armed `Seq`, through all it has applied, and further than the primary's
+    /// floor.
     #[cfg(test)]
     fn stall_loop(&mut self) {
         let partition = PartitionId(1);
@@ -2088,18 +2090,27 @@ impl Host {
             return;
         };
         let floor = primary.tracker().min_required_durable().0;
-        let own = self
-            .engine
-            .durable(partition, self.adopted(partition).generation)
-            .0;
+        let generation = self.adopted(partition).generation;
+        let own = self.engine.durable(partition, generation).0;
+        // A-R389: and durable through all it has applied. A record applied but not yet synced
+        // here stays unsafe until this loop syncs it, which the stall forbids; L1 would then
+        // pause on the primary's own exposure, rightly, and no mail could clear it.
+        let applied = self.engine.buffered_applied(partition, generation).0;
         let through = armed[at].1;
-        if own < through.0 || own <= floor {
+        if own < through.0 || own <= floor || own < applied {
             return;
         }
         let (_, _, pause) = armed.remove(at);
         drop(armed);
         let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
-        tracing::info!(node = self.node.0, own, floor, millis, "test_loop_stalled");
+        tracing::info!(
+            node = self.node.0,
+            own,
+            applied,
+            floor,
+            millis,
+            "test_loop_stalled"
+        );
         std::thread::sleep(pause);
     }
 
