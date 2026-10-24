@@ -572,6 +572,68 @@ async fn read_owner(
     Ok((record.owner, root.instance))
 }
 
+/// Whether node processes for `nodes` may start on empty copies (ruling A-R328, narrowing
+/// A-R231(a)): only when the control plane says the database is formed, and every one of them
+/// is a member of partition 1. Returns the record and the instance an empty copy binds.
+///
+/// # Errors
+///
+/// [`OpenError::Config`] naming the cause: the database is not formed (no `partitions/1`, or
+/// one that names no instance yet), or a node is not a member. [`OpenError::Control`] when the
+/// store does not answer, and [`OpenError::Undecodable`] when the record does not decode.
+async fn formed_member(
+    store: &Arc<dyn ConfigStore>,
+    nodes: &[NodeId],
+) -> Result<(PartitionRecord, [u8; INSTANCE_LEN]), OpenError> {
+    let named = nodes
+        .iter()
+        .map(|node| node.0.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key = ControlKey::Partition(PARTITION).encode();
+    let read = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| {
+            let step = match error {
+                config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
+                _ => "",
+            };
+            OpenError::Control(format!("get partitions/1: {error}{step}"))
+        })?;
+    let Some(found) = read.record else {
+        return Err(OpenError::Config(format!(
+            "database not formed: the control store holds no partitions/1, so node {named} has \
+             no database to rejoin. Run lr up to form it"
+        )));
+    };
+    let record = PartitionRecord::decode(&found.value)
+        .ok_or_else(|| undecodable(&key, "not a partition record this build reads"))?;
+    let Some(root) = PartitionRoot::decode(&found.value) else {
+        return Err(OpenError::Config(format!(
+            "database not formed yet: partitions/1 names no instance. Wait for its first open \
+             (lr up) to finish, then start node {named} again"
+        )));
+    };
+    let members: Vec<NodeId> = admin::members().iter().map(|member| member.node).collect();
+    if let Some(stranger) = nodes.iter().find(|node| !members.contains(node)) {
+        return Err(OpenError::Config(format!(
+            "node {} is not a member of partition {} (its members are nodes {}), so it holds \
+             no copy to rebuild",
+            stranger.0,
+            PARTITION.0,
+            members
+                .iter()
+                .map(|node| node.0.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok((record, root.instance))
+}
+
 /// How a reopen's heal stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealState {
@@ -940,20 +1002,18 @@ impl Db {
         std::fs::create_dir_all(&config.dir)?;
         let partial = local_nodes(&config.local)?;
         let nodes_dir = config.dir.join("nodes");
-        // A node process opens only its own copy, and only one a formed database left (ruling
-        // A-R231(a)): it never creates a copy, binds an instance or bootstraps.
+        // A node process opens only its own copy, and never bootstraps or forms (ruling
+        // A-R231(a)). It creates an empty copy only for a formed database it is a member of
+        // (A-R328): that copy binds the database's instance in `check` and is rebuilt.
         if partial {
-            for node in &config.local {
-                let dir = nodes_dir.join(node.0.to_string());
-                if !dir.join("CURRENT").exists() {
-                    return Err(OpenError::Config(format!(
-                        "{} holds no copy of node {}: form the database first (lr up), then \
-                         start node {} again",
-                        one_separator(&dir).display(),
-                        node.0,
-                        node.0
-                    )));
-                }
+            let missing: Vec<NodeId> = config
+                .local
+                .iter()
+                .copied()
+                .filter(|node| !nodes_dir.join(node.0.to_string()).join("CURRENT").exists())
+                .collect();
+            if !missing.is_empty() {
+                formed_member(&store, &missing).await?;
             }
         }
         let created = match std::fs::create_dir(&nodes_dir) {
@@ -1121,13 +1181,44 @@ impl Db {
             )));
         }
         let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
+        // A node process's empty copy (wiped, or created above) joins a formed database it is a
+        // member of as a behind copy, bound to that database's instance, and F1's rebuild fills
+        // it (ruling A-R328). It never forms one.
         if partial && !holds_data {
-            let nodes: Vec<String> = engines.keys().map(|node| node.0.to_string()).collect();
-            return Err(OpenError::Config(format!(
-                "the copy of node {} holds no data: form the database first (lr up), then start \
-                 the node again",
-                nodes.join(", ")
-            )));
+            let nodes: Vec<NodeId> = engines.keys().copied().collect();
+            let (record, instance) = formed_member(store, &nodes).await?;
+            if let Some(ours) = bound.first() {
+                if *ours != instance {
+                    return Err(OpenError::Mismatch(another_database(
+                        ours,
+                        &format!("instance {}", admin::instance_hex(&instance)),
+                    )));
+                }
+            }
+            if engines.contains_key(&record.owner) {
+                return Err(OpenError::Config(format!(
+                    "the copy of node {} holds no data, and partition {} names it owner: promote \
+                     another node first (lr promote), then start node {} again",
+                    record.owner.0, PARTITION.0, record.owner.0
+                )));
+            }
+            for (node, engine) in engines.iter_mut() {
+                engine
+                    .bind_instance(instance)
+                    .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+            }
+            tracing::info!(
+                generation = record.generation.0,
+                owner = record.owner.0,
+                nodes = ?nodes.iter().map(|node| node.0).collect::<Vec<_>>(),
+                "db_open_empty_copy_joining"
+            );
+            return Ok(Found {
+                instance,
+                fresh: false,
+                owner: record.owner,
+                roll: None,
+            });
         }
         if holds_data {
             if let Some((node, _)) = engines.iter().find(|(_, e)| e.instance().is_none()) {
