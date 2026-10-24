@@ -493,7 +493,8 @@ impl Default for Opened {
 struct Route {
     /// The node calls go to.
     owner: std::sync::atomic::AtomicU32,
-    /// What a `NOT_PRIMARY` answer re-reads `partitions/1` with. `None`: the owner is fixed.
+    /// What a `NOT_PRIMARY` answer, or an owner that cannot be reached, re-reads `partitions/1`
+    /// with. `None`: the owner is fixed.
     refresh: Option<(Arc<dyn ConfigStore>, Handle)>,
 }
 
@@ -1490,15 +1491,40 @@ impl Db {
         })
     }
 
-    fn call(&self, call: ClientCall, wait: Duration) -> Option<Answer> {
+    /// Send `call` to `node`; the receiver its answer comes on. The message holds the only
+    /// sender, so a node that drops the call unanswered disconnects the receiver.
+    fn send_call(
+        &self,
+        node: NodeId,
+        call: ClientCall,
+    ) -> Result<mpsc::Receiver<Answer>, NodeStopped> {
         let (reply, answer) = mpsc::channel();
         let msg = Msg::Client(Client {
             partition: PARTITION,
             call,
             reply,
         });
-        let owner = self.route.owner();
-        if self.send_to(owner, msg).is_err() {
+        self.send_to(node, msg).map(|()| answer)
+    }
+
+    fn call(&self, call: ClientCall, wait: Duration) -> Option<Answer> {
+        let mut owner = self.route.owner();
+        // A `Db` that can look again keeps a copy for one resend: when the owner cannot be
+        // reached it may have been promoted away by another process, which told nobody here
+        // (A-R287 P1, tester-s2 F-T1). Re-read `partitions/1` and, if it names a new owner,
+        // send there.
+        let spare = self.route.refresh.is_some().then(|| call.clone());
+        let mut sent = self.send_call(owner, call);
+        if let (Err(_), Some(call)) = (&sent, spare) {
+            self.refresh_owner();
+            let now = self.route.owner();
+            if now != owner {
+                tracing::info!(was = owner.0, owner = now.0, "db_call_rerouted");
+                owner = now;
+                sent = self.send_call(owner, call);
+            }
+        }
+        let Ok(answer) = sent else {
             // An owner in another process with no link up is unavailable, not a host fault:
             // a retry helps once it is back or promoted away (W7 for W5, tester-s2 G walk).
             let local = lock(&self.nodes).iter().any(|handle| handle.node == owner);
@@ -1510,7 +1536,7 @@ impl Db {
                 },
                 request: None,
             });
-        }
+        };
         match answer.recv_timeout(wait) {
             Ok(answer) => {
                 if let Answer::Error { error, .. } = &answer {
@@ -1530,10 +1556,10 @@ impl Db {
         }
     }
 
-    /// After a `NOT_PRIMARY` answer, read the owner `partitions/1` names now, so the caller's
-    /// retry, which `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the
-    /// read timeout. A `Db` whose owner is fixed reads nothing. A read that fails keeps the
-    /// owner it had and logs why: the next `NOT_PRIMARY` reads again.
+    /// After a `NOT_PRIMARY` answer, or a send the owner could not take (A-R287 P1), read the
+    /// owner `partitions/1` names now, so the next call, or the caller's retry that
+    /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout. A `Db` whose owner is fixed reads nothing. A read that fails keeps the
+    /// owner it had and logs why: the next such answer reads again.
     fn refresh_owner(&self) {
         let Some((store, rt)) = &self.route.refresh else {
             return;
@@ -6409,6 +6435,83 @@ mod tests {
              retrying will not help: keep this Db's log and report this message)"
         );
         assert_eq!(mailbox.try_iter().count(), 0, "nothing was sent");
+    }
+
+    /// A-R287 P1 part 1 (tester-s2 F-T1, all 5 promote runs at f1f6891): an app opened before
+    /// its owner died follows a promote made by another process, with no restart. App A runs no
+    /// node; node 1 stops; the nodes' own `Db` promotes node 2 (as `lr promote 2` does from a
+    /// separate process, so app A's route is not told). App A's next puts must land on node 2
+    /// at the new generation within patience, not answer `UNAVAILABLE` "node 1 is not
+    /// reachable" until node 1 is back.
+    /// Cut: `Db::call` does not re-read the owner when the send fails; every put after the
+    /// promote is refused and this goes red.
+    /// Integration (~5 s: the promote waits node 1's grant out).
+    #[config_log::retcd_test]
+    fn m10_s2_an_open_app_follows_a_promote_it_did_not_make() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut nodes = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("the nodes' open");
+        admits(&nodes, "after the nodes' open");
+        let app_dir = config_testkit::fs::temp_dir();
+        let mut app = rt
+            .block_on(Db::open(
+                DbConfig {
+                    local: Vec::new(),
+                    links: Some(Arc::clone(nodes.links())),
+                    client: ClientId(2),
+                    ..config(app_dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("the app-only open");
+        app.put(b"a", b"1", None)
+            .expect("app A's put while node 1 runs");
+
+        lock(&nodes.nodes)
+            .iter_mut()
+            .find(|handle| handle.node == OWNER)
+            .expect("node 1 runs here")
+            .stop();
+        let promoted = nodes.promote(NodeId(2), None).expect("promote 2");
+        assert_eq!(app.route.owner(), OWNER, "nobody told app A");
+
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = Instant::now() + patience;
+        let mut refused = Vec::new();
+        let put = loop {
+            match app.put(b"b", b"2", None) {
+                Ok(put) => break put,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "app A's put did not land within {patience:?} of the promote; \
+                         {} refusals, the last: {error}",
+                        refused.len()
+                    );
+                    refused.push(error.error.kind);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(put.generation, promoted.generation, "{put:?}");
+        assert_eq!(app.route.owner(), NodeId(2), "app A now calls node 2");
+        assert_eq!(
+            app.get(b"a").expect("get a").value.map(|(_, v)| v),
+            Some(Bytes::from_static(b"1")),
+            "the write made before the promote reads back at node 2"
+        );
+        tracing::info!(refused = ?refused, "p1_app_followed");
+        app.shutdown();
+        nodes.shutdown();
     }
 
     /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
