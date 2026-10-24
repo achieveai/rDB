@@ -228,7 +228,8 @@ allows; it is not a new rule.
 | Error | Retry rule | Class |
 |---|---|---|
 | `NOT_PRIMARY`, `ROUTE_CHANGED` | refresh route; **retain request identity and expected generation** | no admission |
-| `LEASE_EXPIRED`, `RECOVERY_READ_ONLY` | retry after health/authority recovers; **do not assume an already-admitted request failed** | no admission *for this submission* |
+| `LEASE_EXPIRED` | retry after health/authority recovers; **do not assume an already-admitted request failed** | proves no mutation *by this submission* (amended 2026-10-24, below) |
+| `RECOVERY_READ_ONLY` | retry after health/authority recovers; **do not assume an already-admitted request failed** | no admission *for this submission* |
 | `PROTECTION_PAUSED` | retry after health/authority recovers; **do not assume an already-admitted request failed** | proves no mutation *by this submission* (amended 2026-10-22, below) |
 | `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | definitive rejection before mutation; the caller changes the request intentionally | proves no mutation *by this submission* |
 | `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | definitive no-admission; bounded jittered retry | proves no mutation *by this submission* |
@@ -262,8 +263,9 @@ only.
 - What it does not change: the proof covers this send only (#35, above). A resend of an identity
   that may have applied still reports no proof to the app (`Db::retried`), and one waiter per
   identity keeps a resend's answer off the original's.
-- Not moved: `LEASE_EXPIRED` is also what a deny after apply answers, so it proves nothing.
-  `RECOVERY_READ_ONLY` and `DIVERGENCE_REQUIRES_OPERATOR` are unchanged by this ruling.
+- Not moved: `LEASE_EXPIRED` was then also what a deny after apply answered, so it proved
+  nothing (moved on 2026-10-24, below). `RECOVERY_READ_ONLY` and `DIVERGENCE_REQUIRES_OPERATOR`
+  are unchanged by this ruling.
 - Pinned by `a_failed_batch_answers_the_queue_behind_it` (each answer's proof) and
   `no_deny_reason_after_apply_is_paused_or_proves_no_mutation` in `rdb-core/tests/transaction_t1.rs`.
 
@@ -281,6 +283,26 @@ proves no mutation by this submission.** It keeps its retry rule, reconcile.
   `a_write_applied_before_a_generation_change_never_proves_no_mutation` in
   `rdb-core/tests/transaction_t1.rs`.
 
+**Amended 2026-10-24 (M10 S2, lead rulings A-R342 and A-R343; critic-q3; tester-s2 Q3):
+`LEASE_EXPIRED` proves no mutation by this submission.** It keeps its retry rule.
+- Why it holds: every producer refuses before apply. They are admission's authority check (§3
+  check 6) and a freeze for a lost grant, the `StorageDispatch` check and its re-ask, and a
+  refused read, which writes nothing.
+- The boundary: after apply every `DenyReason` answers `UNKNOWN_OUTCOME`, the lease reasons and
+  `ControlUnavailable` (A-R285 had left it `LEASE_EXPIRED`) included. No caller denies a write
+  after apply today; the mapping keeps a future one from claiming a false "definitely not
+  applied". A kind the mapping gains later falls to `UNKNOWN_OUTCOME` in `deny_error`, never to
+  a proof.
+- Why it matters: while an owner waited to abandon a rejoin, every refused write said "not
+  proven", although nothing was written, so an app had to ask status for each one.
+- What it does not change: the proof covers this send only (#35, above). A resend still reports no
+  proof to the app (`Db::retried`). A resend that the ack floor has passed answers
+  `STATUS_EXPIRED` and is never applied.
+- Pinned by `a_lease_deny_before_apply_proves_no_mutation`,
+  `a_lease_deny_after_apply_answers_unknown_outcome` and
+  `no_deny_reason_after_apply_is_paused_or_proves_no_mutation` in
+  `rdb-core/tests/transaction_t1.rs`.
+
 ### 6. The local apply never returns success
 
 Spec §5.2 step 6: success is returned only after one regular-secondary buffered ACK plus an
@@ -292,6 +314,7 @@ publication rules are in the kernel-a design note).
 Consequences that follow and are therefore not separate decisions:
 
 - A post-apply timeout or lease loss returns `UNKNOWN_OUTCOME`, never a definitive failure (§5.3).
+  The deny mapping says the same for every reason after apply (amended 2026-10-24, §5).
 - That partition's normal read/write queue freezes until the transaction is resolved by a replica
   ACK or an explicit recovery decision. No later transaction may skip the unresolved sequence.
 - A transaction received by a replica may recover even if its client never saw success (§5.3).

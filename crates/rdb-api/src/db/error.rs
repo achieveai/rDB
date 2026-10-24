@@ -213,7 +213,8 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
              shows which node is primary"
         }
         ErrorKind::LeaseExpired => {
-            "call `Db::wait_ready`, then send the same request again with `Db::resend`"
+            "call `Db::wait_ready`, then send the same request again with `Db::resend`; if \
+             that answers STATUS_EXPIRED, nothing was written, so send it as a new request"
         }
         ErrorKind::RecoveryReadOnly => {
             "reads still work; writes return when the lost copies are back, and \
