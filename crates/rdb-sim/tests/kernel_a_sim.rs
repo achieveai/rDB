@@ -2012,9 +2012,9 @@ fn m7a_131_a1_p1_expire_authority_between_publication_and_reply() {
 ///
 /// - **Same node** (`gen2_committed`, then gen 3's root at `now`): a retry queued at `now`, ahead
 ///   of the root, is answered from gen 2's own index — the published result replayed, no batch;
-///   the first queued behind the root, during the resume hold, is refused `PROTECTION_PAUSED`;
-///   the other four, through gen 3's first admission, are refused `GENERATION_CHANGED{2, 3}` at
-///   check 5. The sequence is pinned; `NOT_PRIMARY` is never a same-node answer (reviewer T-3).
+///   the five queued behind the root are refused `GENERATION_CHANGED{2, 3}` at check 5. Gen 3's
+///   first resume skips the hold (A-R165), and R1's `Lost` at the generation's start no longer
+///   restores it (A-R344), so no retry meets `PROTECTION_PAUSED`. The sequence is pinned; `NOT_PRIMARY` is never a same-node answer (reviewer T-3).
 ///   `Status{Some(2)}` folds `RecoveredApplied`. A fresh request at `GEN3_ADMITS + 2` is
 ///   published in gen 3 at the next sequence, so gen 3 admits — it just does not re-execute.
 /// - **Different node** (the A1/P1 case): retries reach B before its T1 exists (`NOT_PRIMARY`),
@@ -2105,14 +2105,14 @@ fn m7a_136_f1_t1_generation_reconciliation_no_double_apply() {
             .map(|reply| kind(reply))
             .collect::<Vec<_>>(),
         [
-            "PROTECTION_PAUSED",
+            "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
         ],
-        "behind the root, in reply order: PROTECTION_PAUSED in the resume hold, then \
-         GENERATION_CHANGED{{2, 3}} through gen 3's admission; never NOT_PRIMARY here"
+        "behind the root, in reply order: GENERATION_CHANGED{{2, 3}}, since gen 3's first \
+         resume skips the hold (A-R165, A-R344); never NOT_PRIMARY here"
     );
     assert_eq!(
         status_reply(&replies, WRITTEN),

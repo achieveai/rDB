@@ -818,12 +818,16 @@ fn m7b_77_barrier_invalidated_during_reprotecting_returns_to_paused() {
 }
 
 /// An instance in `Reprotecting{below_since: None}` at `start`, barrier 0, domain `{B, C}`, no
-/// peer heard from since construction. A `Lost` edge first makes this a later resume, which holds
-/// (A-R165): the generation's first resume would skip the hold these rows measure.
+/// peer heard from since construction. A first resume attempt that a `Lost` edge interrupts
+/// makes this a later resume, which holds (A-R165, A-R344): the generation's first resume would
+/// skip the hold these rows measure, and a `Lost` while still `Paused` keeps that skip.
 fn reprotecting_at(start: u64) -> Protection {
     let mut p = fresh(0);
     // R1's report that the cutoff is durable: an unreported predicate holds nothing (A-R167).
     step(&mut p, start, durable(&[(C1, 0)]));
+    step(&mut p, start, edge(QualificationDirection::Gained));
+    health(&mut p, start);
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
     step(&mut p, start, edge(QualificationDirection::Lost));
     step(&mut p, start, edge(QualificationDirection::Gained));
     health(&mut p, start);
@@ -1085,6 +1089,48 @@ fn m7b_141_protection_starts_paused_at_recovered_and_resumes_only_through_reprot
     health(&mut p, 3_500);
     assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
     assert_eq!(run(&mut p, 3_500, 20_000, |_, _| true), Some(8_600));
+}
+
+/// A-R344, found on the lr restart walk (`rejoin_committed`, then admission 5.2 s later). R1
+/// answers the new generation's config with `Lost{ConfigChanged, copies: []}` at the cutoff, a
+/// few ms after `Recovered`, while L1 is still `Paused`. That edge must not spend the
+/// generation's hold skip (A-R165): once a copy is `Gained` at the cutoff and the peers report,
+/// the first resume comes at the first evaluation, not after `resume_hold_millis`. A real pause
+/// after that resume still holds the full 5 s.
+#[retcd_test]
+fn a_generation_start_lost_while_paused_keeps_the_first_resume_hold_skip() {
+    let mut p = Protection::new();
+    step(&mut p, 0, recovered(config(C1, &[]), 100, GEN));
+    let mut start = edge(QualificationDirection::Lost);
+    if let KernelEvent::QualificationChanged(edge) = &mut start {
+        edge.at_seq = Seq(100);
+        edge.qualified_copies = vec![];
+        edge.qualified_ack_count = 0;
+        edge.cause = QualificationCause::ConfigChanged;
+    }
+    assert!(no_allow(&step(&mut p, 3, start)));
+    assert_eq!(p.mode(), Some(Mode::Paused));
+    step(&mut p, 100, durable(&[(C1, 100)]));
+    step(&mut p, 100, edge(QualificationDirection::Gained));
+    health(&mut p, 100);
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
+    // B and C report every 100 ms from 200: the first evaluation that sees lag below 250 ms
+    // resumes. Under the hold this was 5_200.
+    assert_eq!(run(&mut p, 100, 20_000, |_, _| true), Some(200));
+    assert_eq!(p.mode(), Some(Mode::Healthy));
+
+    // A pause after that resume is a later one: the full hold.
+    assert!(no_allow(&step(
+        &mut p,
+        1_000,
+        edge(QualificationDirection::Lost)
+    )));
+    step(&mut p, 1_000, edge(QualificationDirection::Gained));
+    let later = run(&mut p, 1_000, 20_000, |_, _| true);
+    assert!(
+        later.is_some_and(|t| t >= 1_000 + BUDGETS.resume_hold_millis),
+        "{later:?}"
+    );
 }
 
 /// Regression, ruling A-R167: a predicate R1 has not reported in this generation is durable
@@ -1648,10 +1694,15 @@ fn a_drain_returns_warn_to_healthy_in_the_draining_step() {
 
 /// `Recovered{cutoff 40}`, `Gained` at 10 and `DurableAdvanced{C1: 40}` at 20: `Paused` with its
 /// barrier durable, a qualifying secondary and nothing queued (tester probes s15 and d04). A
-/// `Lost` edge at 10 first makes the resume a later one, which holds (A-R165): these probes
-/// measure the hold, and the generation's first resume skips it.
+/// first resume attempt at 10 that a `Lost` edge interrupts makes the resume a later one, which
+/// holds (A-R165, A-R344): these probes measure the hold, and the generation's first resume
+/// skips it.
 fn paused_with_barrier_40_durable() -> Protection {
     let mut p = fresh(40);
+    step(&mut p, 10, edge(QualificationDirection::Gained));
+    step(&mut p, 10, durable(&[(C1, 40)]));
+    health(&mut p, 10);
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
     step(&mut p, 10, edge(QualificationDirection::Lost));
     step(&mut p, 10, edge(QualificationDirection::Gained));
     step(&mut p, 20, durable(&[(C1, 40)]));

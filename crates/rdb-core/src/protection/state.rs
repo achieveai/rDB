@@ -88,8 +88,10 @@ pub(super) struct State {
     lost: BTreeSet<CopyId>,
     blocked: Option<BlockReason>,
     /// Whether the next resume is this generation's first: set at construction, cleared by every
-    /// pause (ruling A-R165, ADR-0006 amendment 2026-10-23). The first resume still passes
-    /// through `Reprotecting` and still needs the exact barrier, a qualifying secondary and lag
+    /// pause that leaves `Healthy`, `Warn` or `Reprotecting` (ruling A-R165, ADR-0006 amendment
+    /// 2026-10-23). A pause while still `Paused` keeps it (A-R344): R1's `Lost{ConfigChanged}` at
+    /// the generation's start reaches a fresh instance that has not resumed, and is no oscillation.
+    /// The first resume still passes through `Reprotecting` and still needs the exact barrier, a qualifying secondary and lag
     /// below `resume_lag_millis`; it skips only the hold. The instance starts `Paused` because no
     /// copy qualifies yet, not because anything oscillated, so there is nothing to damp. Every
     /// later resume holds the full `resume_hold_millis`.
@@ -481,8 +483,12 @@ impl State {
 
     /// `* -> Paused { paused_prefix = highest_applied, resume_barrier = highest_applied }`.
     fn pause_at_head(&mut self) {
+        // A-R344: only a pause that leaves a resumed or resuming mode makes the next resume a
+        // later one. A `Lost` while still `Paused` (the generation-start edge) keeps the skip.
+        if self.mode != Mode::Paused {
+            self.first_resume = false;
+        }
         self.mode = Mode::Paused;
-        self.first_resume = false;
         self.paused_prefix = self.highest_applied;
         self.resume_barrier = self.highest_applied;
     }
