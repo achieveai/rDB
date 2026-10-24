@@ -390,6 +390,24 @@ pub enum Msg {
         /// Its new boot.
         boot: BootId,
     },
+    /// **Dev tool only**, debug builds (ruling A-R230): damage the record at `key` in `ns` of
+    /// lineage `(partition, generation)` in this node's own copy, through
+    /// [`RocksEngine::damage_record`], and answer how it went. Local only, like
+    /// [`Msg::PeerBooted`]: never sent over the links. `rdb_dev admin damage-copy` uses it
+    /// through [`crate::db::Db::damage_record`].
+    #[cfg(debug_assertions)]
+    Damage {
+        /// The partition.
+        partition: PartitionId,
+        /// The lineage's generation.
+        generation: Generation,
+        /// The namespace.
+        ns: Namespace,
+        /// The key in `ns`, as stored: a `History` record's is its seq, u64 big-endian.
+        key: Vec<u8>,
+        /// Where the answer goes.
+        reply: Sender<Result<(), rdb_storage::DamageRefused>>,
+    },
     /// Stop the thread.
     Stop,
 }
@@ -1861,6 +1879,26 @@ impl Host {
             }
             Msg::PeerBooted { node, boot } => {
                 self.peer_booted(node, boot);
+                Ok(())
+            }
+            #[cfg(debug_assertions)]
+            Msg::Damage {
+                partition,
+                generation,
+                ns,
+                key,
+                reply,
+            } => {
+                let answer = self.engine.damage_record(partition, generation, ns, &key);
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    ?ns,
+                    refused = ?answer.as_ref().err(),
+                    "host_record_damage"
+                );
+                let _ = reply.send(answer);
                 Ok(())
             }
             Msg::Stop => Ok(()),
@@ -6835,6 +6873,8 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Client(_) => "client",
         Msg::Inspect { .. } => "inspect",
         Msg::PeerBooted { .. } => "peer_booted",
+        #[cfg(debug_assertions)]
+        Msg::Damage { .. } => "damage",
         Msg::Stop => "stop",
     }
 }

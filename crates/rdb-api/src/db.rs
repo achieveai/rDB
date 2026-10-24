@@ -2167,6 +2167,54 @@ impl Db {
             .collect()
     }
 
+    /// **Dev tool only**, debug builds (ruling A-R230; `rdb_dev admin damage-copy`): damage the
+    /// record at `key` in `ns` of partition 1's lineage `generation` in `node`'s own copy only,
+    /// with [`rdb_storage::RocksEngine::damage_record`] on that node's thread. The other copies
+    /// keep the good record. `generation` is the one `node` holds: [`NodeStatus::holds`].
+    ///
+    /// # Errors
+    ///
+    /// The engine's refusal, as text (nothing was written); `node` not run by this process (a
+    /// copy is damaged from its own process); or `node` not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn damage_record(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        ns: rdb_core::contracts::storage::Namespace,
+        key: &[u8],
+    ) -> Result<(), String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::Damage {
+            partition: PARTITION,
+            generation,
+            ns,
+            key: key.to_vec(),
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: damage its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
     /// The peer links, to hold and heal.
     #[must_use]
     pub fn links(&self) -> &Arc<Links> {
@@ -3455,19 +3503,44 @@ mod tests {
         admits_within(db, phase, Duration::from_secs(5));
     }
 
-    /// [`admits`] with its own patience, scaled the same way.
+    /// [`admits`] with its own patience, scaled the same way. Logs one `admission_wait` line
+    /// when the wait ends, admitted or not, with the owner's last status: a red that left no
+    /// other line still says how long it waited and where node 1 stood (k477).
     fn admits_within(db: &Db, phase: &str, patience: Duration) {
         let patience = crate::host::test_patience(patience);
-        let deadline = std::time::Instant::now() + patience;
-        while owner_of(db, db.node_status()).and_then(|node| node.admits) != Some(true) {
+        let started = std::time::Instant::now();
+        let deadline = started + patience;
+        let mut polls = 0_u32;
+        loop {
+            polls += 1;
+            let owner = owner_of(db, db.node_status());
+            let admitted = owner.as_ref().and_then(|node| node.admits) == Some(true);
+            let timed_out = !admitted && std::time::Instant::now() >= deadline;
+            if admitted || timed_out {
+                tracing::info!(
+                    phase,
+                    admitted,
+                    waited_ms = millis(started.elapsed()),
+                    patience_ms = millis(patience),
+                    polls,
+                    admits = ?owner.as_ref().map(|node| node.admits),
+                    authority = owner.as_ref().map(|node| node.authority.as_str()),
+                    recovery = ?owner.as_ref().and_then(|node| node.recovery.as_deref()),
+                    recovered = ?owner.as_ref().and_then(|node| node.recovered).map(|g| g.0),
+                    protection = ?owner.as_ref().and_then(|node| node.protection.as_deref()),
+                    fault = ?owner.as_ref().and_then(|node| node.fault.as_deref()),
+                    "admission_wait"
+                );
+                assert!(
+                    admitted,
+                    "{phase}: node 1 does not admit writes within {patience:?}"
+                );
+                return;
+            }
             for node in db.node_status() {
                 let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                 crate::host::assert_not_blocked(&node, window);
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{phase}: node 1 does not admit writes within {patience:?}"
-            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -5541,8 +5614,9 @@ mod tests {
     /// carries its look: `Items { at: -1 }` lists the last item. It fails if `write` sends
     /// `expect: None` (the stale write publishes), if `read` forwards `Look::Doc` (the list read
     /// is `INVALID_ARGUMENT`), or if `byte_string` answers a map document as `Ok`.
-    /// Integration (~1 s): three node threads on wall-clock time.
-    #[test]
+    /// Integration (~1 s): three node threads on wall-clock time. A per-test log, so a red at
+    /// its first admission wait can be read (k477: one red under load left no line).
+    #[config_log::retcd_test]
     fn the_public_write_and_read_carry_the_change_its_guard_and_the_look() {
         use crate::host::ListEdit;
         use rdb_value::value::{Int, Map, MapKey};
@@ -5628,6 +5702,99 @@ mod tests {
         let refused = db.get(b"d").expect_err("d holds a map, not bytes");
         assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused:?}");
         assert!(refused.detail.contains("not a byte string"), "{refused:?}");
+        db.shutdown();
+        const METHOD: &str = "the_public_write_and_read_carry_the_change_its_guard_and_the_look";
+        let waits: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "admission_wait")
+            .collect();
+        assert_eq!(waits.len(), 1, "one line for the one wait: {waits:?}");
+        assert_eq!(
+            (&waits[0]["phase"], &waits[0]["admitted"]),
+            (
+                &serde_json::json!("before the first write"),
+                &serde_json::json!(true)
+            ),
+            "{waits:?}"
+        );
+        assert!(waits[0]["waited_ms"].is_u64(), "{waits:?}");
+    }
+
+    /// Ruling A-R230 (k420): `Db::damage_record` reaches one node's own copy through its host,
+    /// for `rdb_dev admin damage-copy`. Damaging node 1's stored `a` makes a read of `a` after
+    /// the next write `CORRUPT_HISTORY` (a read answers from the last step's view, taken before
+    /// the damage); a missing record is refused with nothing written; a `History` record is
+    /// reached by its seq; a node this process does not run is refused by name. It fails if the
+    /// host answers without calling the engine. Integration (~1 s).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn damage_record_damages_one_copy_through_its_host_and_refuses_a_missing_record() {
+        use rdb_core::contracts::storage::Namespace;
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        let put = db.put(b"a", b"1", None).expect("put a");
+        let written = Some((put.seq.0, Bytes::from_static(b"1")));
+        assert_eq!(db.get(b"a").expect("a reads").value, written);
+        let held = |node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .and_then(|status| status.holds)
+                .unwrap_or_else(|| panic!("node {} holds a lineage", node.0))
+                .generation
+        };
+
+        let missing = db
+            .damage_record(OWNER, held(OWNER), Namespace::User, b"zz")
+            .expect_err("nothing is stored at zz");
+        assert!(
+            missing.starts_with("node 1: no stored value at key "),
+            "{missing}"
+        );
+        let elsewhere = db
+            .damage_record(NodeId(9), held(OWNER), Namespace::User, b"a")
+            .expect_err("node 9 is not run here");
+        assert_eq!(
+            elsewhere,
+            "node 9 is not run by this process: damage its copy from its own process"
+        );
+        db.damage_record(
+            NodeId(2),
+            held(NodeId(2)),
+            Namespace::History,
+            &put.seq.0.to_be_bytes(),
+        )
+        .expect("node 2's history record of a is stored");
+
+        // The stored key is the root key, as the host reads it.
+        let root = rdb_value::keys::root_key(TENANT, GROUP, b"a");
+        db.damage_record(OWNER, held(OWNER), Namespace::User, root.as_bytes())
+            .expect("node 1's a is stored");
+        // A read answers from the view of the last step, taken before the damage: the next
+        // write takes a new one.
+        db.put(b"b", b"2", None).expect("put b");
+        let read = db
+            .get(b"a")
+            .expect_err("a's stored bytes no longer match its digest");
+        assert_eq!(
+            (read.kind, read.detail.as_str()),
+            (
+                ErrorKind::CorruptHistory,
+                "object \"a\": header bytes 0..8 and the payload do not hash to the stored digest"
+            ),
+            "{read:?}"
+        );
         db.shutdown();
     }
 
