@@ -260,7 +260,8 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
         }
         ErrorKind::IncompatibleVersion => "open the folder with the newer build that wrote it",
         ErrorKind::StatusExpired => {
-            "the answer is no longer kept: read the object to see whether the write is there"
+            "the answer is no longer kept: read the object to see its value, and write again only \
+             if that value is not the one you want"
         }
         ErrorKind::DivergenceRequiresOperator => {
             "an operator must act: keep this Db's log and report this message; retrying will \

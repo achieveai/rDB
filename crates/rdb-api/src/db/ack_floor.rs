@@ -126,6 +126,12 @@ impl AckFloor {
         self.pins.retain(|(pin, _)| *pin != id);
     }
 
+    /// Whether this open numbered `id` (A-R357): its `STATUS_EXPIRED` then means this `Db` was
+    /// answered for it, not an earlier open of the same client.
+    pub(crate) const fn numbered_here(&self, id: u64) -> bool {
+        open_base(RequestId(id)) == self.base
+    }
+
     /// The pins held, oldest first: what a row checks a settle against.
     #[cfg(test)]
     pub(crate) fn pins(&self) -> Vec<u64> {

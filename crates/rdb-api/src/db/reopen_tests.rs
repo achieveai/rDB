@@ -3150,3 +3150,269 @@ fn m10_s2_a_promote_over_the_net_reaches_node_2_in_another_process_and_writes_la
         db.shutdown();
     }
 }
+
+// dev-w5's A-R357 rows (tester tc1's G2, G3 and G6): what a resend after the ack floor dropped
+// its answer says, an app restarted over the links, two app processes on one `dir`, and the
+// guide's own code run against a real `Db`.
+
+/// embed.md, read at build time: the guide's code blocks must be the code these rows run.
+const GUIDE: &str = include_str!("../../../../docs/rdb/embed.md");
+
+/// The marked span of an included source, as embed.md's code block for it must read.
+fn embed_block(source: &str) -> String {
+    let source = source.replace("\r\n", "\n");
+    let begin = source.find("// embed.md begin\n").expect("begin marker") + 18;
+    let end = source.find("// embed.md end\n").expect("end marker");
+    format!("```rust\n{}```\n", &source[begin..end])
+}
+
+/// A fresh open of the folder at `dir`, ready: the `Db` that runs the three nodes.
+fn ready_nodes(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStore>) -> Db {
+    let nodes = open(rt, dir, store).expect("the fresh open");
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    nodes
+}
+
+/// A-R357 G2: a request this open was answered for, resent once a later write raised the ack
+/// floor past it, is `STATUS_EXPIRED`, and its text says which case it is: this app already
+/// received an answer for it. The step says to read the object, never to send it as new
+/// (A-R360). Nothing is applied. Integration (~1 s): one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_r357_an_answered_write_resent_says_this_app_was_answered() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = ready_nodes(&rt, dir.path(), &store);
+    let answered = db.put(b"a", b"1", None).expect("put a");
+    db.put(b"b", b"1", None)
+        .expect("a later put that acks past a");
+    let refused = db
+        .resend(*answered.sent)
+        .expect_err("its answer was dropped");
+    assert_eq!(refused.error.kind, ErrorKind::StatusExpired, "{refused:?}");
+    let text = refused.error.to_string();
+    assert!(
+        text.contains(&format!(
+            "request {}: this app already received an answer for it in this open",
+            answered.request.0
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("next: the answer is no longer kept: read the object to see its value"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("as new"),
+        "never 'send it as new' (A-R360): {text}"
+    );
+    let (version, value) = db.get(b"a").expect("get a").value.expect("a is there");
+    assert_eq!(
+        (version, value.as_ref()),
+        (answered.seq.0, &b"1"[..]),
+        "applied once"
+    );
+    db.shutdown();
+}
+
+/// A-R357 G3: two app processes on one `dir`, both open at once under one client id. Each open
+/// counts once in rEtcd, so each numbers its writes from its own base: no id is shared, both
+/// writes land, and neither's floor touches the other's answers. Nothing is written to `dir`,
+/// so no lock is needed. Integration (~1 s): one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_r357_two_app_processes_on_one_dir_with_one_client_never_share_an_id() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut nodes = ready_nodes(&rt, dir.path(), &store);
+    let app_dir = config_testkit::fs::temp_dir();
+    let open_one = || {
+        rt.block_on(Db::open_with(
+            app_config(app_dir.path(), nodes.links(), ClientId(2)),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("an app-only open on the shared dir")
+    };
+    let (mut one, mut two) = (open_one(), open_one());
+    let first = one.put(b"a", b"1", None).expect("the first app's put");
+    let second = two
+        .put(b"b", b"2", None)
+        .unwrap_or_else(|refused| panic!("the second app's put is its own: {refused}"));
+    let base = |id: RequestId| rdb_core::transaction::dedup::open_base(id);
+    assert_ne!(
+        base(first.request),
+        base(second.request),
+        "two opens, two bases: {first:?} {second:?}"
+    );
+    assert_ne!(first.seq, second.seq, "two writes, not one replayed");
+    one.put(b"a", b"3", None)
+        .expect("the first app writes past its floor");
+    match two.status(second.request, None).expect("status") {
+        TxnStatus::Resolved(result) => assert_eq!(result.seq, second.seq),
+        other => panic!("the first app's floor touched the second's answer: {other:?}"),
+    }
+    for (object, value) in [(b"a", b"3"), (b"b", b"2")] {
+        assert_eq!(
+            nodes.get(object).expect("get").value.map(|(_, v)| v),
+            Some(Bytes::copy_from_slice(value))
+        );
+    }
+    one.shutdown();
+    two.shutdown();
+    nodes.shutdown();
+}
+
+/// embed.md's transaction and map sample (`guide_sample.rs`), compiled into this module.
+#[allow(dead_code)]
+mod guide_sample {
+    use crate as rdb_api;
+    include!("guide_sample.rs");
+
+    use super::{embed_block, ready_nodes, runtime, GUIDE};
+    use std::sync::Arc;
+
+    /// A-R357 G6: embed.md's transaction and map block is the marked span of
+    /// `guide_sample.rs`, so the guide's code is the code this module compiles and runs.
+    #[test]
+    fn the_txn_and_map_sample_in_embed_md_is_the_one_that_compiles() {
+        let block = embed_block(include_str!("guide_sample.rs"));
+        assert!(block.contains("fn transfer"), "{block}");
+        assert!(
+            GUIDE.replace("\r\n", "\n").contains(&block),
+            "embed.md lacks, verbatim:\n{block}"
+        );
+    }
+
+    /// A-R357 G6: the sample's transaction writes both objects, and its map write and paged
+    /// read give back both entries, in key order. Integration (~1 s): one fresh open until
+    /// ready.
+    #[config_log::retcd_test]
+    fn the_txn_and_map_sample_runs_against_a_db() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        transfer(&db).expect("the first transfer creates both");
+        transfer(&db).expect("the second writes over the version it read");
+        for (object, value) in [(&b"acct-a"[..], &b"90"[..]), (b"acct-b", b"10")] {
+            let (_, got) = db.get(object).expect("get").value.expect("written");
+            assert_eq!(got.as_ref(), value);
+        }
+        let text = |s: &str| Value::Text(s.to_owned());
+        assert_eq!(
+            profile(&db).expect("the map sample"),
+            [(text("lang"), text("rust")), (text("name"), text("ada"))]
+        );
+        db.shutdown();
+    }
+}
+
+/// The guide's `did_it_land` (`rdb-pilot/examples/did_it_land.rs`, ruling A-R359), compiled
+/// into this module so a row runs the exact code embed.md shows.
+#[allow(dead_code)]
+mod guide_did_it_land {
+    use crate as rdb_api;
+    include!("../../../rdb-pilot/examples/did_it_land.rs");
+
+    use super::{app_config, fast, ready_nodes, runtime, Budgets};
+    use rdb_api::{ClientId, NodeId, TxnPut};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A-R357 G2, three-process mode: an app restart is a new open, not a new generation. The
+    /// app saved two requests before it stopped: one answered `UNKNOWN_OUTCOME` (links to the
+    /// secondaries held), and, against the guide's rule, one answered `Ok`. After the restart,
+    /// the guide's `did_it_land` answers `Yes` for the first (its answer replays, same
+    /// generation) and `ReadTheObject` for the second (`STATUS_EXPIRED`: an earlier open was
+    /// answered for it), never an `Err`. Integration (~2 s): one fresh open until ready, a held
+    /// link, two app opens.
+    #[config_log::retcd_test]
+    fn m10_r357_the_guide_s_did_it_land_answers_an_app_restarted_over_the_links() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let app_dir = config_testkit::fs::temp_dir();
+        let mut nodes = ready_nodes(&rt, dir.path(), &store);
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let open_app = || {
+            rt.block_on(Db::open_with(
+                app_config(app_dir.path(), nodes.links(), ClientId(2)),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                budgets,
+            ))
+            .expect("the app-only open")
+        };
+        let mut app = open_app();
+        let answered = app.put(b"x", b"1", None).expect("put x");
+        app.put(b"y", b"1", None).expect("a put that acks past x");
+        nodes.links().hold(NodeId(1), NodeId(2));
+        nodes.links().hold(NodeId(1), NodeId(3));
+        let put = TxnPut {
+            group: rdb_api::db::DEFAULT_GROUP,
+            object: b"z",
+            value: b"1",
+            if_version: None,
+        };
+        let unknown = app
+            .txn(&[put], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let saved = *unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+        app.shutdown();
+        drop(app);
+
+        nodes.links().heal_all();
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+        while nodes.get(b"z").ok().and_then(|got| got.value).is_none() {
+            assert!(Instant::now() < until, "z never published after the heal");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The pause the held links made ends a moment after the heal: wait for a write to land.
+        while let Err(refused) = nodes.put(b"w", b"1", None) {
+            assert!(Instant::now() < until, "writes never resumed: {refused}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut app = open_app();
+        let replayed = did_it_land(&app, saved).expect("the restarted app asks");
+        assert_eq!(
+            replayed,
+            Landed::Yes,
+            "the unknown txn landed, and its resend replays it"
+        );
+        let refused = app
+            .resend((*answered.sent).clone())
+            .expect_err("x's answer was dropped by the first open's floor");
+        assert_eq!(refused.error.kind, ErrorKind::StatusExpired, "{refused:?}");
+        assert!(
+            refused
+                .error
+                .detail
+                .contains("an earlier open of this client received an answer for it"),
+            "{refused:?}"
+        );
+        let expired = did_it_land(&app, *answered.sent)
+            .unwrap_or_else(|error| panic!("never an Err for STATUS_EXPIRED: {error}"));
+        assert_eq!(
+            expired,
+            Landed::ReadTheObject,
+            "an answered request saved against the guide's rule"
+        );
+        assert_eq!(
+            nodes.get(b"x").expect("get x").value.map(|(v, _)| v),
+            Some(answered.seq.0),
+            "x applied once"
+        );
+        app.shutdown();
+        nodes.shutdown();
+    }
+}

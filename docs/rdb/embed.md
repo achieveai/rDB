@@ -158,6 +158,86 @@ fn run() -> Result<(), Box<dyn Error>> {
   those figures as a promise.
 - Call `shutdown` before you exit. A killed process is safe too: see section 5.
 
+### A transaction and a map
+
+`txn` writes several objects at once: all of them land, or none. `write` with `Change::Map`
+changes a map's entries; `read` with `Look::Members` reads them a page at a time. Both functions
+take the `db` from the sample above. `rdb_api::db::DEFAULT_GROUP` is the group `put` and `get`
+use; name it in every `TxnPut`.
+
+```rust
+use rdb_api::db::DEFAULT_GROUP;
+use rdb_api::{Change, Db, ElemOp, Look, Seen, TxnPut, Value};
+use std::error::Error;
+use std::time::Duration;
+
+/// Two objects in one transaction: both are written, or neither. `if_version: Some(v)` writes
+/// only while the object is still at version `v`; a change since then refuses the whole
+/// transaction with `CONDITION_FAILED`, nothing written.
+fn transfer(db: &Db) -> Result<(), Box<dyn Error>> {
+    let seen = db.get(b"acct-a")?.value.map(|(version, _)| version);
+    let ok = db
+        .txn(
+            &[
+                TxnPut {
+                    group: DEFAULT_GROUP, // where `put` and `get` work
+                    object: b"acct-a",
+                    value: b"90",
+                    if_version: seen,
+                },
+                TxnPut {
+                    group: DEFAULT_GROUP,
+                    object: b"acct-b",
+                    value: b"10",
+                    if_version: None, // write over whatever is there, or create it
+                },
+            ],
+            Duration::from_secs(5), // the deadline; at most 30 s
+        )
+        .map_err(|refused| refused.error)?;
+    println!("both written at {:?}", ok.seq);
+    Ok(())
+}
+
+/// A map: put two entries in one write, then read every entry, 100 at a time.
+fn profile(db: &Db) -> Result<Vec<(Value, Value)>, Box<dyn Error>> {
+    let text = |s: &str| Value::Text(s.to_owned());
+    db.write(
+        b"profile",
+        Change::Map(vec![
+            ElemOp::Put(text("name"), text("ada")),
+            ElemOp::Put(text("lang"), text("rust")),
+        ]),
+        None,
+    )
+    .map_err(|refused| refused.error)?;
+    let mut entries = Vec::new();
+    let mut after = None; // start from the first entry
+    loop {
+        let read = db.read(b"profile", Look::Members { after, limit: 100 })?;
+        let Seen::Members(page) = read.seen else {
+            return Err(format!("profile is not a map: {:?}", read.seen).into());
+        };
+        let full = page.members.len() == 100;
+        after = page.members.last().map(|last| last.key.clone());
+        for member in page.members {
+            entries.extend(member.value.map(|value| (member.key, value)));
+        }
+        if !full {
+            return Ok(entries);
+        }
+    }
+}
+```
+
+- `transfer` refuses with `CONDITION_FAILED` when `acct-a` changed after the `get`. Read again
+  and decide; nothing was written.
+- One transaction holds at most `rdb_api::MAX_OPS` puts, all in one group.
+- A map key or value is any `Value`; here, text. `Look::Members` lists them in key order.
+- Sets work the same way with `Change::Set` and `ElemOp::Add` / `ElemOp::Remove`.
+- This code is compiled and run by the rows in `crates/rdb-api/src/db/reopen_tests.rs`
+  (`guide_sample`), so it matches this release.
+
 ## 5. Reopening your folder
 
 Open the same folder against the same rEtcd with the same `Db::open` call. There is nothing
@@ -185,16 +265,10 @@ extra to do, after a clean `shutdown` or after the process was killed.
 - Each open counts as one "reopen" of the folder's history. See the ceilings in section 7 for
   what that costs over many reopens.
 
-### After a reopen: did my write land?
+### After a restart: did my write land?
 
 To ask later, you need something saved before the process stopped. There are two ways.
 
-- **Save the request after its answer.** It is in `ok.sent` on success, or `refused.request` on
-  `UNKNOWN_OUTCOME`. Both hold it boxed: pass `*ok.sent` to `did_it_land` below. A
-  `TxnRequest` serializes with `serde_json` (in the `Cargo.toml` of section 2). Write it to a
-  file, and sync the file (`File::sync_data`) before you rely on it. This does not cover a kill
-  before the answer: `put` builds its request inside `Db`, so there is nothing to save until it
-  returns.
 - **Save the id before the send.** For a write you must be able to settle after a kill, choose
   its request id yourself. Build it with `rdb_api::app_request_id(n)` from your own number `n`
   (it returns `None` when `n` is 2^63 or more). Save the id, synced, then send with
@@ -204,14 +278,31 @@ To ask later, you need something saved before the process stopped. There are two
   `INVALID_ARGUMENT` and send nothing. A send refused before it went out, and `write_as`'s
   `Ok(None)` (the change came to nothing), say nothing about an earlier send under that id:
   ask `status`.
+- **Save a request whose answer was not definitive, and only that.** An `UNKNOWN_OUTCOME`
+  hands the request back in `refused.request`, boxed: save `*request`. A `TxnRequest`
+  serializes with `serde_json` (in the `Cargo.toml` of section 2). Write it to a file and sync
+  it (`File::sync_data`). **Delete it on any definitive answer**: `Ok`, or a refusal with
+  `no_mutation` true. Never save a request after `Ok`: the ack floor (below) drops its answer
+  once a later write is answered, and then asking can only say "read the object". So after a
+  restart only unanswered requests remain, and the owner keeps each of their answers.
+  A `put` builds its request inside `Db`, so a kill before any answer leaves nothing to save:
+  use the first way for writes that must survive that.
 
 With neither, a kill before any answer leaves nothing to ask about. Read the data with `get`.
 
+**What a resend answers after the app restarts** depends on where the copies run:
+
+| Mode | An app restart is | A saved request, resent, answers |
+|---|---|---|
+| Embedded (this page: `local` lists the nodes) | a reopen, so a new generation | `GENERATION_CHANGED`, with nothing applied by that send. Then ask `status` |
+| Three processes ([`local-cluster.md`](local-cluster.md): `local` empty) | a new open in the **same** generation | its own answer, replayed (`Ok`); or `Ok` because it applied now, if it never reached the owner; or `STATUS_EXPIRED` if its answer was dropped |
+
+`did_it_land` below handles both. Rows `m10_r189_...` (embedded) and
+`m10_r357_the_guide_s_did_it_land_answers_an_app_restarted_over_the_links` (three processes) in
+`crates/rdb-api/src/db/reopen_tests.rs` run it.
+
 Then ask:
 
-- **A resend answers `GENERATION_CHANGED`.** The reopen started a new generation (one chapter of
-  the folder's history), and a request from an older one is never replayed or run again. That
-  send changed nothing. Look the request up with `status`; do not resend it as a new request.
 - **Ask `db.status(id, generation)`.** `Resolved` means it landed. Its `outcome` is
   `RecoveredApplied` when the answer comes from history kept across the reopen.
 - **The second argument is the generation the request was sent under**: the request's
@@ -219,11 +310,17 @@ Then ask:
   as after `put_saved`. A request that landed still answers `Resolved`. Only the not-landed
   answers differ: without it, a record from an older generation that is gone answers `Unknown`
   instead of `Expired`.
-- **`Unknown` or `Expired` is not proof that it did not land.** `Expired` means the record is
-  older than the dedup retention (`DbConfig::dedup_retention`, 24 h by default). Ask only after
-  `wait_ready` returns `Ok`. After that, do not keep asking: decide with `get`, or give up and
-  report it. A request of the current open still in flight can answer `Unknown` until it
-  publishes. Ask again a few times within a few seconds at most. Never poll `status` forever.
+- **`Unknown`, `Expired` and `STATUS_EXPIRED` are never proof that it did not land** (spec
+  §8.1). `STATUS_EXPIRED` and `Expired` mean the answer was dropped: the app was answered for it
+  earlier, or it is older than the dedup retention (`DbConfig::dedup_retention`, 24 h by
+  default). The refusal's text says which: "this app already received an answer for it in this
+  open", or "an earlier open of this client received an answer for it, or it stayed unsettled
+  past the dedup retention". Either way, read the object: its value is the answer. Never send
+  it as a new write on that refusal alone.
+- **Ask only after `wait_ready` returns `Ok`.** After that, do not keep asking: decide with
+  `get`, or give up and report it. A request of the current open still in flight can answer
+  `Unknown` until it publishes. Ask again a few times within a few seconds at most. Never poll
+  `status` forever.
 
 `crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
 
@@ -253,23 +350,44 @@ fn put_saved(
         .map_err(|refused| refused.error)?)
 }
 
-/// `true`: request `id` landed. `false`: not known, which is not proof that it did not land.
-/// `sent_in`: the generation it was sent under, when you know it.
-fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<bool, ApiError> {
-    Ok(matches!(db.status(id, sent_in)?, TxnStatus::Resolved(_)))
+/// What became of a saved request, and what the app does next.
+#[derive(Debug, PartialEq, Eq)]
+enum Landed {
+    /// It landed. Delete the saved copy.
+    Yes,
+    /// An answer for it came earlier, or it is too old to settle. Not proof either way: read
+    /// the object to see its value, then delete the saved copy.
+    ReadTheObject,
+    /// Not known yet, which is not proof that it did not land: ask again in a few seconds, or
+    /// read the object. Never send it as a new write.
+    NotKnown,
 }
 
-/// The same question for a request saved after its answer: `*ok.sent`, or `refused.request`'s.
-fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
+/// What became of request `id`. `sent_in`: the generation it was sent under, when you know it.
+fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<Landed, ApiError> {
+    Ok(match db.status(id, sent_in)? {
+        TxnStatus::Resolved(_) => Landed::Yes,
+        TxnStatus::Expired => Landed::ReadTheObject,
+        TxnStatus::Unknown | TxnStatus::Unresolved { .. } => Landed::NotKnown,
+    })
+}
+
+/// The same question for a request saved because its answer was not definitive:
+/// `refused.request` of an `UNKNOWN_OUTCOME`. `Err`: this resend was refused for another
+/// reason (`UNAVAILABLE`, say); its text says when to ask again.
+fn did_it_land(db: &Db, saved: TxnRequest) -> Result<Landed, ApiError> {
     let (id, sent_in) = (saved.identity.request, saved.expected_generation);
-    match db.resend(saved) {
-        Ok(_) => return Ok(true), // same generation: applied now, or its answer replayed
-        Err(refused) if refused.error.kind != ErrorKind::GenerationChanged => {
-            return Err(refused.error)
-        }
-        Err(_) => {} // after a reopen: this send applied nothing; ask what the first one did
+    let refused = match db.resend(saved) {
+        Ok(_) => return Ok(Landed::Yes), // applied now, or its answer replayed
+        Err(refused) => refused.error,
+    };
+    match refused.kind {
+        // Its answer was dropped: answered earlier, or too old. This resend applied nothing.
+        ErrorKind::StatusExpired => Ok(Landed::ReadTheObject),
+        // An embedded folder was reopened: this send applied nothing; ask about the first one.
+        ErrorKind::GenerationChanged => landed(db, id, sent_in),
+        _ => Err(refused),
     }
-    landed(db, id, sent_in)
 }
 ```
 
@@ -311,11 +429,12 @@ floor), so the table above no longer limits it.
 
 - **It keeps up to 8 writes whose outcome is unknown**, so `status` or a resend can still
   settle them. The ninth drops the oldest, which then answers `STATUS_EXPIRED`.
-- **A dropped answer answers `STATUS_EXPIRED`** on a resend, with nothing applied: submit the
-  write as new. `status` with its generation says `Expired`; with none, `Unknown`.
+- **A dropped answer answers `STATUS_EXPIRED`** on a resend; that resend applies nothing. It is
+  never proof that the write did not run: read the object to see its value. `status` with its
+  generation says `Expired`; with none, `Unknown`.
 - **A write is never applied twice.** A resend of a write that was answered, even `Ok`, answers
   `STATUS_EXPIRED` once its answer was dropped. After the owner restarts, a kept write that never
-  applied answers `STATUS_EXPIRED` too: submit it as new.
+  applied answers `STATUS_EXPIRED` too: read the object.
 - **Ids you choose (`put_as`, `txn_as`, `write_as`) get no relief.** The table above applies.
 - **A cap below 3 is refused at open.** The floor and the newest answer would fill it.
 - `ack_floor: false` keeps every answer for the retention, as before.

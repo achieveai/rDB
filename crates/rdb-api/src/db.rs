@@ -59,8 +59,12 @@ const OWNER: NodeId = admin::OWNER;
 /// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
 const TENANT: TenantId = TenantId(1);
 
-/// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads.
-const GROUP: AffinityId = AffinityId(1);
+/// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads. A [`TxnPut`] names it
+/// as its `group` to write where `put` and `get` do.
+pub const DEFAULT_GROUP: AffinityId = AffinityId(1);
+
+/// [`DEFAULT_GROUP`], under its name inside this module.
+const GROUP: AffinityId = DEFAULT_GROUP;
 
 /// The longest deadline [`Db::txn`] and [`Db::resend_within`] accept: the caller's maximum in
 /// `docs/rdb/developer-handoff.md`, ExecuteTxn row. Those two refuse a longer one before
@@ -206,8 +210,9 @@ pub struct DbConfig {
     ///   `Db`, so per partition (A5); the ninth evicts the oldest, which is logged
     ///   `ack_floor_pin_evicted` and from then on answers `STATUS_EXPIRED`.
     /// - A request this `Db` resends after a later write was answered may find its own answer
-    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Submit it as new. This holds
-    ///   while an earlier write is still kept (above), and for a request that was answered `Ok`:
+    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Read the object to see its
+    ///   value. This holds while an earlier write is still kept (above), and for a request that
+    ///   was answered `Ok`:
     ///   it is never applied twice (A-R274). After a restart of the owner, a kept write that never
     ///   applied answers `STATUS_EXPIRED` too.
     /// - Ids an app chose ([`Db::put_as`], [`Db::txn_as`], [`Db::write_as`]) get no relief:
@@ -2082,8 +2087,9 @@ impl Db {
     /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
     ///
     /// With [`DbConfig::ack_floor`] on, a refused request resent after a later write answers
-    /// `STATUS_EXPIRED`, with nothing applied: submit it as new (spec §5.3). A request answered
-    /// `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
+    /// `STATUS_EXPIRED`, with nothing applied: read the object to see its value (spec §5.3,
+    /// A-R357). Its detail says whether this open was answered for it, or an earlier open of the
+    /// same client. A request answered `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
     /// Every other request below the floor, answered `Ok` or refused, stays covered while that
     /// request is unsettled, so a resend never applies one twice (A-R274).
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
@@ -2171,8 +2177,13 @@ impl Db {
         ) {
             self.settled(identity);
         }
+        let here = lock(&self.ack_floor).numbered_here(identity.0);
         answered.map_err(|PutError { error, request }| PutError {
-            error: self.explained(reconcile_step(error, request.as_deref())),
+            error: self.explained(expired_case(
+                reconcile_step(error, request.as_deref()),
+                identity,
+                here,
+            )),
             request,
         })
     }
@@ -3022,6 +3033,29 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
          look it up with Db::status to see whether an earlier send applied it, and do not \
          resend it as a new request",
         error.detail, sent.identity.request.0
+    );
+    error
+}
+
+/// `error` with which case a resend's `STATUS_EXPIRED` of `request` is (A-R357). The kernel
+/// answers it only for an id under its open's ack floor whose answer was dropped, so either the
+/// app was answered for it, or it stayed unsettled past the 8 pins or the dedup retention.
+/// `here`: this open numbered it, so this `Db` is the one that was answered. Any other error is
+/// returned as it is.
+fn expired_case(mut error: ApiError, request: RequestId, here: bool) -> ApiError {
+    if error.kind != ErrorKind::StatusExpired {
+        return error;
+    }
+    let case = if here {
+        "this app already received an answer for it in this open (it is below this client's ack \
+         floor), unless it was one of more than 8 unsettled writes (`ack_floor_pin_evicted`)"
+    } else {
+        "an earlier open of this client received an answer for it, or it stayed unsettled past \
+         the dedup retention"
+    };
+    error.detail = format!(
+        "{}; request {}: {case}; this resend applied nothing, an earlier send may have",
+        error.detail, request.0
     );
     error
 }
