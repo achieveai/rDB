@@ -6,15 +6,15 @@
 //! ```
 //!
 //! It writes `wal_mb` (default 64) of unsynced commits, begins one sync, and runs its
-//! `flush_wal(true)` on a second thread, as a node's syncer does. Meanwhile this thread, the
+//! `WalSync::flush` on a second thread, as a node's syncer does. Meanwhile this thread, the
 //! node thread's stand-in, commits one small batch every `pace_us` (default 20 000, 50/s; 1 000
 //! packs the fsync window, critic-f4 P1) until the sync returns, then for one more second. Each
 //! commit issued inside the fsync is printed with its start and end against the sync's.
 //!
-//! Verdict, last line: `FAIL` (exit 1) when a commit issued inside the fsync waited on it (took
-//! 2 ms or more and returned no earlier than 2 ms before the fsync did), or any commit returned
-//! over 500 ms after it was due; `NOT_EXERCISED` (exit 2) when fewer than 5 commits were issued
-//! inside the fsync; else `PASS` (exit 0). `<dir>` must not exist, or be empty; the probe never
+//! Verdict, last line (A-R373): `FAIL` (exit 1) when a commit issued inside the fsync took over
+//! 10 ms, or half the fsync or more, or any commit returned over 500 ms after it was due;
+//! `NOT_EXERCISED` (exit 2) when the fsync took under 20 ms or fewer than 5 commits were issued
+//! inside it; else `PASS` (exit 0). `<dir>` must not exist, or be empty; the probe never
 //! deletes it.
 
 use std::path::PathBuf;
@@ -26,6 +26,10 @@ use rdb_core::contracts::storage::{Batch, Namespace, Write};
 use rdb_storage::{RocksEngine, StorageOptions, WalSync};
 
 const LATE_LIMIT_MILLIS: u128 = 500;
+/// A commit inside the fsync that takes longer than this waited on it (A-R373).
+const INSIDE_LIMIT: Duration = Duration::from_millis(10);
+/// An fsync shorter than this leaves too little window to tell a wait from noise.
+const MIN_SYNC: Duration = Duration::from_millis(20);
 /// Fewer commits than this issued inside the fsync and the run proves nothing.
 const MIN_INSIDE: usize = 5;
 const BIG_VALUE: usize = 64 << 10;
@@ -137,9 +141,8 @@ fn main() {
     let took = sync_ended.duration_since(sync_began);
     let at = |instant: Instant| instant.saturating_duration_since(sync_began).as_secs_f64() * 1e3;
 
-    // A commit issued inside the fsync, `[sync_began, sync_ended)`, "waited" when it took 2 ms
-    // or more and returned no earlier than 2 ms before the fsync did: its end tracks the sync's.
-    let wait_floor = Duration::from_millis(2);
+    // A commit issued inside the fsync, `[sync_began, sync_ended)`, "waited" when it took over
+    // 10 ms, or half the fsync or more (A-R373).
     let inside: Vec<&(Instant, Instant, Instant)> = commits
         .iter()
         .filter(|(_, began, _)| *began >= sync_began && *began < sync_ended)
@@ -147,7 +150,8 @@ fn main() {
     let waited: Vec<&&(Instant, Instant, Instant)> = inside
         .iter()
         .filter(|(_, began, ended)| {
-            ended.duration_since(*began) >= wait_floor && *ended + wait_floor >= sync_ended
+            let took_it = ended.duration_since(*began);
+            took_it > INSIDE_LIMIT || took_it * 2 >= took
         })
         .collect();
     let inside_max = inside
@@ -186,7 +190,7 @@ fn main() {
     );
     let (verdict, code) = if !waited.is_empty() || late_max.as_millis() > LATE_LIMIT_MILLIS {
         ("FAIL", 1)
-    } else if inside.len() < MIN_INSIDE {
+    } else if took < MIN_SYNC || inside.len() < MIN_INSIDE {
         ("NOT_EXERCISED", 2)
     } else {
         ("PASS", 0)
