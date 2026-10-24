@@ -417,10 +417,12 @@ impl WalSync {
             return Err(failed.clone());
         }
         // A listing can fall between RocksDB creating the next WAL and deleting the last one
-        // and see neither. List once more before calling that a fault (critic-f4, A-R373).
-        let mut synced = self.sync_wal_files()?;
-        if synced == 0 {
-            synced = self.sync_wal_files()?;
+        // and see neither, and a WAL RocksDB is deleting refuses an open with access denied.
+        // Both are passing states, so list once more before calling either a fault; on that
+        // last pass a refused open fails the sync (critic-f4, A-R373).
+        let (mut synced, refused) = self.sync_wal_files(false)?;
+        if synced == 0 || refused {
+            (synced, _) = self.sync_wal_files(true)?;
         }
         if synced == 0 {
             return Err(format!("no WAL file to sync in {}", self.dir.display()));
@@ -429,6 +431,7 @@ impl WalSync {
         // file's entry survives a power cut. On Linux that is a real step; RocksDB's Windows
         // env makes it a no-op (`WinDirectory::Fsync` returns OK), and Windows cannot open a
         // directory as a `File`. So sync it wherever the OS can (A-R373).
+        // Never executed on this host; the first Linux gate owes a row.
         if cfg!(unix) {
             std::fs::File::open(&self.dir)
                 .and_then(|dir| dir.sync_all())
@@ -439,11 +442,13 @@ impl WalSync {
     }
 
     /// Lists the directory and fsyncs each `*.log` through a handle of its own. Returns how
-    /// many it synced.
-    fn sync_wal_files(&self) -> Result<usize, String> {
+    /// many it synced, and whether it skipped one whose open was refused (access denied, as
+    /// for a WAL being deleted). On the `last` pass a refused open is an error instead.
+    fn sync_wal_files(&self, last: bool) -> Result<(usize, bool), String> {
         let entries = std::fs::read_dir(&self.dir)
             .map_err(|e| format!("list the WAL files in {}: {e}", self.dir.display()))?;
         let mut synced = 0;
+        let mut refused = false;
         for entry in entries {
             let path = entry
                 .map_err(|e| format!("list the WAL files in {}: {e}", self.dir.display()))?
@@ -456,13 +461,17 @@ impl WalSync {
             let file = match std::fs::OpenOptions::new().write(true).open(&path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && !last => {
+                    refused = true;
+                    continue;
+                }
                 Err(e) => return Err(format!("open WAL {} to sync it: {e}", path.display())),
             };
             file.sync_all()
                 .map_err(|e| format!("sync WAL {}: {e}", path.display()))?;
             synced += 1;
         }
-        Ok(synced)
+        Ok((synced, refused))
     }
 }
 

@@ -280,3 +280,39 @@ fn m10_f4_a_staged_write_is_not_synced_until_the_next_sync_completes() {
     }
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
+
+/// A-R373: an open refused on the first listing (as for a WAL being deleted) is passed over
+/// and listed again; one still refused on that second listing fails the sync, naming the file,
+/// never skipped silently. A read-only `*.log` in the database directory stands in for a WAL
+/// the syncer may not open.
+/// Cut: skip a refused open on the second pass too, red (the sync succeeds).
+#[retcd_test]
+fn m10_f4_a_wal_whose_open_is_still_refused_after_the_relist_fails_the_sync() {
+    let dir = data_dir("refused-wal");
+    {
+        let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+        let g1 = chain(G1, (Seq::ZERO, Digest::ROOT), 1);
+        commit(&mut engine, &g1, 1, 1);
+        let refused = dir.join("db").join("zz-refused.log");
+        std::fs::write(&refused, b"").expect("plant a file");
+        let mut perms = std::fs::metadata(&refused).expect("metadata").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&refused, perms.clone()).expect("make it read-only");
+
+        let sync = engine.begin_sync(vec![capture(G1, 1)]);
+        let flushed = sync.flush();
+        let error = flushed.expect_err("a WAL still refused after the re-list fails the sync");
+        assert!(
+            error.contains("zz-refused.log") && error.contains("open WAL"),
+            "the error names the file: {error}"
+        );
+        drop(sync);
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&refused, perms).expect("make it writable");
+        std::fs::remove_file(&refused).expect("remove the planted file");
+        assert_eq!(sync_now(&mut engine, vec![capture(G1, 1)]), vec![durable(G1, 1)]);
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
