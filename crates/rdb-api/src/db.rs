@@ -6420,6 +6420,86 @@ mod tests {
         node_1.join().expect("the stub");
     }
 
+    /// A-R319 (W5's probe for A-R313 row 1; critic-degraded M3): `admin promote 2` while node 1
+    /// is stopped and node 2 cannot reach node 3. Node 2 commits read-only, with node 3 pinned
+    /// outside the barrier. While it stays so, node 2's status names the stall although L1
+    /// admits, since a read-only commit takes no write whatever L1 says. Once the link heals,
+    /// node 2 re-plans the same members, and a put lands at a later generation.
+    /// Cuts: `repair_duty` returns at once, red (still refused after the heal); `rebuild_check`
+    /// stays quiet while L1 admits a read-only commit, red (no stall line).
+    /// Integration (~10 s): the promote waits node 1's grant out, then the 5 s rebuild pin wait.
+    #[config_log::retcd_test]
+    fn m10_s2_a_promote_that_missed_node_3_takes_writes_once_node_3_is_back() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"a", b"1", None).expect("put a");
+        lock(&db.nodes)
+            .iter_mut()
+            .find(|handle| handle.node == OWNER)
+            .expect("node 1 runs here")
+            .stop();
+        db.links().hold(NodeId(2), NodeId(3));
+        let promoted = db.promote(NodeId(2), None).expect("promote 2");
+        let node_2 = |db: &Db| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == NodeId(2))
+        };
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(host::REBUILD_PIN_WAIT_MILLIS)
+            + patience;
+        let stalled = loop {
+            let status = node_2(&db);
+            if let Some(line) = status.as_ref().and_then(|status| status.stalled.clone()) {
+                break line;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 never named the read-only stall: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(stalled.contains("mode=ReadOnly"), "{stalled}");
+
+        assert!(
+            db.links().heal(NodeId(2), NodeId(3)) > 0,
+            "the link was held"
+        );
+        let healed = std::time::Instant::now();
+        let landed = loop {
+            match db.put(b"b", b"2", None) {
+                Ok(put) => break put,
+                Err(error) => assert!(
+                    healed.elapsed() < patience,
+                    "still refused {patience:?} after the heal: {error:?} {:?}",
+                    node_2(&db)
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            landed.generation > promoted.generation,
+            "{landed:?} after {promoted:?}"
+        );
+        tracing::info!(
+            waited_ms = healed.elapsed().as_millis(),
+            generation = landed.generation.0,
+            "promote_repair_after_heal_ms"
+        );
+        db.shutdown();
+    }
+
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to

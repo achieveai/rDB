@@ -3961,7 +3961,24 @@ impl Authority {
                         AuthorityIgnoreReason::StaleAuthorityView,
                     )]);
                 }
-                let mut effects = self.revoke_served(ctx, event, *partition);
+                // Owner epochs only grow per partition (`recovery::new_root` commits the prior
+                // epoch plus one; spec §7.3 step 4), so a revocation of the served epoch or a
+                // newer one ends the served epoch, and one of an older epoch is a late persist
+                // that must not: nothing would re-plan the partition (critic-degraded A-9,
+                // ruling A-R325). Ordered, not the restore arm's equality, because revoking a
+                // newer epoch proves the served one is over too. The drain proof follows
+                // either way: the persisted epoch is durably revoked, and the host plans only
+                // from a proof for the epoch it is revoking (A-R321).
+                let older = self
+                    .state
+                    .held()
+                    .and_then(|held| held.served.get(partition))
+                    .is_some_and(|served| *epoch < served.owner_epoch);
+                let mut effects = if older {
+                    Vec::new()
+                } else {
+                    self.revoke_served(ctx, event, *partition)
+                };
                 effects.push(Self::authority(
                     event,
                     AuthorityEffect::Fact(AuthorityFact::DrainProof),

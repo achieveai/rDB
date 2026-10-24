@@ -682,3 +682,425 @@ fn m10_s2_b11_a_revocation_a1_never_answers_is_asked_again() {
     );
     assert_eq!(logged!(METHOD, "membership_drop_planned").len(), 1);
 }
+
+/// Node 1's committed owner epoch.
+fn epoch_of(trio: &Trio) -> OwnerEpoch {
+    trio.nodes[0].0.committed[&PartitionId(1)]
+        .selected
+        .root
+        .owner_epoch
+}
+
+/// b12 (A-R321, critic-degraded A-4): a re-asked revocation persists twice, and the second
+/// persist can land after the plan it fed has committed, while the owner revokes the next
+/// epoch. A1 answers it with a `DrainProof` like any other. The row stands that late persist
+/// in by hand: after b1's drop, node 1 hears the first epoch's revocation persisted again just
+/// before it asks A1 to revoke the current one. The stale proof plans nothing; the plan waits
+/// for the current epoch's revocation and its own proof, and commits the next generation.
+/// Cut: `drained` ignores the epoch the proof is for, red (the plan precedes the revocation).
+/// Integration (~3 s): b1's drop, then one re-plan.
+#[config_log::retcd_test]
+fn m10_s2_b12_a_drain_proof_for_an_older_epoch_plans_nothing() {
+    const METHOD: &str = "m10_s2_b12_a_drain_proof_for_an_older_epoch_plans_nothing";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let stale = epoch_of(&trio);
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    trio.ready();
+    let current = epoch_of(&trio);
+    assert_ne!(stale, current, "the drop moved the epoch");
+
+    let host = &mut trio.nodes[0].0;
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: REJOIN,
+    };
+    let late = AuthorityEvent::EpochRevocationPersisted {
+        partition: PartitionId(1),
+        epoch: stale,
+    };
+    host.push(
+        site,
+        EventKind::Kernel(KernelEvent::Authority(late)),
+        true,
+        None,
+    );
+    host.revoke(PartitionId(1), current, None, None);
+    let replanned = trio.until("node 1 re-planned", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > after)
+    });
+    assert_eq!(
+        replanned,
+        (after.next(), PartitionMode::DegradedRf2, vec![1, 2])
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after.next()),
+        other => panic!("a put after the re-plan: {other:?}"),
+    }
+
+    let order: Vec<String> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .filter_map(|line| match line["@m"].as_str() {
+            Some("epoch_revocation_persisted") => Some(format!("revoked {}", line["epoch"])),
+            Some("authority_fact") if line["fact"] == "DrainProof" => Some("drained".to_owned()),
+            Some("drain_proof_stale") => Some("stale".to_owned()),
+            Some("rejoin_plan") => Some("planned".to_owned()),
+            _ => None,
+        })
+        .collect();
+    let (revoked_stale, revoked_current) = (
+        format!("revoked {}", stale.0),
+        format!("revoked {}", current.0),
+    );
+    assert_eq!(
+        order,
+        [
+            revoked_stale.as_str(),
+            "drained",
+            "planned",
+            "drained",
+            "stale",
+            revoked_current.as_str(),
+            "drained",
+            "planned"
+        ],
+        "node 1's two re-plans, in order"
+    );
+    let stale_lines = logged!(METHOD, "drain_proof_stale");
+    assert_eq!(stale_lines.len(), 1, "{stale_lines:?}");
+    assert_eq!(stale_lines[0]["proved"], stale.0);
+    assert_eq!(stale_lines[0]["revoking"], current.0);
+}
+
+/// [`Trio::until`] for a row that waits through an F1 block: steps by hand, so a block does
+/// not fail the row, and still fails on a fault or after [`Trio::PATIENCE`].
+fn until_through_blocks<T>(trio: &mut Trio, what: &str, done: impl Fn(&Trio) -> Option<T>) -> T {
+    let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+    loop {
+        for (host, _, rx) in &mut trio.nodes {
+            host.run_due();
+            host.drain();
+            while let Ok(msg) = rx.try_recv() {
+                host.handle(msg);
+            }
+            assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+        }
+        if let Some(found) = done(trio) {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "not within the patience: {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// b13 (A-R321, critic-degraded A-5): a block that names no member is retried with the same
+/// members. b1's drop is planned, and the control store goes down before F1 can commit it, so
+/// F1 ends `Blocked(ControlUnavailable)`, which names nobody. The store comes back; once the
+/// plan is `peer_drop_after_millis` old the owner sends it again, and it commits without node 3.
+/// Cut: `retry_blocked_rejoin` leaves a blocked `Planned` alone, red (F1 stays blocked).
+/// Integration (~4 s): b1's drop, one more drop clock for the retry.
+#[config_log::retcd_test]
+fn m10_s2_b13_a_plan_blocked_by_a_control_outage_is_sent_again() {
+    const METHOD: &str = "m10_s2_b13_a_plan_blocked_by_a_control_outage_is_sent_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.until("node 1 planned the drop", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Planned { .. })
+        )
+        .then_some(())
+    });
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    let phase = until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        trio.status(0)
+            .recovery
+            .filter(|phase| phase.starts_with("Blocked("))
+    });
+    assert_eq!(phase, "Blocked(ControlUnavailable)");
+    trio.mem.stop_failing();
+
+    let after = until_through_blocks(&mut trio, "node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(
+        after,
+        (before.next(), PartitionMode::DegradedRf2, vec![1, 2])
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after.0),
+        other => panic!("a put after the drop: {other:?}"),
+    }
+
+    let blocked = logged!(METHOD, "rejoin_blocked");
+    assert!(!blocked.is_empty(), "no rejoin_blocked");
+    assert!(
+        blocked
+            .iter()
+            .all(|line| line["why"] == "the block names no member to leave out"),
+        "{blocked:?}"
+    );
+    let retries = logged!(METHOD, "rejoin_retry");
+    assert!(!retries.is_empty(), "never sent again");
+    assert!(
+        retries.iter().all(|line| line["dropped"] == "Some(3)"
+            && line["waited_ms"].as_u64() >= Some(DROP_AFTER_MILLIS)),
+        "{retries:?}"
+    );
+    assert!(logged!(METHOD, "rejoin_abandoned").is_empty());
+}
+
+/// b14 (A-R325, critic-degraded A-9): b12 without the next revocation. After b1's drop, node 1
+/// hears the first epoch's revocation persisted again, late, and nothing is being revoked. A1
+/// records it and fences nothing, since it serves a later epoch; its drain proof plans
+/// nothing; the next put lands at the drop's generation.
+/// Host-level: A1 is the kernel the sim runs too, so the fix holds for both. Its kernel twin is
+/// rdb-core `a_late_revocation_of_an_older_epoch_leaves_the_served_epoch_admitting`.
+/// Cut: A1's completion arm fences whatever epoch it serves, red (the put is refused).
+/// Integration (~3 s): b1's drop.
+#[config_log::retcd_test]
+fn m10_s2_b14_a_late_revocation_of_an_older_epoch_leaves_the_served_one_writable() {
+    const METHOD: &str =
+        "m10_s2_b14_a_late_revocation_of_an_older_epoch_leaves_the_served_one_writable";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let stale = epoch_of(&trio);
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    trio.ready();
+    assert_ne!(stale, epoch_of(&trio), "the drop moved the epoch");
+
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: REJOIN,
+    };
+    let late = AuthorityEvent::EpochRevocationPersisted {
+        partition: PartitionId(1),
+        epoch: stale,
+    };
+    trio.nodes[0].0.push(
+        site,
+        EventKind::Kernel(KernelEvent::Authority(late)),
+        true,
+        None,
+    );
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the late revocation: {other:?}"),
+    }
+    assert_eq!(trio.status(0).admits, Some(true));
+
+    let unasked = logged!(METHOD, "drain_proof_unasked");
+    assert_eq!(unasked.len(), 1, "the late proof was heard: {unasked:?}");
+    let fences: Vec<_> = logged!(METHOD, "authority_fence")
+        .into_iter()
+        .filter(|line| line["node"] == 1 && line["reason"] == "EpochRevoked")
+        .collect();
+    assert_eq!(
+        fences.len(),
+        1,
+        "only the drop's own revocation fenced: {fences:?}"
+    );
+}
+
+/// b6 (critic-degraded M3, A-R282 M3 wording): node 3 dies and the owner plans without it, but
+/// the link 1-2 is held through that plan's discovery, so node 2 is never heard and the commit
+/// is `ReadOnly`, nodes 1 and 2 pinned, node 2 outside its barrier. Once the link heals and
+/// stays up for the resume hold, the owner re-plans the same two members, and the next
+/// generation is `DegradedRf2` and takes writes again. Nothing else would end the read-only
+/// commit: node 2 is pinned, at the boot it was pinned at, and nothing holds writes up.
+/// Cuts: `repair_duty` returns at once, red (no `DegradedRf2` within the patience); no wait for
+/// the resume hold, red (`linked_ms` below it); no `linked` filter, red (repaired
+/// while node 2 is held).
+/// Integration (~4 s): b1's drop, the read-only commit, the repair's re-plan.
+#[config_log::retcd_test]
+fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
+    const METHOD: &str = "m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    // Half way through node 3's drop clock, so the hold covers the whole of the drop's plan.
+    trio.until("node 3 blamed for half the drop clock", |trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&PartitionId(1))
+            .filter(|blame| HostClock::millis_until(blame.since, now) >= DROP_AFTER_MILLIS / 2)
+            .map(|_| ())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    let read_only = trio.until("node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(
+        read_only,
+        (before.next(), PartitionMode::ReadOnly, vec![1, 2]),
+        "node 2 unheard through the drop's discovery"
+    );
+
+    // Still held: several repair checks past the resume hold repair nothing, since node 2 is
+    // not linked.
+    let until = trio
+        .clock
+        .now()
+        .plus_millis(3 * DROP_CHECK_EVERY_MILLIS + trio.nodes[0].0.budgets.resume_hold_millis);
+    trio.until("repair checks to pass while held", |trio| {
+        (trio.clock.now() >= until).then_some(())
+    });
+    assert_eq!(
+        commit_of(&trio),
+        Some(read_only.clone()),
+        "repaired while node 2 was held"
+    );
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert!(
+        planned.is_empty(),
+        "repaired while node 2 was held: {planned:?}"
+    );
+
+    trio.links.heal(NodeId(1), NodeId(2));
+    let healed = trio.clock.now();
+    let (repaired, mode, members) = trio.until("node 1 repaired the read-only commit", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > read_only.0)
+    });
+    assert_eq!(
+        (repaired, mode, members),
+        (read_only.0.next(), PartitionMode::DegradedRf2, vec![1, 2])
+    );
+    let waited = HostClock::millis_until(healed, trio.clock.now());
+    let host = &trio.nodes[0].0;
+    // The resume hold, up to two drop checks to see it out, and the re-plan's own window.
+    let bound = host.budgets.resume_hold_millis
+        + 2 * DROP_CHECK_EVERY_MILLIS
+        + host.budgets.discovery_window_millis
+        + 1_000;
+    assert!(
+        waited <= bound,
+        "repaired {waited} ms after the heal; bound {bound} ms"
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, repaired),
+        other => panic!("a put after the repair: {other:?}"),
+    }
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert_eq!(planned.len(), 1, "one repair: {planned:?}");
+    assert_eq!(planned[0]["outside"], "[2]");
+    let hold = trio.nodes[0].0.budgets.resume_hold_millis;
+    assert!(
+        planned[0]["linked_ms"].as_u64() >= Some(hold),
+        "repaired before the link held up for {hold} ms: {planned:?}"
+    );
+    tracing::info!(waited, "b6_repair_after_heal_ms");
+}
+
+/// A-R319 defect 2 (W5's probe, k546): a `ReadOnly` commit takes no write whatever L1 says,
+/// so its rebuild check is never quiet on L1 admitting. Before, the check read L1 alone, and a
+/// read-only partition whose L1 had resumed was silent. Every other mode stays quiet while L1
+/// admits (K1 condition 6). A unit row: no host reaches a read-only commit with L1 admitting
+/// on demand; the promote row `m10_s2_a_promote_that_missed_node_3_takes_writes_once_node_3_is_back`
+/// walks it end to end.
+/// Cut: `rebuild_quiet` reads L1 alone, red (read-only and admitting reads as quiet).
+#[test]
+fn a_read_only_commit_is_never_quiet_on_l1_admitting() {
+    assert!(!rebuild_quiet(&PartitionMode::ReadOnly, Some(true)));
+    assert!(!rebuild_quiet(&PartitionMode::ReadOnly, Some(false)));
+    assert!(!rebuild_quiet(&PartitionMode::DegradedRf2, Some(false)));
+    assert!(!rebuild_quiet(&PartitionMode::DegradedRf2, None));
+    assert!(rebuild_quiet(&PartitionMode::DegradedRf2, Some(true)));
+}
+
+/// b17 (A-R319): a repair whose own plan is still running is not repaired again. b6's
+/// read-only commit, the link heals, and the repair's plan is with F1 when the control store
+/// goes down, so F1 blocks and the read-only commit stays the last one, with node 2 linked.
+/// Over several repair checks no second repair is planned: the running re-plan is retried
+/// as it is ([`Host::retry_blocked_rejoin`]). The store comes back and the plan commits.
+/// Cut: `read_only_outside` ignores a running re-plan, red (a second `membership_repair_planned`).
+/// Integration (~4 s): b6's drop, the repair, one blocked plan.
+#[config_log::retcd_test]
+fn m10_s2_b17_a_repair_whose_plan_is_running_is_not_repaired_again() {
+    const METHOD: &str = "m10_s2_b17_a_repair_whose_plan_is_running_is_not_repaired_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.until("node 3 blamed for half the drop clock", |trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&PartitionId(1))
+            .filter(|blame| HostClock::millis_until(blame.since, now) >= DROP_AFTER_MILLIS / 2)
+            .map(|_| ())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    let read_only = trio.until("node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(read_only.1, PartitionMode::ReadOnly);
+
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.until("node 1 planned the repair", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Planned { .. })
+        )
+        .then_some(())
+    });
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        trio.status(0)
+            .recovery
+            .filter(|phase| phase.starts_with("Blocked("))
+    });
+    // Several repair checks with node 2 linked and the read-only commit still the last one,
+    // short of the blocked plan's own retry.
+    let until = trio
+        .clock
+        .now()
+        .plus_millis(3 * DROP_CHECK_EVERY_MILLIS + trio.nodes[0].0.budgets.resume_hold_millis);
+    until_through_blocks(&mut trio, "repair checks to pass", |trio| {
+        (trio.clock.now() >= until).then_some(())
+    });
+    assert_eq!(commit_of(&trio), Some(read_only.clone()), "still read-only");
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert_eq!(
+        planned.len(),
+        1,
+        "repaired again while its plan ran: {planned:?}"
+    );
+
+    trio.mem.stop_failing();
+    let repaired =
+        until_through_blocks(&mut trio, "node 1 repaired the read-only commit", |trio| {
+            commit_of(trio).filter(|(generation, _, _)| *generation > read_only.0)
+        });
+    assert_eq!(
+        (repaired.1, repaired.2),
+        (PartitionMode::DegradedRf2, vec![1, 2])
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, repaired.0),
+        other => panic!("a put after the repair: {other:?}"),
+    }
+}
