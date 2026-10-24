@@ -387,16 +387,44 @@ impl WalSync {
     /// synchronous file object, so `flush_wal(true)` (`FlushFileBuffers` on RocksDB's handle)
     /// held every commit's `WriteFile` for the whole fsync: measured 69 ms and 96 ms waits, one per
     /// fsync. A second handle is a second file object, and its flush still writes the file's
-    /// cached data, so commits go on. Nothing is buffered inside RocksDB: without
-    /// `manual_wal_flush` each commit reaches the OS before it returns.
+    /// cached data, so commits go on. Measured (A-R373 D1): after 1 GiB written through one
+    /// handle, a flush through another took 422-478 ms and the writer's own flush then 0.1-4.6 ms.
+    /// Nothing is buffered inside RocksDB: without `manual_wal_flush` each commit reaches the OS
+    /// before it returns.
     ///
     /// # Errors
     ///
-    /// The file system's error naming the file, the injected fault's, or no WAL file found.
+    /// The file system's error naming the file or directory, the injected fault's, or no WAL
+    /// file found in two listings.
     pub fn flush(&self) -> Result<(), String> {
         if let Some(failed) = &self.failed {
             return Err(failed.clone());
         }
+        // A listing can fall between RocksDB creating the next WAL and deleting the last one
+        // and see neither. List once more before calling that a fault (critic-f4, A-R373).
+        let mut synced = self.sync_wal_files()?;
+        if synced == 0 {
+            synced = self.sync_wal_files()?;
+        }
+        if synced == 0 {
+            return Err(format!("no WAL file to sync in {}", self.dir.display()));
+        }
+        // RocksDB's own sync also fsyncs the WAL directory once a new WAL exists, so the new
+        // file's entry survives a power cut. On Linux that is a real step; RocksDB's Windows
+        // env makes it a no-op (`WinDirectory::Fsync` returns OK), and Windows cannot open a
+        // directory as a `File`. So sync it wherever the OS can (A-R373).
+        if cfg!(unix) {
+            std::fs::File::open(&self.dir)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| format!("sync the WAL directory {}: {e}", self.dir.display()))?;
+        }
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Lists the directory and fsyncs each `*.log` through a handle of its own. Returns how
+    /// many it synced.
+    fn sync_wal_files(&self) -> Result<usize, String> {
         let entries = std::fs::read_dir(&self.dir)
             .map_err(|e| format!("list the WAL files in {}: {e}", self.dir.display()))?;
         let mut synced = 0;
@@ -418,11 +446,7 @@ impl WalSync {
                 .map_err(|e| format!("sync WAL {}: {e}", path.display()))?;
             synced += 1;
         }
-        if synced == 0 {
-            return Err(format!("no WAL file to sync in {}", self.dir.display()));
-        }
-        self.flushes.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(synced)
     }
 }
 
