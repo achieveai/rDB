@@ -166,7 +166,9 @@ pub struct DbConfig {
     /// the first send applied, rather than applying twice.
     pub dedup_retention: Option<Duration>,
     /// The nodes whose copies this process holds and runs (M10 S2). [`ALL_NODES`] is the
-    /// one-process database: all three copies here. Not read yet: every open runs all three.
+    /// one-process database: all three copies here. Some of them is a node process
+    /// (`rdb_node`). Empty is an app: it holds no copy, runs no node and claims no folder, and
+    /// reaches the nodes through [`Self::links`], which it then needs.
     pub local: Vec<NodeId>,
     /// The peer links this process's nodes use (M10 S2). `None`: new in-process links. Not
     /// read yet: every open makes its own in-process links.
