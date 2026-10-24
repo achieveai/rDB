@@ -8602,13 +8602,29 @@ mod tests {
                 )
             })
             .collect();
+        // A-R380: under load node 3 can answer the second open's inventory after F1 commits,
+        // so it too lands generation 2 outside the barrier and links 1->2 (loader run
+        // 2026-10-24). That is legal; the row is about node 2, and no node links one landing
+        // twice.
         assert_eq!(
-            linked,
+            linked
+                .iter()
+                .filter(|(node, _, _)| *node == 2)
+                .cloned()
+                .collect::<Vec<_>>(),
             [
                 (2.into(), 1.into(), 2.into()),
                 (2.into(), 2.into(), 3.into())
             ],
-            "node 2 links once per landing outside the barrier: 1->2, then 2->3"
+            "node 2 links once per landing outside the barrier: 1->2, then 2->3: {linked:?}"
+        );
+        let mut once = linked.clone();
+        once.sort_by_key(|link| format!("{link:?}"));
+        once.dedup();
+        assert_eq!(
+            once.len(),
+            linked.len(),
+            "a landing linked twice: {linked:?}"
         );
         let failed: Vec<_> = lines
             .iter()
