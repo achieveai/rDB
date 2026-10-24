@@ -5229,9 +5229,10 @@ impl Host {
     /// head is a re-send to a copy that is behind. After `stuck_resends` of them the copy is not
     /// advancing: warn once for the episode. A send that changes the record or the progress, or
     /// finds the copy level with the head, sets the count back to 0, so an episode begins when
-    /// the copy falls behind (D5: R1 re-sends seq 1 through L1's resume hold to copies that hold
-    /// it). The first send after the head moves past an unchanged copy repeats the last level
-    /// one, so it is re-send 1; a send that changes the record or the progress is not counted.
+    /// the copy falls behind (D5: while L1 rejects, R1's keepalive re-sends the head, seq 1 at a
+    /// start, to copies that hold it). The first send after the head moves past an unchanged copy
+    /// repeats the last level one, so it is re-send 1; a send that changes the record or the
+    /// progress is not counted.
     /// Nothing else changes; R1 keeps sending.
     fn count_resend(
         &mut self,

@@ -1569,32 +1569,38 @@ fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls
     assert!(host.pending.is_empty(), "nothing is left waiting");
 }
 
-/// D5's guard: a healthy start logs no `replication_copy_not_advancing`. L1 holds its resume
-/// for longer than `stuck_resends` retransmits, and R1 re-sends seq 1 through that hold (OB1)
-/// to copies that acknowledged it. A copy level with the primary's head is not stuck, however
-/// often a record is re-sent to it.
-/// Integration (~1.4 s): the resume hold must outlast the threshold on R1's 100 ms timer.
+/// D5's guard on R1's real send path: a start held paused logs no
+/// `replication_copy_not_advancing` while R1's keepalive re-sends seq 1 every `KEEPALIVE_MS` to
+/// copies that hold it. A copy level with the primary's head is not stuck, however often a record
+/// is re-sent to it. `resume_lag_millis = 0` keeps L1 from resuming (lag is never below 0), so
+/// the keepalive runs for the whole half second; with `stuck_resends = 1` the second identical
+/// send to one copy would warn without the level check. Before A-R344 a start ran L1's resume
+/// hold and a healthy start did this; a first resume now skips the hold (ADR-0006 amendment
+/// 2026-10-23), and a healthy start re-sends seq 1 twice only on some runs.
 #[config_log::retcd_test]
-fn a_healthy_start_reports_no_copy_stuck_through_the_resume_hold() {
-    const METHOD: &str = "a_healthy_start_reports_no_copy_stuck_through_the_resume_hold";
+fn a_start_held_paused_reports_no_copy_stuck_while_r1_re_sends_seq_1() {
+    const METHOD: &str = "a_start_held_paused_reports_no_copy_stuck_while_r1_re_sends_seq_1";
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), |host| {
         Trio::fast(host);
-        host.budgets.resume_hold_millis = 600;
-        host.stuck_resends = 3;
+        host.budgets.resume_lag_millis = 0;
+        host.stuck_resends = 1;
     });
     trio.bootstrap();
-    trio.ready();
-    assert!(
+    let since = trio.until("R1 sent seq 1", |trio| {
         trio.nodes[0]
             .0
             .resends
             .values()
-            .any(|entry| entry.through == Seq(1)),
-        "R1 sent seq 1 during the hold"
-    );
+            .any(|entry| entry.through == Seq(1))
+            .then(|| trio.clock.now().0)
+    });
+    trio.until("half a second of keepalives", |trio| {
+        (trio.clock.now().0 >= since + 500).then_some(())
+    });
+    assert_eq!(trio.status(0).admits, Some(false), "L1 never resumed");
     let warned = not_advancing!(METHOD);
-    assert!(warned.is_empty(), "a healthy start warned: {warned:?}");
+    assert!(warned.is_empty(), "a start held paused warned: {warned:?}");
 }
 
 /// D4's shape at the host: the copy acknowledged the record R1 keeps re-sending (through 1,
