@@ -63,14 +63,57 @@ pub struct StorageOptions {
     /// a column family whose memtable reaches it switches to a new one and flushes the full
     /// one to an SST. `None` keeps [`DEFAULT_WRITE_BUFFER_BYTES`].
     pub write_buffer_bytes: Option<usize>,
+    /// The memtable budget of the whole store, every column family together, in bytes
+    /// (RocksDB's `db_write_buffer_size`, ruling A-R300). When the memtables reach about 7/8
+    /// of it, RocksDB switches the oldest one out and flushes it, so memtable memory stays near
+    /// the budget however long the writes go on. `None` keeps
+    /// [`DEFAULT_MEMTABLE_BUDGET_BYTES`] (64 MiB).
+    ///
+    /// It also caps two things that would otherwise outgrow it:
+    /// - each column family's own budget, which opens at the smaller of this and
+    ///   [`Self::write_buffer_bytes`]. One memtable bigger than the store's budget could never
+    ///   fill, and RocksDB sizes a memtable's allocation blocks from it.
+    /// - the WAL: `max_total_wal_size` is [`WAL_BUDGETS`] times this. A column family written
+    ///   rarely keeps its oldest WAL file alive; past that size RocksDB flushes it so the file
+    ///   can go. RocksDB's own limit is 4 times the sum of every column family's memtables.
+    pub memtable_budget_bytes: Option<usize>,
 }
 
+/// The default memtable budget of one store, all column families together (A-R300): 64 MiB,
+/// one column family's worth at RocksDB's own size.
+pub const DEFAULT_MEMTABLE_BUDGET_BYTES: usize = 64 << 20;
+
+/// `max_total_wal_size` in memtable budgets (A-R300). Four is RocksDB's own ratio of WAL to
+/// memtable memory.
+pub const WAL_BUDGETS: u64 = 4;
+
 impl StorageOptions {
-    /// The memtable budget each column family opens with.
+    /// The memtable budget each column family is asked for, before the store's budget caps
+    /// it (see [`Self::effective_cf_write_buffer_bytes`]).
     #[must_use]
     pub fn effective_write_buffer_bytes(&self) -> usize {
         self.write_buffer_bytes
             .unwrap_or(DEFAULT_WRITE_BUFFER_BYTES)
+    }
+
+    /// The memtable budget of the whole store.
+    #[must_use]
+    pub fn effective_memtable_budget_bytes(&self) -> usize {
+        self.memtable_budget_bytes
+            .unwrap_or(DEFAULT_MEMTABLE_BUDGET_BYTES)
+    }
+
+    /// The memtable budget each column family opens with: the smaller of the two.
+    #[must_use]
+    pub fn effective_cf_write_buffer_bytes(&self) -> usize {
+        self.effective_write_buffer_bytes()
+            .min(self.effective_memtable_budget_bytes())
+    }
+
+    /// `max_total_wal_size`: [`WAL_BUDGETS`] memtable budgets.
+    #[must_use]
+    pub fn max_total_wal_bytes(&self) -> u64 {
+        WAL_BUDGETS.saturating_mul(self.effective_memtable_budget_bytes() as u64)
     }
 }
 
@@ -416,7 +459,7 @@ impl RocksEngine {
             // open replays, flushes and rotates before the marker can be read.
             read_only(&path)?;
         }
-        let options = db_options(!existed);
+        let options = db_options(!existed, storage);
         let db = DB::open_cf_descriptors(&options, &path, descriptors(storage))
             .map_err(|e| backend(&path, &e))?;
         let (created, format) = ensure_format(&db, &path, existed)?;
@@ -446,6 +489,9 @@ impl RocksEngine {
             instance_hex = instance.map(|id| hex(&id)),
             // What the caller asked RocksDB for, not a size RocksDB reports back (A-R253).
             write_buffer_bytes_asked = storage.effective_write_buffer_bytes(),
+            memtable_budget_bytes = storage.effective_memtable_budget_bytes(),
+            cf_write_buffer_bytes = storage.effective_cf_write_buffer_bytes(),
+            max_total_wal_bytes = storage.max_total_wal_bytes(),
             "storage_open"
         );
         Ok(Self {
@@ -537,6 +583,34 @@ impl RocksEngine {
             read("rocksdb.cur-size-active-mem-table")?,
             read("rocksdb.num-entries-active-mem-table")?,
         ))
+    }
+
+    /// Memtable bytes of the whole store: RocksDB's `rocksdb.cur-size-all-mem-tables` (active
+    /// and not yet flushed) summed over [`COLUMN_FAMILIES`] and RocksDB's `default`. This is
+    /// what [`StorageOptions::memtable_budget_bytes`] bounds (A-R300).
+    ///
+    /// # Errors
+    ///
+    /// When RocksDB cannot answer for a column family.
+    pub fn memtable_bytes(&self) -> Result<u64, String> {
+        const PROPERTY: &str = "rocksdb.cur-size-all-mem-tables";
+        let mut total = self
+            .db
+            .property_int_value(PROPERTY)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("RocksDB has no {PROPERTY} for default"))?;
+        for cf in COLUMN_FAMILIES {
+            let handle = self
+                .db
+                .cf_handle(cf)
+                .ok_or_else(|| format!("no column family {cf}"))?;
+            total += self
+                .db
+                .property_int_value_cf(handle, PROPERTY)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("RocksDB has no {PROPERTY} for {cf}"))?;
+        }
+        Ok(total)
     }
 
     /// The directory this engine is open on.
@@ -1544,10 +1618,13 @@ fn dump_inner(path: &Path) -> Result<Vec<RawRecord>, OpenError> {
 /// Options pinned in code (the M8 architecture §2, working notes not in the repository).
 /// `create` only for a fresh directory, so an existing one with a missing column family is
 /// refused rather than silently completed.
-fn db_options(create: bool) -> Options {
+fn db_options(create: bool, storage: StorageOptions) -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(create);
     opts.create_missing_column_families(create);
+    // A-R300: one memtable budget for the store, and a WAL bounded by it.
+    opts.set_db_write_buffer_size(storage.effective_memtable_budget_bytes());
+    opts.set_max_total_wal_size(storage.max_total_wal_bytes());
     // Not SkipAnyCorruptedRecord: skipping a mid-WAL record breaks contiguity. Not
     // AbsoluteConsistency: a torn tail would refuse to open.
     opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime);
@@ -1564,13 +1641,12 @@ fn db_options(create: bool) -> Options {
     opts
 }
 
-/// Each of [`COLUMN_FAMILIES`]' options, RocksDB's own but for what `storage` sets (A-R248).
-/// RocksDB's `default` column family holds nothing of ours and keeps its own.
+/// Each of [`COLUMN_FAMILIES`]' options, RocksDB's own but for the memtable budget (A-R248,
+/// capped by the store's budget since A-R300). RocksDB's `default` column family holds
+/// nothing of ours and keeps its own.
 fn cf_options(storage: StorageOptions) -> Options {
     let mut opts = Options::default();
-    if let Some(bytes) = storage.write_buffer_bytes {
-        opts.set_write_buffer_size(bytes);
-    }
+    opts.set_write_buffer_size(storage.effective_cf_write_buffer_bytes());
     opts
 }
 
@@ -1605,8 +1681,13 @@ type Lineages = BTreeMap<(PartitionId, Generation), Marks>;
 /// Open `path` read-only and make every check `open` makes. A directory with no marker that
 /// holds nothing passes: `open` would stamp it, and a reader finds nothing in it either way.
 fn read_only(path: &Path) -> Result<(DB, Lineages, u32), OpenError> {
-    let db = DB::open_cf_for_read_only(&db_options(false), path, COLUMN_FAMILIES, false)
-        .map_err(|e| backend(path, &e))?;
+    let db = DB::open_cf_for_read_only(
+        &db_options(false, StorageOptions::default()),
+        path,
+        COLUMN_FAMILIES,
+        false,
+    )
+    .map_err(|e| backend(path, &e))?;
     // `None` only for a directory that holds nothing, which `open` would stamp.
     let format = check_format(&db, path, true)?.unwrap_or(FORMAT_VERSION);
     read_instance(&db, path)?;

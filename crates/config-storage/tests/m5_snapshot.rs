@@ -1489,3 +1489,107 @@ async fn m5_01b_a_capture_describes_its_checkpoint_not_later_applies() {
         );
     }
 }
+
+/// M5-01c (A-R286): the view is captured when the build runs, not when OpenRaft takes the
+/// builder, and the snapshot describes exactly that view.
+///
+/// OpenRaft takes the builder on its state-machine worker and then keeps applying while the
+/// build runs in a spawned task, which is the order this row follows: builder, apply 7, build
+/// (held right after its checkpoint), apply 8..9. The snapshot must cover index 7 — the
+/// checkpoint's own applied id, with seven records — and stay at or below what is applied.
+/// A capture taken with the builder would say 6; metadata read from the live state machine
+/// would say 9 over seven records.
+#[retcd_test]
+async fn m5_01c_snapshot_describes_the_view_taken_when_the_build_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let hold = HoldCapture::new();
+        let s = open_at(tmp.path(), hold.clone());
+        seed(&s, 6).await;
+        let later: Vec<_> = (7..=9)
+            .map(|i| put(1, i, &format!("/m5/{i}"), &format!("v{i}")))
+            .collect();
+        s.log_store()
+            .blocking_append(later.clone())
+            .await
+            .expect("append");
+
+        let mut builder = s.state_machine().get_snapshot_builder().await;
+        s.state_machine()
+            .apply(later[..1].to_vec())
+            .await
+            .expect("apply 7");
+
+        let building =
+            tokio::spawn(async move { builder.build_snapshot().await.map(|snap| snap.meta) });
+        hold.reached().await;
+
+        let mut applying = {
+            let s = s.clone();
+            let rest = later[1..].to_vec();
+            tokio::spawn(async move { s.state_machine().apply(rest).await.map(|_| ()) })
+        };
+        let applied_inside = tokio::time::timeout(CAPTURE_PATIENCE, &mut applying).await;
+
+        hold.release();
+        let meta = building
+            .await
+            .expect("the build task joins")
+            .expect("the build succeeds");
+        let finished_inside = applied_inside.is_ok();
+        let joined = match applied_inside {
+            Ok(joined) => joined,
+            Err(_) => applying.await,
+        };
+        joined.expect("the apply task joins").expect("apply 8..9");
+        assert!(
+            finished_inside,
+            "an apply finishes while a snapshot capture is held open"
+        );
+
+        let applied = s.reader().last_applied();
+        assert_eq!(applied, Some(log_id(1, 9)), "every entry applied");
+        assert_eq!(
+            meta.last_log_id,
+            Some(log_id(1, 7)),
+            "the snapshot covers the view taken when the build ran"
+        );
+        assert!(
+            meta.last_log_id <= applied,
+            "a snapshot never runs ahead of apply"
+        );
+        let header = read_header(&snap_path(&s, &meta));
+        assert_eq!(
+            header.last_applied, meta.last_log_id,
+            "the checkpoint's applied id"
+        );
+        assert_eq!(header.cluster_revision, 7);
+        assert_eq!(
+            header.counts.get(CF_KV).copied(),
+            Some(7),
+            "seven records, as the header says"
+        );
+    }
+}
+
+/// A-R286: a store opens with RocksDB `max_background_jobs=16` (4 flush threads), not the
+/// default 2, so one slow flush does not hold every other store's snapshot checkpoint.
+/// Read from the OPTIONS file RocksDB writes at open, which records what it actually applied.
+#[retcd_test]
+async fn a_r286_store_opens_with_more_background_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let s = open_plain(tmp.path());
+        let options = std::fs::read_dir(s.path())
+            .expect("data dir lists")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"))
+            .max_by_key(|e| e.file_name())
+            .expect("RocksDB writes an OPTIONS file at open");
+        let text = std::fs::read_to_string(options.path()).expect("OPTIONS reads");
+        assert!(
+            text.lines().any(|l| l.trim() == "max_background_jobs=16"),
+            "the store's RocksDB options must carry max_background_jobs=16"
+        );
+    }
+}

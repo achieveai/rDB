@@ -220,8 +220,9 @@ because openraft does not order the two operations for the receiver (research §
 
 ## Verification
 
-- M5 rows for: `get_snapshot_builder` captures a `rocksdb::Snapshot` unaffected by concurrent
-  `apply` (write during an in-flight build, assert the exported file matches the pre-write state);
+- M5 rows for: the build's view is unaffected by concurrent `apply` (write during an in-flight
+  build, assert the exported file matches the pre-write state; see the 2026-10-24 Note for where
+  the view is now taken);
   publish ordering survives crash injection at each of the five Publish-ordering steps, reopen
   always yields either the old or the new snapshot as current, never neither and never a torn file;
   `build_snapshot` at startup after a purge with no `current_snapshot` recorded; install validation
@@ -413,3 +414,32 @@ follower's term at 7 and 1106 `exceeded 200 ms` errors.
 Residual: the leader's stream to that follower also carries its heartbeats (OpenRaft 0.9). An
 install longer than the follower's election timeout can still cost one stale campaign; it no
 longer repeats forever.
+
+### 2026-10-24 — the view is a checkpoint taken in `build_snapshot` (rulings A-R279, A-R286)
+
+The Decision's "captured inside `get_snapshot_builder()`" no longer holds. Two facts changed it:
+
+1. **The view was already a checkpoint.** `rocksdb::Snapshot` borrows the `DB` and cannot live in
+   a builder that outlives the call, so the view has been a RocksDB checkpoint (a hard-linked copy
+   of the store) since M5.
+2. **A capture in `get_snapshot_builder` stalls apply.** OpenRaft 0.9.25's sm worker awaits
+   `get_snapshot_builder` before it handles the next apply (`core/sm/worker.rs`). A checkpoint
+   flushes the memtable first; under load that took 2.3-3.0 s, and apply waited the whole time.
+   `m5_snapshot_cluster` failed 8 of 20 runs under load on that and on a shared flush thread.
+
+Now `get_snapshot_builder` only hands over the store. Each `build_snapshot` attempt takes a fresh
+checkpoint, then reads `last_applied`, membership and the header fields **from that checkpoint**,
+never from the live state machine. Apply writes records and metadata in one batch, so the
+metadata always describes the captured data, wherever the capture runs. A2's goal is kept: the
+export never reads live state, and no mutex serializes writes for the build.
+
+Store open also sets RocksDB `max_background_jobs = 16` (4 flush threads instead of 1, shared by
+every store in the process). With both changes `m5_snapshot_cluster` passed 20 of 20 runs under
+the same load.
+
+Rows (`config-storage/tests/m5_snapshot.rs`): `m5_01b_a_capture_describes_its_checkpoint_not_later_applies`,
+`m5_01c_snapshot_describes_the_view_taken_when_the_build_runs`,
+`a_r286_store_opens_with_more_background_jobs`.
+
+Residual: the checkpoint still flushes the memtable. A checkpoint without a flush needs an argument
+rust-rocksdb 0.23 does not expose; that is a follow-up, not this change.

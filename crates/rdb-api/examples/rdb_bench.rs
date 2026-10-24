@@ -59,6 +59,14 @@
 //! family's memtable budget (`StorageOptions::write_buffer_bytes`), so `rss_mb` is read with
 //! RocksDB's memtables held to `N` rather than its 64 MiB default.
 //!
+//! **Three processes** (lead, A-R280). `--nodes 1=A,2=B,3=C --control E,E,E --cert-dir C` drives
+//! an `lr` run's `rdb_node` processes instead: this process holds no copy (`local=[]`) and
+//! talks to them over TLS as app `--app` (default `pilot`). `--fill K` first puts `bench/0..K`.
+//! The copies are in the other processes, so `heap_mb` and `rss_mb` are this client's,
+//! `wal_mb` is -1, the owner's lengths are -1 and the ladder 0 (status carries no lengths over
+//! the wire), and History is off;
+//! `--node-pids P,P,P` adds each node process's resident memory as `node_rss_mb`.
+//!
 //! Exit 0 when every write published (or the dataset was built), 1 when any was refused or the
 //! open failed, 2 on bad arguments. `--dir` is removed at the end unless `--keep`; a dataset is
 //! kept on purpose.
@@ -165,12 +173,24 @@ struct Args {
     dataset: Option<u64>,
     build: Option<u64>,
     root: PathBuf,
+    /// Remote mode: the rEtcd client endpoints of an `lr` run.
+    control: Vec<String>,
+    /// Remote mode: `rdb_node` addresses by node number; non-empty means remote.
+    nodes: BTreeMap<u32, String>,
+    cert_dir: Option<PathBuf>,
+    app: String,
+    /// Remote mode: put `bench/0..K` (as `--build-dataset K` does) before the run.
+    fill: Option<u64>,
+    /// OS pids whose resident memory each minute also shows (the `rdb_node` processes).
+    node_pids: Vec<u32>,
 }
 
 fn usage() -> &'static str {
     "usage: rdb_bench --dir D --log-dir L [--dataset K] [--rate R] [--writers N] [--minutes M] \
      [--keys K] [--value-bytes B] [--keep] [--no-history] [--write-buffer-bytes N]\n       \
-     rdb_bench --build-dataset K --log-dir L [--dataset-root P]\n  \
+     rdb_bench --build-dataset K --log-dir L [--dataset-root P]\n       \
+     rdb_bench --dir D --log-dir L --nodes 1=A,2=B,3=C --control E,E,E --cert-dir C \
+     [--app NAME] [--fill K] [--node-pids P,P,P] [--rate R] [--minutes M] [--keys K]\n  \
      --rate 0 sends back to back; default 100. --minutes default 1 (fractions allowed).\n  \
      --writers N: N threads share the rate, each with one write in flight; default 1.\n"
 }
@@ -192,6 +212,12 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
         dataset: None,
         build: None,
         root: PathBuf::from("C:/rdb_test_data/bench"),
+        control: Vec::new(),
+        nodes: BTreeMap::new(),
+        cert_dir: None,
+        app: "pilot".to_owned(),
+        fill: None,
+        node_pids: Vec::new(),
     };
     while let Some(word) = words.next() {
         let mut value = |name: &str| words.next().ok_or_else(|| format!("{name} needs a value"));
@@ -228,6 +254,25 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.build = Some(positive(&value("--build-dataset")?, "--build-dataset")?);
             }
             "--dataset-root" => args.root = PathBuf::from(value("--dataset-root")?),
+            "--control" => {
+                args.control = value("--control")?.split(',').map(str::to_owned).collect();
+            }
+            "--nodes" => {
+                for pair in value("--nodes")?.split(',') {
+                    let (n, addr) = pair
+                        .split_once('=')
+                        .ok_or_else(|| format!("--nodes: {pair:?} is not N=host:port"))?;
+                    args.nodes.insert(number(n, "--nodes")?, addr.to_owned());
+                }
+            }
+            "--cert-dir" => args.cert_dir = Some(PathBuf::from(value("--cert-dir")?)),
+            "--app" => args.app = value("--app")?,
+            "--fill" => args.fill = Some(positive(&value("--fill")?, "--fill")?),
+            "--node-pids" => {
+                for pid in value("--node-pids")?.split(',') {
+                    args.node_pids.push(number(pid, "--node-pids")?);
+                }
+            }
             other => return Err(format!("unknown argument {other:?}\n{}", usage())),
         }
     }
@@ -239,6 +284,24 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
         }
         (None, Some(dir)) => args.dir = dir,
         (None, None) => return Err(format!("--dir is required\n{}", usage())),
+    }
+    if args.nodes.is_empty() {
+        if !args.control.is_empty() || args.cert_dir.is_some() || args.fill.is_some() {
+            return Err("--control, --cert-dir and --fill go with --nodes (remote mode)".into());
+        }
+    } else {
+        if args.control.is_empty() || args.cert_dir.is_none() {
+            return Err("--nodes needs --control and --cert-dir (an lr run's)".into());
+        }
+        if args.dataset.is_some() || args.build.is_some() || args.write_buffer_bytes.is_some() {
+            return Err(
+                "--nodes runs against processes that hold the data: use --fill K, not \
+                 --dataset, --build-dataset or --write-buffer-bytes"
+                    .into(),
+            );
+        }
+        // The History sampler opens node 1's copy, which is in another process.
+        args.no_history = true;
     }
     Ok(args)
 }
@@ -294,7 +357,12 @@ fn main() -> ExitCode {
     if std::env::var_os("RETCD_TEST_DATA_DIR").is_none() {
         std::env::set_var("RETCD_TEST_DATA_DIR", args.dir.join("control"));
     }
-    let code = match run(&args, costs.ladder) {
+    let outcome = if args.nodes.is_empty() {
+        run(&args, costs.ladder)
+    } else {
+        run_remote(&args, costs.ladder)
+    };
+    let code = match outcome {
         Ok(code) => code,
         Err(message) => {
             eprintln!("rdb_bench: {message}");
@@ -633,6 +701,7 @@ fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
             boot: None,
             storage: rdb_api::db::StorageOptions {
                 write_buffer_bytes: args.write_buffer_bytes,
+                memtable_budget_bytes: None,
             },
         };
         let opened = Instant::now();
@@ -702,6 +771,96 @@ fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
         (None, _) => {}
     }
     result
+}
+
+/// Remote mode (lead, A-R280): drive an `lr` run's three `rdb_node` processes over TLS as an
+/// app that holds no copy (`local=[]`, as `pilot_kv` does), with the run's rEtcd as the control
+/// store. `--fill K` first puts `bench/0..K` as `--build-dataset K` does, since an `lr` run forms
+/// its own database. `--node-pids` adds each process's resident memory to every minute.
+fn run_remote(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
+    use rdb_api::net::faults::Faults;
+    use rdb_api::net::wire::Label;
+    use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
+    use rdb_api::transport::Links;
+    use rdb_api::{BootId, NodeId};
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    let client = config_client::GrpcClient::connect(
+        args.control.clone(),
+        config_client::GrpcClientOptions::default(),
+    )
+    .map_err(|e| format!("--control: {e}"))?;
+    let store: Arc<dyn ConfigStore> = Arc::new(client);
+    let label = Label::App(args.app.clone());
+    let cert_dir = args.cert_dir.as_deref().ok_or("--cert-dir is required")?;
+    let tls = certs::load(cert_dir, &label).map_err(|e| format!("--cert-dir: {e}"))?;
+    let dial: BTreeMap<NodeId, String> = args
+        .nodes
+        .iter()
+        .map(|(n, addr)| (NodeId(*n), addr.clone()))
+        .collect();
+    let peers: Vec<NodeId> = dial.keys().copied().collect();
+    let links = Links::new();
+    // Held to the end: dropping a `Net` aborts its link tasks.
+    let net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label,
+                boot: BootId(0),
+                tls,
+                peers: peers.iter().copied().collect(),
+                dial,
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+            },
+            &links,
+            None,
+        )
+        .map_err(|e| format!("links: {e}"))?
+    };
+    rt.block_on(net.wait_up(&peers, Duration::from_secs(60)))
+        .map_err(|down| format!("links down: {down}"))?;
+    println!("links up nodes={peers:?}");
+    let config = DbConfig {
+        ack_floor: true,
+        dir: args.dir.join("app"),
+        hold: Vec::new(),
+        timeouts: Timeouts::default(),
+        dedup_cap: None,
+        dedup_retention: None,
+        local: Vec::new(),
+        links: Some(links),
+        client: rdb_api::db::DEFAULT_CLIENT,
+        boot: None,
+        storage: rdb_api::db::StorageOptions::default(),
+    };
+    let opened = Instant::now();
+    let mut db = rt
+        .block_on(Db::open(config, store, rt.handle().clone()))
+        .map_err(|e| format!("open: {e}"))?;
+    let code = match db.wait_ready(Duration::from_secs(60)) {
+        Err(e) => Err(format!("not ready: {e}")),
+        Ok(()) => {
+            println!("ready in {:.1} s", opened.elapsed().as_secs_f64());
+            let filled = args.fill.map_or(Ok(()), |keys| fill(&db, keys));
+            filled.map(|()| {
+                let keys = args.keys.or(args.fill).unwrap_or(1_000);
+                drive(&db, args, keys, ladder_cost)
+            })
+        }
+    };
+    db.shutdown();
+    drop(db);
+    drop(net);
+    drop(rt);
+    if !args.keep {
+        remove(&args.dir);
+    }
+    code
 }
 
 /// Put the saved control records back into fresh voters, then write [`PAD_KEY`] until the
@@ -994,7 +1153,7 @@ fn drive(db: &Db, args: &Args, keys: u64, ladder_cost: f64) -> ExitCode {
     );
     println!(
         "minute  ok  rate/s  p50ms  p99ms  maxms  refused  slips  rss_mb  published_total  \
-         history_rows  history_mb  heap_mb  wal_mb  dedup  status  ladder  pub_at  heap_ex_mb"
+         history_rows  history_mb  heap_mb  wal_mb  dedup  status  ladder  pub_at  heap_ex_mb  node_rss_mb"
     );
     sample_rss();
     if !args.no_history {
@@ -1002,6 +1161,7 @@ fn drive(db: &Db, args: &Args, keys: u64, ladder_cost: f64) -> ExitCode {
     }
     let probe = Probe {
         db,
+        node_pids: args.node_pids.clone(),
         nodes: args.dir.join("db").join("nodes"),
         ladder_cost,
     };
@@ -1106,6 +1266,8 @@ fn drive(db: &Db, args: &Args, keys: u64, ladder_cost: f64) -> ExitCode {
 /// What [`report_minute`] reads memory and lengths from.
 struct Probe<'a> {
     db: &'a Db,
+    /// Other processes whose resident memory each minute shows (`--node-pids`).
+    node_pids: Vec<u32>,
     nodes: PathBuf,
     /// Heap bytes one digest-ladder rung costs ([`struct_costs`]).
     ladder_cost: f64,
@@ -1134,6 +1296,17 @@ fn report_minute(
     let (history_rows, history_mb) = history();
     let heap = heap_mb();
     let wal = wal_mb(&probe.nodes);
+    // `-` without `--node-pids`; else each process's MB, `/`-separated, -1 when unread.
+    let node_rss = if probe.node_pids.is_empty() {
+        "-".to_owned()
+    } else {
+        probe
+            .node_pids
+            .iter()
+            .map(|pid| format!("{:.0}", read_rss_mb(*pid)))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     let statuses = probe.db.node_status();
     let owner = statuses
         .iter()
@@ -1181,12 +1354,13 @@ fn report_minute(
         ladder,
         published_at = pub_at,
         heap_ex_mb = heap_ex,
+        node_rss_mb = %node_rss,
         "bench_minute"
     );
     println!(
         "{n:>6} {:>4} {rate:>7.1} {p50:>6.2} {p99:>6.2} {max:>6.2} {:>8} {slips:>6} {rss:>7.0} \
          {published:>16} {history_rows:>13.0} {history_mb:>11.1} {heap:>8.1} {wal:>7.1} \
-         {dedup:>6} {status:>7} {ladder:>7.0} {pub_at:>7} {heap_ex:>11.2}",
+         {dedup:>6} {status:>7} {ladder:>7.0} {pub_at:>7} {heap_ex:>11.2} {node_rss:>12}",
         w.micros.len(),
         w.refused_text()
     );
@@ -1219,13 +1393,13 @@ fn wal_mb(nodes: &Path) -> f64 {
     mb
 }
 
-/// This process's resident memory in MB, or -1 when it cannot be read. Slow on Windows (it runs
-/// `tasklist`), so only [`sample_rss`]'s thread calls it.
-fn read_rss_mb() -> f64 {
+/// Process `pid`'s resident memory in MB, or -1 when it cannot be read. Slow on Windows (it
+/// runs `tasklist`), so only [`sample_rss`]'s thread and the minute reporter call it, never a
+/// writer.
+fn read_rss_mb(pid: u32) -> f64 {
     #[cfg(windows)]
     {
         // `tasklist` prints `"name","pid","session","#","12,345 K"`: the working set.
-        let pid = std::process::id().to_string();
         let out = std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .output();
@@ -1240,7 +1414,7 @@ fn read_rss_mb() -> f64 {
     }
     #[cfg(not(windows))]
     {
-        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
             return -1.0;
         };
         status
@@ -1272,10 +1446,10 @@ static RSS_MB: AtomicU64 = AtomicU64::new(0xBFF0_0000_0000_0000);
 
 /// Sample [`read_rss_mb`] every 10 s on its own thread, so the write loop never waits on it.
 fn sample_rss() {
-    RSS_MB.store(read_rss_mb().to_bits(), Ordering::Relaxed);
+    RSS_MB.store(read_rss_mb(std::process::id()).to_bits(), Ordering::Relaxed);
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_secs(10));
-        RSS_MB.store(read_rss_mb().to_bits(), Ordering::Relaxed);
+        RSS_MB.store(read_rss_mb(std::process::id()).to_bits(), Ordering::Relaxed);
     });
 }
 

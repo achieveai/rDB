@@ -27,7 +27,7 @@ mod snapshot;
 
 pub use engine::{
     dump, BindError, DamageRefused, InjectedFault, OpenError, RawRecord, RocksEngine,
-    StorageOptions, DEFAULT_WRITE_BUFFER_BYTES,
+    StorageOptions, DEFAULT_MEMTABLE_BUDGET_BYTES, DEFAULT_WRITE_BUFFER_BYTES, WAL_BUDGETS,
 };
 pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
 pub use keys::{Link, PublishMark, INSTANCE_LEN};

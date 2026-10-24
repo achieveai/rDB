@@ -1572,10 +1572,26 @@ fn open_boundary(
     }
 }
 
+/// RocksDB `max_background_jobs` for every store (A-R286). RocksDB gives a quarter to flushes,
+/// so 16 is 4 flush and 12 compaction jobs, and at open it raises the process-wide flush and
+/// compaction thread pools to at least that.
+///
+/// The default, 2, means one flush thread for every store in the process. A snapshot checkpoint
+/// flushes the memtable and waits for that thread, so one slow flush held up every other store's
+/// checkpoint: under load ten stores' checkpoints, 2.3-3.0 s each, finished within 80 ms of one
+/// another, and each store's synced log writes waited for its own checkpoint meanwhile.
+///
+/// Why 16: the point was 4 flush threads instead of 1, and RocksDB derives the flush share from
+/// this one number. Only 2 and 16 were measured, on `m5_snapshot_cluster` 20 times under load
+/// at scale 3. With 2, and the capture already moved into `build_snapshot`, it passed 16/20.
+/// With 16 it passed 20/20. Values between 2 and 16 are unmeasured; a lower one may do as well.
+const MAX_BACKGROUND_JOBS: i32 = 16;
+
 fn open_db(dir: &Path, path: &Path) -> Result<DB, StorageOpenError> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
+    db_opts.set_max_background_jobs(MAX_BACKGROUND_JOBS);
 
     let mut cf_opts = Options::default();
     cf_opts.set_compression_type(DBCompressionType::Lz4);
@@ -3027,57 +3043,22 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
             .await
     }
 
-    /// Capture the view the next [`RocksSnapshotBuilder::build_snapshot`] will export.
+    /// Hand out a builder. It captures nothing: the view is taken in
+    /// [`RocksSnapshotBuilder::build_snapshot`] (A-R286).
     ///
-    /// The capture happens **here**, and not in `build_snapshot` — which OpenRaft runs
-    /// concurrently with further applies (research §1.3, trap T3). `apply` writes its records
-    /// and `last_applied` in one batch, and the capture reads `last_applied` back from the
-    /// checkpoint rather than from memory, so a view can never straddle one: the exported data
-    /// and the exported `last_applied` describe the same instant. It does not hold the
-    /// state-machine mutex while the checkpoint is taken (A-R279). A snapshot whose header said
-    /// index N while its bytes held N+5 would install a follower into a state no leader ever
-    /// had.
-    ///
-    /// The view itself is a [`rocksdb::checkpoint::Checkpoint`] — a directory of hard links,
-    /// so its cost is the number of SST files rather than the size of the database — because
-    /// `rocksdb::Snapshot` borrows the `DB` and cannot be stored in a builder that outlives
-    /// this call without `unsafe`, which this crate forbids.
-    ///
-    /// This method cannot return an error (OpenRaft's signature has no `Result`), so a failed
-    /// capture is recorded as "no view" and `build_snapshot` retries it. That is not a
-    /// workaround: `build_snapshot` returning `Err` is *fatal* to the node (research §1.5), so
-    /// every transient failure that can be retried must be.
+    /// OpenRaft awaits this method on its state-machine worker, so every apply queues behind
+    /// it. A capture here took one RocksDB checkpoint — a memtable flush that waits on the
+    /// shared flush threads, 2-3 s under load — and stalled every write for that long.
+    /// `build_snapshot` runs in a spawned task, concurrently with further applies (research
+    /// §1.3, trap T3), and that is safe for this capture: it reads `last_applied` and the rest
+    /// of the header back from the checkpoint, and `apply` writes them in the same batch as the
+    /// records, so the exported data and the exported `last_applied` always describe the same
+    /// instant, however far apply has moved on. A snapshot whose header said index N while its
+    /// bytes held N+5 would install a follower into a state no leader ever had.
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        let shared = Arc::clone(&self.shared);
-        // Three errors are collapsed into "no view" here — the blocking-pool join, the
-        // poison/boundary guard, and the checkpoint itself. Collapsing them is forced by the
-        // signature; losing them is not, so each one is named before it is dropped, otherwise
-        // a node that quietly retries every build forever has no diagnosis (C5-14).
-        let captured = match shared
-            .run(|s| match capture_view(s) {
-                Ok(view) => Ok(Some(view)),
-                Err(e) => {
-                    tracing::warn!(
-                        reason = "capture_failed",
-                        detail = %e,
-                        "snapshot_view_unavailable"
-                    );
-                    Ok(None)
-                }
-            })
-            .await
-        {
-            Ok(view) => view,
-            Err(e) => {
-                tracing::warn!(
-                    reason = "store_unavailable",
-                    detail = %e,
-                    "snapshot_view_unavailable"
-                );
-                None
-            }
-        };
-        RocksSnapshotBuilder { shared, captured }
+        RocksSnapshotBuilder {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Create the file OpenRaft will stream an incoming snapshot into, and remember where it is.
@@ -3204,7 +3185,7 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
 
 /// The consistent view one snapshot is exported from.
 ///
-/// Captured in [`RaftStateMachine::get_snapshot_builder`]. Every field below is read back from
+/// Captured in [`RocksSnapshotBuilder::build_snapshot`]. Every field below is read back from
 /// the checkpoint itself, not from the in-memory state machine, so the checkpoint's contents and
 /// the metadata describe the same applied instant without holding the state-machine lock while
 /// the checkpoint is taken (A-R279).
@@ -3321,13 +3302,10 @@ impl Drop for InFlightBuild {
     }
 }
 
-/// `RocksSm`'s [`RaftSnapshotBuilder`]: exports the view captured in `get_snapshot_builder`
-/// into `<data_dir>/snapshots/<id>.snap` and publishes it (ADR-0022).
+/// `RocksSm`'s [`RaftSnapshotBuilder`]: captures a view, exports it into
+/// `<data_dir>/snapshots/<id>.snap` and publishes it (ADR-0022).
 pub struct RocksSnapshotBuilder {
     shared: Arc<RocksShared>,
-    /// The view captured when this builder was handed out, or `None` if that capture failed
-    /// and [`RocksSnapshotBuilder::build_snapshot`] must take its own.
-    captured: Option<CapturedView>,
 }
 
 impl Debug for RocksSnapshotBuilder {
@@ -3353,21 +3331,15 @@ impl RaftSnapshotBuilder<TypeConfig> for RocksSnapshotBuilder {
         let started = std::time::Instant::now();
         let mut last_err = None;
         for attempt in 0..BUILD_ATTEMPTS {
-            let captured = self.captured.take();
             if attempt > 0 {
                 self.shared
                     .snapshot_build_retries
                     .fetch_add(1, Ordering::SeqCst);
             }
+            // A fresh view per attempt: a failed export removes its checkpoint.
             let result = self
                 .shared
-                .run(move |s| {
-                    let view = match captured {
-                        Some(view) => view,
-                        None => capture_view(s)?,
-                    };
-                    export_snapshot(s, view)
-                })
+                .run(|s| export_snapshot(s, capture_view(s)?))
                 .await;
             match result {
                 Ok(stored) => {

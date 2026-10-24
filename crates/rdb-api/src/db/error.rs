@@ -247,8 +247,8 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
              nodes and its rEtcd are running (on a local run, `scripts/local-rdb.sh status`)"
         }
         ErrorKind::GenerationChanged => {
-            "ask `Db::status` with this request id to learn whether it applied; never replay it \
-             as it is"
+            "this send wrote nothing; if the request was sent before, ask `Db::status` with \
+             this request id whether an earlier send applied it; never replay it as it is"
         }
         ErrorKind::RequestIdReuse => {
             "use a new request id for a different write; this id stays bound to its first write"

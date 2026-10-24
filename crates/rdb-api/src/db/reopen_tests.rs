@@ -1488,8 +1488,9 @@ fn m10_r189_a_generation_changed_refusal_says_to_look_the_request_up_with_status
         (
             ErrorKind::GenerationChanged,
             "generation changed: expected Generation(1), current Generation(2); request 1 was \
-             sent under generation 1; look it up with Db::status to see whether it applied; do \
-             not resend it as a new request"
+             sent under generation 1 and this send wrote nothing; if it was sent before, look \
+             it up with Db::status to see whether an earlier send applied it, and do not resend \
+             it as a new request"
         )
     );
     assert_eq!(
@@ -2554,6 +2555,7 @@ fn m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with() {
             DbConfig {
                 storage: crate::StorageOptions {
                     write_buffer_bytes: Some(ASKED),
+                    memtable_budget_bytes: None,
                 },
                 ..config(dir.path())
             },

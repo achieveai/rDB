@@ -3759,6 +3759,51 @@ fn a_dispatch_check_a1_denies_is_logged_with_its_reason() {
     );
 }
 
+/// Ruling A-R285: a put A1 refuses at dispatch for `ControlUnavailable` (control quorum lost,
+/// grant still held) reaches the client as `PROTECTION_PAUSED` with its no-mutation proof, not
+/// `LEASE_EXPIRED`. Under load on 3 processes an rEtcd election showed 19 such refusals as
+/// `LEASE_EXPIRED`, which reads as a lost grant (dev-perf, lr R=30 run 2, 2026-10-24).
+/// Trio (~2 s): bootstrap, then one store outage on a 100 ms renewal.
+#[config_log::retcd_test]
+fn a_control_unavailable_deny_reaches_the_client_as_protection_paused() {
+    const METHOD: &str = "a_control_unavailable_deny_reaches_the_client_as_protection_paused";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), |host| {
+        Trio::fast(host);
+        host.budgets.renew_millis = 100;
+    });
+    trio.bootstrap();
+    trio.ready();
+    // A stall on this thread past the grant lapses it (#50): ask with time left on it.
+    trio.admits_for(1_000);
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    trio.until("node 1 stops admitting", |trio| {
+        (trio.status(0).admits != Some(true)).then_some(())
+    });
+    let refused = trio.ask(put(1, b"a", b"1", None));
+    trio.mem.stop_failing();
+    let lines = trio.until("authority_check_denied", |_| {
+        let lines = logged!(METHOD, "authority_check_denied");
+        (!lines.is_empty()).then_some(lines)
+    });
+    assert!(
+        lines.iter().any(|line| line["node"] == 1
+            && line["checkpoint"] == "StorageDispatch"
+            && line["reason"] == "ControlUnavailable"),
+        "the refusal is A1's ControlUnavailable deny at dispatch: {lines:?}"
+    );
+    match refused {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::ProtectionPaused, "{error:?}");
+            assert!(error.no_mutation, "refused before apply: {error:?}");
+        }
+        other => panic!("a put while control is unavailable: {other:?}"),
+    }
+}
+
 /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
 /// `count_resend` calls touch its slot.
 const UNSENT: CopyId = CopyId(9);
