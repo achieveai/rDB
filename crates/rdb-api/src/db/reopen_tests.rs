@@ -2549,6 +2549,7 @@ fn m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with() {
                 storage: crate::StorageOptions {
                     write_buffer_bytes: Some(ASKED),
                     memtable_budget_bytes: None,
+                    sync_stuck_millis: None,
                 },
                 ..config(dir.path())
             },

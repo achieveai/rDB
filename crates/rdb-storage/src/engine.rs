@@ -77,7 +77,18 @@ pub struct StorageOptions {
     ///   rarely keeps its oldest WAL file alive; past that size RocksDB flushes it so the file
     ///   can go. RocksDB's own limit is 4 times the sum of every column family's memtables.
     pub memtable_budget_bytes: Option<usize>,
+    /// How long one WAL sync may stay in flight before the node that runs it faults, in
+    /// milliseconds (ruling A-R317). The engine does not read it; the host's syncer does. A
+    /// slow sync that returns inside it costs nothing but durable lag; one still running past
+    /// it is a stuck disk, and the node gives up its grant so another can take over. `None`
+    /// keeps [`DEFAULT_SYNC_STUCK_MILLIS`].
+    pub sync_stuck_millis: Option<u64>,
 }
+
+/// The default of [`StorageOptions::sync_stuck_millis`] (A-R317): 5 s, about 1.7 times the
+/// slowest WAL sync measured under load (2,973 ms, lr6). A stuck disk then costs about 8 s
+/// before another node takes over: this, plus the 2.9 s the last renewed grant still lives.
+pub const DEFAULT_SYNC_STUCK_MILLIS: u64 = 5_000;
 
 /// The default memtable budget of one store, all column families together (A-R300): 64 MiB,
 /// one column family's worth at RocksDB's own size.
@@ -108,6 +119,12 @@ impl StorageOptions {
     pub fn effective_cf_write_buffer_bytes(&self) -> usize {
         self.effective_write_buffer_bytes()
             .min(self.effective_memtable_budget_bytes())
+    }
+
+    /// The stuck-sync limit, in milliseconds: [`Self::sync_stuck_millis`] or its default.
+    #[must_use]
+    pub fn effective_sync_stuck_millis(&self) -> u64 {
+        self.sync_stuck_millis.unwrap_or(DEFAULT_SYNC_STUCK_MILLIS)
     }
 
     /// `max_total_wal_size`: [`WAL_BUDGETS`] memtable budgets.
@@ -243,9 +260,12 @@ pub(crate) struct Marks {
 
 /// One core set's data engine on RocksDB.
 ///
-/// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). The write-order mutex is `&mut self`:
-/// a capture and its sync cannot interleave with a commit. When M9 adds IO workers it becomes a
-/// real `Mutex`.
+/// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). Every write and every capture goes
+/// through `&mut self`, so they are ordered. The WAL sync itself is not held under it (ruling
+/// A-R317, spec §6.1): [`Self::begin_sync`] fixes, under `&mut self`, what a sync may credit,
+/// [`WalSync::flush`] runs `flush_wal(true)` on any thread while commits go on, and
+/// [`Self::finish_sync`] moves the durable marks. A sync makes durable exactly the writes that
+/// returned before it began; a write made during it is durable only after the next one.
 ///
 /// A [`crate::RocksSnapshot`] shares the database (M10 decision 2): dropping the engine closes
 /// RocksDB and releases its `LOCK` and its directory claim only once every view taken from it
@@ -266,10 +286,14 @@ pub struct RocksEngine {
     /// open. Every view holds a clone, so the claim outlives the last handle on `db`.
     pub(crate) claim: Option<Arc<File>>,
     /// A-R214: RocksDB's latest sequence number when the WAL was last known synced through
-    /// it: read just before a `flush_wal(true)` that succeeded, or just after a synced write.
+    /// it: read when a `flush_wal(true)` that succeeded began, or just after a synced write.
     /// `None` until then, so a fresh open counts as unsynced. A write after it, synced or not,
-    /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`].
+    /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`]. It never
+    /// moves backwards (A-R317): a sync that began before a synced write ends after it.
     synced_seq: Option<u64>,
+    /// The options this engine was opened with; the host reads
+    /// [`StorageOptions::sync_stuck_millis`] from them.
+    storage: StorageOptions,
     /// Debug builds: the options a writable open used, kept for their WAL-sync counter
     /// ([`Self::wal_syncs`]); `None` on a read-only open.
     #[cfg(debug_assertions)]
@@ -314,6 +338,53 @@ impl InjectedFault {
             Self::CopyBatch => "copy-batch",
             Self::SyncedPut => "synced-put",
         }
+    }
+}
+
+/// One WAL sync, begun by [`RocksEngine::begin_sync`] (ruling A-R317). It holds what that
+/// sync may credit, fixed when it began, and a handle on the database, so [`Self::flush`] can
+/// run on another thread while the engine's owner goes on committing. Hand it back to
+/// [`RocksEngine::finish_sync`] to move the durable marks.
+pub struct WalSync {
+    db: Arc<DB>,
+    /// RocksDB's latest sequence number when the sync began (A-R214).
+    latest: u64,
+    /// Set when an armed [`InjectedFault::WalFlush`] fired at the start: the fsync fails with
+    /// this, without calling RocksDB.
+    failed: Option<String>,
+    captured: Vec<CapturedPrefix>,
+    /// Per capture, in order: the most it may be credited, `min(captured, applied)` at the
+    /// start; `None` for a lineage the engine did not hold then.
+    credits: Vec<Option<u64>>,
+    /// Ancestor levels an inherited capture reads through, each with the most it may be
+    /// credited: its link's base, and the level's applied mark, at the start.
+    ancestors: Vec<((PartitionId, Generation), u64)>,
+}
+
+impl WalSync {
+    /// The fsync: `flush_wal(true)` over the whole engine WAL. Blocks for as long as the disk
+    /// takes, and takes no engine lock, so commits on the engine's own thread go on meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// RocksDB's error, or the injected fault's.
+    pub fn flush(&self) -> Result<(), String> {
+        if let Some(failed) = &self.failed {
+            return Err(failed.clone());
+        }
+        self.db.flush_wal(true).map_err(|e| e.to_string())
+    }
+}
+
+impl std::fmt::Debug for WalSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalSync")
+            .field("latest", &self.latest)
+            .field("failed", &self.failed)
+            .field("captured", &self.captured)
+            .field("credits", &self.credits)
+            .field("ancestors", &self.ancestors)
+            .finish_non_exhaustive()
     }
 }
 
@@ -364,15 +435,26 @@ impl RocksEngine {
 
     /// [`Self::put_metadata_synced`] for several keys in one atomic batch: all land or none.
     fn put_metadata_synced_all(&mut self, puts: &[(&[u8], &[u8])]) -> Result<(), String> {
+        self.put_metadata_all(puts, true)
+    }
+
+    /// [`Self::put_metadata_synced_all`], or with `sync` off the same batch staged: written to
+    /// the WAL unsynced, so it is durable only after the next WAL sync that begins after it
+    /// returns (A-R317), and [`Self::wal_synced_through_latest`] is `false` until then. The
+    /// staged form exists so a node's thread never waits on an fsync for these keys: its
+    /// syncer's next sync carries them. Fault point [`InjectedFault::SyncedPut`] either way.
+    fn put_metadata_all(&mut self, puts: &[(&[u8], &[u8])], sync: bool) -> Result<(), String> {
         self.fire(InjectedFault::SyncedPut)?;
         let mut opts = WriteOptions::default();
-        opts.set_sync(true);
+        opts.set_sync(sync);
         let mut write = WriteBatch::default();
         for (key, value) in puts {
             write.put_cf(self.cf(CF_METADATA), key, value);
         }
         self.db.write_opt(write, &opts).map_err(|e| e.to_string())?;
-        self.synced_seq = Some(self.db.latest_sequence_number());
+        if sync {
+            self.synced_seq = Some(self.db.latest_sequence_number());
+        }
         Ok(())
     }
 
@@ -503,6 +585,7 @@ impl RocksEngine {
             injected: None,
             claim: Some(Arc::new(claim)),
             synced_seq: None,
+            storage,
             #[cfg(debug_assertions)]
             options: Some(options),
         })
@@ -545,6 +628,7 @@ impl RocksEngine {
             injected: None,
             claim: None,
             synced_seq: None,
+            storage: StorageOptions::default(),
             #[cfg(debug_assertions)]
             options: None,
         })
@@ -619,6 +703,12 @@ impl RocksEngine {
         &self.path
     }
 
+    /// The options this engine was opened with; the defaults on a read-only open.
+    #[must_use]
+    pub const fn storage_options(&self) -> StorageOptions {
+        self.storage
+    }
+
     /// Every lineage the engine holds, in `(partition, generation)` order.
     #[must_use]
     pub fn lineages(&self) -> Vec<(PartitionId, Generation)> {
@@ -678,8 +768,33 @@ impl RocksEngine {
         partition: PartitionId,
         marks: &[PublishMark],
     ) -> Result<(), StorageFault> {
-        let written =
-            self.put_metadata_synced(&publish_marks_key(partition), &encode_publish_marks(marks));
+        self.write_publish_marks(partition, marks, true)
+    }
+
+    /// [`Self::put_publish_marks`] staged, not synced (A-R317): durable only after the next WAL
+    /// sync that begins after it returns. A node's thread writes its periodic marks this way, so
+    /// it never waits on an fsync for them; a lost or late mark only frees less (A-R183).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_publish_marks`].
+    pub fn stage_publish_marks(
+        &mut self,
+        partition: PartitionId,
+        marks: &[PublishMark],
+    ) -> Result<(), StorageFault> {
+        self.write_publish_marks(partition, marks, false)
+    }
+
+    fn write_publish_marks(
+        &mut self,
+        partition: PartitionId,
+        marks: &[PublishMark],
+        sync: bool,
+    ) -> Result<(), StorageFault> {
+        let key = publish_marks_key(partition);
+        let value = encode_publish_marks(marks);
+        let written = self.put_metadata_all(&[(&key, &value)], sync);
         if let Err(e) = written {
             tracing::error!(
                 target: LOG_TARGET,
@@ -749,6 +864,31 @@ impl RocksEngine {
         partition: PartitionId,
         epoch: OwnerEpoch,
     ) -> Result<(), StorageFault> {
+        self.write_epoch_revocation(partition, epoch, true)
+    }
+
+    /// [`Self::persist_epoch_revocation`] staged, not synced (A-R317): the revocation is durable
+    /// only after the next WAL sync that begins after this returns, and does not count until
+    /// then. The host stages it on the node's thread and tells A1 it is persisted only when its
+    /// syncer's next sync returns, so the thread never waits on that fsync.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::persist_epoch_revocation`].
+    pub fn stage_epoch_revocation(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+    ) -> Result<(), StorageFault> {
+        self.write_epoch_revocation(partition, epoch, false)
+    }
+
+    fn write_epoch_revocation(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        sync: bool,
+    ) -> Result<(), StorageFault> {
         let mut epochs = self.revoked(partition)?.unwrap_or_default();
         epochs.insert(epoch);
         let key = revoked_key(partition);
@@ -758,7 +898,7 @@ impl RocksEngine {
         if self.format < FORMAT_VERSION {
             puts.push((FORMAT_KEY, &marker));
         }
-        if let Err(e) = self.put_metadata_synced_all(&puts) {
+        if let Err(e) = self.put_metadata_all(&puts, sync) {
             tracing::error!(
                 target: LOG_TARGET,
                 partition = partition.0,
@@ -777,6 +917,7 @@ impl RocksEngine {
             revoked = epochs.len(),
             from_format,
             format = self.format,
+            synced = sync,
             "epoch_revocation_persisted"
         );
         Ok(())
@@ -1013,7 +1154,8 @@ impl RocksEngine {
         Ok(applied)
     }
 
-    /// Sync the WAL and report which captured prefixes are now durable.
+    /// Sync the WAL and report which captured prefixes are now durable: [`Self::begin_sync`],
+    /// [`WalSync::flush`] and [`Self::finish_sync`] back to back, on this thread.
     ///
     /// `flush_wal(true)` syncs the whole engine WAL, so each prefix is confirmed through
     /// `min(captured, applied)`. The `durable` marks are written **after** the sync returns, in
@@ -1029,80 +1171,108 @@ impl RocksEngine {
         &mut self,
         captured: Vec<CapturedPrefix>,
     ) -> Result<Vec<DurablePrefix>, StorageFault> {
+        let sync = self.begin_sync(captured);
+        let flushed = sync.flush();
+        self.finish_sync(sync, flushed)
+    }
+
+    /// Begin one WAL sync (ruling A-R317, spec §6.1): fix, now, what it may credit. Each
+    /// capture is credited through `min(captured, applied now)`, and each ancestor an inherited
+    /// lineage reads through through its link's base as linked now. So a commit that returns
+    /// after this call is never credited by this sync, whatever its seq: it is durable only
+    /// after the next one. The returned [`WalSync`] runs the fsync on any thread; hand it back
+    /// to [`Self::finish_sync`]. An armed [`InjectedFault::WalFlush`] fires here and fails that
+    /// fsync without calling RocksDB.
+    pub fn begin_sync(&mut self, captured: Vec<CapturedPrefix>) -> WalSync {
         // A-R214: read before the sync, so a write racing it can only cost one more sync.
         let latest = self.db.latest_sequence_number();
-        let synced = self
-            .fire(InjectedFault::WalFlush)
-            .and_then(|()| self.db.flush_wal(true).map_err(|e| e.to_string()));
-        if let Err(e) = synced {
-            tracing::error!(target: LOG_TARGET, error = %e, "wal_sync_failed");
-            return Err(StorageFault::FlushFailed);
-        }
-        self.synced_seq = Some(latest);
-        let mut next = self.lineages.clone();
-        let mut marks_write = WriteBatch::default();
-        let mut durable = Vec::with_capacity(captured.len());
-        let mut raised = Vec::new();
+        let failed = self.fire(InjectedFault::WalFlush).err();
+        let mut credits = Vec::with_capacity(captured.len());
+        let mut ancestors = Vec::new();
         for capture in &captured {
-            // A lineage this engine was never given holds nothing: its durable prefix is the
-            // empty one, and the sync creates no entry for it. One it made was a child with
-            // "history" that the inherit creating the lineage later refused (defect D7).
-            if !next.contains_key(&(capture.partition, capture.generation)) {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    partition = capture.partition.0,
-                    generation = capture.generation.0,
-                    "wal_sync_unknown_lineage"
-                );
-                durable.push(DurablePrefix {
-                    partition: capture.partition,
-                    generation: capture.generation,
-                    through: DurableSeq(0),
-                });
+            let key = (capture.partition, capture.generation);
+            let Some(marks) = self.lineages.get(&key) else {
+                credits.push(None);
                 continue;
-            }
+            };
             // An inherited base is the parent's batches in this same WAL, so the sync that makes
             // it durable in the child makes it durable in every ancestor, through each level's
             // base (`MemoryEngine::sync_ancestors`).
-            let mut level = (capture.partition, capture.generation);
+            let mut level = key;
             let mut through = capture.through.0;
-            while let Some(link) = next.get(&level).and_then(|marks| marks.link) {
+            while let Some(link) = self.lineages.get(&level).and_then(|marks| marks.link) {
                 through = through.min(link.base.0);
                 level = (capture.partition, link.parent);
-                let parent = next.entry(level).or_default();
-                let synced = DurableSeq(through.min(parent.applied.0));
-                if synced > parent.durable {
-                    parent.durable = synced;
-                    marks_write.put_cf(
-                        self.cf(CF_METADATA),
-                        private_key(level.0, level.1, DURABLE_KEY),
-                        synced.0.to_be_bytes(),
-                    );
-                    raised.push((level, synced));
-                }
+                let applied = self
+                    .lineages
+                    .get(&level)
+                    .map_or(0, |parent| parent.applied.0);
+                ancestors.push((level, through.min(applied)));
             }
-            let marks = next
-                .entry((capture.partition, capture.generation))
-                .or_default();
-            let through = capture.through.0.min(marks.applied.0);
-            // B-R13: the one sanctioned crossing from applied to durable in this crate. A real
-            // `flush_wal(true)` just returned over the whole WAL, which holds this prefix.
-            let synced = DurableSeq(through);
-            if synced > marks.durable {
-                marks.durable = synced;
+            credits.push(Some(capture.through.0.min(marks.applied.0)));
+        }
+        WalSync {
+            db: Arc::clone(&self.db),
+            latest,
+            failed,
+            captured,
+            credits,
+            ancestors,
+        }
+    }
+
+    /// Finish a sync [`Self::begin_sync`] began, given how its [`WalSync::flush`] ended. The
+    /// marks are read **now**, not as they were at the start (critic-f4 M6): a commit, an
+    /// inherit or a seal made while the fsync ran stays, and a mark only ever moves up, to what
+    /// the start fixed. The A-R214 synced marker never moves backwards either.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::FlushFailed`] when the fsync failed, or when the durable marks cannot be
+    /// written after it; no durable mark moves in either case.
+    pub fn finish_sync(
+        &mut self,
+        sync: WalSync,
+        flushed: Result<(), String>,
+    ) -> Result<Vec<DurablePrefix>, StorageFault> {
+        if let Err(e) = flushed {
+            tracing::error!(target: LOG_TARGET, error = %e, "wal_sync_failed");
+            return Err(StorageFault::FlushFailed);
+        }
+        self.synced_seq = Some(
+            self.synced_seq
+                .map_or(sync.latest, |seen| seen.max(sync.latest)),
+        );
+        // B-R13: the one sanctioned crossing from applied to durable in this crate. A real
+        // `flush_wal(true)` just returned over the whole WAL, which held every prefix credited
+        // here when the sync began.
+        let mut raise: BTreeMap<(PartitionId, Generation), DurableSeq> = BTreeMap::new();
+        let wanted = sync.ancestors.iter().copied().chain(
+            sync.captured
+                .iter()
+                .zip(&sync.credits)
+                .filter_map(|(capture, credit)| {
+                    credit.map(|through| ((capture.partition, capture.generation), through))
+                }),
+        );
+        for (key, through) in wanted {
+            let Some(marks) = self.lineages.get(&key) else {
+                continue;
+            };
+            let synced = DurableSeq(through.min(marks.applied.0));
+            if synced > marks.durable && raise.get(&key).is_none_or(|at| synced > *at) {
+                raise.insert(key, synced);
+            }
+        }
+        if !raise.is_empty() {
+            let mut marks_write = WriteBatch::default();
+            for (&(partition, generation), synced) in &raise {
                 marks_write.put_cf(
                     self.cf(CF_METADATA),
-                    private_key(capture.partition, capture.generation, DURABLE_KEY),
+                    private_key(partition, generation, DURABLE_KEY),
                     synced.0.to_be_bytes(),
                 );
             }
-            durable.push(DurablePrefix {
-                partition: capture.partition,
-                generation: capture.generation,
-                through: marks.durable,
-            });
-        }
-        if !marks_write.is_empty() {
             let written = self
                 .fire(InjectedFault::MarkWrite)
                 .and_then(|()| self.db.write(marks_write).map_err(|e| e.to_string()));
@@ -1111,25 +1281,55 @@ impl RocksEngine {
                 return Err(StorageFault::FlushFailed);
             }
         }
-        self.lineages = next;
-        for ((partition, generation), synced) in raised {
-            tracing::info!(
-                target: LOG_TARGET,
-                partition = partition.0,
-                generation = generation.0,
-                durable = synced.0,
-                "wal_sync_ancestor"
-            );
+        for (key, synced) in &raise {
+            if let Some(marks) = self.lineages.get_mut(key) {
+                marks.durable = *synced;
+            }
         }
-        for (capture, prefix) in captured.iter().zip(&durable) {
+        for &(level, _) in &sync.ancestors {
+            if let Some(synced) = raise.remove(&level) {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    partition = level.0 .0,
+                    generation = level.1 .0,
+                    durable = synced.0,
+                    "wal_sync_ancestor"
+                );
+            }
+        }
+        let mut durable = Vec::with_capacity(sync.captured.len());
+        for (capture, credit) in sync.captured.iter().zip(&sync.credits) {
+            let key = (capture.partition, capture.generation);
+            // A lineage this engine was not given when the sync began holds nothing it could
+            // credit: its durable prefix is the empty one, and the sync creates no entry for it.
+            // One it made was a child with "history" that the inherit creating the lineage later
+            // refused (defect D7).
+            let through = if credit.is_some() {
+                self.lineages
+                    .get(&key)
+                    .map_or(DurableSeq(0), |marks| marks.durable)
+            } else {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    partition = capture.partition.0,
+                    generation = capture.generation.0,
+                    "wal_sync_unknown_lineage"
+                );
+                DurableSeq(0)
+            };
             tracing::debug!(
                 target: LOG_TARGET,
                 partition = capture.partition.0,
                 generation = capture.generation.0,
                 captured = capture.through.0,
-                durable = prefix.through.0,
+                durable = through.0,
                 "wal_sync"
             );
+            durable.push(DurablePrefix {
+                partition: capture.partition,
+                generation: capture.generation,
+                through,
+            });
         }
         Ok(durable)
     }
@@ -1226,6 +1426,33 @@ impl RocksEngine {
         generation: Generation,
         below: Seq,
     ) -> Result<usize, StorageFault> {
+        self.trim_dedup(partition, generation, below, true)
+    }
+
+    /// [`Self::delete_dedup_trimmed`] staged, not synced (A-R317): the delete is durable only
+    /// after the next WAL sync that begins after this returns. A node's thread deletes this way,
+    /// so it never waits on that fsync; a crash before the sync may reseed what it deleted, as a
+    /// reopen already may for every trim since the last delete (A-R172).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete_dedup_trimmed`].
+    pub fn stage_dedup_trimmed(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        below: Seq,
+    ) -> Result<usize, StorageFault> {
+        self.trim_dedup(partition, generation, below, false)
+    }
+
+    fn trim_dedup(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        below: Seq,
+        sync: bool,
+    ) -> Result<usize, StorageFault> {
         if !self.lineages.contains_key(&(partition, generation)) {
             tracing::error!(
                 target: LOG_TARGET,
@@ -1278,7 +1505,7 @@ impl RocksEngine {
             }
         }
         let mut opts = WriteOptions::default();
-        opts.set_sync(true);
+        opts.set_sync(sync);
         if let Err(e) = self.db.write_opt(write, &opts) {
             tracing::error!(
                 target: LOG_TARGET,
@@ -1291,7 +1518,7 @@ impl RocksEngine {
         }
         // A synced write that deleted something synced the WAL through it, as
         // `put_metadata_synced` does (A-R214). An empty batch is not counted: it may not sync.
-        if deleted > 0 {
+        if sync && deleted > 0 {
             self.synced_seq = Some(self.db.latest_sequence_number());
         }
         tracing::info!(

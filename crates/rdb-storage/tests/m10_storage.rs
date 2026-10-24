@@ -823,6 +823,7 @@ fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
             StorageOptions {
                 write_buffer_bytes: Some(SMALL_BUFFER),
                 memtable_budget_bytes: None,
+                sync_stuck_millis: None,
             },
         )
         .expect("open with a small budget"),
@@ -877,6 +878,7 @@ fn m10_s2_a_small_write_buffer_flushes_where_the_default_keeps_everything_in_mem
         StorageOptions {
             write_buffer_bytes: Some(SMALL_BUFFER),
             memtable_budget_bytes: None,
+            sync_stuck_millis: None,
         },
         "flush-small",
     );
@@ -935,6 +937,7 @@ fn a_r300_memtable_memory_stays_within_the_store_budget() {
         StorageOptions {
             write_buffer_bytes: None,
             memtable_budget_bytes: Some(BUDGET),
+            sync_stuck_millis: None,
         },
     )
     .expect("open with a 1 MiB budget");
