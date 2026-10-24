@@ -5428,6 +5428,8 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
 ///   `seed_pending` (M7A-194) read the dedup namespace of the step's snapshot — rows at or below
 ///   `retained_through`, the recovered cutoff, which is the published position — and expose
 ///   whether that read is still owed; neither hands back a view or a sequence above it.
+///   `status_len` (M10 S2, A-R272) is how many status entries are held: a number, never a
+///   sequence or a view.
 /// - `status.rs`: the KA-9 wire map and the status index. `entry` hands back a status entry: its
 ///   `seq` is the request's own position and its `snapshot` is `None` while pending, so it names no
 ///   view anyone can read. `restore` and `recovered_outcome` (M7A-194) are the seed's write and
@@ -5471,6 +5473,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
             "publication_snapshot",
             "published",
             "seed_pending",
+            "status_len",
             "try_seed",
             "view",
         ],

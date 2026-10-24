@@ -1394,7 +1394,8 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     );
 }
 
-/// A-R188 (tester r8 `nr`): once node 1 has restarted, it does not rejoin in this open.
+/// A-R188 (tester r8 `nr`): once node 1 has restarted, the owner stays out until the folder is
+/// opened again.
 /// `wait_ready` answers at once with `Stopped`, whose text names the restart and says to shut
 /// the `Db` down and open the folder again, rather than waiting out its bound; a put and a get
 /// refused after it carry the same next step. Taking that step works: the reopen reads the write

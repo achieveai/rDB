@@ -118,6 +118,32 @@ const PUBLISH_MARKS: usize = 64;
 /// A publish mark as the host holds it: `(generation, seq, tick)`, a `published_at` entry.
 type Mark = (Generation, Seq, Tick);
 
+/// The width of one `published_at` bucket (design-ackfloor §3).
+const PUBLISH_BUCKET_MILLIS: u64 = 1_000;
+
+/// Record that `generation` published through `seq` at `now`: one `published_at` entry per
+/// (generation, `width` ms bucket), not one per write (design-ackfloor §3, D8). `width` is
+/// [`PUBLISH_BUCKET_MILLIS`] outside crate tests. A publish in the newest entry's bucket moves
+/// that entry up to its seq and its tick, so an entry `(g, seq, at)` still says every seq of
+/// `g` up to `seq` was published by `at`. Keeping the newest tick (Rev 3 A4) means
+/// [`Host::trim_aged`] frees a seq up to one bucket late, never early.
+fn record_published(
+    published: &mut VecDeque<Mark>,
+    width: u64,
+    generation: Generation,
+    seq: Seq,
+    now: Tick,
+) {
+    let bucket = |at: Tick| at.0 / width.max(1);
+    match published.back_mut() {
+        Some((g, last, at)) if *g == generation && bucket(*at) == bucket(now) => {
+            *last = (*last).max(seq);
+            *at = (*at).max(now);
+        }
+        _ => published.push_back((generation, seq, now)),
+    }
+}
+
 /// A-R183 C2: the publish marks of one partition's `published_at`, oldest first: every
 /// `step`-th entry, so at most [`PUBLISH_MARKS`] of them span the whole queue, and the newest
 /// entry of each generation, since a mark covers the seqs of one generation only.
@@ -831,6 +857,24 @@ pub struct NodeStatus {
     /// While a control reload of this node's is retrying, how many of its lists have failed.
     /// Filled by `Db::node_status` from the control adapter; the host itself leaves it `None`.
     pub reload_pending: Option<u32>,
+    /// How many entries each per-write index holds here (M10 S2, A-R272): read-only, for the
+    /// bench's memory proof. The host fills it; it never crosses the wire, so a status read
+    /// from a peer has `None`.
+    pub lengths: Option<IndexLengths>,
+}
+
+/// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
+/// 0 where the node holds no such index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexLengths {
+    /// T1's dedup index: one entry per remembered request.
+    pub dedup: usize,
+    /// P1's status index: one entry per request whose status it holds.
+    pub status: usize,
+    /// R1's digest ladder: the primary's tracker history, or the receiver's on a secondary.
+    pub ladder: usize,
+    /// The host's `published_at` publish marks.
+    pub published_at: usize,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -1368,10 +1412,12 @@ struct Host {
     next_flush: Tick,
     next_ticket: u64,
     next_trim: Tick,
-    /// Per partition, each published `(generation, seq)` and when it was published, oldest
-    /// first, until the trim duty ages it out. Only the owner's P1 publishes, so only the owner
-    /// fills it.
+    /// Per partition, the newest published `(generation, seq)` of each (generation, bucket) and
+    /// when it was published, oldest first, until the trim duty ages it out ([`record_published`]).
+    /// Only the owner's P1 publishes, so only the owner fills it.
     published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
+    /// [`PUBLISH_BUCKET_MILLIS`]; crate tests lower it.
+    publish_bucket_millis: u64,
     /// [`HOST_TRIM_EVERY_MILLIS`]; crate tests lower it.
     trim_every_millis: u64,
     /// D6 (A-R170 D, A-R172): per partition and generation, the newest trim floor `below` not yet
@@ -1518,6 +1564,7 @@ impl Host {
             next_ticket: 1,
             next_trim: now.plus_millis(HOST_TRIM_EVERY_MILLIS),
             published_at: BTreeMap::new(),
+            publish_bucket_millis: PUBLISH_BUCKET_MILLIS,
             trim_every_millis: HOST_TRIM_EVERY_MILLIS,
             trim_floors: BTreeMap::new(),
             trim_deleted_at: BTreeMap::new(),
@@ -3336,10 +3383,9 @@ impl Host {
             }
             // Recorded for the trim duty, then routed to T1 below.
             KernelEffect::Published { lineage, seq, .. } => {
-                self.published_at
-                    .entry(lineage.partition)
-                    .or_default()
-                    .push_back((lineage.generation, *seq, self.clock.now()));
+                let published = self.published_at.entry(lineage.partition).or_default();
+                let (width, now) = (self.publish_bucket_millis, self.clock.now());
+                record_published(published, width, lineage.generation, *seq, now);
             }
             // A1 refused a check. The refusal the client sees (`LEASE_EXPIRED` and the like) does
             // not say which conjunct denied, so name it here (U1, ruling A-R109). Still routed.
@@ -6604,6 +6650,21 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             reload_pending: None,
+            lengths: Some(IndexLengths {
+                dedup: self
+                    .transaction
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.dedup().len()),
+                status: self
+                    .publication
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.status_len()),
+                ladder: match self.replication.primary(self.node, partition) {
+                    Some(primary) => primary.tracker().history().len(),
+                    None => receiver.map_or(0, |receiver| receiver.history().len()),
+                },
+                published_at: self.published_at.get(&partition).map_or(0, VecDeque::len),
+            }),
         }
     }
 }

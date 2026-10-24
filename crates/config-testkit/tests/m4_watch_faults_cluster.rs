@@ -1746,12 +1746,23 @@ async fn m4_83_resume_on_new_leader_after_compaction_is_typed() {
     // after failover it can still race ahead of `new_leader` as "the" leader `compact_now`
     // asks. That ask then itself fails `NotLeader` once the stale node catches up mid-call.
     // Retry rather than asserting the very first attempt succeeds.
+    //
+    // The same retry covers `feature_not_activated` (k468). This is the first `Compact`, so the
+    // schema gate admits it only once every voter has answered the new leader with its schema;
+    // one that has not answered yet counts as schema 1 (ADR-0030 A7). The old leader was healed
+    // the moment the successor won, so for a moment it has not answered.
     let compact_deadline = tokio::time::Instant::now() + cluster.deadline(20);
     let compacted = loop {
         match cluster.compact_now(head).await {
             Ok(v) => break v,
             Err(ConfigError::NotLeader { .. })
                 if tokio::time::Instant::now() < compact_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await; // testkit:allow-sleep: bounded backoff before the next compact_now retry, gated by compact_deadline
+            }
+            Err(ConfigError::Unavailable { ref reason })
+                if reason == config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED
+                    && tokio::time::Instant::now() < compact_deadline =>
             {
                 tokio::time::sleep(Duration::from_millis(50)).await; // testkit:allow-sleep: bounded backoff before the next compact_now retry, gated by compact_deadline
             }
