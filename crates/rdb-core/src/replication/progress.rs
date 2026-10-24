@@ -76,12 +76,21 @@ pub(crate) struct HeldView {
 ///
 /// * another partition or generation: [`ReplicaIgnoreReason::NotRequired`], because installing
 ///   a generation is `Recovered`'s job, never a view's;
+/// * the held `authority_seq`, epoch and configuration version again:
+///   [`ReplicaIgnoreReason::NotRequired`]. That is A1's renewal re-publishing the view this copy
+///   already holds (it does not bump `authority_seq`), not a regress; nothing is stored;
 /// * `authority_seq` not above the held one, or a higher one that lowers the epoch or the
 ///   configuration version: [`ReplicaIgnoreReason::OutOfOrder`], a regress, so nothing is
 ///   stored.
 pub(crate) fn view_refusal(held: &HeldView, view: &AuthorityView) -> Option<ReplicaIgnoreReason> {
     if view.lineage.partition != held.lineage.partition
         || view.lineage.generation != held.lineage.generation
+    {
+        return Some(ReplicaIgnoreReason::NotRequired);
+    }
+    if view.authority_seq == held.authority_seq
+        && view.lineage.owner_epoch == held.lineage.owner_epoch
+        && view.config_version == held.config_version
     {
         return Some(ReplicaIgnoreReason::NotRequired);
     }

@@ -4893,3 +4893,61 @@ fn issue_39_replay_of_a_key_moved_after_the_newer_snapshot() {
         value: record(P1, OTHER, 3).encode(),
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ruling A-R325 (critic-degraded A-9): the completion arm fences the served epoch only when the
+// persisted one is that epoch or newer. Owner epochs only grow per partition, so an older one
+// is a late second persist of a re-asked revocation. The kernel twin of rdb-api's host row
+// `m10_s2_b14`, and the boundary between the two. The fixtures are M7A-184's.
+// ---------------------------------------------------------------------------------------------
+
+/// A late persist for an older epoch, `(p1, e2)` while A1 serves `(p1, e3)`: recorded, the drain
+/// proof follows, and nothing is fenced, so `(p1, e3)` stays served and still admits.
+/// Cut: the arm fences whatever epoch it serves, red (the fence, and `EpochRevoked`).
+#[retcd_test]
+fn a_late_revocation_of_an_older_epoch_leaves_the_served_epoch_admitting() {
+    let mut kernel = Authority::new();
+    let _ = acquire_and_load_p1_p2_at_e3(&mut kernel);
+    let effects = kernel
+        .step(&ctx(6), &revocation_persisted(6, P1, 2))
+        .expect("the late completion");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Fact(AuthorityFact::DrainProof)],
+        "an older epoch fences nothing"
+    );
+    assert_eq!(revoked(&kernel), vec![(P1, OwnerEpoch(2))]);
+    assert_eq!(kernel.view().served.get(&P1), Some(&lineage(3)));
+    assert_eq!(
+        kernel.may_admit_at(p1_at(3), Tick(6), &BUDGETS),
+        Verdict::Admit
+    );
+}
+
+/// The boundary: a persist for the served epoch itself, `(p1, e3)`, fences it `EpochRevoked`
+/// and removes it, and the drain proof follows. `p2` is untouched.
+/// Cut: the older-epoch check also skips an equal epoch, red (no fence).
+#[retcd_test]
+fn a_revocation_of_the_served_epoch_fences_it() {
+    let mut kernel = Authority::new();
+    let _ = acquire_and_load_p1_p2_at_e3(&mut kernel);
+    let effects = kernel
+        .step(&ctx(6), &revocation_persisted(6, P1, 3))
+        .expect("the completion");
+    let shapes = shapes(&effects);
+    assert!(
+        shapes.contains(&Shape::Fence(DenyReason::EpochRevoked))
+            && shapes.contains(&Shape::Fact(AuthorityFact::DrainProof)),
+        "{shapes:?}"
+    );
+    assert_eq!(kernel.view().served.get(&P1), None);
+    assert_ne!(
+        kernel.may_admit_at(p1_at(3), Tick(6), &BUDGETS),
+        Verdict::Admit,
+        "a removed epoch admits nothing"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p2_at(3), Tick(6), &BUDGETS),
+        Verdict::Admit
+    );
+}

@@ -667,6 +667,81 @@ fn freeze_while_dispatched(source: FenceSource) {
     );
 }
 
+/// A-R324, the simulator twin of host row
+/// `a_node_fence_sited_at_partition_0_freezes_partition_1s_queue`. A1 sites a node fence at the
+/// partition of the event that tripped it. Here that is a `NodeLifecycle::Resumed` past the
+/// resume-gap tolerance, queued on B at partition 0, where B serves no T1 or P1, behind A1's
+/// `Dispatch` answer for request 11. The dispatcher delivers the fence at partition 1 too, so
+/// T1 freezes on the dispatched seq 11 with its lost authority, and P1 freezes with it. Before
+/// A-R324 the fence reached partition 0 only, and both stayed open.
+///
+/// A-R331: the fan-out set is A1's own fence views. B also serves partition 2, seeded as a
+/// `partitions/2` record naming B, with no plan: A1 views it, so its P1 takes the fence too,
+/// and no T1 is made there.
+#[retcd_test]
+fn a_node_fence_sited_at_partition_0_freezes_partition_1() {
+    support::preamble();
+    let mut plan = a1p1_plan();
+    let p2 = PartitionRecord {
+        partition: PartitionId(2),
+        owner: B,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+        config_version: rdb_core::contracts::ids::ConfigVersion(1),
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    plan.control_records
+        .push((ControlKey::Partition(PartitionId(2)), p2.encode()));
+    let mut runner = Runner::new(&plan).expect("runner");
+    let mut replies = run_to(&mut runner, SUBMIT - 1);
+    cut_b(&mut runner);
+    while !dispatch_decided(&runner, SUBMIT) {
+        assert!(
+            step(&mut runner, SUBMIT, &mut replies),
+            "the tick ran out before the answer"
+        );
+    }
+    runner
+        .queue(&SeedEvent {
+            partition: PartitionId(0),
+            ..on_b(
+                SUBMIT,
+                9_701,
+                EventKind::Node(NodeLifecycle::Resumed {
+                    suspended_millis: Budgets::SPEC_DEFAULTS.resume_gap_tolerance_millis + 1,
+                }),
+            )
+        })
+        .expect("queue");
+    while step(&mut runner, SUBMIT, &mut replies) {}
+    let lost = FreezeCause::AuthorityLost(DenyReason::ProcessSuspended);
+    assert_eq!(
+        *t1(&runner).mode(),
+        QueueMode::Frozen {
+            cause: lost,
+            unresolved: Some(Seq(WRITE)),
+        },
+        "T1 on partition 1 froze on the dispatched seq 11"
+    );
+    assert_eq!(
+        p1(&runner).mode,
+        PubMode::Frozen { cause: lost },
+        "P1 on partition 1 took the same fence"
+    );
+    let dispatcher = runner.dispatcher();
+    assert_eq!(
+        (
+            dispatcher
+                .publication()
+                .view(B, PartitionId(2))
+                .map(|view| view.mode),
+            dispatcher.transaction().kernel(B, PartitionId(2)).is_some(),
+        ),
+        (Some(PubMode::Frozen { cause: lost }), false),
+        "partition 2's P1 (made by A1's view) took the fence; no T1 was made there"
+    );
+}
+
 // ---- M7A-163 --------------------------------------------------------------------------------
 
 /// M7A-163 (ADR 0008 "Dropped control operation", both consumers). The control completion B's
@@ -1047,8 +1122,10 @@ fn status_reply(replies: &Replies, request: u64) -> Vec<TxnStatus> {
         .collect()
 }
 
-/// When gen 3 on B admits: past its resume hold. Found by the scenario (S-117b), where a
-/// `Submit` at this tick was admitted and published in gen 3.
+/// A tick by which gen 3 on B surely admits. Found by the scenario (S-117b), where a `Submit` at
+/// this tick was admitted and published in gen 3. It was chosen past a resume hold that gen 3's
+/// first resume no longer runs (A-R165, A-R344), so gen 3 admits well before it; rows read it as
+/// "after admission", never as the admission edge.
 const GEN3_ADMITS: u64 = SUBMIT + 110 + 9_000;
 
 /// M7A-117 (ADR 0004 generation reconciliation; A-R68 Q1/Q12). Two sub-cases.
@@ -2012,9 +2089,9 @@ fn m7a_131_a1_p1_expire_authority_between_publication_and_reply() {
 ///
 /// - **Same node** (`gen2_committed`, then gen 3's root at `now`): a retry queued at `now`, ahead
 ///   of the root, is answered from gen 2's own index — the published result replayed, no batch;
-///   the first queued behind the root, during the resume hold, is refused `PROTECTION_PAUSED`;
-///   the other four, through gen 3's first admission, are refused `GENERATION_CHANGED{2, 3}` at
-///   check 5. The sequence is pinned; `NOT_PRIMARY` is never a same-node answer (reviewer T-3).
+///   the five queued behind the root are refused `GENERATION_CHANGED{2, 3}` at check 5. Gen 3's
+///   first resume skips the hold (A-R165), and R1's `Lost` at the generation's start no longer
+///   restores it (A-R344), so no retry meets `PROTECTION_PAUSED`. The sequence is pinned; `NOT_PRIMARY` is never a same-node answer (reviewer T-3).
 ///   `Status{Some(2)}` folds `RecoveredApplied`. A fresh request at `GEN3_ADMITS + 2` is
 ///   published in gen 3 at the next sequence, so gen 3 admits — it just does not re-execute.
 /// - **Different node** (the A1/P1 case): retries reach B before its T1 exists (`NOT_PRIMARY`),
@@ -2105,14 +2182,14 @@ fn m7a_136_f1_t1_generation_reconciliation_no_double_apply() {
             .map(|reply| kind(reply))
             .collect::<Vec<_>>(),
         [
-            "PROTECTION_PAUSED",
+            "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
             "GENERATION_CHANGED{2, 3}",
         ],
-        "behind the root, in reply order: PROTECTION_PAUSED in the resume hold, then \
-         GENERATION_CHANGED{{2, 3}} through gen 3's admission; never NOT_PRIMARY here"
+        "behind the root, in reply order: GENERATION_CHANGED{{2, 3}}, since gen 3's first \
+         resume skips the hold (A-R165, A-R344); never NOT_PRIMARY here"
     );
     assert_eq!(
         status_reply(&replies, WRITTEN),
@@ -2132,6 +2209,34 @@ fn m7a_136_f1_t1_generation_reconciliation_no_double_apply() {
         "gen 3 admits a fresh request at the next sequence"
     );
     let trace = runner.finish().expect("trace");
+    // The first retry behind the root is answered after gen 3 on B resumes, with no hold
+    // between (A-R165, A-R344): why it is `GENERATION_CHANGED`, not `PROTECTION_PAUSED`.
+    let resumed = trace
+        .events
+        .iter()
+        .find(|event| {
+            event.node == B
+                && event.logical_tick >= now
+                && matches!(
+                    event.kind,
+                    TraceKind::ProtectionState {
+                        phase: rdb_core::contracts::trace::ProtectionPhase::Healthy,
+                        ..
+                    }
+                )
+        })
+        .map(|event| event.logical_tick);
+    let answered = trace
+        .events
+        .iter()
+        .filter(|event| event.correlation == CorrelationId(9_602))
+        .map(|event| event.logical_tick)
+        .max();
+    tracing::info!(now, ?resumed, ?answered, "m7a_136_gen3_resume");
+    assert!(
+        resumed.is_some_and(|tick| answered.is_some_and(|at| tick <= at && tick < GEN3_ADMITS)),
+        "gen 3 resumes before 9_602 is answered, long before GEN3_ADMITS: {resumed:?} {answered:?}"
+    );
     let applies = batch_applies(&trace.events);
     let at_5: Vec<_> = applies
         .iter()

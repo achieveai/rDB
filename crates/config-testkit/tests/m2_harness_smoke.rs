@@ -11,14 +11,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use config_core::{
-    ClusterId, ClusterIdentity, ConfigError, Durability, GetRequest, GetResponse, MutationOutcome,
-    NodeId, PutRequest,
+    ClusterId, ClusterIdentity, Durability, GetRequest, GetResponse, MutationOutcome, NodeId,
+    PutRequest,
 };
 use config_storage::{
     Boundary, FaultAction, FaultInjector, NoFaults, RocksStore, StorageOpenError,
 };
 use config_testkit::cluster::{Cluster, ClusterConfig, NodeStartError, RocksSpec, StorageKind};
-use config_testkit::poll_until_async;
 
 fn put_req(k: &str, v: &str) -> PutRequest {
     PutRequest {
@@ -299,38 +298,13 @@ async fn stop_all_then_start_all_recovers_from_disk() {
 /// answered `NotLeader` with a hint to node 2. Not reproduced in those 20 runs; inferred from
 /// the error and the restart order. Any other error still fails the row.
 async fn read_at_leader(cluster: &Cluster, leader: NodeId, key: &str) -> GetResponse {
-    let refused = std::sync::Mutex::new(Vec::new());
-    let refused = &refused;
-    let got = poll_until_async(cluster.deadline(20), cluster.poll_interval(), || {
-        let target = if lock(refused).is_empty() {
-            Some(leader)
-        } else {
-            cluster.leader_now()
-        };
-        async move {
-            let target = target?;
-            match cluster.client(target).get(get_req(key)).await {
-                Ok(got) => Some(got),
-                Err(e @ ConfigError::NotLeader { .. }) => {
-                    tracing::info!(node = target.0, error = %e, "m2_read_not_leader");
-                    lock(refused).push(target);
-                    None
-                }
-                Err(e) => panic!("read {key} at {target}: {e}"),
-            }
-        }
-    })
-    .await;
-    got.unwrap_or_else(|t| {
-        panic!(
-            "no leader answered the read of {key}: {t}; refused by {:?}",
-            lock(refused)
-        )
-    })
-}
-
-fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    cluster
+        .retry_on_not_leader(leader, cluster.deadline(20), |node| {
+            let client = cluster.client(node);
+            async move { client.get(get_req(key)).await }
+        })
+        .await
+        .unwrap_or_else(|e| panic!("read {key} at the leader: {e}"))
 }
 
 /// Issue #31: a read sent to a leader that has since stepped down is re-asked of the new one.

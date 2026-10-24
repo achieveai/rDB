@@ -1643,6 +1643,48 @@ impl Cluster {
             .collect()
     }
 
+    /// Run `op` at `first`, and after a `NotLeader` again at whichever node leads by then.
+    ///
+    /// Leadership can move between finding the leader and sending to it, and under host load it
+    /// does (#31, A-R347). `NotLeader` is refused before anything is proposed, so that answer
+    /// alone is retried: the next attempt waits for a leader other than the node that refused
+    /// (see [`Cluster::leaders_now`] for why not just the first leader) and goes there, until
+    /// `deadline`. Any other error is returned at once, for the row to fail on; so is the last
+    /// `NotLeader` once `deadline` passes. Each refusal logs `not_leader_retry`.
+    pub async fn retry_on_not_leader<T, F, Fut>(
+        &self,
+        first: NodeId,
+        deadline: Duration,
+        mut op: F,
+    ) -> Result<T, config_core::ConfigError>
+    where
+        F: FnMut(NodeId) -> Fut,
+        Fut: std::future::Future<Output = Result<T, config_core::ConfigError>>,
+    {
+        let until = tokio::time::Instant::now() + deadline;
+        let mut target = first;
+        let mut refusals = 0u32;
+        loop {
+            let error = match op(target).await {
+                Err(e @ config_core::ConfigError::NotLeader { .. }) => e,
+                other => return other,
+            };
+            refusals += 1;
+            tracing::info!(node = target.0, refusals, error = %error, "not_leader_retry");
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let stale = target;
+            let next = self
+                .wait_for(&format!("a leader other than {stale}"), left, || {
+                    self.leaders_now().into_iter().find(|id| *id != stale)
+                })
+                .await;
+            match next {
+                Ok(next) => target = next,
+                Err(_) => return Err(error),
+            }
+        }
+    }
+
     /// Every running node that is not the current leader.
     pub fn followers(&self) -> Vec<NodeId> {
         let leader = self.leader_now();

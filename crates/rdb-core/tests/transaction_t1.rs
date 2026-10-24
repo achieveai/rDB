@@ -4197,22 +4197,16 @@ const EVERY_DENY_REASON: [DenyReason; 16] = [
 /// this compiling until someone decides its code here, and must also join
 /// [`EVERY_DENY_REASON`], whose length is part of its type.
 fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
+    // After apply the batch may have landed, whatever the reason (lead rulings A-R298, A-R342).
+    if boundary == Boundary::PostApply {
+        return ErrorKind::UnknownOutcome;
+    }
     match reason {
-        // After apply the batch may have landed (lead ruling A-R298).
-        DenyReason::GenerationChanged => match boundary {
-            Boundary::PreApply => ErrorKind::GenerationChanged,
-            Boundary::PostApply => ErrorKind::UnknownOutcome,
-        },
-        DenyReason::LocalStorageFenced => match boundary {
-            Boundary::PreApply => ErrorKind::ProtectionPaused,
-            Boundary::PostApply => ErrorKind::UnknownOutcome,
-        },
-        // Ruling A-R285: control quorum lost while the grant is held. Before apply nothing was
-        // handed to storage, so the refusal proves no mutation; after apply it proves nothing.
-        DenyReason::ControlUnavailable => match boundary {
-            Boundary::PreApply => ErrorKind::ProtectionPaused,
-            Boundary::PostApply => ErrorKind::LeaseExpired,
-        },
+        DenyReason::GenerationChanged => ErrorKind::GenerationChanged,
+        // Ruling A-R285: control quorum lost while the grant is held, so it is a pause.
+        DenyReason::LocalStorageFenced | DenyReason::ControlUnavailable => {
+            ErrorKind::ProtectionPaused
+        }
         DenyReason::NoGrant
         | DenyReason::Frozen
         | DenyReason::Revoked
@@ -4230,11 +4224,10 @@ fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
 }
 
 /// M7A-71. The mapping is total over every `DenyReason` (16 landed; the plan's "15" predates
-/// `ClockModeUnbounded`) at both boundaries, and checkpoint-sensitive for three reasons only:
-/// `LocalStorageFenced`, `PROTECTION_PAUSED` before apply and `UNKNOWN_OUTCOME` after;
-/// `ControlUnavailable` (ruling A-R285), `PROTECTION_PAUSED` before apply and `LEASE_EXPIRED`
-/// after; and `GenerationChanged` (ruling A-R298), `GENERATION_CHANGED` before apply and
-/// `UNKNOWN_OUTCOME` after. No arm
+/// `ClockModeUnbounded`) at both boundaries. After apply every reason answers `UNKNOWN_OUTCOME`
+/// (rulings A-R298, A-R342). Before apply `LocalStorageFenced` and `ControlUnavailable` (ruling
+/// A-R285) answer `PROTECTION_PAUSED`, `GenerationChanged` answers `GENERATION_CHANGED`, and
+/// every other reason `LEASE_EXPIRED`. No arm
 /// produces `DIVERGENCE_REQUIRES_OPERATOR`; that code reaches a client only through L1's
 /// `AdmissionState.reason` (M7A-69 (c)). T1's `deny_error` and the contract's
 /// `client_error_kind` agree everywhere (lead ruling A-R72a).
@@ -4350,6 +4343,40 @@ fn a_write_applied_before_a_generation_change_never_proves_no_mutation() {
         proofs(&effects).iter().all(|(request, ..)| *request != 1),
         "the applied write is not answered here: {effects:?}"
     );
+}
+
+/// M10 S2 (lead rulings A-R342, A-R343; tester-s2 Q3). A put whose `StorageDispatch` check is
+/// denied for a lost grant was never handed to storage: its `LEASE_EXPIRED` proves it wrote
+/// nothing. This is the refusal apps met while an owner waited to abandon a rejoin; it said
+/// "not proven", so each such write needed a status query.
+#[retcd_test]
+fn a_lease_deny_before_apply_proves_no_mutation() {
+    let mut h = H::live();
+    let check = h.admit(put(1, b"a", b"1"));
+    let effects = h.step(answer(check, 1, Verdict::Deny(DenyReason::Expired)));
+    assert_eq!(
+        proofs(&effects),
+        vec![(1, ErrorKind::LeaseExpired, true)],
+        "{effects:?}"
+    );
+}
+
+/// M10 S2 (lead ruling A-R342). A lease deny after apply answers `UNKNOWN_OUTCOME`, never
+/// `LEASE_EXPIRED`: the batch may have landed, and `LEASE_EXPIRED` now proves it did not.
+#[retcd_test]
+fn a_lease_deny_after_apply_answers_unknown_outcome() {
+    for reason in [DenyReason::Expired, DenyReason::ControlUnavailable] {
+        let error = deny_error(reason, Boundary::PostApply, &deny_at());
+        assert_eq!(
+            error,
+            RdbError::UnknownOutcome {
+                partition: PARTITION,
+                identity: identity(1)
+            },
+            "{reason:?}"
+        );
+        assert!(!error.proves_no_mutation(), "{reason:?}: {error:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

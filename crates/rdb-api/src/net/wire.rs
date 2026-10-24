@@ -171,6 +171,14 @@ pub enum WireMsg {
         /// The sending connection's correlation for the answer.
         reply: u64,
     },
+    /// Appended (protocol 2, D8): an inventory answer stamped with the anchor it answers.
+    Answered {
+        to: NodeId,
+        partition: PartitionId,
+        correlation: CorrelationId,
+        asked: LineageAnchor,
+        kind: KernelEvent,
+    },
 }
 
 impl WireMsg {
@@ -185,7 +193,8 @@ impl WireMsg {
             | Self::Routed { to, .. }
             | Self::Landed { to, .. }
             | Self::Client { to, .. }
-            | Self::Inspect { to, .. } => *to,
+            | Self::Inspect { to, .. }
+            | Self::Answered { to, .. } => *to,
         }
     }
 
@@ -201,6 +210,7 @@ impl WireMsg {
             Self::Landed { .. } => "landed",
             Self::Client { .. } => "client",
             Self::Inspect { .. } => "inspect",
+            Self::Answered { .. } => "answered",
         }
     }
 }
@@ -313,6 +323,18 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             to,
             partition,
             correlation,
+            kind,
+        },
+        Msg::Answered {
+            partition,
+            correlation,
+            asked,
+            kind,
+        } => WireMsg::Answered {
+            to,
+            partition,
+            correlation,
+            asked,
             kind,
         },
         Msg::Landed {
@@ -483,6 +505,21 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
             Msg::Routed {
                 partition,
                 correlation,
+                kind,
+            },
+        ),
+        WireMsg::Answered {
+            to,
+            partition,
+            correlation,
+            asked,
+            kind,
+        } => Inbound::Plain(
+            to,
+            Msg::Answered {
+                partition,
+                correlation,
+                asked,
                 kind,
             },
         ),

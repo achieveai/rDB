@@ -105,8 +105,8 @@ use config_testkit::poll::{poll_until_async, Timeout};
 use ed25519_dalek::{Signer, SigningKey};
 
 use support::{
-    count_messages, deadline, log_field, log_file, log_lines, startup_deadline, DaemonProcess,
-    Harness, Health, NodeOptions, PolicyFixture, PRINCIPAL, TRUST_KEY_NAME,
+    count_messages, deadline, log_field, log_file, log_lines, startup_deadline, write_atomically,
+    DaemonProcess, Harness, Health, NodeOptions, PolicyFixture, PRINCIPAL, TRUST_KEY_NAME,
 };
 
 // =====================================================================================
@@ -202,6 +202,19 @@ fn rejection_reasons(log: &std::path::Path) -> Vec<String> {
         .collect::<Vec<_>>();
     reasons.dedup();
     reasons
+}
+
+/// The lines of `log`, once it holds at least `want` `policy_loaded` lines (A-R309: health can
+/// show an adoption before its line reaches the file).
+async fn loads_when(log: &std::path::Path, want: usize) -> Vec<serde_json::Value> {
+    support::log_lines_when(log, |lines| {
+        lines
+            .iter()
+            .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
+            .count()
+            >= want
+    })
+    .await
 }
 
 /// Poll `log` until it holds at least `want` distinct `policy_rejected` reasons in a row (see
@@ -368,7 +381,9 @@ async fn m6_10_break_glass_is_not_sticky() {
     .await;
     assert_eq!(second.policy_version, Some(1), "{second:#?}");
 
-    let loaded = log_lines(&log)
+    // Health can show version 1 before its line reaches the file (A-R309).
+    let loaded = loads_when(&log, 3)
+        .await
         .into_iter()
         .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
         .collect::<Vec<_>>();
@@ -421,7 +436,11 @@ async fn m6_11_polling_picks_up_a_new_document() {
     let before = support::health(&endpoint).await;
     assert_eq!(before.policy_version, Some(7), "{before:#?}");
     assert_eq!(
-        count_messages(&log, "policy_loaded"),
+        loads_when(&log, 1)
+            .await
+            .iter()
+            .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
+            .count(),
         1,
         "one adoption at startup"
     );
@@ -433,7 +452,9 @@ async fn m6_11_polling_picks_up_a_new_document() {
     .await;
     assert_eq!(after.policy_version, Some(8), "{after:#?}");
 
-    let loaded = log_lines(&log)
+    // Health can show version 8 before its line reaches the file (A-R309).
+    let loaded = loads_when(&log, 2)
+        .await
         .into_iter()
         .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
         .collect::<Vec<_>>();
@@ -824,35 +845,37 @@ async fn m6_118_policy_rejected_line_has_a_closed_reason_set() {
         ["policy_file_missing", "signature_file_missing"]
     );
 
-    // Steps 3 to 5 each write two files, and a tick can land between the two writes. Each step
-    // is built so that tick sees a pair refused for the previous step's reason or this one's,
-    // never a third (#58).
+    // Steps 3 to 5 each write two files. Each file goes in by rename, so no tick reads a file
+    // half-written: a truncated signature is `signature_invalid`, which no step expects (#58).
+    // The first file alone already makes this step's reason, and the row waits for that line
+    // before the second write. A tick reads the document, then the signature, so one that
+    // straddles the second write still holds this step's document: every pair any tick can
+    // see is refused for the previous step's reason or this one's, never a third.
     //
     // 3. hash_mismatch: a complete, valid document that is not the one that was signed. At the
-    // active version, so either file beside the active one is refused as `hash_mismatch` too;
-    // at v11 it was `version_binding`.
+    // active version, so the new signature beside the active document is `hash_mismatch` too.
     let (mismatched, sig) = mismatched_hash_document(10);
-    std::fs::write(&fixture.signature_file, &sig).expect("write the v10 signature");
-    std::fs::write(&fixture.policy_file, &mismatched).expect("write the mismatched document");
+    write_atomically(&fixture.signature_file, &sig);
     wait_for_rejections(&log, 3, "hash_mismatch").await;
+    write_atomically(&fixture.policy_file, &mismatched);
 
     // 4. parse_error: bytes that are not JSON at all, signed as version 12. The document goes
-    // first, so the step-3 signature beside it is refused as `parse_error` already; signature
-    // first, the step-3 document beside the v12 signature was `version_binding`.
+    // first: beside the step-3 signature it is `parse_error` already, while the v12 signature
+    // beside the step-3 document would be `version_binding`.
     let garbage = b"not a policy document".to_vec();
     let garbage_sig = sign_bytes(12, &garbage);
-    std::fs::write(&fixture.policy_file, &garbage).expect("write the unparseable document");
-    std::fs::write(&fixture.signature_file, &garbage_sig).expect("write the v12 signature");
+    write_atomically(&fixture.policy_file, &garbage);
     wait_for_rejections(&log, 4, "parse_error").await;
+    write_atomically(&fixture.signature_file, &garbage_sig);
 
     // 5. version_binding: a well-formed document whose own version disagrees with what its
-    // signature commits to.
+    // signature commits to. The document goes first: beside the v12 signature it is
+    // `version_binding` already, while the v14 signature beside the garbage is `parse_error`.
     let bound_doc = document_bytes(13, &[""], &["root"]);
     let mismatched_sig = sign_bytes(14, &bound_doc);
-    std::fs::write(&fixture.signature_file, &mismatched_sig)
-        .expect("write the mismatched-version signature");
-    std::fs::write(&fixture.policy_file, &bound_doc).expect("write the version-13 document");
+    write_atomically(&fixture.policy_file, &bound_doc);
     wait_for_rejections(&log, 5, "version_binding").await;
+    write_atomically(&fixture.signature_file, &mismatched_sig);
 
     // Recover onto a clean, higher version before the rollback case.
     fixture.write(20, &[""], &["root"]);

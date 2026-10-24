@@ -47,10 +47,12 @@
 # discovery run finds N before a fault run names it.
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
-# config-server. Built if missing; `LR_BUILD=1` rebuilds them. `up --release` uses and builds
-# them under .../release instead, cargo's own folder, so a debug and a release binary are never
-# mixed up. The run records its binaries in run.env, so `start`, `restart` and every other verb
-# use the profile the run was started with; `--release` is refused on any verb but `up`.
+# config-server. Every `up` builds them first (cargo skips what is fresh); `LR_BUILD=0` skips the
+# build and uses them as they are. `promote` builds rdb_dev only when it is missing, or with
+# `LR_BUILD=1`. `up --release` uses and builds them under .../release instead, cargo's own
+# folder, so a debug and a release binary are never mixed up. The run records its binaries in
+# run.env, so `start`, `restart` and every other verb use the profile the run was started
+# with; `--release` is refused on any verb but `up`.
 
 set -euo pipefail
 
@@ -109,17 +111,21 @@ exe() { if [ -f "$1.exe" ]; then printf '%s' "$1.exe"; else printf '%s' "$1"; fi
 NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
 PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
 
-build() {
-    if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$NODE_BIN" ] || [ ! -f "$PILOT_BIN" ]; then
-        local release=""
-        [ "$PROFILE" = release ] && release=--release
-        say "building rdb_node, pilot_kv and config-server into $TARGET/$PROFILE"
-        # shellcheck disable=SC2086
-        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_node \
-            && cargo build $release -p rdb-pilot && cargo build $release -p config-server) >&2
-        NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
-        PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
+build() { # every `up`: a run on a stale binary looks valid and is not; cargo skips what is fresh
+    if [ "${LR_BUILD:-1}" = 0 ]; then
+        [ -f "$NODE_BIN" ] && [ -f "$PILOT_BIN" ] \
+            || die "LR_BUILD=0, but rdb_node or pilot_kv is missing from $TARGET/$PROFILE; drop LR_BUILD=0"
+        say "LR_BUILD=0: not building; using the binaries in $TARGET/$PROFILE as they are"
+        return
     fi
+    local release=""
+    [ "$PROFILE" = release ] && release=--release
+    say "building rdb_node, pilot_kv and config-server into $TARGET/$PROFILE"
+    # shellcheck disable=SC2086
+    (cd "$REPO" && cargo build $release -p rdb-api --example rdb_node \
+        && cargo build $release -p rdb-pilot && cargo build $release -p config-server) >&2
+    NODE_BIN="$(exe "$TARGET/$PROFILE/examples/rdb_node")"
+    PILOT_BIN="$(exe "$TARGET/$PROFILE/pilot_kv")"
     [ -f "$NODE_BIN" ] || die "rdb_node not found at $NODE_BIN after building"
 }
 
@@ -129,7 +135,7 @@ build() {
 
 pick_run() {
     if [ -z "$RUN" ]; then
-        [ -f "$ROOT/current" ] || die "no run: start one with 'lr up' (or pass --run DIR)"
+        [ -f "$ROOT/current" ] || die "no run under $ROOT: start one with 'lr up', or pass the --root DIR you gave 'up' (or --run DIR)"
         RUN="$(cat "$ROOT/current")"
     fi
     [ -d "$RUN" ] || die "run folder $RUN is gone"
@@ -156,17 +162,23 @@ check_node_arg() {
 # Processes. A pid line is "<role> <os pid>"; the os pid is what taskkill and ps -W know.
 # ------------------------------------------------------------------------------------------
 
-record_pid() { # role pid
-    local tmp="$RUN/pids.tmp"
+# Two lr commands can change `pids` at once (`lr start 1 & lr start 2`). Without the lock,
+# one rewrite can drop another's line, and `down` then leaves that node running (A-R332;
+# 12 parallel writes without it kept 1-4 lines of 12). The lock is a directory: mkdir is atomic.
+pids_rewrite() { # role [pid]: drop role's line, then add "role pid" when a pid is given
+    local lock="$RUN/pids.lock" tmp="$RUN/pids.tmp.$$" i held=0
+    for i in $(seq 1 200); do
+        if mkdir "$lock" 2>/dev/null; then held=1; break; fi
+        sleep 0.05
+    done
+    [ "$held" = 1 ] || die "$lock is held for over 10s; if no other lr command runs, remove it"
     grep -v "^$1 " "$RUN/pids" 2>/dev/null > "$tmp" || true
-    echo "$1 $2" >> "$tmp"
+    if [ -n "${2:-}" ]; then echo "$1 $2" >> "$tmp"; fi
     mv "$tmp" "$RUN/pids"
+    rmdir "$lock"
 }
-forget_pid() {
-    local tmp="$RUN/pids.tmp"
-    grep -v "^$1 " "$RUN/pids" 2>/dev/null > "$tmp" || true
-    mv "$tmp" "$RUN/pids"
-}
+record_pid() { pids_rewrite "$1" "$2"; } # role pid
+forget_pid() { pids_rewrite "$1"; }       # role
 pid_of() { awk -v r="$1" '$1 == r { print $2 }' "$RUN/pids" 2>/dev/null | tr -d '\r'; }
 
 os_pid_is() { # os-pid exe-name: true while that pid runs that program
@@ -208,10 +220,10 @@ wait_line() { # file pattern seconds os-pid: wait for a stdout line; fail if the
     return 1
 }
 
-start_node() { # n
+start_node() { # n [stopped]: `stopped` skips the running check when the caller just stopped n
     local n="$1" out err pid os
     check_node_arg "$n"
-    if node_alive "$n"; then say "node $n already runs (pid $(pid_of "node-$n"))"; return 0; fi
+    if [ "${2:-}" != stopped ] && node_alive "$n"; then say "node $n already runs (pid $(pid_of "node-$n"))"; return 0; fi
     mkdir -p "$RUN/out" "$RUN/stop" "$RUN/faults" "$RUN/logs"
     rm -f "$RUN/stop/node-$n"
     out="$RUN/out/node-$n.out"
@@ -270,15 +282,33 @@ not_ready() { # n: `start`/`restart` end here when await_ready did not see ready
     die "node $1 is not ready (why is above) and is not running"
 }
 
-stop_node() { # n: stop file, then a hard kill after 15 s. Idempotent.
-    local n="$1" os deadline
+stop_node() { # n [say]: stop file, then a hard kill after 15 s. Idempotent; `say` reports a
+    # node that was not running.
+    local n="$1" os deadline i=0
     os="$(pid_of "node-$n")"
-    if ! os_pid_is "$os" rdb_node; then forget_pid "node-$n"; return 0; fi
+    if ! os_pid_is "$os" rdb_node; then
+        forget_pid "node-$n"
+        if [ -n "${2:-}" ]; then say "node $n is not running"; fi
+        return 0
+    fi
     mkdir -p "$RUN/stop"
     : > "$RUN/stop/node-$n"
+    # Wait for the node's own last line, not for the process list: one `ps -W` takes 0.5 s on
+    # an idle host and seconds on a loaded one, and a stop must end well inside the owner's
+    # 10 s drop timer (A-R332; a tester saw 12 s of down time on a loaded host). The list is
+    # still read once a second, for a node that dies without its line, and at the end, so lr
+    # never reports a live node stopped. Measured 2026-10-24: 1.9-3.1 s per stop.
     deadline=$(( $(date +%s) + 15 ))
-    while [ "$(date +%s)" -lt "$deadline" ] && os_pid_is "$os" rdb_node; do sleep 0.2; done
-    if os_pid_is "$os" rdb_node; then
+    while [ "$(date +%s)" -lt "$deadline" ] && ! grep -q "^rdb_node stopped" "$RUN/out/node-$n.out" 2>/dev/null; do
+        i=$((i + 1))
+        if [ $((i % 10)) = 0 ] && ! os_pid_is "$os" rdb_node; then break; fi
+        sleep 0.1
+    done
+    local alive=1
+    while [ "$alive" = 1 ] && [ "$(date +%s)" -lt "$deadline" ]; do
+        if os_pid_is "$os" rdb_node; then sleep 0.1; else alive=0; fi
+    done
+    if [ "$alive" = 1 ]; then
         say "node $n (pid $os) did not stop within 15s; killing"
         hard_kill "$os"
     fi
@@ -476,7 +506,7 @@ case "$COMMAND" in
     kill) pick_run; check_node_arg "$ARG"; kill_node "$ARG" ;;
     stop)
         pick_run; check_node_arg "$ARG"
-        if node_alive "$ARG"; then stop_node "$ARG"; else forget_pid "node-$ARG"; say "node $ARG is not running"; fi ;;
+        stop_node "$ARG" say ;;
     start)
         pick_run; check_node_arg "$ARG"
         if [ "$WIPE" = 1 ]; then
@@ -485,7 +515,7 @@ case "$COMMAND" in
             say "node $ARG wiped"
         fi
         start_node "$ARG"; await_ready "$ARG" || not_ready "$ARG" ;;
-    restart) pick_run; check_node_arg "$ARG"; stop_node "$ARG"; start_node "$ARG"; await_ready "$ARG" || not_ready "$ARG" ;;
+    restart) pick_run; check_node_arg "$ARG"; stop_node "$ARG"; start_node "$ARG" stopped; await_ready "$ARG" || not_ready "$ARG" ;;
     suspend) pick_run; check_node_arg "$ARG"; fault_add "$ARG" "hold all"; fault_add "$ARG" "cut-control" ;;
     resume) pick_run; check_node_arg "$ARG"; fault_remove "$ARG" "hold all"; fault_remove "$ARG" "cut-control" ;;
     hold) pick_run; read -r a b <<<"$(pair "$ARG")"; fault_add "$a" "hold $b"; fault_add "$b" "hold $a" ;;

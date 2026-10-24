@@ -67,9 +67,10 @@ const fn kind(msg: &WireMsg) -> usize {
         WireMsg::Landed { .. } => 5,
         WireMsg::Client { .. } => 6,
         WireMsg::Inspect { .. } => 7,
+        WireMsg::Answered { .. } => 8,
     }
 }
-const KINDS: usize = 8;
+const KINDS: usize = 9;
 
 /// `msg` as the far side of a link posts it, and the kind it travelled as.
 fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
@@ -438,6 +439,12 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         Msg::Routed {
             partition: PartitionId(1),
             correlation: zero(),
+            kind: zero(),
+        },
+        Msg::Answered {
+            partition: PartitionId(1),
+            correlation: zero(),
+            asked: zero(),
             kind: zero(),
         },
         Msg::Landed {
@@ -1191,13 +1198,16 @@ fn node_process(
     NodeProcess { net, db, boot }
 }
 
-/// #42 caller (rulings A-R251, A-R270): three node processes, each with its own links under
-/// mutual TLS. Node 3's process restarts at a new boot. Node 1's links see a known peer back at
-/// another boot, log `peer_rebooted` and post `PeerBooted` to node 1, whose host logs
-/// `peer_booted` for node 3 and, as the record owner whose plan pinned node 3's old boot,
-/// starts the re-plan (`rejoin_revoke`). Cut: no post, and node 1 never hears of it.
-/// Integration (~3 s): a formation, three node opens until ready, one process restart, real
-/// TLS on loopback.
+/// #42 caller (rulings A-R251, A-R270), on tester-s2's sequence at 3b676c2: three node
+/// processes, each with its own links under mutual TLS. Node 3's process stops; writes go on
+/// through node 1 until the owner pauses them for the unheard copy. Node 3's process starts
+/// again at a new boot. Node 1's links see a known peer back at another boot, log
+/// `peer_rebooted` and post `PeerBooted` to node 1, whose host logs `peer_booted` and, as the
+/// record owner whose plan pinned node 3's old boot, re-plans (`rejoin_revoke` ..
+/// `rejoin_committed`). Writes then resume, and every write reads back. Cut: no post, so node 1
+/// never hears of it and stays paused.
+/// Integration (~15 s): a formation, three node opens until ready, the owner's pause, one
+/// process restart and the re-plan, real TLS on loopback.
 #[config_log::retcd_test]
 fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     const METHOD: &str = "a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted";
@@ -1246,6 +1256,9 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         .expect("node 1's process heals and is ready");
     let old = three.boot;
     assert_eq!(one.net.boot_of(NodeId(3)), Some(old), "node 1 links node 3");
+    one.db
+        .put(b"before", b"1", None)
+        .expect("a put with every copy up");
 
     // Node 3's process stops and starts again at a new boot. Nothing dials node 3 (the higher
     // id dials), so it may listen on a fresh port: its old one can still be held for a moment.
@@ -1257,6 +1270,22 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     three_db.shutdown();
     drop(three_db);
     drop(three_net);
+    // Writes go on with node 3 away until the owner pauses them for the unheard copy (B-R38).
+    let mut landed = 0u32;
+    let paused_by = std::time::Instant::now() + patience;
+    loop {
+        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+            Ok(_) => landed += 1,
+            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
+            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
+        }
+        assert!(
+            std::time::Instant::now() < paused_by,
+            "writes never paused with node 3 away: {landed} landed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(landed >= 1, "no put landed with node 3 away");
     let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
     let mut again = start(3, relisten);
     assert!(
@@ -1271,6 +1300,7 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         (m == "peer_rebooted" && line["node"] == 3 && line["told"] == "[1]")
             || (m == "peer_booted" && line["node"] == 1 && line["peer"] == 3)
             || (m == "rejoin_revoke" && line["node"] == 1)
+            || (m == "rejoin_committed" && line["node"] == 1)
     };
     let seen = loop {
         config_log::layer::flush_test_logs();
@@ -1280,7 +1310,15 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
                 .filter(|line| wanted(line))
                 .collect();
         let has = |m: &str| lines.iter().any(|line| line["@m"] == m);
-        if has("peer_rebooted") && has("peer_booted") && has("rejoin_revoke") {
+        if [
+            "peer_rebooted",
+            "peer_booted",
+            "rejoin_revoke",
+            "rejoin_committed",
+        ]
+        .iter()
+        .all(|m| has(m))
+        {
             break lines;
         }
         assert!(
@@ -1296,7 +1334,280 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     assert_eq!(rebooted["old"], old.0, "{rebooted}");
     assert_eq!(rebooted["boot"], again.boot.0, "{rebooted}");
 
+    // Node 3 rejoined: writes resume on every copy, and nothing written before is lost.
+    let resumed_by = std::time::Instant::now() + patience;
+    loop {
+        match one.db.put(b"after", b"2", None) {
+            Ok(_) => break,
+            Err(e)
+                if e.error.name() == "PROTECTION_PAUSED"
+                    && std::time::Instant::now() < resumed_by =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("writes did not resume after node 3 rejoined: {e}"),
+        }
+    }
+    // A rejoin, not a give-up (A-R278): no catch-up was refused and no re-plan abandoned.
+    config_log::layer::flush_test_logs();
+    let gave_up: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "rejoin_abandoned" || line["@m"] == "catch_up_refused")
+            .collect();
+    assert!(gave_up.is_empty(), "{gave_up:?}");
+    let last = format!("away-{}", landed - 1);
+    for key in ["before", "away-0", last.as_str(), "after"] {
+        let got = one
+            .db
+            .get(key.as_bytes())
+            .unwrap_or_else(|e| panic!("read {key}: {e}"));
+        assert!(got.value.is_some(), "{key} reads back");
+    }
+
     again.db.shutdown();
     one.db.shutdown();
     two.db.shutdown();
+}
+
+/// A-R313, the hang in the row above (L5-3, killed at 900 s): node 2 dialled node 1 while node
+/// 1's `Db` was still opening, gave up after `HANDSHAKE` and dialled again, so node 1 held two
+/// handshakes from node 2 waiting on `serving`. Both went on once node 1 registered, and the
+/// second link replaced the first while it was still live. `install` closed the old link while
+/// it held the routes lock, `close` locked it again on the same thread, and that runtime worker
+/// never came back: the reopen's heal waited on `boot_of` behind it, `wait_ready` timed out,
+/// and the runtime's drop waited for the worker for ever. Now the old link is closed after the
+/// lock is let go: the new link is the route, the old one is gone with its waiters, and the
+/// routes answer. Cut: close under the lock, and the install never returns (red at `PATIENCE`,
+/// not a hang). Unit (~1 ms): no sockets, no TLS.
+#[config_log::retcd_test]
+fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let shared = Arc::new(super::Shared {
+        label: Label::Node(NodeId(1)),
+        boot: BootId(11),
+        protocol_version: PROTOCOL_VERSION,
+        faults: Faults::new(),
+        links: std::sync::Weak::new(),
+        routes: std::sync::Mutex::new(BTreeMap::from([(
+            NodeId(2),
+            super::Route {
+                conn: None,
+                queue: std::collections::VecDeque::new(),
+                boot: None,
+                refused: None,
+                last_error: None,
+            },
+        )])),
+        conns: std::sync::Mutex::new(BTreeMap::new()),
+        next_conn: std::sync::atomic::AtomicU64::new(0),
+        rt: rt.handle().clone(),
+        span: tracing::Span::current(),
+        on_boot: std::sync::Mutex::new(None),
+    });
+    let boot = BootId(22);
+    let (first_tx, _first_out) = tokio::sync::mpsc::unbounded_channel();
+    let first = super::new_conn(&shared, Label::Node(NodeId(2)), first_tx);
+    super::install(&shared, NodeId(2), &first, boot);
+    let (waiter, answer) = mpsc::channel();
+    super::lock(&first.pending).insert(1, super::Waiter::Status(waiter));
+
+    // The second handshake, still live beside the first. On its own thread, so a lock that is
+    // never let go fails the row at `PATIENCE` instead of hanging it.
+    let (second_tx, _second_out) = tokio::sync::mpsc::unbounded_channel();
+    let second = super::new_conn(&shared, Label::Node(NodeId(2)), second_tx);
+    let (done, installed) = mpsc::channel();
+    {
+        let shared = Arc::clone(&shared);
+        let second = Arc::clone(&second);
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _entered = span.enter();
+            super::install(&shared, NodeId(2), &second, boot);
+            let routed = super::lock(&shared.routes)[&NodeId(2)]
+                .conn
+                .as_ref()
+                .map(|conn| conn.id);
+            let _ = done.send(routed);
+        });
+    }
+    let routed = installed.recv_timeout(PATIENCE).unwrap_or_else(|_| {
+        panic!("replacing a live link did not return within {PATIENCE:?}: the routes lock is held")
+    });
+    assert_eq!(routed, Some(second.id), "the newer link is node 2's route");
+    let conns: Vec<u64> = super::lock(&shared.conns).keys().copied().collect();
+    assert_eq!(conns, vec![second.id], "the replaced link is gone");
+    assert!(
+        matches!(
+            answer.recv_timeout(Duration::ZERO),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "a call waiting on the replaced link is let go, not left waiting"
+    );
+}
+
+/// A handshake from node 2's certificate that this row holds open, as a dialler that has not
+/// given up yet would; dropping both halves abandons it, as a dialler past `HANDSHAKE` has.
+async fn handshake_as_node_2(
+    certs: &FsPath,
+    addr: std::net::SocketAddr,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<super::pb::Envelope>,
+    tonic::Streaming<super::pb::Envelope>,
+) {
+    let tls = certs::load(certs, &Label::Node(NodeId(2))).expect("certs");
+    let channel = tonic::transport::Endpoint::from_shared(format!("https://{addr}"))
+        .expect("endpoint")
+        .tls_config(tls.client_tls_config_for(&certs::node_domain(NodeId(1))))
+        .expect("tls")
+        .connect()
+        .await
+        .expect("connects");
+    let mut client = super::pb::rdb_net_client::RdbNetClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let hello = Frame::Hello(wire::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        label: Label::Node(NodeId(2)),
+        boot: BootId(22),
+    });
+    tx.send(super::envelope(&hello)).expect("hello");
+    let inbound = client
+        .link(tonic::Request::new(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
+        .await
+        .expect("link")
+        .into_inner();
+    (tx, inbound)
+}
+
+/// The id of the link node `net` routes node 2 by, read on a thread of its own so a lock that
+/// is never let go fails the row instead of hanging it.
+fn route_to_2(net: &Arc<Net>) -> Option<u64> {
+    let net = Arc::clone(net);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let id = super::lock(&net.shared.routes)[&NodeId(2)]
+            .conn
+            .as_ref()
+            .map(|conn| conn.id);
+        let _ = tx.send(id);
+    });
+    rx.recv_timeout(PATIENCE)
+        .expect("the routes answer within PATIENCE")
+}
+
+/// Poll `route_to_2(net)` until `wanted` holds or `PATIENCE` passes.
+fn until_route(net: &Arc<Net>, what: &str, wanted: impl Fn(Option<u64>) -> bool) -> Option<u64> {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        let id = route_to_2(net);
+        if wanted(id) {
+            return id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} within {PATIENCE:?}: node 1 routes node 2 by {id:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A-R320, both install orders of an abandoned handshake beside node 2's live dial (see
+/// [`a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer`]). Whichever installs
+/// second, nodes 1 and 2 end with one live link and a route both ways: a message crosses each
+/// way within `PATIENCE`.
+fn an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(abandoned_first: bool) {
+    let runtime = Bounded(Some(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime"),
+    ));
+    let rt = runtime.0.as_ref().expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = rt.block_on(side(Spec::node(1, dir.path(), &[2]), true));
+    let addr = one.net.addr().expect("listening");
+    let dial_2 = || {
+        rt.block_on(side(
+            Spec::node(2, dir.path(), &[1]).dialling(1, addr),
+            false,
+        ))
+    };
+    let two = if abandoned_first {
+        let abandoned = rt.block_on(handshake_as_node_2(dir.path(), addr));
+        let first = until_route(&one.net, "the held handshake installs", |id| id.is_some());
+        let two = dial_2();
+        until_route(&one.net, "node 2's dial replaces it", |id| {
+            id.is_some_and(|id| id != first.expect("installed"))
+        });
+        drop(abandoned);
+        two
+    } else {
+        let two = dial_2();
+        let live = until_route(&one.net, "node 2's dial installs", |id| id.is_some());
+        let abandoned = rt.block_on(handshake_as_node_2(dir.path(), addr));
+        // Node 1 numbers links as it accepts them, and the held handshake is the only one it
+        // accepts while node 2's live link is up, so it takes the next id. Node 2 dials again
+        // about 100 ms after its link is replaced, so a slow poll can first see that redial.
+        // Waiting for the first id seen after `live` to go away then waits on the good link for
+        // ever (A-R356: 5 of 100 under load, `routes node 2 by Some(3)`).
+        let abandoned_id = live.expect("installed") + 1;
+        until_route(&one.net, "the held handshake replaces it", |id| id != live);
+        drop(abandoned);
+        until_route(&one.net, "node 1 has a live route to node 2 again", |id| {
+            id.is_some_and(|id| id != abandoned_id)
+        });
+        two
+    };
+
+    let ask = || Msg::Restore {
+        partition: PartitionId(1),
+        seed: seed(),
+    };
+    one.links.send(NodeId(1), NodeId(2), ask()).expect("sent");
+    let got = two
+        .mail
+        .recv_timeout(PATIENCE)
+        .expect("node 1 reaches node 2: it has a route to node 2 again");
+    assert_eq!(format!("{got:?}"), format!("{:?}", ask()));
+    two.links.send(NodeId(2), NodeId(1), ask()).expect("sent");
+    let got = one
+        .mail
+        .recv_timeout(PATIENCE)
+        .expect("node 2 reaches node 1");
+    assert_eq!(format!("{got:?}"), format!("{:?}", ask()));
+}
+
+/// A runtime that, dropped, waits at most a second for its workers: one a cut leaves stuck on
+/// a lock must fail the row, not hang it, panicking or not.
+struct Bounded(Option<tokio::runtime::Runtime>);
+
+impl Drop for Bounded {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_timeout(Duration::from_secs(1));
+        }
+    }
+}
+
+/// The held handshake installs first and node 2's dial replaces it. Cut: close a replaced link
+/// under the routes lock (before 27620de), and the routes never answer again.
+/// Integration (~0.1 s: real TLS on loopback).
+#[config_log::retcd_test]
+fn an_abandoned_handshake_installed_first_leaves_routes_both_ways() {
+    an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(true);
+}
+
+/// L5-3's order: the abandoned handshake installs second and replaces node 2's live link.
+/// Closing the live link ends its stream, so node 2 dials again and node 1 gets a route back.
+/// Cut: close only forgets the link, node 2 still holds it up and never dials, and node 1's
+/// message to node 2 waits for ever. Integration (~0.1 s: real TLS on loopback).
+#[config_log::retcd_test]
+fn an_abandoned_handshake_installed_second_leaves_routes_both_ways() {
+    an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(false);
 }
