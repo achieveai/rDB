@@ -819,7 +819,7 @@ pub const TRUST_KEY_NAME: &str = "rotate";
 ///
 /// A poller that reads a half-written document sees a `parse_error` and keeps the old policy,
 /// which is correct but makes a rotation row flap; renaming into place removes the window.
-fn write_atomically(path: &Path, bytes: &[u8]) {
+pub fn write_atomically(path: &Path, bytes: &[u8]) {
     let staging = path.with_extension("staging");
     std::fs::write(&staging, bytes).expect("write the staged policy artifact");
     std::fs::rename(&staging, path).expect("rename the staged policy artifact into place");

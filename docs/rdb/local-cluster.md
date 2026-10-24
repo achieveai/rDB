@@ -19,8 +19,9 @@ Run every `lr` command from the checkout.
 
 Where things go:
 
-- Binaries: `$CARGO_TARGET_DIR/debug` (default `./target/debug`). The first `up` builds them.
-  That takes several minutes.
+- Binaries: `$CARGO_TARGET_DIR/debug` (default `./target/debug`). Every `up` builds them first,
+  so a run never uses a stale binary. The first build takes several minutes; after that, cargo
+  skips what has not changed. `LR_BUILD=0` skips the build and uses the binaries as they are.
 - Each `up` makes a new **run folder** under `C:/rdb_test_data/lr` (or `$RDB_LR_ROOT`, or
   `--root DIR`). Its name is `<commit>-<base port>-<time>`. `<root>/current` names the last one.
 - In the run folder:
