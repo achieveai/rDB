@@ -29,6 +29,9 @@ const P: PartitionId = PartitionId(1);
 const G1: Generation = Generation(1);
 const G2: Generation = Generation(2);
 
+/// One staged write, named, as the staged-writes row applies it.
+type Stage = fn(&mut RocksEngine);
+
 fn data_dir(name: &str) -> PathBuf {
     let root = std::env::var_os("RETCD_TEST_DATA_DIR")
         .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
@@ -225,7 +228,7 @@ fn m10_f4_a_staged_write_is_not_synced_until_the_next_sync_completes() {
         commit(&mut engine, &g1, 1, 10);
         settle(&mut engine, 10);
 
-        let staged: [(&str, fn(&mut RocksEngine)); 3] = [
+        let staged: [(&str, Stage); 3] = [
             ("publish marks", |engine| {
                 engine.stage_publish_marks(P, &[]).expect("stage marks");
             }),

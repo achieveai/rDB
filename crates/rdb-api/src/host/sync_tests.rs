@@ -330,7 +330,7 @@ fn held_syncs(lines: &[Line], from: usize, node: u64) -> Vec<(usize, usize)> {
 }
 
 /// The `host_duty` lines of `kind` node `node` logged inside one of `held`.
-fn duties_in<'a>(lines: &'a [Line], held: &[(usize, usize)], node: u64, kind: &str) -> usize {
+fn duties_in(lines: &[Line], held: &[(usize, usize)], node: u64, kind: &str) -> usize {
     held.iter()
         .map(|&(slowed, returned)| {
             lines[slowed..returned]

@@ -1354,6 +1354,9 @@ enum Reply {
     Here(Site),
 }
 
+/// A-R326: one landing's acquire, waiting in [`Host::link_pending`] for its link sync.
+type LinkWaiter = (Box<RecoveryResult>, Site);
+
 /// The sync in flight on the syncer.
 #[derive(Debug)]
 struct InFlight {
@@ -1724,7 +1727,7 @@ struct Host {
     sync_next: Vec<AfterSync>,
     /// A-R326: new generations whose link sync is requested and not yet returned, each with
     /// the acquires its landings scheduled, run when it returns (A-R217).
-    link_pending: BTreeMap<(PartitionId, Generation), Vec<(Box<RecoveryResult>, Site)>>,
+    link_pending: BTreeMap<(PartitionId, Generation), Vec<LinkWaiter>>,
     /// [`rdb_storage::StorageOptions::sync_stuck_millis`]: a sync in flight longer faults the
     /// node, so its grant lapses and another can take over.
     sync_stuck_millis: u64,
