@@ -5018,6 +5018,136 @@ mod tests {
         db.shutdown();
     }
 
+    /// The done-when scenario of slice 2 (A-R278, A-R323), beside W5's row above: writes keep
+    /// going while node 3 is away, then node 3 restarts and catches up from the live owner and
+    /// rejoins as a full copy. Node 3 is cut off both ways and puts go on through node 1 until
+    /// the owner pauses them for the unheard copy, at most 200. Node 3 restarts, its links
+    /// heal, node 1 re-plans with it, writes resume, and every write reads back. After shutdown,
+    /// node 3's store holds node 1's generation through the same head with the same record
+    /// digest there. No catch-up was refused and no rejoin abandoned. Cut: `restore_dormant`
+    /// skips a node holding a primary, so node 1 sources nothing and node 3 never holds the
+    /// generation, red. Integration (~5 s): three node threads, the owner's pause, one restart
+    /// and its re-plan.
+    #[config_log::retcd_test]
+    fn m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy() {
+        const METHOD: &str =
+            "m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"before", b"1", None)
+            .expect("a put with every copy up");
+        let of = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+
+        for other in [OWNER, NodeId(2)] {
+            db.links().drop_direction(NodeId(3), other);
+            db.links().drop_direction(other, NodeId(3));
+        }
+        let mut landed = 0_u32;
+        let paused_by = std::time::Instant::now() + patience;
+        while landed < 200 {
+            match db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+                Ok(_) => landed += 1,
+                Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => break,
+                Err(refused) => panic!("a put with node 3 away, after {landed}: {refused:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < paused_by,
+                "{landed} puts in {patience:?} and no pause"
+            );
+        }
+        assert!(landed >= 1, "no put landed with node 3 away");
+        let before = of(&db, OWNER).recovered.expect("node 1 recovered");
+
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        db.links().heal_all();
+
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let owner = of(&db, OWNER);
+            if owner.recovered > Some(before) && owner.admits == Some(true) {
+                match db.put(b"after", b"2", None) {
+                    Ok(_) => break,
+                    Err(refused) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no put landed within {patience:?} of the restart: {refused:?}"
+                    ),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 did not re-plan past generation {} and admit within {patience:?}: \
+                 {owner:?}",
+                before.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let generation = of(&db, OWNER).recovered.expect("node 1 recovered");
+        let target = of(&db, OWNER).holds.expect("node 1 holds").applied;
+        loop {
+            let held = of(&db, NodeId(3)).holds;
+            if held.is_some_and(|held| {
+                held.generation == generation && held.applied >= target && held.durable >= target
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 holds {held:?}, not generation {} through {target}, within {patience:?}",
+                generation.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let last = format!("away-{}", landed - 1);
+        for key in ["before", "away-0", last.as_str(), "after"] {
+            let got = db
+                .get(key.as_bytes())
+                .unwrap_or_else(|e| panic!("read {key}: {e:?}"));
+            assert!(got.value.is_some(), "{key} reads back");
+        }
+        db.shutdown();
+
+        let head = |n: u32| {
+            use rdb_core::contracts::envelope::ReplicationEnvelope;
+            let engine = RocksEngine::open(dir.path().join("nodes").join(n.to_string()))
+                .expect("open engine");
+            let seq = engine.buffered_applied(PARTITION, generation).0;
+            let (record, _) = engine
+                .history_at(PARTITION, generation, Seq(seq))
+                .expect("history read")
+                .unwrap_or_else(|| panic!("node {n} holds record {seq}"));
+            let digest = ReplicationEnvelope::decode(&record)
+                .expect("decodes")
+                .record_digest;
+            (seq, digest)
+        };
+        let (one, three) = (head(1), head(3));
+        assert!(one.0 >= u64::from(landed) + 2, "node 1's head {one:?}");
+        assert_eq!(three, one, "node 3 holds node 1's head and digest");
+
+        config_log::layer::flush_test_logs();
+        let gave_up: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "rejoin_abandoned" || line["@m"] == "catch_up_refused")
+            .collect();
+        assert!(gave_up.is_empty(), "{gave_up:?}");
+    }
+
     /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts and stops
     /// advancing, L1 pauses writes; a put refused then was refused at admission and never
     /// queued, so a retry of it must not promise that `status` will show its outcome: status

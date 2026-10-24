@@ -6397,3 +6397,75 @@ fn m10_s2_a_dormant_receiver_beside_a_live_primary_sources_the_catch_up_and_noth
         "the forged ACK"
     );
 }
+
+/// A's primary at `head`, durable `head`, its ladder `1..=head`, and, when `with_primary` is
+/// false, nothing else: only the dormant receiver for A's copy 0 at `head`.
+fn owner_with_dormant(head_at: u64, with_primary: bool) -> Replication {
+    let mut module = Replication::new();
+    if with_primary {
+        let mut history = DigestLadder::new();
+        for seq in 1..=head_at {
+            history.insert(Seq(seq), d(seq));
+        }
+        module.install_primary(
+            ProgressTracker::new(TrackerInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                history,
+                local: ReplicaProgress {
+                    received: ReceivedSeq(head_at),
+                    buffered_applied: AppliedSeq(head_at),
+                    durable: DurableSeq(head_at),
+                },
+            })
+            .expect("A's tracker"),
+        );
+    }
+    module.install_receiver(
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                head: head(head_at),
+                durable: DurableSeq(0),
+            },
+            REVISION,
+        )
+        .expect("A's dormant receiver"),
+    );
+    module
+}
+
+/// A-R327 (critic-degraded A-10): a receiver beside a serving primary only sources, whenever
+/// it was installed. A fenced recovery append with a valid credential, from C, reaches A's
+/// dormant receiver for copy 0 at 10. Without a primary on A it stages record 11, so the frame
+/// is one the receiver takes. Beside A's serving primary R1 refuses it `Replica(NotRequired)`
+/// with no reply and no store effect, and the receiver and the primary are unchanged. Cut: R1
+/// hands a recovery append to the receiver beside a primary, red.
+#[retcd_test]
+fn m10_s2_a_recovery_append_never_reaches_a_receiver_beside_a_serving_primary() {
+    let body = recovery_body(&fence(2, EPOCH, REVISION), &golden());
+    let append = on(A, delivered(label(C), body));
+
+    let mut alone = owner_with_dormant(10, false);
+    assert_eq!(
+        staged_batch(&step(&mut alone, &append)),
+        (BatchId(0), GEN, Seq(11)),
+        "without a primary the receiver stages it"
+    );
+
+    let mut module = owner_with_dormant(10, true);
+    let receiver = module.receiver(A, P).cloned().expect("A's receiver");
+    let primary = module.primary(A, P).cloned().expect("A's primary");
+    assert_eq!(
+        step(&mut module, &append),
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::NotRequired
+        ))],
+        "a recovery append beside a serving primary is refused, with no reply or store effect"
+    );
+    assert_eq!(module.receiver(A, P), Some(&receiver), "the receiver");
+    assert_eq!(module.primary(A, P), Some(&primary), "the primary");
+}
