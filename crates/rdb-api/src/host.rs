@@ -5257,8 +5257,13 @@ impl Host {
 
     /// Restore R1's dormant receiver for this node's copy of `partition` (A-R173), from the
     /// engine's lineage at the seed's generation and the seed's epoch, revision and
-    /// configuration. A node already running a live side keeps it. `with_history` also gives
+    /// configuration. A node already running a live receiver keeps it. `with_history` also gives
     /// the receiver its verified ladder, `(0, ROOT)` through its head, once (critic-d7 F2).
+    ///
+    /// A live primary is no reason to skip (A-R278, A-R314): a live owner re-planning around a
+    /// restarted copy is F1's catch-up source, and R1 sources a catch-up from a receiver only.
+    /// The dormant receiver sits beside the primary, refuses every plain append, and R1 drops
+    /// it at the next `Recovered`.
     ///
     /// Nothing here faults the node (critic-d7 F5): a copy that cannot be restored is logged
     /// `dormant_restore_refused{reason}` and holds no receiver, so its catch-up is refused and
@@ -5267,9 +5272,7 @@ impl Host {
         let node = self.node;
         let held = self.replication.receiver(node, partition);
         let dormant = held.map(AppendReceiver::is_dormant);
-        if dormant == Some(false)
-            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
-        {
+        if dormant == Some(false) {
             return;
         }
         if dormant.is_none() {

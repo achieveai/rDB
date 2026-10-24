@@ -2420,8 +2420,10 @@ impl Dispatcher {
 
     /// The twin of the host's `restore_dormant` (A-R173): restore R1's dormant receiver for
     /// `node`'s copy of `partition` from its engine's lineage at the seed's generation. A node
-    /// running a live side (a live receiver, or a primary) keeps it. `with_history` also gives
-    /// the receiver its ladder, `(0, ROOT)` through its head, once.
+    /// running a live receiver keeps it. A live primary is no reason to skip (A-R278, A-R314):
+    /// R1 sources a catch-up from a receiver only, so the dormant receiver sits beside the
+    /// primary, refuses every plain append, and R1 drops it at the next `Recovered`.
+    /// `with_history` also gives the receiver its ladder, `(0, ROOT)` through its head, once.
     ///
     /// Never faults: a copy that cannot be restored is logged `dormant_restore_refused{reason}`
     /// and holds no receiver, so R1 refuses its catch-up `NotASource` and F1's deadline ends
@@ -2443,11 +2445,8 @@ impl Dispatcher {
             .replication
             .receiver(node, partition)
             .map(AppendReceiver::is_dormant);
-        // A live side is kept. The receiver half is pinned by m7b_136. No row reaches the primary
-        // half yet: that takes a second recovery of a live partition (slice-2 residual, A-R216).
-        if dormant == Some(false)
-            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
-        {
+        // A live receiver is kept; it is pinned by m7b_136.
+        if dormant == Some(false) {
             return;
         }
         let refused = |reason: &str| {

@@ -6269,3 +6269,123 @@ fn m10_s2_r1_answers_its_shadow_timer_on_every_node() {
         replica_answer(ReplicaIgnoreReason::StaleTimer)
     );
 }
+
+// --- a dormant receiver beside a live primary (A-R278, A-R314) ---------------------------------
+
+/// A-R278 (W6b): a live owner re-planning around a restarted copy is F1's catch-up source, and
+/// it holds its own copy as a primary. R1 sources a catch-up from a receiver only, so the host
+/// restores a dormant receiver for that copy beside the primary (A-R314). Here A leads P at 15,
+/// durable 10. With the primary alone the catch-up is refused `NotASource` (the host's fault
+/// before the fix). With the dormant receiver beside it, F1's catch-up of C through 15 starts,
+/// and the receiver serves that and nothing else: a plain append to it is refused with no
+/// reply, and neither the catch-up nor the append changes the primary. A flush of A's own
+/// engine raises the primary's durable as it always does; whatever the receiver says to A
+/// about it is refused by the primary as A's own voice (`ForgedIdentity`) and moves nothing.
+#[retcd_test]
+fn m10_s2_a_dormant_receiver_beside_a_live_primary_sources_the_catch_up_and_nothing_else() {
+    let rungs: Vec<(Seq, Digest)> = std::iter::once((Seq::ZERO, Digest::ROOT))
+        .chain((1..=15).map(|seq| (Seq(seq), d(seq))))
+        .collect();
+    let mut history = DigestLadder::new();
+    for seq in 1..=15 {
+        history.insert(Seq(seq), d(seq));
+    }
+    let mut module = Replication::new();
+    module.install_primary(
+        ProgressTracker::new(TrackerInit {
+            config: config(),
+            own: CopyId(0),
+            lineage: authority(GEN, EPOCH),
+            history,
+            local: ReplicaProgress {
+                received: ReceivedSeq(15),
+                buffered_applied: AppliedSeq(15),
+                durable: DurableSeq(10),
+            },
+        })
+        .expect("A's tracker"),
+    );
+    let credential = fence(0, EPOCH, Revision(7));
+    let catch_up_c = on(A, catch_up(0, 2, 15, credential));
+
+    let mut alone = module.clone();
+    assert_eq!(
+        step(&mut alone, &catch_up_c),
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::NotASource
+        ))],
+        "a primary alone is no catch-up source"
+    );
+
+    module.install_receiver(
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                head: head(15),
+                durable: DurableSeq(0),
+            },
+            REVISION,
+        )
+        .expect("A's dormant receiver"),
+    );
+    module
+        .restore_history(A, P, &rungs)
+        .expect("A's ladder, 0..=15");
+    let primary = module.primary(A, P).cloned().expect("A's primary");
+
+    let effects = step(&mut module, &catch_up_c);
+    assert!(
+        effects.contains(&EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes {
+            copy: CopyId(2),
+            from: Seq(15),
+            through: Seq(15),
+            credential,
+        })),
+        "A sources C's catch-up: {effects:?}"
+    );
+    assert!(module.source(A, P, CopyId(2)).is_some());
+    assert_eq!(module.primary(A, P), Some(&primary), "the catch-up");
+
+    let append = on(A, delivered(label(C), golden().encode().expect("encode")));
+    assert_eq!(
+        step(&mut module, &append),
+        vec![ignored(KernelIgnoredReason::AppendRejected(
+            AppendReject::NotAMember
+        ))],
+        "a plain append to the dormant receiver is refused with no reply"
+    );
+    assert_eq!(module.primary(A, P), Some(&primary), "the plain append");
+
+    let effects = step(&mut module, &on(A, flushed(&[(P, GEN, 15)])));
+    let flushed_primary = module.primary(A, P).cloned().expect("A's primary");
+    let to_self: Vec<Bytes> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Send(SendEffect::Unicast { to, frame }) if *to == A => {
+                Some(frame.body.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !to_self.is_empty(),
+        "the dormant receiver ACKs its flush to A: {effects:?}"
+    );
+    for body in to_self {
+        let reply = on(A, framed(label(A), authority(GEN, EPOCH), CONFIG, body));
+        assert_eq!(
+            step(&mut module, &reply),
+            vec![ignored(KernelIgnoredReason::AckRejected(
+                AckRejectReason::ForgedIdentity
+            ))],
+            "the primary refuses its own node's ACK"
+        );
+        assert_eq!(
+            module.primary(A, P),
+            Some(&flushed_primary),
+            "the receiver's ACK moved the primary"
+        );
+    }
+}
