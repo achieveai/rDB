@@ -1269,7 +1269,8 @@ fn m10_s2_d8_two_down_return_commits_rf2_and_writes_land() {
     host.rebuild_check(PartitionId(1), down.dropped);
     let stalled = host.status(PartitionId(1)).stalled.expect("the stall line");
     assert!(
-        stalled.contains("phase=Committed")
+        stalled.contains("phase=Committed: F1 set up no rebuild")
+            && !stalled.contains("host_catch_up")
             && stalled.ends_with(
                 "F1 set up no rebuild, so the partition stays ReadOnly and does not activate"
             ),
@@ -1298,7 +1299,8 @@ fn m10_s2_d8_two_down_return_commits_rf2_and_writes_land() {
 /// run either. [`two_down`], then the kept member starts again with its link to node 1 held.
 /// Once node 1's rejoin plan is in place, an `InventoryFailed` for the dropped generation's
 /// ask reaches it; then the link heals and the copy answers the current ask.
-/// Cut: no `inventory_answer_late` check in `process`, red (the copy dropped, `ReadOnly`).
+/// Cut: no `inventory_answer_late` check in `process`, red: F1 drops the copy as a source
+/// (`RecordSourceUnavailable`) before its real answer arrives.
 /// Integration (~5 s): as the row above.
 #[config_log::retcd_test]
 fn m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy() {
@@ -1314,6 +1316,7 @@ fn m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy() {
         let plan = trio.nodes[0].0.plans.get(&PartitionId(1))?;
         (plan.anchor.lineage.generation == dropped).then_some(())
     });
+    let before = unavailable(METHOD, copy);
     down.trio.nodes[0]
         .1
         .send(Msg::Answered {
@@ -1324,6 +1327,13 @@ fn m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy() {
         })
         .expect("node 1 up");
     pass(&mut down.trio, 50);
+    // The link is still held, so nothing the copy sent has reached node 1: F1 drops no
+    // source on the late Failed alone (critic-d8r M1).
+    assert_eq!(
+        unavailable(METHOD, copy),
+        before,
+        "the late InventoryFailed dropped copy {copy:?} before its real answer"
+    );
     down.trio.links.heal(NodeId(1), NodeId(kept));
     rejoined_and_writes_land(
         &mut down.trio,
@@ -1339,6 +1349,16 @@ fn m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy() {
             && line["failed"] == true),
         "node 1 dropped the late InventoryFailed: {late:?}"
     );
+}
+
+/// How many times node 1's F1 has dropped `copy` as a record source so far in this test.
+fn unavailable(method: &str, copy: CopyId) -> usize {
+    let fact = format!("RecordSourceUnavailable {{ copy: {copy:?},");
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "recovery_fact" && line["node"] == 1)
+        .filter(|line| line["effect"].as_str().is_some_and(|e| e.contains(&fact)))
+        .count()
 }
 
 /// Node `node`'s copy in node 1's last commit.

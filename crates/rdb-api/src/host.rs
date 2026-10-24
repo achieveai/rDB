@@ -4296,7 +4296,7 @@ impl Host {
         let mode = watch.mode.clone();
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
-             waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: {}, so the partition",
+             waited_ms={waited_ms} phase={phase}{}, so the partition",
             partition.0,
             generation.0,
             watch.mode,
@@ -7125,13 +7125,14 @@ fn rebuild_quiet(mode: &PartitionMode, admits: Option<bool>) -> bool {
     *mode != PartitionMode::ReadOnly && admits == Some(true)
 }
 
-/// Why a watched rebuild is not pinned, for the stall line. F1 still `Committed` set up no
-/// rebuild at all: a `ReadOnly` commit whose second copy was not a source (D8, A-R337 item 3),
-/// so "never pinned" would send a reader looking for a rebuild that never existed.
+/// Why a watched rebuild is not pinned: the stall line's tail after `phase=`. F1 still
+/// `Committed` set up no rebuild at all: a `ReadOnly` commit whose second copy was not a source
+/// (D8, A-R337 item 3). "Never pinned" would send a reader looking for a rebuild that never
+/// existed, and no catch-up was ever needed, so `host_catch_up` is left out (critic-d8r A4).
 fn unpinned_cause(phase: Option<&RecoveryPhase>) -> &'static str {
     match phase {
-        Some(RecoveryPhase::Committed) => "F1 set up no rebuild",
-        _ => "F1 never pinned its rebuild",
+        Some(RecoveryPhase::Committed) => ": F1 set up no rebuild",
+        _ => " host_catch_up=unsupported: F1 never pinned its rebuild",
     }
 }
 
