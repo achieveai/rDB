@@ -1834,6 +1834,22 @@ impl Dispatcher {
             let at = scheduler
                 .now()
                 .plus_millis(hop::delay(&self.hops, node, kernel));
+            // A node fence is every served partition's, wherever A1 sited it (A-R324).
+            let held: Vec<PartitionId> = self
+                .adopted
+                .keys()
+                .filter(|(held, _)| *held == node)
+                .map(|(_, partition)| *partition)
+                .filter(|partition| {
+                    self.transaction.kernel(node, *partition).is_some()
+                        || self.publication.kernel(node, *partition).is_some()
+                })
+                .collect();
+            for partition in route::node_fence_sites(kernel, site.1, held) {
+                let fanned = EventKind::Kernel(event.clone());
+                let id = self.schedule(scheduler, at, (node, partition, site.2), fanned)?;
+                self.routed.insert(id);
+            }
             let id = self.schedule(scheduler, at, site, EventKind::Kernel(event))?;
             self.routed.insert(id);
             return Ok(());

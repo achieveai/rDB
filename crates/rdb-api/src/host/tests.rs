@@ -2116,6 +2116,65 @@ fn a_write_unpublished_at_a_fence_is_what_the_queue_waits_on_until_it_publishes(
     drop(unacknowledged);
 }
 
+/// A-R324: a node fence that A1 sites at partition 0 still freezes partition 1's queue. A1
+/// sites a fence at the partition of the event that finds the grant expired. Under load that
+/// can be a host duty or a control answer at partition 0, where no T1 or P1 serves; before
+/// A-R324 the fence reached only partition 0, so partition 1's T1 never froze, never recorded
+/// its lost authority, and `waits_on` stayed `None` with seq 2 unpublished (the
+/// `a_write_unpublished_at_a_fence...` red, perf and w8 runs 2026-10-23). Here node 1 is held
+/// still past its grant's expiry, then given only the flush duty, which is sited at partition 0.
+/// Integration (~2 s): bootstrap's discovery window, then one 600 ms grant left to lapse.
+#[config_log::retcd_test]
+fn a_node_fence_sited_at_partition_0_freezes_partition_1s_queue() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), |host| {
+        Trio::fast(host);
+        host.budgets.grant_millis = 600;
+        host.budgets.renew_millis = 100;
+    });
+    trio.bootstrap();
+    trio.ready();
+    trio.links.drop_direction(NodeId(2), NodeId(1));
+    trio.links.drop_direction(NodeId(3), NodeId(1));
+    let unacknowledged = trio.call(put(1, b"a", b"1", None));
+    trio.until("node 1 applies seq 2", |trio| {
+        (trio.head() == Some(2)).then_some(())
+    });
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    let through = trio.nodes[0]
+        .0
+        .authority_views
+        .get(&PartitionId(1))
+        .map(|view| view.valid_through_tick)
+        .expect("node 1 holds a view for partition 1");
+    // Not stepped, so no partition-1 timer can find the expiry first. The grant ends a renew
+    // period after the view's horizon at most; 700 ms is past both.
+    while trio.clock.now() <= through.plus_millis(700) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let host = &mut trio.nodes[0].0;
+    host.flush_duty().expect("the flush duty");
+    host.drain();
+    let status = host.status(PartitionId(1));
+    assert_eq!(
+        (status.fence, status.waits_on, status.admits),
+        (Some(DenyReason::Expired), Some(Seq(2)), Some(false)),
+        "partition 1's queue freezes on the unpublished put: {status:?}"
+    );
+    let fences: Vec<_> = logged!(
+        "a_node_fence_sited_at_partition_0_freezes_partition_1s_queue",
+        "authority_fence"
+    )
+    .iter()
+    .map(|line| line["partition"].as_u64())
+    .collect();
+    assert_eq!(fences, [Some(0)], "the one fence was sited at partition 0");
+    drop(unacknowledged);
+}
+
 /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
 /// logged, never dropped in silence, and the primary neither faults nor stops taking
 /// writes: copy 1 still acknowledges. The `SendFailed` event it also queues is not asserted:

@@ -44,8 +44,9 @@
 //! [`EffectKind::Kernel`]: crate::contracts::event::EffectKind::Kernel
 //! [`EventKind::Kernel`]: crate::contracts::event::EventKind::Kernel
 
-use crate::contracts::authority::{AuthorityEffect, AuthorityEvent, Checkpoint};
+use crate::contracts::authority::{AuthorityEffect, AuthorityEvent, Checkpoint, FenceScope};
 use crate::contracts::event::{KernelEffect, KernelEvent, ModuleName};
+use crate::contracts::ids::PartitionId;
 use crate::contracts::recovery::RecoveryEvent;
 
 /// The [`KernelEvent`] arms, without their payloads, so a table can name one.
@@ -405,6 +406,38 @@ pub fn event_for(effect: &KernelEffect) -> Option<KernelEvent> {
     })
 }
 
+/// The partitions, besides its own site, that a node-scope [`AuthorityEffect::Fence`] is also
+/// delivered at: each of `held` other than `site`, ascending and once (lead ruling A-R324).
+/// Empty for every other effect, a partition-scope fence included, which is its own partition's.
+///
+/// A1 sites a node fence at the partition of the event that tripped it, which may be one no
+/// T1 or P1 serves (a control answer or a host duty at partition 0). A1 already supersedes
+/// every served partition's view (A-R53.1); this is the twin for the fence itself, so each
+/// served T1 freezes and records its lost authority. `held` is the partitions the dispatcher
+/// holds a T1 or P1 for on the emitting node. The host and the simulator both call this, so
+/// the two dispatchers cannot drift.
+#[must_use]
+pub fn node_fence_sites(
+    effect: &KernelEffect,
+    site: PartitionId,
+    held: impl IntoIterator<Item = PartitionId>,
+) -> Vec<PartitionId> {
+    if !matches!(
+        effect,
+        KernelEffect::Authority(AuthorityEffect::Fence {
+            scope: FenceScope::Node,
+            ..
+        })
+    ) {
+        return Vec::new();
+    }
+    held.into_iter()
+        .filter(|partition| *partition != site)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! SCAFFOLDING, not test rows: the table's own shape.
@@ -553,5 +586,52 @@ mod tests {
         };
         assert_eq!(Arm::of(&event), Some(Arm::CatchUp));
         assert_eq!(consumers(Arm::CatchUp), [ModuleName::Replication]);
+    }
+
+    /// A node fence goes to every other held partition once, ascending, and never twice to its
+    /// own site; a partition fence, or any other effect, goes nowhere else (A-R324).
+    #[test]
+    fn a_node_fence_reaches_every_other_held_partition_once() {
+        use super::node_fence_sites;
+        use crate::contracts::authority::{AuthorityEffect, DenyReason, FenceScope};
+        use crate::contracts::event::KernelEffect;
+        use crate::contracts::ids::PartitionId;
+        let fence = |scope| {
+            KernelEffect::Authority(AuthorityEffect::Fence {
+                scope,
+                reason: DenyReason::Expired,
+            })
+        };
+        let held = [3, 1, 0, 3, 2].map(PartitionId);
+        assert_eq!(
+            node_fence_sites(&fence(FenceScope::Node), PartitionId(0), held),
+            [1, 2, 3].map(PartitionId),
+            "sited at a held partition: the others, ascending, once"
+        );
+        assert_eq!(
+            node_fence_sites(&fence(FenceScope::Node), PartitionId(9), held),
+            [0, 1, 2, 3].map(PartitionId),
+            "sited where nothing is held: every held partition"
+        );
+        assert_eq!(
+            node_fence_sites(
+                &fence(FenceScope::Partition(PartitionId(1))),
+                PartitionId(1),
+                held
+            ),
+            [],
+            "a partition fence stays at its own partition"
+        );
+        assert_eq!(
+            node_fence_sites(
+                &KernelEffect::CopyLost {
+                    copy: crate::contracts::membership::CopyId(1)
+                },
+                PartitionId(0),
+                held
+            ),
+            [],
+            "not a fence"
+        );
     }
 }

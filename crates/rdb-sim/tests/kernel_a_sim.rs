@@ -667,6 +667,54 @@ fn freeze_while_dispatched(source: FenceSource) {
     );
 }
 
+/// A-R324, the simulator twin of host row
+/// `a_node_fence_sited_at_partition_0_freezes_partition_1s_queue`. A1 sites a node fence at the
+/// partition of the event that tripped it. Here that is a `NodeLifecycle::Resumed` past the
+/// resume-gap tolerance, queued on B at partition 0, where B serves no T1 or P1, behind A1's
+/// `Dispatch` answer for request 11. The dispatcher delivers the fence at partition 1 too, so
+/// T1 freezes on the dispatched seq 11 with its lost authority, and P1 freezes with it. Before
+/// A-R324 the fence reached partition 0 only, and both stayed open.
+#[retcd_test]
+fn a_node_fence_sited_at_partition_0_freezes_partition_1() {
+    support::preamble();
+    let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+    let mut replies = run_to(&mut runner, SUBMIT - 1);
+    cut_b(&mut runner);
+    while !dispatch_decided(&runner, SUBMIT) {
+        assert!(
+            step(&mut runner, SUBMIT, &mut replies),
+            "the tick ran out before the answer"
+        );
+    }
+    runner
+        .queue(&SeedEvent {
+            partition: PartitionId(0),
+            ..on_b(
+                SUBMIT,
+                9_701,
+                EventKind::Node(NodeLifecycle::Resumed {
+                    suspended_millis: Budgets::SPEC_DEFAULTS.resume_gap_tolerance_millis + 1,
+                }),
+            )
+        })
+        .expect("queue");
+    while step(&mut runner, SUBMIT, &mut replies) {}
+    let lost = FreezeCause::AuthorityLost(DenyReason::ProcessSuspended);
+    assert_eq!(
+        *t1(&runner).mode(),
+        QueueMode::Frozen {
+            cause: lost,
+            unresolved: Some(Seq(WRITE)),
+        },
+        "T1 on partition 1 froze on the dispatched seq 11"
+    );
+    assert_eq!(
+        p1(&runner).mode,
+        PubMode::Frozen { cause: lost },
+        "P1 on partition 1 took the same fence"
+    );
+}
+
 // ---- M7A-163 --------------------------------------------------------------------------------
 
 /// M7A-163 (ADR 0008 "Dropped control operation", both consumers). The control completion B's

@@ -3312,6 +3312,25 @@ impl Host {
                     at = self.stepped_at.0,
                     "authority_fence"
                 );
+                // A node fence is every served partition's, wherever A1 sited it (A-R324).
+                let held: Vec<PartitionId> = self
+                    .adopted
+                    .keys()
+                    .chain(self.l1.keys())
+                    .copied()
+                    .filter(|partition| {
+                        self.transaction.kernel(self.node, *partition).is_some()
+                            || self.publication.kernel(self.node, *partition).is_some()
+                    })
+                    .collect();
+                for partition in route::node_fence_sites(kernel, site.partition, held) {
+                    let event = KernelEvent::Authority(AuthorityEvent::Fence {
+                        scope: *scope,
+                        reason: *reason,
+                    });
+                    let at = Site { partition, ..site };
+                    self.push(at, EventKind::Kernel(event), true, None);
+                }
                 if *scope == FenceScope::Node {
                     self.schedule_acquire_after_fence(site);
                 }
