@@ -3,7 +3,7 @@
 #
 #   scripts/local-rdb.sh up [--base-port P] [--root DIR] [--timeout-sec N]
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
-#   scripts/local-rdb.sh kill N | start N [--wipe] | restart N    [--run DIR]
+#   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
 #   scripts/local-rdb.sh suspend N | resume N                     [--run DIR]
 #   scripts/local-rdb.sh hold A-B | heal A-B                      [--run DIR]
 #   scripts/local-rdb.sh drop-request N [--node M] | drop-reply N [--node M]   [--run DIR]
@@ -15,6 +15,9 @@
 # database once in one process (rdb_node --form, ruling A-R231), then starts rdb_node 1, 2 and 3,
 # each holding only its own copy, and waits for each to say ready. Ctrl-C or a failed step brings
 # everything it started back down.
+#
+# `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
+# it at once, as a crash. Any other verb is refused with the list of verbs, exit 2.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
 # named <sha>-<base port>-<HHMMSS>. The last `up` is recorded in <root>/current, and every other
@@ -414,6 +417,9 @@ case "$COMMAND" in
     status) pick_run; status ;;
     env) pick_run; cat "$RUN/run.env"; echo "RUN=$RUN"; echo "PEERS=$(peers)" ;;
     kill) pick_run; check_node_arg "$ARG"; kill_node "$ARG" ;;
+    stop)
+        pick_run; check_node_arg "$ARG"
+        if node_alive "$ARG"; then stop_node "$ARG"; else forget_pid "node-$ARG"; say "node $ARG is not running"; fi ;;
     start)
         pick_run; check_node_arg "$ARG"
         if [ "$WIPE" = 1 ]; then
@@ -440,5 +446,6 @@ case "$COMMAND" in
             [ "$DROP" != "$ARG" ] || die "promote $ARG cannot also drop $ARG"
         fi
         promote ;;
-    *) usage ;;
+    "") usage ;;
+    *) echo "lr: unknown verb '$COMMAND'; the verbs are:" >&2; usage ;;
 esac
