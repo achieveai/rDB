@@ -12,6 +12,7 @@ use super::*;
 
 fn config(dir: &Path) -> DbConfig {
     DbConfig {
+        ack_floor: true,
         dir: dir.to_path_buf(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),

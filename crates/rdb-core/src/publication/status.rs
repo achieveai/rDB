@@ -15,10 +15,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::errors::ErrorKind;
-use crate::contracts::ids::{Generation, RequestIdentity, Seq};
-use crate::contracts::publication::{StatusEntry, StatusOutcome};
+use crate::contracts::ids::{ClientId, Generation, RequestId, RequestIdentity, Seq, TenantId};
+use crate::contracts::publication::{AckFloor, StatusEntry, StatusOutcome};
 use crate::contracts::recovery::RetainedStatusMap;
 use crate::contracts::txn::{Outcome as TxnOutcome, TxnResult, TxnStatus};
+use crate::transaction::dedup::{open_base, APP_ID_MIN};
 use crate::transaction::RETENTION_CAP_ENTRIES;
 
 /// The wire answer for `outcome` (test plan KA-9). Never [`TxnStatus::Unresolved`]: that is
@@ -54,6 +55,12 @@ pub struct StatusIndex {
     /// The generations holding an entry for each request: `entries` keyed the other way round,
     /// so [`Self::lookup_any`] is logarithmic (PR #1 R1-F007). Never holds an empty set.
     by_request: BTreeMap<RequestIdentity, BTreeSet<Generation>>,
+    /// Each `Db` open's ack floor per generation, as T1's dedup index holds it (A-R252, A-R255):
+    /// the effective floor, `acked_below` or the lowest pin when that is lower. An id under it
+    /// that holds no entry was forgotten under a floor and answers `StatusExpired`. One per
+    /// `(generation, tenant, client, open)`, so not counted against [`Self::cap`]; they go with
+    /// their generation at [`Self::retire`].
+    floors: BTreeMap<(Generation, TenantId, ClientId, u64), RequestId>,
 }
 
 impl Default for StatusIndex {
@@ -65,6 +72,7 @@ impl Default for StatusIndex {
             retired: BTreeSet::new(),
             cap: RETENTION_CAP_ENTRIES,
             by_request: BTreeMap::new(),
+            floors: BTreeMap::new(),
         }
     }
 }
@@ -149,7 +157,7 @@ impl StatusIndex {
         if let Some(entry) = self.entries.get(&(generation, request)) {
             return entry.outcome;
         }
-        if self.retired.contains(&generation) {
+        if self.retired.contains(&generation) || self.below_floor(generation, request) {
             return StatusOutcome::StatusExpired;
         }
         match self.retained_from_seq.get(&generation) {
@@ -254,8 +262,74 @@ impl StatusIndex {
         *floor = (*floor).max(below);
     }
 
+    /// Forget the statuses an ack floor releases (ruling A-R255): the sender's ids in
+    /// `[open base, floor.below)` in `generation`, except the pinned ones, the same set T1
+    /// deletes from dedup. The open's floor then rises to the effective floor, `below` or the
+    /// lowest pin when that is lower, and never falls. Monotone and idempotent: a floor at or
+    /// under one already applied forgets what is already gone. App-chosen ids get no floor.
+    pub fn forget_below(
+        &mut self,
+        generation: Generation,
+        sender: RequestIdentity,
+        floor: &AckFloor,
+    ) {
+        if self.retired.contains(&generation) || floor.below >= APP_ID_MIN {
+            return;
+        }
+        let base = open_base(RequestId(floor.below));
+        let at = |request| RequestIdentity {
+            request: RequestId(request),
+            ..sender
+        };
+        let pinned = |request: &RequestId| floor.pinned.contains(&Some(request.0));
+        let gone: Vec<_> = self
+            .entries
+            .range((generation, at(base))..(generation, at(floor.below)))
+            .map(|(key, _)| *key)
+            .filter(|(_, identity)| !pinned(&identity.request))
+            .collect();
+        for key in gone {
+            self.entries.remove(&key);
+            forget(&mut self.by_request, key.1, generation);
+        }
+        let lowest = floor
+            .pinned
+            .iter()
+            .flatten()
+            .fold(floor.below, |a, b| a.min(*b));
+        self.set_floor(generation, at(lowest));
+    }
+
+    /// Hold `floor.request` as the effective floor of its open in `generation`, unless a higher
+    /// one is held. The seed's write, from T1's floor record ([`Self::forget_below`] for the
+    /// rest).
+    pub fn set_floor(&mut self, generation: Generation, floor: RequestIdentity) {
+        if self.retired.contains(&generation) || floor.request.0 >= APP_ID_MIN {
+            return;
+        }
+        let key = floor_key(generation, floor);
+        let held = self.floors.entry(key).or_insert(floor.request);
+        *held = (*held).max(floor.request);
+    }
+
+    /// Whether `request` is under its open's floor in `generation` (A-R252 M3).
+    fn below_floor(&self, generation: Generation, request: RequestIdentity) -> bool {
+        request.request.0 < APP_ID_MIN
+            && self
+                .floors
+                .get(&floor_key(generation, request))
+                .is_some_and(|floor| request.request < *floor)
+    }
+
+    /// How many open floors are held, over every generation.
+    #[must_use]
+    pub fn floor_count(&self) -> usize {
+        self.floors.len()
+    }
+
     /// Drop `generation` whole. Every later lookup in it answers `StatusExpired`.
     pub fn retire(&mut self, generation: Generation) {
+        self.floors.retain(|key, _| key.0 != generation);
         let by_request = &mut self.by_request;
         self.entries.retain(|(gen, request), _| {
             let keep = *gen != generation;
@@ -279,6 +353,19 @@ impl StatusIndex {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// The [`StatusIndex::floors`] key of `identity`'s open in `generation`.
+const fn floor_key(
+    generation: Generation,
+    identity: RequestIdentity,
+) -> (Generation, TenantId, ClientId, u64) {
+    (
+        generation,
+        identity.tenant,
+        identity.client,
+        open_base(identity.request),
+    )
 }
 
 /// Drop `generation` from `request`'s set in [`StatusIndex::by_request`], and the set once empty.
