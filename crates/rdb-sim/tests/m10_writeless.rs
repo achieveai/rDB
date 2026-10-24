@@ -15,7 +15,7 @@
 //! `kernel_a_sim`'s `recover_gen3_at` does: `partitions/1` is rewritten to name the next
 //! generation and a new owner epoch, and the root reaches A and C through their control
 //! watches, with every copy in its barrier. The simulator has no F1-led recovery after the first
-//! that activates (M7V-47, I1 owed), so the root is the reopen's commit, not its discovery.
+//! that activates (M7V-47), so the root is the reopen's commit, not its discovery.
 //!
 //! What the row then checks is what D3 broke: after each writeless reopen L1 on B admits again,
 //! and the last write publishes in the newest generation, right after the first one.
@@ -216,7 +216,12 @@ fn newest_root(runner: &Runner) -> RecoveryResult {
 /// note is not in the trace (`Runner::carry_out`); it is returned instead, for the next reopen.
 ///
 /// A copy `behind` is left out of the barrier, and its links are left as they are.
-fn reopen(runner: &mut Runner, root: &RecoveryResult, behind: Option<NodeId>) -> RecoveryResult {
+fn reopen(
+    runner: &mut Runner,
+    root: &RecoveryResult,
+    behind: Option<NodeId>,
+    cut_b: bool,
+) -> RecoveryResult {
     let kernel = runner
         .dispatcher()
         .transaction()
@@ -303,14 +308,14 @@ fn reopen(runner: &mut Runner, root: &RecoveryResult, behind: Option<NodeId>) ->
         "reopen"
     );
     // B's R1 sends at once, and a member still in the old generation answers `NeedLineage`, which
-    // R1 turns into `CopyAheadOnControl`. The simulator refuses that effect (I1 owed; M7V-47 hit
-    // the same stop), so B's links are cut while the root goes out. The members' watches are
-    // held by the cut and land when it heals; B's first frames are lost, and its next ones reach
-    // members that have landed.
+    // R1 turns into `CopyAheadOnControl` (I1). With `cut_b`, B's links are cut while the root
+    // goes out: the members' watches are held by the cut and land when it heals, B's first frames
+    // are lost, and its next ones reach members that have landed, so I1 is not reached. Without
+    // it, the dispatcher's `copy_ahead` (the host's H3 twin) consumes the effect.
     let cut = |state| {
         [A_NODE, C_NODE]
             .into_iter()
-            .filter(|member| Some(*member) != behind)
+            .filter(|member| cut_b && Some(*member) != behind)
             .map(move |member| NetworkOp::SetLink {
                 a: B_NODE,
                 b: member,
@@ -418,7 +423,7 @@ fn opened(
         "generation 2 is B's newest root"
     );
     for reopened in 1..=writeless + 1 {
-        root = reopen(&mut runner, &root, behind);
+        root = reopen(&mut runner, &root, behind, true);
         let generation = root.new_generation;
         let opened = at;
         at += SETTLE_MILLIS;
@@ -814,4 +819,97 @@ fn m10_a_r177_a_copy_at_the_base_misses_three_writeless_reopens_and_the_write_re
         3,
     );
     assert_eq!(newest, Generation(6));
+}
+
+/// The I1 twin (M10 slice 2, #59): the host's H3 arm, `CopyAheadOnControl`, in the simulator.
+/// After the first write, B carries a reopen into generation 3 with its links up, so its R1
+/// sends before A's and C's control watches land and they answer from generation 2. R1 turns
+/// that into `CopyAheadOnControl`, and the dispatcher's `copy_ahead` consumes it: the root is
+/// already on its way in each member's watch, so it logs `copy_ahead_pending` and posts no
+/// second one. Nothing is refused or faults, L1 on B admits, and the next write publishes in
+/// generation 3 and lands on A and C.
+#[retcd_test]
+fn m10_s2_i1_a_reopen_sent_before_the_members_land_is_consumed_by_copy_ahead() {
+    let method = "m10_s2_i1_a_reopen_sent_before_the_members_land_is_consumed_by_copy_ahead";
+    support::preamble();
+    let mut runner = Runner::new(&plan()).expect("the harness takes the plan");
+    runner.queue(&submit(FIRST_AT, 1)).expect("queue");
+    let first = run_to(&mut runner, FIRST_AT + 1_000);
+    assert_eq!(
+        first,
+        vec![(1, Ok((Generation(2), Seq(CUTOFF.0 + 1))))],
+        "the first write publishes in generation 2"
+    );
+    let prior = newest_root(&runner);
+    let root = reopen(&mut runner, &prior, None, false);
+    let newest = root.new_generation;
+    assert_eq!(newest, Generation(3));
+    let opened = FIRST_AT + 1_000;
+    let at = opened + SETTLE_MILLIS;
+    let quiet = run_to(&mut runner, at);
+    assert!(quiet.is_empty(), "nothing is answered: {quiet:?}");
+
+    let pending: Vec<(u64, u64, u64)> = logged(method, "copy_ahead_pending")
+        .iter()
+        .map(|line| {
+            (
+                line["node"].as_u64().unwrap_or(0),
+                line["member"].as_u64().unwrap_or(0),
+                line["generation"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    let b = u64::from(B_NODE.0);
+    assert_eq!(
+        pending,
+        vec![
+            (b, u64::from(C_NODE.0), newest.0),
+            (b, u64::from(A_NODE.0), newest.0)
+        ],
+        "B's R1 is ahead of both members' landing once, and their watches already carry the root"
+    );
+    for message in [
+        "copy_ahead_reposted",
+        "copy_ahead_unrouted",
+        "kernel effect refused: no consumer",
+        "land_link_refused",
+    ] {
+        let lines = logged(method, message);
+        assert!(lines.is_empty(), "no {message}: {lines:?}");
+    }
+    let faults: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test("m10_writeless", method)
+            .into_iter()
+            .filter(|line| {
+                line["@l"] == "Error"
+                    || line["kernel"]
+                        .as_str()
+                        .is_some_and(|kernel| kernel.contains("Quarantined"))
+            })
+            .collect();
+    assert!(faults.is_empty(), "nothing faults: {faults:?}");
+    let admitted = admissions_since(&runner, opened);
+    assert_eq!(
+        admitted.last().map(|(_, allow)| *allow),
+        Some(true),
+        "L1 on B admits again in generation 3: {admitted:?}"
+    );
+
+    runner.queue(&submit(at, 2)).expect("queue");
+    let next = run_to(&mut runner, at + 1_000);
+    let written = Seq(CUTOFF.0 + 2);
+    assert_eq!(
+        next,
+        vec![(2, Ok((newest, written)))],
+        "the next write publishes in generation 3"
+    );
+    for node in [A_NODE, C_NODE] {
+        let applied = runner
+            .dispatcher()
+            .engine(node)
+            .expect("the member's engine")
+            .buffered_applied(PARTITION, newest)
+            .0;
+        assert_eq!(applied, written.0, "node {} applies the write", node.0);
+    }
 }
