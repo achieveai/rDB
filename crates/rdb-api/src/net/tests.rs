@@ -67,9 +67,10 @@ const fn kind(msg: &WireMsg) -> usize {
         WireMsg::Landed { .. } => 5,
         WireMsg::Client { .. } => 6,
         WireMsg::Inspect { .. } => 7,
+        WireMsg::Answered { .. } => 8,
     }
 }
-const KINDS: usize = 8;
+const KINDS: usize = 9;
 
 /// `msg` as the far side of a link posts it, and the kind it travelled as.
 fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
@@ -438,6 +439,12 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         Msg::Routed {
             partition: PartitionId(1),
             correlation: zero(),
+            kind: zero(),
+        },
+        Msg::Answered {
+            partition: PartitionId(1),
+            correlation: zero(),
+            asked: zero(),
             kind: zero(),
         },
         Msg::Landed {
