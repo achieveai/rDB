@@ -924,8 +924,8 @@ fn m10_s2_b14_a_late_revocation_of_an_older_epoch_leaves_the_served_one_writable
 /// generation is `DegradedRf2` and takes writes again. Nothing else would end the read-only
 /// commit: node 2 is pinned, at the boot it was pinned at, and nothing holds writes up.
 /// Cuts: `repair_duty` returns at once, red (no `DegradedRf2` within the patience); no wait for
-/// the resume hold, red (`linked_ms` below it); no `linked` filter, red (repaired
-/// while node 2 is held).
+/// the resume hold, red (`linked_ms` below it). A held link is never probed into a repair
+/// either (b20; the `linked` filter's cut is b19's).
 /// Integration (~4 s): b1's drop, the read-only commit, the repair's re-plan.
 #[config_log::retcd_test]
 fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
@@ -1103,4 +1103,152 @@ fn m10_s2_b17_a_repair_whose_plan_is_running_is_not_repaired_again() {
         Answer::Txn { result, .. } => assert_eq!(result.generation, repaired.0),
         other => panic!("a put after the repair: {other:?}"),
     }
+}
+
+/// b19 (A-R346 M1): a repair that cannot take its member in is not repeated until that member
+/// moves. b6's read-only commit {1, 2}, node 2 outside, but node 2 now refuses every inventory
+/// F1 asks of it, as a copy that missed a generation below the base does (#59). Once node 2
+/// links again the owner repairs once; F1 leaves node 2 out, so the repair commits `ReadOnly`
+/// again. Over three more holds, with node 2 linked throughout and nothing about it moved, no
+/// second repair runs: one `membership_repair_held` line, and the commit stays where the repair
+/// left it. Node 2's link going down and up again is a move: the next repair runs.
+/// Cuts: no bound in `repair_duty`, red (a second `membership_repair_planned` while held); no
+/// `linked` filter, or a link going down that keeps the mark, red (no repair after the new link).
+/// Integration (~6 s): b1's drop, two repairs, three holds.
+#[config_log::retcd_test]
+fn m10_s2_b19_a_repair_that_ends_read_only_again_waits_for_its_member_to_move() {
+    const METHOD: &str =
+        "m10_s2_b19_a_repair_that_ends_read_only_again_waits_for_its_member_to_move";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    trio.until("node 3 blamed for half the drop clock", |trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&PartitionId(1))
+            .filter(|blame| HostClock::millis_until(blame.since, now) >= DROP_AFTER_MILLIS / 2)
+            .map(|_| ())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    let read_only = trio.until("node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(
+        read_only,
+        (before.next(), PartitionMode::ReadOnly, vec![1, 2]),
+        "node 2 unheard through the drop's discovery"
+    );
+
+    trio.nodes[1].0.refuse_inventories = true;
+    trio.links.heal(NodeId(1), NodeId(2));
+    let again = trio.until("node 1 repaired, and the repair ended read-only", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > read_only.0)
+    });
+    assert_eq!(
+        (again.1.clone(), again.2.clone()),
+        (PartitionMode::ReadOnly, vec![1, 2]),
+        "{again:?}"
+    );
+    let holds = |trio: &mut Trio, label: &str| {
+        let until = trio.clock.now().plus_millis(
+            3 * trio.nodes[0].0.budgets.resume_hold_millis + 3 * DROP_CHECK_EVERY_MILLIS,
+        );
+        trio.until(label, |trio| (trio.clock.now() >= until).then_some(()));
+    };
+    holds(&mut trio, "three more holds with node 2 linked");
+    assert_eq!(commit_of(&trio), Some(again.clone()), "repaired again");
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert_eq!(
+        planned.len(),
+        1,
+        "one repair while nothing moved: {planned:?}"
+    );
+    let held = logged!(METHOD, "membership_repair_held");
+    assert_eq!(held.len(), 1, "the held repair is logged once: {held:?}");
+
+    // A new link is a move.
+    trio.links.hold(NodeId(1), NodeId(2));
+    holds(&mut trio, "node 2 down for a while");
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.until("node 1 repaired after the new link", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > again.0)
+    });
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert_eq!(planned.len(), 2, "repaired after the new link: {planned:?}");
+}
+
+/// b20 (A-R350): a half-open member is never repaired, so reads are never fenced for it. b6's
+/// read-only commit {1, 2}, node 2 outside; the hold lifts, but everything node 1 sends node 2
+/// is lost, as on a connection that is up and answers nothing. Node 2 counts as linked, so
+/// each check past the resume hold probes it with an `Inspect`, and no answer comes: over three
+/// holds there is no repair, no fence and no new generation. Once node 1's frames reach node 2
+/// again, a probe is answered and the repair runs.
+/// Cut: a linked member counts as answered, red (a repair while node 2 answers nothing).
+/// Integration (~5 s): b1's drop, three holds, one repair.
+#[config_log::retcd_test]
+fn m10_s2_b20_a_member_that_answers_no_probe_is_not_repaired() {
+    const METHOD: &str = "m10_s2_b20_a_member_that_answers_no_probe_is_not_repaired";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    trio.until("node 3 blamed for half the drop clock", |trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&PartitionId(1))
+            .filter(|blame| HostClock::millis_until(blame.since, now) >= DROP_AFTER_MILLIS / 2)
+            .map(|_| ())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    let read_only = trio.until("node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(
+        read_only,
+        (before.next(), PartitionMode::ReadOnly, vec![1, 2]),
+        "node 2 unheard through the drop's discovery"
+    );
+    let fenced = logged!(METHOD, "authority_fence").len();
+
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.links.drop_direction(NodeId(1), NodeId(2));
+    let until = trio
+        .clock
+        .now()
+        .plus_millis(3 * trio.nodes[0].0.budgets.resume_hold_millis + 3 * DROP_CHECK_EVERY_MILLIS);
+    trio.until("three holds with node 2 half-open", |trio| {
+        (trio.clock.now() >= until).then_some(())
+    });
+    assert_eq!(
+        commit_of(&trio),
+        Some(read_only.clone()),
+        "repaired a half-open member"
+    );
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert!(
+        planned.is_empty(),
+        "repaired a half-open member: {planned:?}"
+    );
+    let fences = logged!(METHOD, "authority_fence");
+    assert_eq!(
+        fences.len(),
+        fenced,
+        "fenced for a half-open member: {fences:?}"
+    );
+
+    trio.links.heal(NodeId(1), NodeId(2));
+    let repaired = trio.until("node 1 repaired once node 2 answers", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > read_only.0)
+    });
+    assert_eq!(
+        (repaired.1, repaired.2),
+        (PartitionMode::DegradedRf2, vec![1, 2])
+    );
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert_eq!(planned.len(), 1, "one repair: {planned:?}");
 }
