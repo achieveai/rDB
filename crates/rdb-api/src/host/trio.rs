@@ -18,14 +18,25 @@ pub(super) use logged;
 /// them (the record, its `History` row, the applied-head `Progress` row). Their digests,
 /// `[0]` at seq 1.
 pub(super) fn write_chain(engine: &mut RocksEngine, generation: Generation, n: u64) -> Vec<Digest> {
+    write_chain_after(engine, generation, Vec::new(), n)
+}
+
+/// [`write_chain`] continued: `n` more records in `generation`, chained after `digests` (the
+/// records already held, `[0]` at seq 1). Returns every digest, `digests` first.
+pub(super) fn write_chain_after(
+    engine: &mut RocksEngine,
+    generation: Generation,
+    mut digests: Vec<Digest>,
+    n: u64,
+) -> Vec<Digest> {
     use rdb_core::contracts::digest::Domain;
     use rdb_core::contracts::envelope::EnvelopeHeader;
     use rdb_core::contracts::ids::{BatchId, ClientId, LeaseId, TenantId};
     use rdb_core::contracts::storage::{Batch, Write};
     use rdb_core::contracts::txn::Outcome;
     use rdb_core::contracts::version::ENVELOPE_VERSION;
-    let mut digests: Vec<Digest> = Vec::new();
-    for seq in 1..=n {
+    let first = digests.len() as u64 + 1;
+    for seq in first..first + n {
         let mut env = ReplicationEnvelope {
             header: EnvelopeHeader {
                 protocol_version: ENVELOPE_VERSION,

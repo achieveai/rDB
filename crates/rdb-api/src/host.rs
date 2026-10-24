@@ -5846,9 +5846,13 @@ impl Host {
     /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
     /// `Dispatcher::current_inventory` reports, read from this engine alone.
     ///
-    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at
+    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at or below
     /// `anchor.base_seq` (its stored link), and the digest it stores at the base is
-    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). A copy holding a newer generation of the
+    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). The digest chains every record before
+    /// it, so a match there proves the prefix. A copy that linked the generation below the
+    /// base (`land_link_behind`) and stored the base's record since holds the anchor too (D8,
+    /// A-R337). A link above the base has no producer and is refused. A copy holding a newer
+    /// generation of the
     /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
     /// plan is made, never here.
     fn survivor(
@@ -5880,7 +5884,7 @@ impl Host {
             .engine
             .link(partition, generation)
             .ok_or("anchor_generation_unlinked")?;
-        if link.base != anchor.base_seq {
+        if link.base > anchor.base_seq {
             return Err("base_differs");
         }
         let digest_at = |seq: Seq| -> Result<Digest, &'static str> {

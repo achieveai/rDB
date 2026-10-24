@@ -166,10 +166,13 @@ pub struct DbConfig {
     /// the first send applied, rather than applying twice.
     pub dedup_retention: Option<Duration>,
     /// The nodes whose copies this process holds and runs (M10 S2). [`ALL_NODES`] is the
-    /// one-process database: all three copies here. Not read yet: every open runs all three.
+    /// one-process database: all three copies here. Some of them is a node process
+    /// (`rdb_node`). Empty is an app: it holds no copy, runs no node and claims no folder, and
+    /// reaches the nodes through [`Self::links`], which it then needs.
     pub local: Vec<NodeId>,
-    /// The peer links this process's nodes use (M10 S2). `None`: new in-process links. Not
-    /// read yet: every open makes its own in-process links.
+    /// The links this process sends over (M10 S2). `Some`: these links, such as a `Net` over
+    /// TLS to node processes; an app (empty [`Self::local`]) needs them. `None`: new
+    /// in-process links, which is what a one-process database uses.
     pub links: Option<Arc<Links>>,
     /// The client every request of this `Db` is sent as (M10 S2-8: two apps on one node are
     /// two clients, and the dedup state keys on it). [`DEFAULT_CLIENT`] is the one client every
@@ -495,6 +498,9 @@ impl Default for Opened {
     }
 }
 
+/// The least time between two reads of `partitions/1` by one `Db`'s route (A-R299).
+const OWNER_REREAD_GAP: Duration = Duration::from_millis(250);
+
 /// Where a `Db` sends its calls (ruling A-R226 h2): the owner `partitions/1` names, and, for a
 /// `Db` that can look again, the store and runtime it reads the record with.
 struct Route {
@@ -503,6 +509,9 @@ struct Route {
     /// What a `NOT_PRIMARY` answer, or an owner that cannot be reached, re-reads `partitions/1`
     /// with. `None`: the owner is fixed.
     refresh: Option<(Arc<dyn ConfigStore>, Handle)>,
+    /// When `refresh` last read `partitions/1`. A read within [`OWNER_REREAD_GAP`] of it is not
+    /// made: the call goes on with the owner that read named (A-R299).
+    last_read: Mutex<Option<Instant>>,
 }
 
 impl Default for Route {
@@ -510,6 +519,7 @@ impl Default for Route {
         Self {
             owner: std::sync::atomic::AtomicU32::new(OWNER.0),
             refresh: None,
+            last_read: Mutex::new(None),
         }
     }
 }
@@ -906,6 +916,7 @@ impl Db {
             route: Route {
                 owner: std::sync::atomic::AtomicU32::new(owner.0),
                 refresh: Some((store, rt)),
+                last_read: Mutex::new(None),
             },
         })
     }
@@ -1055,6 +1066,7 @@ impl Db {
             route: Route {
                 owner: std::sync::atomic::AtomicU32::new(found.owner.0),
                 refresh: partial.then(|| (Arc::clone(&store), rt.clone())),
+                last_read: Mutex::new(None),
             },
         };
         let mut failed = None;
@@ -1565,12 +1577,23 @@ impl Db {
 
     /// After a `NOT_PRIMARY` answer, or a send the owner could not take (A-R287 P1), read the
     /// owner `partitions/1` names now, so the next call, or the caller's retry that
-    /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout. A `Db` whose owner is fixed reads nothing. A read that fails keeps the
-    /// owner it had and logs why: the next such answer reads again.
+    /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout.
+    /// A `Db` whose owner is fixed reads nothing. At most one read per [`OWNER_REREAD_GAP`]
+    /// (A-R299): an outage is when the control plane is weakest, and every call would read
+    /// otherwise; a call inside the gap goes on with the owner the last read named. A read that
+    /// fails keeps the owner it had and logs why: the next such answer past the gap reads again.
     fn refresh_owner(&self) {
         let Some((store, rt)) = &self.route.refresh else {
             return;
         };
+        {
+            let mut last = lock(&self.route.last_read);
+            let now = Instant::now();
+            if last.is_some_and(|at| now.duration_since(at) < OWNER_REREAD_GAP) {
+                return;
+            }
+            *last = Some(now);
+        }
         let (done, read) = mpsc::channel();
         let store = Arc::clone(store);
         rt.spawn(async move {
@@ -4667,18 +4690,28 @@ mod tests {
     /// at once through one `Db`, and every put succeeds. Before the fix T1 froze its queue at
     /// every local apply until the publish, so a put that arrived in that window was refused
     /// `PROTECTION_PAUSED` (290 a minute with 2 writers at 100 puts a second in `rdb_bench`).
+    ///
+    /// L1 keeps the spec's ages, scaled as a wait (ruling A-R313). Under `fast()` a 400 ms
+    /// flush on a loaded host pauses L1, which is a correct refusal of another kind and not the
+    /// freeze this row is about (d2 paused that way 3 times in 46 loaded runs). The freeze cut
+    /// still refuses at the first apply, whatever the ages.
     /// Integration (~1 s): three node threads, 120 puts.
     #[test]
     fn concurrent_writers_wait_behind_the_unpublished_write_and_none_is_refused() {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: millis(crate::host::test_patience(Duration::from_secs(1))),
+            pause_age_millis: millis(crate::host::test_patience(Duration::from_secs(2))),
+            ..fast()
+        };
         let mut db = rt
             .block_on(Db::open_with(
                 config(dir.path()),
                 store,
                 rt.handle().clone(),
-                fast(),
+                budgets,
             ))
             .expect("open");
         admits(&db, "after the open");
@@ -4691,14 +4724,21 @@ mod tests {
                         for i in 0..20 {
                             let key = format!("w{writers}/{writer}/{i}");
                             if let Err(e) = db.put(key.as_bytes(), b"v", None) {
-                                refused.lock().expect("lock").push(e.error.kind);
+                                refused
+                                    .lock()
+                                    .expect("lock")
+                                    .push((e.error.kind, e.error.detail));
                             }
                         }
                     });
                 }
             });
             let refused = refused.into_inner().expect("lock");
-            assert!(refused.is_empty(), "{writers} writers: refused {refused:?}");
+            assert!(
+                refused.is_empty(),
+                "{writers} writers: refused {refused:?}; owner now {:?}",
+                owner_of(&db, db.node_status())
+            );
         }
         db.shutdown();
     }
@@ -5002,9 +5042,29 @@ mod tests {
             .expect("open");
         admits(&db, "after the open");
         db.put(b"a", b"1", None).expect("before the restart");
-        let before = owner_status(&db, "node 1 before the restart").recovered;
-        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        let owner = owner_status(&db, "node 1 before the restart");
+        let before = owner.recovered;
+        let applied = owner.holds.expect("node 1 holds the partition").applied;
         let patience = crate::host::test_patience(Duration::from_secs(5));
+        // A-R301b/A-R305: node 3 durable at a=1 before it stops, so nothing is unsafe while it
+        // restarts and L1 keeps admitting. Otherwise L1 pauses on node 3 for the whole restart,
+        // and a restart slowed past PEER_DROP_AFTER_MILLIS by host load (13 and 26 s in gates
+        // k521 and k513) let node 1 drop node 3, leaving the link hold below nothing to pause.
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
+            let durable = node_3.as_ref().and_then(|n| n.holds).map(|h| h.durable);
+            if durable >= Some(applied) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 not durable at node 1's applied {applied} within {patience:?}: \
+                 {node_3:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
         let deadline = std::time::Instant::now() + patience;
         let first = loop {
             let owner = owner_status(&db, "node 1 re-planning");
@@ -5019,6 +5079,14 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
+        // A re-plan that dropped node 3 leaves the hold below nothing to pause: say so now.
+        let owner = owner_status(&db, "node 1 after the re-plan");
+        let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
+        assert_eq!(
+            node_3.as_ref().and_then(|n| n.recovered),
+            owner.recovered,
+            "node 3 is not in node 1's re-plan (dropped?): owner {owner:?}, node 3 {node_3:?}"
+        );
         db.links().hold(OWNER, NodeId(3));
         owner_when(&db, "L1 pauses", patience, &|node| {
             node.admits == Some(false)
@@ -6308,6 +6376,11 @@ mod tests {
             reload_pending: None,
             lengths: None,
         };
+        // From here node 1 answers, and the claim is the text an answer gives. Each look waits
+        // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
+        // it and the text said "answered no status look" (A-R307). The 60 ms the texts name is
+        // `within`, which a look that answers late still reports.
+        db.timeouts.read = crate::host::test_patience(Duration::from_secs(1));
         let node_1 = std::thread::spawn(move || {
             while let Ok(msg) = mailbox.recv() {
                 if let Msg::Inspect { reply, .. } = msg {
@@ -6599,6 +6672,78 @@ mod tests {
             "the write made before the promote reads back at node 2"
         );
         tracing::info!(refused = ?refused, "p1_app_followed");
+        app.shutdown();
+        nodes.shutdown();
+    }
+
+    /// A-R299: while an app's owner is down and not yet promoted, the app re-reads
+    /// `partitions/1` at most once per 250 ms however many calls it makes, so an outage does
+    /// not turn every call into a control read. 200 puts, 5 ms apart, against a stopped owner
+    /// make at most `1 + elapsed / 250 ms` reads (each read logs `db_owner_refreshed` or
+    /// `db_owner_refresh_failed`), about 5 for a second of puts.
+    /// Cut: no gap, one read per put, and this goes red.
+    /// Integration (~3 s: three node threads, then a second of puts).
+    #[config_log::retcd_test]
+    fn m10_s2_an_app_whose_owner_is_down_reads_the_owner_at_most_every_250_ms() {
+        const METHOD: &str =
+            "m10_s2_an_app_whose_owner_is_down_reads_the_owner_at_most_every_250_ms";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut nodes = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("the nodes' open");
+        admits(&nodes, "after the nodes' open");
+        let app_dir = config_testkit::fs::temp_dir();
+        let mut app = rt
+            .block_on(Db::open(
+                DbConfig {
+                    local: Vec::new(),
+                    links: Some(Arc::clone(nodes.links())),
+                    client: ClientId(2),
+                    ..config(app_dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("the app-only open");
+        app.put(b"a", b"1", None)
+            .expect("app A's put while node 1 runs");
+        lock(&nodes.nodes)
+            .iter_mut()
+            .find(|handle| handle.node == OWNER)
+            .expect("node 1 runs here")
+            .stop();
+
+        let began = Instant::now();
+        for _ in 0..200 {
+            let refused = app.put(b"a", b"2", None).expect_err("node 1 has stopped");
+            assert_eq!(refused.error.kind, ErrorKind::Unavailable, "{refused:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = began.elapsed();
+        let reads = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .filter(|line| {
+                line["@m"] == "db_owner_refreshed" || line["@m"] == "db_owner_refresh_failed"
+            })
+            .count();
+        let most = 1 + elapsed.as_millis() / OWNER_REREAD_GAP.as_millis();
+        tracing::info!(
+            reads,
+            most,
+            elapsed_ms = elapsed.as_millis(),
+            "owner_reads_counted"
+        );
+        assert!(
+            reads >= 1 && reads as u128 <= most,
+            "200 puts over {elapsed:?} made {reads} owner reads; at most {most} allowed"
+        );
         app.shutdown();
         nodes.shutdown();
     }
@@ -9692,6 +9837,12 @@ mod tests {
     /// D2 (design-ackfloor §5): with the floor on, a `Db` writes far past a small dedup cap, and
     /// every copy keeps on disk only the newest answer and its open's floor record. Cap 3, 150
     /// puts, none `OVERLOADED`. With the floor off the fourth put is `OVERLOADED`.
+    ///
+    /// A put refused `PROTECTION_PAUSED` is sent again once node 1 admits, which must happen
+    /// within patience (ruling A-R293). Under host load a WAL flush can outlast `fast()`'s
+    /// 400 ms pause age: in gate run 20261023-183438 every node's flush took 398-416 ms and L1
+    /// paused at seq 78. A pause proves no mutation, so the resend is safe and adds no dedup
+    /// row. Any other refusal, `OVERLOADED` from a filled cap above all, still fails at once.
     /// Integration (~1 s): three node threads, 150 puts.
     #[config_log::retcd_test]
     fn m10_s2_d2_a_small_cap_never_fills_and_each_copy_keeps_two_dedup_rows() {
@@ -9706,9 +9857,19 @@ mod tests {
             .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
             .expect("open");
         admits(&db, "after the open");
+        let mut paused = 0_u32;
         for n in 0..150_u32 {
-            db.put(b"a", &n.to_le_bytes(), None)
-                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+            loop {
+                match db.put(b"a", &n.to_le_bytes(), None) {
+                    Ok(_) => break,
+                    Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => {
+                        paused += 1;
+                        tracing::info!(put = n, paused, "d2_put_paused_resend");
+                        admits(&db, "after a pause");
+                    }
+                    Err(refused) => panic!("put {n}: {refused:?}"),
+                }
+            }
         }
         db.shutdown();
         drop(db);
@@ -9744,7 +9905,20 @@ mod tests {
             db.put(b"a", &n.to_le_bytes(), None)
                 .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
         }
-        let statuses = db.node_status();
+        // A put is answered once two copies hold it, so the third may still be receiving the
+        // last few: under load node 2 read 35 rungs straight after the 40th answer (A-R307).
+        // Its catching up is a wait; the rung a write is the claim.
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        let statuses = loop {
+            let statuses = db.node_status();
+            let short = statuses
+                .iter()
+                .any(|status| status.lengths.is_none_or(|lengths| lengths.ladder < 40));
+            if (statuses.len() == 3 && !short) || Instant::now() >= deadline {
+                break statuses;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let seconds = began.elapsed().as_secs();
         db.shutdown();
         drop(db);

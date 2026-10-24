@@ -30,7 +30,7 @@ Where things go:
   - `logs/rdb_node-N.jsonl`: node N's log. `out/node-N.out` and `.err`: its console.
   - `run.env`: the ports and binaries.
 - Ports: rEtcd uses `P+1` to `P+24`. Node N listens on `P+40+N`. `P` is 19800 unless you pass
-  `--base-port P`.
+  `--base-port P`. **Keep `P+1` to `P+43` free:** `up` refuses to start if anything holds one.
 
 ## 2. The commands
 
@@ -45,7 +45,8 @@ scripts/local-rdb.sh up
 - Another run on this machine? Give `up` its own `--base-port P` and `--root DIR`.
 
 Every other verb acts on the last run. If you passed `--root DIR` to `up`, pass it to every verb
-too. `--run DIR` picks another run.
+too, `env` included. Or set it once with `export RDB_LR_ROOT=DIR`, and every command on this page
+works as written. `--run DIR` picks another run.
 
 | Command | What it does |
 |---|---|
@@ -56,17 +57,17 @@ too. `--run DIR` picks another run.
 | `start N` | Starts node N and waits for `rdb_node ready`. Exit 1 with the node's reason if it is not ready. |
 | `restart N` | `stop N`, then `start N`, with the same wait for ready. |
 | `kill N` | Kills node N at once, like a crash. Prints `lr: node N killed (pid ...)`. |
-| `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. |
+| `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. |
 | `down` | Stops the nodes and rEtcd. The run folder stays, so you can read its logs. |
-| `clean` | `down`, then deletes the run folder. Prints `lr: removed <run folder>`. |
+| `clean` | `down`, then deletes the run folder, **its logs included**: copy what you need first. Prints `lr: removed <run folder>`. |
 
 `scripts/local-rdb.sh` with no verb lists every verb, including the fault verbs.
 
 ## 3. Your app
 
 Make a crate outside this repository, with the `Cargo.toml` from
-[`embed.md`](embed.md#2-your-cargotoml) section 2. Its first build takes about 7 minutes.
-Put this in `src/main.rs`:
+[`embed.md`](embed.md#2-your-cargotoml) section 2. Its first build takes 5 to 10 minutes on a
+cold build (7 min 08 s on the dev host). Put this in `src/main.rs`:
 
 ```rust
 use rdb_api::net::faults::Faults;
@@ -174,11 +175,14 @@ Everything else is the same `Db` you would embed.
 Run it from your crate's folder in Git Bash, with `<checkout>` as in `embed.md`:
 
 ```bash
-eval "$(<checkout>/scripts/local-rdb.sh env)"
-cargo run -- "$CONTROL" "$PEERS" "$RUN"
+vars="$(<checkout>/scripts/local-rdb.sh env)" && eval "$vars" &&
+  cargo run -- "$CONTROL" "$PEERS" "$RUN"
 ```
 
-It prints `read back hello at version N`. Run it again and `N` goes up.
+- The `&&` matters. With no run, `env` prints `lr: no run ...` and exits 1. A bare
+  `eval "$(... env)"` hides that and leaves the three values empty.
+- It prints `read back hello at version N`. Run it again and `N` goes up. Once built, a run
+  takes about 2 seconds.
 
 When you are done, from the checkout. `clean` deletes the logs too, so read them first if you
 need them (section 4):
@@ -199,14 +203,29 @@ scripts/local-rdb.sh clean
 Query a copy, never a file a node is still writing. Warnings and errors from all three nodes:
 
 ```bash
-eval "$(scripts/local-rdb.sh env)"
-mkdir -p "$RUN/logs-copy" && cp "$RUN"/logs/rdb_node-*.jsonl "$RUN/logs-copy/"
+vars="$(scripts/local-rdb.sh env)" && eval "$vars" &&
+  mkdir -p "$RUN/logs-copy" && cp "$RUN"/logs/rdb_node-*.jsonl "$RUN/logs-copy/"
 duckdb -c "SELECT json->>'@t' AS t, json->>'@l' AS level, json->>'@m' AS message, filename FROM read_ndjson_objects('$RUN/logs-copy/*.jsonl', filename=true) WHERE (json->>'@l') IN ('Warning','Error') ORDER BY t DESC LIMIT 20"
 ```
 
+Warnings a healthy run shows, most often while the machine is busy (a cargo build, say):
+
+- `db_send_unreachable`, a few, just after a node starts: it tried node `node` before their link
+  was up. Every `up` shows some; the nodes still reach ready.
+- `host_stall`: a node's timer fired late, by `late_ms`. The machine was slow to run the node.
+  Many of them, with `late_ms` near a second, are normal under load.
+- `authority_fence` with `reason=Expired scope=Node`, now and then: the node's permission to
+  write ran out, most often while rEtcd elected a new leader. The node takes it again by itself;
+  a write refused in between says so, with a retry hint. Retry it.
+
+If your app still reads and writes, these are noise. Anything else at `Warning` or `Error` is
+worth reading.
+
 ## 5. Known limits today
 
-- **A restarted owner does not rejoin by itself (#42).** A restarted secondary rejoins once the
-  owner re-plans. A restarted owner stays out until the app opens its folder again.
-- **After `promote`, the app must reopen.** Shut the `Db` down and open it again to write to the
-  new owner. This lasts until W5's P1 fix lands.
+<!-- update-when: W6's restart rejoin lands (M10 S2); rewrite the restart bullet below. -->
+- **A restarted node does not rejoin yet.** `lr restart N` on a secondary exits 1 with
+  `rdb_node not-ready ... BarrierIncomplete`, and reads and writes stay refused (`LEASE_EXPIRED`).
+  A restarted owner stays out too (#42). Avoid `stop` and `restart` on a run you still need
+  (`kill` then `promote` works). To recover, start a new run (`clean`, then `up`); its data is
+  lost.

@@ -1,7 +1,7 @@
 //! Host catch-up and landing rows: inventory, `land_link`, the missed-generation links and
 //! the D7 catch-up wiring. Moved out of `host.rs` (M10 S2 event 0).
 
-use super::trio::{current_thread, host_over, logged, write_chain, Trio};
+use super::trio::{current_thread, host_over, logged, write_chain, write_chain_after, Trio};
 use super::*;
 
 /// M9 serves only an empty copy, so a copy that holds anything must answer
@@ -960,4 +960,54 @@ fn a_shadow_named_by_the_pin_gets_its_probe_timer_armed_and_fired() {
             .filter(|version| *version > armed)
     });
     assert_eq!(fired.0, armed.0 + 1, "R1 took the fire and armed the next");
+}
+
+/// D8 fix 1 (A-R337, critic-d8 finding 5): a copy that linked generation 2 below the anchor's
+/// base, as `land_link_behind` does, and stored the base's record since, reports for that
+/// anchor: the digest it stores at the base is the anchor's. The same copy asked with another
+/// digest at the base answers nothing, and so does a copy that never stored the base's record.
+/// Cut: `link.base != anchor.base_seq` in `survivor`, red (`base_differs` for the first).
+#[test]
+fn a_copy_linked_below_the_anchor_base_reports_only_when_it_holds_the_base() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let linked_at_two = |name: &str| {
+        let path = dir.path().join(name);
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 2);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(2))
+            .expect("inherit");
+        (path, engine, digests)
+    };
+
+    let (path, mut engine, digests) = linked_at_two("holding");
+    let digests = write_chain_after(&mut engine, Generation(2), digests, 1);
+    drop(engine);
+    let mut holding = host_over(&path, &rt);
+    match holding.survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[2])) {
+        Ok(inventory) => {
+            assert_eq!(inventory.head, (Seq(3), digests[2]));
+            assert_eq!(inventory.ladder, vec![(Seq(3), digests[2])]);
+        }
+        Err(reason) => panic!("linked at 2 and holding 3: {reason}"),
+    }
+    assert_eq!(
+        holding
+            .survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[1]))
+            .map(drop),
+        Err("base_digest_differs"),
+        "another record at the base"
+    );
+
+    let (path, engine, digests) = linked_at_two("behind");
+    drop(engine);
+    let mut behind = host_over(&path, &rt);
+    assert_eq!(
+        behind
+            .survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[1]))
+            .map(drop),
+        Err("no_record"),
+        "linked at 2 and holding only 2"
+    );
 }

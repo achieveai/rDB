@@ -206,6 +206,19 @@ fn rejection_reasons(log: &std::path::Path) -> Vec<String> {
 
 /// Poll `log` until it holds at least `want` distinct `policy_rejected` reasons in a row (see
 /// [`rejection_reasons`]), or fail loudly.
+/// The lines of `log`, once it holds at least `want` `policy_loaded` lines (A-R309: health can
+/// show an adoption before its line reaches the file).
+async fn loads_when(log: &std::path::Path, want: usize) -> Vec<serde_json::Value> {
+    support::log_lines_when(log, |lines| {
+        lines
+            .iter()
+            .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
+            .count()
+            >= want
+    })
+    .await
+}
+
 async fn wait_for_rejections(log: &std::path::Path, want: usize, what: &str) {
     let deadline = tokio::time::Instant::now() + rotation_deadline();
     loop {
@@ -368,7 +381,9 @@ async fn m6_10_break_glass_is_not_sticky() {
     .await;
     assert_eq!(second.policy_version, Some(1), "{second:#?}");
 
-    let loaded = log_lines(&log)
+    // Health can show version 1 before its line reaches the file (A-R309).
+    let loaded = loads_when(&log, 3)
+        .await
         .into_iter()
         .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
         .collect::<Vec<_>>();
@@ -421,7 +436,11 @@ async fn m6_11_polling_picks_up_a_new_document() {
     let before = support::health(&endpoint).await;
     assert_eq!(before.policy_version, Some(7), "{before:#?}");
     assert_eq!(
-        count_messages(&log, "policy_loaded"),
+        loads_when(&log, 1)
+            .await
+            .iter()
+            .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
+            .count(),
         1,
         "one adoption at startup"
     );
@@ -433,7 +452,9 @@ async fn m6_11_polling_picks_up_a_new_document() {
     .await;
     assert_eq!(after.policy_version, Some(8), "{after:#?}");
 
-    let loaded = log_lines(&log)
+    // Health can show version 8 before its line reaches the file (A-R309).
+    let loaded = loads_when(&log, 2)
+        .await
         .into_iter()
         .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
         .collect::<Vec<_>>();
