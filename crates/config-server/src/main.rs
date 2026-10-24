@@ -30,6 +30,7 @@ mod manifest;
 mod policy;
 mod rotation;
 mod run;
+mod watchdog;
 
 use clap::Parser;
 
@@ -296,10 +297,13 @@ fn start(cli: Cli) -> Result<ExitCode, Fatal> {
         return Ok(ExitCode::Ok);
     }
 
-    logging::init(&cli.log_dir, &cfg.identity, &log_fields)
+    // Declared first so it drops last: after `shutdown_complete`, on every return path, so the
+    // log file holds every line when the process exits (E2E-09).
+    let log_guard = logging::init(&cli.log_dir, &cfg.identity, &log_fields)
         .map_err(|e| Fatal::rejected("logging_unavailable", e))?;
     let span = logging::process_span(&cfg.identity);
     let _entered = span.enter();
+    log_guard.attach(&span);
 
     // One current-thread-per-core runtime, built here rather than by `#[tokio::main]` so that
     // the `--capabilities` path above never starts one.
@@ -314,11 +318,20 @@ fn start(cli: Cli) -> Result<ExitCode, Fatal> {
             return Err(fatal);
         }
     };
+    // A diagnostic, so a node runs without it rather than refusing to start.
+    let watchdog = match watchdog::start(runtime.handle(), &span) {
+        Ok(watchdog) => Some(watchdog),
+        Err(error) => {
+            tracing::error!(%error, "stall_watchdog_unavailable");
+            None
+        }
+    };
     let result = runtime.block_on(config_log::testing::in_current_span(run::run(cfg, cli)));
     // Shut the runtime down explicitly: a background task still holding the store open when
     // `main` returns would make the data directory unopenable for a moment after exit, which
     // a restart test would see as a lock error.
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    drop(watchdog);
     match &result {
         // Last, and provably last: every task that could still have logged is gone.
         Ok(_) => tracing::info!("shutdown_complete"),

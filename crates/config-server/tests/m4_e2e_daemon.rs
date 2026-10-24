@@ -330,7 +330,17 @@ async fn e2e_24_25_compaction_via_tiny_retention_then_watch_below_watermark() {
         "compaction must have moved the oldest retained revision, not left the journal empty: {settled:#?}"
     );
 
+    // Health can show the compaction before its lines reach the files (A-R309), so each read
+    // waits for its line.
+    let logged = |message: &'static str| {
+        move |lines: &[serde_json::Value]| {
+            lines
+                .iter()
+                .any(|line| support::log_field(line, "@m") == Some(message))
+        }
+    };
     let leader_log = support::log_file(&harness.nodes[leader]);
+    support::log_lines_when(&leader_log, logged("compaction_proposed")).await;
     assert!(
         support::count_messages(&leader_log, "compaction_proposed") >= 1,
         "the leader must have logged at least one compaction_proposed"
@@ -343,6 +353,7 @@ async fn e2e_24_25_compaction_via_tiny_retention_then_watch_below_watermark() {
                 .find(|n| n.node_id == node.node_id())
                 .expect("node is in the harness"),
         );
+        support::log_lines_when(&log, logged("compaction_applied")).await;
         assert!(
             support::count_messages(&log, "compaction_applied") >= 1,
             "node {} must have applied at least one compaction",

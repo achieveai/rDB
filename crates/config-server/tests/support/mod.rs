@@ -1257,6 +1257,35 @@ pub fn log_lines(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Every JSON line of a running daemon's log, once `ready` holds for them.
+///
+/// The daemon writes its log from a background thread (A-R309), so a line logged just before
+/// something a row can observe (a health field, an RPC answer) can reach the file a moment
+/// after it. A row that reads such a line while the daemon runs waits for it here. A row that
+/// reads after the daemon exited needs no wait: exit writes every queued line.
+///
+/// At the deadline it returns the last read, so the row's own assertion says what is missing.
+pub async fn log_lines_when(
+    path: &Path,
+    ready: impl Fn(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    let read = || {
+        if path.exists() {
+            log_lines(path)
+        } else {
+            Vec::new()
+        }
+    };
+    let waited =
+        config_testkit::poll::poll_until_async(deadline(10), Duration::from_millis(50), || {
+            let lines = read();
+            let found = ready(&lines).then_some(lines);
+            async move { found }
+        })
+        .await;
+    waited.unwrap_or_else(|_| read())
+}
+
 /// This node's JSONL log file (`<log-dir>/<node_id>.jsonl`), whether or not it exists yet.
 pub fn log_file(node: &NodeLayout) -> PathBuf {
     node.log_dir.join(format!("{}.jsonl", node.node_id))

@@ -23,8 +23,8 @@ built.
   LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }
   ```
 
-- **Time for the first build.** It compiles RocksDB from source: about 3 minutes
-  (3 min 2 s for an outside crate on the dev host, 2026-10-22). Later builds reuse it.
+- **Time for the first build.** It compiles RocksDB from source: 5 to 10 minutes on a cold
+  build (7 min 08 s for an outside crate on the dev host, 2026-10-24). Later builds reuse it.
 - A checkout of this repository. You depend on its crates by path; nothing is published.
 
 ## 2. Your `Cargo.toml`

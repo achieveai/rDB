@@ -129,7 +129,7 @@ build() {
 
 pick_run() {
     if [ -z "$RUN" ]; then
-        [ -f "$ROOT/current" ] || die "no run: start one with 'lr up' (or pass --run DIR)"
+        [ -f "$ROOT/current" ] || die "no run under $ROOT: start one with 'lr up', or pass the --root DIR you gave 'up' (or --run DIR)"
         RUN="$(cat "$ROOT/current")"
     fi
     [ -d "$RUN" ] || die "run folder $RUN is gone"
