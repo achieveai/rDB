@@ -138,6 +138,10 @@ impl DenyReason {
     /// boundary: before apply nothing was handed to storage, so the partition is paused; after it
     /// the batch may have landed, so the outcome is unknown.
     ///
+    /// A lost control quorum also depends on it (ruling A-R285). The grant is still held and never
+    /// fenced, so before apply the refusal is a pause that proves no mutation; after apply it
+    /// stays `LEASE_EXPIRED`, which proves nothing.
+    ///
     /// No wildcard arm on purpose: a variant added to [`DenyReason`] fails this match rather than
     /// silently becoming `LEASE_EXPIRED`.
     #[must_use]
@@ -147,6 +151,10 @@ impl DenyReason {
             Self::LocalStorageFenced => match boundary {
                 Boundary::PreApply => ErrorKind::ProtectionPaused,
                 Boundary::PostApply => ErrorKind::UnknownOutcome,
+            },
+            Self::ControlUnavailable => match boundary {
+                Boundary::PreApply => ErrorKind::ProtectionPaused,
+                Boundary::PostApply => ErrorKind::LeaseExpired,
             },
             Self::NoGrant
             | Self::Frozen
@@ -160,8 +168,7 @@ impl DenyReason {
             | Self::ProcessSuspended
             | Self::BootMismatch
             | Self::AuthorityGenerationChanged
-            | Self::SelfFenced
-            | Self::ControlUnavailable => ErrorKind::LeaseExpired,
+            | Self::SelfFenced => ErrorKind::LeaseExpired,
         }
     }
 }

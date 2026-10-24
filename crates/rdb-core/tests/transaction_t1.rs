@@ -4203,6 +4203,12 @@ fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
             Boundary::PreApply => ErrorKind::ProtectionPaused,
             Boundary::PostApply => ErrorKind::UnknownOutcome,
         },
+        // Ruling A-R285: control quorum lost while the grant is held. Before apply nothing was
+        // handed to storage, so the refusal proves no mutation; after apply it proves nothing.
+        DenyReason::ControlUnavailable => match boundary {
+            Boundary::PreApply => ErrorKind::ProtectionPaused,
+            Boundary::PostApply => ErrorKind::LeaseExpired,
+        },
         DenyReason::NoGrant
         | DenyReason::Frozen
         | DenyReason::Revoked
@@ -4215,14 +4221,15 @@ fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
         | DenyReason::ProcessSuspended
         | DenyReason::BootMismatch
         | DenyReason::AuthorityGenerationChanged
-        | DenyReason::SelfFenced
-        | DenyReason::ControlUnavailable => ErrorKind::LeaseExpired,
+        | DenyReason::SelfFenced => ErrorKind::LeaseExpired,
     }
 }
 
 /// M7A-71. The mapping is total over every `DenyReason` (16 landed; the plan's "15" predates
-/// `ClockModeUnbounded`) at both boundaries, and checkpoint-sensitive only for
-/// `LocalStorageFenced`: `PROTECTION_PAUSED` before apply, `UNKNOWN_OUTCOME` after. No arm
+/// `ClockModeUnbounded`) at both boundaries, and checkpoint-sensitive for two reasons only:
+/// `LocalStorageFenced`, `PROTECTION_PAUSED` before apply and `UNKNOWN_OUTCOME` after; and
+/// `ControlUnavailable` (ruling A-R285), `PROTECTION_PAUSED` before apply and `LEASE_EXPIRED`
+/// after. No arm
 /// produces `DIVERGENCE_REQUIRES_OPERATOR`; that code reaches a client only through L1's
 /// `AdmissionState.reason` (M7A-69 (c)). T1's `deny_error` and the contract's
 /// `client_error_kind` agree everywhere (lead ruling A-R72a).
