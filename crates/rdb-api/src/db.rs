@@ -1496,9 +1496,17 @@ impl Db {
             call,
             reply,
         });
-        if self.send_to(self.route.owner(), msg).is_err() {
+        let owner = self.route.owner();
+        if self.send_to(owner, msg).is_err() {
+            // An owner in another process with no link up is unavailable, not a host fault:
+            // a retry helps once it is back or promoted away (W7 for W5, tester-s2 G walk).
+            let local = lock(&self.nodes).iter().any(|handle| handle.node == owner);
             return Some(Answer::Error {
-                error: ApiError::host("the owner's node thread has stopped"),
+                error: if local {
+                    ApiError::host("the owner's node thread has stopped")
+                } else {
+                    ApiError::owner_unreachable(owner)
+                },
                 request: None,
             });
         }
@@ -9038,7 +9046,8 @@ mod tests {
 
     /// Ruling A-R226 h1: a call for a node this process does not run goes over the peer links
     /// (`Links::post`), and with nothing registered for that node it is refused at once as the
-    /// owner's thread stopped, never a wait. Unit: no node thread.
+    /// owner not reachable, never a wait, and never a host fault (W7, tester-s2 G walk: a retry
+    /// helps once it is back). Unit: no node thread.
     #[test]
     fn m10_a_call_for_a_node_this_process_does_not_run_goes_over_the_links() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -9058,7 +9067,8 @@ mod tests {
 
         let refused = db.put(b"a", b"1", None).expect_err("nobody holds node 1");
         assert!(
-            refused.error.detail.contains("has stopped"),
+            refused.error.detail.contains("is not reachable")
+                && refused.error.retry == RetryRule::RetryAfterRecovery,
             "{:?}",
             refused.error
         );

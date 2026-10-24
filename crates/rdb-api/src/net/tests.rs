@@ -1035,6 +1035,49 @@ async fn a_handshake_that_cannot_succeed_is_refused_naming_the_address() {
             "names the address and what was expected there: {error}"
         );
     }
+    // tester-s2 paper cut: the cause was said twice, `X: X`. Cut: `error_chain` appends every
+    // cause again and this goes red.
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, foreign), false).await;
+    let error = two
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect_err("no link");
+    assert_eq!(
+        error.matches("InvalidContentType").count(),
+        1,
+        "the cause once: {error}"
+    );
+}
+
+/// tester-s2 F1c: a port nothing listens on said `connect: transport error: tcp connect error:
+/// tcp connect error: ...`, with no address and no node. It now says nothing is listening
+/// there, naming the address and the node, once. It is still redialled until the caller's wait
+/// ends (A-R273). Integration (~4 s on Windows: the OS answers a closed port late).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_port_nothing_listens_on_says_so_naming_the_address_and_node() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let (listener, addr) = config_testkit::ports::ephemeral_listener().await;
+    drop(listener);
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    // The first dial's error lands after ~2-5 s on Windows (a closed loopback port answers
+    // only after SYN retries), so wait for it rather than for a fixed time.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let error = loop {
+        if let Some(LinkState::Waiting(Some(error))) = two.net.states().get(&NodeId(1)) {
+            break error.clone();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no dial error");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        error.contains(&format!(
+            "nothing is listening at {addr} (connection refused); is node-1 of this run"
+        )),
+        "{error}"
+    );
+    assert!(!error.contains("tcp connect error"), "{error}");
 }
 
 /// Walking the row above by hand: an address whose listener accepts and never answers (rEtcd's
