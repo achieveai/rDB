@@ -47,11 +47,12 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use config_core::NodeId;
+use config_core::{ConfigError, NodeId};
 use config_engine::admin::SnapshotTriggered;
 use config_storage::Boundary;
 use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::poll::TestTimers;
+use config_testkit::poll_until_async;
 
 use support::{put_req, ScriptedInjector};
 
@@ -202,12 +203,48 @@ async fn m5_11_crash_before_snapshot_tmp_sync_leaves_no_publication() {
     }
 
     // The node rejoins and keeps serving — the crash was recoverable, not fatal to the cluster.
-    let leader_after = cluster.leader().await;
-    cluster
-        .client(leader_after)
-        .put(put_req("/m5/11/after", "v"))
-        .await
-        .expect("the cluster keeps serving after the crashed node recovers");
+    // Leadership can move between finding the leader and the put: under 3 loaders it did, and
+    // the put answered `NotLeader` (A-R347, 1 of 15). `NotLeader` is refused before anything is
+    // proposed, so the put is sent again at whichever node leads then, as
+    // `m2_harness_smoke::read_at_leader` does for a read. Any other error still fails the row.
+    let cluster: &Cluster = &cluster;
+    let refused = std::sync::Mutex::new(Vec::new());
+    let refused = &refused;
+    let first = cluster.leader().await;
+    poll_until_async(cluster.deadline(20), cluster.poll_interval(), || {
+        let target = if lock(refused).is_empty() {
+            Some(first)
+        } else {
+            cluster.leader_now()
+        };
+        async move {
+            let target = target?;
+            match cluster
+                .client(target)
+                .put(put_req("/m5/11/after", "v"))
+                .await
+            {
+                Ok(_) => Some(()),
+                Err(e @ ConfigError::NotLeader { .. }) => {
+                    tracing::info!(node = target.0, error = %e, "m5_11_put_not_leader");
+                    lock(refused).push(target);
+                    None
+                }
+                Err(e) => panic!("the cluster keeps serving after the crashed node recovers: {e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|t| {
+        panic!(
+            "no leader took the put after the crashed node recovered: {t}; refused by {:?}",
+            lock(refused)
+        )
+    });
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // -------------------------------------------------------------------------------------------
