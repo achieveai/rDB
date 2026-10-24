@@ -526,8 +526,8 @@ fn m10_s2_d2_a_pause_for_divergence_is_never_dropped_past() {
 /// nodes 1 and 2 within the later of `peer_drop_after_millis` and F1's
 /// barrier wait (7 windows), plus a margin for the re-plan's own window and CAS, and writes
 /// land again. Every `rejoin_abandoned` names node 3, the copy that never advanced.
-/// Cut: `holding_up` answers `None` during a rejoin and `rejoin_blocked` returns at once (the
-/// abandon removed), red (no commit without node 3 within the patience).
+/// Only F1's block ends the rejoin; no clock does (ruling A-R316).
+/// Cut: `rejoin_blocked` returns at once, red (node 1's F1 stays blocked).
 /// Integration (~5 s): bootstrap's window, puts until L1 pauses, F1's sync and barrier
 /// waits, the abandon's re-plan.
 #[config_log::retcd_test]
@@ -598,4 +598,87 @@ fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
         abandoned.iter().all(|line| line["dropped"] == 3),
         "only node 3 is blamed: {abandoned:?}"
     );
+}
+
+/// A-R316 (critic-degraded A-1): a block on a re-plan leaves a member out only when it names
+/// that member's copy. The rejoiner goes when the barrier misses it, among others or alone;
+/// another member goes when its copy is the only one missing; anything else names nobody, so
+/// the plan is retried with the same members. A plan that already leaves node 3 out never
+/// leaves out a second member: the commit's members less node 2 would put node 3 back.
+/// Cuts: `named_by_block` falls back to the rejoiner for every reason, red (`CasContention`);
+/// `block_leaves_out` without its drop check, red (node 2 for the drop plan).
+#[test]
+fn a_block_leaves_out_only_the_member_it_names() {
+    let members: Vec<Member> = (1..=3u8)
+        .map(|n| Member {
+            copy: CopyId(n - 1),
+            node: NodeId(u32::from(n)),
+            boot: BOOT,
+            role: if n == 1 {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::RegularSecondary
+            },
+        })
+        .collect();
+    let barrier = |missing: &[u8]| BlockReason::BarrierIncomplete {
+        missing: missing.iter().map(|copy| CopyId(*copy)).collect(),
+    };
+    let replan = |drop: Option<u32>, rejoiner: Option<u32>| Replan {
+        drop: drop.map(NodeId),
+        rejoiner: rejoiner.map(NodeId),
+        since: Tick(0),
+    };
+    let rejoin = replan(None, Some(3));
+    let out = |reason: &BlockReason, plan: Replan| block_leaves_out(reason, plan, &members);
+    assert_eq!(out(&barrier(&[2]), rejoin), Some(NodeId(3)));
+    assert_eq!(out(&barrier(&[1, 2]), rejoin), Some(NodeId(3)));
+    assert_eq!(out(&barrier(&[1]), rejoin), Some(NodeId(2)));
+    assert_eq!(out(&barrier(&[0, 1]), rejoin), None);
+    assert_eq!(out(&barrier(&[1]), replan(None, None)), Some(NodeId(2)));
+    assert_eq!(out(&barrier(&[1]), replan(Some(3), None)), None);
+    for reason in [
+        BlockReason::CasContention,
+        BlockReason::OvertakenByPeer,
+        BlockReason::ControlUnavailable,
+        BlockReason::ControlUnknown,
+        BlockReason::NoEligibleRegular,
+    ] {
+        assert_eq!(out(&reason, rejoin), None, "{reason:?}");
+    }
+}
+
+/// b11 (A-R316, critic-degraded A-2): A1's `DrainProof` for b1's drop is lost once, as if A1
+/// never answered the revocation. The owner asks again once the revocation is
+/// `peer_drop_after_millis` old, A1 answers the repeated request, and the drop commits; writes
+/// land again.
+/// Cut: `retry_blocked_rejoin` leaves a `Revoking` alone, red (no commit without node 3 within
+/// the patience).
+/// Integration (~4 s): b1's drop, one more drop clock for the second ask.
+#[config_log::retcd_test]
+fn m10_s2_b11_a_revocation_a1_never_answers_is_asked_again() {
+    const METHOD: &str = "m10_s2_b11_a_revocation_a1_never_answers_is_asked_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[0].0.drain_proofs_to_lose = 1;
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the drop: {other:?}"),
+    }
+
+    assert_eq!(logged!(METHOD, "drain_proof_lost_for_test").len(), 1);
+    let retries = logged!(METHOD, "rejoin_revoke_retry");
+    assert_eq!(retries.len(), 1, "asked again once: {retries:?}");
+    assert_eq!(retries[0]["dropped"], "Some(3)");
+    let waited = retries[0]["waited_ms"].as_u64().expect("waited_ms");
+    assert!(
+        (DROP_AFTER_MILLIS..DROP_AFTER_MILLIS + 2 * DROP_CHECK_EVERY_MILLIS).contains(&waited),
+        "asked again after {waited} ms"
+    );
+    assert_eq!(logged!(METHOD, "membership_drop_planned").len(), 1);
 }

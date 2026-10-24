@@ -1362,3 +1362,81 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     one.db.shutdown();
     two.db.shutdown();
 }
+
+/// A-R313, the hang in the row above (L5-3, killed at 900 s): node 2 dialled node 1 while node
+/// 1's `Db` was still opening, gave up after `HANDSHAKE` and dialled again, so node 1 held two
+/// handshakes from node 2 waiting on `serving`. Both went on once node 1 registered, and the
+/// second link replaced the first while it was still live. `install` closed the old link while
+/// it held the routes lock, `close` locked it again on the same thread, and that runtime worker
+/// never came back: the reopen's heal waited on `boot_of` behind it, `wait_ready` timed out,
+/// and the runtime's drop waited for the worker for ever. Now the old link is closed after the
+/// lock is let go: the new link is the route, the old one is gone with its waiters, and the
+/// routes answer. Cut: close under the lock, and the install never returns (red at `PATIENCE`,
+/// not a hang). Unit (~1 ms): no sockets, no TLS.
+#[config_log::retcd_test]
+fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let shared = Arc::new(super::Shared {
+        label: Label::Node(NodeId(1)),
+        boot: BootId(11),
+        protocol_version: PROTOCOL_VERSION,
+        faults: Faults::new(),
+        links: std::sync::Weak::new(),
+        routes: std::sync::Mutex::new(BTreeMap::from([(
+            NodeId(2),
+            super::Route {
+                conn: None,
+                queue: std::collections::VecDeque::new(),
+                boot: None,
+                refused: None,
+                last_error: None,
+            },
+        )])),
+        conns: std::sync::Mutex::new(BTreeMap::new()),
+        next_conn: std::sync::atomic::AtomicU64::new(0),
+        rt: rt.handle().clone(),
+        span: tracing::Span::current(),
+        on_boot: std::sync::Mutex::new(None),
+    });
+    let boot = BootId(22);
+    let (first_tx, _first_out) = tokio::sync::mpsc::unbounded_channel();
+    let first = super::new_conn(&shared, Label::Node(NodeId(2)), first_tx);
+    super::install(&shared, NodeId(2), &first, boot);
+    let (waiter, answer) = mpsc::channel();
+    super::lock(&first.pending).insert(1, super::Waiter::Status(waiter));
+
+    // The second handshake, still live beside the first. On its own thread, so a lock that is
+    // never let go fails the row at `PATIENCE` instead of hanging it.
+    let (second_tx, _second_out) = tokio::sync::mpsc::unbounded_channel();
+    let second = super::new_conn(&shared, Label::Node(NodeId(2)), second_tx);
+    let (done, installed) = mpsc::channel();
+    {
+        let shared = Arc::clone(&shared);
+        let second = Arc::clone(&second);
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _entered = span.enter();
+            super::install(&shared, NodeId(2), &second, boot);
+            let routed = super::lock(&shared.routes)[&NodeId(2)]
+                .conn
+                .as_ref()
+                .map(|conn| conn.id);
+            let _ = done.send(routed);
+        });
+    }
+    let routed = installed.recv_timeout(PATIENCE).unwrap_or_else(|_| {
+        panic!("replacing a live link did not return within {PATIENCE:?}: the routes lock is held")
+    });
+    assert_eq!(routed, Some(second.id), "the newer link is node 2's route");
+    let conns: Vec<u64> = super::lock(&shared.conns).keys().copied().collect();
+    assert_eq!(conns, vec![second.id], "the replaced link is gone");
+    assert!(
+        matches!(
+            answer.recv_timeout(Duration::ZERO),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "a call waiting on the replaced link is let go, not left waiting"
+    );
+}
