@@ -6328,6 +6328,11 @@ mod tests {
             reload_pending: None,
             lengths: None,
         };
+        // From here node 1 answers, and the claim is the text an answer gives. Each look waits
+        // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
+        // it and the text said "answered no status look" (A-R307). The 60 ms the texts name is
+        // `within`, which a look that answers late still reports.
+        db.timeouts.read = crate::host::test_patience(Duration::from_secs(1));
         let node_1 = std::thread::spawn(move || {
             while let Ok(msg) = mailbox.recv() {
                 if let Msg::Inspect { reply, .. } = msg {
@@ -9756,7 +9761,20 @@ mod tests {
             db.put(b"a", &n.to_le_bytes(), None)
                 .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
         }
-        let statuses = db.node_status();
+        // A put is answered once two copies hold it, so the third may still be receiving the
+        // last few: under load node 2 read 35 rungs straight after the 40th answer (A-R307).
+        // Its catching up is a wait; the rung a write is the claim.
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        let statuses = loop {
+            let statuses = db.node_status();
+            let short = statuses
+                .iter()
+                .any(|status| status.lengths.is_none_or(|lengths| lengths.ladder < 40));
+            if (statuses.len() == 3 && !short) || Instant::now() >= deadline {
+                break statuses;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let seconds = began.elapsed().as_secs();
         db.shutdown();
         drop(db);
