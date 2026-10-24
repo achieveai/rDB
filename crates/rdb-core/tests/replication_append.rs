@@ -6269,3 +6269,224 @@ fn m10_s2_r1_answers_its_shadow_timer_on_every_node() {
         replica_answer(ReplicaIgnoreReason::StaleTimer)
     );
 }
+
+// --- a dormant receiver beside a live primary (A-R278, A-R314) ---------------------------------
+
+/// A-R278 (W6b): a live owner re-planning around a restarted copy is F1's catch-up source, and
+/// it holds its own copy as a primary. R1 sources a catch-up from a receiver only, so the host
+/// restores a dormant receiver for that copy beside the primary (A-R314). Here A leads P at 15,
+/// durable 10. With the primary alone the catch-up is refused `NotASource` (the host's fault
+/// before the fix). With the dormant receiver beside it, F1's catch-up of C through 15 starts,
+/// and the receiver serves that and nothing else: a plain append to it is refused with no
+/// reply, and neither the catch-up nor the append changes the primary. On a flush of A's own
+/// engine the receiver sends A no ACK and answers `RecoveryOnly` (A-R323 A-8); an ACK in A's
+/// own name is still refused `ForgedIdentity` and moves nothing. Cut: the receiver ACKs its
+/// own node on a flush, red.
+#[retcd_test]
+fn m10_s2_a_dormant_receiver_beside_a_live_primary_sources_the_catch_up_and_nothing_else() {
+    let rungs: Vec<(Seq, Digest)> = std::iter::once((Seq::ZERO, Digest::ROOT))
+        .chain((1..=15).map(|seq| (Seq(seq), d(seq))))
+        .collect();
+    let mut history = DigestLadder::new();
+    for seq in 1..=15 {
+        history.insert(Seq(seq), d(seq));
+    }
+    let mut module = Replication::new();
+    module.install_primary(
+        ProgressTracker::new(TrackerInit {
+            config: config(),
+            own: CopyId(0),
+            lineage: authority(GEN, EPOCH),
+            history,
+            local: ReplicaProgress {
+                received: ReceivedSeq(15),
+                buffered_applied: AppliedSeq(15),
+                durable: DurableSeq(10),
+            },
+        })
+        .expect("A's tracker"),
+    );
+    let credential = fence(0, EPOCH, Revision(7));
+    let catch_up_c = on(A, catch_up(0, 2, 15, credential));
+
+    let mut alone = module.clone();
+    assert_eq!(
+        step(&mut alone, &catch_up_c),
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::NotASource
+        ))],
+        "a primary alone is no catch-up source"
+    );
+
+    module.install_receiver(
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                head: head(15),
+                durable: DurableSeq(0),
+            },
+            REVISION,
+        )
+        .expect("A's dormant receiver"),
+    );
+    module
+        .restore_history(A, P, &rungs)
+        .expect("A's ladder, 0..=15");
+    let primary = module.primary(A, P).cloned().expect("A's primary");
+
+    let effects = step(&mut module, &catch_up_c);
+    assert!(
+        effects.contains(&EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes {
+            copy: CopyId(2),
+            from: Seq(15),
+            through: Seq(15),
+            credential,
+        })),
+        "A sources C's catch-up: {effects:?}"
+    );
+    assert!(module.source(A, P, CopyId(2)).is_some());
+    assert_eq!(module.primary(A, P), Some(&primary), "the catch-up");
+
+    let append = on(A, delivered(label(C), golden().encode().expect("encode")));
+    assert_eq!(
+        step(&mut module, &append),
+        vec![ignored(KernelIgnoredReason::AppendRejected(
+            AppendReject::NotAMember
+        ))],
+        "a plain append to the dormant receiver is refused with no reply"
+    );
+    assert_eq!(module.primary(A, P), Some(&primary), "the plain append");
+
+    // A-R323 A-8: on A's own flush the receiver sends A nothing. An ACK to its own node is no
+    // evidence, and the primary would refuse one as a forgery on every flush; the receiver
+    // answers `RecoveryOnly` instead.
+    let effects = step(&mut module, &on(A, flushed(&[(P, GEN, 15)])));
+    assert!(
+        effects.contains(&ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::RecoveryOnly
+        ))),
+        "{effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            EffectKind::Send(SendEffect::Unicast { to, .. }) if *to == A
+        )),
+        "the dormant receiver ACKed its own node: {effects:?}"
+    );
+    let flushed_primary = module.primary(A, P).cloned().expect("A's primary");
+
+    // A real ACK in A's own name is still a forgery, and moves nothing.
+    let forged = AppendOutcome::Accepted(AppendAck {
+        from: A,
+        boot: BootId(1),
+        ..ack(15, 15, 15)
+    });
+    assert_eq!(
+        step(&mut module, &reply_from_to(label(A), A, &forged)),
+        vec![ignored(KernelIgnoredReason::AckRejected(
+            AckRejectReason::ForgedIdentity
+        ))],
+        "the primary refuses an ACK in its own node's name"
+    );
+    assert_eq!(
+        module.primary(A, P),
+        Some(&flushed_primary),
+        "the forged ACK"
+    );
+}
+
+/// A's primary at `head`, durable `head`, its ladder `1..=head`, and, when `with_primary` is
+/// false, nothing else: only the dormant receiver for A's copy 0 at `head`.
+fn owner_with_dormant(head_at: u64, with_primary: bool) -> Replication {
+    let mut module = Replication::new();
+    if with_primary {
+        let mut history = DigestLadder::new();
+        for seq in 1..=head_at {
+            history.insert(Seq(seq), d(seq));
+        }
+        module.install_primary(
+            ProgressTracker::new(TrackerInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                history,
+                local: ReplicaProgress {
+                    received: ReceivedSeq(head_at),
+                    buffered_applied: AppliedSeq(head_at),
+                    durable: DurableSeq(head_at),
+                },
+            })
+            .expect("A's tracker"),
+        );
+    }
+    module.install_receiver(
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                head: head(head_at),
+                durable: DurableSeq(0),
+            },
+            REVISION,
+        )
+        .expect("A's dormant receiver"),
+    );
+    module
+}
+
+/// A-R327 (critic-degraded A-10): a receiver beside a serving primary only sources, whenever
+/// it was installed. A fenced recovery append with a valid credential, from C, reaches A's
+/// dormant receiver for copy 0 at 10. Without a primary on A it stages record 11, so the frame
+/// is one the receiver takes. Beside A's serving primary R1 refuses it `Replica(NotRequired)`
+/// with no reply and no store effect, and the receiver and the primary are unchanged. Once the
+/// takeover's `Recovered` retires that primary, the retransmitted append is staged (A-11).
+/// Cuts: R1 hands a recovery append to the receiver beside a primary, red; R1 refuses one
+/// beside any primary, retired or not, red.
+#[retcd_test]
+fn m10_s2_a_recovery_append_never_reaches_a_receiver_beside_a_serving_primary() {
+    let body = recovery_body(&fence(2, EPOCH, REVISION), &golden());
+    let append = on(A, delivered(label(C), body));
+
+    let mut alone = owner_with_dormant(10, false);
+    assert_eq!(
+        staged_batch(&step(&mut alone, &append)),
+        (BatchId(0), GEN, Seq(11)),
+        "without a primary the receiver stages it"
+    );
+
+    let mut module = owner_with_dormant(10, true);
+    let receiver = module.receiver(A, P).cloned().expect("A's receiver");
+    let primary = module.primary(A, P).cloned().expect("A's primary");
+    assert_eq!(
+        step(&mut module, &append),
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::NotRequired
+        ))],
+        "a recovery append beside a serving primary is refused, with no reply or store effect"
+    );
+    assert_eq!(module.receiver(A, P), Some(&receiver), "the receiver");
+    assert_eq!(module.primary(A, P), Some(&primary), "the primary");
+
+    // A-11: the guard is for a serving primary only. The takeover's `Recovered` retires A's
+    // primary and re-anchors the receiver at 10 in NEW_GEN; the source retransmits the append
+    // under the new lineage, and the receiver stages it. This is the handover's self-heal: an
+    // append refused before `Recovered` is taken after it.
+    step(
+        &mut module,
+        &requiring(recovered(10, d(10), takeover_config()), &[0, 2], A),
+    );
+    assert!(module.primary(A, P).expect("kept").tracker().retired());
+    let retransmit = recovery_body(
+        &fence_in(NEW_GEN, 2, NEW_EPOCH, REVISION),
+        &taken_over(golden()),
+    );
+    assert_eq!(
+        staged_batch(&step(&mut module, &on(A, delivered(label(C), retransmit)))),
+        (BatchId(0), NEW_GEN, Seq(11)),
+        "beside a retired primary the receiver stages the retransmitted append"
+    );
+}

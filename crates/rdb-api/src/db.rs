@@ -1366,19 +1366,23 @@ impl Db {
     /// node 1 itself each time, never at what an earlier look saw. Once node 1 has restarted,
     /// or its restart failed, answers at once: the owner stays out until the folder is opened
     /// again. So does a
-    /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
-    /// one fence only (ruling F-a, A-R196). So does a quarantined one, which nothing in an open
-    /// leaves (A-R196(2a)).
+    /// recovery that ended `Blocked` on an owner this `Db` runs: only a fresh fence leaves that
+    /// phase, and an open sends one fence only (ruling F-a, A-R196). An owner in another process
+    /// is not ended by it: that owner re-plans a rejoin that does not end writable (A-R282), so
+    /// this waits on to `within` and answers [`ReadyError::TimedOut`] naming the phase (A-R314
+    /// item 2). A quarantined recovery answers at once wherever the owner runs, since nothing in
+    /// an open leaves it (A-R196(2a)).
     ///
     /// # Errors
     ///
     /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, and
-    /// [`ReadyError::Blocked`] once its recovery is blocked, whose texts say to shut this `Db`
-    /// down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
+    /// [`ReadyError::Blocked`] once the recovery of an owner this `Db` runs is blocked, whose
+    /// texts say to shut this `Db` down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
     /// recovery is quarantined, whose text says a reopen will not help (A-R196(2a), A-R196(2b)).
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from(NO_ANSWER);
+        let mut remote_blocked: Option<String> = None;
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                 return Err(ReadyError::Heal(error.clone()));
@@ -1392,9 +1396,21 @@ impl Db {
                     return Ok(());
                 }
                 match stuck_recovery(&owner) {
-                    Some(ReadyError::Blocked { reason }) => {
+                    Some(ReadyError::Blocked { reason })
+                        if lock(&self.nodes)
+                            .iter()
+                            .any(|handle| handle.node == owner.node) =>
+                    {
                         tracing::warn!(reason, "ready_blocked");
                         return Err(ReadyError::Blocked { reason });
+                    }
+                    Some(ReadyError::Blocked { reason }) => {
+                        // Another process's owner is not ended by one blocked recovery: it
+                        // re-plans a rejoin that does not end writable (A-R282, A-R314 item 2).
+                        if remote_blocked.as_ref() != Some(&reason) {
+                            tracing::info!(owner = owner.node.0, reason, "ready_owner_blocked");
+                            remote_blocked = Some(reason);
+                        }
                     }
                     Some(stuck) => {
                         tracing::warn!("ready_quarantined");
@@ -5021,6 +5037,136 @@ mod tests {
         db.shutdown();
     }
 
+    /// The done-when scenario of slice 2 (A-R278, A-R323), beside W5's row above: writes keep
+    /// going while node 3 is away, then node 3 restarts and catches up from the live owner and
+    /// rejoins as a full copy. Node 3 is cut off both ways and puts go on through node 1 until
+    /// the owner pauses them for the unheard copy, at most 200. Node 3 restarts, its links
+    /// heal, node 1 re-plans with it, writes resume, and every write reads back. After shutdown,
+    /// node 3's store holds node 1's generation through the same head with the same record
+    /// digest there. No catch-up was refused and no rejoin abandoned. Cut: `restore_dormant`
+    /// skips a node holding a primary, so node 1 sources nothing and node 3 never holds the
+    /// generation, red. Integration (~5 s): three node threads, the owner's pause, one restart
+    /// and its re-plan.
+    #[config_log::retcd_test]
+    fn m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy() {
+        const METHOD: &str =
+            "m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"before", b"1", None)
+            .expect("a put with every copy up");
+        let of = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+
+        for other in [OWNER, NodeId(2)] {
+            db.links().drop_direction(NodeId(3), other);
+            db.links().drop_direction(other, NodeId(3));
+        }
+        let mut landed = 0_u32;
+        let paused_by = std::time::Instant::now() + patience;
+        while landed < 200 {
+            match db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+                Ok(_) => landed += 1,
+                Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => break,
+                Err(refused) => panic!("a put with node 3 away, after {landed}: {refused:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < paused_by,
+                "{landed} puts in {patience:?} and no pause"
+            );
+        }
+        assert!(landed >= 1, "no put landed with node 3 away");
+        let before = of(&db, OWNER).recovered.expect("node 1 recovered");
+
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        db.links().heal_all();
+
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let owner = of(&db, OWNER);
+            if owner.recovered > Some(before) && owner.admits == Some(true) {
+                match db.put(b"after", b"2", None) {
+                    Ok(_) => break,
+                    Err(refused) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no put landed within {patience:?} of the restart: {refused:?}"
+                    ),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 did not re-plan past generation {} and admit within {patience:?}: \
+                 {owner:?}",
+                before.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let generation = of(&db, OWNER).recovered.expect("node 1 recovered");
+        let target = of(&db, OWNER).holds.expect("node 1 holds").applied;
+        loop {
+            let held = of(&db, NodeId(3)).holds;
+            if held.is_some_and(|held| {
+                held.generation == generation && held.applied >= target && held.durable >= target
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 3 holds {held:?}, not generation {} through {target}, within {patience:?}",
+                generation.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let last = format!("away-{}", landed - 1);
+        for key in ["before", "away-0", last.as_str(), "after"] {
+            let got = db
+                .get(key.as_bytes())
+                .unwrap_or_else(|e| panic!("read {key}: {e:?}"));
+            assert!(got.value.is_some(), "{key} reads back");
+        }
+        db.shutdown();
+
+        let head = |n: u32| {
+            use rdb_core::contracts::envelope::ReplicationEnvelope;
+            let engine = RocksEngine::open(dir.path().join("nodes").join(n.to_string()))
+                .expect("open engine");
+            let seq = engine.buffered_applied(PARTITION, generation).0;
+            let (record, _) = engine
+                .history_at(PARTITION, generation, Seq(seq))
+                .expect("history read")
+                .unwrap_or_else(|| panic!("node {n} holds record {seq}"));
+            let digest = ReplicationEnvelope::decode(&record)
+                .expect("decodes")
+                .record_digest;
+            (seq, digest)
+        };
+        let (one, three) = (head(1), head(3));
+        assert!(one.0 >= u64::from(landed) + 2, "node 1's head {one:?}");
+        assert_eq!(three, one, "node 3 holds node 1's head and digest");
+
+        config_log::layer::flush_test_logs();
+        let gave_up: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "rejoin_abandoned" || line["@m"] == "catch_up_refused")
+            .collect();
+        assert!(gave_up.is_empty(), "{gave_up:?}");
+    }
+
     /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts and stops
     /// advancing, L1 pauses writes; a put refused then was refused at admission and never
     /// queued, so a retry of it must not promise that `status` will show its outcome: status
@@ -6251,6 +6397,102 @@ mod tests {
             took < Duration::from_secs(1),
             "answered {took:?} after node 1's first answer"
         );
+    }
+
+    /// A-R314 item 2 (W6b): one blocked recovery does not end an owner in another process,
+    /// which re-plans a rejoin that does not end writable (A-R282). Node 1 is a stub this `Db`
+    /// reaches over the links only and runs no handle of. Answering `Blocked` to its first three
+    /// looks and writable after, `wait_ready` waits through the blocked looks and answers `Ok`.
+    /// Staying blocked, it is waited on to the bound and answered `TimedOut` naming the blocked
+    /// phase. The local half, an owner this `Db` runs, stays final:
+    /// `m10_d10_wait_ready_answers_at_once_when_the_recovery_is_blocked`. Cut: `wait_ready`
+    /// answers `Blocked` at once whoever runs the owner, and both halves fail.
+    /// Unit (~400 ms): no node thread.
+    #[test]
+    fn m10_s2_wait_ready_waits_out_a_blocked_owner_in_another_process() {
+        let blocked = format!(
+            "{:?}",
+            rdb_core::recovery::RecoveryPhase::Blocked(
+                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                    missing: vec![rdb_core::contracts::membership::CopyId(2)],
+                }
+            )
+        );
+        let status = |recovery: Option<String>, admits: bool| NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery,
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(admits),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+            lengths: None,
+        };
+        // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
+        let remote = |blocked_looks: usize| {
+            let (db, _unused, rt) = unanswered(Duration::from_millis(20));
+            lock(&db.nodes).clear();
+            let (tx, mailbox) = std::sync::mpsc::channel();
+            db.links.register(OWNER, tx, host::BOOT);
+            let blocked = status(Some(blocked.clone()), false);
+            let ready = status(None, true);
+            let looks = Arc::new(AtomicU64::new(0));
+            let node_1 = {
+                let looks = Arc::clone(&looks);
+                std::thread::spawn(move || {
+                    while let Ok(msg) = mailbox.recv() {
+                        if let Msg::Inspect { reply, .. } = msg {
+                            let seen = looks.fetch_add(1, Ordering::Relaxed);
+                            let answer = if usize::try_from(seen).expect("looks") < blocked_looks {
+                                blocked.clone()
+                            } else {
+                                ready.clone()
+                            };
+                            let _ = reply.send(answer);
+                        }
+                    }
+                })
+            };
+            (db, rt, node_1, looks)
+        };
+
+        let (db, _rt, node_1, looks) = remote(3);
+        assert_eq!(db.wait_ready(Duration::from_secs(5)), Ok(()));
+        drop(db);
+        node_1.join().expect("the stub");
+        assert_eq!(
+            looks.load(Ordering::Relaxed),
+            4,
+            "three blocked looks, then the writable one"
+        );
+
+        let (db, _rt, node_1, looks) = remote(usize::MAX);
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_millis(300));
+        let waited = started.elapsed();
+        assert_eq!(
+            answer,
+            Err(ReadyError::TimedOut {
+                within_ms: 300,
+                owner: OWNER,
+                phase: blocked.clone(),
+            })
+        );
+        assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+        drop(db);
+        node_1.join().expect("the stub");
+        assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
     }
 
     /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
