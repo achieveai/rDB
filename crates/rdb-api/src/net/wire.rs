@@ -1636,6 +1636,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
             waits_on: status.waits_on,
             stalled: status.stalled,
             reload_pending: status.reload_pending,
+            lengths: None,
         })
     }
 }

@@ -802,6 +802,24 @@ pub struct NodeStatus {
     /// While a control reload of this node's is retrying, how many of its lists have failed.
     /// Filled by `Db::node_status` from the control adapter; the host itself leaves it `None`.
     pub reload_pending: Option<u32>,
+    /// How many entries each per-write index holds here (M10 S2, A-R272): read-only, for the
+    /// bench's memory proof. The host fills it; it never crosses the wire, so a status read
+    /// from a peer has `None`.
+    pub lengths: Option<IndexLengths>,
+}
+
+/// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
+/// 0 where the node holds no such index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexLengths {
+    /// T1's dedup index: one entry per remembered request.
+    pub dedup: usize,
+    /// P1's status index: one entry per request whose status it holds.
+    pub status: usize,
+    /// R1's digest ladder: the primary's tracker history, or the receiver's on a secondary.
+    pub ladder: usize,
+    /// The host's `published_at` publish marks.
+    pub published_at: usize,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -6325,6 +6343,21 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             reload_pending: None,
+            lengths: Some(IndexLengths {
+                dedup: self
+                    .transaction
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.dedup().len()),
+                status: self
+                    .publication
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.status_len()),
+                ladder: match self.replication.primary(self.node, partition) {
+                    Some(primary) => primary.tracker().history().len(),
+                    None => receiver.map_or(0, |receiver| receiver.history().len()),
+                },
+                published_at: self.published_at.get(&partition).map_or(0, VecDeque::len),
+            }),
         }
     }
 }

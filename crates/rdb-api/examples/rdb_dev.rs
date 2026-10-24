@@ -4796,6 +4796,7 @@ mod tests {
             waits_on: None,
             stalled: stalled.map(str::to_owned),
             reload_pending: None,
+            lengths: None,
         }
     }
 

@@ -669,6 +669,13 @@ impl PubKernel {
         }
     }
 
+    /// How many entries the status index holds (A-R272): a number, for the bench's per-minute
+    /// lengths, without cloning the index as [`Self::view`] does.
+    #[must_use]
+    pub fn status_len(&self) -> usize {
+        self.status.len()
+    }
+
     /// The durable status not loaded yet, or `None` once it is (or was never owed).
     #[must_use]
     pub const fn seed_pending(&self) -> Option<&StatusSeed> {
