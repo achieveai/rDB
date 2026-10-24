@@ -9522,13 +9522,15 @@ mod tests {
     }
 
     /// A-R272: `node_status` reports each per-write index's length on every node it reads, and
-    /// a dedup index held to its newest answers by the floor stays short after 40 puts.
+    /// a dedup index held to its newest answers by the floor stays short after 40 puts, and
+    /// `published_at` holds one mark per second since the open, not one a publish (D8).
     /// Integration (~1 s): three node threads, 40 puts.
     #[config_log::retcd_test]
     fn m10_s2_l1_node_status_reports_every_index_length() {
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let dir = config_testkit::fs::temp_dir();
+        let began = Instant::now();
         let mut db = rt
             .block_on(Db::open_with(
                 config(dir.path()),
@@ -9543,6 +9545,7 @@ mod tests {
                 .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
         }
         let statuses = db.node_status();
+        let seconds = began.elapsed().as_secs();
         db.shutdown();
         drop(db);
         assert_eq!(statuses.len(), 3, "{statuses:?}");
@@ -9559,7 +9562,12 @@ mod tests {
                     "the newest answer and the floor record: {lengths:?}"
                 );
                 assert!(lengths.status >= 1, "{lengths:?}");
-                assert!(lengths.published_at >= 40, "a mark a publish: {lengths:?}");
+                // D8: one mark per (generation, second) since the open, not one a publish.
+                assert!(
+                    (1..=usize::try_from(seconds).expect("seconds") + 2)
+                        .contains(&lengths.published_at),
+                    "{seconds} s: {lengths:?}"
+                );
             }
         }
     }

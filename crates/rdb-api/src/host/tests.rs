@@ -3082,6 +3082,8 @@ fn the_durable_trim_delete_runs_at_most_once_per_period() {
         Trio::fast(host);
         host.trim_every_millis = 50;
         host.budgets.dedup_retention_millis = 400;
+        // One bucket a publish, as the trim cadence below assumes.
+        host.publish_bucket_millis = 1;
     });
     trio.bootstrap();
     trio.ready();
@@ -3478,7 +3480,7 @@ fn a_dedup_cap_overload_says_when_the_cap_can_first_free() {
 /// holds a row. Before A-R187 each was named as the hint. Cut either half of the rule and
 /// the hint comes back.
 ///
-/// Constructed: T1's two entries are real puts, and their own buckets are taken out by hand.
+/// Constructed: T1's two entries are real puts, and the bucket is cut back to seq 1 by hand.
 /// That stands in for entries no bucket covers (a condition failure T1 retains, A-R108),
 /// which this Trio cannot retain at the cap without a publish; the retire due is set by
 /// hand too. Trio (~1 s), a 5-minute retention.
@@ -3513,7 +3515,9 @@ fn a_full_dedup_cap_that_nothing_scheduled_frees_gives_no_hint() {
         .published_at
         .get_mut(&PartitionId(1))
         .expect("the puts published");
-    published.retain(|&(_, seq, _)| seq == Seq(1));
+    // The puts publish into the bootstrap's bucket (D8): cut it back to seq 1.
+    let at = published.front().expect("a bucket").2;
+    *published = VecDeque::from([(served, Seq(1), at)]);
     assert_eq!(
         published
             .iter()
@@ -3585,6 +3589,60 @@ fn publish_marks_sample_the_queue_and_keep_each_generations_newest() {
     );
     assert!(marks.windows(2).all(|pair| pair[0] < pair[1]), "in order");
     assert_eq!(sample_marks(&VecDeque::new()), []);
+}
+
+/// Design-ackfloor D8 (§3, Rev 3 A4): `published_at` grows with seconds, not writes. 10,000
+/// publishes 2 ms apart, over 20 s, leave at most 21 entries, one per (generation, 1 s
+/// bucket). A bucket keeps its last seq and its newest tick, so the trim duty, which frees a
+/// bucket once its tick is a retention old, never frees a seq before its own publish is: the
+/// newest publish of each bucket is recorded verbatim. A new generation starts its own bucket
+/// in the same second. It fails if every publish is its own entry (10,000).
+#[test]
+fn d8_published_at_keeps_one_entry_per_generation_and_second() {
+    let mut published = VecDeque::new();
+    let (start, step) = (7_300_u64, 2_u64);
+    for n in 0..10_000_u64 {
+        record_published(
+            &mut published,
+            PUBLISH_BUCKET_MILLIS,
+            Generation(1),
+            Seq(n + 1),
+            Tick(start + n * step),
+        );
+    }
+    assert!(published.len() <= 21, "{} entries", published.len());
+    assert_eq!(
+        published.back(),
+        Some(&(Generation(1), Seq(10_000), Tick(start + 9_999 * step))),
+        "the last bucket holds the newest publish"
+    );
+    for &(_, seq, at) in &published {
+        // Seq n + 1 published at start + n * step: the bucket's tick is its last seq's own,
+        // and the publish after it falls in the next second.
+        assert_eq!(at, Tick(start + (seq.0 - 1) * step), "{published:?}");
+        assert!(
+            seq == Seq(10_000) || (at.0 + step) / 1_000 != at.0 / 1_000,
+            "{seq:?} is not its second's newest: {published:?}"
+        );
+    }
+    let last = *published.back().expect("one entry at least");
+    record_published(
+        &mut published,
+        PUBLISH_BUCKET_MILLIS,
+        Generation(2),
+        Seq(1),
+        Tick(last.2 .0 + 1),
+    );
+    assert_eq!(
+        published.back(),
+        Some(&(Generation(2), Seq(1), Tick(last.2 .0 + 1))),
+        "a new generation is a new bucket"
+    );
+    assert_eq!(
+        published[published.len() - 2],
+        last,
+        "the old bucket is unchanged"
+    );
 }
 
 /// M9 S3-5c, guard 1: a write ages from its publication, never from its commit. Node 1
