@@ -5172,10 +5172,36 @@ mod tests {
     /// skips a node holding a primary, so node 1 sources nothing and node 3 never holds the
     /// generation, red. Integration (~5 s): three node threads, the owner's pause, one restart
     /// and its re-plan.
+    ///
+    /// A-R370: a restart slowed past `PEER_DROP_AFTER_MILLIS` by host load (24.6 s in int gate
+    /// k632) lets node 1 drop node 3 first. Node 3 then comes back as a shadow and is promoted
+    /// (A-R336), so the row asserts on the promote's generation on that side of the drop. The
+    /// `_after_it_was_dropped` row below takes that side every time.
     #[config_log::retcd_test]
     fn m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy() {
-        const METHOD: &str =
-            "m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy";
+        away_then_rejoins(
+            "m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy",
+            false,
+        );
+    }
+
+    /// A-R370: the row above with node 3 restarted only once node 1 has dropped it, as a host
+    /// stall longer than the drop clock does. Node 1 re-adds it as a shadow at its new boot and
+    /// promotes it once caught up; node 3 then holds the promote's generation through node 1's
+    /// head, and every write reads back.
+    /// Cut: `readd_candidate` re-adds nobody (int before A-R336), red (node 3 holds nothing).
+    /// Integration (~15 s): the 10 s drop clock, the re-add and the promote.
+    #[config_log::retcd_test]
+    fn m10_s2_a_copy_dropped_while_away_rejoins_as_a_full_copy_after_it_restarts() {
+        away_then_rejoins(
+            "m10_s2_a_copy_dropped_while_away_rejoins_as_a_full_copy_after_it_restarts",
+            true,
+        );
+    }
+
+    /// The two rows above: node 3 is cut off, puts go on until node 1 pauses, and node 3
+    /// restarts, after node 1 has dropped it when `drop_first`.
+    fn away_then_rejoins(method: &'static str, drop_first: bool) {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -5217,6 +5243,20 @@ mod tests {
         }
         assert!(landed >= 1, "no put landed with node 3 away");
         let before = of(&db, OWNER).recovered.expect("node 1 recovered");
+        if drop_first {
+            let dropped_by =
+                std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+            while !config_testkit::logs::lines_for_current_test(module_path!(), method)
+                .iter()
+                .any(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3)
+            {
+                assert!(
+                    std::time::Instant::now() < dropped_by,
+                    "node 1 never dropped node 3"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
 
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
         db.links().heal_all();
@@ -5241,7 +5281,36 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        let generation = of(&db, OWNER).recovered.expect("node 1 recovered");
+        // A-R370: once node 1 has dropped node 3, node 3 is a full copy again only at the
+        // commit after the promote of its shadow.
+        let dropped = |lines: &[serde_json::Value]| {
+            lines
+                .iter()
+                .any(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3)
+        };
+        let generation = loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+            if !dropped(&lines) {
+                break of(&db, OWNER).recovered.expect("node 1 recovered");
+            }
+            let promoted = lines
+                .iter()
+                .position(|line| line["@m"] == "shadow_promote")
+                .and_then(|at| {
+                    lines[at..]
+                        .iter()
+                        .find(|line| line["@m"] == "rejoin_committed")
+                })
+                .and_then(|line| line["generation"].as_u64());
+            if let Some(promoted) = promoted {
+                break Generation(promoted);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 dropped node 3 and did not promote it back within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let target = of(&db, OWNER).holds.expect("node 1 holds").applied;
         loop {
             let held = of(&db, NodeId(3)).holds;
@@ -5285,7 +5354,7 @@ mod tests {
         assert_eq!(three, one, "node 3 holds node 1's head and digest");
 
         config_log::layer::flush_test_logs();
-        let gave_up: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        let gave_up: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), method)
             .into_iter()
             .filter(|line| line["@m"] == "rejoin_abandoned" || line["@m"] == "catch_up_refused")
             .collect();
