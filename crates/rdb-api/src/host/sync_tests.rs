@@ -160,7 +160,10 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
     let mut db = open(&rt, config(dir.path()), &store, fast());
     admits_within(&db, "the reopen", Duration::from_secs(30));
     let read = db.get(b"a").expect("get a");
-    assert_eq!(read.value.map(|(_, value)| value), Some(Bytes::from_static(b"1")));
+    assert_eq!(
+        read.value.map(|(_, value)| value),
+        Some(Bytes::from_static(b"1"))
+    );
     // A write needs the new generation activated, which waits on node 1's link sync.
     db.put(b"b", b"2", None).expect("put b after the reopen");
     db.shutdown();
@@ -171,9 +174,15 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
     let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
     let armed = next(&lines, 0, "f4_slow_armed", &|_| true).expect("the marker");
     let slow = slow_steps(&lines, armed);
-    assert!(slow.is_empty(), "node-thread steps over {STEP_LIMIT_MILLIS} ms: {slow:?}");
+    assert!(
+        slow.is_empty(),
+        "node-thread steps over {STEP_LIMIT_MILLIS} ms: {slow:?}"
+    );
     let waited = waited_on_a_sync(&lines, armed);
-    assert!(waited.is_empty(), "a write or sync waited on a sync in flight: {waited:?}");
+    assert!(
+        waited.is_empty(),
+        "a write or sync waited on a sync in flight: {waited:?}"
+    );
 
     let mut links = 0;
     for at in (armed..lines.len()).filter(|&at| is(&lines[at], "link_sync_requested")) {
@@ -182,10 +191,15 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
         let same = |line: &Line| num(line, "node") == node && num(line, "generation") == generation;
         // A copy's link sync may still be in flight when the row shuts down.
         let Some(synced) = next(&lines, at, "link_synced", &same) else {
-            assert!(node != 1, "node 1 g{generation}: no link_synced, yet b was written");
+            assert!(
+                node != 1,
+                "node 1 g{generation}: no link_synced, yet b was written"
+            );
             continue;
         };
-        let held = next(&lines, at, "test_sync_slowed", &|line| num(line, "node") == node);
+        let held = next(&lines, at, "test_sync_slowed", &|line| {
+            num(line, "node") == node
+        });
         assert!(
             held.is_some_and(|held| held < synced),
             "node {node} g{generation}: link_synced without a held sync begun after its write"
@@ -204,9 +218,9 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
     assert!(links > 0, "the reopen requested no link sync");
 
     let mut answers = 0;
-    for at in (armed..lines.len()).filter(|&at| {
-        is(&lines[at], "holder_sync_requested") && lines[at]["post_commit"] == false
-    }) {
+    for at in (armed..lines.len())
+        .filter(|&at| is(&lines[at], "holder_sync_requested") && lines[at]["post_commit"] == false)
+    {
         let asked = &lines[at];
         let node = num(asked, "node");
         let same = |line: &Line| {
@@ -218,7 +232,9 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
         let Some(proven) = next(&lines, at, "sync_proven", &same) else {
             continue;
         };
-        let held = next(&lines, at, "test_sync_slowed", &|line| num(line, "node") == node);
+        let held = next(&lines, at, "test_sync_slowed", &|line| {
+            num(line, "node") == node
+        });
         assert!(
             held.is_some_and(|held| held < proven),
             "node {node}: sync_proven without a held sync begun after its ask: {asked}"
@@ -292,5 +308,8 @@ fn m10_f4_a_stop_with_a_sync_in_flight_finishes_it_before_the_final_marks() {
         "node 1 stopped with a sync in flight: finished {finished:?}, final marks {marks:?}"
     );
     let waited = waited_on_a_sync(&lines, armed);
-    assert!(waited.is_empty(), "a write or sync waited on a sync in flight: {waited:?}");
+    assert!(
+        waited.is_empty(),
+        "a write or sync waited on a sync in flight: {waited:?}"
+    );
 }
