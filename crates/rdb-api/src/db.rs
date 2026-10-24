@@ -170,8 +170,9 @@ pub struct DbConfig {
     /// (`rdb_node`). Empty is an app: it holds no copy, runs no node and claims no folder, and
     /// reaches the nodes through [`Self::links`], which it then needs.
     pub local: Vec<NodeId>,
-    /// The peer links this process's nodes use (M10 S2). `None`: new in-process links. Not
-    /// read yet: every open makes its own in-process links.
+    /// The links this process sends over (M10 S2). `Some`: these links, such as a `Net` over
+    /// TLS to node processes; an app (empty [`Self::local`]) needs them. `None`: new
+    /// in-process links, which is what a one-process database uses.
     pub links: Option<Arc<Links>>,
     /// The client every request of this `Db` is sent as (M10 S2-8: two apps on one node are
     /// two clients, and the dedup state keys on it). [`DEFAULT_CLIENT`] is the one client every

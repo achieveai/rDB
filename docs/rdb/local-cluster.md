@@ -58,7 +58,7 @@ too. `--run DIR` picks another run.
 | `kill N` | Kills node N at once, like a crash. Prints `lr: node N killed (pid ...)`. |
 | `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. |
 | `down` | Stops the nodes and rEtcd. The run folder stays, so you can read its logs. |
-| `clean` | `down`, then deletes the run folder. Prints `lr: removed <run folder>`. |
+| `clean` | `down`, then deletes the run folder, **its logs included**: copy what you need first. Prints `lr: removed <run folder>`. |
 
 `scripts/local-rdb.sh` with no verb lists every verb, including the fault verbs.
 
