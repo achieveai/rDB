@@ -7569,8 +7569,11 @@ mod tests {
     ///
     /// Ordered (ruling A-R197, critic D12 A3): b=2 is put only after node 1 logged generation 3
     /// `recovered mode=Active`, so a put that lands between the first resume and the activation
-    /// re-emit cannot pass it. After the put, node 1 has logged no `set_admission allow=false`
-    /// since that line: the re-emit did not pause lag protection.
+    /// re-emit cannot pass it. After the put, any `set_admission allow=false` node 1 logged
+    /// since that line is followed by an `allow=true` within patience: a pause lifts (ruling
+    /// A-R291). It does not have to be absent. On a loaded host (gate k494) the cutoff records
+    /// waited 2.4 s for node 2's durable ack behind a 611 ms flush. That is real lag, and the
+    /// spec does not promise it away.
     fn d7_active_at_3(db: &Db, method: &str, case: &str) {
         let patience = crate::host::test_patience(Duration::from_secs(30));
         let deadline = std::time::Instant::now() + patience;
@@ -7646,18 +7649,23 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
-        let active = activated(&lines).expect("logged above");
-        let paused: Vec<_> = lines[active..]
-            .iter()
-            .filter(|line| {
-                line["@m"] == "set_admission" && line["node"] == 1 && line["allow"] == false
-            })
-            .collect();
-        assert!(
-            paused.is_empty(),
-            "{case}: lag protection paused after the activation re-emit: {paused:?}"
-        );
+        loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+            let active = activated(&lines).expect("logged above");
+            let last = lines[active..]
+                .iter()
+                .rev()
+                .find(|line| line["@m"] == "set_admission" && line["node"] == 1);
+            if last.is_none_or(|line| line["allow"] == true) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: lag protection paused after the activation re-emit and did not lift \
+                 within {patience:?}: {last:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Node 2's lines, in order, among `inventory_reported` for generation 2, its first
