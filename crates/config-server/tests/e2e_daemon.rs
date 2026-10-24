@@ -668,13 +668,23 @@ async fn e2e_10_cross_process_trace_correlation() {
     })
     .await;
 
-    let traced: Vec<serde_json::Value> = nodes
-        .iter()
-        .flat_map(|n| support::log_lines(&n.log_file()))
-        .filter(|line| {
-            line.get("trace_id").and_then(serde_json::Value::as_str) == Some(trace_id.as_str())
+    // Health can show the put before its lines reach the files (A-R309), so wait for them: a
+    // traced line on every node, and the leader's apply line.
+    let is_traced = |line: &serde_json::Value| {
+        line.get("trace_id").and_then(serde_json::Value::as_str) == Some(trace_id.as_str())
+    };
+    let mut traced: Vec<serde_json::Value> = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let lines = support::log_lines_when(&node.log_file(), |lines| {
+            lines.iter().any(|line| {
+                is_traced(line)
+                    && (index != leader
+                        || line.get("op").and_then(serde_json::Value::as_str) == Some("apply"))
+            })
         })
-        .collect();
+        .await;
+        traced.extend(lines.into_iter().filter(|line| is_traced(line)));
+    }
     assert!(
         !traced.is_empty(),
         "no daemon line carried trace_id {trace_id}; the client's trace never crossed a process \
@@ -738,7 +748,16 @@ async fn e2e_11_per_process_log_files_exist_and_are_tagged() {
     wait_formed(&harness, &nodes).await;
 
     for node in &nodes {
-        let lines = support::log_lines(&node.log_file());
+        // Formation can finish before a node's lines reach its file (A-R309): wait for one of
+        // its own lines, which the assertions below need.
+        let lines = support::log_lines_when(&node.log_file(), |lines| {
+            lines.iter().any(|l| {
+                !l.get("@logger")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| t.starts_with("openraft") || t.starts_with("memberlist"))
+            })
+        })
+        .await;
         assert!(!lines.is_empty(), "node {} logged nothing", node.node_id());
         let methods: std::collections::BTreeSet<&str> = lines
             .iter()
@@ -858,13 +877,18 @@ async fn e2e_13_unlisted_principal_denied_at_process_level() {
         "expected PermissionDenied, got {error:?}"
     );
 
-    let denials: Vec<serde_json::Value> = support::log_lines(&nodes[leader].log_file())
-        .into_iter()
-        .filter(|line| {
-            line.get("decision").and_then(serde_json::Value::as_str) == Some("deny")
-                && line.get("principal").and_then(serde_json::Value::as_str)
-                    == Some(UNLISTED_PRINCIPAL)
+    let is_denial = |line: &serde_json::Value| {
+        line.get("decision").and_then(serde_json::Value::as_str) == Some("deny")
+            && line.get("principal").and_then(serde_json::Value::as_str) == Some(UNLISTED_PRINCIPAL)
+    };
+    // The refusal can reach the client before its audit line reaches the file (A-R309).
+    let denials: Vec<serde_json::Value> =
+        support::log_lines_when(&nodes[leader].log_file(), |lines| {
+            lines.iter().any(is_denial)
         })
+        .await
+        .into_iter()
+        .filter(|line| is_denial(line))
         .collect();
     assert!(
         !denials.is_empty(),
@@ -2593,6 +2617,11 @@ async fn e2e_46_daemon_break_glass_rollback_is_audited() {
     processes[BREAK_GLASS]
         .stop_gracefully(startup_deadline())
         .await;
+    // The stopped process wrote all its lines on exit; the restart appends to the same file.
+    let loads_before = support::count_messages(
+        &support::log_file(&harness.nodes[BREAK_GLASS]),
+        "policy_loaded",
+    );
     std::fs::remove_file(&harness.nodes[BREAK_GLASS].shutdown_file)
         .expect("remove the shutdown file before restarting (E2E-08's own rule)");
     let mut spec = harness.spec(BREAK_GLASS);
@@ -2605,10 +2634,15 @@ async fn e2e_46_daemon_break_glass_rollback_is_audited() {
     wait_on_policy_version(&restarted, 9).await;
     processes[BREAK_GLASS] = restarted;
     let bg_log = support::log_file(&harness.nodes[BREAK_GLASS]);
-    let restart_load = support::log_lines(&bg_log)
-        .into_iter()
-        .rfind(|l| support::log_field(l, "@m") == Some("policy_loaded"))
-        .expect("the restart's own startup adoption is logged");
+    let is_load = |l: &serde_json::Value| support::log_field(l, "@m") == Some("policy_loaded");
+    // Health can show version 9 before the load's line reaches the file (A-R309).
+    let restart_load = support::log_lines_when(&bg_log, |lines| {
+        lines.iter().filter(|l| is_load(l)).count() > loads_before
+    })
+    .await
+    .into_iter()
+    .rfind(|l| is_load(l))
+    .expect("the restart's own startup adoption is logged");
     assert_eq!(
         restart_load
             .get("break_glass")
