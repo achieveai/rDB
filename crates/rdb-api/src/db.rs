@@ -6104,6 +6104,7 @@ mod tests {
             waits_on: None,
             stalled: None,
             reload_pending: None,
+            lengths: None,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -6179,6 +6180,7 @@ mod tests {
             waits_on: None,
             stalled: None,
             reload_pending: None,
+            lengths: None,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -6269,6 +6271,7 @@ mod tests {
             waits_on: None,
             stalled: None,
             reload_pending: None,
+            lengths: None,
         };
         let node_1 = std::thread::spawn(move || {
             while let Ok(msg) = mailbox.recv() {
@@ -6443,6 +6446,7 @@ mod tests {
                 waits_on: None,
                 stalled: None,
                 reload_pending: None,
+                lengths: None,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -7490,6 +7494,7 @@ mod tests {
             waits_on: None,
             stalled: None,
             reload_pending: None,
+            lengths: None,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {
@@ -9513,6 +9518,49 @@ mod tests {
                 2,
                 "node {n}: the newest answer and the floor record"
             );
+        }
+    }
+
+    /// A-R272: `node_status` reports each per-write index's length on every node it reads, and
+    /// a dedup index held to its newest answers by the floor stays short after 40 puts.
+    /// Integration (~1 s): three node threads, 40 puts.
+    #[config_log::retcd_test]
+    fn m10_s2_l1_node_status_reports_every_index_length() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        for n in 0..40_u32 {
+            db.put(b"a", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+        }
+        let statuses = db.node_status();
+        db.shutdown();
+        drop(db);
+        assert_eq!(statuses.len(), 3, "{statuses:?}");
+        for status in &statuses {
+            let lengths = status
+                .lengths
+                .unwrap_or_else(|| panic!("no lengths: {status:?}"));
+            tracing::info!(node = status.node.0, ?lengths, "l1_lengths");
+            // One rung a write on every copy.
+            assert!(lengths.ladder >= 40, "node {}: {lengths:?}", status.node.0);
+            if status.node == OWNER {
+                assert!(
+                    (1..=2).contains(&lengths.dedup),
+                    "the newest answer and the floor record: {lengths:?}"
+                );
+                assert!(lengths.status >= 1, "{lengths:?}");
+                assert!(lengths.published_at >= 40, "a mark a publish: {lengths:?}");
+            }
         }
     }
 

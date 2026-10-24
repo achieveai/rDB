@@ -4,7 +4,7 @@
 //! ```text
 //! cargo run --release -p rdb-api --example rdb_bench -- --dir D --log-dir L
 //!     [--dataset K] [--rate R] [--writers N] [--minutes M] [--keys K] [--value-bytes B] [--keep]
-//!     [--no-history]
+//!     [--no-history] [--write-buffer-bytes N]
 //! cargo run --release -p rdb-api --example rdb_bench -- --build-dataset K --log-dir L
 //!     [--dataset-root P]
 //! ```
@@ -50,6 +50,14 @@
 //! At start it measures what one entry costs in each per-write index (`bench_struct_costs`):
 //! the digest ladder, the dedup index and the status index. `--no-history` skips the History
 //! sampler, whose read-only open replays the WAL in this process and so adds to `rss_mb`.
+//!
+//! **Lengths** (lead, A-R272). Each minute also shows each index's length from
+//! `Db::node_status`: the owner's dedup index, status index and `published_at` marks, and the
+//! digest ladder summed over the three copies. `heap_ex_mb` is `heap_mb` less the ladder's
+//! share (its length times the measured rung cost). The end prints `heap_ex_mb` and the ladder
+//! as slopes per minute over the full minutes. `--write-buffer-bytes N` sets each column
+//! family's memtable budget (`StorageOptions::write_buffer_bytes`), so `rss_mb` is read with
+//! RocksDB's memtables held to `N` rather than its 64 MiB default.
 //!
 //! Exit 0 when every write published (or the dataset was built), 1 when any was refused or the
 //! open failed, 2 on bad arguments. `--dir` is removed at the end unless `--keep`; a dataset is
@@ -153,6 +161,7 @@ struct Args {
     value_bytes: usize,
     keep: bool,
     no_history: bool,
+    write_buffer_bytes: Option<usize>,
     dataset: Option<u64>,
     build: Option<u64>,
     root: PathBuf,
@@ -160,7 +169,7 @@ struct Args {
 
 fn usage() -> &'static str {
     "usage: rdb_bench --dir D --log-dir L [--dataset K] [--rate R] [--writers N] [--minutes M] \
-     [--keys K] [--value-bytes B] [--keep] [--no-history]\n       \
+     [--keys K] [--value-bytes B] [--keep] [--no-history] [--write-buffer-bytes N]\n       \
      rdb_bench --build-dataset K --log-dir L [--dataset-root P]\n  \
      --rate 0 sends back to back; default 100. --minutes default 1 (fractions allowed).\n  \
      --writers N: N threads share the rate, each with one write in flight; default 1.\n"
@@ -179,6 +188,7 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
         value_bytes: 100,
         keep: false,
         no_history: false,
+        write_buffer_bytes: None,
         dataset: None,
         build: None,
         root: PathBuf::from("C:/rdb_test_data/bench"),
@@ -207,6 +217,12 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--keep" => args.keep = true,
             "--no-history" => args.no_history = true,
+            "--write-buffer-bytes" => {
+                let n = positive(&value("--write-buffer-bytes")?, "--write-buffer-bytes")?;
+                args.write_buffer_bytes = Some(
+                    usize::try_from(n).map_err(|_| format!("--write-buffer-bytes {n}: too big"))?,
+                );
+            }
             "--dataset" => args.dataset = Some(positive(&value("--dataset")?, "--dataset")?),
             "--build-dataset" => {
                 args.build = Some(positive(&value("--build-dataset")?, "--build-dataset")?);
@@ -278,7 +294,7 @@ fn main() -> ExitCode {
     if std::env::var_os("RETCD_TEST_DATA_DIR").is_none() {
         std::env::set_var("RETCD_TEST_DATA_DIR", args.dir.join("control"));
     }
-    let code = match run(&args) {
+    let code = match run(&args, costs.ladder) {
         Ok(code) => code,
         Err(message) => {
             eprintln!("rdb_bench: {message}");
@@ -548,7 +564,7 @@ fn saved_revision(path: &Path) -> Result<u64, String> {
         .ok_or_else(|| format!("{}: no revision line", path.display()))
 }
 
-fn run(args: &Args) -> Result<ExitCode, String> {
+fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
     let control = match (args.build, args.dataset) {
         (Some(keys), _) => {
             let dataset = dataset_dir(&args.root, keys);
@@ -615,7 +631,9 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
-            storage: rdb_api::db::StorageOptions::default(),
+            storage: rdb_api::db::StorageOptions {
+                write_buffer_bytes: args.write_buffer_bytes,
+            },
         };
         let opened = Instant::now();
         let mut db = rt
@@ -628,7 +646,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             (Ok(()), Some(keys)) => fill(&db, keys).map(|()| ExitCode::SUCCESS),
             (Ok(()), None) => {
                 let keys = args.keys.or(args.dataset).unwrap_or(1_000);
-                Ok(drive(&db, args, keys))
+                Ok(drive(&db, args, keys, ladder_cost))
             }
         };
         db.shutdown();
@@ -953,7 +971,7 @@ fn writer(
     }
 }
 
-fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
+fn drive(db: &Db, args: &Args, keys: u64, ladder_cost: f64) -> ExitCode {
     let value = vec![b'v'; args.value_bytes];
     let period = (args.rate > 0).then(|| Duration::from_secs(1) / args.rate);
     let length = Duration::from_secs_f64(args.minutes * 60.0);
@@ -976,13 +994,18 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
     );
     println!(
         "minute  ok  rate/s  p50ms  p99ms  maxms  refused  slips  rss_mb  published_total  \
-         history_rows  history_mb  heap_mb  wal_mb"
+         history_rows  history_mb  heap_mb  wal_mb  dedup  status  ladder  pub_at  heap_ex_mb"
     );
     sample_rss();
     if !args.no_history {
         sample_history(args.dir.join("db").join("nodes").join("1"));
     }
-    let nodes = args.dir.join("db").join("nodes");
+    let probe = Probe {
+        db,
+        nodes: args.dir.join("db").join("nodes"),
+        ladder_cost,
+    };
+    let mut full_minutes = Vec::new();
     let start = Instant::now();
     let shared = Mutex::new(Shared::default());
     let mut total = Window::default();
@@ -1004,14 +1027,14 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
             }
             std::thread::sleep(minute_end.saturating_duration_since(Instant::now()));
             let (minute, slips, published) = shared.lock().expect("no writer panics").take();
-            report_minute(
+            full_minutes.push(report_minute(
                 minute_no,
                 &minute,
                 Duration::from_secs(60),
                 slips,
                 published,
-                &nodes,
-            );
+                &probe,
+            ));
             total.add(&minute);
             minute_no += 1;
             minute_start = minute_end;
@@ -1021,7 +1044,11 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
     let ended_at = Instant::now();
     let (minute, minute_slips, published) = shared.lock().expect("no writer panics").take();
     let span = ended_at.duration_since(minute_start);
-    report_minute(minute_no, &minute, span, minute_slips, published, &nodes);
+    let last = report_minute(minute_no, &minute, span, minute_slips, published, &probe);
+    // A last minute that ran (nearly) its whole 60 s counts toward the slopes.
+    if span >= Duration::from_secs(59) {
+        full_minutes.push(last);
+    }
     total.add(&minute);
     let slips = shared.lock().expect("no writer panics").slips;
     let (p50, p99, max) = total.quantiles();
@@ -1029,6 +1056,19 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
     #[allow(clippy::cast_precision_loss)]
     let rate = published as f64 / secs;
     let rss = rss_mb();
+    // Slopes over the full minutes only: a short last minute is not a minute's growth.
+    let slope = |of: fn(&Memory) -> f64| match (full_minutes.first(), full_minutes.last()) {
+        (Some(first), Some(last)) if full_minutes.len() >= 2 => {
+            #[allow(clippy::cast_precision_loss)]
+            let minutes = (full_minutes.len() - 1) as f64;
+            (of(last) - of(first)) / minutes
+        }
+        _ => f64::NAN,
+    };
+    let heap_ex_slope = slope(|m| m.heap_ex_mb);
+    let ladder_slope = slope(|m| m.ladder);
+    let ladder_mb_slope = ladder_slope * ladder_cost / 1_048_576.0;
+    let rss_slope = slope(|m| m.rss_mb);
     tracing::info!(
         published,
         secs,
@@ -1039,12 +1079,22 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
         refused = %total.refused_text(),
         slips,
         rss_mb = rss,
+        heap_ex_mb_per_min = heap_ex_slope,
+        ladder_per_min = ladder_slope,
+        ladder_mb_per_min = ladder_mb_slope,
+        rss_mb_per_min = rss_slope,
         "bench_total"
     );
     println!(
         "total published={published} secs={secs:.1} rate/s={rate:.1} p50ms={p50:.2} \
          p99ms={p99:.2} maxms={max:.2} refused={} slips={slips} rss_mb={rss:.0}",
         total.refused_text()
+    );
+    println!(
+        "slopes over {} full minutes: heap_ex_mb/min={heap_ex_slope:.3} \
+         ladder/min={ladder_slope:.0} ladder_mb/min={ladder_mb_slope:.3} \
+         rss_mb/min={rss_slope:.1}",
+        full_minutes.len()
     );
     if total.refusals() == 0 {
         ExitCode::SUCCESS
@@ -1053,14 +1103,64 @@ fn drive(db: &Db, args: &Args, keys: u64) -> ExitCode {
     }
 }
 
-fn report_minute(n: u32, w: &Window, span: Duration, slips: u64, published: u64, nodes: &Path) {
+/// What [`report_minute`] reads memory and lengths from.
+struct Probe<'a> {
+    db: &'a Db,
+    nodes: PathBuf,
+    /// Heap bytes one digest-ladder rung costs ([`struct_costs`]).
+    ladder_cost: f64,
+}
+
+/// One minute's memory, for the slopes at the end.
+struct Memory {
+    heap_ex_mb: f64,
+    /// Ladder rungs summed over every copy.
+    ladder: f64,
+    rss_mb: f64,
+}
+
+fn report_minute(
+    n: u32,
+    w: &Window,
+    span: Duration,
+    slips: u64,
+    published: u64,
+    probe: &Probe<'_>,
+) -> Memory {
     let (p50, p99, max) = w.quantiles();
     #[allow(clippy::cast_precision_loss)]
     let rate = w.micros.len() as f64 / span.as_secs_f64().max(f64::EPSILON);
     let rss = rss_mb();
     let (history_rows, history_mb) = history();
     let heap = heap_mb();
-    let wal = wal_mb(nodes);
+    let wal = wal_mb(&probe.nodes);
+    let statuses = probe.db.node_status();
+    let owner = statuses
+        .iter()
+        .find(|status| status.node.0 == 1)
+        .and_then(|status| status.lengths);
+    for status in &statuses {
+        tracing::info!(minute = n, node = status.node.0, lengths = ?status.lengths, "bench_lengths");
+    }
+    let ladder: usize = statuses
+        .iter()
+        .filter_map(|status| status.lengths)
+        .map(|lengths| lengths.ladder)
+        .sum();
+    #[allow(clippy::cast_precision_loss)]
+    let ladder = ladder as f64;
+    let heap_ex = heap - ladder * probe.ladder_cost / 1_048_576.0;
+    // -1 when the owner is not listed or reports no lengths.
+    let owner_len = |of: fn(&rdb_api::host::IndexLengths) -> usize| {
+        owner.map_or(-1, |lengths| {
+            i64::try_from(of(&lengths)).unwrap_or(i64::MAX)
+        })
+    };
+    let (dedup, status, pub_at) = (
+        owner_len(|l| l.dedup),
+        owner_len(|l| l.status),
+        owner_len(|l| l.published_at),
+    );
     tracing::info!(
         minute = n,
         history_rows,
@@ -1076,14 +1176,25 @@ fn report_minute(n: u32, w: &Window, span: Duration, slips: u64, published: u64,
         slips,
         rss_mb = rss,
         published,
+        dedup,
+        status,
+        ladder,
+        published_at = pub_at,
+        heap_ex_mb = heap_ex,
         "bench_minute"
     );
     println!(
         "{n:>6} {:>4} {rate:>7.1} {p50:>6.2} {p99:>6.2} {max:>6.2} {:>8} {slips:>6} {rss:>7.0} \
-         {published:>16} {history_rows:>13.0} {history_mb:>11.1} {heap:>8.1} {wal:>7.1}",
+         {published:>16} {history_rows:>13.0} {history_mb:>11.1} {heap:>8.1} {wal:>7.1} \
+         {dedup:>6} {status:>7} {ladder:>7.0} {pub_at:>7} {heap_ex:>11.2}",
         w.micros.len(),
         w.refused_text()
     );
+    Memory {
+        heap_ex_mb: heap_ex,
+        ladder,
+        rss_mb: rss,
+    }
 }
 
 /// The write-ahead logs (`*.log`) of every copy under `nodes`, in MB: what the copies'

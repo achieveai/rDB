@@ -376,6 +376,7 @@ fn status() -> NodeStatus {
         waits_on: None,
         stalled: Some("s".to_owned()),
         reload_pending: Some(2),
+        lengths: None,
     }
 }
 
