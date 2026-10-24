@@ -1117,6 +1117,7 @@ async fn an_address_that_never_answers_the_tls_hello_says_so() {
 /// A formation config on `dir`: all three nodes, no links, as `rdb_node --form` opens.
 fn db_config(dir: &FsPath) -> crate::db::DbConfig {
     crate::db::DbConfig {
+        ack_floor: true,
         dir: dir.to_path_buf(),
         hold: Vec::new(),
         timeouts: crate::Timeouts::default(),
