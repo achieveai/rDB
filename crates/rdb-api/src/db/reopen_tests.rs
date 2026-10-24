@@ -3429,10 +3429,19 @@ fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_hos
         (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery, false),
         "{text}"
     );
-    assert!(text.contains("node 1, the owner, went out of reach"), "{text}");
-    assert!(text.contains("next: the database is not serving right now: wait"), "{text}");
+    assert!(
+        text.contains("node 1, the owner, went out of reach"),
+        "{text}"
+    );
+    assert!(
+        text.contains("next: the database is not serving right now: wait"),
+        "{text}"
+    );
     assert!(!text.contains("report this message"), "{text}");
     assert!(!text.contains("host fault"), "{text}");
     let local = unanswered(true, NodeId(1)).to_string();
-    assert!(local.contains("host fault: the owner dropped the call unanswered"), "{local}");
+    assert!(
+        local.contains("host fault: the owner dropped the call unanswered"),
+        "{local}"
+    );
 }

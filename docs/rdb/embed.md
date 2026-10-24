@@ -295,7 +295,7 @@ With neither, a kill before any answer leaves nothing to ask about. Read the dat
 | Mode | An app restart is | A saved request, resent, answers |
 |---|---|---|
 | Embedded (this page: `local` lists the nodes) | a reopen, so a new generation | `GENERATION_CHANGED`, with nothing applied by that send. Then ask `status` |
-| Three processes ([`local-cluster.md`](local-cluster.md): `local` empty) | a new open in the **same** generation | its own answer, replayed (`Ok`); or `Ok` because it applied now, if it never reached the owner; or `STATUS_EXPIRED` if its answer was dropped |
+| Three processes ([`local-cluster.md`](local-cluster.md): `local` empty) | a new open in the **same** generation | its own answer, replayed (`Ok`); or `Ok` because it applied now, if it never reached the owner; or `STATUS_EXPIRED` if its answer was dropped. `GENERATION_CHANGED` only if a node process restarted meanwhile |
 
 `did_it_land` below handles both. Rows `m10_r189_...` (embedded) and
 `m10_r357_the_guide_s_did_it_land_answers_an_app_restarted_over_the_links` (three processes) in
@@ -442,11 +442,36 @@ floor), so the table above no longer limits it.
 ### When writes pause
 
 Writes can pause without any error in your code. Most pauses end by themselves, and none
-loses data.
-A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, say).
+loses data. A write made meanwhile is refused. Each refusal names its next step; this is what
+each one means:
+
+| Refusal | What happened to this write | What to do |
+|---|---|---|
+| `PROTECTION_PAUSED` | Nothing: it was refused before it was applied. | Wait, then `db.resend(..)` with the request from `refused.request`. `db.node_status()` shows what writes wait on. |
+| `LEASE_EXPIRED` | Nothing: the owner's permission to write ran out. | `db.wait_ready(..)`, then resend. |
+| `GENERATION_CHANGED` | Nothing by this send: a node restarted and the generation moved on. | If the request was sent before, ask `db.status(..)` whether an earlier send applied it. Otherwise send it again. |
+| `UNKNOWN_OUTCOME` | Not known: no answer before the deadline (5 s at most; about 2 s in the walk below). | Ask `db.status(..)` with its id, or resend the same request. Never send it under a new id. |
+| `UNAVAILABLE`, "went out of reach while this call waited" | Not known: the owner's process stopped mid-call. | Once it is back, resend the same request, or ask `status`. |
+| `UNAVAILABLE`, "is not reachable ... nothing was sent" | Nothing. | Wait a few seconds and try again. A read is refused this way after 1 s (`Timeouts::read`). |
+
+`did_it_land` above does the "ask" part. Keep retrying the same request and it lands once the
+pause ends.
+
+Measured with three processes on the dev host (local-cluster.md section 5 has the walk), an
+app writing all the time:
+
+| Event | Writes refused for | Refusals seen, in order |
+|---|---|---|
+| A secondary killed and left down for 60 s | 15.4 s, then writes resumed **with the copy still down** | `PROTECTION_PAUSED`, `LEASE_EXPIRED`, `PROTECTION_PAUSED` |
+| A secondary restarted (`lr restart 2`) | 8.6 s | `UNKNOWN_OUTCOME`, `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED` |
+| The owner restarted (`lr restart 1`) | 3.6 s | `UNAVAILABLE` (went out of reach), `PROTECTION_PAUSED` |
+
+Every acknowledged write read back afterwards (28,734, 6,217 and 13,644 of them, 0 missing).
+One run each, on a busy host: treat the times as rough.
 
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
-  new writes until that copy catches up. Then they resume.
+  new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
+  walk, 15 s after the kill, while the copy stayed down.
 - **The exception: a copy cut off across two or more reopens with no writes in between.** That
   copy stays behind, and writes stay paused:
   - A plain reopen does not help, even with every link up. Reads still work.

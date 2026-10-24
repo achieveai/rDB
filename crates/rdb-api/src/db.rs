@@ -1683,7 +1683,10 @@ impl Db {
             // The node dropped the call's waiter unanswered: not a timeout, so not the
             // timeout's outcome either (F-001).
             Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
-                error: unanswered(lock(&self.nodes).iter().any(|handle| handle.node == owner), owner),
+                error: unanswered(
+                    lock(&self.nodes).iter().any(|handle| handle.node == owner),
+                    owner,
+                ),
                 request: None,
             }),
         }
@@ -2087,9 +2090,10 @@ impl Db {
     /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
     ///
     /// With [`DbConfig::ack_floor`] on, a refused request resent after a later write answers
-    /// `STATUS_EXPIRED`, with nothing applied: read the object to see its value (spec §5.3,
-    /// A-R357). Its detail says whether this open was answered for it, or an earlier open of the
-    /// same client. A request answered `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
+    /// `STATUS_EXPIRED`. That resend applies nothing, but an earlier send may have: read the
+    /// object to see its value (spec §5.3 and §8.1, A-R357). Its detail says whether this open
+    /// was answered for it, or an earlier open of the same client. A request answered
+    /// `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
     /// Every other request below the floor, answered `Ok` or refused, stays covered while that
     /// request is unsettled, so a resend never applies one twice (A-R274).
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {

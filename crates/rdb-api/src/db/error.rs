@@ -149,8 +149,9 @@ impl ApiError {
             no_mutation: false,
             detail: format!(
                 "node {}, the owner, went out of reach while this call waited for its answer (its \
-                 process may have stopped); a write sent here may have applied: before sending \
-                 it as new, read the object",
+                 process may have stopped); a write sent here may have applied: once it is \
+                 back, send the same request again with `Db::resend`, or ask `Db::status`; \
+                 never send it under a new request id",
                 node.0
             ),
             retry_after: None,
