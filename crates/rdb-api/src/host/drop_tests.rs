@@ -635,6 +635,7 @@ fn a_block_leaves_out_only_the_member_it_names() {
     let replan = |drop: Option<u32>, rejoiner: Option<u32>| Replan {
         drop: drop.map(NodeId),
         rejoiner: rejoiner.map(NodeId),
+        promote: false,
         since: Tick(0),
     };
     let rejoin = replan(None, Some(3));
@@ -1025,6 +1026,25 @@ fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
 /// on demand; the promote row `m10_s2_a_promote_that_missed_node_3_takes_writes_once_node_3_is_back`
 /// walks it end to end.
 /// Cut: `rebuild_quiet` reads L1 alone, red (read-only and admitting reads as quiet).
+/// A-R366 (critic Q3): a `ReadOnly` commit's repair is for its regular secondaries only. The
+/// primary is not outside, and a shadow is never repaired: [`Host::shadow_duty`] promotes it.
+/// Cut: `read_only_outside` keeps any role (r346d2), red (node 3 the shadow, node 1).
+#[test]
+fn a_read_only_repair_counts_regular_secondaries_only() {
+    let member = |n: u8, role| Member {
+        copy: CopyId(n - 1),
+        node: NodeId(u32::from(n)),
+        boot: BOOT,
+        role,
+    };
+    let members = [
+        member(1, ReplicaRole::Primary),
+        member(2, ReplicaRole::RegularSecondary),
+        member(3, ReplicaRole::Shadow),
+    ];
+    assert_eq!(regular_secondaries(&members), vec![NodeId(2)]);
+}
+
 #[test]
 fn a_read_only_commit_is_never_quiet_on_l1_admitting() {
     assert!(!rebuild_quiet(&PartitionMode::ReadOnly, Some(true)));
@@ -1467,10 +1487,14 @@ fn role_of_three(trio: &Trio) -> Option<ReplicaRole> {
 /// sends them (`copy_caught_up`); H2's snapshot serves only a record no longer held. The row
 /// takes either, and asserts no `snapshot_catchup_unservable`. The H2-only path is owed with
 /// History trim (#61): nothing trims records in this tree, so no row can reach it yet.
+/// (e) A-R366: node 3's links stay held from its restart, so it is a shadow that is behind.
+/// It restarts again; the restart's re-plan pins it again as a shadow at its new boot, and
+/// nothing promotes it until the links heal and it catches up.
 /// Deterministic: node 3 boots only once node 1 runs the drop's re-plan.
 /// Cuts: `drained` re-adds as `RegularSecondary`, red (L1 pauses on it, dropped again);
-/// `shadow_duty` never promotes, red (node 3 stays a shadow).
-/// Integration (~5 s): b1's drop, the re-add's re-plan, the promote's re-plan.
+/// `shadow_duty` never promotes, red (node 3 stays a shadow); `drained` promotes any
+/// rejoiner shadow, red (e).
+/// Integration (~6 s): b1's drop, the re-add's re-plan, the restart's, the promote's.
 #[config_log::retcd_test]
 fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
     const METHOD: &str = "m10_s2_b15_a_dropped_copy_that_restarts_is_added_back";
@@ -1488,6 +1512,9 @@ fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
         .then_some(())
     });
     trio.links.heal_all();
+    // Node 3 hears nothing, and is heard by nobody, until (e) heals it: a shadow that is behind.
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
     restart(&mut trio, dir.path(), 3);
 
     // (a) Re-added as a shadow: L1 admits writes with node 3 counted for nothing.
@@ -1503,6 +1530,29 @@ fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
         Answer::Txn { result, .. } => assert!(result.generation >= shadowed),
         other => panic!("a put with node 3 a shadow: {other:?}"),
     }
+
+    // (e) The behind shadow restarts: pinned again as a shadow at its new boot, not promoted.
+    trio.until("the re-add's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    let reboot = restart(&mut trio, dir.path(), 3);
+    let (repinned, role) = trio.until("node 1 pinned node 3 at its new boot", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+        let three = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.boot == reboot)?;
+        Some((committed.new_generation, three.role))
+    });
+    assert!(repinned > shadowed, "{repinned:?}");
+    assert_eq!(role, ReplicaRole::Shadow, "a restart promoted the shadow");
+    assert!(
+        logged!(METHOD, "shadow_promote").is_empty(),
+        "promoted while behind"
+    );
+    trio.links.heal_all();
 
     // (c) Promoted: a regular secondary again, at or past the cutoff, and a put lands there.
     let (promoted, mode, members) = trio.until("node 1 pinned node 3 as regular", |trio| {
@@ -1569,20 +1619,18 @@ fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
     assert!(logged!(METHOD, "rejoin_readd_abandoned").is_empty());
 }
 
-/// b24 (A-R336, critic A6): a repair is only for the regular copies a `ReadOnly` commit leaves
-/// outside, never for a shadow. b6's read-only drop, node 2 held, with node 3 restarted while
-/// node 1 drops it: the re-add pins node 3 as a shadow, and with node 2 still unheard the
-/// commit is `ReadOnly` {1, 2, 3}. Node 3 is linked and answers, but over three holds no repair
-/// runs, because the one regular copy outside is node 2. Node 3 catches up and its promote
-/// waits on node 2; once node 2 links again, the promote commits `DegradedRf2`.
-/// Cut: `read_only_outside` keeps any role, **survives**: node 3 catches up from held records
-/// and is promoted ~400 ms after the shadow commit, before a repair check can probe it (the
-/// hold, then one check to probe, one to read). A shadow that stays behind needs History trim
-/// (#61), so the red for this cut is owed with it.
-/// Integration (~6 s): b1's drop, the re-add, three holds, one repair.
+/// b24 (A-R336, critic A6, A-R366): a `ReadOnly` commit that pins a shadow is promoted, not
+/// repaired. b6's read-only drop, node 2 held, with node 3 restarted while node 1 drops it:
+/// the re-add pins node 3 as a shadow, and with node 2 still unheard the commit is `ReadOnly`
+/// {1, 2, 3}. Node 3 catches up and node 1 starts its promote, which waits on node 2. While
+/// that re-plan runs, over three holds, no repair is planned; once node 2 links again, the
+/// promote commits `DegradedRf2` with node 3 regular.
+/// It does not reach the role filter: the running promote masks `read_only_outside`. That
+/// filter's row is `a_read_only_repair_counts_regular_secondaries_only`.
+/// Integration (~6 s): b1's drop, the re-add, three holds, the promote.
 #[config_log::retcd_test]
-fn m10_s2_b24_a_read_only_commit_is_never_repaired_for_its_shadow() {
-    const METHOD: &str = "m10_s2_b24_a_read_only_commit_is_never_repaired_for_its_shadow";
+fn m10_s2_b24_a_read_only_shadow_commit_is_promoted_not_repaired() {
+    const METHOD: &str = "m10_s2_b24_a_read_only_shadow_commit_is_promoted_not_repaired";
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, _) = started(dir.path(), tuned);
     kill(&trio, 3, &[1, 2]);

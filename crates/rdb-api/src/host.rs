@@ -1075,6 +1075,10 @@ struct Replan {
     /// plan on its copy, the plan is replaced without it (rulings A-R306, A-R316), and it stays
     /// out: nothing links a member that is not pinned until M3's add half lands.
     rejoiner: Option<NodeId>,
+    /// A-R366: the re-plan is [`Host::shadow_duty`]'s promote, the only one that pins the
+    /// rejoiner shadow as a regular secondary. Any other re-plan (a restart) pins it again as a
+    /// shadow at its live boot.
+    promote: bool,
     /// When the revocation was asked.
     since: Tick,
 }
@@ -3747,8 +3751,9 @@ impl Host {
     /// (the commit's) pins fewer regular copies than rf3. The restart re-plan pins it again as
     /// a shadow, which L1 never counts and R1 catches up off the stream; [`Self::shadow_duty`]
     /// promotes it once it reaches the cutoff. A member pinned in any role, a shadow included,
-    /// is already re-added. Only a newer boot counts, so a copy that was dropped while up is
-    /// not re-added until it restarts.
+    /// is already re-added. Only a boot newer than the one the drop recorded counts. That is the
+    /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
+    /// rejoiner) is re-added at once, and a copy dropped at its live boot waits for a restart.
     fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
         let copies = config
             .members
@@ -3784,8 +3789,14 @@ impl Host {
         let replan = Replan {
             drop,
             rejoiner,
+            promote: false,
             since: self.clock.now(),
         };
+        self.start_revoke(partition, epoch, replan);
+    }
+
+    /// Ask A1 to revoke `partition`'s committed `epoch` for `replan`.
+    fn start_revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, replan: Replan) {
         self.rejoins
             .insert(partition, Rejoin::Revoking { epoch, replan });
         let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
@@ -3864,9 +3875,11 @@ impl Host {
                     // reach it, which its barrier names.
                     self.links.boot_of(member.node).unwrap_or(member.boot)
                 };
-                // A-R329: a shadow that is the rejoiner is promoted (`Self::shadow_duty`).
-                let promoted =
-                    member.role == ReplicaRole::Shadow && Some(member.node) == replan.rejoiner;
+                // A-R329, A-R366: only `Self::shadow_duty`'s re-plan promotes its shadow; a
+                // restarted shadow stays a shadow at its live boot.
+                let promoted = replan.promote
+                    && member.role == ReplicaRole::Shadow
+                    && Some(member.node) == replan.rejoiner;
                 let role = if promoted {
                     ReplicaRole::RegularSecondary
                 } else {
@@ -4258,7 +4271,13 @@ impl Host {
             cutoff = cutoff.0,
             "shadow_promote"
         );
-        self.revoke(partition, epoch, None, Some(shadow.node));
+        let replan = Replan {
+            drop: None,
+            rejoiner: Some(shadow.node),
+            promote: true,
+            since: self.clock.now(),
+        };
+        self.start_revoke(partition, epoch, replan);
     }
 
     /// The regular secondaries `partition`'s commit pins, while that commit is `ReadOnly`, this
@@ -4279,11 +4298,7 @@ impl Host {
         if result.mode != PartitionMode::ReadOnly || !owner {
             return Vec::new();
         }
-        members
-            .iter()
-            .filter(|member| member.role == ReplicaRole::RegularSecondary)
-            .map(|member| member.node)
-            .collect()
+        regular_secondaries(members)
     }
 
     /// Whether this node has a link to `node` now: in this process, registered and not held;
@@ -4544,7 +4559,14 @@ impl Host {
                         waited_ms,
                         "rejoin_revoke_retry"
                     );
-                    self.revoke(partition, epoch, replan.drop, replan.rejoiner);
+                    self.start_revoke(
+                        partition,
+                        epoch,
+                        Replan {
+                            since: now,
+                            ..replan
+                        },
+                    );
                 }
                 return;
             }
@@ -4570,7 +4592,14 @@ impl Host {
             waited_ms,
             "rejoin_retry"
         );
-        self.revoke(partition, epoch, replan.drop, replan.rejoiner);
+        self.start_revoke(
+            partition,
+            epoch,
+            Replan {
+                since: now,
+                ..replan
+            },
+        );
     }
 
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
@@ -7490,6 +7519,17 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
         .iter()
         .find(|member| member.copy == copy)
         .map(|member| member.node)
+}
+
+/// The regular secondaries among `members`: the copies outside a `ReadOnly` commit's barrier
+/// that M3's repair re-plans. A shadow is never one: L1 never counts it, and
+/// [`Host::shadow_duty`] promotes it.
+fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
+    members
+        .iter()
+        .filter(|member| member.role == ReplicaRole::RegularSecondary)
+        .map(|member| member.node)
+        .collect()
 }
 
 /// Whether a rebuild check that found F1 unpinned stays quiet. K1 ruling, condition 6: a
