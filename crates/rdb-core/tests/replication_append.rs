@@ -6442,8 +6442,10 @@ fn owner_with_dormant(head_at: u64, with_primary: bool) -> Replication {
 /// it was installed. A fenced recovery append with a valid credential, from C, reaches A's
 /// dormant receiver for copy 0 at 10. Without a primary on A it stages record 11, so the frame
 /// is one the receiver takes. Beside A's serving primary R1 refuses it `Replica(NotRequired)`
-/// with no reply and no store effect, and the receiver and the primary are unchanged. Cut: R1
-/// hands a recovery append to the receiver beside a primary, red.
+/// with no reply and no store effect, and the receiver and the primary are unchanged. Once the
+/// takeover's `Recovered` retires that primary, the retransmitted append is staged (A-11).
+/// Cuts: R1 hands a recovery append to the receiver beside a primary, red; R1 refuses one
+/// beside any primary, retired or not, red.
 #[retcd_test]
 fn m10_s2_a_recovery_append_never_reaches_a_receiver_beside_a_serving_primary() {
     let body = recovery_body(&fence(2, EPOCH, REVISION), &golden());
@@ -6468,4 +6470,23 @@ fn m10_s2_a_recovery_append_never_reaches_a_receiver_beside_a_serving_primary() 
     );
     assert_eq!(module.receiver(A, P), Some(&receiver), "the receiver");
     assert_eq!(module.primary(A, P), Some(&primary), "the primary");
+
+    // A-11: the guard is for a serving primary only. The takeover's `Recovered` retires A's
+    // primary and re-anchors the receiver at 10 in NEW_GEN; the source retransmits the append
+    // under the new lineage, and the receiver stages it. This is the handover's self-heal: an
+    // append refused before `Recovered` is taken after it.
+    step(
+        &mut module,
+        &requiring(recovered(10, d(10), takeover_config()), &[0, 2], A),
+    );
+    assert!(module.primary(A, P).expect("kept").tracker().retired());
+    let retransmit = recovery_body(
+        &fence_in(NEW_GEN, 2, NEW_EPOCH, REVISION),
+        &taken_over(golden()),
+    );
+    assert_eq!(
+        staged_batch(&step(&mut module, &on(A, delivered(label(C), retransmit)))),
+        (BatchId(0), NEW_GEN, Seq(11)),
+        "beside a retired primary the receiver stages the retransmitted append"
+    );
 }
