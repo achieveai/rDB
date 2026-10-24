@@ -3182,8 +3182,10 @@ fn tracker_pin(module: &Replication) -> (OwnerEpoch, ConfigVersion, u64) {
 /// config 7 with one predicate. B's ACK at epoch 5 is now `StaleEpoch`, and at epoch 6 is
 /// admitted. The `ConfigChanged` to 8 that follows is still taken, not refused as stale, and
 /// its incarnation reset still runs (M7B-150): B, re-announced at a new boot, is fresh. The
-/// same view again is `OutOfOrder`, and so is a newer one that names config 7 now that the
-/// tracker pins 8: the gate reads the version `ConfigChanged` wrote. Neither changes anything.
+/// same view again is `NotRequired`: it is A1's renewal, which does not bump `authority_seq`, and
+/// not a regress. The same seq naming another epoch is still `OutOfOrder`, and so is a newer one
+/// that names config 7 now that the tracker pins 8: the gate reads the version `ConfigChanged`
+/// wrote. None of them changes anything.
 /// A view touches no cursor: B's catch-up runs through one unchanged.
 #[retcd_test]
 fn m7b_161_a_newer_view_moves_the_primarys_epoch_and_never_its_config() {
@@ -3226,15 +3228,24 @@ fn m7b_161_a_newer_view_moves_the_primarys_epoch_and_never_its_config() {
     );
 
     let before = module.clone();
-    for (stale, case) in [
-        (view(1, NEW_EPOCH, NEW_CONFIG), "the same seq again"),
-        (view(2, OwnerEpoch(7), CONFIG), "a newer seq below config 8"),
+    for (stale, answer, case) in [
+        (
+            view(1, NEW_EPOCH, NEW_CONFIG),
+            ReplicaIgnoreReason::NotRequired,
+            "the same view again, a renewal",
+        ),
+        (
+            view(1, OwnerEpoch(7), NEW_CONFIG),
+            ReplicaIgnoreReason::OutOfOrder,
+            "the same seq naming another epoch",
+        ),
+        (
+            view(2, OwnerEpoch(7), CONFIG),
+            ReplicaIgnoreReason::OutOfOrder,
+            "a newer seq below config 8",
+        ),
     ] {
-        assert_eq!(
-            route(&mut module, stale),
-            vec![replica(ReplicaIgnoreReason::OutOfOrder)],
-            "{case}"
-        );
+        assert_eq!(route(&mut module, stale), vec![replica(answer)], "{case}");
         assert_eq!(module, before, "{case}: a refused view changes nothing");
     }
 
