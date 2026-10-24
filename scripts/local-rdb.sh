@@ -213,18 +213,32 @@ start_node() { # n
     say "node $n started: pid $os, $(head -n1 "$out")"
 }
 
-await_ready() { # n: 0 only on `rdb_node ready`; a `not-ready` line, an exit or a timeout is 1
-    local n="$1" os line
+settled_line() { # file: the last ready or final not-ready line. A not-ready line ending
+    # `(retrying)` is a missed deadline, not an end: the node keeps trying and later prints
+    # `rdb_node ready node=N (after Ns)` (tester-s2 `lr up` race, A-R271).
+    { grep "^rdb_node \(ready\|not-ready\)" "$1" 2>/dev/null || true; } \
+        | { grep -v "(retrying)$" || true; } | tail -n1
+}
+
+await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an exit or a timeout is 1
+    local n="$1" os line deadline out
+    out="$RUN/out/node-$n.out"
     os="$(pid_of "node-$n")"
-    if wait_line "$RUN/out/node-$n.out" "^rdb_node \(ready\|not-ready\)" "$TIMEOUT_SEC" "$os"; then
-        line="$(grep "^rdb_node \(ready\|not-ready\)" "$RUN/out/node-$n.out" | tail -n1)"
+    deadline=$(( $(date +%s) + TIMEOUT_SEC ))
+    while [ "$(date +%s)" -lt "$deadline" ] && os_pid_is "$os" rdb_node; do
+        line="$(settled_line "$out")"
+        [ -n "$line" ] && break
+        sleep 0.2
+    done
+    line="$(settled_line "$out")"
+    if [ -n "$line" ]; then
         say "node $n: $line"
         case "$line" in "rdb_node ready"*) return 0 ;; *) return 1 ;; esac
-    else
-        tail -n 5 "$RUN/out/node-$n.err" >&2 || true
-        say "node $n: no ready line within ${TIMEOUT_SEC}s (see $RUN/out/node-$n.err)"
-        return 1
     fi
+    tail -n 5 "$RUN/out/node-$n.err" >&2 || true
+    line="$(grep "^rdb_node not-ready" "$out" 2>/dev/null | tail -n1 || true)"
+    say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
+    return 1
 }
 
 stop_node() { # n: stop file, then a hard kill after 15 s. Idempotent.
