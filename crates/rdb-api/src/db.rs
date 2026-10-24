@@ -2063,13 +2063,18 @@ impl Db {
     /// Which nodes of this `Db` have restarted or failed to restart; `None` while every node runs
     /// its first boot. Names each restarted node and its boot, and says when the restart failed
     /// and the node stays stopped (F-013), in one short clause, because it rides on every refused
-    /// answer (tester walk 5). A restarted copy does not rejoin in this open (achieveai/rDB#42):
-    /// it takes part again once the folder is opened again (M10 A-R188).
+    /// answer (tester walk 5). Then what is true now (A-R275): a restarted secondary rejoins by
+    /// itself once the owner re-plans (A-R256(2)), while a restarted owner stays out until the
+    /// folder is opened again (A-R188). A failed restart adds nothing more: its node stays stopped.
     #[must_use]
     pub fn restart_note(&self) -> Option<String> {
-        let restarted: Vec<String> = lock(&self.nodes)
+        let nodes = lock(&self.nodes);
+        let moved: Vec<&NodeHandle> = nodes
             .iter()
             .filter(|handle| handle.boot != self.opened.base_boot)
+            .collect();
+        let restarted: Vec<String> = moved
+            .iter()
             .map(|handle| {
                 let (node, boot) = (handle.node.0, handle.boot.0);
                 let who = if handle.node == OWNER {
@@ -2084,11 +2089,16 @@ impl Db {
                 }
             })
             .collect();
-        (!restarted.is_empty()).then(|| {
-            format!(
-                "{}; a restarted node stays out until the folder is opened again (#42)",
-                restarted.join(", ")
-            )
+        let tail = if moved.iter().any(|handle| handle.node == OWNER) {
+            Some("the owner stays out until the folder is opened again")
+        } else if moved.iter().any(|handle| !handle.start_failed) {
+            Some("a restarted copy rejoins by itself once the owner re-plans")
+        } else {
+            None
+        };
+        (!restarted.is_empty()).then(|| match tail {
+            Some(tail) => format!("{}; {tail}", restarted.join(", ")),
+            None => restarted.join(", "),
         })
     }
 
@@ -4646,6 +4656,14 @@ mod tests {
             .recovered
             .expect("node 1 recovered at the open");
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        assert_eq!(
+            db.restart_note().as_deref(),
+            Some(
+                "node 3 restarted (now boot 2); a restarted copy rejoins by itself once the owner \
+                 re-plans"
+            ),
+            "A-R275: a refusal says what is true now"
+        );
 
         let patience = crate::host::test_patience(Duration::from_secs(10));
         let deadline = std::time::Instant::now() + patience;
@@ -4978,8 +4996,8 @@ mod tests {
         let note = db.restart_note().expect("the owner restarted");
         assert_eq!(
             note,
-            "the owner, node 1, restarted (now boot 2); a restarted node stays out until the folder \
-             is opened again (#42)"
+            "the owner, node 1, restarted (now boot 2); the owner stays out until the folder is \
+             opened again"
         );
         for kind in kinds {
             let plain = ApiError::new(kind, "d");
