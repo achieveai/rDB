@@ -3416,3 +3416,23 @@ mod guide_did_it_land {
         nodes.shutdown();
     }
 }
+
+/// A-R357 D1 (tester tc1): a call the owner in another process never answered, because its
+/// link dropped while the call waited (`lr down`), is `UNAVAILABLE`: wait and retry, never a
+/// host fault to report. The same drop by a node of this process stays a host fault.
+#[test]
+fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_host_fault() {
+    let lost = unanswered(false, NodeId(1));
+    let text = lost.to_string();
+    assert_eq!(
+        (lost.kind, lost.retry, lost.no_mutation),
+        (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery, false),
+        "{text}"
+    );
+    assert!(text.contains("node 1, the owner, went out of reach"), "{text}");
+    assert!(text.contains("next: the database is not serving right now: wait"), "{text}");
+    assert!(!text.contains("report this message"), "{text}");
+    assert!(!text.contains("host fault"), "{text}");
+    let local = unanswered(true, NodeId(1)).to_string();
+    assert!(local.contains("host fault: the owner dropped the call unanswered"), "{local}");
+}

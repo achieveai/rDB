@@ -1683,7 +1683,7 @@ impl Db {
             // The node dropped the call's waiter unanswered: not a timeout, so not the
             // timeout's outcome either (F-001).
             Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
-                error: ApiError::host("the owner dropped the call unanswered"),
+                error: unanswered(lock(&self.nodes).iter().any(|handle| handle.node == owner), owner),
                 request: None,
             }),
         }
@@ -3035,6 +3035,17 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
         error.detail, sent.identity.request.0
     );
     error
+}
+
+/// The refusal for a call `owner` dropped unanswered (F-001). A node of this process that drops
+/// one is a host fault. One in another process went out of reach, most often because its
+/// process stopped (`lr down`): `UNAVAILABLE`, wait and retry, never "report this" (tc1 D1).
+fn unanswered(local: bool, owner: NodeId) -> ApiError {
+    if local {
+        ApiError::host("the owner dropped the call unanswered")
+    } else {
+        ApiError::owner_lost(owner)
+    }
 }
 
 /// `error` with which case a resend's `STATUS_EXPIRED` of `request` is (A-R357). The kernel

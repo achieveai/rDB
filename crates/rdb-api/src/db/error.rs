@@ -137,6 +137,26 @@ impl ApiError {
         }
     }
 
+    /// A call to the owner that runs in another process, sent, whose answer never came back:
+    /// the link dropped while it waited, as when that process is stopped (`lr down`, tester tc1
+    /// D1, A-R357). Not a host fault: a retry helps once the node is back. The call was sent,
+    /// so a write may have applied.
+    #[must_use]
+    pub fn owner_lost(node: NodeId) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: false,
+            detail: format!(
+                "node {}, the owner, went out of reach while this call waited for its answer (its \
+                 process may have stopped); a write sent here may have applied: before sending \
+                 it as new, read the object",
+                node.0
+            ),
+            retry_after: None,
+        }
+    }
+
     /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
     #[must_use]
     pub fn host(detail: &str) -> Self {
