@@ -861,3 +861,58 @@ fn m10_s2_b13_a_plan_blocked_by_a_control_outage_is_sent_again() {
     );
     assert!(logged!(METHOD, "rejoin_abandoned").is_empty());
 }
+
+/// b14 (A-R325, critic-degraded A-9): b12 without the next revocation. After b1's drop, node 1
+/// hears the first epoch's revocation persisted again, late, and nothing is being revoked. A1
+/// records it and fences nothing, since it serves a later epoch; its drain proof plans
+/// nothing; the next put lands at the drop's generation.
+/// Host-level: A1 is the kernel the sim runs too, so the fix holds for both. Its kernel twin is
+/// rdb-core `a_late_revocation_of_an_older_epoch_leaves_the_served_epoch_admitting`.
+/// Cut: A1's completion arm fences whatever epoch it serves, red (the put is refused).
+/// Integration (~3 s): b1's drop.
+#[config_log::retcd_test]
+fn m10_s2_b14_a_late_revocation_of_an_older_epoch_leaves_the_served_one_writable() {
+    const METHOD: &str =
+        "m10_s2_b14_a_late_revocation_of_an_older_epoch_leaves_the_served_one_writable";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let stale = epoch_of(&trio);
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    trio.ready();
+    assert_ne!(stale, epoch_of(&trio), "the drop moved the epoch");
+
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: REJOIN,
+    };
+    let late = AuthorityEvent::EpochRevocationPersisted {
+        partition: PartitionId(1),
+        epoch: stale,
+    };
+    trio.nodes[0].0.push(
+        site,
+        EventKind::Kernel(KernelEvent::Authority(late)),
+        true,
+        None,
+    );
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after the late revocation: {other:?}"),
+    }
+    assert_eq!(trio.status(0).admits, Some(true));
+
+    let unasked = logged!(METHOD, "drain_proof_unasked");
+    assert_eq!(unasked.len(), 1, "the late proof was heard: {unasked:?}");
+    let fences: Vec<_> = logged!(METHOD, "authority_fence")
+        .into_iter()
+        .filter(|line| line["node"] == 1 && line["reason"] == "EpochRevoked")
+        .collect();
+    assert_eq!(
+        fences.len(),
+        1,
+        "only the drop's own revocation fenced: {fences:?}"
+    );
+}
