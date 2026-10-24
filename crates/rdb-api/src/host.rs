@@ -1088,6 +1088,10 @@ struct Replan {
     /// plan on its copy, the plan is replaced without it (rulings A-R306, A-R316), and it stays
     /// out: nothing links a member that is not pinned until M3's add half lands.
     rejoiner: Option<NodeId>,
+    /// A-R366: the re-plan is [`Host::shadow_duty`]'s promote, the only one that pins the
+    /// rejoiner shadow as a regular secondary. Any other re-plan (a restart) pins it again as a
+    /// shadow at its live boot.
+    promote: bool,
     /// When the revocation was asked.
     since: Tick,
 }
@@ -1566,6 +1570,11 @@ struct Host {
     acquire_scheduled: BTreeSet<PartitionId>,
     /// Per partition, the restart re-plan this owner is running (#42, A-R249).
     rejoins: BTreeMap<PartitionId, Rejoin>,
+    /// Per partition, each member a drop plan left out, at the boot it was pinned at (A-R329).
+    /// When its link reports a newer boot while the commit pins fewer than rf3's copies, the
+    /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
+    /// pinned again.
+    left_out: BTreeMap<PartitionId, Vec<Member>>,
     /// The epoch of the `EpochRevocationPersisted` being offered, when that is the event in
     /// hand. A1 emits `DrainProof` only for that event, and the proof is for that epoch alone:
     /// a re-asked revocation persists twice, and a late second proof must not plan from a later
@@ -1703,6 +1712,7 @@ impl Host {
             land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
+            left_out: BTreeMap::new(),
             revocation_persisted: None,
             blamed: BTreeMap::new(),
             #[cfg(test)]
@@ -3754,7 +3764,12 @@ impl Host {
                 (live > member.boot).then_some((member.node.0, member.boot.0, live.0))
             })
             .collect();
-        if stale.is_empty() {
+        let readd = if stale.is_empty() {
+            self.readd_candidate(partition, config)
+        } else {
+            None
+        };
+        if stale.is_empty() && readd.is_none() {
             return Some("every member's pinned boot is current");
         }
         if let Some(rejoin) = self.rejoins.get(&partition) {
@@ -3763,6 +3778,7 @@ impl Host {
                 partition = partition.0,
                 rejoin = ?rejoin,
                 stale = ?stale,
+                readd = ?readd.map(|member| member.node.0),
                 "rejoin_pending"
             );
             return None;
@@ -3774,11 +3790,44 @@ impl Host {
             generation = committed.new_generation.0,
             epoch = epoch.0,
             stale = ?stale,
+            readd = ?readd.map(|member| member.node.0),
             "rejoin_revoke"
         );
-        let rejoiner = stale.first().map(|&(node, _, _)| NodeId(node));
+        let rejoiner = stale
+            .first()
+            .map(|&(node, _, _)| NodeId(node))
+            .or(readd.map(|member| member.node));
         self.revoke(partition, epoch, None, rejoiner);
         None
+    }
+
+    /// A-R329: a member a drop left out of `partition` that started again since, while `config`
+    /// (the commit's) pins fewer regular copies than rf3. The restart re-plan pins it again as
+    /// a shadow, which L1 never counts and R1 catches up off the stream; [`Self::shadow_duty`]
+    /// promotes it once it reaches the cutoff. A member pinned in any role, a shadow included,
+    /// is already re-added. Only a boot newer than the one the drop recorded counts. That is the
+    /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
+    /// rejoiner) is re-added at once, and a copy dropped at its live boot waits for a restart.
+    fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
+        let copies = config
+            .members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        if copies >= crate::admin::members().len() {
+            return None;
+        }
+        self.left_out.get(&partition)?.iter().copied().find(|left| {
+            let pinned = config
+                .members
+                .iter()
+                .any(|member| member.node == left.node || member.copy == left.copy);
+            !pinned
+                && self
+                    .links
+                    .boot_of(left.node)
+                    .is_some_and(|live| live > left.boot)
+        })
     }
 
     /// Ask A1 to revoke `partition`'s committed `epoch`, whose `DrainProof` [`Self::drained`]
@@ -3794,8 +3843,14 @@ impl Host {
         let replan = Replan {
             drop,
             rejoiner,
+            promote: false,
             since: self.clock.now(),
         };
+        self.start_revoke(partition, epoch, replan);
+    }
+
+    /// Ask A1 to revoke `partition`'s committed `epoch` for `replan`.
+    fn start_revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, replan: Replan) {
         self.rejoins
             .insert(partition, Rejoin::Revoking { epoch, replan });
         let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
@@ -3862,7 +3917,7 @@ impl Host {
             base_digest: committed.selected.cutoff_digest,
         };
         let pinned = &committed.committed.pinned_config;
-        let members: Vec<Member> = pinned
+        let mut members: Vec<Member> = pinned
             .members
             .iter()
             .filter(|member| Some(member.node) != replan.drop)
@@ -3874,9 +3929,54 @@ impl Host {
                     // reach it, which its barrier names.
                     self.links.boot_of(member.node).unwrap_or(member.boot)
                 };
-                Member { boot, ..*member }
+                // A-R329, A-R366: only `Self::shadow_duty`'s re-plan promotes its shadow; a
+                // restarted shadow stays a shadow at its live boot.
+                let promoted = replan.promote
+                    && member.role == ReplicaRole::Shadow
+                    && Some(member.node) == replan.rejoiner;
+                let role = if promoted {
+                    ReplicaRole::RegularSecondary
+                } else {
+                    member.role
+                };
+                Member {
+                    boot,
+                    role,
+                    ..*member
+                }
             })
             .collect();
+        // A-R329: a rejoiner that is not pinned is a member a drop left out, linked again as a
+        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it off the
+        // stream; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
+        let readded = replan.rejoiner.and_then(|node| {
+            let left = self
+                .left_out
+                .get(&partition)?
+                .iter()
+                .find(|left| left.node == node)?;
+            let free = !pinned
+                .members
+                .iter()
+                .any(|member| member.node == node || member.copy == left.copy);
+            free.then(|| Member {
+                boot: self.links.boot_of(node).unwrap_or(left.boot),
+                role: ReplicaRole::Shadow,
+                ..*left
+            })
+        });
+        if let Some(member) = readded {
+            members.push(member);
+            members.sort_by_key(|member| member.copy);
+        }
+        if let Some(left) = replan
+            .drop
+            .and_then(|node| pinned.members.iter().find(|member| member.node == node))
+        {
+            let entry = self.left_out.entry(partition).or_default();
+            entry.retain(|member| member.node != left.node);
+            entry.push(*left);
+        }
         // A1's own view when it published one; the plan's otherwise. A1 replaces it at the
         // install after commit either way (as `admin::heal`).
         let (view, view_source) = match self.authority_views.get(&partition) {
@@ -3917,6 +4017,7 @@ impl Host {
             boots = ?boots,
             dropped = ?replan.drop.map(|node| node.0),
             rejoiner = ?replan.rejoiner.map(|node| node.0),
+            readded = ?readded.map(|member| member.node.0),
             "rejoin_plan"
         );
         self.rejoins
@@ -3942,6 +4043,13 @@ impl Host {
     /// pinned at its older boot, so the partition is checked once more: a newer boot supersedes
     /// (arch-s2).
     fn rejoin_committed(&mut self, partition: PartitionId, generation: Generation) {
+        if let (Some(left), Some(committed)) = (
+            self.left_out.get_mut(&partition),
+            self.committed.get(&partition),
+        ) {
+            let pinned = &committed.committed.pinned_config.members;
+            left.retain(|member| !pinned.iter().any(|pin| pin.node == member.node));
+        }
         let Some(Rejoin::Planned {
             generation: planned,
             ..
@@ -3978,6 +4086,7 @@ impl Host {
         for partition in partitions {
             self.retry_blocked_rejoin(partition, now);
             self.repair_duty(partition, now);
+            self.shadow_duty(partition);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
                 self.blamed.remove(&partition);
                 continue;
@@ -4167,6 +4276,64 @@ impl Host {
             .collect()
     }
 
+    /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
+    /// drop left out and a restart re-added, [`Self::readd_candidate`]) has applied up to the
+    /// commit's cutoff, as this primary's tracker last admitted it, the owner re-plans with it
+    /// as the rejoiner, and [`Self::drained`] pins it as a regular secondary. That run's F1
+    /// catches up what it still lacks and syncs it in the barrier before L1 counts it. Nothing
+    /// while a re-plan runs, or on a node that is not the commit's pinned primary.
+    fn shadow_duty(&mut self, partition: PartitionId) {
+        if self.rejoins.contains_key(&partition) {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let owner = members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        let Some(shadow) = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Shadow)
+            .copied()
+        else {
+            return;
+        };
+        if !owner {
+            return;
+        }
+        let Some(primary) = self.replication.primary(self.node, partition) else {
+            return;
+        };
+        let acked = primary
+            .tracker()
+            .peer(shadow.copy)
+            .map_or(0, |peer| peer.progress.buffered_applied.0);
+        let cutoff = committed.selected.cutoff_seq;
+        if acked < cutoff.0 {
+            return;
+        }
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = committed.new_generation.0,
+            shadow = shadow.node.0,
+            copy = shadow.copy.0,
+            acked,
+            cutoff = cutoff.0,
+            "shadow_promote"
+        );
+        let replan = Replan {
+            drop: None,
+            rejoiner: Some(shadow.node),
+            promote: true,
+            since: self.clock.now(),
+        };
+        self.start_revoke(partition, epoch, replan);
+    }
+
     /// The regular secondaries `partition`'s commit pins, while that commit is `ReadOnly`, this
     /// node is its pinned primary and no re-plan runs for it. Empty otherwise. All of them are
     /// outside the barrier: a `ReadOnly` commit has one eligible regular copy holding it
@@ -4185,11 +4352,7 @@ impl Host {
         if result.mode != PartitionMode::ReadOnly || !owner {
             return Vec::new();
         }
-        members
-            .iter()
-            .filter(|member| member.role == ReplicaRole::RegularSecondary)
-            .map(|member| member.node)
-            .collect()
+        regular_secondaries(members)
     }
 
     /// Whether this node has a link to `node` now: in this process, registered and not held;
@@ -4332,9 +4495,44 @@ impl Host {
             return;
         };
         let members = &committed.committed.pinned_config.members;
-        let candidate = block_leaves_out(reason, replan, members);
         let epoch = committed.selected.root.owner_epoch;
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
+        // A-R329: a re-add F1 blocks on is given up, and the commit's members are planned
+        // again. The member stays left out at the boot it was planned at, so only another
+        // restart re-adds it, never a loop of re-adds.
+        let readd = replan
+            .rejoiner
+            .filter(|node| !members.iter().any(|member| member.node == *node))
+            .and_then(|node| {
+                self.left_out
+                    .get(&partition)?
+                    .iter()
+                    .find(|left| left.node == node)
+                    .copied()
+            });
+        if let Some(left) = readd.filter(|left| named_by_block(reason, Some(left.copy)).is_some()) {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                planned = planned.0,
+                readd = left.node.0,
+                waited_ms,
+                reason = ?reason,
+                "rejoin_readd_abandoned"
+            );
+            let live = self.links.boot_of(left.node).unwrap_or(left.boot);
+            if let Some(entry) = self
+                .left_out
+                .get_mut(&partition)
+                .and_then(|entry| entry.iter_mut().find(|member| member.node == left.node))
+            {
+                entry.boot = live;
+            }
+            self.blamed.remove(&partition);
+            self.revoke(partition, epoch, None, None);
+            return;
+        }
+        let candidate = block_leaves_out(reason, replan, members);
         let verdict = candidate.map(|node| drop_target(members, Some(node), self.node).0);
         let dropped = match verdict {
             Some(Ok(node)) => node,
@@ -4415,7 +4613,14 @@ impl Host {
                         waited_ms,
                         "rejoin_revoke_retry"
                     );
-                    self.revoke(partition, epoch, replan.drop, replan.rejoiner);
+                    self.start_revoke(
+                        partition,
+                        epoch,
+                        Replan {
+                            since: now,
+                            ..replan
+                        },
+                    );
                 }
                 return;
             }
@@ -4441,7 +4646,14 @@ impl Host {
             waited_ms,
             "rejoin_retry"
         );
-        self.revoke(partition, epoch, replan.drop, replan.rejoiner);
+        self.start_revoke(
+            partition,
+            epoch,
+            Replan {
+                since: now,
+                ..replan
+            },
+        );
     }
 
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
@@ -7374,6 +7586,17 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
         .iter()
         .find(|member| member.copy == copy)
         .map(|member| member.node)
+}
+
+/// The regular secondaries among `members`: the copies outside a `ReadOnly` commit's barrier
+/// that M3's repair re-plans. A shadow is never one: L1 never counts it, and
+/// [`Host::shadow_duty`] promotes it.
+fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
+    members
+        .iter()
+        .filter(|member| member.role == ReplicaRole::RegularSecondary)
+        .map(|member| member.node)
+        .collect()
 }
 
 /// Whether a rebuild check that found F1 unpinned stays quiet. K1 ruling, condition 6: a

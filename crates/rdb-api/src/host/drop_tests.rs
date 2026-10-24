@@ -527,6 +527,8 @@ fn m10_s2_d2_a_pause_for_divergence_is_never_dropped_past() {
 /// barrier wait (7 windows), plus a margin for the re-plan's own window and CAS, and writes
 /// land again. Every `rejoin_abandoned` names node 3, the copy that never advanced.
 /// Only F1's block ends the rejoin; no clock does (ruling A-R316).
+/// Since A-R336, node 3's newer boot also makes the drop's commit re-add it at once as a shadow
+/// (b15), which L1 never counts: the put lands at the drop's generation or that one.
 /// Cut: `rejoin_blocked` returns at once, red (node 1's F1 stays blocked).
 /// Integration (~5 s): bootstrap's window, puts until L1 pauses, F1's sync and barrier
 /// waits, the abandon's re-plan.
@@ -576,8 +578,9 @@ fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
         "writes held {waited} ms by a rejoin that never completes; bound {bound} ms"
     );
     trio.ready();
+    // At the drop's generation, or at the shadow re-add's that follows it (A-R336).
     match trio.ask(put(request)) {
-        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        Answer::Txn { result, .. } => assert!(result.generation >= after, "{result:?}"),
         other => panic!("a put after the abandon: {other:?}"),
     }
 
@@ -587,10 +590,15 @@ fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
         "the rejoin links node 3: {plans:?}"
     );
     assert_eq!(plans[0]["rejoiner"], "Some(3)", "{plans:?}");
-    assert_eq!(
-        plans.last().map(|plan| plan["dropped"].clone()),
-        Some("Some(3)".into()),
-        "the last plan leaves node 3 out: {plans:?}"
+    let left_out = plans
+        .iter()
+        .position(|plan| plan["dropped"] == "Some(3)")
+        .unwrap_or_else(|| panic!("a plan leaves node 3 out: {plans:?}"));
+    assert!(
+        plans[left_out + 1..]
+            .iter()
+            .all(|plan| plan["readded"] == "Some(3)"),
+        "after node 3 is left out, a plan only re-adds it as a shadow: {plans:?}"
     );
     let abandoned = logged!(METHOD, "rejoin_abandoned");
     assert!(!abandoned.is_empty(), "no rejoin_abandoned");
@@ -627,6 +635,7 @@ fn a_block_leaves_out_only_the_member_it_names() {
     let replan = |drop: Option<u32>, rejoiner: Option<u32>| Replan {
         drop: drop.map(NodeId),
         rejoiner: rejoiner.map(NodeId),
+        promote: false,
         since: Tick(0),
     };
     let rejoin = replan(None, Some(3));
@@ -1017,6 +1026,25 @@ fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
 /// on demand; the promote row `m10_s2_a_promote_that_missed_node_3_takes_writes_once_node_3_is_back`
 /// walks it end to end.
 /// Cut: `rebuild_quiet` reads L1 alone, red (read-only and admitting reads as quiet).
+/// A-R366 (critic Q3): a `ReadOnly` commit's repair is for its regular secondaries only. The
+/// primary is not outside, and a shadow is never repaired: [`Host::shadow_duty`] promotes it.
+/// Cut: `read_only_outside` keeps any role (r346d2), red (node 3 the shadow, node 1).
+#[test]
+fn a_read_only_repair_counts_regular_secondaries_only() {
+    let member = |n: u8, role| Member {
+        copy: CopyId(n - 1),
+        node: NodeId(u32::from(n)),
+        boot: BOOT,
+        role,
+    };
+    let members = [
+        member(1, ReplicaRole::Primary),
+        member(2, ReplicaRole::RegularSecondary),
+        member(3, ReplicaRole::Shadow),
+    ];
+    assert_eq!(regular_secondaries(&members), vec![NodeId(2)]);
+}
+
 #[test]
 fn a_read_only_commit_is_never_quiet_on_l1_admitting() {
     assert!(!rebuild_quiet(&PartitionMode::ReadOnly, Some(true)));
@@ -1701,4 +1729,285 @@ fn m10_s2_b22_a_restarted_member_is_repaired_at_once() {
         Answer::Txn { result, .. } => assert_eq!(result.generation, generation),
         other => panic!("a put after the restart: {other:?}"),
     }
+}
+
+/// Node 3's role in node 1's commit, when the commit pins it.
+fn role_of_three(trio: &Trio) -> Option<ReplicaRole> {
+    trio.nodes[0]
+        .0
+        .committed
+        .get(&PartitionId(1))?
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .find(|member| member.node == NodeId(3))
+        .map(|member| member.role)
+}
+
+/// b15 (A-R329, A-R336 option 3): node 3 restarts after node 1 has decided to drop it. The
+/// drop commits without node 3, and since it left out a member that has started again while
+/// the commit pins two regular copies, node 1 re-plans with node 3 as a shadow. L1 never
+/// counts it, so writes go on at rf2 while R1 catches it up off the stream. Once it has applied
+/// the cutoff, node 1 promotes it: the next commit pins it as a regular secondary, synced in
+/// the barrier, and a put lands there. It is never dropped again. Node 3 restarts as a new
+/// host ([`restart`]), so the frames it sends carry the boot the commit pins.
+/// The catch-up (A-R361): node 1 still holds every record node 3 lacks, so R1's shadow cursor
+/// sends them (`copy_caught_up`); H2's snapshot serves only a record no longer held. The row
+/// takes either, and asserts no `snapshot_catchup_unservable`. The H2-only path is owed with
+/// History trim (#61): nothing trims records in this tree, so no row can reach it yet.
+/// (e) A-R366: node 3's links stay held from its restart, so it is a shadow that is behind.
+/// It restarts again; the restart's re-plan pins it again as a shadow at its new boot, and
+/// nothing promotes it until the links heal and it catches up.
+/// Deterministic: node 3 boots only once node 1 runs the drop's re-plan.
+/// Cuts: `drained` re-adds as `RegularSecondary`, red (L1 pauses on it, dropped again);
+/// `shadow_duty` never promotes, red (node 3 stays a shadow); `drained` promotes any
+/// rejoiner shadow, red (e).
+/// Integration (~6 s): b1's drop, the re-add's re-plan, the restart's, the promote's.
+#[config_log::retcd_test]
+fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
+    const METHOD: &str = "m10_s2_b15_a_dropped_copy_that_restarts_is_added_back";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.until("node 1 decided to drop node 3", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.drop == Some(NodeId(3))
+        )
+        .then_some(())
+    });
+    trio.links.heal_all();
+    // Node 3 hears nothing, and is heard by nobody, until (e) heals it: a shadow that is behind.
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    restart(&mut trio, dir.path(), 3);
+
+    // (a) Re-added as a shadow: L1 admits writes with node 3 counted for nothing.
+    let (shadowed, mode, members) = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert!(shadowed > before.next(), "{shadowed:?}");
+    assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2, 3]));
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert!(result.generation >= shadowed),
+        other => panic!("a put with node 3 a shadow: {other:?}"),
+    }
+
+    // (e) The behind shadow restarts: pinned again as a shadow at its new boot, not promoted.
+    trio.until("the re-add's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    let reboot = restart(&mut trio, dir.path(), 3);
+    let (repinned, role) = trio.until("node 1 pinned node 3 at its new boot", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+        let three = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.boot == reboot)?;
+        Some((committed.new_generation, three.role))
+    });
+    assert!(repinned > shadowed, "{repinned:?}");
+    assert_eq!(role, ReplicaRole::Shadow, "a restart promoted the shadow");
+    assert!(
+        logged!(METHOD, "shadow_promote").is_empty(),
+        "promoted while behind"
+    );
+    trio.links.heal_all();
+
+    // (c) Promoted: a regular secondary again, at or past the cutoff, and a put lands there.
+    let (promoted, mode, members) = trio.until("node 1 pinned node 3 as regular", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::RegularSecondary))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert!(promoted > shadowed, "{promoted:?}");
+    assert_eq!((mode, members), (PartitionMode::Active, vec![1, 2, 3]));
+    let host = &trio.nodes[0].0;
+    let cutoff = host.committed[&PartitionId(1)].selected.cutoff_seq;
+    let known = host
+        .replication
+        .primary(NodeId(1), PartitionId(1))
+        .and_then(|primary| primary.tracker().known(CopyId(2)))
+        .expect("node 1 tracks copy 2");
+    assert!(known.durable.0 >= cutoff.0, "{known:?} below {cutoff:?}");
+    trio.ready();
+    match trio.ask(put(request + 1)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, promoted),
+        other => panic!("a put after the promote: {other:?}"),
+    }
+
+    // (b) The shadow caught up, from records or from H2, then node 1 promoted it, once, at or
+    // past the cutoff (A-R361).
+    let mut caught_up: Vec<_> = logged!(METHOD, "copy_caught_up")
+        .into_iter()
+        .chain(logged!(METHOD, "snapshot_catchup_served"))
+        .filter(|line| line["copy"] == 2)
+        .collect();
+    caught_up.sort_by(|a, b| a["@t"].as_str().cmp(&b["@t"].as_str()));
+    assert!(
+        logged!(METHOD, "snapshot_catchup_unservable").is_empty(),
+        "a catch-up node 1 could not serve"
+    );
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "one promote: {promotes:?}");
+    assert_eq!(promotes[0]["shadow"], 3);
+    assert!(
+        promotes[0]["acked"].as_u64() >= promotes[0]["cutoff"].as_u64(),
+        "promoted below the cutoff: {promotes:?}"
+    );
+    assert!(
+        caught_up
+            .first()
+            .is_some_and(|first| first["@t"].as_str() < promotes[0]["@t"].as_str()),
+        "promoted before any catch-up: {caught_up:?} {promotes:?}"
+    );
+    // (d) Dropped once, never again.
+    let planned = logged!(METHOD, "membership_drop_planned");
+    assert_eq!(planned.len(), 1, "one drop: {planned:?}");
+    let plans = logged!(METHOD, "rejoin_plan");
+    assert_eq!(
+        plans.first().map(|plan| plan["dropped"].clone()),
+        Some("Some(3)".into()),
+        "the drop came first: {plans:?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan["readded"] == "Some(3)" && plan["rejoiner"] == "Some(3)"),
+        "node 3 was planned back: {plans:?}"
+    );
+    assert!(logged!(METHOD, "rejoin_readd_abandoned").is_empty());
+}
+
+/// b25 (A-R369): a promote whose `DrainProof` is lost is asked again as a promote. b15's
+/// behind shadow; node 1 loses the next drain proof (b11's hook), then node 3's links heal.
+/// It catches up, node 1 starts the promote, the proof is lost, and the revocation is asked
+/// again once `peer_drop_after_millis` old. The first commit after the shadow's pins node 3
+/// as a regular secondary, from one `shadow_promote`.
+/// Cut: a retry drops `promote` (r366b), red (the retry pins node 3 as a shadow again).
+/// Integration (~5 s): b1's drop, the re-add, the promote and its one retry.
+#[config_log::retcd_test]
+fn m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote() {
+    const METHOD: &str =
+        "m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    trio.until("node 1 decided to drop node 3", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.drop == Some(NodeId(3))
+        )
+        .then_some(())
+    });
+    trio.links.heal_all();
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    restart(&mut trio, dir.path(), 3);
+    let (shadowed, _, _) = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    trio.until("the re-add's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.nodes[0].0.drain_proofs_to_lose = 1;
+    trio.links.heal_all();
+
+    let (next, role) = trio.until("node 1 committed past the shadow's", |trio| {
+        let (generation, _, _) = commit_of(trio)?;
+        (generation > shadowed).then(|| (generation, role_of_three(trio)))
+    });
+    assert_eq!(next, shadowed.next(), "one commit after the shadow's");
+    assert_eq!(
+        role,
+        Some(ReplicaRole::RegularSecondary),
+        "the retried promote pinned node 3 as {role:?}"
+    );
+    let retries = logged!(METHOD, "rejoin_revoke_retry");
+    assert_eq!(retries.len(), 1, "one retry: {retries:?}");
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "one promote: {promotes:?}");
+}
+
+/// b24 (A-R336, critic A6, A-R366): a `ReadOnly` commit that pins a shadow is promoted, not
+/// repaired. b6's read-only drop, node 2 held, with node 3 restarted while node 1 drops it:
+/// the re-add pins node 3 as a shadow, and with node 2 still unheard the commit is `ReadOnly`
+/// {1, 2, 3}. Node 3 catches up and node 1 starts its promote, which waits on node 2. While
+/// that re-plan runs, over three holds, no repair is planned; once node 2 links again, the
+/// promote commits `DegradedRf2` with node 3 regular.
+/// It does not reach the role filter: the running promote masks `read_only_outside`. That
+/// filter's row is `a_read_only_repair_counts_regular_secondaries_only`.
+/// Integration (~6 s): b1's drop, the re-add, three holds, the promote.
+#[config_log::retcd_test]
+fn m10_s2_b24_a_read_only_shadow_commit_is_promoted_not_repaired() {
+    const METHOD: &str = "m10_s2_b24_a_read_only_shadow_commit_is_promoted_not_repaired";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    trio.until("node 3 blamed for half the drop clock", |trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&PartitionId(1))
+            .filter(|blame| HostClock::millis_until(blame.since, now) >= DROP_AFTER_MILLIS / 2)
+            .map(|_| ())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.until("node 1 decided to drop node 3", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.drop == Some(NodeId(3))
+        )
+        .then_some(())
+    });
+    trio.links.heal(NodeId(1), NodeId(3));
+    trio.links.heal(NodeId(2), NodeId(3));
+    restart(&mut trio, dir.path(), 3);
+
+    let (shadowed, mode, members) = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert_eq!(
+        (mode, members),
+        (PartitionMode::ReadOnly, vec![1, 2, 3]),
+        "node 2 unheard through the re-add"
+    );
+    let until = trio
+        .clock
+        .now()
+        .plus_millis(3 * trio.nodes[0].0.budgets.resume_hold_millis + 3 * DROP_CHECK_EVERY_MILLIS);
+    trio.until("three holds with node 2 held", |trio| {
+        (trio.clock.now() >= until).then_some(())
+    });
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert!(planned.is_empty(), "repaired for the shadow: {planned:?}");
+    assert_eq!(commit_of(&trio).map(|(g, _, _)| g), Some(shadowed));
+
+    // The shadow's promote, waiting on node 2, commits once node 2 links: no repair at all.
+    trio.links.heal(NodeId(1), NodeId(2));
+    let (_, mode, members) = trio.until("node 1 committed once node 2 linked", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > shadowed)
+    });
+    assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2, 3]));
+    assert_eq!(role_of_three(&trio), Some(ReplicaRole::RegularSecondary));
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert!(planned.is_empty(), "{planned:?}");
 }
