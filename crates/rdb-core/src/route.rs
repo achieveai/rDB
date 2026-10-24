@@ -421,6 +421,10 @@ pub fn event_for(effect: &KernelEffect) -> Option<KernelEvent> {
 /// partitions and the site, and a partition leaving `served` is fenced with a past view
 /// (A-R54.2). One skipped for having no kernel admits only on a fresh view, which a fenced A1
 /// never publishes.
+///
+/// The kernel filter is defence in depth, pinned by the route row only (A-R340): the host and
+/// the simulator cannot reach a viewed partition with no P1, since A1's first view of a served
+/// partition is routed to P1 there and installs its slot.
 #[must_use]
 pub fn node_fence_sites<'a>(
     effect: &KernelEffect,
