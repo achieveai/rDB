@@ -1010,6 +1010,7 @@ fn a_r315_block_cache_memory_stays_within_the_store_capacity() {
             write_buffer_bytes: None,
             memtable_budget_bytes: Some(1 << 20),
             block_cache_bytes: Some(CACHE),
+            sync_stuck_millis: None,
         },
     )
     .expect("open with a 1 MiB block cache");

@@ -312,7 +312,10 @@ fn m10_f4_a_wal_whose_open_is_still_refused_after_the_relist_fails_the_sync() {
         perms.set_readonly(false);
         std::fs::set_permissions(&refused, perms).expect("make it writable");
         std::fs::remove_file(&refused).expect("remove the planted file");
-        assert_eq!(sync_now(&mut engine, vec![capture(G1, 1)]), vec![durable(G1, 1)]);
+        assert_eq!(
+            sync_now(&mut engine, vec![capture(G1, 1)]),
+            vec![durable(G1, 1)]
+        );
     }
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
