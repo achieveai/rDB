@@ -1580,6 +1580,11 @@ fn open_boundary(
 /// flushes the memtable and waits for that thread, so one slow flush held up every other store's
 /// checkpoint: under load ten stores' checkpoints, 2.3-3.0 s each, finished within 80 ms of one
 /// another, and each store's synced log writes waited for its own checkpoint meanwhile.
+///
+/// Why 16: the point was 4 flush threads instead of 1, and RocksDB derives the flush share from
+/// this one number. Only 2 and 16 were measured, on `m5_snapshot_cluster` 20 times under load
+/// at scale 3. With 2, and the capture already moved into `build_snapshot`, it passed 16/20.
+/// With 16 it passed 20/20. Values between 2 and 16 are unmeasured; a lower one may do as well.
 const MAX_BACKGROUND_JOBS: i32 = 16;
 
 fn open_db(dir: &Path, path: &Path) -> Result<DB, StorageOpenError> {
