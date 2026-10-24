@@ -2144,6 +2144,10 @@ fn a_node_fence_sited_at_partition_0_freezes_partition_1s_queue() {
         .failing_with(config_core::ConfigError::Unavailable {
             reason: "the control store is down".to_owned(),
         });
+    // `step` hands the mailbox to the host after it drains, so the last `until` can leave
+    // partition-1 events queued. Drained now, before the expiry, none of them can find it
+    // (under 2x load one did, and sited the fence at partition 1).
+    trio.nodes[0].0.drain();
     let through = trio.nodes[0]
         .0
         .authority_views
@@ -2156,6 +2160,7 @@ fn a_node_fence_sited_at_partition_0_freezes_partition_1s_queue() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let host = &mut trio.nodes[0].0;
+    assert_eq!(host.queue.len(), 0, "nothing but the flush duty can run");
     host.flush_duty().expect("the flush duty");
     host.drain();
     let status = host.status(PartitionId(1));
