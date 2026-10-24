@@ -445,11 +445,26 @@ makes divergence impossible there.
 
 ### 7. `sync_wal_through` and the RocksDB write modes (future requirement, stated now)
 
-The storage seam exposes `sync_wal_through(captured_prefixes)`. It holds a **per-engine write-order
-mutex from capture through a successful `DB::flush_wal(true)`**, after every captured `WriteBatch`
-call has returned. No concurrent engine write may bypass it. Only unambiguous success publishes the
-captured prefixes; error or partial completion advances nothing. A memtable flush is not a
-substitute.
+The storage seam exposes `sync_wal_through(captured_prefixes)`. **Amended in M10 (ruling A-R317):
+there is no write-order mutex held across the fsync.** The sync has two halves. Begin runs after
+every captured `WriteBatch` call has returned, and fixes what the sync may credit: per prefix, the
+lower of the captured position and what the engine has applied. The fsync, `DB::flush_wal(true)`,
+runs on the node's syncer thread. Finish raises the durable marks to what begin fixed and never
+lowers them. Only unambiguous success publishes the captured prefixes; error or partial completion
+advances nothing. A memtable flush is not a substitute.
+
+Writes may commit while the fsync runs. A write that returned before the sync began is durable once
+it succeeds. A write that commits during the sync is durable only after the next sync that begins
+after it returned. With `manual_wal_flush` off, each record reaches the OS before its write returns,
+and a sync covers every WAL file numbered at or below the current one when it begins, so a sync
+never credits a write it did not cover. While a sync is in flight, no synced write and no second
+sync runs on the node's thread, since RocksDB would make it wait on that fsync; such writes are
+staged and the next sync carries them. The native rows are in `rdb-storage/tests/m10_wal_sync.rs`
+and the host rows in `rdb-api/src/host/sync_tests.rs`.
+
+Before M10 this section required a per-engine write-order mutex from capture through a successful
+`DB::flush_wal(true)`. That kept the node's thread waiting on every fsync, which cost a grant under
+load (F4, lr6: a 2,973 ms fsync).
 
 M7 models this in the simulator (M1) and proves the kernel obeys it. M8/D1 must additionally prove
 the native engine does, and until then the contract is asserted, not established — spec §6.1 says
@@ -535,7 +550,7 @@ does not describe.
 | Divergence with no floor blocks, never silently pauses | Then copy B diverges: effect vector in index order `DivergenceDetected`, `Alert`, `CopyLost`, `QualificationChanged { Lost }`, `BlockPartition { DivergenceRequiresOperator, [C, B] }` — **gate V3** |
 | Set change without a predicate flip emits nothing | RF3, threshold 1, one copy diverges: no `QualificationChanged` in the effect vector; `qualifies_now(head)` still true |
 | Unequal secondary prefixes converge | Every unequal pairing catches up by suffix and reaches equal head digests — **gate V3** |
-| `sync_wal_through` ordering | M1 models the write-order mutex; D1 enforces it natively and tests rejection of the disabled write modes |
+| `sync_wal_through` ordering | M1 models the write-order mutex; D1 enforces it natively and tests rejection of the disabled write modes. M10 (A-R317) replaces the mutex with begin and finish: `rdb-storage/tests/m10_wal_sync.rs` |
 
 ## References
 
