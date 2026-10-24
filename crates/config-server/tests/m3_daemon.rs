@@ -114,19 +114,21 @@ fn field<'a>(row: &'a serde_json::Value, name: &str) -> Option<&'a str> {
     support::log_field(row, name)
 }
 
-/// Every JSONL line node `node` wrote whose `@m` equals `message`, for `method`.
-fn lines_with_message(
+/// Every JSONL line node `node` wrote whose `@m` equals `message`, for `method`, once there is
+/// one: the daemon logs from a background thread, so a line can reach the file after the
+/// health answer a row waited on (A-R309).
+async fn lines_with_message(
     node: &support::NodeLayout,
     method: &str,
     message: &str,
 ) -> Vec<serde_json::Value> {
-    let path = support::log_file(node);
-    if !path.exists() {
-        return Vec::new();
-    }
-    support::log_lines(&path)
+    let matches = |l: &serde_json::Value| {
+        field(l, "@m") == Some(message) && field(l, "testMethod") == Some(method)
+    };
+    support::log_lines_when(&support::log_file(node), |lines| lines.iter().any(matches))
+        .await
         .into_iter()
-        .filter(|l| field(l, "@m") == Some(message) && field(l, "testMethod") == Some(method))
+        .filter(|l| matches(l))
         .collect()
 }
 
@@ -225,7 +227,7 @@ async fn m3_44_daemon_accepts_insecure_with_flag_and_warns() {
     assert_eq!(health[0].transport_security, "Insecure");
 
     // The gate is loud: exactly one warn line per startup, never zero and never a stream.
-    let warnings = lines_with_message(node, METHOD, "insecure_transport_enabled");
+    let warnings = lines_with_message(node, METHOD, "insecure_transport_enabled").await;
     assert_eq!(
         warnings.len(),
         1,
@@ -364,7 +366,7 @@ async fn m3_45_daemon_without_policy_is_unready_and_denies() {
 
     // The refusal is announced once at startup, so an operator can see why without issuing a
     // request first.
-    let unavailable = lines_with_message(node, METHOD, "authz_unavailable");
+    let unavailable = lines_with_message(node, METHOD, "authz_unavailable").await;
     assert_eq!(
         unavailable.len(),
         1,

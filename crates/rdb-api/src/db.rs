@@ -192,6 +192,8 @@ pub struct DbConfig {
     ///   flushes.
     /// - `storage.write_buffer_bytes`: the budget of one column family, capped by the above.
     ///   `None` is RocksDB's own, 64 MiB.
+    /// - `storage.block_cache_bytes`: the block cache of each node's store, one cache that
+    ///   every column family reads through (A-R315). `None` is 64 MiB per node.
     pub storage: StorageOptions,
     /// Whether each write tells the owner which of this open's earlier writes the app already
     /// has its answer for (the client ack floor, M10 S2, rulings A-R252 and A-R267). `true` by
@@ -572,6 +574,68 @@ async fn read_owner(
     Ok((record.owner, root.instance))
 }
 
+/// Whether node processes for `nodes` may start on empty copies (ruling A-R328, narrowing
+/// A-R231(a)): only when the control plane says the database is formed, and every one of them
+/// is a member of partition 1. Returns the record and the instance an empty copy binds.
+///
+/// # Errors
+///
+/// [`OpenError::Config`] naming the cause: the database is not formed (no `partitions/1`, or
+/// one that names no instance yet), or a node is not a member. [`OpenError::Control`] when the
+/// store does not answer, and [`OpenError::Undecodable`] when the record does not decode.
+async fn formed_member(
+    store: &Arc<dyn ConfigStore>,
+    nodes: &[NodeId],
+) -> Result<(PartitionRecord, [u8; INSTANCE_LEN]), OpenError> {
+    let named = nodes
+        .iter()
+        .map(|node| node.0.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key = ControlKey::Partition(PARTITION).encode();
+    let read = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| {
+            let step = match error {
+                config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
+                _ => "",
+            };
+            OpenError::Control(format!("get partitions/1: {error}{step}"))
+        })?;
+    let Some(found) = read.record else {
+        return Err(OpenError::Config(format!(
+            "database not formed: the control store holds no partitions/1, so node {named} has \
+             no database to rejoin. Run lr up to form it"
+        )));
+    };
+    let record = PartitionRecord::decode(&found.value)
+        .ok_or_else(|| undecodable(&key, "not a partition record this build reads"))?;
+    let Some(root) = PartitionRoot::decode(&found.value) else {
+        return Err(OpenError::Config(format!(
+            "database not formed yet: partitions/1 names no instance. Wait for its first open \
+             (lr up) to finish, then start node {named} again"
+        )));
+    };
+    let members: Vec<NodeId> = admin::members().iter().map(|member| member.node).collect();
+    if let Some(stranger) = nodes.iter().find(|node| !members.contains(node)) {
+        return Err(OpenError::Config(format!(
+            "node {} is not a member of partition {} (its members are nodes {}), so it holds \
+             no copy to rebuild",
+            stranger.0,
+            PARTITION.0,
+            members
+                .iter()
+                .map(|node| node.0.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok((record, root.instance))
+}
+
 /// How a reopen's heal stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealState {
@@ -940,20 +1004,18 @@ impl Db {
         std::fs::create_dir_all(&config.dir)?;
         let partial = local_nodes(&config.local)?;
         let nodes_dir = config.dir.join("nodes");
-        // A node process opens only its own copy, and only one a formed database left (ruling
-        // A-R231(a)): it never creates a copy, binds an instance or bootstraps.
+        // A node process opens only its own copy, and never bootstraps or forms (ruling
+        // A-R231(a)). It creates an empty copy only for a formed database it is a member of
+        // (A-R328): that copy binds the database's instance in `check` and is rebuilt.
         if partial {
-            for node in &config.local {
-                let dir = nodes_dir.join(node.0.to_string());
-                if !dir.join("CURRENT").exists() {
-                    return Err(OpenError::Config(format!(
-                        "{} holds no copy of node {}: form the database first (lr up), then \
-                         start node {} again",
-                        one_separator(&dir).display(),
-                        node.0,
-                        node.0
-                    )));
-                }
+            let missing: Vec<NodeId> = config
+                .local
+                .iter()
+                .copied()
+                .filter(|node| !nodes_dir.join(node.0.to_string()).join("CURRENT").exists())
+                .collect();
+            if !missing.is_empty() {
+                formed_member(&store, &missing).await?;
             }
         }
         let created = match std::fs::create_dir(&nodes_dir) {
@@ -1121,13 +1183,44 @@ impl Db {
             )));
         }
         let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
+        // A node process's empty copy (wiped, or created above) joins a formed database it is a
+        // member of as a behind copy, bound to that database's instance, and F1's rebuild fills
+        // it (ruling A-R328). It never forms one.
         if partial && !holds_data {
-            let nodes: Vec<String> = engines.keys().map(|node| node.0.to_string()).collect();
-            return Err(OpenError::Config(format!(
-                "the copy of node {} holds no data: form the database first (lr up), then start \
-                 the node again",
-                nodes.join(", ")
-            )));
+            let nodes: Vec<NodeId> = engines.keys().copied().collect();
+            let (record, instance) = formed_member(store, &nodes).await?;
+            if let Some(ours) = bound.first() {
+                if *ours != instance {
+                    return Err(OpenError::Mismatch(another_database(
+                        ours,
+                        &format!("instance {}", admin::instance_hex(&instance)),
+                    )));
+                }
+            }
+            if engines.contains_key(&record.owner) {
+                return Err(OpenError::Config(format!(
+                    "the copy of node {} holds no data, and partition {} names it owner: promote \
+                     another node first (lr promote), then start node {} again",
+                    record.owner.0, PARTITION.0, record.owner.0
+                )));
+            }
+            for (node, engine) in engines.iter_mut() {
+                engine
+                    .bind_instance(instance)
+                    .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+            }
+            tracing::info!(
+                generation = record.generation.0,
+                owner = record.owner.0,
+                nodes = ?nodes.iter().map(|node| node.0).collect::<Vec<_>>(),
+                "db_open_empty_copy_joining"
+            );
+            return Ok(Found {
+                instance,
+                fresh: false,
+                owner: record.owner,
+                roll: None,
+            });
         }
         if holds_data {
             if let Some((node, _)) = engines.iter().find(|(_, e)| e.instance().is_none()) {
@@ -4706,18 +4799,28 @@ mod tests {
     /// at once through one `Db`, and every put succeeds. Before the fix T1 froze its queue at
     /// every local apply until the publish, so a put that arrived in that window was refused
     /// `PROTECTION_PAUSED` (290 a minute with 2 writers at 100 puts a second in `rdb_bench`).
+    ///
+    /// L1 keeps the spec's ages, scaled as a wait (ruling A-R313). Under `fast()` a 400 ms
+    /// flush on a loaded host pauses L1, which is a correct refusal of another kind and not the
+    /// freeze this row is about (d2 paused that way 3 times in 46 loaded runs). The freeze cut
+    /// still refuses at the first apply, whatever the ages.
     /// Integration (~1 s): three node threads, 120 puts.
     #[test]
     fn concurrent_writers_wait_behind_the_unpublished_write_and_none_is_refused() {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: millis(crate::host::test_patience(Duration::from_secs(1))),
+            pause_age_millis: millis(crate::host::test_patience(Duration::from_secs(2))),
+            ..fast()
+        };
         let mut db = rt
             .block_on(Db::open_with(
                 config(dir.path()),
                 store,
                 rt.handle().clone(),
-                fast(),
+                budgets,
             ))
             .expect("open");
         admits(&db, "after the open");
@@ -4730,14 +4833,21 @@ mod tests {
                         for i in 0..20 {
                             let key = format!("w{writers}/{writer}/{i}");
                             if let Err(e) = db.put(key.as_bytes(), b"v", None) {
-                                refused.lock().expect("lock").push(e.error.kind);
+                                refused
+                                    .lock()
+                                    .expect("lock")
+                                    .push((e.error.kind, e.error.detail));
                             }
                         }
                     });
                 }
             });
             let refused = refused.into_inner().expect("lock");
-            assert!(refused.is_empty(), "{writers} writers: refused {refused:?}");
+            assert!(
+                refused.is_empty(),
+                "{writers} writers: refused {refused:?}; owner now {:?}",
+                owner_of(&db, db.node_status())
+            );
         }
         db.shutdown();
     }
@@ -4941,8 +5051,15 @@ mod tests {
     /// restart of node 1: a put lands and node 3 holds it durably at node 1's generation. Cut:
     /// no re-plan, and node 1 logs `replication_copy_not_advancing` while node 3 never gets the
     /// put. Integration (~3 s): three node threads, one restart.
+    ///
+    /// A-R330: under host stalls node 1 may drop node 3 before it reboots; since A-R329 node 3
+    /// rejoins either way, so the outcome is asserted on both sides of the drop. One
+    /// `rf3_restart_breakdown` line, and every failure message, say whether node 3 was dropped,
+    /// how long the reopen took, and how long until node 3 held the put.
     #[config_log::retcd_test]
     fn m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3() {
+        const METHOD: &str =
+            "m10_s2_a_secondary_restarted_under_a_live_owner_rejoins_and_writes_resume_on_rf3";
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -4965,7 +5082,23 @@ mod tests {
         let before = of(&db, OWNER)
             .recovered
             .expect("node 1 recovered at the open");
+        let reopen = std::time::Instant::now();
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        let reopen_ms = u64::try_from(reopen.elapsed().as_millis()).expect("ms fit u64");
+        let restarted = std::time::Instant::now();
+        // Whether node 1 planned node 3's drop, read from this row's own log.
+        let dropped = || {
+            config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                .iter()
+                .any(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3)
+        };
+        let facts = || {
+            format!(
+                "[dropped={}, reopen_ms={reopen_ms}, since_restart_ms={}]",
+                if dropped() { "yes" } else { "no" },
+                restarted.elapsed().as_millis()
+            )
+        };
         assert_eq!(
             db.restart_note().as_deref(),
             Some(
@@ -4984,15 +5117,17 @@ mod tests {
                     Ok(put) => break put,
                     Err(refused) => assert!(
                         std::time::Instant::now() < deadline,
-                        "no put landed within {patience:?} of the restart: {refused:?}"
+                        "no put landed within {patience:?} of the restart: {refused:?} {}",
+                        facts()
                     ),
                 }
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "node 1 did not re-plan past generation {} and admit within {patience:?}: \
-                 {owner:?}",
-                before.0
+                 {owner:?} {}",
+                before.0,
+                facts()
             );
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -5010,11 +5145,20 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "node 3 holds {held:?}, not generation {} through {target}, within {patience:?} \
-                 (put {put:?})",
-                generation.0
+                 (put {put:?}) {}",
+                generation.0,
+                facts()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        let rf3_ms = u64::try_from(restarted.elapsed().as_millis()).expect("ms fit u64");
+        tracing::info!(
+            dropped = dropped(),
+            reopen_ms,
+            rf3_ms,
+            generation = generation.0,
+            "rf3_restart_breakdown"
+        );
         db.shutdown();
     }
 
@@ -5028,10 +5172,36 @@ mod tests {
     /// skips a node holding a primary, so node 1 sources nothing and node 3 never holds the
     /// generation, red. Integration (~5 s): three node threads, the owner's pause, one restart
     /// and its re-plan.
+    ///
+    /// A-R370: a restart slowed past `PEER_DROP_AFTER_MILLIS` by host load (24.6 s in int gate
+    /// k632) lets node 1 drop node 3 first. Node 3 then comes back as a shadow and is promoted
+    /// (A-R336), so the row asserts on the promote's generation on that side of the drop. The
+    /// `_after_it_was_dropped` row below takes that side every time.
     #[config_log::retcd_test]
     fn m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy() {
-        const METHOD: &str =
-            "m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy";
+        away_then_rejoins(
+            "m10_s2_writes_go_on_while_node_3_is_away_then_it_restarts_and_rejoins_as_a_full_copy",
+            false,
+        );
+    }
+
+    /// A-R370: the row above with node 3 restarted only once node 1 has dropped it, as a host
+    /// stall longer than the drop clock does. Node 1 re-adds it as a shadow at its new boot and
+    /// promotes it once caught up; node 3 then holds the promote's generation through node 1's
+    /// head, and every write reads back.
+    /// Cut: `readd_candidate` re-adds nobody (int before A-R336), red (node 3 holds nothing).
+    /// Integration (~15 s): the 10 s drop clock, the re-add and the promote.
+    #[config_log::retcd_test]
+    fn m10_s2_a_copy_dropped_while_away_rejoins_as_a_full_copy_after_it_restarts() {
+        away_then_rejoins(
+            "m10_s2_a_copy_dropped_while_away_rejoins_as_a_full_copy_after_it_restarts",
+            true,
+        );
+    }
+
+    /// The two rows above: node 3 is cut off, puts go on until node 1 pauses, and node 3
+    /// restarts, after node 1 has dropped it when `drop_first`.
+    fn away_then_rejoins(method: &'static str, drop_first: bool) {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -5073,6 +5243,20 @@ mod tests {
         }
         assert!(landed >= 1, "no put landed with node 3 away");
         let before = of(&db, OWNER).recovered.expect("node 1 recovered");
+        if drop_first {
+            let dropped_by =
+                std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+            while !config_testkit::logs::lines_for_current_test(module_path!(), method)
+                .iter()
+                .any(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3)
+            {
+                assert!(
+                    std::time::Instant::now() < dropped_by,
+                    "node 1 never dropped node 3"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
 
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
         db.links().heal_all();
@@ -5097,7 +5281,49 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        let generation = of(&db, OWNER).recovered.expect("node 1 recovered");
+        // A-R370: once node 1 has dropped node 3, node 3 is a full copy again only at the
+        // commit after the promote of its shadow.
+        let dropped = |lines: &[serde_json::Value]| {
+            lines
+                .iter()
+                .any(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3)
+        };
+        let generation = loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+            if !dropped(&lines) {
+                break of(&db, OWNER).recovered.expect("node 1 recovered");
+            }
+            // A12: only a drop before the restart is the stall this side is for; a restarted
+            // copy dropped afterwards is a fault, even when the re-add then repairs it.
+            let drop = lines
+                .iter()
+                .position(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3);
+            let restart = lines
+                .iter()
+                .position(|line| line["@m"] == "node_restarted" && line["node"] == 3);
+            assert!(
+                restart.is_some() && drop < restart,
+                "node 1 dropped node 3 after its restart: drop line {drop:?}, restart line \
+                 {restart:?}"
+            );
+            let promoted = lines
+                .iter()
+                .position(|line| line["@m"] == "shadow_promote")
+                .and_then(|at| {
+                    lines[at..]
+                        .iter()
+                        .find(|line| line["@m"] == "rejoin_committed")
+                })
+                .and_then(|line| line["generation"].as_u64());
+            if let Some(promoted) = promoted {
+                break Generation(promoted);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 dropped node 3 and did not promote it back within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let target = of(&db, OWNER).holds.expect("node 1 holds").applied;
         loop {
             let held = of(&db, NodeId(3)).holds;
@@ -5141,7 +5367,7 @@ mod tests {
         assert_eq!(three, one, "node 3 holds node 1's head and digest");
 
         config_log::layer::flush_test_logs();
-        let gave_up: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        let gave_up: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), method)
             .into_iter()
             .filter(|line| line["@m"] == "rejoin_abandoned" || line["@m"] == "catch_up_refused")
             .collect();
@@ -6643,6 +6869,86 @@ mod tests {
         );
         drop(db);
         node_1.join().expect("the stub");
+    }
+
+    /// A-R319 (W5's probe for A-R313 row 1; critic-degraded M3): `admin promote 2` while node 1
+    /// is stopped and node 2 cannot reach node 3. Node 2 commits read-only, with node 3 pinned
+    /// outside the barrier. While it stays so, node 2's status names the stall although L1
+    /// admits, since a read-only commit takes no write whatever L1 says. Once the link heals,
+    /// node 2 re-plans the same members, and a put lands at a later generation.
+    /// Cuts: `repair_duty` returns at once, red (still refused after the heal); `rebuild_check`
+    /// stays quiet while L1 admits a read-only commit, red (no stall line).
+    /// Integration (~10 s): the promote waits node 1's grant out, then the 5 s rebuild pin wait.
+    #[config_log::retcd_test]
+    fn m10_s2_a_promote_that_missed_node_3_takes_writes_once_node_3_is_back() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"a", b"1", None).expect("put a");
+        lock(&db.nodes)
+            .iter_mut()
+            .find(|handle| handle.node == OWNER)
+            .expect("node 1 runs here")
+            .stop();
+        db.links().hold(NodeId(2), NodeId(3));
+        let promoted = db.promote(NodeId(2), None).expect("promote 2");
+        let node_2 = |db: &Db| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == NodeId(2))
+        };
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(host::REBUILD_PIN_WAIT_MILLIS)
+            + patience;
+        let stalled = loop {
+            let status = node_2(&db);
+            if let Some(line) = status.as_ref().and_then(|status| status.stalled.clone()) {
+                break line;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 never named the read-only stall: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(stalled.contains("mode=ReadOnly"), "{stalled}");
+
+        assert!(
+            db.links().heal(NodeId(2), NodeId(3)) > 0,
+            "the link was held"
+        );
+        let healed = std::time::Instant::now();
+        let landed = loop {
+            match db.put(b"b", b"2", None) {
+                Ok(put) => break put,
+                Err(error) => assert!(
+                    healed.elapsed() < patience,
+                    "still refused {patience:?} after the heal: {error:?} {:?}",
+                    node_2(&db)
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            landed.generation > promoted.generation,
+            "{landed:?} after {promoted:?}"
+        );
+        tracing::info!(
+            waited_ms = healed.elapsed().as_millis(),
+            generation = landed.generation.0,
+            "promote_repair_after_heal_ms"
+        );
+        db.shutdown();
     }
 
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
@@ -9173,7 +9479,8 @@ mod tests {
             .expect("open")
         };
         // A put lands, or fails at once if it is OVERLOADED. A host-load refusal such as a
-        // lapsed grant's LEASE_EXPIRED is retried; CONDITION_FAILED means an earlier try landed.
+        // lapsed grant's LEASE_EXPIRED wrote nothing and is retried; CONDITION_FAILED means an
+        // earlier try that was not refused (a timeout, say) landed.
         let land = |db: &Db, key: &[u8], what: &str| {
             let patience = crate::host::test_patience(Duration::from_secs(5));
             let deadline = std::time::Instant::now() + patience;
@@ -9982,6 +10289,12 @@ mod tests {
     /// D2 (design-ackfloor §5): with the floor on, a `Db` writes far past a small dedup cap, and
     /// every copy keeps on disk only the newest answer and its open's floor record. Cap 3, 150
     /// puts, none `OVERLOADED`. With the floor off the fourth put is `OVERLOADED`.
+    ///
+    /// A put refused `PROTECTION_PAUSED` is sent again once node 1 admits, which must happen
+    /// within patience (ruling A-R293). Under host load a WAL flush can outlast `fast()`'s
+    /// 400 ms pause age: in gate run 20261023-183438 every node's flush took 398-416 ms and L1
+    /// paused at seq 78. A pause proves no mutation, so the resend is safe and adds no dedup
+    /// row. Any other refusal, `OVERLOADED` from a filled cap above all, still fails at once.
     /// Integration (~1 s): three node threads, 150 puts.
     #[config_log::retcd_test]
     fn m10_s2_d2_a_small_cap_never_fills_and_each_copy_keeps_two_dedup_rows() {
@@ -9996,9 +10309,19 @@ mod tests {
             .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
             .expect("open");
         admits(&db, "after the open");
+        let mut paused = 0_u32;
         for n in 0..150_u32 {
-            db.put(b"a", &n.to_le_bytes(), None)
-                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+            loop {
+                match db.put(b"a", &n.to_le_bytes(), None) {
+                    Ok(_) => break,
+                    Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => {
+                        paused += 1;
+                        tracing::info!(put = n, paused, "d2_put_paused_resend");
+                        admits(&db, "after a pause");
+                    }
+                    Err(refused) => panic!("put {n}: {refused:?}"),
+                }
+            }
         }
         db.shutdown();
         drop(db);

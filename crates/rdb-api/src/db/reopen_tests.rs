@@ -2142,8 +2142,9 @@ fn m10_s2_a_folder_opened_against_another_store_says_to_open_it_against_its_own(
     );
 }
 
-/// A-R231(a): a node process started on a folder no formation wrote is refused before it
-/// creates anything, and says to form the database first. Unit (~20 ms): nothing opens.
+/// A-R231(a), narrowed by A-R328: a node process started on a folder while the control store
+/// holds no `partitions/1` is refused before it creates anything, and says the database is not
+/// formed and to run lr up. Unit (~20 ms): nothing opens.
 #[config_log::retcd_test]
 fn m10_s2_a_node_process_on_an_unformed_folder_says_to_form_it_first() {
     let rt = runtime();
@@ -2159,7 +2160,8 @@ fn m10_s2_a_node_process_on_an_unformed_folder_says_to_form_it_first() {
     let text = refused.to_string();
     assert!(
         text.contains(
-            "holds no copy of node 2: form the database first (lr up), then start node 2 again"
+            "database not formed: the control store holds no partitions/1, so node 2 has no \
+             database to rejoin. Run lr up to form it"
         ),
         "{text}"
     );
@@ -2173,9 +2175,9 @@ fn m10_s2_a_node_process_on_an_unformed_folder_says_to_form_it_first() {
     );
 }
 
-/// A-R231(a): a node process whose copy exists but holds no data (formation never reached
-/// it) is refused before it binds or bootstraps, and says to form the database first.
-/// Unit (~100 ms): one empty RocksDB copy.
+/// A-R231(a), narrowed by A-R328: a node process whose copy exists but holds no data, while
+/// the control store holds no `partitions/1`, is refused before it binds or bootstraps, and
+/// says the database is not formed. Unit (~100 ms): one empty RocksDB copy.
 #[config_log::retcd_test]
 fn m10_s2_a_node_process_on_an_empty_copy_says_to_form_it_first() {
     let rt = runtime();
@@ -2189,7 +2191,7 @@ fn m10_s2_a_node_process_on_an_empty_copy_says_to_form_it_first() {
     };
     let text = refused.to_string();
     assert!(
-        text.contains("the copy of node 2 holds no data: form the database first (lr up)"),
+        text.contains("database not formed: the control store holds no partitions/1, so node 2"),
         "{text}"
     );
     let partitions = rt
@@ -2198,6 +2200,190 @@ fn m10_s2_a_node_process_on_an_empty_copy_says_to_form_it_first() {
         }))
         .expect("read partitions/1");
     assert!(partitions.record.is_none(), "nothing was bootstrapped");
+}
+
+/// `partitions/1`'s raw record in `store`, with its revisions.
+fn partitions_record(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+) -> Option<config_core::Record> {
+    rt.block_on(store.get(config_core::GetRequest {
+        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+    }))
+    .expect("read partitions/1")
+    .record
+}
+
+/// A-R328 (tester D6): after formation, node 2's copy is wiped (`lr start 2 --wipe`). Its
+/// process creates an empty copy, binds the formed database's instance, and starts it as a
+/// behind copy that holds no lineage until F1 rebuilds it. It never forms or bootstraps: the
+/// open writes nothing to `partitions/1`, and starts no heal. Cut: the old A-R231(a) refusal
+/// ("holds no copy of node 2: form the database first"), and this open is refused `Config`.
+/// Integration (~1 s): one fresh open until ready, one node-process open.
+#[config_log::retcd_test]
+fn m10_s2_a_wiped_member_copy_rejoins_the_formed_database_as_a_behind_copy() {
+    const METHOD: &str = "m10_s2_a_wiped_member_copy_rejoins_the_formed_database_as_a_behind_copy";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let instance = marker(dir.path(), 1).expect("the formed database's instance");
+    let before = partitions_record(&rt, &store).expect("partitions/1 after formation");
+    std::fs::remove_dir_all(dir.path().join("nodes").join("2")).expect("wipe node 2's copy");
+
+    let mut db = open_node(&rt, dir.path(), &store, &[2]).expect("node 2's process opens");
+    let running: Vec<NodeId> = lock(&db.nodes).iter().map(|handle| handle.node).collect();
+    assert_eq!(running, vec![NodeId(2)], "it runs node 2 only");
+    let status = db.inspect(NodeId(2)).expect("node 2 answers");
+    assert_eq!(
+        status.holds, None,
+        "the copy holds no lineage until F1 rebuilds it: {status:?}"
+    );
+    db.shutdown();
+    assert_eq!(
+        marker(dir.path(), 2),
+        Some(instance),
+        "the empty copy is bound to the formed database's instance"
+    );
+    let after = partitions_record(&rt, &store).expect("partitions/1 after the join");
+    assert_eq!(
+        (after.mod_revision, after.value),
+        (before.mod_revision, before.value),
+        "the join wrote nothing to partitions/1"
+    );
+    let logged = messages(METHOD);
+    assert!(
+        logged.iter().any(|m| m == "db_open_empty_copy_joining"),
+        "{logged:?}"
+    );
+    assert!(
+        !logged.iter().any(|m| m == "db_heal_started"),
+        "node 2 is not the owner, so its process heals nothing: {logged:?}"
+    );
+}
+
+/// A-R328: `partitions/1` exists but names no instance yet (the first open has not finished).
+/// A node process on an empty folder is refused before it creates anything, and is told to wait
+/// for that open. Unit (~20 ms): nothing opens.
+#[config_log::retcd_test]
+fn m10_s2_a_node_process_before_the_first_open_finishes_is_told_to_wait() {
+    use rdb_core::contracts::ids::{Generation, OwnerEpoch};
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let record = PartitionRecord {
+        partition: PARTITION,
+        owner: OWNER,
+        generation: Generation(0),
+        owner_epoch: OwnerEpoch(0),
+        config_version: admin::CONFIG_VERSION,
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        value: record.encode(),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("put partitions/1 with no root");
+    let dir = config_testkit::fs::temp_dir();
+    let refused = match open_node(&rt, dir.path(), &store, &[3]) {
+        Err(error @ OpenError::Config(_)) => error,
+        other => panic!("Config, not {:?}", other.map(|_| "Db")),
+    };
+    assert!(
+        refused.to_string().contains(
+            "database not formed yet: partitions/1 names no instance. Wait for its first open \
+             (lr up) to finish, then start node 3 again"
+        ),
+        "{refused}"
+    );
+    assert!(
+        !dir.path().join("nodes").join("3").exists(),
+        "no copy was created"
+    );
+}
+
+/// A-R328: a node that is not a member of partition 1 has no copy to rebuild, and the refusal
+/// names the members. `local_nodes` refuses such a node before any open reaches the check, so
+/// this calls the check itself. Integration (~1 s): one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_s2_a_node_that_is_not_a_member_is_refused_with_the_members() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    match rt.block_on(formed_member(&store, &[NodeId(2), NodeId(4)])) {
+        Err(OpenError::Config(text)) => assert_eq!(
+            text,
+            "node 4 is not a member of partition 1 (its members are nodes 1, 2, 3), so it holds \
+             no copy to rebuild"
+        ),
+        other => panic!("Config, not {other:?}"),
+    }
+    let (record, instance) = rt
+        .block_on(formed_member(&store, &[NodeId(2)]))
+        .expect("node 2 is a member");
+    assert_eq!(
+        (record.owner, Some(instance)),
+        (OWNER, marker(dir.path(), 1)),
+        "a member's check returns the owner and the formed instance"
+    );
+}
+
+/// A-R328: an empty copy already bound to another database's instance does not join this one.
+/// The open is refused `Mismatch` and the copy keeps its own binding. Integration (~1 s): one
+/// fresh open until ready, one refused node-process open.
+#[config_log::retcd_test]
+fn m10_s2_an_empty_copy_bound_to_another_instance_is_refused() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let formed = marker(dir.path(), 1).expect("the formed database's instance");
+    let copy = dir.path().join("nodes").join("2");
+    std::fs::remove_dir_all(&copy).expect("wipe node 2's copy");
+    let other = [9; INSTANCE_LEN];
+    {
+        let mut engine = RocksEngine::open(&copy).expect("an empty copy");
+        engine.bind_instance(other).expect("bind another instance");
+    }
+    match open_node(&rt, dir.path(), &store, &[2]) {
+        Err(OpenError::Mismatch(text)) => assert_eq!(
+            text,
+            another_database(
+                &other,
+                &format!("instance {}", admin::instance_hex(&formed))
+            )
+        ),
+        other => panic!("Mismatch, not {:?}", other.map(|_| "Db")),
+    }
+    assert_eq!(
+        marker(dir.path(), 2),
+        Some(other),
+        "the copy keeps its binding"
+    );
+}
+
+/// A-R328: the owner's own copy, wiped, is not rejoined as a behind copy: nothing could rebuild
+/// it while `partitions/1` names it owner. The refusal says to promote another node first, and
+/// the empty copy stays unbound. Integration (~1 s): one fresh open until ready, one refused
+/// node-process open.
+#[config_log::retcd_test]
+fn m10_s2_the_owners_wiped_copy_is_refused_with_a_promote_hint() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    std::fs::remove_dir_all(dir.path().join("nodes").join("1")).expect("wipe node 1's copy");
+    match open_node(&rt, dir.path(), &store, &[1]) {
+        Err(OpenError::Config(text)) => assert_eq!(
+            text,
+            "the copy of node 1 holds no data, and partition 1 names it owner: promote another \
+             node first (lr promote), then start node 1 again"
+        ),
+        other => panic!("Config, not {:?}", other.map(|_| "Db")),
+    }
+    assert_eq!(marker(dir.path(), 1), None, "the empty copy stays unbound");
 }
 
 /// A-R231(a), B1 case 1: after formation, node 2's process opens its own copy only. It is not
@@ -2549,6 +2735,7 @@ fn m10_s2_a_restarted_node_keeps_the_write_buffer_this_db_was_opened_with() {
                 storage: crate::StorageOptions {
                     write_buffer_bytes: Some(ASKED),
                     memtable_budget_bytes: None,
+                    block_cache_bytes: None,
                 },
                 ..config(dir.path())
             },

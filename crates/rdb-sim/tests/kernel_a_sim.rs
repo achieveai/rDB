@@ -667,6 +667,81 @@ fn freeze_while_dispatched(source: FenceSource) {
     );
 }
 
+/// A-R324, the simulator twin of host row
+/// `a_node_fence_sited_at_partition_0_freezes_partition_1s_queue`. A1 sites a node fence at the
+/// partition of the event that tripped it. Here that is a `NodeLifecycle::Resumed` past the
+/// resume-gap tolerance, queued on B at partition 0, where B serves no T1 or P1, behind A1's
+/// `Dispatch` answer for request 11. The dispatcher delivers the fence at partition 1 too, so
+/// T1 freezes on the dispatched seq 11 with its lost authority, and P1 freezes with it. Before
+/// A-R324 the fence reached partition 0 only, and both stayed open.
+///
+/// A-R331: the fan-out set is A1's own fence views. B also serves partition 2, seeded as a
+/// `partitions/2` record naming B, with no plan: A1 views it, so its P1 takes the fence too,
+/// and no T1 is made there.
+#[retcd_test]
+fn a_node_fence_sited_at_partition_0_freezes_partition_1() {
+    support::preamble();
+    let mut plan = a1p1_plan();
+    let p2 = PartitionRecord {
+        partition: PartitionId(2),
+        owner: B,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+        config_version: rdb_core::contracts::ids::ConfigVersion(1),
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    plan.control_records
+        .push((ControlKey::Partition(PartitionId(2)), p2.encode()));
+    let mut runner = Runner::new(&plan).expect("runner");
+    let mut replies = run_to(&mut runner, SUBMIT - 1);
+    cut_b(&mut runner);
+    while !dispatch_decided(&runner, SUBMIT) {
+        assert!(
+            step(&mut runner, SUBMIT, &mut replies),
+            "the tick ran out before the answer"
+        );
+    }
+    runner
+        .queue(&SeedEvent {
+            partition: PartitionId(0),
+            ..on_b(
+                SUBMIT,
+                9_701,
+                EventKind::Node(NodeLifecycle::Resumed {
+                    suspended_millis: Budgets::SPEC_DEFAULTS.resume_gap_tolerance_millis + 1,
+                }),
+            )
+        })
+        .expect("queue");
+    while step(&mut runner, SUBMIT, &mut replies) {}
+    let lost = FreezeCause::AuthorityLost(DenyReason::ProcessSuspended);
+    assert_eq!(
+        *t1(&runner).mode(),
+        QueueMode::Frozen {
+            cause: lost,
+            unresolved: Some(Seq(WRITE)),
+        },
+        "T1 on partition 1 froze on the dispatched seq 11"
+    );
+    assert_eq!(
+        p1(&runner).mode,
+        PubMode::Frozen { cause: lost },
+        "P1 on partition 1 took the same fence"
+    );
+    let dispatcher = runner.dispatcher();
+    assert_eq!(
+        (
+            dispatcher
+                .publication()
+                .view(B, PartitionId(2))
+                .map(|view| view.mode),
+            dispatcher.transaction().kernel(B, PartitionId(2)).is_some(),
+        ),
+        (Some(PubMode::Frozen { cause: lost }), false),
+        "partition 2's P1 (made by A1's view) took the fence; no T1 was made there"
+    );
+}
+
 // ---- M7A-163 --------------------------------------------------------------------------------
 
 /// M7A-163 (ADR 0008 "Dropped control operation", both consumers). The control completion B's

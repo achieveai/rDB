@@ -202,10 +202,14 @@ async fn m5_11_crash_before_snapshot_tmp_sync_leaves_no_publication() {
     }
 
     // The node rejoins and keeps serving — the crash was recoverable, not fatal to the cluster.
-    let leader_after = cluster.leader().await;
+    // Leadership can move between finding the leader and the put: under 3 loaders it did, and
+    // the put answered `NotLeader` (A-R347, 1 of 15), so it follows the move.
+    let first = cluster.leader().await;
     cluster
-        .client(leader_after)
-        .put(put_req("/m5/11/after", "v"))
+        .retry_on_not_leader(first, cluster.deadline(20), |node| {
+            let client = cluster.client(node);
+            async move { client.put(put_req("/m5/11/after", "v")).await }
+        })
         .await
         .expect("the cluster keeps serving after the crashed node recovers");
 }

@@ -33,8 +33,8 @@ use rdb_core::contracts::storage::{Batch, CapturedPrefix, DurablePrefix, Namespa
 use rdb_core::replication::append::PROGRESS_KEY;
 use rdb_core::transaction::dedup::parse_dedup_value;
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction, IteratorMode, Options,
-    WriteBatch, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction,
+    IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 
 use rdb_core::contracts::trace::Version;
@@ -66,7 +66,9 @@ pub struct StorageOptions {
     /// The memtable budget of the whole store, every column family together, in bytes
     /// (RocksDB's `db_write_buffer_size`, ruling A-R300). When the memtables reach about 7/8
     /// of it, RocksDB switches the oldest one out and flushes it, so memtable memory stays near
-    /// the budget however long the writes go on. `None` keeps
+    /// the budget however long the writes go on. A write that finds the memtables at the budget
+    /// waits for a flush to free memory (A-R349), so a flush that lags under load slows writes
+    /// rather than letting memory grow past the budget. `None` keeps
     /// [`DEFAULT_MEMTABLE_BUDGET_BYTES`] (64 MiB).
     ///
     /// It also caps two things that would otherwise outgrow it:
@@ -77,7 +79,15 @@ pub struct StorageOptions {
     ///   rarely keeps its oldest WAL file alive; past that size RocksDB flushes it so the file
     ///   can go. RocksDB's own limit is 4 times the sum of every column family's memtables.
     pub memtable_budget_bytes: Option<usize>,
+    /// The block cache of the whole store, every column family together, in bytes (ruling
+    /// A-R315): one LRU cache that every column family's table reads share. `None` keeps
+    /// [`DEFAULT_BLOCK_CACHE_BYTES`] (64 MiB). Without it RocksDB gives each column family a
+    /// cache of its own, 32 MiB each, so the store's read cache grew with its column families.
+    pub block_cache_bytes: Option<usize>,
 }
+
+/// The default block cache of one store, all column families together (A-R315): 64 MiB.
+pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 << 20;
 
 /// The default memtable budget of one store, all column families together (A-R300): 64 MiB,
 /// one column family's worth at RocksDB's own size.
@@ -108,6 +118,12 @@ impl StorageOptions {
     pub fn effective_cf_write_buffer_bytes(&self) -> usize {
         self.effective_write_buffer_bytes()
             .min(self.effective_memtable_budget_bytes())
+    }
+
+    /// The block cache of the whole store.
+    #[must_use]
+    pub fn effective_block_cache_bytes(&self) -> usize {
+        self.block_cache_bytes.unwrap_or(DEFAULT_BLOCK_CACHE_BYTES)
     }
 
     /// `max_total_wal_size`: [`WAL_BUDGETS`] memtable budgets.
@@ -459,8 +475,18 @@ impl RocksEngine {
             // open replays, flushes and rotates before the marker can be read.
             read_only(&path)?;
         }
-        let options = db_options(!existed, storage);
-        let db = DB::open_cf_descriptors(&options, &path, descriptors(storage))
+        // A-R315: one block cache for the store, shared by every column family.
+        let cache = Cache::new_lru_cache(storage.effective_block_cache_bytes());
+        let mut options = db_options(!existed, storage);
+        // A-R349: `db_write_buffer_size` alone only asks for a flush; under load the flushes lag
+        // and the memtables outgrew the budget (4.3 MiB on a 1 MiB budget). A manager that
+        // stalls makes it a bound: a write that finds the memtables at the budget waits for a
+        // flush to free memory.
+        options.set_write_buffer_manager(&WriteBufferManager::new_write_buffer_manager(
+            storage.effective_memtable_budget_bytes(),
+            true,
+        ));
+        let db = DB::open_cf_descriptors(&options, &path, descriptors(storage, &cache))
             .map_err(|e| backend(&path, &e))?;
         let (created, format) = ensure_format(&db, &path, existed)?;
         let instance = read_instance(&db, &path)?;
@@ -492,6 +518,7 @@ impl RocksEngine {
             memtable_budget_bytes = storage.effective_memtable_budget_bytes(),
             cf_write_buffer_bytes = storage.effective_cf_write_buffer_bytes(),
             max_total_wal_bytes = storage.max_total_wal_bytes(),
+            block_cache_bytes = storage.effective_block_cache_bytes(),
             "storage_open"
         );
         Ok(Self {
@@ -611,6 +638,52 @@ impl RocksEngine {
                 .ok_or_else(|| format!("RocksDB has no {PROPERTY} for {cf}"))?;
         }
         Ok(total)
+    }
+
+    /// The block caches the store reads through, as `(capacity, usage)` in bytes, each cache
+    /// counted once (A-R315). Every column family and RocksDB's `default` is asked for its
+    /// cache's id (`rocksdb.block-cache-entry-stats`), capacity and usage; column families
+    /// that share a cache report the same id. So a store with one shared cache answers that
+    /// cache's numbers, and one with a cache per column family answers their sum.
+    ///
+    /// # Errors
+    ///
+    /// When RocksDB cannot answer for a column family, or its entry stats name no cache.
+    pub fn block_cache(&self) -> Result<(u64, u64), String> {
+        let mut caches = BTreeMap::new();
+        for cf in std::iter::once("default").chain(COLUMN_FAMILIES) {
+            let handle = self
+                .db
+                .cf_handle(cf)
+                .ok_or_else(|| format!("no column family {cf}"))?;
+            let int = |property: &str| {
+                self.db
+                    .property_int_value_cf(handle, property)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("RocksDB has no {property} for {cf}"))
+            };
+            let stats = self
+                .db
+                .property_value_cf(handle, "rocksdb.block-cache-entry-stats")
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("RocksDB has no block cache entry stats for {cf}"))?;
+            // "Block cache <id> capacity: ..." (RocksDB's `CacheEntryRoleStats::ToString`).
+            let id = stats
+                .strip_prefix("Block cache ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .ok_or_else(|| format!("no cache id in {cf}'s entry stats: {stats}"))?
+                .to_owned();
+            caches.insert(
+                id,
+                (
+                    int("rocksdb.block-cache-capacity")?,
+                    int("rocksdb.block-cache-usage")?,
+                ),
+            );
+        }
+        Ok(caches
+            .values()
+            .fold((0, 0), |(cap, used), (c, u)| (cap + c, used + u)))
     }
 
     /// The directory this engine is open on.
@@ -1644,16 +1717,32 @@ fn db_options(create: bool, storage: StorageOptions) -> Options {
 /// Each of [`COLUMN_FAMILIES`]' options, RocksDB's own but for the memtable budget (A-R248,
 /// capped by the store's budget since A-R300). RocksDB's `default` column family holds
 /// nothing of ours and keeps its own.
-fn cf_options(storage: StorageOptions) -> Options {
+fn cf_options(storage: StorageOptions, cache: &Cache) -> Options {
     let mut opts = Options::default();
     opts.set_write_buffer_size(storage.effective_cf_write_buffer_bytes());
+    opts.set_block_based_table_factory(&table_options(cache));
     opts
 }
 
-fn descriptors(storage: StorageOptions) -> Vec<ColumnFamilyDescriptor> {
+/// RocksDB's own table options but for the block cache: the store's one cache (A-R315), so
+/// no column family gets a 32 MiB cache of its own.
+fn table_options(cache: &Cache) -> BlockBasedOptions {
+    let mut table = BlockBasedOptions::default();
+    table.set_block_cache(cache);
+    table
+}
+
+fn descriptors(storage: StorageOptions, cache: &Cache) -> Vec<ColumnFamilyDescriptor> {
     COLUMN_FAMILIES
         .iter()
-        .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(storage)))
+        .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(storage, cache)))
+        // A-R315: named here because rust-rocksdb otherwise adds `default` with
+        // `Options::default()`, and so a 32 MiB cache of its own. Its memtable stays RocksDB's.
+        .chain(std::iter::once(ColumnFamilyDescriptor::new("default", {
+            let mut opts = Options::default();
+            opts.set_block_based_table_factory(&table_options(cache));
+            opts
+        })))
         .collect()
 }
 
