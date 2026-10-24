@@ -2122,6 +2122,58 @@ fn a_write_unpublished_at_a_fence_is_what_the_queue_waits_on_until_it_publishes(
     drop(unacknowledged);
 }
 
+/// A-R376: a node fence that A1 notices on another partition's event still freezes partition
+/// 1's queue. A1 ends admission on every partition (A-R53.1), but its `Fence` effect carries
+/// the noticing event's partition, and T1 freezes only the partition of the event it steps.
+/// The fence here is a long suspension, injected on partition 0 so it is noticed there, as an
+/// expiry was in the flaky runs of the row above (2 of 4 full rdb-api runs, 2026-10-24).
+/// The put stays unpublished (both ACKs dropped), so status names seq 2 and admits nothing.
+#[config_log::retcd_test]
+fn a_node_fence_noticed_on_another_partition_freezes_this_partitions_queue() {
+    use rdb_core::contracts::event::NodeLifecycle;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    trio.links.drop_direction(NodeId(2), NodeId(1));
+    trio.links.drop_direction(NodeId(3), NodeId(1));
+    let unacknowledged = trio.call(put(1, b"a", b"1", None));
+    trio.until("node 1 applies seq 2", |trio| {
+        (trio.head() == Some(2)).then_some(())
+    });
+
+    trio.nodes[0]
+        .1
+        .send(Msg::Inject {
+            partition: PartitionId(0),
+            correlation: CorrelationId(7_600),
+            kind: EventKind::Node(NodeLifecycle::Resumed {
+                suspended_millis: 60_000,
+            }),
+        })
+        .expect("send");
+    let fenced = trio.until("node 1 fenced", |trio| {
+        let status = trio.status(0);
+        status.fence.is_some().then_some(status)
+    });
+    assert_eq!(
+        (
+            fenced.fence,
+            fenced.waits_on,
+            fenced.admits,
+            fenced.published.map(|(_, seq)| seq)
+        ),
+        (
+            Some(DenyReason::ProcessSuspended),
+            Some(Seq(2)),
+            Some(false),
+            Some(Seq(1))
+        ),
+        "partition 1's queue is frozen on the unpublished put: {fenced:?}"
+    );
+    drop(unacknowledged);
+}
+
 /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
 /// logged, never dropped in silence, and the primary neither faults nor stops taking
 /// writes: copy 1 still acknowledges. The `SendFailed` event it also queues is not asserted:

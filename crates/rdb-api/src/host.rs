@@ -3314,6 +3314,39 @@ impl Host {
                 );
                 if *scope == FenceScope::Node {
                     self.schedule_acquire_after_fence(site);
+                    // A-R376: A1 ends admission on every partition (A-R53.1), but its one
+                    // `Fence` carries the partition of the event that noticed it, and T1 and P1
+                    // freeze only the partition they step. So every other partition this node
+                    // holds a view or a commit for gets the fence too; the noticing one gets it
+                    // below. A partition with no T1 instance ignores it (`NotPrimary`).
+                    let others: BTreeSet<PartitionId> = self
+                        .authority_views
+                        .keys()
+                        .chain(self.committed.keys())
+                        .copied()
+                        .filter(|partition| *partition != site.partition)
+                        .collect();
+                    for partition in others {
+                        tracing::info!(
+                            node,
+                            from = site.partition.0,
+                            partition = partition.0,
+                            reason = ?reason,
+                            "authority_fence_fanned"
+                        );
+                        self.push(
+                            Site {
+                                partition,
+                                correlation: site.correlation,
+                            },
+                            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Fence {
+                                scope: *scope,
+                                reason: *reason,
+                            })),
+                            true,
+                            None,
+                        );
+                    }
                 }
             }
             KernelEffect::SetAdmission(state) => {
