@@ -16,7 +16,7 @@
 # database once in one process (rdb_node --form, ruling A-R231), then starts rdb_node 1, 2 and 3,
 # each holding only its own copy, and waits for each to say ready. Ctrl-C or a failed step brings
 # everything it started back down. `up --resume` starts a run that is down again (its rEtcd,
-# then nodes 1-3) with the binaries and ports it was started with; nothing is formed anew.
+# then nodes 1-3) with its ports and binary paths; nothing is formed anew.
 #
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
 # it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
@@ -361,19 +361,31 @@ run_basis() {
 }
 
 up() {
-    if [ "$RESUME" = 1 ]; then pick_run; fi
-    local lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 43)) p sha stamp
+    local lo hi p sha stamp n role fix="pick another --base-port"
+    if [ "$RESUME" = 1 ]; then
+        pick_run
+        # A run still up says so before the port checks below, which would otherwise blame
+        # the base port: a resume cannot change it, run.env sets it (critic-w5g A1).
+        for n in 1 2 3; do
+            node_alive "$n" && die "node $n of $RUN still runs: the run is up; 'lr down' first"
+        done
+        for role in $(awk '$1 ~ /^retcd-/ { print $1 }' "$RUN/pids" 2>/dev/null); do
+            os_pid_is "$(pid_of "$role")" config-server \
+                && die "rEtcd ($role) of $RUN still runs: the run is up; 'lr down' first"
+        done
+        fix="stop what holds it: this run's ports are fixed in $RUN/run.env"
+    fi
+    lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 43))
     for p in 27021 27031; do
         [ "$p" -lt "$lo" ] || [ "$p" -gt "$hi" ] || die "ports $lo-$hi hold $p (mongod on this host); pick another --base-port"
     done
     for p in $(seq "$lo" "$hi"); do
-        port_free "$p" || die "port $p is already in use; pick another --base-port (lr uses $lo-$hi)"
+        port_free "$p" || die "port $p is already in use; $fix (lr uses $lo-$hi)"
     done
     if [ "$RESUME" = 1 ]; then
-        # The run kept its rEtcd data and its copies across `down`: start them again, with
-        # the binaries it was started with (run.env). Nothing is formed or made anew.
-        local n
-        for n in 1 2 3; do node_alive "$n" && die "node $n of $RUN runs; resume a run that is down"; done
+        # The run kept its rEtcd data and its copies across `down`: start them again, from
+        # the binary paths in run.env (a later `up` may have rebuilt them in place). Nothing
+        # is formed or made anew.
         echo "$RUN" > "$ROOT/current"
         start_retcd
         start_all

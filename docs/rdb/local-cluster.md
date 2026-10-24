@@ -61,7 +61,7 @@ works as written. `--run DIR` picks another run.
 | `kill N` | Kills node N at once, like a crash. Prints `lr: node N killed (pid ...)`. |
 | `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. |
 | `down` | Stops the nodes and rEtcd. The run folder stays, with its data and logs. |
-| `up --resume` | Starts the last run again after a `down`: its rEtcd, then nodes 1, 2 and 3, with the binaries and ports it was started with. The data written before `down` is still there. Plain `up` always makes a **new**, empty run. |
+| `up --resume` | Starts the last run again after a `down`: its rEtcd, then nodes 1, 2 and 3, with its own ports and binary paths (a later `up` rebuilds those binaries in place). The data written before `down` is still there. A run that is still up is refused: "the run is up; 'lr down' first". Plain `up` always makes a **new**, empty run. |
 | `clean` | `down`, then deletes the run folder, **its logs included**: copy what you need first. Prints `lr: removed <run folder>`. |
 
 `scripts/local-rdb.sh` with no verb lists every verb, including the fault verbs.
@@ -215,7 +215,7 @@ app holds none, so:
 - **No `InUse`.** Nothing is locked, and two app processes may run at once (the `ClientId`
   bullet above).
 - **Each open still counts once in rEtcd**, so the open counter's limit (`OpenError::Counter`,
-  2^24 opens) covers app opens too.
+  2^23 opens, `admin::MAX_OPENS`) covers app opens too.
 - **The refusals an app open can see:** `Control` (rEtcd not reachable), `Counter`, and
   `Config` (no `links`, or a database not formed yet: "form the database first (lr up)").
   Folder errors (`Mismatch`, `Stale`, `CopyMissing`, `Node`) belong to the node processes:

@@ -278,13 +278,17 @@ To ask later, you need something saved before the process stopped. There are two
   `INVALID_ARGUMENT` and send nothing. A send refused before it went out, and `write_as`'s
   `Ok(None)` (the change came to nothing), say nothing about an earlier send under that id:
   ask `status`.
-- **Save a request whose answer was not definitive, and only that.** An `UNKNOWN_OUTCOME`
-  hands the request back in `refused.request`, boxed: save `*request`. A `TxnRequest`
+- **Save a request whose answer was not definitive, and only that.** That is any refusal with
+  `no_mutation` false that hands the request back in `refused.request`, boxed: save
+  `*request`. `UNKNOWN_OUTCOME` is the common one; `UNAVAILABLE` "went out of reach while this
+  call waited" is another. A `TxnRequest`
   serializes with `serde_json` (in the `Cargo.toml` of section 2). Write it to a file and sync
   it (`File::sync_data`). **Delete it on any definitive answer**: `Ok`, or a refusal with
   `no_mutation` true. Never save a request after `Ok`: the ack floor (below) drops its answer
   once a later write is answered, and then asking can only say "read the object". So after a
-  restart only unanswered requests remain, and the owner keeps each of their answers.
+  restart only unanswered requests remain. The owner keeps their answers too, with three
+  limits: at most 8 unsettled writes per open, not across a restart of the owner, and not past
+  the dedup retention. Past those, asking answers "read the object".
   A `put` builds its request inside `Db`, so a kill before any answer leaves nothing to save:
   use the first way for writes that must survive that.
 
@@ -297,7 +301,8 @@ With neither, a kill before any answer leaves nothing to ask about. Read the dat
 | Embedded (this page: `local` lists the nodes) | a reopen, so a new generation | `GENERATION_CHANGED`, with nothing applied by that send. Then ask `status` |
 | Three processes ([`local-cluster.md`](local-cluster.md): `local` empty) | a new open in the **same** generation | its own answer, replayed (`Ok`); or `Ok` because it applied now, if it never reached the owner; or `STATUS_EXPIRED` if its answer was dropped. `GENERATION_CHANGED` only if a node process restarted meanwhile |
 
-`did_it_land` below handles both. Rows `m10_r189_...` (embedded) and
+`did_it_land` below handles both. Rows
+`m10_r357_the_guide_s_did_it_land_answers_an_embedded_app_after_its_reopen` (embedded) and
 `m10_r357_the_guide_s_did_it_land_answers_an_app_restarted_over_the_links` (three processes) in
 `crates/rdb-api/src/db/reopen_tests.rs` run it.
 
@@ -311,11 +316,13 @@ Then ask:
   answers differ: without it, a record from an older generation that is gone answers `Unknown`
   instead of `Expired`.
 - **`Unknown`, `Expired` and `STATUS_EXPIRED` are never proof that it did not land** (spec
-  §8.1). `STATUS_EXPIRED` and `Expired` mean the answer was dropped: the app was answered for it
-  earlier, or it is older than the dedup retention (`DbConfig::dedup_retention`, 24 h by
-  default). The refusal's text says which: "this app already received an answer for it in this
-  open", or "an earlier open of this client received an answer for it, or it stayed unsettled
-  past the dedup retention". Either way, read the object: its value is the answer. Never send
+  §8.1). `STATUS_EXPIRED` and `Expired` mean the answer was dropped. That happens when the app
+  was answered for it earlier, when it was one of more than 8 unsettled writes of one open,
+  when the owner restarted while it was unsettled, or when it is older than the dedup retention
+  (`DbConfig::dedup_retention`, 24 h by default). The refusal's text says whose floor it is
+  below: "below this open's ack floor", or "an earlier open of this client received an answer
+  for it, or it stayed unsettled past the dedup retention". Either way, read the object: its
+  value is the answer. Never send
   it as a new write on that refusal alone.
 - **Ask only after `wait_ready` returns `Ok`.** After that, do not keep asking: decide with
   `get`, or give up and report it. A request of the current open still in flight can answer
@@ -442,19 +449,29 @@ floor), so the table above no longer limits it.
 ### When writes pause
 
 Writes can pause without any error in your code. Most pauses end by themselves, and none
-loses data. A write made meanwhile is refused. Each refusal names its next step; this is what
-each one means:
+loses data. A write made meanwhile is refused.
 
-| Refusal | What happened to this write | What to do |
+**What happened to the write is in `refused.error.no_mutation`, not in the refusal's name.**
+
+- **`no_mutation` true:** this send wrote nothing, and no earlier send exists: a first send of
+  a new write. Retry it as the step says.
+- **`no_mutation` false:** an earlier send of this request may have applied. This is always the
+  case for a resend, whatever the refusal. Send the **same** request again with
+  `db.resend(..)` (the request is in `refused.request`), or ask `db.status(..)`. Never send it
+  as a new write under a new id: it could apply twice.
+
+What each refusal means, and when to retry:
+
+| Refusal | Why | When to retry |
 |---|---|---|
-| `PROTECTION_PAUSED` | Nothing: it was refused before it was applied. | Wait, then `db.resend(..)` with the request from `refused.request`. `db.node_status()` shows what writes wait on. |
-| `LEASE_EXPIRED` | Nothing: the owner's permission to write ran out. | `db.wait_ready(..)`, then resend. |
-| `GENERATION_CHANGED` | Nothing by this send: a node restarted and the generation moved on. | If the request was sent before, ask `db.status(..)` whether an earlier send applied it. Otherwise send it again. |
-| `UNKNOWN_OUTCOME` | Not known: no answer before the deadline (5 s at most; about 2 s in the walk below). | Ask `db.status(..)` with its id, or resend the same request. Never send it under a new id. |
-| `UNAVAILABLE`, "went out of reach while this call waited" | Not known: the owner's process stopped mid-call. | Once it is back, resend the same request, or ask `status`. |
-| `UNAVAILABLE`, "is not reachable ... nothing was sent" | Nothing. | Wait a few seconds and try again. A read is refused this way after 1 s (`Timeouts::read`). |
+| `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
+| `LEASE_EXPIRED` | The owner's permission to write ran out. | After `db.wait_ready(..)`. |
+| `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
+| `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
+| `UNAVAILABLE`, "went out of reach while this call waited" | The owner's process stopped mid-call. | Once it is back. |
+| `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 
-`did_it_land` above does the "ask" part. Keep retrying the same request and it lands once the
+`did_it_land` above does the "ask" part. Keep resending the same request and it lands once the
 pause ends.
 
 Measured with three processes on the dev host (local-cluster.md section 5 has the walk), an
@@ -551,7 +568,7 @@ does not help; the "what to do" column does.
 | `OpenError::Stale` | The folder is an old copy: the rEtcd records a newer generation than any copy here holds | Do not delete this directory: its acknowledged writes are intact. Open the folder, or restore the backup, that holds the generation the message names |
 | `OpenError::Unbound` | The folder was made before M10 (M9's `rdb_dev --keep`) and never bound to an rEtcd | Start a new folder; M9 dev data is not migrated |
 | `OpenError::CopyMissing` | One of the folder's `nodes/<n>` directories is missing or empty while another holds data | Restore that directory from where it came from |
-| `OpenError::Counter` | The folder's open counter is used up (2^24 opens), or holds a value this build does not write | Used up (the message says "the most one directory may have"): start a new folder. A value this build does not write (the message says "is not an open counter"): do not delete the folder, its acknowledged writes are intact; stop and report it with the message |
+| `OpenError::Counter` | The folder's open counter is used up (2^23 opens, `admin::MAX_OPENS`), or holds a value this build does not write | Used up (the message says "the most one directory may have"): start a new folder. A value this build does not write (the message says "is not an open counter"): do not delete the folder, its acknowledged writes are intact; stop and report it with the message |
 
 A `Stale` whose message says "the open counter marks generation N activated" means a later
 open already served that generation, so this copy cannot catch up to it. A crash during the

@@ -3176,9 +3176,10 @@ fn ready_nodes(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigS
 }
 
 /// A-R357 G2: a request this open was answered for, resent once a later write raised the ack
-/// floor past it, is `STATUS_EXPIRED`, and its text says which case it is: this app already
-/// received an answer for it. The step says to read the object, never to send it as new
-/// (A-R360). Nothing is applied. Integration (~1 s): one fresh open until ready.
+/// floor past it, is `STATUS_EXPIRED`, and its text says which case it is: below this open's
+/// floor, naming every way an answer is dropped there, an answer received among them (critic-w5g
+/// M4: an owner restart or the retention also drops one no answer reached). The step says to
+/// read the object, never to send it as new (A-R360). Nothing is applied. Integration (~1 s): one fresh open until ready.
 #[config_log::retcd_test]
 fn m10_r357_an_answered_write_resent_says_this_app_was_answered() {
     let rt = runtime();
@@ -3195,10 +3196,12 @@ fn m10_r357_an_answered_write_resent_says_this_app_was_answered() {
     let text = refused.error.to_string();
     assert!(
         text.contains(&format!(
-            "request {}: this app already received an answer for it in this open",
+            "request {}: it is below this open's ack floor: this app received an answer for it, \
+             or it was one of more than 8 unsettled writes (`ack_floor_pin_evicted`), or the \
+             owner restarted or the dedup retention passed while it was unsettled",
             answered.request.0
         )),
-        "{text}"
+        "every case the floor drops an answer in is named (critic-w5g M4): {text}"
     );
     assert!(
         text.contains("next: the answer is no longer kept: read the object to see its value"),
@@ -3311,6 +3314,30 @@ mod guide_sample {
     }
 }
 
+/// local-cluster.md section 3's app, compiled here as the guide prints it (critic-w5g A4). Its
+/// `main` needs a running `lr` cluster, so no row runs it; the compile and the byte check below
+/// are what keep the guide's code buildable.
+#[allow(dead_code)]
+mod local_cluster_sample {
+    use crate as rdb_api;
+    include!("local_cluster_sample.rs");
+
+    /// The sample in local-cluster.md section 3 is this file, byte for byte.
+    #[test]
+    fn the_app_in_local_cluster_md_is_the_one_that_compiles() {
+        let guide = include_str!("../../../../docs/rdb/local-cluster.md").replace("\r\n", "\n");
+        let block = format!(
+            "```rust\n{}```\n",
+            include_str!("local_cluster_sample.rs").replace("\r\n", "\n")
+        );
+        assert!(block.contains("local: Vec::new()"), "{block}");
+        assert!(
+            guide.contains(&block),
+            "local-cluster.md lacks, verbatim:\n{block}"
+        );
+    }
+}
+
 /// The guide's `did_it_land` (`rdb-pilot/examples/did_it_land.rs`, ruling A-R359), compiled
 /// into this module so a row runs the exact code embed.md shows.
 #[allow(dead_code)]
@@ -3414,6 +3441,111 @@ mod guide_did_it_land {
         );
         app.shutdown();
         nodes.shutdown();
+    }
+
+    /// critic-w5g M3, embedded mode: a restart of the process that holds the copies is a reopen,
+    /// so a new generation. A txn answered `UNKNOWN_OUTCOME` (links to the secondaries held) is
+    /// saved; after the heal and a reopen, the guide's `did_it_land` resends it, gets
+    /// `GENERATION_CHANGED`, and asks `status` with the generation it was sent in. The answer
+    /// is a plain `Landed`, never an `Err`, and z holds its value once. Integration (~3 s): one
+    /// fresh open until ready, a held link, one reopen until ready.
+    #[config_log::retcd_test]
+    fn m10_r357_the_guide_s_did_it_land_answers_an_embedded_app_after_its_reopen() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let put = TxnPut {
+            group: rdb_api::db::DEFAULT_GROUP,
+            object: b"z",
+            value: b"1",
+            if_version: None,
+        };
+        let unknown = db
+            .txn(&[put], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let saved = *unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+        db.links().heal_all();
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+        while db.get(b"z").ok().and_then(|got| got.value).is_none() {
+            assert!(Instant::now() < until, "z never published after the heal");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+        drop(db);
+
+        let mut db = super::open(&rt, dir.path(), &store).expect("the reopen");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the reopen is ready");
+        let resent = db
+            .resend(saved.clone())
+            .expect_err("sent under the old generation");
+        assert_eq!(
+            resent.error.kind,
+            ErrorKind::GenerationChanged,
+            "the arm this row pins: {resent:?}"
+        );
+        let landed = did_it_land(&db, saved)
+            .unwrap_or_else(|error| panic!("never an Err after a reopen: {error}"));
+        assert_eq!(landed, Landed::Yes, "z applied before the reopen");
+        let (_, value) = db.get(b"z").expect("get z").value.expect("z is there");
+        assert_eq!(value.as_ref(), b"1");
+        db.shutdown();
+    }
+
+    /// critic-w5g A2, through `Db::call` itself: an app's txn waits at the owner (links to the
+    /// secondaries held), and the process holding the copies shuts down under it, as `lr down`
+    /// does. The app's call is answered `UNAVAILABLE` naming node 1 as gone out of reach, with
+    /// no `no_mutation` claim, never the host fault a node of the app's own would be.
+    /// Integration (~2 s): one fresh open until ready, a held link, one app open.
+    #[config_log::retcd_test]
+    fn m10_r357_d1_an_app_whose_owner_shuts_down_mid_call_is_told_unavailable() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let app_dir = config_testkit::fs::temp_dir();
+        let mut nodes = ready_nodes(&rt, dir.path(), &store);
+        let mut app = rt
+            .block_on(Db::open_with(
+                app_config(app_dir.path(), nodes.links(), ClientId(2)),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("the app-only open");
+        app.put(b"x", b"1", None).expect("a put over the links");
+        nodes.links().hold(NodeId(1), NodeId(2));
+        nodes.links().hold(NodeId(1), NodeId(3));
+        let refused = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                let put = TxnPut {
+                    group: rdb_api::db::DEFAULT_GROUP,
+                    object: b"z",
+                    value: b"1",
+                    if_version: None,
+                };
+                app.txn(&[put], Duration::from_secs(20))
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            nodes.shutdown();
+            waiting.join().expect("the app's call")
+        })
+        .expect_err("the owner went away under the call");
+        let text = refused.error.to_string();
+        assert_eq!(
+            (refused.error.kind, refused.error.no_mutation),
+            (ErrorKind::Unavailable, false),
+            "{text}"
+        );
+        assert!(
+            text.contains("node 1, the owner, went out of reach while this call waited"),
+            "{text}"
+        );
+        assert!(!text.contains("host fault"), "{text}");
+        app.shutdown();
     }
 }
 

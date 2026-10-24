@@ -210,8 +210,8 @@ pub struct DbConfig {
     ///   `Db`, so per partition (A5); the ninth evicts the oldest, which is logged
     ///   `ack_floor_pin_evicted` and from then on answers `STATUS_EXPIRED`.
     /// - A request this `Db` resends after a later write was answered may find its own answer
-    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Read the object to see its
-    ///   value. This holds while an earlier write is still kept (above), and for a request that
+    ///   dropped: it answers `STATUS_EXPIRED`. That resend applies nothing, but an earlier send
+    ///   may have: read the object to see its value. This holds while an earlier write is still kept (above), and for a request that
     ///   was answered `Ok`:
     ///   it is never applied twice (A-R274). After a restart of the owner, a kept write that never
     ///   applied answers `STATUS_EXPIRED` too.
@@ -3062,8 +3062,9 @@ fn expired_case(mut error: ApiError, request: RequestId, here: bool) -> ApiError
         return error;
     }
     let case = if here {
-        "this app already received an answer for it in this open (it is below this client's ack \
-         floor), unless it was one of more than 8 unsettled writes (`ack_floor_pin_evicted`)"
+        "it is below this open's ack floor: this app received an answer for it, or it was one \
+         of more than 8 unsettled writes (`ack_floor_pin_evicted`), or the owner restarted or \
+         the dedup retention passed while it was unsettled"
     } else {
         "an earlier open of this client received an answer for it, or it stayed unsettled past \
          the dedup retention"
@@ -10291,7 +10292,7 @@ mod tests {
     /// applied: an id above the pin stays covered (A-R274). The txn, resent,
     /// replays its answer, since a pin keeps it, and that settles the pin; its status still
     /// answers. With no pin left, one more put raises the floor past the paused put, which,
-    /// resent, answers `STATUS_EXPIRED` and applies nothing (submit it as new); its status, asked
+    /// resent, answers `STATUS_EXPIRED` and applies nothing (read the object); its status, asked
     /// with its generation, is `Expired`.
     /// Integration (~2 s): three node threads, a real pause and a heal.
     #[config_log::retcd_test]
