@@ -297,10 +297,13 @@ fn start(cli: Cli) -> Result<ExitCode, Fatal> {
         return Ok(ExitCode::Ok);
     }
 
-    logging::init(&cli.log_dir, &cfg.identity, &log_fields)
+    // Declared first so it drops last: after `shutdown_complete`, on every return path, so the
+    // log file holds every line when the process exits (E2E-09).
+    let log_guard = logging::init(&cli.log_dir, &cfg.identity, &log_fields)
         .map_err(|e| Fatal::rejected("logging_unavailable", e))?;
     let span = logging::process_span(&cfg.identity);
     let _entered = span.enter();
+    log_guard.attach(&span);
 
     // One current-thread-per-core runtime, built here rather than by `#[tokio::main]` so that
     // the `--capabilities` path above never starts one.
