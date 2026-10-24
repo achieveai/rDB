@@ -9492,6 +9492,12 @@ mod tests {
     /// D2 (design-ackfloor §5): with the floor on, a `Db` writes far past a small dedup cap, and
     /// every copy keeps on disk only the newest answer and its open's floor record. Cap 3, 150
     /// puts, none `OVERLOADED`. With the floor off the fourth put is `OVERLOADED`.
+    ///
+    /// A put refused `PROTECTION_PAUSED` is sent again once node 1 admits, which must happen
+    /// within patience (ruling A-R293). Under host load a WAL flush can outlast `fast()`'s
+    /// 400 ms pause age: in gate run 20261023-183438 every node's flush took 398-416 ms and L1
+    /// paused at seq 78. A pause proves no mutation, so the resend is safe and adds no dedup
+    /// row. Any other refusal, `OVERLOADED` from a filled cap above all, still fails at once.
     /// Integration (~1 s): three node threads, 150 puts.
     #[config_log::retcd_test]
     fn m10_s2_d2_a_small_cap_never_fills_and_each_copy_keeps_two_dedup_rows() {
@@ -9506,9 +9512,19 @@ mod tests {
             .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
             .expect("open");
         admits(&db, "after the open");
+        let mut paused = 0_u32;
         for n in 0..150_u32 {
-            db.put(b"a", &n.to_le_bytes(), None)
-                .unwrap_or_else(|refused| panic!("put {n}: {refused:?}"));
+            loop {
+                match db.put(b"a", &n.to_le_bytes(), None) {
+                    Ok(_) => break,
+                    Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => {
+                        paused += 1;
+                        tracing::info!(put = n, paused, "d2_put_paused_resend");
+                        admits(&db, "after a pause");
+                    }
+                    Err(refused) => panic!("put {n}: {refused:?}"),
+                }
+            }
         }
         db.shutdown();
         drop(db);
