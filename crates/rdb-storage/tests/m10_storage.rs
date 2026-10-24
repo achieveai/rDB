@@ -823,6 +823,7 @@ fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
             StorageOptions {
                 write_buffer_bytes: Some(SMALL_BUFFER),
                 memtable_budget_bytes: None,
+                block_cache_bytes: None,
             },
         )
         .expect("open with a small budget"),
@@ -877,6 +878,7 @@ fn m10_s2_a_small_write_buffer_flushes_where_the_default_keeps_everything_in_mem
         StorageOptions {
             write_buffer_bytes: Some(SMALL_BUFFER),
             memtable_budget_bytes: None,
+            block_cache_bytes: None,
         },
         "flush-small",
     );
@@ -935,6 +937,7 @@ fn a_r300_memtable_memory_stays_within_the_store_budget() {
         StorageOptions {
             write_buffer_bytes: None,
             memtable_budget_bytes: Some(BUDGET),
+            block_cache_bytes: None,
         },
     )
     .expect("open with a 1 MiB budget");
@@ -978,5 +981,84 @@ fn a_r300_memtable_memory_stays_within_the_store_budget() {
         write_buffer_sizes(&dir)[rdb_storage::keys::CF_DATA],
         BUDGET,
         "a column family's buffer is capped to the store's budget"
+    );
+}
+
+/// A-R315: one block cache per store, sized by `block_cache_bytes`. A store with a 1 MiB
+/// cache and a 1 MiB memtable budget takes 6,000 puts of 1 KiB (about 6 MiB, flushed to SSTs)
+/// over three column families, then reads every one back, so each column family's reads
+/// alone would fill the cache. After every 100 reads the store's block caches, each counted
+/// once, use at most the configured capacity, and their capacity is that size. Before
+/// A-R315 every column family and `default` had a 32 MiB cache of its own. A store opened
+/// with the default options has one 64 MiB cache.
+#[retcd_test]
+fn a_r315_block_cache_memory_stays_within_the_store_capacity() {
+    use bytes::Bytes;
+    use rdb_core::contracts::ids::BatchId;
+    use rdb_core::contracts::storage::{Batch, Write};
+    use rdb_storage::DEFAULT_BLOCK_CACHE_BYTES;
+
+    const CACHE: usize = 1 << 20;
+    const PUTS: u64 = 6_000;
+    let dir = data_dir("block-cache");
+    let mut engine = RocksEngine::open_with(
+        &dir,
+        StorageOptions {
+            write_buffer_bytes: None,
+            memtable_budget_bytes: Some(1 << 20),
+            block_cache_bytes: Some(CACHE),
+        },
+    )
+    .expect("open with a 1 MiB block cache");
+    let value = Bytes::from(vec![0x5a; 1024]);
+    let spread = [Namespace::User, Namespace::History, Namespace::Dedup];
+    let ns = |i: u64| spread[usize::try_from(i % 3).expect("small")];
+    for i in 0..PUTS {
+        engine
+            .commit(Batch {
+                id: BatchId(i + 1),
+                partition: PartitionId(1),
+                generation: Generation(1),
+                seq: Seq(i + 1),
+                writes: vec![Write {
+                    ns: ns(i),
+                    key: Bytes::from(i.to_be_bytes().to_vec()),
+                    value: Some(value.clone()),
+                }],
+            })
+            .expect("commit");
+    }
+    let mut peak = 0;
+    let mut capacity = 0;
+    for i in 0..PUTS {
+        let read = engine
+            .get(PartitionId(1), Generation(1), ns(i), &i.to_be_bytes())
+            .expect("get");
+        assert!(read.is_some(), "put {i} reads back");
+        if i % 100 == 99 {
+            let (cap, used) = engine.block_cache().expect("block cache");
+            capacity = cap;
+            peak = peak.max(used);
+        }
+    }
+    tracing::info!(peak, capacity, asked = CACHE, "a_r315_block_cache_peak");
+    assert!(
+        peak > CACHE as u64 / 2,
+        "the reads filled the cache: peak {peak} bytes of {CACHE}"
+    );
+    assert!(
+        peak <= CACHE as u64,
+        "block caches peaked at {peak} bytes, over the store's capacity ({CACHE})"
+    );
+    assert_eq!(
+        capacity, CACHE as u64,
+        "the store's block caches hold {CACHE} bytes in all"
+    );
+    drop(engine);
+    let defaults = RocksEngine::open(data_dir("block-cache-default")).expect("open with defaults");
+    assert_eq!(
+        defaults.block_cache().expect("block cache").0,
+        DEFAULT_BLOCK_CACHE_BYTES as u64,
+        "the default is one 64 MiB cache"
     );
 }

@@ -11,7 +11,9 @@
 //! declines the rest with [`RdbError::Unavailable`]:
 //!
 //! * for a partition this node has a receiver installed for: an `Append` or `RecoveryAppend`
-//!   frame ([`wire::classify`]), and `Committed`/`CommitFailed` for the batch it staged;
+//!   frame ([`wire::classify`]), and `Committed`/`CommitFailed` for the batch it staged. A
+//!   `RecoveryAppend` beside a primary that is not retired is refused `NotRequired` instead
+//!   (A-R327): a receiver there only sources a catch-up;
 //! * for a partition this node has a primary installed for, and not retired: a `Reply` frame,
 //!   `LocalApplied`, `ConfigChanged`, `TransitionBarrierConfirmed`, `DivergenceDetected` and
 //!   `CopyQuarantined` ([`primary::Primary`]);
@@ -274,6 +276,11 @@ impl Module for Replication {
                 match wire::classify(&frame.body) {
                     Some(R1Frame::Append) => {
                         receiver.map(|receiver| receiver.on_append(from, frame))
+                    }
+                    // A receiver beside a serving primary only sources a catch-up, whenever it
+                    // was installed: no recovery append reaches the primary's store (A-R327).
+                    Some(R1Frame::RecoveryAppend) if primary.is_some() => {
+                        Some(replica(ReplicaIgnoreReason::NotRequired))
                     }
                     Some(R1Frame::RecoveryAppend) => {
                         receiver.map(|receiver| receiver.on_recovery_append(from, frame))

@@ -1334,6 +1334,14 @@ impl RepairHeld {
                 last.node != now.node || last.boot != now.boot || now.durable > last.durable
             })
     }
+
+    /// The wait after a retry of this repair with nothing moved: double this one, never past
+    /// [`REPAIR_RETRY_CAP_MILLIS`] (A-R353).
+    fn next_wait(&self) -> u64 {
+        self.wait_millis
+            .saturating_mul(2)
+            .min(REPAIR_RETRY_CAP_MILLIS)
+    }
 }
 
 /// One copy's sends of one record, for the stuck-cursor warning.
@@ -3229,7 +3237,7 @@ impl Host {
                         self.timers.remove(id);
                     }
                 }
-                EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site)?,
+                EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site, effects)?,
             }
         }
         // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
@@ -3365,7 +3373,13 @@ impl Host {
     }
 
     /// One kernel effect: recorded, routed, served, or refused by name (the sim's `kernel`).
-    fn kernel(&mut self, from: ModuleName, kernel: &KernelEffect, site: Site) -> Result<(), Fault> {
+    fn kernel(
+        &mut self,
+        from: ModuleName,
+        kernel: &KernelEffect,
+        site: Site,
+        step: &[Effect],
+    ) -> Result<(), Fault> {
         let node = self.node.0;
         match kernel {
             KernelEffect::Ignored { reason } => {
@@ -3395,6 +3409,20 @@ impl Host {
                     at = self.stepped_at.0,
                     "authority_fence"
                 );
+                // A node fence is every served partition's, wherever A1 sited it: the ones A1
+                // views in this step and a T1 or P1 serves (A-R324, A-R331).
+                let sites = route::node_fence_sites(kernel, site.partition, step, |partition| {
+                    self.transaction.kernel(self.node, partition).is_some()
+                        || self.publication.kernel(self.node, partition).is_some()
+                });
+                for partition in sites {
+                    let event = KernelEvent::Authority(AuthorityEvent::Fence {
+                        scope: *scope,
+                        reason: *reason,
+                    });
+                    let at = Site { partition, ..site };
+                    self.push(at, EventKind::Kernel(event), true, None);
+                }
                 if *scope == FenceScope::Node {
                     self.schedule_acquire_after_fence(site);
                 }
@@ -3992,10 +4020,7 @@ impl Host {
                     }
                     return;
                 }
-                wait_millis = last
-                    .wait_millis
-                    .saturating_mul(2)
-                    .min(REPAIR_RETRY_CAP_MILLIS);
+                wait_millis = last.next_wait();
             }
         }
         // A-R350: a link that is up is not a member that answers. The repair runs only for a
@@ -5566,8 +5591,14 @@ impl Host {
 
     /// Restore R1's dormant receiver for this node's copy of `partition` (A-R173), from the
     /// engine's lineage at the seed's generation and the seed's epoch, revision and
-    /// configuration. A node already running a live side keeps it. `with_history` also gives
+    /// configuration. A node already running a live receiver keeps it. `with_history` also gives
     /// the receiver its verified ladder, `(0, ROOT)` through its head, once (critic-d7 F2).
+    ///
+    /// A live primary is no reason to skip a source (A-R278, A-R314): a live owner re-planning
+    /// around a restarted copy is F1's catch-up source, and R1 sources a catch-up from a receiver
+    /// only. The dormant receiver sits beside the primary, refuses every plain append, and R1
+    /// drops it at the next `Recovered`. A target restore (`with_history` false) beside a
+    /// serving primary is refused `serving_primary`: the receiver there only sources (A-R323).
     ///
     /// Nothing here faults the node (critic-d7 F5): a copy that cannot be restored is logged
     /// `dormant_restore_refused{reason}` and holds no receiver, so its catch-up is refused and
@@ -5576,9 +5607,23 @@ impl Host {
         let node = self.node;
         let held = self.replication.receiver(node, partition);
         let dormant = held.map(AppendReceiver::is_dormant);
-        if dormant == Some(false)
-            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
-        {
+        if dormant == Some(false) {
+            return;
+        }
+        // Beside a serving primary the receiver only sources (A-R314, A-R323 A-6): a target
+        // restore here would let recovery appends into the primary's own store.
+        let serving = self
+            .replication
+            .primary(node, partition)
+            .is_some_and(|primary| !primary.tracker().retired());
+        if serving && !with_history {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                generation = seed.lineage.generation.0,
+                reason = "serving_primary",
+                "dormant_restore_refused"
+            );
             return;
         }
         if dormant.is_none() {

@@ -1236,6 +1236,31 @@ fn m10_s2_b21_a_member_whose_answers_are_lost_is_not_repaired() {
     );
 }
 
+/// b23 (A-R353, critic A7): a held repair's wait doubles from the first and stops at the cap,
+/// so a persistent F1 miss fences reads at most once a minute: 5, 10, 20, 40, then 60 s for
+/// every retry after.
+/// Cut: `next_wait` without the cap, red (80 s at the fifth retry).
+/// Unit: no trio.
+#[test]
+fn m10_s2_b23_a_held_repairs_wait_doubles_up_to_the_cap() {
+    let mut held = RepairHeld {
+        marks: Vec::new(),
+        at: Tick(0),
+        wait_millis: REPAIR_RETRY_FIRST_MILLIS,
+        logged: false,
+    };
+    let mut waits = vec![held.wait_millis];
+    for _ in 0..6 {
+        held.wait_millis = held.next_wait();
+        waits.push(held.wait_millis);
+    }
+    assert_eq!(
+        waits,
+        [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000]
+    );
+    assert_eq!(REPAIR_RETRY_CAP_MILLIS, 60_000);
+}
+
 /// b20's and b21's row, with `lost` the direction whose frames are dropped.
 fn half_open_is_not_repaired(method: &'static str, lost: (NodeId, NodeId)) {
     let dir = config_testkit::fs::temp_dir();
