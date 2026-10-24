@@ -33,6 +33,8 @@ fn an_app_whose_owner_has_stopped_is_told_a_retry_can_help() {
         client,
         boot: None,
         storage: rdb_api::StorageOptions::default(),
+        // What an app gets; this row does not depend on the floor.
+        ack_floor: true,
     };
     let dir = config_testkit::fs::temp_dir();
     let mut nodes = rt
