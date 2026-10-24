@@ -35,12 +35,12 @@ use config_engine::AuthnRejectReason;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::Router;
 
 use crate::credentials::CredentialSource;
 use crate::error::GrpcError;
-use crate::tls::TlsMode;
+use crate::tls::{TlsMode, DEFAULT_HANDSHAKE_TIMEOUT};
 
 /// How many completed handshakes may wait for tonic to pick them up.
 ///
@@ -143,7 +143,11 @@ pub(crate) fn spawn(
     tracing::info!(plane, %addr, scheme = tls.scheme(), "grpc server listening");
     let (join, credentials) = match tls {
         TlsMode::Insecure => {
-            let incoming = TcpListenerStream::new(listener);
+            let incoming = ReceiverStream::new(spawn_first_bytes(
+                plane,
+                listener,
+                DEFAULT_HANDSHAKE_TIMEOUT,
+            ));
             let join = tokio::spawn(config_log::testing::in_current_span(async move {
                 router
                     .serve_with_incoming_shutdown(incoming, shutdown)
@@ -175,6 +179,69 @@ pub(crate) fn spawn(
         join: Some(join),
         credentials,
     })
+}
+
+/// Accept plaintext connections and hand tonic only the ones whose client has sent something.
+///
+/// tonic's graceful shutdown waits for every connection it was given, with no deadline, and
+/// hyper's answer to a shutdown that arrives before the HTTP/2 preface is to wait for the
+/// preface. So one accepted socket that never speaks held a node's stop forever (#31: a peer's
+/// dial, abandoned by its caller, landed in a restarting node's backlog and never sent a byte).
+/// The TLS path is immune because its handshake is bounded; this is the same bound for the
+/// plaintext path, under the same constant.
+///
+/// Each socket waits in its own task, so a silent one never stalls the accept loop. It is
+/// dropped, with a warning, when it has sent nothing within `timeout` or when shutdown closes
+/// the stream first — so a socket still waiting here never holds a stop.
+fn spawn_first_bytes(
+    plane: &'static str,
+    listener: TcpListener,
+    timeout: std::time::Duration,
+) -> mpsc::Receiver<Result<TcpStream, std::io::Error>> {
+    let (tx, rx) = mpsc::channel(HANDSHAKE_BUFFER);
+    tokio::spawn(config_log::testing::in_current_span(async move {
+        loop {
+            let accepted = tokio::select! {
+                biased;
+                () = tx.closed() => return,
+                accepted = listener.accept() => accepted,
+            };
+            let (io, peer) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(plane, %error, "grpc accept failed");
+                    continue;
+                }
+            };
+            tracing::debug!(plane, %peer, "grpc connection waiting for its first bytes");
+            let tx = tx.clone();
+            tokio::spawn(config_log::testing::in_current_span(async move {
+                let started = tokio::time::Instant::now();
+                let dropped = tokio::select! {
+                    biased;
+                    () = tx.closed() => Some("shutdown"),
+                    // Readable covers end-of-file and a socket error too; tonic reports those
+                    // itself, so they pass through like any connection that spoke.
+                    ready = tokio::time::timeout(timeout, io.readable()) => {
+                        ready.err().map(|_elapsed| "timeout")
+                    }
+                };
+                let Some(dropped) = dropped else {
+                    // A send failure means tonic stopped; dropping is all that is left.
+                    let _ = tx.send(Ok(io)).await;
+                    return;
+                };
+                tracing::warn!(
+                    plane,
+                    %peer,
+                    cause = dropped,
+                    waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "grpc connection dropped before it sent a byte"
+                );
+            }));
+        }
+    }));
+    rx
 }
 
 /// Accept connections and hand each one to its own handshake task.
