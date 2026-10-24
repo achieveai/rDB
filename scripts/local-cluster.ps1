@@ -269,11 +269,9 @@ function New-Cluster {
             "path = `"$manifestPathToml`""
             "sig = `"$sigPathToml`""
             "signing_key_pub = `"$pubPathToml`""
-            ""
-            "[raft]"
-            "heartbeat_ms = 150"
-            "election_min_ms = 450"
-            "election_max_ms = 900"
+            # No [raft]: the node keeps the product's timers (config_engine::RaftTimers's
+            # Default). The dev values 150/450/900 lost the leader under CPU load, and one
+            # election stalled the control plane for 2.84 s (A-R284).
         )
         Set-Utf8NoBom -Path (Join-Path $n.Dir 'config.toml') -Lines $configLines
     }
