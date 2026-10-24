@@ -336,6 +336,18 @@ port_free() {
     fi
 }
 
+# The commit a run is named after. A `git archive` export is no checkout, so `git rev-parse`
+# cannot answer there: read the export's EXPORT_BASIS (AGENTS.md), else say "unknown". Never
+# fails, so `up` runs from an export too (A-R295).
+run_basis() {
+    local s=""
+    if [ -e "$REPO/.git" ]; then s="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || true)"; fi
+    if [ -z "$s" ] && [ -f "$REPO/EXPORT_BASIS" ]; then
+        s="$(head -n1 "$REPO/EXPORT_BASIS" | tr -cd '0-9A-Za-z' | cut -c1-7)"
+    fi
+    printf '%s' "${s:-unknown}"
+}
+
 up() {
     local lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 43)) p sha stamp
     for p in 27021 27031; do
@@ -345,7 +357,7 @@ up() {
         port_free "$p" || die "port $p is already in use; pick another --base-port (lr uses $lo-$hi)"
     done
     build
-    sha="$(git -C "$REPO" rev-parse --short HEAD)"
+    sha="$(run_basis)"
     stamp="$(date -u +%H%M%S)"
     mkdir -p "$ROOT"
     RUN="$ROOT/$sha-$BASE_PORT-$stamp"
