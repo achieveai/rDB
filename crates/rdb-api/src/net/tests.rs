@@ -1544,10 +1544,16 @@ fn an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(abandoned_f
         let two = dial_2();
         let live = until_route(&one.net, "node 2's dial installs", |id| id.is_some());
         let abandoned = rt.block_on(handshake_as_node_2(dir.path(), addr));
-        let held = until_route(&one.net, "the held handshake replaces it", |id| id != live);
+        // Node 1 numbers links as it accepts them, and the held handshake is the only one it
+        // accepts while node 2's live link is up, so it takes the next id. Node 2 dials again
+        // about 100 ms after its link is replaced, so a slow poll can first see that redial.
+        // Waiting for the first id seen after `live` to go away then waits on the good link for
+        // ever (A-R356: 5 of 100 under load, `routes node 2 by Some(3)`).
+        let abandoned_id = live.expect("installed") + 1;
+        until_route(&one.net, "the held handshake replaces it", |id| id != live);
         drop(abandoned);
         until_route(&one.net, "node 1 has a live route to node 2 again", |id| {
-            id.is_some() && id != held
+            id.is_some_and(|id| id != abandoned_id)
         });
         two
     };
