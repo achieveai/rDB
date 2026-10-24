@@ -169,7 +169,7 @@ invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (t
 | `rdb_storage` | `lineage_verified` / `lineage_verify_failed` | `partition, generation, applied, durable` / `fault` |
 | `rdb_storage` | `storage_open_refused_*` (level ERROR, one per refusal, field `error`) | suffix `locked`, `column_families`, `format`, `durable_above_applied`, `corrupt_record`, `no_database`, `backend`. Logged by `open`, `open_existing`, `open_read_only` and `dump` alike. |
 | `rdb_storage` | `dump_open` | `path, records` |
-| `rdb_storage` | `epoch_revocation_persisted` / `epoch_revocation_write_failed` (ERROR) | `partition, epoch` + `revoked, from_format, format` / `error` |
+| `rdb_storage` | `epoch_revocation_persisted` (synced write) / `epoch_revocation_written_unsynced` (staged; durable after the next sync) / `epoch_revocation_write_failed` (ERROR) | `partition, epoch` + `revoked, from_format, format` / `error` |
 | `rdb_storage` | `record_damaged` (WARN, debug builds only) | `partition, generation, ns, key_hex, offset` |
 | `rdb_storage` | `batch_commit_failed`, `wal_sync_failed`, `wal_sync_mark_write_failed` (ERROR) | `error` |
 | `rdb_storage` | `fault_injected` (WARN, debug builds; written when the fault fires, never at arming) | `fault`, `point` (the `--inject` spelling, as `fault_not_reached` uses) |

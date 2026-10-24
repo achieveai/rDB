@@ -1019,6 +1019,79 @@ fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
     tracing::info!(waited, "b6_repair_after_heal_ms");
 }
 
+/// b26 (A-R381, A-R383, parked by A-R386): a `ReadOnly` commit drops nothing. Every regular
+/// copy is outside its barrier, so a blame there picks a copy almost at random, the healthy one
+/// included. The trio starts with node 1's links to nodes 2 and 3 held, so F1 commits
+/// `ReadOnly` on nodes 1, 2 and 3 at cutoff 0. Node 2 then dies and the link 1-3 heals: node 3
+/// answers, and the commit is repaired to `DegradedRf2` on the same members with node 3 in the
+/// barrier. Only there does the drop clock run, and it drops node 2, the copy really missing.
+///
+/// Known gap, so ignored: a copy missed at formation never lands. Node 3 holds no generation 0,
+/// so it logs `land_link_refused{reason=anchor_generation_absent}`, its post-commit sync stays
+/// `sync_deferred`, and every repair's inventory fails the same way and commits `ReadOnly`
+/// again. The landing fix (critic-w9 "A-R383 re-plan", option (c)): treat an empty copy as head
+/// 0 at the root, as `inventory_reported_empty` already does. This body is the acceptance row
+/// for that fix, together with A-R381's `ReadOnly` gate in `holding_up` and A-R383's repair
+/// past a pinned rebuild that only unanswering members hold.
+/// Cuts, once it runs: `holding_up` blames in `ReadOnly`, red (a drop while `ReadOnly`, node 3
+/// dropped, seen 2026-10-24); the repair skipped whenever the rebuild is pinned, red (no repair).
+/// Integration (~5 s): the held bootstrap, three drop clocks of `ReadOnly`, the repair, the drop.
+#[config_log::retcd_test]
+#[ignore = "known gap: a copy missed at formation never lands; issue pending"]
+fn m10_s2_b26_a_read_only_commit_drops_nothing_until_repaired() {
+    const METHOD: &str = "m10_s2_b26_a_read_only_commit_drops_nothing_until_repaired";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), tuned);
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.bootstrap();
+    let read_only = trio.until("node 1 committed", commit_of);
+    assert_eq!(
+        (read_only.1.clone(), read_only.2.clone()),
+        (PartitionMode::ReadOnly, vec![1, 2, 3]),
+        "nodes 2 and 3 unheard through the bootstrap's discovery"
+    );
+    kill(&trio, 2, &[1, 3]);
+    trio.links.heal(NodeId(1), NodeId(3));
+
+    // Three drop clocks of `ReadOnly` with node 2 gone: nothing is dropped.
+    let until = trio.clock.now().plus_millis(3 * DROP_AFTER_MILLIS);
+    let repaired = trio.until("three drop clocks, or the repair", |trio| {
+        let commit = commit_of(trio)?;
+        (commit.1 != PartitionMode::ReadOnly || trio.clock.now() >= until).then_some(commit)
+    });
+    let dropped = logged!(METHOD, "membership_drop_planned");
+    assert!(dropped.is_empty(), "a drop while ReadOnly: {dropped:?}");
+    let (repaired, mode, members) = if repaired.1 == PartitionMode::ReadOnly {
+        trio.until("node 1 repaired the read-only commit", |trio| {
+            commit_of(trio).filter(|(_, mode, _)| *mode != PartitionMode::ReadOnly)
+        })
+    } else {
+        repaired
+    };
+    assert_eq!(
+        (mode, members),
+        (PartitionMode::DegradedRf2, vec![1, 2, 3]),
+        "repaired with node 3 in the barrier"
+    );
+    let dropped = logged!(METHOD, "membership_drop_planned");
+    assert!(dropped.is_empty(), "a drop while ReadOnly: {dropped:?}");
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert_eq!(planned.len(), 1, "one repair: {planned:?}");
+
+    // `DegradedRf2`: L1 blames node 2, and the drop clock drops it.
+    let (after, mode, members) = trio.until("node 1 committed without node 2", |trio| {
+        commit_of(trio).filter(|(generation, _, _)| *generation > repaired)
+    });
+    assert_eq!(
+        (after, mode, members),
+        (repaired.next(), PartitionMode::DegradedRf2, vec![1, 3])
+    );
+    let dropped = logged!(METHOD, "membership_drop_planned");
+    assert_eq!(dropped.len(), 1, "one drop: {dropped:?}");
+    assert_eq!(dropped[0]["dropped"], 2, "node 2 dropped: {dropped:?}");
+}
+
 /// A-R319 defect 2 (W5's probe, k546): a `ReadOnly` commit takes no write whatever L1 says,
 /// so its rebuild check is never quiet on L1 admitting. Before, the check read L1 alone, and a
 /// read-only partition whose L1 had resumed was silent. Every other mode stays quiet while L1

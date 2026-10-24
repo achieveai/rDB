@@ -824,6 +824,7 @@ fn m10_s2_the_write_buffer_option_reaches_every_column_family_and_is_logged() {
                 write_buffer_bytes: Some(SMALL_BUFFER),
                 memtable_budget_bytes: None,
                 block_cache_bytes: None,
+                sync_stuck_millis: None,
             },
         )
         .expect("open with a small budget"),
@@ -879,6 +880,7 @@ fn m10_s2_a_small_write_buffer_flushes_where_the_default_keeps_everything_in_mem
             write_buffer_bytes: Some(SMALL_BUFFER),
             memtable_budget_bytes: None,
             block_cache_bytes: None,
+            sync_stuck_millis: None,
         },
         "flush-small",
     );
@@ -938,6 +940,7 @@ fn a_r300_memtable_memory_stays_within_the_store_budget() {
             write_buffer_bytes: None,
             memtable_budget_bytes: Some(BUDGET),
             block_cache_bytes: None,
+            sync_stuck_millis: None,
         },
     )
     .expect("open with a 1 MiB budget");
@@ -1007,6 +1010,7 @@ fn a_r315_block_cache_memory_stays_within_the_store_capacity() {
             write_buffer_bytes: None,
             memtable_budget_bytes: Some(1 << 20),
             block_cache_bytes: Some(CACHE),
+            sync_stuck_millis: None,
         },
     )
     .expect("open with a 1 MiB block cache");
