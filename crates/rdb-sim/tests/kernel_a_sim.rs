@@ -1047,8 +1047,10 @@ fn status_reply(replies: &Replies, request: u64) -> Vec<TxnStatus> {
         .collect()
 }
 
-/// When gen 3 on B admits: past its resume hold. Found by the scenario (S-117b), where a
-/// `Submit` at this tick was admitted and published in gen 3.
+/// A tick by which gen 3 on B surely admits. Found by the scenario (S-117b), where a `Submit` at
+/// this tick was admitted and published in gen 3. It was chosen past a resume hold that gen 3's
+/// first resume no longer runs (A-R165, A-R344), so gen 3 admits well before it; rows read it as
+/// "after admission", never as the admission edge.
 const GEN3_ADMITS: u64 = SUBMIT + 110 + 9_000;
 
 /// M7A-117 (ADR 0004 generation reconciliation; A-R68 Q1/Q12). Two sub-cases.
@@ -2132,6 +2134,34 @@ fn m7a_136_f1_t1_generation_reconciliation_no_double_apply() {
         "gen 3 admits a fresh request at the next sequence"
     );
     let trace = runner.finish().expect("trace");
+    // The first retry behind the root is answered after gen 3 on B resumes, with no hold
+    // between (A-R165, A-R344): why it is `GENERATION_CHANGED`, not `PROTECTION_PAUSED`.
+    let resumed = trace
+        .events
+        .iter()
+        .find(|event| {
+            event.node == B
+                && event.logical_tick >= now
+                && matches!(
+                    event.kind,
+                    TraceKind::ProtectionState {
+                        phase: rdb_core::contracts::trace::ProtectionPhase::Healthy,
+                        ..
+                    }
+                )
+        })
+        .map(|event| event.logical_tick);
+    let answered = trace
+        .events
+        .iter()
+        .filter(|event| event.correlation == CorrelationId(9_602))
+        .map(|event| event.logical_tick)
+        .max();
+    tracing::info!(now, ?resumed, ?answered, "m7a_136_gen3_resume");
+    assert!(
+        resumed.is_some_and(|tick| answered.is_some_and(|at| tick <= at && tick < GEN3_ADMITS)),
+        "gen 3 resumes before 9_602 is answered, long before GEN3_ADMITS: {resumed:?} {answered:?}"
+    );
     let applies = batch_applies(&trace.events);
     let at_5: Vec<_> = applies
         .iter()

@@ -375,8 +375,11 @@ else still applies to it:
 
 - It still starts `Paused`, still needs the exact barrier durable on every predicate, a qualifying
   secondary, and `replication_lag < 250 ms` at the evaluation that resumes.
-- Any later pause in the same generation (a `Lost` edge, an exposure pause, a demotion) clears
-  the exemption, and that resume holds the full 5 s as before.
+- The skip covers only the first resume after the generation starts. Any pause from a mode other
+  than `Paused` (`Healthy`, `Warn` or `Reprotecting`) spends it: every later pause is real
+  oscillation, and its resume holds the full 5 s as before. A pause while still `Paused` does not
+  spend it, such as R1's `Lost{ConfigChanged}` at the generation's start (lead rulings A-R344,
+  A-R364).
 - Rejected: starting `Healthy`, and a `DbConfig` knob for the hold.
 
 **What it exposed (A-R167).** With the hold gone, the simulator's INV-LAG oracle caught a resume

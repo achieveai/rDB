@@ -1569,11 +1569,14 @@ fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls
     assert!(host.pending.is_empty(), "nothing is left waiting");
 }
 
-/// D5's guard: a healthy start logs no `replication_copy_not_advancing`. L1 holds its resume
-/// for longer than `stuck_resends` retransmits, and R1 re-sends seq 1 through that hold (OB1)
-/// to copies that acknowledged it. A copy level with the primary's head is not stuck, however
-/// often a record is re-sent to it.
-/// Integration (~1.4 s): the resume hold must outlast the threshold on R1's 100 ms timer.
+/// D5's guard: a healthy start logs no `replication_copy_not_advancing`. A copy level with the
+/// primary's head is not stuck, however often a record is re-sent to it.
+/// Integration. Before A-R344 a start ran L1's resume hold, R1 re-sent seq 1 through it (OB1)
+/// past `stuck_resends`, and this row was D5's cut-red guard. A generation's first resume now
+/// skips the hold (ADR-0006 amendment 2026-10-23), so a start re-sends too few times to reach
+/// the threshold and dropping the level check leaves this row green (checked 2026-10-24). The
+/// guard is `a_copy_acked_below_the_head_is_reported_once_it_stops_advancing`'s "level with
+/// the head" assert, which goes red under that cut.
 #[config_log::retcd_test]
 fn a_healthy_start_reports_no_copy_stuck_through_the_resume_hold() {
     const METHOD: &str = "a_healthy_start_reports_no_copy_stuck_through_the_resume_hold";
@@ -1591,7 +1594,7 @@ fn a_healthy_start_reports_no_copy_stuck_through_the_resume_hold() {
             .resends
             .values()
             .any(|entry| entry.through == Seq(1)),
-        "R1 sent seq 1 during the hold"
+        "R1 sent seq 1"
     );
     let warned = not_advancing!(METHOD);
     assert!(warned.is_empty(), "a healthy start warned: {warned:?}");
