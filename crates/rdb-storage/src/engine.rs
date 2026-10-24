@@ -34,7 +34,7 @@ use rdb_core::replication::append::PROGRESS_KEY;
 use rdb_core::transaction::dedup::parse_dedup_value;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction,
-    IteratorMode, Options, WriteBatch, WriteOptions, DB,
+    IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 
 use rdb_core::contracts::trace::Version;
@@ -66,7 +66,9 @@ pub struct StorageOptions {
     /// The memtable budget of the whole store, every column family together, in bytes
     /// (RocksDB's `db_write_buffer_size`, ruling A-R300). When the memtables reach about 7/8
     /// of it, RocksDB switches the oldest one out and flushes it, so memtable memory stays near
-    /// the budget however long the writes go on. `None` keeps
+    /// the budget however long the writes go on. A write that finds the memtables at the budget
+    /// waits for a flush to free memory (A-R349), so a flush that lags under load slows writes
+    /// rather than letting memory grow past the budget. `None` keeps
     /// [`DEFAULT_MEMTABLE_BUDGET_BYTES`] (64 MiB).
     ///
     /// It also caps two things that would otherwise outgrow it:
@@ -475,7 +477,15 @@ impl RocksEngine {
         }
         // A-R315: one block cache for the store, shared by every column family.
         let cache = Cache::new_lru_cache(storage.effective_block_cache_bytes());
-        let options = db_options(!existed, storage);
+        let mut options = db_options(!existed, storage);
+        // A-R349: `db_write_buffer_size` alone only asks for a flush; under load the flushes lag
+        // and the memtables outgrew the budget (4.3 MiB on a 1 MiB budget). A manager that
+        // stalls makes it a bound: a write that finds the memtables at the budget waits for a
+        // flush to free memory.
+        options.set_write_buffer_manager(&WriteBufferManager::new_write_buffer_manager(
+            storage.effective_memtable_budget_bytes(),
+            true,
+        ));
         let db = DB::open_cf_descriptors(&options, &path, descriptors(storage, &cache))
             .map_err(|e| backend(&path, &e))?;
         let (created, format) = ensure_format(&db, &path, existed)?;
