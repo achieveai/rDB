@@ -1316,15 +1316,42 @@ enum AfterSync {
         epoch: OwnerEpoch,
         site: Site,
     },
+    /// A-R217 and A-R326: a new generation's link, written unsynced. The acquires its landings
+    /// schedule wait in [`Host::link_pending`] until this sync returns.
+    Link {
+        partition: PartitionId,
+        generation: Generation,
+        started: Instant,
+    },
+    /// A-R326: a holder's recovery sync (`PeerAsk::Sync`), answered once this sync returns.
+    Answer {
+        reply: Reply,
+        copy: CopyId,
+        post_commit: bool,
+        captured: [CapturedPrefix; 1],
+    },
 }
 
 impl AfterSync {
     fn captured(&self) -> &[CapturedPrefix] {
         match self {
             Self::Duty { captured, .. } | Self::Flush { captured, .. } => captured,
-            Self::Revocation { .. } => &[],
+            Self::Answer { captured, .. } => captured,
+            Self::Revocation { .. } | Self::Link { .. } => &[],
         }
     }
+}
+
+/// Where a holder's recovery-sync answer goes.
+#[derive(Debug, Clone, Copy)]
+enum Reply {
+    /// A peer's F1, over the peer link.
+    Peer {
+        asker: NodeId,
+        correlation: CorrelationId,
+    },
+    /// This node's own F1 (D10's own asks).
+    Here(Site),
 }
 
 /// The sync in flight on the syncer.
@@ -1332,24 +1359,6 @@ impl AfterSync {
 struct InFlight {
     started: Instant,
     after: Vec<AfterSync>,
-}
-
-/// F4 (A-R317): node-thread work that syncs inline, held while a sync is in flight and run
-/// when it returns, so the thread never waits behind the syncer's fsync. Rare: a first
-/// landing's link sync and a holder's recovery sync.
-#[derive(Debug)]
-enum Parked {
-    Landing {
-        result: Box<RecoveryResult>,
-        site: Site,
-        emitter: NodeId,
-    },
-    /// A `PeerAsk::Sync`; `asker` is `None` for this node's own F1 (D10's own asks).
-    Ask {
-        asker: Option<NodeId>,
-        site: Site,
-        ask: PeerAsk,
-    },
 }
 
 /// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
@@ -1713,8 +1722,9 @@ struct Host {
     syncing: Option<InFlight>,
     /// What waits for the next sync: asked for while one was in flight.
     sync_next: Vec<AfterSync>,
-    /// Inline syncs held until the sync in flight returns.
-    parked: Vec<Parked>,
+    /// A-R326: new generations whose link sync is requested and not yet returned, each with
+    /// the acquires its landings scheduled, run when it returns (A-R217).
+    link_pending: BTreeMap<(PartitionId, Generation), Vec<(Box<RecoveryResult>, Site)>>,
     /// [`rdb_storage::StorageOptions::sync_stuck_millis`]: a sync in flight longer faults the
     /// node, so its grant lapses and another can take over.
     sync_stuck_millis: u64,
@@ -1811,7 +1821,7 @@ impl Host {
             syncer: None,
             syncing: None,
             sync_next: Vec::new(),
-            parked: Vec::new(),
+            link_pending: BTreeMap::new(),
             sync_stuck_millis: engine_sync_stuck,
             #[cfg(test)]
             fail_step_view: false,
@@ -2532,8 +2542,8 @@ impl Host {
         ))
     }
 
-    /// [`Msg::Synced`]: the sync in flight returned. Its work is answered, then each inline
-    /// sync held behind it runs, then the next sync begins for what waited.
+    /// [`Msg::Synced`]: the sync in flight returned. Its work is answered, then the next sync
+    /// begins for what waited.
     fn on_synced(&mut self, done: SyncDone) -> Result<(), Fault> {
         let Some(flight) = self.syncing.take() else {
             return Err(Fault::from(
@@ -2541,9 +2551,6 @@ impl Host {
             ));
         };
         self.synced(done, flight.after)?;
-        for parked in std::mem::take(&mut self.parked) {
-            self.unpark(parked)?;
-        }
         if self.syncing.is_none() && !self.sync_next.is_empty() {
             let next = std::mem::take(&mut self.sync_next);
             self.start_sync(next)?;
@@ -2615,6 +2622,45 @@ impl Host {
                     ));
                     self.push(site, kind, true, None);
                 }
+                AfterSync::Link {
+                    partition,
+                    generation,
+                    started,
+                } => {
+                    let waiting = self
+                        .link_pending
+                        .remove(&(partition, generation))
+                        .unwrap_or_default();
+                    if let Err(fault) = &result {
+                        return Err(Fault::from(format!(
+                            "sync the link of p{} g{}: {fault:?}",
+                            partition.0, generation.0
+                        )));
+                    }
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        generation = generation.0,
+                        millis = millis(started),
+                        acquires = waiting.len(),
+                        "link_synced"
+                    );
+                    for (landed, site) in waiting {
+                        self.schedule_acquire(&landed, site);
+                    }
+                }
+                AfterSync::Answer {
+                    reply,
+                    copy,
+                    post_commit,
+                    captured: [capture],
+                } => {
+                    if let Some(answer) =
+                        self.sync_answer(capture, copy, post_commit, result.is_ok())
+                    {
+                        self.send_answer(reply, capture.partition, answer);
+                    }
+                }
             }
             at += count;
         }
@@ -2651,49 +2697,6 @@ impl Host {
             Duration::from_millis(self.sync_stuck_millis.saturating_add(1))
                 .saturating_sub(flight.started.elapsed())
         })
-    }
-
-    /// Whether `ask` waits for the sync in flight: a holder's recovery sync runs inline.
-    fn parks(&self, ask: &PeerAsk) -> bool {
-        self.syncing.is_some() && matches!(ask, PeerAsk::Sync { .. })
-    }
-
-    /// Hold `parked` until the sync in flight returns.
-    fn park(&mut self, parked: Parked) {
-        let what = match &parked {
-            Parked::Landing { .. } => "landing",
-            Parked::Ask { .. } => "sync_ask",
-        };
-        tracing::info!(node = self.node.0, what, "sync_parked");
-        self.parked.push(parked);
-    }
-
-    fn unpark(&mut self, parked: Parked) -> Result<(), Fault> {
-        match parked {
-            Parked::Landing {
-                result,
-                site,
-                emitter,
-            } => self.land(result, site, emitter),
-            Parked::Ask {
-                asker: Some(asker),
-                site,
-                ask,
-            } => {
-                self.answer_peer(asker, site.partition, site.correlation, &ask);
-                Ok(())
-            }
-            Parked::Ask {
-                asker: None,
-                site,
-                ask,
-            } => {
-                if let Some(answer) = self.answer(site.partition, &ask) {
-                    self.answer_here(site, answer);
-                }
-                Ok(())
-            }
-        }
     }
 
     /// The trim duty (achieveai/rDB#34; ADR-rdb-0004 §4): per partition, the published writes
@@ -3600,15 +3603,7 @@ impl Host {
         // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
         // its own fsync never delays theirs.
         for (site, ask) in std::mem::take(&mut self.own_asks) {
-            if self.parks(&ask) {
-                self.park(Parked::Ask {
-                    asker: None,
-                    site,
-                    ask,
-                });
-                continue;
-            }
-            if let Some(answer) = self.answer(site.partition, &ask) {
+            if let Some(answer) = self.answer(site.partition, &ask, Reply::Here(site)) {
                 self.answer_here(site, answer);
             }
         }
@@ -4546,15 +4541,6 @@ impl Host {
         emitter: NodeId,
     ) -> Result<(), Fault> {
         let partition = site.partition;
-        // F4 (A-R317): a first landing syncs its link inline, so it waits for a sync in flight.
-        if self.syncing.is_some() && !self.landed.contains(&(partition, result.new_generation)) {
-            self.park(Parked::Landing {
-                result,
-                site,
-                emitter,
-            });
-            return Ok(());
-        }
         let first = self.landed.insert((partition, result.new_generation));
         let barrier = in_barrier(&result, self.node);
         tracing::info!(
@@ -4572,7 +4558,8 @@ impl Host {
         // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
         // generation now, before `Recovered` re-anchors its receiver, so it never carries an
         // unlinked generation into the next open.
-        // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is.
+        // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is: the
+        // acquire waits for the link's sync on the syncer (A-R326).
         let caught_up = if first && !barrier {
             let caught_up = self.land_link(partition, &result);
             self.sync_link(partition, result.new_generation)?;
@@ -4585,7 +4572,20 @@ impl Host {
         }
         self.restore_marks(partition, result.new_generation)?;
         self.answer_deferred_syncs(partition, result.new_generation);
-        self.schedule_acquire(&result, site);
+        if let Some(waiting) = self
+            .link_pending
+            .get_mut(&(partition, result.new_generation))
+        {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = result.new_generation.0,
+                "acquire_waits_on_link_sync"
+            );
+            waiting.push((result.clone(), site));
+        } else {
+            self.schedule_acquire(&result, site);
+        }
         self.committed.insert(partition, result.clone());
         self.committed_correlation
             .insert(partition, site.correlation);
@@ -4839,25 +4839,27 @@ impl Host {
     /// would leave the counter naming a generation no copy holds, and every later open would
     /// be `Stale`. One sync per generation change; none when every write is synced already.
     /// A failed sync faults the node, so nothing follows the link.
+    ///
+    /// A-R326: the sync runs on the syncer, requested after the link is written, so it covers
+    /// it. Until it returns the generation is in [`Self::link_pending`], and [`Self::land`]
+    /// holds the acquire there instead of scheduling it; the node's thread never waits.
     fn sync_link(&mut self, partition: PartitionId, generation: Generation) -> Result<(), Fault> {
         if self.engine.wal_synced_through_latest() {
             return Ok(());
         }
-        let started = Instant::now();
-        self.engine.sync_wal_through(Vec::new()).map_err(|fault| {
-            Fault::from(format!(
-                "sync the link of p{} g{}: {fault:?}",
-                partition.0, generation.0
-            ))
-        })?;
+        self.link_pending
+            .insert((partition, generation), Vec::new());
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
             generation = generation.0,
-            millis = millis(started),
-            "link_synced"
+            "link_sync_requested"
         );
-        Ok(())
+        self.request_sync(AfterSync::Link {
+            partition,
+            generation,
+            started: Instant::now(),
+        })
     }
 
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
@@ -5915,37 +5917,42 @@ impl Host {
                 return;
             }
         }
-        if self.parks(ask) {
-            let site = Site {
-                partition,
-                correlation,
-            };
-            self.park(Parked::Ask {
-                asker: Some(asker),
-                site,
-                ask: ask.clone(),
-            });
-            return;
-        }
-        let Some(answer) = self.answer(partition, ask) else {
-            return;
-        };
-        let msg = Msg::Routed {
-            partition,
-            correlation,
-            kind: KernelEvent::Recovery(answer),
-        };
-        if let Err(fault) = self.links.send(self.node, asker, msg) {
-            tracing::warn!(
-                node = self.node.0,
-                asker = asker.0,
-                ?fault,
-                "peer_answer_unreachable"
-            );
+        let reply = Reply::Peer { asker, correlation };
+        if let Some(answer) = self.answer(partition, ask, reply) {
+            self.send_answer(reply, partition, answer);
         }
     }
 
-    fn answer(&mut self, partition: PartitionId, ask: &PeerAsk) -> Option<RecoveryEvent> {
+    /// Send `answer` where `reply` says.
+    fn send_answer(&mut self, reply: Reply, partition: PartitionId, answer: RecoveryEvent) {
+        match reply {
+            Reply::Here(site) => self.answer_here(site, answer),
+            Reply::Peer { asker, correlation } => {
+                let msg = Msg::Routed {
+                    partition,
+                    correlation,
+                    kind: KernelEvent::Recovery(answer),
+                };
+                if let Err(fault) = self.links.send(self.node, asker, msg) {
+                    tracing::warn!(
+                        node = self.node.0,
+                        asker = asker.0,
+                        ?fault,
+                        "peer_answer_unreachable"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The answer to `ask` now, or `None` when there is none yet: a `PeerAsk::Sync` is
+    /// answered to `reply` once its sync returns (A-R326).
+    fn answer(
+        &mut self,
+        partition: PartitionId,
+        ask: &PeerAsk,
+        reply: Reply,
+    ) -> Option<RecoveryEvent> {
         match *ask {
             PeerAsk::Inventory { copy, anchor } => Some(self.inventory(partition, copy, anchor)),
             PeerAsk::Sync {
@@ -5953,7 +5960,10 @@ impl Host {
                 cutoff,
                 generation,
                 post_commit,
-            } => self.sync(partition, copy, cutoff, generation, post_commit),
+            } => {
+                self.request_holder_sync(partition, copy, cutoff, generation, post_commit, reply);
+                None
+            }
         }
     }
 
@@ -6219,16 +6229,18 @@ impl Host {
         }
     }
 
-    /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`). `None` is a
-    /// withheld answer, logged as `sync_withheld`: F1's own timer reports it.
-    fn sync(
+    /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`), on the syncer
+    /// (A-R326): requested now, after the writes it must cover, and answered to `reply` by
+    /// [`Self::sync_answer`] once it returns. A request the syncer cannot take faults the node.
+    fn request_holder_sync(
         &mut self,
         partition: PartitionId,
         copy: CopyId,
         cutoff: Seq,
         generation: Generation,
         post_commit: bool,
-    ) -> Option<RecoveryEvent> {
+        reply: Reply,
+    ) {
         let node = self.node.0;
         if !post_commit {
             let pause = {
@@ -6246,17 +6258,75 @@ impl Host {
                 std::thread::sleep(pause);
             }
         }
-        let captured = vec![CapturedPrefix {
+        tracing::info!(
+            node,
+            partition = partition.0,
+            copy = copy.0,
+            cutoff = cutoff.0,
+            generation = generation.0,
+            post_commit,
+            "holder_sync_requested"
+        );
+        let capture = CapturedPrefix {
             partition,
             generation,
             through: AppliedSeq(cutoff.0),
-        }];
-        if let Err(fault) = self.engine.sync_wal_through(captured) {
+        };
+        let requested = self.request_sync(AfterSync::Answer {
+            reply,
+            copy,
+            post_commit,
+            captured: [capture],
+        });
+        if let Err(fault) = requested {
+            self.set_fault(fault);
+        }
+    }
+
+    /// Crate rows: a holder's recovery sync on this thread, begun and finished at once, and
+    /// its answer, as [`Self::request_holder_sync`] then the sync's return give it.
+    #[cfg(test)]
+    fn sync(
+        &mut self,
+        partition: PartitionId,
+        copy: CopyId,
+        cutoff: Seq,
+        generation: Generation,
+        post_commit: bool,
+    ) -> Option<RecoveryEvent> {
+        let capture = CapturedPrefix {
+            partition,
+            generation,
+            through: AppliedSeq(cutoff.0),
+        };
+        let sync = self.engine.begin_sync(vec![capture]);
+        let flushed = sync.flush();
+        let synced = self.engine.finish_sync(sync, flushed).is_ok();
+        self.sync_answer(capture, copy, post_commit, synced)
+    }
+
+    /// A holder's recovery sync returned (`synced` says whether it succeeded): the
+    /// `DurableAt` proof, or `None`, a withheld answer, logged as `sync_withheld`: F1's own
+    /// timer reports it.
+    fn sync_answer(
+        &mut self,
+        capture: CapturedPrefix,
+        copy: CopyId,
+        post_commit: bool,
+        synced: bool,
+    ) -> Option<RecoveryEvent> {
+        let node = self.node.0;
+        let CapturedPrefix {
+            partition,
+            generation,
+            through: AppliedSeq(cutoff),
+        } = capture;
+        let cutoff = Seq(cutoff);
+        if !synced {
             tracing::warn!(
                 node,
                 copy = copy.0,
                 cutoff = cutoff.0,
-                ?fault,
                 reason = "failed",
                 "sync_withheld"
             );

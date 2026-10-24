@@ -138,9 +138,11 @@ fn m10_f4_a_commit_made_while_a_sync_runs_is_durable_only_after_the_next_sync() 
 /// Critic-f4 M6: an inherit (link, seal, child applied) and a child commit made while a sync
 /// runs survive its finish, which raises the parent's durable mark; the sealed parent still
 /// refuses a write. A synced put made while a later sync runs moves the synced marker past that
-/// sync's start, and the finish does not move it back.
+/// sync's start, and the finish does not move it back. That put would wait on a real fsync in
+/// flight, so the engine logs it as `synced_write_during_sync` (the guard b3 asserts absent).
 /// Cut: snapshot the lineages at begin and restore them at finish, red (link and seal lost).
 /// Cut: `synced_seq = Some(sync.latest)` in `finish_sync`, red (not synced through latest).
+/// Cut: drop the `synced_write_during_sync` log, red (no line).
 #[retcd_test]
 fn m10_f4_state_set_while_a_sync_runs_is_kept_and_the_synced_marker_never_moves_back() {
     let dir = data_dir("m6");
@@ -196,6 +198,16 @@ fn m10_f4_state_set_while_a_sync_runs_is_kept_and_the_synced_marker_never_moves_
             "the synced marker did not move back to the sync's start"
         );
     }
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "m10_f4_state_set_while_a_sync_runs_is_kept_and_the_synced_marker_never_moves_back",
+    );
+    let during: Vec<_> = lines
+        .iter()
+        .filter(|row| row["@m"] == "synced_write_during_sync")
+        .collect();
+    assert_eq!(during.len(), 1, "one synced write ran during a sync");
+    assert_eq!(during[0]["what"], "metadata");
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 

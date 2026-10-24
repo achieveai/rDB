@@ -294,6 +294,10 @@ pub struct RocksEngine {
     /// The options this engine was opened with; the host reads
     /// [`StorageOptions::sync_stuck_millis`] from them.
     storage: StorageOptions,
+    /// A-R317: a sync [`Self::begin_sync`] began and [`Self::finish_sync`] has not finished.
+    /// A synced write, or another sync, begun meanwhile would wait on that fsync inside
+    /// RocksDB, on the caller's thread: each logs an error instead of passing silently.
+    sync_in_flight: bool,
     /// Debug builds: the options a writable open used, kept for their WAL-sync counter
     /// ([`Self::wal_syncs`]); `None` on a read-only open.
     #[cfg(debug_assertions)]
@@ -445,6 +449,9 @@ impl RocksEngine {
     /// syncer's next sync carries them. Fault point [`InjectedFault::SyncedPut`] either way.
     fn put_metadata_all(&mut self, puts: &[(&[u8], &[u8])], sync: bool) -> Result<(), String> {
         self.fire(InjectedFault::SyncedPut)?;
+        if sync {
+            self.note_synced_write("metadata");
+        }
         let mut opts = WriteOptions::default();
         opts.set_sync(sync);
         let mut write = WriteBatch::default();
@@ -456,6 +463,15 @@ impl RocksEngine {
             self.synced_seq = Some(self.db.latest_sequence_number());
         }
         Ok(())
+    }
+
+    /// A-R317: log `synced_write_during_sync` when a synced write named `what` starts while a
+    /// sync is in flight. RocksDB makes such a write wait for that fsync on the caller's
+    /// thread, which on a node's thread is the stall F4 removes, so it is loud, never silent.
+    fn note_synced_write(&self, what: &'static str) {
+        if self.sync_in_flight {
+            tracing::error!(target: LOG_TARGET, what, "synced_write_during_sync");
+        }
     }
 
     /// `Err` once, if [`Self::inject_fault`] armed `at`. The `fault_injected` line is
@@ -586,6 +602,7 @@ impl RocksEngine {
             claim: Some(Arc::new(claim)),
             synced_seq: None,
             storage,
+            sync_in_flight: false,
             #[cfg(debug_assertions)]
             options: Some(options),
         })
@@ -629,6 +646,7 @@ impl RocksEngine {
             claim: None,
             synced_seq: None,
             storage: StorageOptions::default(),
+            sync_in_flight: false,
             #[cfg(debug_assertions)]
             options: None,
         })
@@ -1184,6 +1202,10 @@ impl RocksEngine {
     /// to [`Self::finish_sync`]. An armed [`InjectedFault::WalFlush`] fires here and fails that
     /// fsync without calling RocksDB.
     pub fn begin_sync(&mut self, captured: Vec<CapturedPrefix>) -> WalSync {
+        if self.sync_in_flight {
+            tracing::error!(target: LOG_TARGET, "sync_began_during_sync");
+        }
+        self.sync_in_flight = true;
         // A-R214: read before the sync, so a write racing it can only cost one more sync.
         let latest = self.db.latest_sequence_number();
         let failed = self.fire(InjectedFault::WalFlush).err();
@@ -1235,6 +1257,7 @@ impl RocksEngine {
         sync: WalSync,
         flushed: Result<(), String>,
     ) -> Result<Vec<DurablePrefix>, StorageFault> {
+        self.sync_in_flight = false;
         if let Err(e) = flushed {
             tracing::error!(target: LOG_TARGET, error = %e, "wal_sync_failed");
             return Err(StorageFault::FlushFailed);
@@ -1503,6 +1526,9 @@ impl RocksEngine {
                 write.delete_cf(cf, &raw);
                 deleted += 1;
             }
+        }
+        if sync {
+            self.note_synced_write("dedup_trim");
         }
         let mut opts = WriteOptions::default();
         opts.set_sync(sync);
