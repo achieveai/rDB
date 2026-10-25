@@ -5851,3 +5851,102 @@ fn m10_s2_a_fenced_owner_never_admits_a_put_after_it_reads_the_owner() {
     );
     assert_eq!(after.holds, before.holds, "nothing applied after the read");
 }
+
+/// A-R399 condition (2), lead leftover after critic: `redirect` rewrites only a fenced node's
+/// `LEASE_EXPIRED` that provably mutated nothing, and only toward another node. Each guard gets
+/// its own answer, and each must leave the answer as it was:
+/// - not `LEASE_EXPIRED` (`!expired`): an `Unchanged`, and an `OVERLOADED` error;
+/// - `LEASE_EXPIRED` that may have mutated (`error.no_mutation`): a `NOT_PRIMARY` with
+///   `no_mutation = true` would tell the app nothing was written when something may have been;
+/// - a node that is not fenced (`fence_of(..).is_none()`): node 2, given a learned owner;
+/// - a learned owner that is this node (`owner == self.node`).
+///
+/// The positive control first: node 1's own refusal is rewritten, so the setup is live.
+/// Cuts, one at a time: drop `!expired`; drop `&& error.no_mutation`; drop the fenced check;
+/// drop the owner check. Each turns its case into `NOT_PRIMARY`, red.
+/// Integration (~3 s): `cut_owner_promoted_away`, then direct calls.
+#[config_log::retcd_test]
+fn m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, cut) = cut_owner_promoted_away(dir.path());
+    let Answer::Error { error: lease, .. } = cut else {
+        panic!("a put while cut: {cut:?}");
+    };
+    assert_eq!(
+        (lease.kind, lease.no_mutation),
+        (ErrorKind::LeaseExpired, true)
+    );
+    let error = |kind: ErrorKind, no_mutation: bool| Answer::Error {
+        error: ApiError {
+            kind,
+            no_mutation,
+            ..lease.clone()
+        },
+        request: None,
+    };
+    let shape = |answer: &Answer| match answer {
+        Answer::Error { error, .. } => {
+            format!("{:?} no_mutation={}", error.kind, error.no_mutation)
+        }
+        Answer::Unchanged => "Unchanged".to_owned(),
+        other => format!("{other:?}"),
+    };
+    let p1 = PartitionId(1);
+
+    // Positive control: the case the rewrite is for.
+    let rewritten = trio.nodes[0]
+        .0
+        .redirect(p1, error(ErrorKind::LeaseExpired, true));
+    assert_eq!(shape(&rewritten), "NotPrimary no_mutation=true", "control");
+
+    // `!expired`: anything else is not rewritten.
+    let kept = trio.nodes[0].0.redirect(p1, Answer::Unchanged);
+    assert_eq!(shape(&kept), "Unchanged", "!expired: Unchanged");
+    let kept = trio.nodes[0]
+        .0
+        .redirect(p1, error(ErrorKind::Overloaded, true));
+    assert_eq!(
+        shape(&kept),
+        "Overloaded no_mutation=true",
+        "!expired: Overloaded"
+    );
+
+    // `error.no_mutation`: a refusal that may have mutated keeps saying so.
+    let kept = trio.nodes[0]
+        .0
+        .redirect(p1, error(ErrorKind::LeaseExpired, false));
+    assert_eq!(
+        shape(&kept),
+        "LeaseExpired no_mutation=false",
+        "no_mutation: may have mutated"
+    );
+
+    // The fenced check: node 2 holds its grant, so a learned owner changes nothing there.
+    assert!(trio.status(1).fence.is_none(), "node 2 is not fenced");
+    trio.nodes[1]
+        .0
+        .owner_after_fence
+        .insert(p1, Some(NodeId(3)));
+    let kept = trio.nodes[1]
+        .0
+        .redirect(p1, error(ErrorKind::LeaseExpired, true));
+    assert_eq!(
+        shape(&kept),
+        "LeaseExpired no_mutation=true",
+        "fenced check: node 2"
+    );
+
+    // The owner check: a record naming this node never points the app back at itself.
+    trio.nodes[0]
+        .0
+        .owner_after_fence
+        .insert(p1, Some(NodeId(1)));
+    let kept = trio.nodes[0]
+        .0
+        .redirect(p1, error(ErrorKind::LeaseExpired, true));
+    assert_eq!(
+        shape(&kept),
+        "LeaseExpired no_mutation=true",
+        "owner check: itself"
+    );
+}
