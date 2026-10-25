@@ -478,7 +478,11 @@ fn m10_bb_45_a_first_open_whose_recovery_cas_answers_unknown_is_ready_and_writes
             faulty.partition_puts()
         );
         let owner = owner_status(&db, case);
-        assert_eq!(owner.recovery.as_deref(), Some("Committed"), "{case}: {owner:?}");
+        assert_eq!(
+            owner.recovery.as_deref(),
+            Some("Committed"),
+            "{case}: {owner:?}"
+        );
         db.put(b"a", b"1", None)
             .unwrap_or_else(|e| panic!("{case}: a put after the first open: {e}"));
         let got = db
