@@ -479,7 +479,8 @@ What each refusal means, and when to retry:
 | Refusal | Why | When to retry |
 |---|---|---|
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
-| `LEASE_EXPIRED` | The owner's permission to write ran out. | After `db.wait_ready(..)`. |
+| `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd answers this for as long as it is cut. | After `db.wait_ready(..)`. |
+| `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` re-reads the owner on this answer, so the retry goes to the new one. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
 | `UNAVAILABLE`, "went out of reach ...; a write sent here may have applied" | The owner's process stopped after the write was sent (`no_mutation` false). | Once it is back: `db.resend(..)` the request, or ask `db.status(..)`. |
@@ -496,17 +497,24 @@ for that answer. With rEtcd down too, each refused `put` took about 0.8 s. A loo
 retries then runs for about 27 minutes and looks like a hang. Stop retrying a set time after
 the first refusal.
 
+While the whole rEtcd is down, each `LEASE_EXPIRED` also makes the `Db` ask rEtcd who owns
+the partition. That is at most one ask every 250 ms, and each can wait up to the 1 s read
+timeout.
+
 Measured with three processes on the dev host (local-cluster.md section 5 has the walk), an
 app writing all the time:
 
 | Event | Writes refused for | Refusals seen, in order |
 |---|---|---|
 | A secondary killed and left down for 60 s | 15.4 s, then writes resumed **with the copy still down** | `PROTECTION_PAUSED`, `LEASE_EXPIRED`, `PROTECTION_PAUSED` |
-| A secondary restarted (`lr restart 2`) | 8.6 s | `UNKNOWN_OUTCOME`, `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED` |
+| A secondary restarted (`lr restart 2`) | 8.6 s (older build, see below) | `UNKNOWN_OUTCOME`, `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED` |
 | The owner restarted (`lr restart 1`) | 3.6 s | `UNAVAILABLE` (went out of reach, either form), `PROTECTION_PAUSED` |
 
 Every acknowledged write read back afterwards (28,734, 6,217 and 13,644 of them, 0 missing).
 One run each, on a busy host: treat the times as rough.
+
+The 8.6 s was measured before a restarted secondary came back as a standby. A secondary
+restart with all three copies up now pauses writes for about 0.2 s (the bullet below).
 
 A later walk killed node 2 and started it 20 s later. The kill showed `PROTECTION_PAUSED`,
 `LEASE_EXPIRED`, `UNAVAILABLE` "not yet marked activated", `PROTECTION_PAUSED`. The start gave
@@ -516,11 +524,29 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
   new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
   walk, 15 s after the kill, while the copy stayed down.
+- **A copy cut off long enough to be dropped stays out after the link heals.** That is the
+  copy rDB stopped waiting for, in the bullet above. Writes keep working on the other two
+  copies. Healing the link alone does not add it back. Restart that node: `lr restart N` with
+  three processes, or `db.restart_node(NodeId(N))` embedded. It comes back as a standby first,
+  then as a full copy.
 - **A restarted copy waits about 5 s before it counts again.** Once it has caught up, it must
   stay within 250 ms of the owner for 5 s in a row before writes resume (`resume_hold_millis`
-  and `resume_lag_millis`). Falling behind again restarts the 5 s. That wait is most of the
+  and `resume_lag_millis`). Falling behind again restarts the 5 s. That wait was most of the
   3.6 to 8.6 s restart pauses above; opening the node's store takes only 37 to 55 ms. The
   first resume after an open skips the wait. An app cannot change these times in this release.
+  A secondary restarted with all three copies up no longer makes writes wait this way: see the
+  next bullet.
+- **A secondary restarts while all three copies are up.** It comes back as a standby first. A
+  standby does not count as a copy, so writes go on with the other two. Writes pause about
+  0.2 s, or about 2 s twice if its data was wiped. Then it is a full copy again.
+- **The owner is cut off from rEtcd.** While it is cut, it answers `LEASE_EXPIRED`. On that
+  answer the `Db` re-reads who owns the partition, at most once every 250 ms. So it follows a
+  promote made elsewhere, and your retries go to the new owner.
+- **The cut ends after a promote.** The old owner is now fenced. It reads the owner record
+  and answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true. A resend is
+  safe. Its log shows `host_owner_learned`.
+- **The old owner starts again after a promote.** It is added back automatically, as a
+  standby first.
 - **The exception: a copy cut off across two or more reopens with no writes in between.** That
   copy stays behind, and writes stay paused:
   - A plain reopen does not help, even with every link up. Reads still work.
@@ -591,16 +617,16 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   full read of the object, and a clear of it are all refused `INCOMPATIBLE_VERSION`, with
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
-- **A restarted secondary rejoins by itself** once the owner re-plans: writes pause briefly,
-  then resume. **Embedded only: a restarted owner stays out until the folder is opened
-  again.** That is node 1 restarted inside this open (`Db::restart_node`); see section 5. With
-  three processes, a restarted owner process comes back and serves with no app reopen: writes
+- **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
+  resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
+  folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
+  see section 5. With three processes, a restarted owner process comes back and serves with no app reopen: writes
   were refused for 3.6 s (`lr restart 1`, local-cluster.md section 5).
 - **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
-  can promote too. **A dropped node rejoins as a secondary at the next reopen heal; membership
-  is fixed at three nodes.**
+  can promote too. **The dropped node is added back automatically when it starts again, or at
+  the next reopen heal; membership is fixed at three nodes.**
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry

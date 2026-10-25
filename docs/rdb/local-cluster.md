@@ -59,7 +59,9 @@ works as written. `--run DIR` picks another run.
 | `start N` | Starts node N and waits for `rdb_node ready`. Exit 1 with the node's reason if it is not ready. |
 | `restart N` | `stop N`, then `start N`, with the same wait for ready. |
 | `kill N` | Kills node N at once, like a crash. Prints `lr: node N killed (pid ...)`. |
-| `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. |
+| `hold A-B` | Holds every frame between nodes A and B: a cut link (a delay, never a loss). |
+| `heal A-B` | Lifts that hold. If the cut lasted long enough that a copy was dropped, `heal` alone does not add it back. Writes keep working on the other two copies. Run `lr restart N` for the dropped node; it comes back as a standby first, then as a full copy. |
+| `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. The node left out is added back automatically when it starts again. |
 | `down` | Stops the nodes and rEtcd. The run folder stays, with its data and logs. |
 | `up --resume` | Starts the last run again after a `down`: its rEtcd, then nodes 1, 2 and 3, with its own ports and binary paths (a later `up` rebuilds those binaries in place). The data written before `down` is still there. A run that is still up is refused: "the run is up; 'lr down' first". Plain `up` always makes a **new**, empty run. |
 | `clean` | `down`, then deletes the run folder, **its logs included**: copy what you need first. Prints `lr: removed <run folder>`. |
@@ -272,12 +274,14 @@ worth reading.
   | Step | `lr` took | Writes refused for |
   |---|---|---|
   | `kill 3`, left down 60 s, then `start 3` | `start`: 1.6 s | 15.4 s, then writes resumed with node 3 still down |
-  | `restart 2` | 12.0 s (stop, then start) | 8.6 s |
+  | `restart 2` | 12.0 s (stop, then start) | 8.6 s (older build; now about 0.2 s, below) |
   | `restart 1`, the owner | 5.2 s | 3.6 s |
   | `down`, then `up --resume` | 52 s | until `up --resume`; the data was all there |
 
-  Every acknowledged write read back (0 missing). The refusals the app saw, and what to do with
-  each, are in embed.md, "When writes pause". A write sent to the owner as it stops answers
+  Every acknowledged write read back (0 missing). The `restart 2` time was measured before a
+  restarted secondary came back as a standby. With all three nodes up, it now pauses writes
+  about 0.2 s, or about 2 s twice if the node's data was wiped. The refusals the app saw, and
+  what to do with each, are in embed.md, "When writes pause". A write sent to the owner as it stops answers
   `UNAVAILABLE (node 1, the owner, went out of reach while this call waited ...)`. With
   `no_mutation` false ("a write sent here may have applied"), resend that same request once it
   is back. With `no_mutation` true ("this call writes nothing"), nothing was applied: send it

@@ -463,6 +463,14 @@ name and writes nothing. This changes no row of the table above, and it does not
 amendment: a copy that is unheard, or that holds less than `base` in its own generation, still
 pauses writes (B-R38).
 
+**Ruling 2026-10-24 (M10 S2, lead ruling A-R406; critic-d4 ADV-1): a secondary restarted while
+every copy is up is handled like a dropped copy.** This records existing behaviour; it changes no
+row of the table above and no other rule.
+- It is re-added as a shadow. Until that shadow is promoted, writes need the primary plus the one
+  remaining regular copy: `DEGRADED_RF2`.
+- A shadow never counts toward an ack or toward durability.
+- A further loss in that window gives `READ_ONLY`, as the table says for one eligible regular.
+
 The mode is **derived, never configured**. rDB has no equivalent of
 `unclean.leader.election.enable` and must not acquire one: the Kafka toggle is a single boolean that
 converts a durability guarantee into an availability guarantee, and the equivalent pressure here
