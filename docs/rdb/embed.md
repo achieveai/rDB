@@ -489,6 +489,11 @@ One run each, on a busy host: treat the times as rough.
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
   new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
   walk, 15 s after the kill, while the copy stayed down.
+- **A restarted copy waits about 5 s before it counts again.** Once it has caught up, it must
+  stay within 250 ms of the owner for 5 s in a row before writes resume (`resume_hold_millis`
+  and `resume_lag_millis`). Falling behind again restarts the 5 s. That wait is most of the
+  3.6 to 8.6 s restart pauses above; opening the node's store takes only 37 to 55 ms. The
+  first resume after an open skips the wait. An app cannot change these times in this release.
 - **The exception: a copy cut off across two or more reopens with no writes in between.** That
   copy stays behind, and writes stay paused:
   - A plain reopen does not help, even with every link up. Reads still work.
@@ -507,6 +512,11 @@ One run each, on a busy host: treat the times as rough.
   process, on one machine. Each node process then opens its own `nodes/<n>` in that shared
   folder. Forming a new database over the network is not supported yet. A node process started
   on a folder that was never formed is refused with "form the database first (lr up)".
+- **A copy missed while the database is first formed never joins.** This happens when a node's
+  report misses the first discovery window, for example when the host stalls during `lr up`.
+  The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
+  one more copy and the partition becomes read-only. A copy wiped after forming is not
+  affected: it rejoins through the heal.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or

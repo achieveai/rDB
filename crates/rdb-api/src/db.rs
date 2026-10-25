@@ -5347,8 +5347,9 @@ mod tests {
     /// queued, so a retry of it must not promise that `status` will show its outcome: status
     /// stays `Unknown` for good. A retry of the published put keeps the promise, since status
     /// shows it (review F-023). Since A-R256(2) node 1 re-plans after the restart and writes
-    /// resume once node 3 syncs, so the published put is made at the re-planned generation and
-    /// node 3's link is then held to bring the pause, and the refusals still name the restart.
+    /// resume once node 3 syncs, so node 3's link is held once the re-plan includes it, and the
+    /// published put is made under that hold at the re-planned generation: it stays unsafe and
+    /// brings the pause (A-R371), and the refusals still name the restart.
     /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
     #[test]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
@@ -5389,28 +5390,29 @@ mod tests {
         }
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
         let deadline = std::time::Instant::now() + patience;
-        let first = loop {
+        // A-R371 (W9 load runs, 2 of 85 red, "L1 pauses: not within 15s"): L1 pauses only on
+        // the age of its oldest unsafe record. The put used to land first and the hold come
+        // after, so when node 3 synced it in between, nothing was unsafe and L1 stayed healthy.
+        // Hold first, so the put is published by node 2 and stays unsafe until node 3 has it.
+        loop {
             let owner = owner_status(&db, "node 1 re-planning");
-            if owner.recovered > before && owner.admits == Some(true) {
-                if let Ok(put) = db.put(b"a", b"2", None) {
-                    break put;
-                }
+            let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
+            let replanned = owner.recovered > before && owner.admits == Some(true);
+            // A re-plan that dropped node 3 leaves the hold below nothing to pause: say so.
+            if replanned && node_3.as_ref().and_then(|n| n.recovered) == owner.recovered {
+                break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "no put landed after node 1's re-plan within {patience:?}: {owner:?}"
+                "node 1 never re-planned with node 3 within {patience:?}: owner {owner:?}, \
+                 node 3 {node_3:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
-        };
-        // A re-plan that dropped node 3 leaves the hold below nothing to pause: say so now.
-        let owner = owner_status(&db, "node 1 after the re-plan");
-        let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
-        assert_eq!(
-            node_3.as_ref().and_then(|n| n.recovered),
-            owner.recovered,
-            "node 3 is not in node 1's re-plan (dropped?): owner {owner:?}, node 3 {node_3:?}"
-        );
+        }
         db.links().hold(OWNER, NodeId(3));
+        let first = db
+            .put(b"a", b"2", None)
+            .expect("node 2 publishes a put node 3 cannot hold");
         owner_when(&db, "L1 pauses", patience, &|node| {
             node.admits == Some(false)
         });
