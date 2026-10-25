@@ -1619,6 +1619,10 @@ pub struct WireNodeStatus {
     pub waits_on: Option<Seq>,
     pub stalled: Option<String>,
     pub reload_pending: Option<u32>,
+    /// Added under version 3 (A-R412): no released build speaks 3.
+    pub pinned: Vec<rdb_core::contracts::membership::Member>,
+    /// Added under version 3 (A-R415 C-2), as `pinned` was.
+    pub config_version: Option<rdb_core::contracts::ids::ConfigVersion>,
 }
 
 /// The role words a host reports (`host::Node::status`).
@@ -1650,6 +1654,8 @@ impl From<&NodeStatus> for WireNodeStatus {
             waits_on: status.waits_on,
             stalled: status.stalled.clone(),
             reload_pending: status.reload_pending,
+            pinned: status.pinned.clone(),
+            config_version: status.config_version,
         }
     }
 }
@@ -1686,6 +1692,8 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
             waits_on: status.waits_on,
             stalled: status.stalled,
             reload_pending: status.reload_pending,
+            pinned: status.pinned,
+            config_version: status.config_version,
             lengths: None,
         })
     }

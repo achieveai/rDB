@@ -1,8 +1,9 @@
 //! Physical layout: column families, key prefix, value framing and the format marker.
 //!
 //! [`FORMAT_VERSION`] `2` (M10 S2): format `1`, settled by ADR-rdb-0010 decision 11, plus the
-//! epoch revocations. A format-1 directory still opens; see [`OLDEST_FORMAT_VERSION`]. S0's
-//! provisional `0` is refused at open, so no S0 data directory is read.
+//! epoch revocations and the ack floor's dedup rows. A format-1 directory still opens; see
+//! [`OLDEST_FORMAT_VERSION`]. S0's provisional `0` is refused at open, so no S0 data
+//! directory is read.
 //!
 //! - **Key:** `partition u32 BE | generation u64 BE | ns u8 | key`. Fixed-width, so a key is
 //!   unambiguous, and partition- and generation-contiguous, so a prefix export or a
@@ -38,14 +39,18 @@ use rdb_core::contracts::trace::Version;
 
 /// The on-disk format this build writes (ADR-rdb-0010 decision 11). `0` was S0's provisional
 /// layout and is refused. Format 2 (M10 S2) adds one record, the epoch revocations
-/// ([`REVOKED_PREFIX`]); a key added after it needs another bump.
+/// ([`REVOKED_PREFIX`]), and gives `dedup` rows a meaning format 1 lacks: an ack floor's record
+/// and the deletes it licenses (A-R252). A key added after it needs another bump.
 pub const FORMAT_VERSION: u32 = 2;
 
-/// The oldest format this build opens. Format 2 only adds a record, so a format-1 directory is a
-/// format-2 one that holds no revocation. Its marker stays `1`, and a format-1 build can still
-/// open it, until its first revocation: that synced write moves the marker to `2` in the same
-/// batch, so no directory a format-1 build accepts ever holds a record it cannot read (gate
-/// V12: a format-1 build refuses marker `2`, because it accepts only its own).
+/// The oldest format this build opens. A format-1 directory is a format-2 one that holds no
+/// revocation and no ack floor. Its marker stays `1`, and a format-1 build can still open it,
+/// until the first write a format-1 build would misread: an epoch revocation, or a commit that
+/// carries an ack floor's record or deletes. That write moves the marker to `2` in the same
+/// batch (review-s2 F-006, A-R411). A floor row parses as a plain dedup row, so a format-1
+/// build would open it and re-execute a resend the floor dropped. So no directory a format-1
+/// build accepts ever holds a record it would misread (gate V12: a format-1 build refuses
+/// marker `2`, because it accepts only its own).
 pub const OLDEST_FORMAT_VERSION: u32 = 1;
 
 /// Column family for [`Namespace::User`].

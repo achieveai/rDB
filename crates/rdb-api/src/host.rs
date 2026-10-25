@@ -965,6 +965,14 @@ pub struct NodeStatus {
     /// bench's memory proof. The host fills it; it never crosses the wire, so a status read
     /// from a peer has `None`.
     pub lengths: Option<IndexLengths>,
+    /// The members of the newest configuration this node landed or committed for the
+    /// partition, with their roles; empty before it holds one. `Db::promote` reads it from the
+    /// node it promotes, before it writes, so a shadow is refused and stays a shadow (review-s2
+    /// F-004, A-R412). Crosses the wire.
+    pub pinned: Vec<Member>,
+    /// The version of the configuration `pinned` belongs to; `None` before it holds one.
+    /// `admin::promote` refuses when it is not `partitions/1`'s (A-R415 C-2). Crosses the wire.
+    pub config_version: Option<ConfigVersion>,
 }
 
 /// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
@@ -8519,6 +8527,16 @@ impl Host {
                 },
                 published_at: self.published_at.get(&partition).map_or(0, VecDeque::len),
             }),
+            pinned: self
+                .committed
+                .get(&partition)
+                .map_or_else(Vec::new, |result| {
+                    result.committed.pinned_config.members.clone()
+                }),
+            config_version: self
+                .committed
+                .get(&partition)
+                .map(|result| result.committed.pinned_config.config_version),
         }
     }
 }

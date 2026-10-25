@@ -2383,6 +2383,64 @@ fn m10_s2_the_owners_wiped_copy_is_refused_with_a_promote_hint() {
     assert_eq!(marker(dir.path(), 1), None, "the empty copy stays unbound");
 }
 
+/// A-R415 C-1, A-R416 (the critic's row): after a full restart with node 1's copy lost, nodes
+/// 2 and 3 open as node processes and land no configuration, since only the owner heals. A
+/// promote of node 2 cannot tell their roles, so it is refused `UNAVAILABLE`/`NotWired` with
+/// nothing written, saying node 2 holds no configuration since its restart, never "promote
+/// again". This is the stated limit until the member list is stored. Cut: `promote_members`
+/// takes an answer with no configuration as `PeersUnknown`, red (the text says "promote
+/// again"). Integration (~2 s): one fresh open until ready, one two-node open, one app open.
+#[config_log::retcd_test]
+fn m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_names_the_limit() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    std::fs::remove_dir_all(dir.path().join("nodes").join("1")).expect("wipe node 1's copy");
+    let mut nodes = open_node(&rt, dir.path(), &store, &[2, 3]).expect("nodes 2 and 3 open");
+    let before = partition_revision(&rt, &store);
+
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let refused = app
+        .promote(NodeId(2), None)
+        .expect_err("node 2 holds no configuration");
+    assert_eq!(
+        (refused.kind, refused.retry, refused.no_mutation),
+        (ErrorKind::Unavailable, RetryRule::NotWired, true),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .detail
+            .starts_with("node 2 holds no configuration since its restart"),
+        "{}",
+        refused.detail
+    );
+    assert!(
+        !refused.detail.contains("promote again"),
+        "{}",
+        refused.detail
+    );
+    assert_eq!(
+        partition_revision(&rt, &store),
+        before,
+        "nothing was written"
+    );
+    app.shutdown();
+    nodes.shutdown();
+}
+
+/// `partitions/1`'s `mod_revision`, read now.
+fn partition_revision(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> u64 {
+    rt.block_on(store.get(config_core::GetRequest {
+        key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+    }))
+    .expect("get partitions/1")
+    .record
+    .expect("partitions/1")
+    .mod_revision
+}
+
 /// A-R231(a), B1 case 1: after formation, node 2's process opens its own copy only. It is not
 /// the owner `partitions/1` names, so it starts no heal; node 1's process heals.
 /// Integration (~1 s): one fresh open until ready, one node-process open.
@@ -2952,10 +3010,29 @@ fn promote_redelivering(
         drop: None,
         within: heal_within(&fast()),
         members: admin::members(),
+        // The fixed list is the live one here: nothing has reconfigured partition 1.
+        members_version: partition_version(rt, store),
         member_boot: Arc::new(move |node| boot_links.boot_of(node)),
         send: Arc::new(send),
     };
     rt.block_on(admin::promote(ctx))
+}
+
+/// `partitions/1`'s `config_version`, read now.
+fn partition_version(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+) -> rdb_core::contracts::ids::ConfigVersion {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record
+        .expect("partitions/1");
+    PartitionRecord::decode(&read.value)
+        .expect("a partition record")
+        .config_version
 }
 
 /// `partitions/1`'s owner and generation, read now.
@@ -2975,7 +3052,9 @@ fn partition_owner(
 }
 
 /// A-R265/A-R266 (W7's walk G, condition 3): a promote that cannot reach node 2 is refused
-/// `UNAVAILABLE` after it wrote, and says to promote again. Node 2 then runs again, and the re-run
+/// `UNAVAILABLE`, and says to promote again. Since review-s2 F-004 (A-R412) it is refused before
+/// it writes: it reads node 2's roles first, and node 2 does not answer. The refusal after a
+/// write is pinned in `admin`'s own rows. Node 2 then runs again, and the re-run
 /// finishes: node 2 owns partition 1 one generation on. Its plan and fence reach node 2 twice in
 /// the re-run, as a re-run after a lost answer sends them, and once more after the commit. Node 2
 /// steps all six without a fault and commits one generation, not two, and a put lands on it.
@@ -3005,13 +3084,13 @@ fn m10_s2_a_promote_that_could_not_reach_node_2_finishes_when_run_again_and_rede
     let refused = app.promote(NodeId(2), None).expect_err("node 2 is stopped");
     assert_eq!(
         (refused.kind, refused.retry, refused.no_mutation),
-        (ErrorKind::Unavailable, RetryRule::BoundedJitter, false),
+        (ErrorKind::Unavailable, RetryRule::BoundedJitter, true),
         "{refused:?}"
     );
     assert!(
         refused
             .detail
-            .starts_with("node 2 could not be sent the new plan;")
+            .starts_with("no link to node 2 came up within")
             && refused.detail.ends_with("promote again"),
         "{refused:?}"
     );

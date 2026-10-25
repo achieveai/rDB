@@ -25,6 +25,11 @@ refused at open (exit 6).
   (`persist_epoch_revocation`; `epoch_revocations` for the host's replay at start). `dump`
   shows `revoked_epochs p=<id> [<epochs>]`. A format-1 copy keeps marker 1 until its first
   revocation; that batch writes marker 2, so a format-1 build then refuses the copy.
+- Ack floor rows (format 2, M10 S2, A-R252): a floor record is a `dedup` row under affinity 0
+  and a reserved request id, and a floor deletes `dedup` rows early. Both parse in format 1,
+  but a format-1 build would re-execute a resend the floor dropped. So the first `commit`
+  that carries a floor record or a `dedup` delete writes marker 2 in the same batch
+  (review-s2 F-006, A-R411), logged `format_marker_moved_for_ack_floor`.
 - A new key needs a `FORMAT_VERSION` bump. This build refuses a short `metadata` key it
   does not define (A-R184), so a copy holding a newer build's key would not open here.
 - A stored `Meta` record is refused at open; a `Meta` write is refused at commit.
@@ -163,6 +168,7 @@ invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (t
 | `rdb_storage` | `meta_write_refused`, `sealed_generation_write_refused`, `staging_generation_write_refused` (ERROR) | `partition, generation, seq` + `sealed_by` / `parent, base` |
 | `rdb_storage` | `wal_sync_ancestor` | `partition, generation, durable` |
 | `rdb_storage` | `batch_commit` | `partition, generation, seq, writes, applied` |
+| `rdb_storage` | `format_marker_moved_for_ack_floor` (the commit that first carries an ack floor on a format-1 copy) | `partition, generation, seq, from_format, format` |
 | `rdb_storage` | `dedup_delete_below` / `dedup_delete_unknown_lineage`, `dedup_delete_failed` (ERROR) | `partition, generation` + `levels, end_hex` / `error` |
 | `rdb_storage` | `dedup_trim_deleted` / `dedup_trim_unknown_lineage`, `dedup_trim_value_undecodable`, `dedup_trim_read_failed`, `dedup_trim_delete_failed` (ERROR) | `partition, generation` + `below, scanned, deleted` / `key_hex` / `error` |
 | `rdb_storage` | `wal_sync` (DEBUG; one per captured lineage per flush, so `RUST_LOG=rdb_storage=debug` to see it) | `partition, generation, captured, durable` |

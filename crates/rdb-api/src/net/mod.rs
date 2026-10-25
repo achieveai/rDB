@@ -15,6 +15,15 @@
 //! name, so TLS itself proves it reached that node. A link that comes up reports the peer's
 //! boot ([`Net::boot_of`], `net_peer_booted`).
 //!
+//! Every message after it is held to that label too: an app may send only client calls,
+//! `Inspect` and a promote's two recovery events (`Plan`, `FenceProven`), and a node may not
+//! name another node as a message's sender. Anything else is dropped before a node sees it,
+//! logged `net_msg_sender_refused{peer, msg, to, reason}` (review-s2 F-008).
+//!
+//! Not checked (A-R415, advisory): a node's `Routed` event whose body names another copy, and
+//! a frame's `boot` against its link's. Only that node's own certificate can send either, and a
+//! member lying about itself is outside the fault model.
+//!
 //! # Replies
 //!
 //! A client call's `Sender` stays with the caller. Its connection mints a correlation, the
@@ -57,7 +66,9 @@ use self::faults::Faults;
 use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, WireReply};
 
 /// The wire version this build speaks. A peer that speaks another is refused at the
-/// handshake, naming both. Move it whenever a type in [`wire`] changes.
+/// handshake, naming both. Move it whenever a type in [`wire`] changes, once a build that speaks
+/// it has been released. `3` came with M10 S2 (41cc012) and no released build speaks it, so
+/// `WireNodeStatus::pinned` (review-s2 F-004, A-R412) was added under `3`, not `4`.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
@@ -513,6 +524,58 @@ impl Net {
             }
         }
     }
+
+    /// Send an already-encoded client call, as [`Net::send`] does after `outbound`. Rows use it
+    /// to send a call the far side cannot decode, which `outbound` never produces.
+    #[cfg(test)]
+    fn send_wire_call(
+        &self,
+        to: NodeId,
+        partition: rdb_core::contracts::ids::PartitionId,
+        call: wire::WireCall,
+        reply: mpsc::Sender<Answer>,
+    ) {
+        let routes = lock(&self.shared.routes);
+        let conn = routes[&to].conn.as_ref().expect("link up");
+        let correlation = conn.correlation();
+        lock(&conn.pending).insert(correlation, Waiter::Answer(reply));
+        conn.out(Frame::Msg(WireMsg::Client {
+            to,
+            partition,
+            call,
+            reply: correlation,
+        }));
+    }
+
+    /// Wait on a status from `from`, then handle `status` as its reply, as the read loop does.
+    /// Rows use it to land a status reply that does not decode, which the far side never sends.
+    /// Returns what the read loop would act on (`Err`: it closes the link with that reason) and
+    /// the caller's channel.
+    #[cfg(test)]
+    fn status_reply_from(
+        &self,
+        from: NodeId,
+        status: wire::WireNodeStatus,
+    ) -> (Result<(), String>, mpsc::Receiver<NodeStatus>) {
+        let conn = Arc::clone(
+            lock(&self.shared.routes)[&from]
+                .conn
+                .as_ref()
+                .expect("link up"),
+        );
+        let (tx, rx) = mpsc::channel();
+        let correlation = conn.correlation();
+        lock(&conn.pending).insert(correlation, Waiter::Status(tx));
+        let handled = handle(
+            &self.shared,
+            &conn,
+            Frame::Reply {
+                correlation,
+                reply: WireReply::Status(status),
+            },
+        );
+        (handled, rx)
+    }
 }
 
 impl Drop for Net {
@@ -714,8 +777,12 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
                         Ok(status) => {
                             let _ = tx.send(status);
                         }
+                        // The waiter is dropped, so the caller's channel closes now; the link
+                        // closes with the reason, so the next look fails fast and says why
+                        // instead of logging this again for every poll (review-s2 F-015).
                         Err(error) => {
                             tracing::error!(peer = %conn.peer, %error, "net_status_undecodable");
+                            return Err(format!("a status reply did not decode: {error}"));
                         }
                     }
                 }
@@ -736,8 +803,51 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
     }
 }
 
+/// Why a message may not come from `peer`, the label its connection's certificate names
+/// (review-s2 F-008). The handshake proves who is at the other end; this holds every message
+/// to it:
+/// - an app holds no copy, so it sends client calls, `Inspect`, and a promote's `Plan` and
+///   `FenceProven` (`Routed`, A-R415 C-3); any other kind from an app is refused;
+/// - a node may name no other node as a frame's `from`, an ask's or catch-up's `asker`, or a
+///   landed result's `emitter`.
+fn sender_refused(peer: &Label, msg: &WireMsg) -> Option<String> {
+    let claimed = match (peer, msg) {
+        (
+            Label::App(_),
+            WireMsg::Client { .. }
+            | WireMsg::Inspect { .. }
+            | WireMsg::Routed {
+                kind:
+                    rdb_core::contracts::event::KernelEvent::Recovery(
+                        rdb_core::contracts::recovery::RecoveryEvent::Plan(_)
+                        | rdb_core::contracts::recovery::RecoveryEvent::FenceProven(_),
+                    ),
+                ..
+            },
+        ) => return None,
+        (Label::App(_), _) => return Some(format!("an app may not send {}", msg.name())),
+        (Label::Node(_), WireMsg::Frame { from, .. }) => from.node,
+        (Label::Node(_), WireMsg::PeerAsk { asker, .. } | WireMsg::CatchUp { asker, .. }) => *asker,
+        (Label::Node(_), WireMsg::Landed { emitter, .. }) => *emitter,
+        (Label::Node(_), _) => return None,
+    };
+    match peer {
+        Label::Node(node) if *node != claimed => Some(format!(
+            "{} names node {} as its sender",
+            msg.name(),
+            claimed.0
+        )),
+        _ => None,
+    }
+}
+
 /// Deliver a received message to the local node it names.
 fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
+    if let Some(reason) = sender_refused(&conn.peer, &msg) {
+        tracing::warn!(peer = %conn.peer, msg = msg.name(), to = msg.to().0, %reason,
+            "net_msg_sender_refused");
+        return;
+    }
     let client = match &msg {
         WireMsg::Client { call, .. } => {
             let n = shared.faults.next_client_request();
@@ -761,10 +871,29 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
     };
     let name = msg.name();
     let to = msg.to();
+    let asked = match &msg {
+        WireMsg::Client { reply, .. } => Some((*reply, true)),
+        WireMsg::Inspect { reply, .. } => Some((*reply, false)),
+        _ => None,
+    };
     let inbound = match wire::inbound(msg) {
         Ok(inbound) => inbound,
         Err(error) => {
             tracing::error!(peer = %conn.peer, msg = name, %error, "net_msg_undecodable");
+            // A caller waits on its correlation: answer it, so a decode failure is a named
+            // error now, not a timeout that says to wait (review-s2 F-015). A status has no
+            // error to carry; its waiter is dropped, which closes the caller's channel at once.
+            if let Some((correlation, client)) = asked {
+                let reply = if client {
+                    WireReply::Answer(WireAnswer::carry(&Answer::Error {
+                        error: undecodable_call(to, &error.to_string()),
+                        request: None,
+                    }))
+                } else {
+                    WireReply::Dropped
+                };
+                conn.out(Frame::Reply { correlation, reply });
+            }
             return;
         }
     };
@@ -864,6 +993,22 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
         }
     }
     let _ = to;
+}
+
+/// The answer to a client call `to`'s process could not decode (review-s2 F-015). It never
+/// reached the node, so nothing ran; the same bytes fail the same way, so a retry will not help.
+fn undecodable_call(to: NodeId, error: &str) -> ApiError {
+    ApiError {
+        kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
+        retry: rdb_core::contracts::errors::RetryRule::NotWired,
+        no_mutation: true,
+        detail: format!(
+            "node {}'s process could not decode the call ({error}); it was not run, and sending \
+             it again will not help: check both sides run the same build",
+            to.0
+        ),
+        retry_after: None,
+    }
 }
 
 /// Wait until this process's own node can take messages: registered in its [`Links`], which

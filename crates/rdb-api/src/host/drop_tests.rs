@@ -2193,6 +2193,290 @@ fn m10_s2_d9_a_wiped_secondary_rejoins_as_a_shadow_and_writes_go_on() {
     assert!(logged!(METHOD, "membership_drop_planned").is_empty());
 }
 
+/// review-s2 F-007 (D9, S2-4 wiped): writes go on *while* a wiped copy catches up as a shadow,
+/// with no link held. 1,000 records, node 3 restarted on an empty disk, then puts in a loop
+/// until node 1's promote of the shadow commits. Some put lands while node 3's applied position
+/// is below the cutoff `shadow_promote` names and still rising, and no run of refusals lasts
+/// longer than the accepted pause (~2 s, scaled). D9's own row holds link 1-3 before it writes,
+/// which stops the catch-up, so it never showed this.
+/// Cut: L1 counts the shadow (drop the `Shadow` filter where the host builds L1's members), red
+/// (writes refused until the copy is rebuilt).
+/// The stepped trio catches the shadow up ~1.7 records per put it lands, so 3,000 records
+/// needed ~4,500 puts and outran the deadline on a loaded host (2 of 4 runs).
+/// Integration (~20 s): 1,000 puts, the restart's re-plan, ~1,500 puts of catch-up.
+#[config_log::retcd_test]
+fn m10_s2_f007_writes_land_while_a_wiped_shadow_catches_up() {
+    const METHOD: &str = "m10_s2_f007_writes_land_while_a_wiped_shadow_catches_up";
+    const SEED: u64 = 1_000;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    for request in 1..=SEED {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} with every copy up: {other:?}"),
+        }
+    }
+    restart_as(&mut trio, dir.path(), 3, true);
+    trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+
+    let pause_bound = test_patience(Duration::from_millis(2_500));
+    let deadline = Instant::now() + test_patience(Duration::from_secs(30));
+    // Node 3's applied position at each put that landed while it was still a shadow.
+    let mut landed_at: Vec<u64> = Vec::new();
+    let mut refused_since: Option<Tick> = None;
+    let mut request = SEED + 1;
+    while role_of_three(&trio) == Some(ReplicaRole::Shadow) {
+        assert!(Instant::now() < deadline, "node 3 was never promoted");
+        let applied = trio.status(2).holds.map_or(0, |held| held.applied);
+        let answer = trio.ask(put(request));
+        request += 1;
+        let now = trio.clock.now();
+        match answer {
+            Answer::Txn { .. } => {
+                refused_since = None;
+                landed_at.push(applied);
+            }
+            Answer::Error { error, .. } => {
+                let since = *refused_since.get_or_insert(now);
+                let refused_for = HostClock::millis_until(since, now);
+                assert!(
+                    u128::from(refused_for) <= pause_bound.as_millis(),
+                    "puts refused for {refused_for} ms while node 3 caught up, last: {error:?}"
+                );
+            }
+            other => panic!("put {}: {other:?}", request - 1),
+        }
+    }
+
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "one promote: {promotes:?}");
+    let cutoff = promotes[0]["cutoff"]
+        .as_u64()
+        .expect("the promote's cutoff");
+    let below: Vec<u64> = landed_at
+        .iter()
+        .copied()
+        .filter(|applied| *applied < cutoff)
+        .collect();
+    assert!(
+        !below.is_empty(),
+        "no put landed while node 3 was below the cutoff {cutoff}: {landed_at:?}"
+    );
+    assert!(
+        below.iter().max() > below.iter().min(),
+        "node 3's progress did not rise while puts landed: {below:?}"
+    );
+}
+
+/// D9's setup up to the shadow commit: 20 puts, node 3 restarted wiped, and nodes 2 and 3 both
+/// landed the commit that pins node 3 a shadow. Nothing is held: the trio is stepped by hand,
+/// so nothing moves while a row then runs a promote.
+fn shadow_landed(dir: &std::path::Path) -> Trio {
+    let (mut trio, _) = started(dir, tuned);
+    for request in 1..=20 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} with every copy up: {other:?}"),
+        }
+    }
+    restart_as(&mut trio, dir, 3, true);
+    trio.until("nodes 2 and 3 landed node 3 as a shadow", |trio| {
+        [1, 2]
+            .iter()
+            .all(|&at| {
+                trio.status(at)
+                    .pinned
+                    .iter()
+                    .any(|member| member.node == NodeId(3) && member.role == ReplicaRole::Shadow)
+            })
+            .then_some(())
+    });
+    trio
+}
+/// `partitions/1` as the trio's control store holds it, rewritten as the layout-3 record a
+/// `Db` writes (the trio's hosts write no root, which `admin::promote` needs), in a store of
+/// its own so the trio's hosts never see it; `bump` moves its `config_version` on, as a
+/// configuration `to` has not landed would.
+fn rooted_store(trio: &Trio, bump: u64) -> Arc<dyn config_core::ConfigStore> {
+    use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+    let key =
+        Bytes::from(rdb_core::contracts::control::ControlKey::Partition(PartitionId(1)).encode());
+    let found = trio
+        .rt
+        .block_on(trio.store.get(config_core::GetRequest { key: key.clone() }))
+        .expect("read partitions/1")
+        .record
+        .expect("partitions/1");
+    let mut record = PartitionRecord::decode(&found.value).expect("a partition record");
+    record.config_version.0 += bump;
+    let root = PartitionRoot {
+        mode: rdb_core::authority::partition::RecordMode::Active,
+        owner_boot: trio
+            .links
+            .boot_of(record.owner)
+            .expect("the owner is linked"),
+        base_seq: rdb_core::contracts::ids::Seq(0),
+        base_digest: rdb_core::contracts::digest::Digest::ROOT,
+        predecessor_generation: record.generation,
+        predecessor_cutoff: rdb_core::contracts::ids::Seq(0),
+        instance: [7; INSTANCE_LEN],
+        run: rdb_core::contracts::ids::Revision(1),
+    };
+    let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    trio.rt
+        .block_on(store.put(config_core::PutRequest {
+            key,
+            value: record.encode_with(&root),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put partitions/1");
+    store
+}
+
+/// A promote of `to` as `Db::promote` runs it: members from `to`'s own live status, then
+/// `admin::promote` against `store`. `send` reaches nobody.
+fn promote_in(
+    trio: &Trio,
+    store: &Arc<dyn config_core::ConfigStore>,
+    to: u32,
+    within: Duration,
+) -> Result<crate::admin::Promoted, crate::admin::PromoteError> {
+    let at = usize::try_from(to - 1).expect("a trio node");
+    let (members, members_version) =
+        crate::admin::promote_members(NodeId(to), Some(trio.status(at)), Duration::from_secs(1))?;
+    let links = Arc::clone(&trio.links);
+    let ctx = crate::admin::PromoteCtx {
+        store: Arc::clone(store),
+        budgets: trio.nodes[0].0.budgets,
+        clock: trio.clock,
+        to: NodeId(to),
+        drop: None,
+        within,
+        members,
+        members_version,
+        member_boot: Arc::new(move |node: NodeId| links.boot_of(node)),
+        send: Arc::new(|node: NodeId, _: Msg| Err(NodeStopped(node))),
+    };
+    trio.rt.block_on(crate::admin::promote(ctx))
+}
+
+/// `partitions/1`'s `mod_revision` in `store` now.
+fn partition_revision(trio: &Trio, store: &Arc<dyn config_core::ConfigStore>) -> u64 {
+    trio.rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(
+                rdb_core::contracts::control::ControlKey::Partition(PartitionId(1)).encode(),
+            ),
+        }))
+        .expect("read partitions/1")
+        .record
+        .expect("partitions/1")
+        .mod_revision
+}
+
+/// review-s2 F-004 (A-R412): `lr promote 3` while node 3 is a live shadow is refused
+/// `INVALID_ARGUMENT` before anything is written, naming node 2 instead. The roles come from
+/// node 3's own status, as `Db::promote` reads them. Before the fix the fixed rf3 list held no
+/// shadow, so node 3 was fenced in and pinned primary over a copy that held nothing.
+/// Cuts: `promote_members` returns `admin::members()`, red (no `Shadow` refusal, partitions/1
+/// fenced); the host's status leaves `pinned` empty, red (`PeersUnknown`).
+/// Integration (~3 s): bootstrap's window, the restart's re-plan.
+#[config_log::retcd_test]
+fn m10_s2_f004_a_promote_of_a_live_shadow_is_refused_before_it_writes() {
+    let dir = config_testkit::fs::temp_dir();
+    let trio = shadow_landed(dir.path());
+    let store = rooted_store(&trio, 0);
+    let before = partition_revision(&trio, &store);
+    let refused = promote_in(&trio, &store, 3, Duration::from_secs(1)).expect_err("a shadow `to`");
+    assert!(
+        matches!(
+            refused,
+            crate::admin::PromoteError::Shadow {
+                node: 3,
+                instead: 2
+            }
+        ),
+        "{refused:?}"
+    );
+    let error = ApiError::from(refused);
+    assert_eq!(
+        (error.kind, error.no_mutation),
+        (ErrorKind::InvalidArgument, true),
+        "{error:?}"
+    );
+    assert!(error.detail.contains("node 2"), "{error:?}");
+    assert_eq!(
+        partition_revision(&trio, &store),
+        before,
+        "partitions/1 was written"
+    );
+}
+
+/// review-s2 F-004 (A-R412): a promote of the regular node 2 while node 3 is a live shadow
+/// keeps node 3 a shadow in the members it plans (`promote_members_kept`). It is cut short
+/// after it plans them: nothing answers `send`, and its time runs out in the expiry wait.
+/// Cuts: `promote_members` returns `admin::members()`, red (node 3 kept `RegularSecondary`);
+/// the host's status leaves `pinned` empty, red (`PeersUnknown`, nothing kept).
+/// Integration (~4 s): bootstrap's window, the restart's re-plan, one second of promote.
+#[config_log::retcd_test]
+fn m10_s2_f004_a_promote_of_a_regular_node_keeps_the_shadow_a_shadow() {
+    const METHOD: &str = "m10_s2_f004_a_promote_of_a_regular_node_keeps_the_shadow_a_shadow";
+    let dir = config_testkit::fs::temp_dir();
+    let trio = shadow_landed(dir.path());
+    let store = rooted_store(&trio, 0);
+    let stopped = promote_in(&trio, &store, 2, Duration::from_secs(1));
+    assert!(stopped.is_err(), "nothing answers the plan: {stopped:?}");
+    let kept = logged!(METHOD, "promote_members_kept");
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let members = kept[0]["members"].as_str().unwrap_or_default();
+    assert!(
+        members.contains("(2, ") && members.contains("Primary"),
+        "node 2 planned primary: {members}"
+    );
+    assert!(
+        members.contains("(3, ") && members.contains("Shadow)"),
+        "node 3 kept a shadow: {members}"
+    );
+    assert!(!members.contains("RegularSecondary"), "{members}");
+}
+
+/// A-R415 C-2: `partitions/1` is one configuration past the one node 2 landed, as after a heal
+/// node 2 missed. Its roles may be out of date, so a promote of node 2 is refused
+/// `StaleMembers` naming both versions, with nothing written. Cut: no version check in
+/// `admin::promote` → it plans node 2's stale roles and fences partitions/1 (revision moves).
+/// Integration (~3 s): bootstrap's window, the restart's re-plan.
+#[config_log::retcd_test]
+fn m10_s2_c2_a_promote_from_an_older_configuration_is_refused_before_it_writes() {
+    let dir = config_testkit::fs::temp_dir();
+    let trio = shadow_landed(dir.path());
+    let held = trio.status(1).config_version.expect("node 2 landed one").0;
+    let store = rooted_store(&trio, 1);
+    let before = partition_revision(&trio, &store);
+    let refused = promote_in(&trio, &store, 2, Duration::from_secs(1)).expect_err("stale");
+    assert!(
+        matches!(
+            refused,
+            crate::admin::PromoteError::StaleMembers { node: 2, held: h, current: c }
+                if h == held && c == held + 1
+        ),
+        "{refused:?}"
+    );
+    let error = ApiError::from(refused);
+    assert_eq!(
+        (error.kind, error.no_mutation),
+        (ErrorKind::Unavailable, true),
+        "{error:?}"
+    );
+    assert_eq!(
+        partition_revision(&trio, &store),
+        before,
+        "partitions/1 was written"
+    );
+}
+
 /// ADV-2 (A-R406): a restart under an `Active` owner is shadowed only when two *linked*
 /// regular members are current. With node 2 held off node 1, a restarted node 3 is not
 /// pinned a shadow: a shadow plan would leave node 1 the only counted copy it can reach, and

@@ -32,7 +32,9 @@ use bytes::Bytes;
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, OwnerEpoch, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, DurablePrefix, Namespace, StorageFault};
 use rdb_core::replication::append::PROGRESS_KEY;
-use rdb_core::transaction::dedup::parse_dedup_value;
+use rdb_core::transaction::dedup::{
+    is_floor_record_id, parse_dedup_key, parse_dedup_value, FLOOR_AFFINITY,
+};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction,
     IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
@@ -172,7 +174,10 @@ pub enum OpenError {
         found: Vec<String>,
     },
     /// The format marker is missing from a non-empty directory, or names another format.
-    #[error("database at {path} has format {found:?}; this build reads only {FORMAT_VERSION}")]
+    #[error(
+        "database at {path} has format {found:?}; this build reads formats \
+         {OLDEST_FORMAT_VERSION} through {FORMAT_VERSION}"
+    )]
     Format {
         /// The directory.
         path: PathBuf,
@@ -1325,6 +1330,17 @@ impl RocksEngine {
             private_key(batch.partition, batch.generation, APPLIED_KEY),
             applied.0.to_be_bytes(),
         );
+        // An ack floor's record and deletes mean nothing to a format-1 build, which would
+        // re-execute a resend the floor dropped (review-s2 F-006, A-R411). The same batch moves
+        // the marker, as an epoch revocation does, so a format-1 build refuses this copy.
+        let upgrade = self.format < FORMAT_VERSION && carries_ack_floor(&batch);
+        if upgrade {
+            write.put_cf(
+                self.cf(CF_METADATA),
+                FORMAT_KEY,
+                FORMAT_VERSION.to_be_bytes(),
+            );
+        }
         let mut opts = WriteOptions::default();
         opts.set_sync(false);
         opts.disable_wal(false);
@@ -1343,6 +1359,18 @@ impl RocksEngine {
             return Err(StorageFault::WriteFailed);
         }
         self.lineages.insert(key, Marks { applied, ..marks });
+        if upgrade {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = batch.partition.0,
+                generation = batch.generation.0,
+                seq = batch.seq.0,
+                from_format = self.format,
+                format = FORMAT_VERSION,
+                "format_marker_moved_for_ack_floor"
+            );
+            self.format = FORMAT_VERSION;
+        }
         tracing::info!(
             target: LOG_TARGET,
             partition = batch.partition.0,
@@ -1694,7 +1722,7 @@ impl RocksEngine {
             scanned += 1;
             let seq = match unframe(&value) {
                 Some(Frame::Value(_, bytes)) => parse_dedup_value(bytes).map(|v| v.seq),
-                // T1 never deletes a Dedup row, but a tombstone holds nothing to seed.
+                // An ack floor's delete on a linked lineage is a tombstone: nothing to seed.
                 Some(Frame::Tombstone(_)) => continue,
                 None => None,
             };
@@ -2251,6 +2279,19 @@ fn ensure_format(db: &DB, path: &Path, existed: bool) -> Result<(bool, u32), Ope
             .map_err(|e| backend(path, &e))?;
     }
     Ok((found.is_none(), found.unwrap_or(FORMAT_VERSION)))
+}
+
+/// Whether `batch` writes any part of an ack floor (A-R252): a `Dedup` delete, which only a floor
+/// licenses, or a floor record's put. A format-1 build reads both as plain dedup rows, so either
+/// one needs the format-2 marker (review-s2 F-006).
+fn carries_ack_floor(batch: &Batch) -> bool {
+    batch.writes.iter().any(|w| {
+        w.ns == Namespace::Dedup
+            && (w.value.is_none()
+                || parse_dedup_key(&w.key).is_some_and(|k| {
+                    k.affinity == FLOOR_AFFINITY && is_floor_record_id(k.identity.request)
+                }))
+    })
 }
 
 /// Refuse a missing or foreign format marker. `Ok(Some(version))`: a marker this build opens,

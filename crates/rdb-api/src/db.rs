@@ -2836,6 +2836,9 @@ impl Db {
     /// and ten seconds; [`admin::promote`] says each step. Returns once `partitions/1` names
     /// `to` at a newer generation; this `Db`'s calls go to `to` from then on.
     ///
+    /// The members and their roles are `to`'s own: the newest configuration it landed, read
+    /// from it before anything is written. A shadow kept stays a shadow.
+    ///
     /// Membership is fixed at three nodes (A-R256 known limit for M10): a dropped node rejoins
     /// as a secondary at the next reopen heal. An app-only `Db` promotes too, over its links
     /// (A-R261).
@@ -2844,7 +2847,9 @@ impl Db {
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `to` or `drop` holds no copy, `to` is a shadow, owns
     /// the partition already, or is `drop`. `UNAVAILABLE`, nothing changed, from a `Db` a crate
-    /// test built by hand, which has no control store.
+    /// test built by hand, which has no control store. `UNAVAILABLE`, nothing changed, when
+    /// `to` does not answer within the read timeout, holds no configuration since its restart
+    /// (a stated limit: retrying will not help), or holds one older than `partitions/1`'s.
     /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
     /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
     /// it again picks up where it stopped.
@@ -2860,6 +2865,10 @@ impl Db {
                 .to_owned(),
                 retry_after: None,
             })?;
+        // The roles come from `to`'s own pinned configuration, read before anything is
+        // written (review-s2 F-004, A-R412).
+        let (members, members_version) =
+            admin::promote_members(to, self.look(to).ok(), self.timeouts.read)?;
         let (senders, boots): (
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
@@ -2893,9 +2902,8 @@ impl Db {
             to,
             drop,
             within,
-            // S2 pins the rf3 members and has no shadow yet; a later slice reads the pinned
-            // configuration from the owner instead.
-            members: admin::members(),
+            members,
+            members_version,
             member_boot: Arc::new(member_boot),
             send: Arc::new(send),
         };
@@ -7045,6 +7053,8 @@ mod tests {
             stalled: None,
             reload_pending: None,
             lengths: None,
+            pinned: Vec::new(),
+            config_version: None,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -7128,6 +7138,8 @@ mod tests {
             stalled: None,
             reload_pending: None,
             lengths: None,
+            pinned: Vec::new(),
+            config_version: None,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
         let remote = |blocked_looks: usize| {
@@ -7220,6 +7232,8 @@ mod tests {
             stalled: None,
             reload_pending: None,
             lengths: None,
+            pinned: Vec::new(),
+            config_version: None,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
         lock(&db.nodes).clear();
@@ -7287,6 +7301,8 @@ mod tests {
             stalled: None,
             reload_pending: None,
             lengths: None,
+            pinned: Vec::new(),
+            config_version: None,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -7378,6 +7394,8 @@ mod tests {
             stalled: None,
             reload_pending: None,
             lengths: None,
+            pinned: Vec::new(),
+            config_version: None,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
         // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
@@ -8051,6 +8069,8 @@ mod tests {
                 stalled: None,
                 reload_pending: None,
                 lengths: None,
+                pinned: Vec::new(),
+                config_version: None,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -9102,6 +9122,8 @@ mod tests {
             stalled: None,
             reload_pending: None,
             lengths: None,
+            pinned: Vec::new(),
+            config_version: None,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {
