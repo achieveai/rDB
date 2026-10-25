@@ -7554,7 +7554,8 @@ mod tests {
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
-    /// it. A put then lands on node 2 at the new generation, and the write made before reads
+    /// it; within about a second of the promote that refusal is `NOT_PRIMARY` naming node 2
+    /// (#66). A put then lands on node 2 at the new generation, and the write made before reads
     /// back there. Node 1's refusal proves it wrote nothing and its held head stays (review-s2
     /// F-012); a resend there never claims `no_mutation` and, redirected, says only that this
     /// send wrote nothing (F-014). A fault of node 2, the owner now, is named as node 2's
@@ -7562,6 +7563,8 @@ mod tests {
     /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
     /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2. Redirect's
     /// text back to "nothing was sent", or `Faulted` with no owner ("node 1 stopped"): red.
+    /// #66: the `OwnerLearned` arm stops at the first answer: node 1 still answers
+    /// `LEASE_EXPIRED` a second after the promote, red.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -7610,22 +7613,38 @@ mod tests {
                 .map(|held| (held.generation, held.applied))
         };
         let held = head(&db);
-        db.route.owner.store(OWNER.0, Ordering::Relaxed);
-        let old = db.put(b"c", b"3", None);
-        db.route.owner.store(2, Ordering::Relaxed);
-        let old = old.expect_err("node 1 took a put after the promote");
-        assert!(
-            matches!(
-                old.error.kind,
-                ErrorKind::NotPrimary | ErrorKind::LeaseExpired
-            ) && old.error.no_mutation,
-            "node 1 refused at admission, writing nothing: {old:?}"
-        );
+        // #66: node 1 was fenced by the freeze before `partitions/1` moved, so its read at the
+        // fence named itself. It reads again every 250 ms while it does, so within about a
+        // second of the promote it refuses `NOT_PRIMARY` naming node 2. Until then it may
+        // still refuse `LEASE_EXPIRED`; every refusal writes nothing.
+        let within = crate::host::test_patience(Duration::from_secs(1));
+        let promoted_at = std::time::Instant::now();
+        let old = loop {
+            db.route.owner.store(OWNER.0, Ordering::Relaxed);
+            let old = db.put(b"c", b"3", None);
+            db.route.owner.store(2, Ordering::Relaxed);
+            let old = old.expect_err("node 1 took a put after the promote");
+            assert!(
+                matches!(
+                    old.error.kind,
+                    ErrorKind::NotPrimary | ErrorKind::LeaseExpired
+                ) && old.error.no_mutation,
+                "node 1 refused at admission, writing nothing: {old:?}"
+            );
+            if old.error.kind == ErrorKind::NotPrimary {
+                break old;
+            }
+            assert!(
+                promoted_at.elapsed() < within,
+                "node 1 still answers LEASE_EXPIRED {within:?} after the promote: {old:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(old.error.detail.contains("names node 2"), "{old:?}");
 
         // review-s2 F-014: a resend to node 1 may have applied on an earlier send, so its
-        // answer never claims `no_mutation`, and its text never says nothing was sent. Node 1
-        // was fenced by the freeze before `partitions/1` moved, so it still answers
-        // `LEASE_EXPIRED` here; the redirect's own text is pinned in host/tests.rs
+        // answer never claims `no_mutation`, and its text never says nothing was sent. The
+        // redirect's own text is pinned in host/tests.rs
         // (`m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner`).
         let request = old.request.expect("a refused put keeps its request");
         db.route.owner.store(OWNER.0, Ordering::Relaxed);
