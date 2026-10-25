@@ -303,51 +303,70 @@ fn wait_for_line(
 /// dropped its `Msg::Synced`, so the engine still counted the sync in flight and the clean
 /// stop's synced final marks logged `synced_write_during_sync`. Now the stop finishes that sync
 /// first (`sync_finished_at_stop`), and nothing logs a write that waited on a sync.
+/// A-R393: an attempt whose stop came only after node 1's held syncs had all returned (a
+/// starved test thread, 3 s late in 1 of 25 runs beside 3 suite loops) had no sync in flight
+/// to finish, so it proves nothing and the row tries again, up to 3 times.
 /// Cut: drop `finish_sync_at_stop` from the stop, red (no `sync_finished_at_stop`, and the final
 /// marks log `synced_write_during_sync`).
-/// Integration (~2 s): a fresh open, then a stop while node 1's sync is held 1 s.
+/// Integration (~2 s per attempt): a fresh open, then a stop while node 1's sync is held 1 s.
 #[config_log::retcd_test]
 fn m10_f4_a_stop_with_a_sync_in_flight_finishes_it_before_the_final_marks() {
     const METHOD: &str = "m10_f4_a_stop_with_a_sync_in_flight_finishes_it_before_the_final_marks";
     let rt = runtime();
-    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-    let dir = config_testkit::fs::temp_dir();
-    let mut db = open(&rt, config(dir.path()), &store, fast());
-    admits_within(&db, "the open", Duration::from_secs(10));
-    // A-R393, as A-R392 for the stuck row: armed before `put a`, whose own sync is the one
-    // held. Armed after it, a slow test thread let that sync run unheld, and with nothing else
-    // to sync no held sync came at all. A put does not wait for its own fsync.
-    let one = node_dir(dir.path(), 1);
-    tracing::info!("f4_slow_armed");
-    let armed = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
-    slow_sync(&one, Duration::from_secs(1), true);
-    db.put(b"a", b"1", None).expect("put a");
-    wait_for_line(
-        METHOD,
-        armed,
-        "test_sync_slowed",
-        &|line| num(line, "node") == 1,
-        Duration::from_secs(5),
-    );
-    db.shutdown();
-    clear_slow_sync(&one);
+    for attempt in 1..=3 {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open(&rt, config(dir.path()), &store, fast());
+        admits_within(&db, "the open", Duration::from_secs(10));
+        // A-R393, as A-R392 for the stuck row: armed before `put a`, whose own sync is the one
+        // held. Armed after it, a slow test thread let that sync run unheld, and with nothing
+        // else to sync no held sync came at all. A put does not wait for its own fsync.
+        let one = node_dir(dir.path(), 1);
+        tracing::info!(attempt, "f4_slow_armed");
+        let armed = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+        slow_sync(&one, Duration::from_secs(1), true);
+        db.put(b"a", b"1", None).expect("put a");
+        wait_for_line(
+            METHOD,
+            armed,
+            "test_sync_slowed",
+            &|line| num(line, "node") == 1,
+            Duration::from_secs(5),
+        );
+        db.shutdown();
+        clear_slow_sync(&one);
 
-    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-    let finished = next(&lines, armed, "sync_finished_at_stop", &|line| {
-        num(line, "node") == 1 && line["ok"] == true
-    });
-    let marks = next(&lines, armed, "host_duty", &|line| {
-        num(line, "node") == 1 && line["kind"] == "final_marks"
-    });
-    assert!(
-        finished.is_some_and(|finished| marks.is_some_and(|marks| finished < marks)),
-        "node 1 stopped with a sync in flight: finished {finished:?}, final marks {marks:?}"
-    );
-    let waited = waited_on_a_sync(&lines, armed);
-    assert!(
-        waited.is_empty(),
-        "a write or sync waited on a sync in flight: {waited:?}"
-    );
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let of_one = |line: &Line| num(line, "node") == 1;
+        let finished = next(&lines, armed, "sync_finished_at_stop", &|line| {
+            of_one(line) && line["ok"] == true
+        });
+        let marks = next(&lines, armed, "host_duty", &|line| {
+            of_one(line) && line["kind"] == "final_marks"
+        });
+        // Every held sync of node 1 returned on its node thread before the final marks: the
+        // stop found none in flight. A dropped `Msg::Synced` logs no `wal_sync_slow`, so the
+        // cut never reads as late.
+        let late = marks.is_some_and(|marks| {
+            held_syncs(&lines, armed, 1)
+                .iter()
+                .all(|&(_, returned)| returned < marks)
+        });
+        if finished.is_none() && late && attempt < 3 {
+            tracing::info!(attempt, "f4_stop_came_after_the_held_syncs");
+            continue;
+        }
+        assert!(
+            finished.is_some_and(|finished| marks.is_some_and(|marks| finished < marks)),
+            "node 1 stopped with a sync in flight: finished {finished:?}, final marks {marks:?}"
+        );
+        let waited = waited_on_a_sync(&lines, armed);
+        assert!(
+            waited.is_empty(),
+            "a write or sync waited on a sync in flight: {waited:?}"
+        );
+        return;
+    }
 }
 
 /// The index ranges `[slowed, returned)` of node `node`'s held syncs at or after `from`: each
