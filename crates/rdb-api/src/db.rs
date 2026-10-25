@@ -738,6 +738,18 @@ pub enum ReadyError {
          membership comes in a later build)"
     )]
     Quarantined,
+    /// Node 1 faulted, before or after it took writes. A faulted node takes no writes again in
+    /// this open, so no wait helps (PR #60 review F3). The text carries the fault as node 1
+    /// recorded it.
+    #[error(
+        "node 1 stopped on a fault, and it takes no writes in this open: \
+         {fault}. Shut this Db down and open the folder again, once; if that open stops the \
+         same way, stop and report it with this message, and do not delete the folder"
+    )]
+    Faulted {
+        /// Node 1's fault, as its status records it.
+        fault: String,
+    },
 }
 
 /// The next step once node 1 has restarted: nothing it served comes back in this open
@@ -893,6 +905,12 @@ impl Db {
     /// heals partition 1 in the background (M10, arch R3a, R3b). Returns once the bootstrap's
     /// events are queued or the heal has started, not when the partition is ready: call
     /// [`Self::wait_ready`].
+    ///
+    /// `rt` must belong to a runtime that keeps running until [`Self::shutdown`] returns:
+    /// control calls, watches and the reopen's heal run as tasks on it, also while a caller
+    /// blocks in [`Self::wait_ready`], [`Self::put`] or [`Self::get`]. A multi-thread runtime
+    /// does. A current-thread runtime runs its tasks only inside its own `block_on`, so once
+    /// that returns they stop (PR #60 review F5).
     ///
     /// # Errors
     ///
@@ -1358,13 +1376,17 @@ impl Db {
                 admin::instance_hex(&root.instance)
             ))));
         }
+        // PR #60 review F1: a copy staged into the generation and never switched in does not
+        // hold it, so it does not stop the roll-forward that resumes it.
         let holds = engines
             .values()
-            .any(|engine| engine.lineages().contains(&(PARTITION, record.generation)));
+            .any(|engine| serves(engine, record.generation));
         // arch-s2 B1 case 2 (the lr up race): a node process whose copy is only behind the
         // record joins. The live owner's heal links it again; refusing it Stale here left a node
         // started after the owner's reopen out for good. A copy ahead of the record still falls
-        // through to the refusal below, as does the owner's own copy.
+        // through to the refusal below, as does the owner's own copy, and so does a copy staged
+        // into the record's generation and never switched in (PR #60 F1): it rolls forward or is
+        // refused.
         let behind: Vec<u64> = engines
             .values()
             .flat_map(RocksEngine::lineages)
@@ -1499,7 +1521,9 @@ impl Db {
     /// is not ended by it: that owner re-plans a rejoin that does not end writable (A-R282), so
     /// this waits on to `within` and answers [`ReadyError::TimedOut`] naming the phase (A-R314
     /// item 2). A quarantined recovery answers at once wherever the owner runs, since nothing in
-    /// an open leaves it (A-R196(2a)).
+    /// an open leaves it (A-R196(2a)). So does an owner this `Db` runs that has faulted, before
+    /// or after ready: a faulted node takes no writes again in this open (PR #60 review F3). A
+    /// faulted owner in another process is waited on to `within`, as a blocked one is.
     ///
     /// # Errors
     ///
@@ -1507,10 +1531,13 @@ impl Db {
     /// [`ReadyError::Blocked`] once the recovery of an owner this `Db` runs is blocked, whose
     /// texts say to shut this `Db` down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
     /// recovery is quarantined, whose text says a reopen will not help (A-R196(2a), A-R196(2b)).
+    /// [`ReadyError::Faulted`] once an owner this `Db` runs has faulted, whose text carries the
+    /// fault.
     pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
         let deadline = std::time::Instant::now() + within;
         let mut phase = String::from(NO_ANSWER);
         let mut remote_blocked: Option<String> = None;
+        let mut remote_faulted: Option<String> = None;
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                 return Err(ReadyError::Heal(error.clone()));
@@ -1550,6 +1577,22 @@ impl Db {
                         return Err(stuck);
                     }
                     None => {}
+                }
+                // PR #60 review F3: a faulted owner this `Db` runs takes no writes again in this
+                // open. An owner in another process is not ended by it: that process restarts
+                // and rejoins, so this waits on to `within`, as for a blocked one (A-R314 item 2).
+                if let Some(fault) = owner.fault {
+                    if lock(&self.nodes)
+                        .iter()
+                        .any(|handle| handle.node == owner.node)
+                    {
+                        tracing::warn!(fault, "ready_faulted");
+                        return Err(ReadyError::Faulted { fault });
+                    }
+                    if remote_faulted.as_ref() != Some(&fault) {
+                        tracing::info!(owner = owner.node.0, fault, "ready_owner_faulted");
+                        remote_faulted = Some(fault);
+                    }
                 }
                 phase = owner.recovery.unwrap_or_else(|| NO_RECOVERY.to_owned());
             }
@@ -3210,6 +3253,15 @@ struct Roll {
     copies: Vec<NodeId>,
 }
 
+/// Whether `engine` holds `generation` of partition 1 as a generation it can serve. A full copy
+/// staged into it and never switched in, its `copying` record still there, is not that
+/// generation, only the start of one: its keys are partial and it has no link (PR #60 review
+/// F1). Counted as held, it stopped the roll-forward that resumes it, and no open succeeded.
+fn serves(engine: &RocksEngine, generation: Generation) -> bool {
+    engine.lineages().contains(&(PARTITION, generation))
+        && engine.staging(PARTITION, generation).is_none()
+}
+
 /// Ruling A-R184 (arch R3b check 4, critic-rollfwd F2): the copies a reopen may roll forward to
 /// `generation`, which no copy holds. Only when the open counter proves no host ever activated
 /// `generation`, so it never admitted a write, and only onto copies that hold the predecessor
@@ -3249,10 +3301,21 @@ fn roll_forward_copies(
     }
     // A copy that holds a generation after `from` saw the database move on from it, so this
     // root is not the one that generation's successor was built on: nothing to roll forward.
+    // Except `generation` itself staged from this root's base and never switched in (PR #60
+    // review F1): a flatten cut short there. The roll-forward's inherit re-runs it.
+    let resumable = |engine: &RocksEngine, held: Generation| {
+        held == generation && engine.staging(PARTITION, held) == Some((from, cutoff))
+    };
     if let Some(newer) = engines
         .values()
-        .flat_map(RocksEngine::lineages)
-        .filter(|(partition, held)| *partition == PARTITION && *held > from)
+        .flat_map(|engine| {
+            engine
+                .lineages()
+                .into_iter()
+                .filter(move |&(partition, held)| {
+                    partition == PARTITION && held > from && !resumable(engine, held)
+                })
+        })
         .map(|(_, held)| held)
         .max()
     {
@@ -7088,6 +7151,68 @@ mod tests {
         assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
     }
 
+    /// PR #60 review F3, merged into slice 2 (w18): a fault ends an owner this `Db` runs at once
+    /// (`m10_wait_ready_answers_a_fault_of_node_1_at_once_and_names_it`), but not an owner in
+    /// another process, which restarts and rejoins: it is waited on to the bound, as a blocked
+    /// one is (A-R314 item 2), and answered `TimedOut`. Node 1 is a stub this `Db` reaches over
+    /// the links only. Cut: `wait_ready` answers `Faulted` whoever runs the owner, and this
+    /// answers at once, red. Unit (~300 ms): no node thread.
+    #[test]
+    fn m10_s2_wait_ready_waits_out_a_faulted_owner_in_another_process() {
+        let faulted = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: Some("publish marks of p1: injected".to_owned()),
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: None,
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+            lengths: None,
+        };
+        let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
+        lock(&db.nodes).clear();
+        let (tx, mailbox) = std::sync::mpsc::channel();
+        db.links.register(OWNER, tx, host::BOOT);
+        let looks = Arc::new(AtomicU64::new(0));
+        let node_1 = {
+            let looks = Arc::clone(&looks);
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        looks.fetch_add(1, Ordering::Relaxed);
+                        let _ = reply.send(faulted.clone());
+                    }
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_millis(300));
+        let waited = started.elapsed();
+        assert_eq!(
+            answer,
+            Err(ReadyError::TimedOut {
+                within_ms: 300,
+                owner: OWNER,
+                phase: NO_RECOVERY.to_owned(),
+            })
+        );
+        assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+        drop(db);
+        node_1.join().expect("the stub");
+        assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
+    }
+
     /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
     /// open leaves, so `wait_ready` answers at once with `Quarantined`, whose text says the data
     /// is kept and that neither a reopen nor a repair command helps yet (A-R196(2b)). Node 1 is a
@@ -10560,6 +10685,158 @@ mod tests {
         db.shutdown();
     }
 
+    /// `partitions/1` in `store` now: the record, its root and its revision.
+    fn stored_root(
+        rt: &tokio::runtime::Runtime,
+        store: &Arc<dyn ConfigStore>,
+    ) -> (PartitionRecord, PartitionRoot, u64) {
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1")
+            .record
+            .expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("a record");
+        let root = PartitionRoot::decode(&found.value).expect("a root");
+        (record, root, found.mod_revision)
+    }
+
+    /// The record digest `engine` holds at `seq` of `generation`; `Digest::ROOT` at seq 0.
+    fn digest_at(
+        engine: &RocksEngine,
+        generation: Generation,
+        seq: Seq,
+    ) -> rdb_core::contracts::digest::Digest {
+        if seq == Seq::ZERO {
+            return rdb_core::contracts::digest::Digest::ROOT;
+        }
+        let (bytes, _) = engine
+            .history_at(PARTITION, generation, seq)
+            .expect("read history")
+            .expect("a record at the seq");
+        rdb_core::contracts::envelope::ReplicationEnvelope::decode(&bytes)
+            .expect("an envelope")
+            .record_digest
+    }
+
+    /// PR #60 review F1: a reopen whose history is 32 levels deep copies the merged data into
+    /// the new generation in batches, the `copying` marker first and the switch last. A process
+    /// that dies between the two, before node 1 tells the other copies, leaves node 1 holding
+    /// only a staged copy of the generation `partitions/1` names. A staged copy is not that
+    /// generation, so the next open rolls it forward from the verified predecessor on every
+    /// copy, node 1's included (a re-run clears the staged keys and copies again), and reads
+    /// back. Before, the staged copy counted as held: nothing rolled forward, node 1 reported
+    /// it unlinked, nodes 2 and 3 refused a 33rd level, and every open failed the same way.
+    ///
+    /// The 32 levels are built offline, since a real reopen per level would take ~45 s: each
+    /// copy links generations 3..=31 at generation 2's head, and `partitions/1` moves to 31
+    /// with the same root. The crash is a switch fault on node 1's engine, offline, after the
+    /// reopen's commit stopped node 1 (`AfterCommit::Fault`). Cut: `check` counts a staged
+    /// generation as held, and the last open is never ready. Integration (~8 s): four opens.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_after_a_flatten_cut_short_before_its_switch_rolls_forward_and_reads_back() {
+        const METHOD: &str =
+            "m10_a_reopen_after_a_flatten_cut_short_before_its_switch_rolls_forward_and_reads_back";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let nodes = dir.path().join("nodes");
+        wrote_a_and_quit(&rt, dir.path(), &store);
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen to generation 2");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("generation 2 is ready");
+        db.shutdown();
+        drop(db);
+
+        // Generations 3..=31, linked on every copy at generation 2's head: with 0..=2, 32 levels.
+        let (record, root, revision) = stored_root(&rt, &store);
+        assert_eq!(record.generation, Generation(2), "{record:?}");
+        let mut head = None;
+        for n in 1..=3u32 {
+            let mut engine =
+                RocksEngine::open_existing(nodes.join(n.to_string())).expect("open a copy");
+            let applied = Seq(engine.buffered_applied(PARTITION, Generation(2)).0);
+            assert!(head.is_none_or(|head| head == applied), "copies differ");
+            head = Some(applied);
+            for to in 3..=31 {
+                engine
+                    .inherit(PARTITION, Generation(to - 1), Generation(to), applied)
+                    .expect("link a level");
+            }
+            assert_eq!(engine.chain_depth(PARTITION, Generation(31)), 32);
+        }
+        let head = head.expect("three copies");
+        let digest = {
+            let engine = RocksEngine::open_existing(nodes.join("1")).expect("node 1");
+            digest_at(&engine, Generation(31), head)
+        };
+        let moved = PartitionRoot {
+            base_seq: head,
+            base_digest: digest,
+            predecessor_generation: Generation(30),
+            predecessor_cutoff: head,
+            ..root
+        };
+        let record = PartitionRecord {
+            generation: Generation(31),
+            ..record
+        };
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: record.encode_with(&moved),
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        }))
+        .expect("move partitions/1 to generation 31");
+
+        // The reopen commits generation 32, and node 1 stops before it links it.
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen cut short");
+        until_stored(&rt, &store, 32);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+
+        // Node 1 flattens generation 32 and dies before the switch: only the staged copy.
+        let (_, root, _) = stored_root(&rt, &store);
+        let base = root.predecessor_cutoff;
+        assert_eq!(root.predecessor_generation, Generation(31), "{root:?}");
+        {
+            let mut engine = RocksEngine::open_existing(nodes.join("1")).expect("node 1");
+            engine.inject_fault(rdb_storage::InjectedFault::Switch);
+            let cut = engine.inherit(PARTITION, Generation(31), Generation(32), base);
+            assert!(
+                matches!(cut, Err(rdb_storage::InheritError::Storage(_))),
+                "{cut:?}"
+            );
+            assert_eq!(
+                engine.staging(PARTITION, Generation(32)),
+                Some((Generation(31), base))
+            );
+            assert_eq!(engine.link(PARTITION, Generation(32)), None);
+        }
+        for n in 2..=3u32 {
+            let engine =
+                RocksEngine::open_existing(nodes.join(n.to_string())).expect("open a copy");
+            assert!(
+                !engine.lineages().contains(&(PARTITION, Generation(32))),
+                "node {n} never heard of generation 32"
+            );
+        }
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open after the cut flatten");
+        let rolled = rolled_forward(METHOD);
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert_eq!(
+            (&rolled[0]["generation"], &rolled[0]["from"]),
+            (&serde_json::json!(32), &serde_json::json!(31)),
+            "{rolled:?}"
+        );
+        ready_and_reads_back(&db, "after the cut flatten");
+        db.shutdown();
+    }
+
     /// Ruling A-R184 (critic-rollfwd row 3, F2): once a host marked a generation activated, it
     /// may have admitted writes there, so an open whose copies are older is `Stale` and names
     /// the mark, never rolled forward over them. Here node 1 is restarted and its grant cleared,
@@ -10628,6 +10905,59 @@ mod tests {
                 std::fs::copy(entry.path(), target).expect("copy");
             }
         }
+    }
+
+    /// PR #60 review round 2: `wait_ready` answers `Faulted` for any fault on node 1, one after
+    /// it took writes too, so the text claims nothing about when the node stopped. Pins the
+    /// whole text. Cut: the round-1 text ("stopped on a fault before it took writes"), red.
+    /// Unit.
+    #[test]
+    fn the_faulted_text_says_no_writes_in_this_open_and_not_when_it_stopped() {
+        let error = ReadyError::Faulted {
+            fault: "storage write fault".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "node 1 stopped on a fault, and it takes no writes in this open: storage write \
+             fault. Shut this Db down and open the folder again, once; if that open stops the \
+             same way, stop and report it with this message, and do not delete the folder"
+        );
+    }
+
+    /// PR #60 review F3: a node that faulted takes no writes again in this open, so once node 1
+    /// has faulted `wait_ready` answers at once, `Faulted`, with the fault in its text. Before,
+    /// it waited out `within` and answered `TimedOut`, naming only a recovery phase, and the
+    /// cause was in the log alone. Here the reopen's commit faults node 1
+    /// (`AfterCommit::Fault`). Cut: `wait_ready` does not read node 1's fault, and the row waits
+    /// out the whole bound. Integration (~5 s): a fresh open, a reopen that faults.
+    #[config_log::retcd_test]
+    fn m10_wait_ready_answers_a_fault_of_node_1_at_once_and_names_it() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        let within = crate::host::test_patience(Duration::from_secs(20));
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(within);
+        let took = started.elapsed();
+        crate::host::set_after_commit(dir.path(), None);
+        let Err(error @ ReadyError::Faulted { .. }) = answer else {
+            panic!("node 1 faulted, so wait_ready says so: {answer:?}");
+        };
+        assert!(took < within / 2, "answered at once, not after {took:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains("after-commit hook: generation 2 committed and not linked"),
+            "the text carries the fault: {text}"
+        );
+        assert!(
+            text.contains("open the folder again"),
+            "and the step: {text}"
+        );
+        db.shutdown();
     }
 
     /// Ruling A-R184: a node acquires under a generation, and admits writes, only once the open

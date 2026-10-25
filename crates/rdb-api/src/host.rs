@@ -1932,6 +1932,10 @@ struct Host {
     /// be, so P1 withholds the reply (F-014 rows).
     #[cfg(test)]
     deny_reply_checks: bool,
+    /// Each module offer, and the synced write of a clean stop's final marks, first sleep this
+    /// long, so a row can see a slow step logged (PR #60 review F8, F9).
+    #[cfg(test)]
+    step_pause: Duration,
 }
 
 impl Host {
@@ -2038,6 +2042,8 @@ impl Host {
             fail_step_view: false,
             #[cfg(test)]
             deny_reply_checks: false,
+            #[cfg(test)]
+            step_pause: Duration::ZERO,
         }
     }
 
@@ -2113,9 +2119,15 @@ impl Host {
                     break;
                 }
             }
+            // PR #60 review F4: a step that faults the node ends the turn. Nothing after it
+            // runs, so no duty writes marks, links or activations for a node that has failed.
             if self.fault.is_none() {
                 self.drain();
+            }
+            if self.fault.is_none() {
                 self.run_due();
+            }
+            if self.fault.is_none() {
                 self.drain();
             }
             let wait = self.wait();
@@ -2135,7 +2147,11 @@ impl Host {
         // reopen ages every write this process published from its publish tick, not from its
         // landing. A crash or kill writes none; that tail keeps the landing plus the retention.
         if self.fault.is_none() {
-            if let Err(fault) = self.mark_duty(self.clock.now(), 0, "final_marks", true) {
+            // PR #60 review F8: a synced write, timed like every other duty.
+            let started = Instant::now();
+            let marked = self.mark_duty(self.clock.now(), 0, "final_marks", true);
+            self.slow_step("duty", || "final_marks".to_owned(), started);
+            if let Err(fault) = marked {
                 self.set_fault(fault);
             }
         }
@@ -2530,8 +2546,25 @@ impl Host {
         }
     }
 
+    /// Fail the node and every waiter. The first fault is the cause, so it is the one kept and
+    /// reported, and any waiter still open is answered with it; a later fault is only logged
+    /// (PR #60 review F4).
     fn set_fault(&mut self, fault: Fault) {
-        tracing::error!(node = self.node.0, detail = %fault.detail, damage = ?fault.damage, "host_fault");
+        let fault = match self.fault.take() {
+            Some(first) => {
+                tracing::error!(
+                    node = self.node.0,
+                    detail = %fault.detail,
+                    first = %first.detail,
+                    "host_fault_after_fault"
+                );
+                first
+            }
+            None => {
+                tracing::error!(node = self.node.0, detail = %fault.detail, damage = ?fault.damage, "host_fault");
+                fault
+            }
+        };
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
@@ -3082,26 +3115,28 @@ impl Host {
         self.retire_duty(now)
     }
 
-    /// The trim duty's sweep in memory: per partition, the `published_at` entries of its oldest
-    /// generation at least a retention old go, as one `DedupTrim` and one `StatusTrim` below
-    /// the last of them plus one, and that floor is kept for the delete. `kind` names the
-    /// `host_duty` line.
+    /// The trim duty's sweep in memory: per partition and generation, oldest first, the
+    /// `published_at` entries at least a retention old go, as one `DedupTrim` and one
+    /// `StatusTrim` below the last of them plus one, and that floor is kept for the delete. It
+    /// moves to the next generation only once a whole generation has aged, and stops at the
+    /// first entry that has not (PR #60 review F2: a restore holding several generations
+    /// trims them all at once). `kind` names the `host_duty` line.
     fn trim_aged(&mut self, now: Tick, kind: &'static str) {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
         for (partition, published) in &mut self.published_at {
-            let Some(&(generation, _, _)) = published.front() else {
-                continue;
-            };
-            let mut last: Option<(Seq, Tick)> = None;
-            while let Some(&(g, seq, at)) = published.front() {
-                if g != generation || at.plus_millis(retention) > now {
-                    break;
+            while let Some(&(generation, _, _)) = published.front() {
+                let mut last: Option<(Seq, Tick)> = None;
+                while let Some(&(g, seq, at)) = published.front() {
+                    if g != generation || at.plus_millis(retention) > now {
+                        break;
+                    }
+                    last = Some((seq, at));
+                    published.pop_front();
                 }
-                last = Some((seq, at));
-                published.pop_front();
-            }
-            if let Some((last, at)) = last {
+                let Some((last, at)) = last else {
+                    break;
+                };
                 trims.push((*partition, generation, Seq(last.0 + 1), at));
             }
         }
@@ -3183,6 +3218,10 @@ impl Host {
         }
         for (partition, marks, changed) in due {
             if changed {
+                #[cfg(test)]
+                if kind == "final_marks" {
+                    std::thread::sleep(self.step_pause);
+                }
                 let marks_now = publish_marks(&marks);
                 if synced {
                     self.engine.put_publish_marks(partition, &marks_now)
@@ -3805,33 +3844,34 @@ impl Host {
         self.answering = self.statuses.remove(&event.id);
         for module in offers {
             let started = Instant::now();
-            match self.offer(module, &event) {
+            let stepped = match self.offer(module, &event) {
                 Ok(effects) => {
                     tracing::trace!(node = self.node.0, module = ?module, event = event_name(&event.kind), effects = effects.len(), "step");
-                    let delivered = self.deliver(&effects);
-                    self.slow_step(
-                        "module",
-                        || format!("{module:?} on {}", event_name(&event.kind)),
-                        started,
-                    );
-                    delivered?;
+                    self.deliver(&effects)
                 }
                 Err(StepError::Module(error @ RdbError::Unavailable { .. })) => {
                     if (routed && route::edge(arm, module) == Edge::Named) || addressed.is_some() {
-                        return Err(Fault::from(format!(
+                        Err(Fault::from(format!(
                             "{module:?} declined {} it must answer: {error}",
                             event_name(&event.kind)
-                        )));
+                        )))
+                    } else {
+                        Ok(())
                     }
                 }
-                Err(StepError::Module(error)) => {
-                    return Err(Fault::from(format!(
-                        "{module:?} failed on {}: {error}",
-                        event_name(&event.kind)
-                    )));
-                }
-                Err(StepError::Host(detail)) => return Err(detail),
-            }
+                Err(StepError::Module(error)) => Err(Fault::from(format!(
+                    "{module:?} failed on {}: {error}",
+                    event_name(&event.kind)
+                ))),
+                Err(StepError::Host(detail)) => Err(detail),
+            };
+            // PR #60 review F9: timed whatever the offer answered, a decline or a failure too.
+            self.slow_step(
+                "module",
+                || format!("{module:?} on {}", event_name(&event.kind)),
+                started,
+            );
+            stepped?;
         }
         // P1 answers a status query in the step that takes it, START_RECORD included.
         if let Some((identity, reply)) = self.answering.take() {
@@ -3862,6 +3902,8 @@ impl Host {
 
     /// Step `module` with the adopted triple, and T1 and P1 with the step view.
     fn offer(&mut self, module: ModuleName, event: &Event) -> Result<Vec<Effect>, StepError> {
+        #[cfg(test)]
+        std::thread::sleep(self.step_pause);
         let partition = event.partition;
         let adopted = self.adopted(partition);
         let reads_storage = matches!(module, ModuleName::Transaction | ModuleName::Publication);

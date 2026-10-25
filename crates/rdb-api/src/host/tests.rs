@@ -411,6 +411,182 @@ fn a_full_mailbox_runs_the_due_duties_after_the_cap_before_reading_on() {
     );
 }
 
+/// PR #60 review F4: a queued event that faults the node ends its turn. The mailbox holds
+/// `MAIL_BEFORE_DUTIES` letters, then `Stop`, with the flush duty due: first an injected
+/// timer whose offer faults (`fail_step_view`), then stale-boot letters that change nothing.
+/// The read stops at the cap with the timer still queued, so the drain after it faults, and
+/// the flush duty after that drain must not run. Cut: the duties run on whatever the
+/// drain did, and a `flush` duty line follows the fault, red. Unit, under a second.
+#[config_log::retcd_test]
+fn a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn() {
+    const METHOD: &str = "a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn";
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    host.engine
+        .commit(rdb_core::contracts::storage::Batch {
+            id: rdb_core::contracts::ids::BatchId(1),
+            partition: PartitionId(2),
+            generation: Generation(1),
+            seq: Seq(1),
+            writes: Vec::new(),
+        })
+        .expect("commit");
+    host.next_flush = host.clock.now();
+    host.fail_step_view = true;
+    let stale = BootId(host.boot.0 + 1);
+    let (tx, rx) = mpsc::channel();
+    tx.send(Msg::Inject {
+        partition: PartitionId(2),
+        correlation: CorrelationId::default(),
+        kind: EventKind::Timer(TimerFired {
+            id: HEALTH_EVAL_TIMER,
+            version: TimerVersion(0),
+            scheduled_at: host.clock.now(),
+        }),
+    })
+    .expect("send");
+    for _ in 1..MAIL_BEFORE_DUTIES {
+        tx.send(Msg::Activated {
+            boot: stale,
+            partition: PartitionId(2),
+            generation: Generation(1),
+        })
+        .expect("send");
+    }
+    tx.send(Msg::Stop).expect("send");
+    host.run(&rx);
+
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let fault = lines
+        .iter()
+        .position(|line| line["@m"] == "host_fault")
+        .expect("the injected timer faulted the node");
+    let letters = lines[..fault]
+        .iter()
+        .filter(|line| line["@m"] == "control_stale_boot_dropped")
+        .count();
+    assert_eq!(letters, MAIL_BEFORE_DUTIES - 1, "it faulted after the cap");
+    let after: Vec<_> = lines[fault + 1..]
+        .iter()
+        .filter(|line| line["@m"] == "host_duty" || line["@m"] == "host_fault")
+        .collect();
+    assert!(after.is_empty(), "nothing ran after the fault: {after:?}");
+}
+
+/// PR #60 review F4: the first fault is the one the node keeps and reports. A later one is
+/// logged, never kept. Cut: `set_fault` overwrites, and the status names the later one, red.
+#[test]
+fn a_second_fault_keeps_the_first() {
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    host.set_fault(Fault::from("the first".to_owned()));
+    host.set_fault(Fault::from("the second".to_owned()));
+    assert_eq!(
+        host.status(PartitionId(2)).fault.as_deref(),
+        Some("the first"),
+        "the first fault is kept"
+    );
+}
+
+/// PR #60 review F8: the final marks a clean stop writes are a synced write, timed like
+/// every other duty, so a slow one logs `host_slow_step`. The host restored its marks and
+/// published seq 6 of generation 1, so the stop has marks to write; that write is held past
+/// the 250 ms threshold (`step_pause`, inside the write only). The row checks the write ran
+/// (`host_duty` `final_marks`, the mark on disk) and was logged slow, after it. Cut: the
+/// `slow_step` call removed, and no such line, red. Unit, about 0.3 s.
+#[config_log::retcd_test]
+fn a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow() {
+    const METHOD: &str = "a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let rt = current_thread();
+    reopened_with_marks(&path, 2, &[]);
+    let published = (Generation(1), Seq(6), Tick(HostClock::start().now().0 - 10));
+    {
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(2))
+            .expect("restore");
+        host.published_at
+            .entry(PartitionId(1))
+            .or_default()
+            .push_back(published);
+        host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Stop).expect("send stop");
+        host.run(&rx);
+    }
+
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let wrote = lines
+        .iter()
+        .position(|line| line["@m"] == "host_duty" && line["kind"] == "final_marks")
+        .expect("the clean stop wrote its final marks");
+    let slow: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line["@m"] == "host_slow_step")
+        .map(|(at, line)| (at, line["step"].clone(), line["what"].clone()))
+        .collect();
+    assert_eq!(
+        slow.iter()
+            .map(|(_, step, what)| (step, what))
+            .collect::<Vec<_>>(),
+        [(
+            &serde_json::json!("duty"),
+            &serde_json::json!("final_marks")
+        )],
+        "the slow final write was logged as slow"
+    );
+    assert!(slow[0].0 > wrote, "logged once the write had run");
+    let marks: Vec<Mark> = RocksEngine::open(&path)
+        .expect("open engine")
+        .publish_marks(PartitionId(1))
+        .expect("read marks")
+        .into_iter()
+        .map(|mark| (mark.generation, mark.seq, mark.tick))
+        .collect();
+    assert_eq!(marks, [published], "the final write reached the disk");
+}
+
+/// PR #60 review F9: an offer is timed whatever it answers. Here the step view fails
+/// (`fail_step_view`), so Transaction's offer of an injected timer ends in a host error,
+/// after a pause past the threshold. Cut: only an offer that delivers is timed, and no
+/// `Transaction` line, red. Unit, about 0.6 s: Authority's offer is held too.
+#[config_log::retcd_test]
+fn a_slow_offer_that_fails_is_logged_as_slow() {
+    const METHOD: &str = "a_slow_offer_that_fails_is_logged_as_slow";
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
+    host.fail_step_view = true;
+    host.handle(Msg::Inject {
+        partition: PartitionId(2),
+        correlation: CorrelationId::default(),
+        kind: EventKind::Timer(TimerFired {
+            id: HEALTH_EVAL_TIMER,
+            version: TimerVersion(0),
+            scheduled_at: host.clock.now(),
+        }),
+    });
+    host.drain();
+    let fault = host.fault.clone().expect("the offer failed");
+    assert!(fault.detail.contains("injected"), "{fault:?}");
+
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let slow: Vec<String> = lines
+        .iter()
+        .filter(|line| line["@m"] == "host_slow_step" && line["step"] == "module")
+        .filter_map(|line| line["what"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        slow.iter().any(|what| what.starts_with("Transaction on")),
+        "the failed offer was timed: {slow:?}"
+    );
+}
+
 /// A-R214 row 2: an inherit at base 0 (a landing at cutoff 0) writes the link and the
 /// seal, and leaves both lineages applied and durable at 0. The duty syncs it. Cut
 /// (durable == applied alone): the fault stays armed, red.
@@ -3338,6 +3514,53 @@ fn a_reopen_trims_what_the_marks_cover_at_restore_and_spares_the_tail() {
     host.trim_duty(host.clock.now()).expect("trim");
     assert_eq!(dedup_trims_queued(&host), [(1, 6)], "the tick adds no trim");
     assert_eq!(host.trim_deletes, 1, "the floor is deleted on disk too");
+}
+
+/// PR #60 review F2: marks of two generations, both a retention old, as several clean
+/// reopens inside one window leave them. The restore trims both before the landing's
+/// `Recovered`, a `DedupTrim` and a `StatusTrim` for each, with no trim tick. Before, the
+/// sweep stopped at the first generation's end, and generation 2's entries counted against
+/// the dedup cap until later ticks took them one generation each. Cut: `trim_aged` takes
+/// one generation per sweep, and only generation 1 is queued.
+#[test]
+fn a_reopen_trims_the_aged_marks_of_every_generation_at_restore() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let rt = current_thread();
+    let now = HostClock::start().now();
+    let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+    let old = Tick(now.0 - 2 * retention);
+    reopened_with_marks(
+        &path,
+        3,
+        &[
+            (Generation(1), Seq(5), old),
+            (Generation(2), Seq(9), old.plus_millis(10)),
+        ],
+    );
+    let mut host = host_over(&path, &rt);
+    host.restore_marks(PartitionId(1), Generation(3))
+        .expect("restore");
+    assert_eq!(
+        dedup_trims_queued(&host),
+        [(1, 6), (2, 10)],
+        "both generations trimmed at restore"
+    );
+    let status_trims: Vec<(u64, u64)> = host
+        .queue
+        .iter()
+        .filter_map(|queued| match queued.event.kind {
+            EventKind::Kernel(KernelEvent::StatusTrim { generation, below }) => {
+                Some((generation.0, below.0))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(status_trims, [(1, 6), (2, 10)], "and both status floors");
+    assert!(
+        host.published_at[&PartitionId(1)].is_empty(),
+        "nothing aged is left"
+    );
 }
 
 /// A-R183 row 2: a store with no marks (a crash before the first write of marks, or data

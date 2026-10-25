@@ -144,6 +144,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 - `Db::open` is async; run it on your runtime. `wait_ready`, `put` and `get` are plain blocking
   calls; do not call them from inside an async task.
+- The runtime whose handle you pass must keep running until `db.shutdown()` returns. Control
+  calls to rEtcd, watches and the reopen's repair run as tasks on it, also while your thread
+  sits in `wait_ready`, `put` or `get`. A multi-thread runtime, as above, does that. A
+  current-thread runtime runs its tasks only inside its own `block_on`: once `block_on`
+  returns, those tasks stop, and an open that still needs them does not reach ready.
 - Every error here returns from `run`. `main` prints its text, which says what failed and, for
   most errors, the next step (`InUse`, for one, says to close the other open), and exits with
   code 1. A `Db` that is dropped on the way out shuts itself down. In a real app, match on the
@@ -553,6 +558,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - A `put` is refused with `PROTECTION_PAUSED`, retry rule "retry after recovery". Waiting does
     not clear it in this release; a later release catches the copy up across those reopens.
   - Nothing is lost: the other copies hold every acknowledged write.
+  - How this case behaves is checked in rDB's simulator only. A check of the same case
+    against a real open of a folder is still owed (issue #59).
 - **The host is starved** (CPU or disk saturated by other work). Timers run late, so writes
   can pause and then recover once the host has room.
 - **rEtcd stalls for more than about 2 s,** for example during its own leader election. Node
@@ -670,6 +677,7 @@ report it with the message.
 | `ReadyError::Heal` | The reopen's repair failed. The message says why: for example, the last run's grant is still held by another open of this folder's data | Do what the message says (often: shut that other open down), then open again |
 | `ReadyError::Stopped` | Node 1 restarted in this open | Shut this `Db` down and open the folder again |
 | `ReadyError::Blocked` | The open's recovery stopped before node 1 took writes; the message names why (often a copy answered too late) | Shut this `Db` down and open the folder again, once. If that open is blocked too, stop and report it with the message; do not retry in a loop |
+| `ReadyError::Faulted` | Node 1 stopped on a fault, and it takes no writes in this open; the message carries the fault (a storage or link step that failed, say) | Shut this `Db` down and open the folder again, once. If that open stops the same way, stop and report it with the message; do not delete the folder |
 
 **Not fixed by opening again.**
 
@@ -703,8 +711,8 @@ What a `TimedOut` message says the owner last answered:
   not answer. Wait longer.
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
-failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked` and
-`Quarantined`.
+failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked`,
+`Quarantined` and `Faulted`.
 
 ## 7. The pilot, `pilot_kv`
 
@@ -734,7 +742,8 @@ failed (`open refused: <Variant>: ...`); 4 `--verify` found a journalled key mis
 The journal is written without buffering, so a killed process keeps every line it wrote. It is
 not synced to disk, so it proves nothing about power loss. After a kill, `--verify` may also find
 the one key after the last journalled line: that put was in flight. It is reported apart as
-`unjournalled_present` and does not fail the check.
+`unjournalled_present` and does not fail the check. A last line a kill cut short is left out
+and said; the next `--write` drops it from the file before it appends.
 
 ### Measured on the dev host
 
