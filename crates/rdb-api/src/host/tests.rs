@@ -6036,6 +6036,12 @@ fn m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_
                 "{error:?}"
             );
             assert!(error.detail.contains("names node 2"), "{error:?}");
+            // review-s2 F-014: the same text reaches a resend, which may have applied on an
+            // earlier send, so it claims only this send.
+            assert!(
+                error.detail.ends_with("this send wrote nothing"),
+                "{error:?}"
+            );
         }
         other => panic!("a put after the read: {other:?}"),
     }

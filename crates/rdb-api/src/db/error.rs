@@ -33,6 +33,12 @@ const OPEN_AGAIN: &str = "open the folder again";
 /// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
 const RUN_AGAIN: &str = "run it again to read where it stands";
 
+/// The tail of [`super::ReadyError::Quarantined`]'s text, which a refusal carries while the
+/// owner's recovery is quarantined ([`super::Db::explained`]). It already says what to do, which
+/// a "wait a few seconds and try again" step would contradict (review-s2 F-003).
+pub(crate) const QUARANTINED_STEP: &str =
+    "do not delete the folder; stop and report it with this message";
+
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
     /// step. See [`ApiError::explain`].
@@ -147,11 +153,11 @@ impl ApiError {
             kind: ErrorKind::Unavailable,
             retry: RetryRule::RetryAfterRecovery,
             no_mutation: false,
+            // The step is not in the detail: [`ApiError::next_step`] picks it from the kind, the
+            // rule and `no_mutation` (review-s2 F-003), so it is said once.
             detail: format!(
                 "node {}, the owner, went out of reach while this call waited for its answer (its \
-                 process may have stopped); a write sent here may have applied: once it is \
-                 back, send the same request again with `Db::resend`, or ask `Db::status`; \
-                 never send it under a new request id",
+                 process may have stopped); a write sent here may have applied",
                 node.0
             ),
             retry_after: None,
@@ -213,21 +219,28 @@ impl ApiError {
         wire_name(self.kind)
     }
 
-    /// What the caller does next, in words, for this kind and retry rule. `None` when
-    /// [`Self::detail`] already ends with its own step, which a second one would contradict: the
-    /// host said to shut the `Db` down and open the folder again, or an admin call said to run it
-    /// again to read where it stands. A write's `UnknownOutcome` (`QueryStatus`) keeps its step
-    /// after "open the folder again", because asking [`super::Db::status`] with the same id is
-    /// still right after the new open.
+    /// What the caller does next, in words, for this kind, retry rule and mutation proof. `None`
+    /// when [`Self::detail`] already ends with its own step, which a second one would contradict:
+    /// the host said to shut the `Db` down and open the folder again, an admin call said to run
+    /// it again to read where it stands, or the owner's recovery is quarantined. A write's
+    /// `UnknownOutcome` (`QueryStatus`) keeps its step after "open the folder again", because
+    /// asking [`super::Db::status`] with the same id is still right after the new open.
+    ///
+    /// Where the step says to send a write again, `no_mutation` picks how (review-s2 F-002,
+    /// F-003). True: this send wrote nothing and no earlier send exists, and [`super::Db`]'s ack
+    /// floor counts the refusal as settled, so a later write can expire its id and a resend then
+    /// answers `STATUS_EXPIRED` without applying it: send it again as a new write. False: an
+    /// earlier send may have applied, so only a resend of the same request or a status look is
+    /// safe; a new id could apply it twice.
     #[must_use]
     pub fn next_step(&self) -> Option<&'static str> {
         let write_unknown =
             self.kind == ErrorKind::UnknownOutcome && self.retry == RetryRule::QueryStatus;
         let reopen = self.detail.ends_with(OPEN_AGAIN) && !write_unknown;
-        if reopen || self.detail.ends_with(RUN_AGAIN) {
+        if reopen || self.detail.ends_with(RUN_AGAIN) || self.detail.ends_with(QUARANTINED_STEP) {
             return None;
         }
-        Some(step_for(self.kind, self.retry))
+        Some(step_for(self.kind, self.retry, self.no_mutation))
     }
 
     /// [`Self::detail`] with its next step: `detail; next: step`. This is the text to show an
@@ -241,28 +254,56 @@ impl ApiError {
     }
 }
 
-/// The next step for an error of `kind` with `retry`. Total over [`ErrorKind`], so a new kind
-/// does not compile until it has a step. `NotWired` wins over the kind: nothing in this open
-/// serves it, so no kind's retry advice applies.
-const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
+/// The next step for an error of `kind` with `retry` and `no_mutation`. Total over
+/// [`ErrorKind`], so a new kind does not compile until it has a step. `NotWired` wins over the
+/// kind: nothing in this open serves it, so no kind's retry advice applies. `no_mutation` picks
+/// how a refused write is sent again ([`ApiError::next_step`]); it never turns a read's step
+/// into a write's, and `Unavailable` keys on it only with `RetryAfterRecovery`, the owner-link
+/// refusals, so a read's `Unavailable` keeps its plain words.
+const fn step_for(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> &'static str {
     if matches!(retry, RetryRule::NotWired) {
         return "retrying will not help: keep this Db's log and report this message";
     }
     match kind {
+        ErrorKind::NotPrimary | ErrorKind::RouteChanged if no_mutation => {
+            "this send wrote nothing: send the write again as a new write (`Db::put`, `Db::txn` \
+             or `Db::write`), not with `Db::resend`; if this repeats, `Db::node_status` shows \
+             which node is primary"
+        }
         ErrorKind::NotPrimary | ErrorKind::RouteChanged => {
-            "send the same request again with `Db::resend`; if this repeats, `Db::node_status` \
-             shows which node is primary"
+            "an earlier send may have applied: send the same request again with `Db::resend`, \
+             or ask `Db::status`; never send it under a new request id; if this repeats, \
+             `Db::node_status` shows which node is primary"
+        }
+        ErrorKind::LeaseExpired if no_mutation => {
+            "call `Db::wait_ready`; then a read reads again, and a write is sent again as a new \
+             write (`Db::put`, `Db::txn` or `Db::write`), not with `Db::resend`: this send wrote \
+             nothing"
         }
         ErrorKind::LeaseExpired => {
-            "call `Db::wait_ready`, then send the same request again with `Db::resend`"
+            "call `Db::wait_ready`; an earlier send may have applied: send the same request \
+             again with `Db::resend`, or ask `Db::status`; never send it under a new request id"
+        }
+        ErrorKind::RecoveryReadOnly if no_mutation => {
+            "reads still work; writes return when the lost copies are back, and \
+             `Db::node_status` shows the recovery; this send wrote nothing: then send the write \
+             again as a new write, not with `Db::resend`"
         }
         ErrorKind::RecoveryReadOnly => {
             "reads still work; writes return when the lost copies are back, and \
-             `Db::node_status` shows the recovery"
+             `Db::node_status` shows the recovery; an earlier send may have applied: then send \
+             the same request again with `Db::resend`, or ask `Db::status`; never send it under \
+             a new request id"
+        }
+        ErrorKind::ProtectionPaused if no_mutation => {
+            "wait; then a read reads again, and a write is sent again as a new write \
+             (`Db::put`, `Db::txn` or `Db::write`), not with `Db::resend`: this send wrote \
+             nothing; `Db::node_status` shows what writes are waiting on"
         }
         ErrorKind::ProtectionPaused => {
-            "wait, then send the same request again with `Db::resend`; `Db::node_status` shows \
-             what writes are waiting on"
+            "wait; an earlier send may have applied: send the same request again with \
+             `Db::resend`, or ask `Db::status`; never send it under a new request id; \
+             `Db::node_status` shows what writes are waiting on"
         }
         ErrorKind::ConditionFailed => "read the object again, then decide whether to write",
         ErrorKind::CrossAffinity => {
@@ -271,12 +312,25 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
         ErrorKind::InvalidArgument => {
             "fix the argument this message names; the same request fails the same way"
         }
+        ErrorKind::Overloaded if no_mutation => {
+            "wait for `retry_after`; then a read reads again, and a write is sent again as a new \
+             write (`Db::put`, `Db::txn` or `Db::write`), not with `Db::resend`: this send wrote \
+             nothing; a shorter `DbConfig::dedup_retention` raises the cap"
+        }
         ErrorKind::Overloaded => {
-            "wait for `retry_after`, then send the same request again with `Db::resend`; a \
-             shorter `DbConfig::dedup_retention` raises the cap"
+            "wait for `retry_after`; an earlier send may have applied: send the same request \
+             again with `Db::resend`, or ask `Db::status`; never send it under a new request id; \
+             a shorter `DbConfig::dedup_retention` raises the cap"
+        }
+        ErrorKind::DeadlineBeforeAdmission if no_mutation => {
+            "this send wrote nothing: send the write again as a new write with a longer \
+             deadline (`Db::txn` takes one; `Timeouts::put` is a put's), not with \
+             `Db::resend_within`"
         }
         ErrorKind::DeadlineBeforeAdmission => {
-            "send the same request again with `Db::resend_within` and a longer deadline"
+            "an earlier send may have applied: send the same request again with \
+             `Db::resend_within` and a longer deadline, or ask `Db::status`; never send it under \
+             a new request id"
         }
         // Only a write carries `QueryStatus`; a read has no request to ask about (tester-s2,
         // A-R230), so any other rule here is a read's.
@@ -307,6 +361,18 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
         ErrorKind::DivergenceRequiresOperator => {
             "an operator must act: keep this Db's log and report this message; retrying will \
              not help"
+        }
+        // The owner in another process is out of reach (`ApiError::owner_unreachable`,
+        // `owner_lost`, `owner_lost_unsent`), keyed on the rule as well as the proof: a read's
+        // `Unavailable` has `BoundedJitter` and keeps the plain words below (review-s2 F-003).
+        ErrorKind::Unavailable if matches!(retry, RetryRule::RetryAfterRecovery) && no_mutation => {
+            "this call wrote nothing: once the owner is back or another node is promoted, call it \
+             again; a read reads again, and a write is sent again as a new write (`Db::put`, \
+             `Db::txn` or `Db::write`), not with `Db::resend`"
+        }
+        ErrorKind::Unavailable if matches!(retry, RetryRule::RetryAfterRecovery) => {
+            "once the owner is back, send the same request again with `Db::resend`, or ask \
+             `Db::status`; never send it under a new request id"
         }
         // In plain words, not API names (W5, A-R256): the reader may be an app author or a
         // person running `scripts/local-rdb.sh`.
@@ -507,18 +573,21 @@ mod tests {
         let mut missing = Vec::new();
         for kind in every_kind() {
             for retry in every_retry() {
-                let error = ApiError {
-                    retry,
-                    ..ApiError::new(kind, "d")
-                };
-                let step = error.next_step();
-                let ok = step.is_some_and(|step| {
-                    step.split_whitespace().count() >= 3
-                        && error.explain() == format!("d; next: {step}")
-                        && error.to_string() == format!("{} (d; next: {step})", error.name())
-                });
-                if !ok {
-                    missing.push(format!("{kind:?}/{retry:?}: {error}"));
+                for no_mutation in [false, true] {
+                    let error = ApiError {
+                        retry,
+                        no_mutation,
+                        ..ApiError::new(kind, "d")
+                    };
+                    let step = error.next_step();
+                    let ok = step.is_some_and(|step| {
+                        step.split_whitespace().count() >= 3
+                            && error.explain() == format!("d; next: {step}")
+                            && error.to_string() == format!("{} (d; next: {step})", error.name())
+                    });
+                    if !ok {
+                        missing.push(format!("{kind:?}/{retry:?}/{no_mutation}: {error}"));
+                    }
                 }
             }
         }
@@ -538,7 +607,7 @@ mod tests {
              now: wait a few seconds and try again; if it keeps refusing, check that its nodes \
              and its rEtcd are running (on a local run, `scripts/local-rdb.sh status`))"
         );
-        let read = step_for(ErrorKind::UnknownOutcome, RetryRule::BoundedJitter);
+        let read = step_for(ErrorKind::UnknownOutcome, RetryRule::BoundedJitter, true);
         for step in [error.next_step().expect("a step"), read] {
             assert!(
                 !step.contains("wait_ready") && !step.contains("node_status"),
@@ -625,19 +694,105 @@ mod tests {
     /// false: an earlier send may have applied, and spec §8.1 says `STATUS_EXPIRED` does not
     /// prove a write never ran. Sending it as new could apply it twice.
     /// Cut: put the "send it as a new request" clause back and this row goes red.
+    /// review-s2 F-002 keeps this for `no_mutation` false only: a first send that proves it
+    /// wrote nothing is told to send it as a new write, which the row below pins.
     #[test]
     fn a_lease_expired_step_never_says_to_send_it_as_new() {
         for retry in every_retry() {
             let error = ApiError {
                 retry,
+                no_mutation: false,
                 ..ApiError::new(ErrorKind::LeaseExpired, "lease lapsed")
             };
             let text = error.explain();
             assert!(
-                !text.contains("STATUS_EXPIRED") && !text.contains("as a new request"),
+                !text.contains("STATUS_EXPIRED")
+                    && !text.contains("as a new request")
+                    && !text.contains("as a new write"),
                 "{text}"
             );
         }
+    }
+
+    /// review-s2 F-002: a refused write's step follows `no_mutation`, for every kind and rule.
+    /// True (a first send that wrote nothing, which the ack floor counts as settled, so a later
+    /// write can expire its id and a resend then applies nothing): never "the same request again"
+    /// and, wherever it says to send again, "as a new write". False (an earlier send may have
+    /// applied): never "as a new write".
+    /// Cut: the `no_mutation` arms of `step_for` removed, so true takes false's step, red.
+    #[test]
+    fn a_write_that_wrote_nothing_is_sent_as_new_and_one_that_may_have_applied_is_resent() {
+        for kind in every_kind() {
+            for retry in every_retry() {
+                let with = |no_mutation| {
+                    ApiError {
+                        retry,
+                        no_mutation,
+                        ..ApiError::new(kind, "d")
+                    }
+                    .explain()
+                };
+                let (nothing, maybe) = (with(true), with(false));
+                assert!(
+                    !nothing.contains("same request again"),
+                    "{kind:?}: {nothing}"
+                );
+                assert!(
+                    !nothing.contains("Db::resend") || nothing.contains("as a new write"),
+                    "{kind:?}/{retry:?}: {nothing}"
+                );
+                assert!(!maybe.contains("as a new write"), "{kind:?}: {maybe}");
+            }
+        }
+    }
+
+    /// review-s2 F-003: the owner went out of reach after the write was sent, so it may have
+    /// applied. Its step is picked from the kind, the rule and `no_mutation`, not from how the
+    /// detail ends, and it is said once: resend the same request or ask its status, never a new
+    /// id. It was the plain "wait a few seconds and try again", appended after the detail's own
+    /// resend step, and an app that "tries again" with `Db::put` mints a new id. The same owner
+    /// lost before the write was sent says to send it as a new write.
+    /// Cut: the `RetryAfterRecovery` arms of `step_for` removed, red.
+    #[test]
+    fn an_owner_lost_under_a_write_says_once_to_resend_or_ask_status() {
+        let lost = ApiError::owner_lost(NodeId(2));
+        let generic = step_for(ErrorKind::Unavailable, RetryRule::BoundedJitter, false);
+        let step = lost.next_step().expect("a step");
+        assert_ne!(step, generic, "{lost}");
+        let text = lost.explain();
+        assert_eq!(text.matches("; next: ").count(), 1, "{text}");
+        assert_eq!(text.matches("Db::resend").count(), 1, "{text}");
+        assert!(
+            step.contains("`Db::resend`") && step.contains("`Db::status`"),
+            "{text}"
+        );
+        assert!(
+            step.contains("never send it under a new request id"),
+            "{text}"
+        );
+        assert!(!text.contains("try again"), "{text}");
+
+        for unsent in [
+            ApiError::owner_lost_unsent(NodeId(2)),
+            ApiError::owner_unreachable(NodeId(2)),
+        ] {
+            let text = unsent.explain();
+            assert!(text.contains("as a new write"), "{text}");
+            assert!(!text.contains("same request again"), "{text}");
+        }
+    }
+
+    /// review-s2 F-003: an `UNAVAILABLE` that carries the quarantined text already says what to
+    /// do, so it gets no second step; "wait a few seconds and try again" contradicted it.
+    /// Cut: `next_step` does not stop on `QUARANTINED_STEP`, red.
+    #[test]
+    fn an_unavailable_that_carries_the_quarantined_text_gets_no_second_step() {
+        let quarantined = super::super::ReadyError::Quarantined { owner: NodeId(2) }.to_string();
+        assert!(quarantined.ends_with(QUARANTINED_STEP), "{quarantined}");
+        let error = ApiError::new(ErrorKind::Unavailable, format!("d; {quarantined}"));
+        assert_eq!(error.next_step(), None, "{error}");
+        assert_eq!(error.explain(), format!("d; {quarantined}"));
+        assert!(!error.to_string().contains("try again"), "{error}");
     }
 
     /// A host fault (`NotWired`) says no retry helps, whatever its kind.

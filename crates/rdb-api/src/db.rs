@@ -711,43 +711,57 @@ pub enum ReadyError {
         /// [`Db::restart_note`].
         note: String,
     },
-    /// Node 1's recovery ended `Blocked` before it took writes. It does not try again in this
+    /// The owner's recovery ended `Blocked` before it took writes. It does not try again in this
     /// open (ruling F-a), so no wait helps (A-R196). A new open usually gets past it; one that
     /// is blocked again is not a slow host, so the text says to stop then (review-s1 F-007).
     #[error(
-        "the open's recovery stopped before node 1 took writes ({reason}), and it does not try \
-         again in this open. If the last open of this folder stopped the same way, stop and \
-         report it with this message; otherwise shut this Db down and open the folder again"
+        "the open's recovery stopped before node {node} took writes ({reason}), and it does \
+         not try again in this open. If the last open of this folder stopped the same way, stop \
+         and report it with this message; otherwise shut this Db down and open the folder again",
+        node = .owner.0
     )]
     Blocked {
-        /// The block's reason, as node 1's recovery phase names it.
+        /// The owner whose status said so: node 1, or the node a promote moved it to
+        /// (review-s2 F-011).
+        owner: NodeId,
+        /// The block's reason, as the owner's recovery phase names it.
         reason: String,
     },
-    /// Node 1's recovery found copies whose histories diverged and quarantined them. That is
+    /// The owner's recovery found copies whose histories diverged and quarantined them. That is
     /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
     /// wait nor a reopen helps (A-R196(2a)).
     ///
     /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator removes the
     /// diverged copies from membership and fences again. This build has no command for that, so
-    /// the text does not tell the reader to do it (A-R196(2b)); node 1's `recovery_fact` log
-    /// line names the copies.
+    /// the text does not tell the reader to do it (A-R196(2b)); the owner's `recovery_fact` log
+    /// line names the copies. The text ends with [`error::QUARANTINED_STEP`], so a refusal that
+    /// carries it gets no second step (review-s2 F-003).
     #[error(
-        "the open's recovery found copies whose histories disagree, so node 1 takes no writes; \
-         the acknowledged data is kept. Opening the folder again will not help, and do not \
-         delete the folder: this build has no repair command yet (removing a copy from \
-         membership comes in a later build)"
+        "the open's recovery found copies whose histories disagree, so node {node} takes no \
+         writes; the acknowledged data is kept. This build has no repair command yet (removing \
+         a copy from membership comes in a later build), so opening the folder again will not \
+         help: {step}",
+        node = .owner.0,
+        step = error::QUARANTINED_STEP
     )]
-    Quarantined,
-    /// Node 1 faulted, before or after it took writes. A faulted node takes no writes again in
-    /// this open, so no wait helps (PR #60 review F3). The text carries the fault as node 1
+    Quarantined {
+        /// The owner whose status said so (review-s2 F-011).
+        owner: NodeId,
+    },
+    /// The owner faulted, before or after it took writes. A faulted node takes no writes again
+    /// in this open, so no wait helps (PR #60 review F3). The text carries the fault as the owner
     /// recorded it.
     #[error(
-        "node 1 stopped on a fault, and it takes no writes in this open: \
+        "node {node} stopped on a fault, and it takes no writes in this open: \
          {fault}. Shut this Db down and open the folder again, once; if that open stops the \
-         same way, stop and report it with this message, and do not delete the folder"
+         same way, stop and report it with this message, and do not delete the folder",
+        node = .owner.0
     )]
     Faulted {
-        /// Node 1's fault, as its status records it.
+        /// The owner whose status said so: node 1, or the node a promote moved it to
+        /// (review-s2 F-011).
+        owner: NodeId,
+        /// The owner's fault, as its status records it.
         fault: String,
     },
 }
@@ -757,8 +771,9 @@ pub enum ReadyError {
 const REOPEN_STEP: &str = "nothing is served again in this open: to read or write again, shut \
                            this Db down and open the folder again";
 
-/// Node 1's recovery when nothing in this open moves it on: `Blocked` (ruling F-a, A-R196) or
-/// `Quarantined` (A-R196(2a)), read from the phase as the host spells it. [`Db::wait_ready`]
+/// The owner's recovery when nothing in this open moves it on: `Blocked` (ruling F-a, A-R196) or
+/// `Quarantined` (A-R196(2a)), read from the phase as the host spells it, naming the node whose
+/// status said so (review-s2 F-011). [`Db::wait_ready`]
 /// and every refusal read it here, so the two never disagree (A-R200).
 fn stuck_recovery(owner: &NodeStatus) -> Option<ReadyError> {
     let phase = owner.recovery.as_deref()?;
@@ -767,10 +782,11 @@ fn stuck_recovery(owner: &NodeStatus) -> Option<ReadyError> {
         .and_then(|rest| rest.strip_suffix(')'))
     {
         return Some(ReadyError::Blocked {
+            owner: owner.node,
             reason: reason.to_owned(),
         });
     }
-    (phase == "Quarantined").then_some(ReadyError::Quarantined)
+    (phase == "Quarantined").then_some(ReadyError::Quarantined { owner: owner.node })
 }
 
 /// The largest restart count one open gives a node, so it never reaches the next open's boots.
@@ -1556,15 +1572,17 @@ impl Db {
                     return Ok(());
                 }
                 match stuck_recovery(&owner) {
-                    Some(ReadyError::Blocked { reason })
-                        if lock(&self.nodes)
-                            .iter()
-                            .any(|handle| handle.node == owner.node) =>
-                    {
-                        tracing::warn!(reason, "ready_blocked");
-                        return Err(ReadyError::Blocked { reason });
+                    Some(ReadyError::Blocked {
+                        owner: node,
+                        reason,
+                    }) if self.runs(node) => {
+                        tracing::warn!(owner = node.0, reason, "ready_blocked");
+                        return Err(ReadyError::Blocked {
+                            owner: node,
+                            reason,
+                        });
                     }
-                    Some(ReadyError::Blocked { reason }) => {
+                    Some(ReadyError::Blocked { reason, .. }) => {
                         // Another process's owner is not ended by one blocked recovery: it
                         // re-plans a rejoin that does not end writable (A-R282, A-R314 item 2).
                         if remote_blocked.as_ref() != Some(&reason) {
@@ -1582,12 +1600,12 @@ impl Db {
                 // open. An owner in another process is not ended by it: that process restarts
                 // and rejoins, so this waits on to `within`, as for a blocked one (A-R314 item 2).
                 if let Some(fault) = owner.fault {
-                    if lock(&self.nodes)
-                        .iter()
-                        .any(|handle| handle.node == owner.node)
-                    {
-                        tracing::warn!(fault, "ready_faulted");
-                        return Err(ReadyError::Faulted { fault });
+                    if self.runs(owner.node) {
+                        tracing::warn!(owner = owner.node.0, fault, "ready_faulted");
+                        return Err(ReadyError::Faulted {
+                            owner: owner.node,
+                            fault,
+                        });
                     }
                     if remote_faulted.as_ref() != Some(&fault) {
                         tracing::info!(owner = owner.node.0, fault, "ready_owner_faulted");
@@ -2565,9 +2583,9 @@ impl Db {
     /// next step follows: shut this `Db` down and open the folder again (A-R188). The kind,
     /// retry rule and mutation proof are unchanged.
     ///
-    /// An `UNAVAILABLE` answered while node 1's recovery is stuck for this open, `Blocked` or
+    /// An `UNAVAILABLE` answered while the owner's recovery is stuck for this open, `Blocked` or
     /// `Quarantined`, also names that state and the one step that helps, as the latest look at
-    /// node 1 found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
+    /// the owner found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
     /// proof stay; it only cannot succeed in this open.
     fn explained(&self, mut error: ApiError) -> ApiError {
         if error.kind == ErrorKind::Unavailable {
@@ -2596,19 +2614,27 @@ impl Db {
         error
     }
 
-    /// What a refusal adds while node 1's recovery is stuck for this open (A-R200), or `None`.
-    /// It reads what the latest look at node 1 found ([`Self::wait_ready`], [`Self::node_status`])
-    /// and sends nothing: `Blocked` and `Quarantined` are final within an open, so a look that
-    /// found either still holds. A refusal before any look carries no step.
+    /// What a refusal adds while the owner's recovery is stuck for this open (A-R200), or
+    /// `None`. It reads what the latest look at the owner found ([`Self::wait_ready`],
+    /// [`Self::node_status`]) and sends nothing: `Blocked` of an owner this `Db` runs and
+    /// `Quarantined` are final within an open, so a look that found either still holds. A
+    /// refusal before any look carries no step. [`Self::look`] keeps no `Blocked` of an owner in
+    /// another process (review-s2 F-005). Each text names the owner the look found (F-011).
     fn stuck_step(&self) -> Option<String> {
         let stuck = lock(&self.opened.stuck).clone();
         match stuck? {
-            ReadyError::Blocked { reason } => Some(format!(
-                "node 1 is blocked for this open ({reason}); retrying will not help: shut this \
-                 Db down and open the folder again"
+            ReadyError::Blocked { owner, reason } => Some(format!(
+                "node {} is blocked for this open ({reason}); retrying will not help: shut this \
+                 Db down and open the folder again",
+                owner.0
             )),
             stuck => Some(stuck.to_string()),
         }
+    }
+
+    /// Whether this `Db` runs `node`'s process, rather than reaching it over the links.
+    fn runs(&self, node: NodeId) -> bool {
+        lock(&self.nodes).iter().any(|handle| handle.node == node)
     }
 
     /// Whether node 1 has restarted, or its restart failed: it then holds nothing, and the owner
@@ -2656,7 +2682,12 @@ impl Db {
             .recv_timeout(self.timeouts.read)
             .map_err(|_| Unlooked::NoAnswer)?;
         if node == self.route.owner() {
-            *lock(&self.opened.stuck) = stuck_recovery(&status);
+            // review-s2 F-005: an owner in another process is not ended by a blocked recovery;
+            // it re-plans a rejoin (A-R282) and `wait_ready` waits it out, so a refusal must not
+            // say "retrying will not help". A quarantine is final wherever the owner runs.
+            let stuck = stuck_recovery(&status)
+                .filter(|stuck| self.runs(node) || !matches!(stuck, ReadyError::Blocked { .. }));
+            *lock(&self.opened.stuck) = stuck;
         }
         Ok(status)
     }
@@ -4446,7 +4477,9 @@ mod tests {
             );
             assert!(text.contains("nothing was applied"), "{what}: {text}");
             assert!(!text.contains("may have applied"), "{what}: {text}");
-            assert!(!text.contains("Db::resend"), "{what}: {text}");
+            // review-s2 F-002: nothing was applied, so the step is a new write, never a resend.
+            assert!(!text.contains("same request again"), "{what}: {text}");
+            assert!(text.contains("as a new write"), "{what}: {text}");
         };
 
         let put = db
@@ -7035,6 +7068,7 @@ mod tests {
         assert_eq!(
             answer,
             Err(ReadyError::Blocked {
+                owner: OWNER,
                 reason: "BarrierIncomplete { missing: [CopyId(1), CopyId(2)] }".to_owned()
             })
         );
@@ -7146,6 +7180,13 @@ mod tests {
             })
         );
         assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+        // review-s2 F-005: the looks found a blocked owner this `Db` does not run, so a
+        // refusal is not told that retrying will not help. Cut: `look` keeps any owner's
+        // `Blocked`, red.
+        let refused = db
+            .explained(ApiError::new(ErrorKind::Unavailable, "d"))
+            .explain();
+        assert!(!refused.contains("retrying will not help"), "{refused}");
         drop(db);
         node_1.join().expect("the stub");
         assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
@@ -7269,13 +7310,13 @@ mod tests {
 
         let answer = db.wait_ready(Duration::from_secs(3));
         let returned = std::time::Instant::now();
-        assert_eq!(answer, Err(ReadyError::Quarantined));
+        assert_eq!(answer, Err(ReadyError::Quarantined { owner: OWNER }));
         assert_eq!(
             answer.expect_err("quarantined").to_string(),
             "the open's recovery found copies whose histories disagree, so node 1 takes no \
-             writes; the acknowledged data is kept. Opening the folder again will not help, and \
-             do not delete the folder: this build has no repair command yet (removing a copy \
-             from membership comes in a later build)"
+             writes; the acknowledged data is kept. This build has no repair command yet \
+             (removing a copy from membership comes in a later build), so opening the folder \
+             again will not help: do not delete the folder; stop and report it with this message"
         );
         drop(db);
         node_1.join().expect("the stub");
@@ -7485,9 +7526,13 @@ mod tests {
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
     /// it. A put then lands on node 2 at the new generation, and the write made before reads
-    /// back there.
+    /// back there. Node 1's refusal proves it wrote nothing and its held head stays (review-s2
+    /// F-012); a resend there never claims `no_mutation` and, redirected, says only that this
+    /// send wrote nothing (F-014). A fault of node 2, the owner now, is named as node 2's
+    /// (F-011).
     /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
-    /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2.
+    /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2. Redirect's
+    /// text back to "nothing was sent", or `Faulted` with no owner ("node 1 stopped"): red.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -7528,10 +7573,42 @@ mod tests {
             Some(rdb_core::contracts::authority::DenyReason::Frozen),
             "{first:?}"
         );
+        // review-s2 F-012: node 1 refuses the put at admission, proving it wrote nothing, and
+        // its held head does not move.
+        let head = |db: &Db| {
+            status(db, OWNER)
+                .holds
+                .map(|held| (held.generation, held.applied))
+        };
+        let held = head(&db);
         db.route.owner.store(OWNER.0, Ordering::Relaxed);
         let old = db.put(b"c", b"3", None);
         db.route.owner.store(2, Ordering::Relaxed);
-        assert!(old.is_err(), "node 1 took a put after the promote: {old:?}");
+        let old = old.expect_err("node 1 took a put after the promote");
+        assert!(
+            matches!(
+                old.error.kind,
+                ErrorKind::NotPrimary | ErrorKind::LeaseExpired
+            ) && old.error.no_mutation,
+            "node 1 refused at admission, writing nothing: {old:?}"
+        );
+
+        // review-s2 F-014: a resend to node 1 may have applied on an earlier send, so its
+        // answer never claims `no_mutation`, and its text never says nothing was sent. Node 1
+        // was fenced by the freeze before `partitions/1` moved, so it still answers
+        // `LEASE_EXPIRED` here; the redirect's own text is pinned in host/tests.rs
+        // (`m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner`).
+        let request = old.request.expect("a refused put keeps its request");
+        db.route.owner.store(OWNER.0, Ordering::Relaxed);
+        let again = db.resend(*request);
+        db.route.owner.store(2, Ordering::Relaxed);
+        let again = again.expect_err("node 1 took a resend after the promote");
+        let text = again.error.explain();
+        assert!(
+            !again.error.no_mutation && !text.contains("nothing was sent"),
+            "a resend's answer: {again:?}; {text}"
+        );
+        assert_eq!(head(&db), held, "node 1's held head after its refusals");
 
         // A-R254, A-R256: writes go on at node 2, the write made before reads back there.
         let patience = crate::host::test_patience(Duration::from_secs(10));
@@ -7555,6 +7632,27 @@ mod tests {
                 String::from_utf8_lossy(key)
             );
         }
+
+        // review-s2 F-011: node 2 is the owner now, so its fault's text names node 2.
+        let boot = db.boot_of(NodeId(2)).expect("this Db runs node 2");
+        db.send_to(
+            NodeId(2),
+            Msg::Fault {
+                boot,
+                kind: "f011",
+                detail: "injected".to_owned(),
+            },
+        )
+        .expect("node 2 takes the fault");
+        let answer = db.wait_ready(crate::host::test_patience(Duration::from_secs(10)));
+        let Err(error @ ReadyError::Faulted { .. }) = answer else {
+            panic!("node 2 faulted, so wait_ready says so: {answer:?}");
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("node 2 stopped on a fault") && text.contains("f011: injected"),
+            "{text}"
+        );
         db.shutdown();
     }
 
@@ -8021,7 +8119,10 @@ mod tests {
                  retrying will not help: shut this Db down and open the folder again"
                     .to_owned(),
             ),
-            (quarantined, ReadyError::Quarantined.to_string()),
+            (
+                quarantined,
+                ReadyError::Quarantined { owner: OWNER }.to_string(),
+            ),
         ];
         for (phase, step) in cases {
             let (put, get) = refusals(Some(phase.clone()));
@@ -10686,7 +10787,7 @@ mod tests {
     }
 
     /// `partitions/1` in `store` now: the record, its root and its revision.
-    fn stored_root(
+    pub(super) fn stored_root(
         rt: &tokio::runtime::Runtime,
         store: &Arc<dyn ConfigStore>,
     ) -> (PartitionRecord, PartitionRoot, u64) {
@@ -10703,7 +10804,7 @@ mod tests {
     }
 
     /// The record digest `engine` holds at `seq` of `generation`; `Digest::ROOT` at seq 0.
-    fn digest_at(
+    pub(super) fn digest_at(
         engine: &RocksEngine,
         generation: Generation,
         seq: Seq,
@@ -10914,6 +11015,7 @@ mod tests {
     #[test]
     fn the_faulted_text_says_no_writes_in_this_open_and_not_when_it_stopped() {
         let error = ReadyError::Faulted {
+            owner: OWNER,
             fault: "storage write fault".to_owned(),
         };
         assert_eq!(
@@ -11465,6 +11567,92 @@ mod tests {
                 .expect("status with no generation"),
             TxnStatus::Unknown,
             "A-R63: with no generation, never Expired"
+        );
+        db.shutdown();
+    }
+
+    /// Sends a refused put again the way its error's step says: as a new write when the step
+    /// says so, otherwise the same request with `Db::resend`. What an app following
+    /// `ApiError::next_step` (embed.md "When writes pause") does.
+    fn send_again_as_told(
+        db: &Db,
+        refused: &PutError,
+        object: &[u8],
+        value: &[u8],
+    ) -> Result<PutOk, PutError> {
+        let step = refused.error.next_step().unwrap_or_default();
+        if step.contains("as a new write") {
+            db.put(object, value, None)
+        } else {
+            let request = refused
+                .request
+                .as_deref()
+                .expect("a refusal that keeps its request");
+            db.resend(request.clone())
+        }
+    }
+
+    /// review-s2 F-002: a put refused `PROTECTION_PAUSED` with `no_mutation` true wrote nothing,
+    /// and the ack floor counts it as settled, so once a later write of the open publishes, a
+    /// resend of it answers `STATUS_EXPIRED` and applies nothing (the row above shows that).
+    /// Sent again as its step says, it lands: the step says to send it as a new write, and its
+    /// value reads back. The pause and the later writes are the row above's: links held, a txn
+    /// left unknown, the put paused behind it, then 30 puts after the heal.
+    /// Cut: `step_for` ignores `no_mutation` (the step says `Db::resend` whatever it is): the
+    /// resend answers `STATUS_EXPIRED`, red.
+    /// Integration (~2 s): three node threads, a real pause and a heal.
+    #[config_log::retcd_test]
+    fn m10_s2_f002_a_paused_put_sent_again_as_its_step_says_lands_after_a_later_put() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            dedup_cap: Some(8),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let paused = db
+            .put(b"c", b"1", None)
+            .expect_err("refused while the txn is unpublished");
+        assert_eq!(
+            (paused.error.kind, paused.error.no_mutation),
+            (ErrorKind::ProtectionPaused, true),
+            "{paused:?}"
+        );
+
+        db.links().heal_all();
+        admits(&db, "after the heal");
+        publishes(&db, Seq(2), "after the heal");
+        for n in 0..30_u32 {
+            db.put(b"b", &n.to_le_bytes(), None)
+                .unwrap_or_else(|refused| panic!("later put {n}: {refused:?}"));
+        }
+
+        let landed = send_again_as_told(&db, &paused, b"c", b"1")
+            .unwrap_or_else(|refused| panic!("sent again as told: {refused:?}"));
+        tracing::info!(request = landed.request.0, "f002_landed");
+        assert_eq!(
+            db.get(b"c").expect("get c").value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"1")),
+            "the paused put's value reads back"
         );
         db.shutdown();
     }
