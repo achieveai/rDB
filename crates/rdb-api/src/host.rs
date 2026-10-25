@@ -2402,6 +2402,25 @@ impl Host {
                         current = self.owner_fence,
                         "host_owner_learned_stale"
                     );
+                } else if owner == Some(self.node) {
+                    // #66: a promote freezes this node's grant before it names the new owner,
+                    // so the read at the fence names this node. Read again while the same fence
+                    // holds; a later fence or a regained grant drops the answer above and ends
+                    // it. Debug: it repeats for as long as the fence lasts.
+                    tracing::debug!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        fence,
+                        "host_owner_still_self"
+                    );
+                    self.owner_after_fence.insert(partition, owner);
+                    self.control.read_owner_after_fence(
+                        self.node,
+                        self.boot,
+                        partition,
+                        fence,
+                        crate::control::OWNER_REREAD_AFTER,
+                    );
                 } else {
                     tracing::info!(
                         node = self.node.0,
@@ -4415,6 +4434,7 @@ impl Host {
                             self.boot,
                             partition,
                             self.owner_fence,
+                            std::time::Duration::ZERO,
                         );
                     }
                 }
