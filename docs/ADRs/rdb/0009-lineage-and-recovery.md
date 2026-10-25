@@ -401,9 +401,15 @@ and a fence held behind the activation whose re-entry is refused leaves F1 resol
 `Blocked`. Only the recovery CAS still blocks on `Unavailable` or `Unknown`.
 Safety rests on the exact-revision CAS and the linearizable read: after our commit no recoverer
 can write our bytes, and a takeover first needs a non-`Serving` record (A-R51), which changes them.
-The recovery CAS cannot be resolved this way: `PartitionRecord` binds no run id or cutoff, so our
-bytes cannot be told from a peer's identical decision (ruling F-g). That needs a run id in
-`partitions/{id}`, owed to M10 and tracked as achieveai/rDB#45.
+An unbound F1 (the simulator, layout-2 record) cannot resolve the recovery CAS this way:
+`PartitionRecord` binds no run id or cutoff, so our bytes cannot be told from a peer's identical
+decision (ruling F-g). **Amended (M10 S1-5, A-R182; closed achieveai/rDB#45 in the bug bash):**
+F1 bound to an rDB instance writes the layout-3 root, whose `run` (the fence's control revision),
+cutoff and owner boot name this run, so it resolves the recovery CAS by the same read-then-CAS
+(`ProposalUnresolved`). The host binds F1 from the first open, so this covers the bootstrap's CAS
+as well as a reopen's. Rows: `m10_bb_45_a_first_open_whose_recovery_cas_answers_unknown_is_ready_and_writes`
+and `m10_a_reopen_whose_recovery_cas_answers_unknown_settles_by_read_then_cas`
+(`rdb-api` `db/reopen_tests.rs`).
 
 **Amended 2026-10-22 (M10, lead ruling A-R185; critic-d7fix C5): landing is a third `inherit`
 caller.** A copy that answers the discovery window late is left out of the barrier. Before this,
