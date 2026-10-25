@@ -5649,7 +5649,10 @@ mod tests {
         loop {
             let owner = owner_status(&db, "node 1 re-planning");
             let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
-            let replanned = owner.recovered > before && owner.admits == Some(true);
+            // D9 (A-R398): the restart pins node 3 as a shadow, which L1 never counts, and the
+            // promote's commit after it pins node 3 regular again: hold only once both landed.
+            let replanned =
+                owner.recovered > before.map(Generation::next) && owner.admits == Some(true);
             // A re-plan that dropped node 3 leaves the hold below nothing to pause: say so.
             if replanned && node_3.as_ref().and_then(|n| n.recovered) == owner.recovered {
                 break;
@@ -7248,6 +7251,194 @@ mod tests {
                 String::from_utf8_lossy(key)
             );
         }
+        db.shutdown();
+    }
+
+    /// D10 (A-R398, S2-4 `ahead2`): the old owner that a promote dropped is re-added when it
+    /// restarts. Node 2 promoted, node 1 dropped; node 1 restarts at a new boot. Node 2 pins it
+    /// back as a shadow, promotes it once caught up, and the partition is `Active` on three
+    /// copies again; node 1 holds the new generation through node 2's head.
+    /// Cut: `recovered` records no member the commit left out (before D10): node 2 logs
+    /// `peer_booted_ignored`, red (node 1 never re-added).
+    /// Integration (~8 s): the promote waits node 1's grant out, then the re-add and promote.
+    #[config_log::retcd_test]
+    fn m10_s2_d10_the_owner_a_promote_dropped_is_added_back_after_it_restarts() {
+        const METHOD: &str =
+            "m10_s2_d10_the_owner_a_promote_dropped_is_added_back_after_it_restarts";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        db.put(b"a", b"1", None).expect("before the promote");
+        let of = |db: &Db, node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .unwrap_or_else(|| panic!("node {} answers a status look", node.0))
+        };
+        let promoted = db.promote(NodeId(2), None).expect("promote");
+        assert_eq!(promoted.dropped, OWNER, "{promoted:?}");
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        while let Err(refused) = db.put(b"b", b"2", None) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed on node 2 within {patience:?}: {refused:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        db.restart_node(OWNER).expect("restart node 1");
+        let deadline = std::time::Instant::now() + patience;
+        let generation = loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+            let back = lines
+                .iter()
+                .position(|line| line["@m"] == "shadow_promote" && line["shadow"] == 1)
+                .and_then(|at| {
+                    lines[at..]
+                        .iter()
+                        .find(|line| line["@m"] == "rejoin_committed" && line["node"] == 2)
+                })
+                .and_then(|line| line["generation"].as_u64());
+            if let Some(back) = back {
+                break Generation(back);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 did not add node 1 back within {patience:?}: {:?}",
+                of(&db, NodeId(2))
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(generation > promoted.generation, "{generation:?}");
+        let put = loop {
+            match db.put(b"c", b"3", None) {
+                Ok(put) => break put,
+                Err(refused) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no put after the re-add: {refused:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(put.generation >= generation, "{put:?}");
+        let target = of(&db, NodeId(2)).holds.expect("node 2 holds").applied;
+        loop {
+            let held = of(&db, OWNER).holds;
+            if held.is_some_and(|held| held.generation >= generation && held.durable >= target) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 holds {held:?}, not generation {} through {target}",
+                generation.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let readded = lines.iter().any(|line| {
+            line["@m"] == "rejoin_plan" && line["node"] == 2 && line["readded"] == "Some(1)"
+        });
+        assert!(readded, "node 1 was not planned back as a shadow");
+        db.shutdown();
+    }
+
+    /// D10 (A-R398, S2-4 `ahead2` by hand): the re-add of the old owner while writes go on.
+    /// Node 2, promoted from a secondary, still holds that side's receiver, retired. The
+    /// promote plan of the shadow it re-adds names node 2 the catch-up source through its head,
+    /// which the shadow is short of while puts keep landing. R1 refused that catch-up
+    /// `NotASource` from the retired receiver, F1 waited its 14 s out and dropped node 1 again,
+    /// writes refused all that while. Now node 2 restores a dormant receiver to source it: no
+    /// catch-up is refused, no re-plan is abandoned, and node 1 is promoted back. Node 1
+    /// restarts until one promote needed that catch-up, so the row never passes without one.
+    /// Cut: the source restore keeps a retired receiver (before the fix): `catch_up_refused`,
+    /// red.
+    /// Integration (~10-40 s): the promote waits node 1's grant out, then each re-add and promote.
+    #[config_log::retcd_test]
+    fn m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on() {
+        const METHOD: &str = "m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        db.put(b"a", b"1", None).expect("before the promote");
+        let promoted = db.promote(NodeId(2), None).expect("promote");
+        assert_eq!(promoted.dropped, OWNER, "{promoted:?}");
+        let patience = crate::host::test_patience(Duration::from_secs(90));
+        let deadline = std::time::Instant::now() + patience;
+        while let Err(refused) = db.put(b"b", b"2", None) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no put landed on node 2 within {patience:?}: {refused:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let lines = || config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        // The catch-up is routed only when a put lands between the shadow's last ACK and the
+        // promote's fence, so node 1 restarts until one was (a restart from `Active` is pinned
+        // as a shadow again, D9), at most ten times. Each restart's writer starts after it: a
+        // put sent across a restart waits its timeout out.
+        let mut routed = 0;
+        let mut request = 1_000;
+        for _ in 0..10 {
+            let before = lines().len();
+            db.restart_node(OWNER).expect("restart node 1");
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let base = request;
+            let (cycle, sent) = std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let mut sent = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let id = app_request_id(base + sent).expect("below 2^63");
+                        let _ = db.put_as(id, format!("w{sent}").as_bytes(), b"v", None);
+                        sent += 1;
+                        std::thread::yield_now();
+                    }
+                    sent
+                });
+                let cycle = loop {
+                    let lines = lines();
+                    let cycle = lines[before..].to_vec();
+                    let settled = cycle
+                        .iter()
+                        .position(|line| {
+                            line["@m"] == "shadow_promote"
+                                && line["node"] == 2
+                                && line["shadow"] == 1
+                        })
+                        .is_some_and(|at| {
+                            cycle[at..].iter().any(|line| {
+                                (line["@m"] == "rejoin_committed" && line["node"] == 2)
+                                    || line["@m"] == "rejoin_abandoned"
+                            })
+                        });
+                    if settled {
+                        break cycle;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "node 2 did not promote node 1 back within {patience:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                (cycle, writer.join().expect("writer"))
+            });
+            request += sent;
+            if cycle
+                .iter()
+                .any(|line| line["@m"] == "catch_up_routed" && line["node"] == 2)
+            {
+                routed += 1;
+                break;
+            }
+        }
+        let lines = lines();
+        let refused: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "catch_up_refused" || line["@m"] == "rejoin_abandoned")
+            .collect();
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(routed, 1, "no restart needed a catch-up from node 2");
         db.shutdown();
     }
 

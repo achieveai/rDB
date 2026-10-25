@@ -1118,6 +1118,14 @@ fn restart_three(trio: &mut Trio, dir: &std::path::Path, tune: impl Fn(&mut Host
     boot
 }
 
+/// [`Trio::fast_pause`] on the regular rejoin path: D9 (A-R398) pins a copy restarted from an
+/// `Active` commit as a shadow, and the rows below are for F1's routed catch-up, which every
+/// other restart still takes.
+fn regular_rejoin(host: &mut Host) {
+    Trio::fast_pause(host);
+    host.restart_shadow = false;
+}
+
 /// A-R278 (W6b): a secondary restarted behind a live owner catches up from the owner's own
 /// copy and rejoins, twice. Node 3 dies, misses puts until L1 pauses on it, and restarts. The
 /// owner re-plans (#42) and F1 routes node 3's catch-up to the owner's copy, which the owner
@@ -1136,7 +1144,7 @@ fn a_secondary_restarted_behind_a_live_owner_catches_up_from_the_owner_and_rejoi
     const METHOD: &str =
         "a_secondary_restarted_behind_a_live_owner_catches_up_from_the_owner_and_rejoins_twice";
     let dir = config_testkit::fs::temp_dir();
-    let mut trio = Trio::new(dir.path(), Trio::fast_pause);
+    let mut trio = Trio::new(dir.path(), regular_rejoin);
     trio.bootstrap();
     trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
     let mut generation = trio.status(0).recovered.expect("bootstrap committed");
@@ -1144,7 +1152,7 @@ fn a_secondary_restarted_behind_a_live_owner_catches_up_from_the_owner_and_rejoi
     for round in 1..=2u64 {
         let (next, landed) = three_dies_and_misses_puts(&mut trio, request);
         assert!(landed >= 1, "round {round}: node 3 missed no put");
-        let boot = restart_three(&mut trio, dir.path(), Trio::fast_pause);
+        let boot = restart_three(&mut trio, dir.path(), regular_rejoin);
         let rejoined = trio.until("node 1 commits the rejoin with all three", |trio| {
             let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
             let nodes: Vec<(u32, BootId)> = committed

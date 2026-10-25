@@ -536,7 +536,11 @@ fn m10_s2_d2_a_pause_for_divergence_is_never_dropped_past() {
 fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
     const METHOD: &str = "m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned";
     let dir = config_testkit::fs::temp_dir();
-    let (mut trio, before) = started(dir.path(), tuned);
+    // D9 (A-R398): the regular rejoin path, which a restart from an `Active` commit no longer takes.
+    let (mut trio, before) = started(dir.path(), |host| {
+        tuned(host);
+        host.restart_shadow = false;
+    });
     trio.short_window_after_commit();
 
     kill(&trio, 3, &[1, 2]);
@@ -1700,6 +1704,12 @@ fn half_open_is_not_repaired(method: &'static str, lost: (NodeId, NodeId)) {
 /// the other nodes hear `PeerBooted`. A new host, not new links alone: every frame it sends
 /// carries its own boot, which the next commit pins.
 fn restart(trio: &mut Trio, dir: &std::path::Path, n: u32) -> BootId {
+    restart_as(trio, dir, n, false)
+}
+
+/// [`restart`], with node `n`'s data folder removed first when `wipe`: a new process on an
+/// empty disk, as `lr start N --wipe`.
+fn restart_as(trio: &mut Trio, dir: &std::path::Path, n: u32, wipe: bool) -> BootId {
     let at = trio
         .nodes
         .iter()
@@ -1709,6 +1719,9 @@ fn restart(trio: &mut Trio, dir: &std::path::Path, n: u32) -> BootId {
     let boot = BootId(old.boot.0 + 1);
     let control = Arc::clone(&old.control);
     drop(old);
+    if wipe {
+        std::fs::remove_dir_all(dir.join(n.to_string())).expect("wipe the node's folder");
+    }
     let engine = RocksEngine::open(dir.join(n.to_string())).expect("reopen engine");
     let (tx, rx) = mpsc::channel();
     trio.links.register(NodeId(n), tx.clone(), boot);
@@ -2090,4 +2103,69 @@ fn m10_s2_b24_a_read_only_shadow_commit_is_promoted_not_repaired() {
     assert_eq!(role_of_three(&trio), Some(ReplicaRole::RegularSecondary));
     let planned = logged!(METHOD, "membership_repair_planned");
     assert!(planned.is_empty(), "{planned:?}");
+}
+
+/// D9 (A-R398, arch-s2 S2-4 wiped): a secondary that restarts on an empty disk under a live,
+/// `Active` owner is re-pinned as a shadow, so writes go on with two copies while it catches
+/// up; once it has, node 1 promotes it and the partition is `Active` on three again. Before
+/// D9 the restart's re-plan pinned it regular: L1 counted a copy that held nothing and
+/// refused writes until the whole copy was rebuilt (7.6-7.9 s at 10,000 records).
+/// Cut: `restart_shadowed` returns `None`, red (node 3 pinned regular at its new boot).
+/// Integration (~3 s): bootstrap's window, the restart's re-plan, the promote's.
+#[config_log::retcd_test]
+fn m10_s2_d9_a_wiped_secondary_rejoins_as_a_shadow_and_writes_go_on() {
+    const METHOD: &str = "m10_s2_d9_a_wiped_secondary_rejoins_as_a_shadow_and_writes_go_on";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    for request in 1..=20 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} with every copy up: {other:?}"),
+        }
+    }
+
+    let boot = restart_as(&mut trio, dir.path(), 3, true);
+    let (shadowed, role, mode) = trio.until("node 1 pinned node 3 at its new boot", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+        let three = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.boot == boot)?;
+        Some((committed.new_generation, three.role, committed.mode.clone()))
+    });
+    assert!(shadowed > before, "{shadowed:?}");
+    assert_eq!(
+        (role, mode),
+        (ReplicaRole::Shadow, PartitionMode::DegradedRf2),
+        "the wiped copy is pinned as a shadow, not counted"
+    );
+
+    let (promoted, mode, members) = trio.until("node 1 pinned node 3 as regular", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::RegularSecondary))
+            .then(|| commit_of(trio))
+            .flatten()
+            .filter(|(generation, mode, _)| {
+                *generation > shadowed && *mode == PartitionMode::Active
+            })
+    });
+    assert_eq!((mode, members), (PartitionMode::Active, vec![1, 2, 3]));
+    trio.ready();
+    match trio.ask(put(21)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, promoted),
+        other => panic!("a put after the promote: {other:?}"),
+    }
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "one promote: {promotes:?}");
+    assert!(
+        promotes[0]["acked"].as_u64() >= promotes[0]["cutoff"].as_u64(),
+        "promoted below the cutoff: {promotes:?}"
+    );
+    let plans = logged!(METHOD, "rejoin_plan");
+    assert!(
+        plans.iter().any(|plan| plan["shadowed"] == "Some(3)"),
+        "the restart's plan shadowed node 3: {plans:?}"
+    );
+    assert!(logged!(METHOD, "membership_drop_planned").is_empty());
 }

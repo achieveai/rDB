@@ -1841,6 +1841,10 @@ struct Host {
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
+    /// D9 (A-R398): a restart re-plan from an `Active` commit pins the restarted secondary as a
+    /// shadow ([`Self::restart_shadowed`]). Crate rows of the regular rejoin path (F1 routes the
+    /// catch-up, as it still does from any other commit) set it false.
+    restart_shadow: bool,
     /// The instance this node's engine is bound to when it started, whose open counter holds
     /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
     /// is marked, and nothing waits on a mark.
@@ -1973,6 +1977,7 @@ impl Host {
             repair_probes: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
+            restart_shadow: true,
             instance: engine_instance,
             activation: BTreeMap::new(),
             after_commit,
@@ -4249,6 +4254,7 @@ impl Host {
             "recovered"
         );
         self.inherit(partition, result)?;
+        self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
         self.committed_correlation
             .insert(partition, site.correlation);
@@ -4428,6 +4434,84 @@ impl Host {
         })
     }
 
+    /// D10 (A-R398): each member the commit this node knew pinned and `result` (committed here)
+    /// does not, at the boot it was pinned at, is left out, as [`Self::drained`] records a
+    /// drop. That covers a drop this node never planned: a promote's plan pins only the members
+    /// it keeps, so without this the owner a promote dropped is never a [`Self::readd_candidate`]
+    /// and stays out for good.
+    fn note_left_out(&mut self, partition: PartitionId, result: &RecoveryResult) {
+        let Some(prior) = self.committed.get(&partition) else {
+            return;
+        };
+        let pinned = &result.committed.pinned_config.members;
+        let gone: Vec<Member> = prior
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .filter(|member| !pinned.iter().any(|pin| pin.node == member.node))
+            .copied()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = result.new_generation.0,
+            left_out = ?gone.iter().map(|member| (member.node.0, member.boot.0)).collect::<Vec<_>>(),
+            "commit_left_out"
+        );
+        let entry = self.left_out.entry(partition).or_default();
+        for left in gone {
+            entry.retain(|member| member.node != left.node);
+            entry.push(left);
+        }
+    }
+
+    /// D9 (A-R398, arch-s2 S2-4): the restarted regular secondary a restart re-plan pins again
+    /// as a shadow. A restarted copy is behind by whatever it missed, and a wiped one holds
+    /// nothing; pinned regular, L1 counts it and refuses writes until it has caught up, for as
+    /// long as the copy takes. As a shadow L1 never counts it and F1's barrier skips it, so
+    /// writes go on with the two regular copies while R1 catches it up, and
+    /// [`Self::shadow_duty`] promotes it once it reaches the cutoff (two short re-plans, the
+    /// `behind` case's). Only from an `Active` commit, for a plain restart (no drop, not the
+    /// promote), and only when two regular copies whose pinned boot is current stay pinned:
+    /// otherwise the rejoiner stays regular, as before.
+    fn restart_shadowed(&self, committed: &RecoveryResult, replan: Replan) -> Option<NodeId> {
+        if !self.restart_shadow
+            || replan.promote
+            || replan.drop.is_some()
+            || committed.mode != PartitionMode::Active
+        {
+            return None;
+        }
+        let rejoiner = replan.rejoiner?;
+        let members = &committed.committed.pinned_config.members;
+        let restarted = members.iter().find(|member| {
+            member.node == rejoiner
+                && member.node != self.node
+                && member.role == ReplicaRole::RegularSecondary
+                && self
+                    .links
+                    .boot_of(member.node)
+                    .is_some_and(|live| live > member.boot)
+        })?;
+        let current = members
+            .iter()
+            .filter(|member| member.node != restarted.node && member.role != ReplicaRole::Shadow)
+            .filter(|member| {
+                member.node == self.node
+                    || self
+                        .links
+                        .boot_of(member.node)
+                        .is_some_and(|live| live == member.boot)
+            })
+            .count();
+        (current >= 2).then_some(restarted.node)
+    }
+
     /// Ask A1 to revoke `partition`'s committed `epoch`, whose `DrainProof` [`Self::drained`]
     /// plans the next generation from, without `drop` when one is named. `rejoiner` is the
     /// restarted member the plan links again, if it is for one.
@@ -4515,6 +4599,7 @@ impl Host {
             base_digest: committed.selected.cutoff_digest,
         };
         let pinned = &committed.committed.pinned_config;
+        let shadowed = self.restart_shadowed(committed, replan);
         let mut members: Vec<Member> = pinned
             .members
             .iter()
@@ -4534,6 +4619,8 @@ impl Host {
                     && Some(member.node) == replan.rejoiner;
                 let role = if promoted {
                     ReplicaRole::RegularSecondary
+                } else if Some(member.node) == shadowed {
+                    ReplicaRole::Shadow
                 } else {
                     member.role
                 };
@@ -4616,6 +4703,7 @@ impl Host {
             dropped = ?replan.drop.map(|node| node.0),
             rejoiner = ?replan.rejoiner.map(|node| node.0),
             readded = ?readded.map(|member| member.node.0),
+            shadowed = ?shadowed.map(|node| node.0),
             "rejoin_plan"
         );
         self.rejoins
@@ -6495,16 +6583,20 @@ impl Host {
     fn restore_dormant(&mut self, partition: PartitionId, seed: &DormantSeed, with_history: bool) {
         let node = self.node;
         let held = self.replication.receiver(node, partition);
-        let dormant = held.map(AppendReceiver::is_dormant);
+        let serving = self
+            .replication
+            .primary(node, partition)
+            .is_some_and(|primary| !primary.tracker().retired());
+        // D10 (A-R398): an owner promoted from a secondary still holds that side's receiver,
+        // retired by the promote's `Recovered` (B-R58a). R1 sources no catch-up from a retired
+        // receiver, so a source restore replaces it as if none were held.
+        let stale = serving && with_history && held.is_some_and(AppendReceiver::retired);
+        let dormant = held.filter(|_| !stale).map(AppendReceiver::is_dormant);
         if dormant == Some(false) {
             return;
         }
         // Beside a serving primary the receiver only sources (A-R314, A-R323 A-6): a target
         // restore here would let recovery appends into the primary's own store.
-        let serving = self
-            .replication
-            .primary(node, partition)
-            .is_some_and(|primary| !primary.tracker().retired());
         if serving && !with_history {
             tracing::warn!(
                 node = node.0,
