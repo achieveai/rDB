@@ -9405,6 +9405,50 @@ mod tests {
         );
     }
 
+    /// #59 item 4 (A-R421): row 1's late copy, with the `CopyCaughtUp` its landing sends lost
+    /// once. Its host re-sends it on a backoff (`caught_up_resent`, debug), F1 pins it, syncs every
+    /// copy and activates generation 3, and F1's post-commit sync to node 2 ends the re-sends
+    /// (`caught_up_resend_done`). Repeats that reach F1 after it pinned change nothing: the
+    /// generation is still 3, and no node faults.
+    /// Cut: `resend_caught_up` returns at once, red (F1 stays `Rebuilding`, as in slice 1).
+    /// Integration (~14 s): three opens, a 4 s pause, one or two re-sends.
+    #[config_log::retcd_test]
+    fn m10_s2_59_a_lost_copy_caught_up_is_sent_again_and_the_reopen_is_active() {
+        const METHOD: &str =
+            "m10_s2_59_a_lost_copy_caught_up_is_sent_again_and_the_reopen_is_active";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        d7_node_2_behind(&rt, dir.path(), &store);
+
+        let node_2 = dir.path().join("nodes").join("2");
+        let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+        crate::host::pause_before_inventory(&node_2, Duration::from_millis(2 * window));
+        crate::host::drop_first_caught_up(&node_2);
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        d7_active_at_3(&db, METHOD, "lost CopyCaughtUp");
+        db.shutdown();
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let said = |message: &str| {
+            lines
+                .iter()
+                .filter(|line| line["@m"] == message && line["node"] == 2)
+                .count()
+        };
+        assert_eq!(said("test_caught_up_dropped"), 1, "the first one was lost");
+        // `caught_up_resent` is debug, below the test filter for rdb_api; the info line that
+        // ends the re-sends carries their count.
+        let done: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "caught_up_resend_done" && line["node"] == 2)
+            .collect();
+        assert_eq!(done.len(), 1, "F1's sync ended the re-sends: {done:?}");
+        assert!(
+            done[0]["attempts"].as_u64().is_some_and(|n| n >= 1),
+            "it was sent again before F1 synced it: {done:?}"
+        );
+    }
+
     /// Ruling A-R185 row 2 (critic-d7fix (c), land-first): the third open holds link 1-2, so
     /// node 2 never hears the inventory ask, and lands generation 3 from the control watch
     /// outside the barrier. It holds generation 2 through the cutoff exactly (linked at its

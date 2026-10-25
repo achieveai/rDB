@@ -1278,6 +1278,36 @@ pub(crate) fn pause_before_inventory(node_dir: &std::path::Path, pause: Duration
         .push((node_dir.to_path_buf(), pause));
 }
 
+/// Test-only: node directories whose host loses its next landing's `CopyCaughtUp` once, as a
+/// dropped message would (#59 item 4).
+#[cfg(test)]
+static DROP_CAUGHT_UP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Test-only: the host on the copy at `node_dir` does not send its next landing's
+/// `CopyCaughtUp`, once; only [`Host::resend_caught_up`] can then deliver it.
+#[cfg(test)]
+pub(crate) fn drop_first_caught_up(node_dir: &std::path::Path) {
+    DROP_CAUGHT_UP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(node_dir.to_path_buf());
+}
+
+/// The first re-send of a landing's `CopyCaughtUp` (#59 item 4), and the cap its doubling
+/// stops at: a bounded backoff, kept until F1's post-commit sync reaches this copy.
+const CAUGHT_UP_RESEND_FIRST_MILLIS: u64 = 1_000;
+const CAUGHT_UP_RESEND_MAX_MILLIS: u64 = 8_000;
+
+/// A landing's `CopyCaughtUp`, kept for [`Host::resend_caught_up`] until F1 has it.
+#[derive(Debug)]
+struct CaughtUpResend {
+    event: RecoveryEvent,
+    emitter: NodeId,
+    correlation: CorrelationId,
+    attempt: u32,
+    next: Tick,
+}
+
 /// Node directories whose host sleeps once, for the time given, before its next barrier sync
 /// (a `SyncWalThrough` before the commit), as a slow fsync would (D10). Empty unless
 /// [`pause_before_sync`] armed it.
@@ -1838,6 +1868,8 @@ struct Host {
     committed_correlation: BTreeMap<PartitionId, CorrelationId>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
+    /// #59 item 4: the `CopyCaughtUp` each such link answered, re-sent until F1 has it.
+    caught_up_resends: BTreeMap<(PartitionId, Generation), CaughtUpResend>,
     acquire_scheduled: BTreeSet<PartitionId>,
     /// Per partition, the restart re-plan this owner is running (#42, A-R249).
     rejoins: BTreeMap<PartitionId, Rejoin>,
@@ -2010,6 +2042,7 @@ impl Host {
             snapshots_served: BTreeSet::new(),
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
+            caught_up_resends: BTreeMap::new(),
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
@@ -2690,6 +2723,7 @@ impl Host {
             self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
             self.drop_duty(now);
         }
+        self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
         for (_, item) in due {
@@ -2717,6 +2751,46 @@ impl Host {
             if let Err(fault) = outcome {
                 self.set_fault(fault);
                 return;
+            }
+        }
+    }
+
+    /// #59 item 4: re-send each landing's `CopyCaughtUp` that is due, to the F1 that committed,
+    /// under its correlation, doubling the wait from [`CAUGHT_UP_RESEND_FIRST_MILLIS`] up to
+    /// [`CAUGHT_UP_RESEND_MAX_MILLIS`]. F1 takes a repeat as it takes the first: required and
+    /// awaited, it pins; already pinned, it syncs the copy again; once activating or active, it
+    /// ignores it. Ends at F1's post-commit sync ([`Self::request_holder_sync`]) or a newer
+    /// landing of the partition ([`Self::land`]); a node that stops drops it with the host.
+    fn resend_caught_up(&mut self, now: Tick) {
+        let node = self.node;
+        for (&(partition, generation), resend) in &mut self.caught_up_resends {
+            if resend.next > now {
+                continue;
+            }
+            resend.attempt = resend.attempt.saturating_add(1);
+            let wait = CAUGHT_UP_RESEND_FIRST_MILLIS
+                .saturating_mul(1 << resend.attempt.min(3))
+                .min(CAUGHT_UP_RESEND_MAX_MILLIS);
+            resend.next = now.plus_millis(wait);
+            tracing::debug!(
+                node = node.0,
+                partition = partition.0,
+                generation = generation.0,
+                attempt = resend.attempt,
+                "caught_up_resent"
+            );
+            let msg = Msg::Routed {
+                partition,
+                correlation: resend.correlation,
+                kind: KernelEvent::Recovery(resend.event.clone()),
+            };
+            if let Err(fault) = self.links.send(node, resend.emitter, msg) {
+                tracing::debug!(
+                    node = node.0,
+                    emitter = resend.emitter.0,
+                    ?fault,
+                    "caught_up_resend_unreachable"
+                );
             }
         }
     }
@@ -5740,6 +5814,7 @@ impl Host {
         emitter: NodeId,
     ) -> Result<(), Fault> {
         let partition = site.partition;
+        let landed_generation = result.new_generation;
         let first = self.landed.insert((partition, result.new_generation));
         let barrier = in_barrier(&result, self.node);
         tracing::info!(
@@ -5783,7 +5858,41 @@ impl Host {
         );
         // Then it reports itself caught up at the cutoff to the F1 that committed, in B-R59's
         // shape; F1's `Committed` arm pins it and syncs it like any required copy.
+        // #59 item 4: a lost one is re-sent on a backoff until F1's post-commit sync for this
+        // generation reaches this copy ([`Self::resend_caught_up`]); a newer landing ends it.
+        if first {
+            self.caught_up_resends
+                .retain(|(p, g), _| *p != partition || *g >= landed_generation);
+        }
         if let Some(event) = caught_up {
+            self.caught_up_resends.insert(
+                (partition, landed_generation),
+                CaughtUpResend {
+                    event: event.clone(),
+                    emitter,
+                    correlation: site.correlation,
+                    attempt: 0,
+                    next: self.clock.now().plus_millis(CAUGHT_UP_RESEND_FIRST_MILLIS),
+                },
+            );
+            #[cfg(test)]
+            {
+                let mut dropped = DROP_CAUGHT_UP
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(at) = dropped
+                    .iter()
+                    .position(|dir| self.engine.path().starts_with(dir))
+                {
+                    dropped.remove(at);
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        "test_caught_up_dropped"
+                    );
+                    return Ok(());
+                }
+            }
             let msg = Msg::Routed {
                 partition,
                 correlation: site.correlation,
@@ -7555,6 +7664,19 @@ impl Host {
             post_commit,
             "holder_sync_requested"
         );
+        // #59 item 4: F1 syncs this copy after the commit only once it has what it needs from
+        // it, so the landing's `CopyCaughtUp` stops being re-sent.
+        if post_commit {
+            if let Some(resend) = self.caught_up_resends.remove(&(partition, generation)) {
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    attempts = resend.attempt,
+                    "caught_up_resend_done"
+                );
+            }
+        }
         let capture = CapturedPrefix {
             partition,
             generation,
