@@ -415,6 +415,32 @@ fn reads_back_and_writes(db: &Db, case: &str) {
     );
 }
 
+/// A new put as `docs/rdb/embed.md` tells an app to send one: a `PROTECTION_PAUSED` refusal
+/// with `no_mutation` true wrote nothing, so the same put is sent again after a short wait.
+/// Any other refusal, or a pause that outlasts the patience, fails the row. A-R391: with the
+/// rows' 400 ms `pause_age_millis`, a WAL sync slower than that on every copy (530-628 ms in
+/// int gate k680) leaves the write before this one unsafe past the pause age. The owner then
+/// pauses and refuses this put, which is the product working, not a fault in the heal.
+fn put_through_pauses(db: &Db, object: &[u8], value: &[u8], case: &str) {
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    let mut paused = 0_u32;
+    loop {
+        match db.put(object, value, None) {
+            Ok(_) => break,
+            Err(refused)
+                if refused.error.kind == ErrorKind::ProtectionPaused
+                    && refused.error.no_mutation
+                    && Instant::now() < deadline =>
+            {
+                paused += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(refused) => panic!("{case}: {refused:?} after {paused} paused sends"),
+        }
+    }
+    tracing::info!(case, paused, "test_put_through_pauses");
+}
+
 /// S1-5 (#45): the store answers "unknown" to the reopen's recovery CAS. Whether it applied
 /// (`LoseOne`) or not (`DropOne`), F1 reads `partitions/1` and sends the same CAS again at the
 /// revision it read: its own bytes there, or the record it fenced, unchanged. That CAS lands,
@@ -2542,7 +2568,7 @@ fn m10_s2_three_node_processes_on_one_folder_heal_and_serve() {
         );
     }
     let mut app = open_app(&rt, &store, &links, ClientId(2));
-    app.put(b"c", b"3", None).expect("the app's put");
+    put_through_pauses(&app, b"c", b"3", "the app's put");
     assert_eq!(
         app.get(b"c").expect("get c").value.map(|(_, v)| v),
         Some(Bytes::from_static(b"3"))
