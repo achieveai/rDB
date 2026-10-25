@@ -201,7 +201,9 @@ impl StatusIndex {
                 // `Unknown`), then carried into the new lineage by the cutoff: it landed
                 // (A-R394 E2). Only that answer moves it; a discarded or past-cutoff one stays
                 // `Unknown`, which never proves nonexecution. The result is the one the status
-                // seed builds from the same record's dedup row.
+                // seed builds from the same record's dedup row. Matched by `seq` alone, as the
+                // `Published` arm is: the map holds no per-seq digest to check `record_digest`
+                // against, and one writer per generation means one record per seq.
                 (StatusOutcome::Unknown, Some(seq)) => {
                     let result = TxnResult {
                         partition: entry.lineage.partition,

@@ -2957,6 +2957,73 @@ fn m10_r394_e2_recovery_folds_an_unknown_entry_the_cutoff_retained() {
     }
 }
 
+/// The status reply for `r{n}` in the predecessor generation, as `want`.
+fn status_is(rig: &mut Rig, n: u64, want: TxnStatus) -> Vec<EffectKind> {
+    let got = rig.step(status(n, Some(GEN)));
+    assert_eq!(
+        got,
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(n),
+            status: want,
+        })],
+        "r{n}"
+    );
+    got
+}
+
+/// A-R397 (critic-e2 A4a): the quarantine arm's `Unknown` entry folds as the post-apply
+/// deadline's does. Through `Module::step`: a deny quarantines r5, then a recovery. A cutoff
+/// at r5 carried it into the new lineage, so ADR-rdb-0004's fold row answers
+/// `RECOVERED_APPLIED` with the retained result; a cutoff below it, r5 discarded, stays
+/// `Unknown`.
+#[retcd_test]
+fn m10_r397_a4_a_quarantined_entry_the_cutoff_retained_folds_to_recovered_applied() {
+    let applied = TxnStatus::Resolved(TxnResult {
+        outcome: Outcome::RecoveredApplied,
+        ..result(P, 5)
+    });
+    for (cutoff, discarded_from, want) in [(5, None, applied), (4, Some(5), TxnStatus::Unknown)] {
+        let mut rig = Rig::new();
+        let c = rig.pending_with_recheck(5);
+        let effects = rig.step(answer(
+            Checkpoint::Publication,
+            c,
+            Verdict::Deny(DenyReason::Expired),
+        ));
+        assert!(effects.contains(&quarantined(5)), "{effects:?}");
+        rig.step(recovered(
+            PartitionMode::Active,
+            cutoff,
+            false,
+            discarded_from,
+        ));
+        status_is(&mut rig, 5, want);
+    }
+}
+
+/// A-R397 (critic-e2 A4b): a write still pending when the recovery lands. Its `on_candidate`
+/// entry is `Unknown` with a seq, and the fold runs before `pending` is dropped. Above the
+/// cutoff it stays `Unknown` — never `StatusExpired`, which would say it was dropped. At the
+/// cutoff the record is on every required copy, so it answers `RecoveredApplied`, as the
+/// seed answers from its dedup row. A write dispatched but never a candidate has no entry and
+/// answers `Unknown` whatever the cutoff.
+#[retcd_test]
+fn m10_r397_a4_a_write_pending_at_recovery_resolves_only_when_the_cutoff_retained_it() {
+    let applied = TxnStatus::Resolved(TxnResult {
+        outcome: Outcome::RecoveredApplied,
+        ..result(P, 5)
+    });
+    for (cutoff, want) in [(4, TxnStatus::Unknown), (5, applied)] {
+        let mut rig = Rig::new();
+        rig.step(candidate(5, 5));
+        assert!(rig.view().pending.is_some(), "cutoff {cutoff}: r5 pending");
+        rig.step(recovered(PartitionMode::Active, cutoff, false, None));
+        assert!(rig.view().pending.is_none(), "cutoff {cutoff}: dropped");
+        status_is(&mut rig, 5, want);
+        status_is(&mut rig, 9, TxnStatus::Unknown);
+    }
+}
+
 // ---- reads ------------------------------------------------------------------------------------
 
 /// A fresh read waits behind the candidate and is served at the new published position.
