@@ -5760,7 +5760,7 @@ impl Host {
         // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is: the
         // acquire waits for the link's sync on the syncer (A-R326).
         let caught_up = if first && !barrier {
-            let caught_up = self.land_link(partition, &result);
+            let caught_up = self.land_link(partition, &result)?;
             self.sync_link(partition, result.new_generation)?;
             caught_up
         } else {
@@ -5808,14 +5808,22 @@ impl Host {
     /// send: caught up at the cutoff, nothing to copy. When it holds less (arm 3, A-R224 item
     /// 3) it links at its own head, logged `land_link_behind`, gets a receiver there, and
     /// answers nothing: its `Recovered` asks the primary for the rest. Otherwise it writes
-    /// nothing, sends nothing and logs `land_link_refused{reason}`; the partition's writes then
-    /// stay paused until the database is opened again. Called once per (partition, generation):
+    /// nothing, sends nothing and logs `land_link_refused{reason}`. A copy refused past the
+    /// cutoff does not stall writes: the drop duty leaves it out, and once it restarts it is
+    /// re-added as a shadow and walked up from the root (#59,
+    /// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up`). Called once per
+    /// (partition, generation):
     /// `landed` dedups the landing.
+    ///
+    /// # Errors
+    ///
+    /// A `land_link_receiver_refused` fault when the link is made but the pin's own copy cannot
+    /// hold a receiver (review-r185 ADV2).
     fn land_link(
         &mut self,
         partition: PartitionId,
         result: &RecoveryResult,
-    ) -> Option<RecoveryEvent> {
+    ) -> Result<Option<RecoveryEvent>, Fault> {
         // The new generation's lineage, spelled once (review-r185 ADV1).
         let lineage = result.selected.root;
         let generation = lineage.generation;
@@ -5844,7 +5852,7 @@ impl Host {
                     "land_link_refused"
                 );
             }
-            None
+            Ok(None)
         };
         let Some(copy) = result
             .committed
@@ -5913,6 +5921,21 @@ impl Host {
                         quarantined = kept.quarantine().is_some(),
                         "land_receiver_kept"
                     );
+                } else if result
+                    .committed
+                    .pinned_config
+                    .member(copy)
+                    .is_some_and(|member| member.role == ReplicaRole::Primary)
+                {
+                    // The pin's primary holds no receiver: it appends. Linked, nothing to send
+                    // (#59 item 5: before, `AppendReceiver::new` refused it, logged as an error).
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        generation = generation.0,
+                        "land_receiver_primary"
+                    );
+                    return Ok(None);
                 } else {
                     // Claims nothing durable, as a dormant receiver does: F1's sync proves the
                     // cutoff, and the next flush raises it (critic-d7fix follow-up A1).
@@ -5939,25 +5962,25 @@ impl Host {
                                 "land_receiver_installed"
                             );
                         }
+                        // review-r185 ADV2, #59: a member the pin names as a secondary that a
+                        // receiver still refuses (a root and a pin of different partitions) is a
+                        // broken commit, not a copy that cannot catch up: the node faults by
+                        // name, as `inherit` does.
                         Err(error) => {
-                            tracing::error!(
-                                node,
-                                partition = partition.0,
-                                generation = generation.0,
-                                ?error,
-                                "land_link_receiver_refused"
-                            );
-                            return None;
+                            return Err(Fault::from(format!(
+                                "land_link_receiver_refused p{} g{}: {error:?}",
+                                partition.0, generation.0
+                            )));
                         }
                     }
                 }
                 // Behind, it is not caught up: its `Recovered` re-anchors the receiver at its
                 // head under the root and R1 sends the rest, older-stamped, then reports it.
-                (!behind).then_some(RecoveryEvent::CopyCaughtUp {
+                Ok((!behind).then_some(RecoveryEvent::CopyCaughtUp {
                     copy,
                     head: cutoff,
                     digest,
-                })
+                }))
             }
             Err(reason) => refused(reason),
         }

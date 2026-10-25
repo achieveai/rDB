@@ -2607,3 +2607,99 @@ fn m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two() 
         "{dropped:?}"
     );
 }
+
+/// #59 item 3, the past half (A-R185 C2 "past the cutoff"): node 3 holds a tail of the old
+/// generation past every later cutoff, as an old owner's unacknowledged writes would be. It is
+/// dropped (b1), restarts, and is re-added as a shadow (b15). Its landing of that commit links
+/// nothing (`land_link_refused{held_past_base}`), so the tail is never made part of the new
+/// generation. The writes do not stall until a reopen: L1 never counts the shadow, R1 walks it
+/// up from the root, node 1 promotes it, and the next commit is `Active` with all three, node 3
+/// durable through its cutoff, and a put lands there.
+/// Cut: `shadow_duty` returns at once, red (node 3 stays a shadow; no `Active` commit).
+/// Integration (~6 s): b1's drop, the re-add's re-plan, the catch-up, the promote's.
+#[config_log::retcd_test]
+fn m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up() {
+    const METHOD: &str = "m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.until("node 1 decided to drop node 3", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.drop == Some(NodeId(3))
+        )
+        .then_some(())
+    });
+    // The tail: 500 records of node 3's newest generation after its head, which no other copy
+    // holds, so node 3 is past the cutoff of every commit this row makes.
+    let three = &mut trio.nodes[2].0;
+    let held = three
+        .engine
+        .lineages()
+        .into_iter()
+        .filter(|(p, _)| *p == PartitionId(1))
+        .map(|(_, g)| g)
+        .max()
+        .expect("node 3 holds a generation");
+    let head = Seq(three.engine.buffered_applied(PartitionId(1), held).0);
+    let mut digests = vec![Digest::ROOT; usize::try_from(head.0).expect("a small head")];
+    if let Some(last) = digests.last_mut() {
+        *last = three
+            .checked(PartitionId(1), held, head)
+            .expect("its head")
+            .1;
+    }
+    super::trio::write_chain_after(&mut three.engine, held, digests, 500);
+    trio.links.heal_all();
+    restart(&mut trio, dir.path(), 3);
+
+    let shadowed = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow))
+            .then(|| commit_of(trio).map(|(generation, _, _)| generation))
+            .flatten()
+    });
+    assert!(shadowed > before.next(), "{shadowed:?}");
+    let (promoted, mode, members) =
+        trio.until("node 1 committed Active with node 3 regular", |trio| {
+            (role_of_three(trio) == Some(ReplicaRole::RegularSecondary))
+                .then(|| commit_of(trio))
+                .flatten()
+                .filter(|(generation, mode, _)| {
+                    *generation > shadowed && *mode == PartitionMode::Active
+                })
+        });
+    assert_eq!((mode, members), (PartitionMode::Active, vec![1, 2, 3]));
+    let host = &trio.nodes[0].0;
+    let cutoff = host.committed[&PartitionId(1)].selected.cutoff_seq;
+    let known = host
+        .replication
+        .primary(NodeId(1), PartitionId(1))
+        .and_then(|primary| primary.tracker().known(CopyId(2)))
+        .expect("node 1 tracks copy 2");
+    assert!(known.durable.0 >= cutoff.0, "{known:?} below {cutoff:?}");
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, promoted),
+        other => panic!("a put after the promote: {other:?}"),
+    }
+
+    // The landing that met the tail linked nothing, by name, at the shadow's generation.
+    let refused: Vec<_> = logged!(METHOD, "land_link_refused")
+        .into_iter()
+        .filter(|line| line["node"] == 3)
+        .map(|line| (line["reason"].clone(), line["generation"].clone()))
+        .collect();
+    assert_eq!(
+        refused,
+        [("held_past_base".into(), shadowed.0.into())],
+        "node 3 met the cutoff with its tail"
+    );
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "one promote: {promotes:?}");
+    assert!(
+        promotes[0]["acked"].as_u64() >= promotes[0]["cutoff"].as_u64(),
+        "promoted below the cutoff: {promotes:?}"
+    );
+}

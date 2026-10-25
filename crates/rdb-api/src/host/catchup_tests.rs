@@ -321,7 +321,7 @@ fn a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_
         .expect("node 2 is pinned")
         .copy;
     assert_eq!(
-        host.land_link(PartitionId(1), &result),
+        host.land_link(PartitionId(1), &result).expect("no fault"),
         Some(RecoveryEvent::CopyCaughtUp {
             copy,
             head: Seq(2),
@@ -370,7 +370,7 @@ fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links
     let mut host = host_over(&path, &rt);
     let held = host.engine.lineages();
     for result in [&past, &off] {
-        assert_eq!(host.land_link(PartitionId(1), result), None);
+        assert_eq!(host.land_link(PartitionId(1), result), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         assert!(host
             .replication
@@ -414,7 +414,7 @@ fn a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head(
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
     assert_eq!(
-        host.land_link(PartitionId(1), &result),
+        host.land_link(PartitionId(1), &result).expect("no fault"),
         None,
         "not caught up"
     );
@@ -475,7 +475,7 @@ fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
     let mut holding = host_over(&path, &rt);
     let refuses = |host: &mut Host, result: &RecoveryResult| {
         let held = host.engine.lineages();
-        assert_eq!(host.land_link(PartitionId(1), result), None);
+        assert_eq!(host.land_link(PartitionId(1), result), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         assert!(host
             .replication
@@ -502,6 +502,119 @@ fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
             serde_json::Value::from(level)
         ))
     );
+}
+
+/// #59 item 5 (review-r185 ADV2), the receiver arm of a landing outside the barrier. (a) The
+/// pin names this copy its primary: it links, holds no receiver, answers nothing to send and
+/// logs `land_receiver_primary` at info; it does not fault (the A-R217 `land_link` row lands
+/// the primary this way). (b) The pin names it a secondary but the receiver still refuses: the
+/// commit's root and pin name different partitions, a broken commit, so the node faults by name
+/// (`land_link_receiver_refused`), as `inherit` does.
+/// Cuts: no primary arm, red (a faults); the refusal logs and answers `Ok(None)` as before, red
+/// (b does not fault). Unit, about 2.5 s (the trio's bootstrap window).
+#[config_log::retcd_test]
+fn m10_s2_59_a_landing_whose_receiver_is_refused_faults_by_name() {
+    const METHOD: &str = "m10_s2_59_a_landing_whose_receiver_is_refused_faults_by_name";
+    let rt = current_thread();
+    let primary_dir = config_testkit::fs::temp_dir();
+    let broken_dir = config_testkit::fs::temp_dir();
+    let mut hosts = [&primary_dir, &broken_dir].map(|dir| {
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        (host_over(&path, &rt), digests[1])
+    });
+    let mut primary = landing_at(2, hosts[0].1);
+    let mut broken = primary.clone();
+    for member in &mut primary.committed.pinned_config.members {
+        if member.node == NodeId(2) {
+            member.role = ReplicaRole::Primary;
+        }
+    }
+    broken.committed.pinned_config.partition = PartitionId(9);
+    let [(primary_host, _), (broken_host, _)] = &mut hosts;
+    assert_eq!(primary_host.land_link(PartitionId(1), &primary), Ok(None));
+    assert_eq!(logged!(METHOD, "land_receiver_primary").len(), 1);
+    let fault = broken_host
+        .land_link(PartitionId(1), &broken)
+        .expect_err("a refused receiver faults");
+    assert!(
+        fault
+            .detail
+            .starts_with("land_link_receiver_refused p1 g2: "),
+        "{fault:?}"
+    );
+    for (host, _) in &hosts {
+        assert!(host
+            .replication
+            .receiver(NodeId(2), PartitionId(1))
+            .is_none());
+    }
+}
+
+/// #59 item 7 (arch-s2 arm 2, critic-d7fix follow-up A2): two commits land outside the barrier
+/// in one boot, each at the cutoff. The first installs a receiver at generation 2. The second
+/// links generation 3 onto 2 and keeps that live receiver (`land_receiver_kept`), which its
+/// `Recovered` re-anchors from its own ladder, and still answers `CopyCaughtUp`. The trio row
+/// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up` reaches the same arm
+/// end to end (a shadow's receiver kept at its promote).
+/// Cut: the live receiver is replaced like a dormant one, red (generation 3 installed).
+/// Unit, about 2.5 s (the trio's bootstrap window).
+#[config_log::retcd_test]
+fn m10_s2_59_a_second_landing_in_one_boot_keeps_the_live_receiver() {
+    const METHOD: &str = "m10_s2_59_a_second_landing_in_one_boot_keeps_the_live_receiver";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        2,
+    );
+    let first = landing_at(2, digests[1]);
+    let mut second = first.clone();
+    second.new_generation = Generation(3);
+    second.selected.root.generation = Generation(3);
+    second.retained_status_map.predecessor_generation = Generation(2);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    for result in [&first, &second] {
+        assert!(
+            matches!(
+                host.land_link(PartitionId(1), result),
+                Ok(Some(RecoveryEvent::CopyCaughtUp { head: Seq(2), .. }))
+            ),
+            "generation {} caught up at the cutoff",
+            result.new_generation.0
+        );
+    }
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(3)),
+        Some(rdb_storage::Link {
+            parent: Generation(2),
+            base: Seq(2),
+            copied: false,
+        })
+    );
+    let receiver = host
+        .replication
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("a receiver");
+    assert_eq!(receiver.lineage().generation, Generation(2), "kept");
+    let kept: Vec<_> = logged!(METHOD, "land_receiver_kept")
+        .into_iter()
+        .map(|line| {
+            (
+                line["generation"].clone(),
+                line["kept_generation"].clone(),
+                line["quarantined"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(kept, [(3.into(), 2.into(), false.into())]);
+    assert_eq!(logged!(METHOD, "land_receiver_installed").len(), 1);
 }
 
 /// A-R177 rows 3-5 (critic-f5 C2): the guards refuse before anything is written, each by
