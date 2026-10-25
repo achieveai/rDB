@@ -1971,8 +1971,18 @@ async fn cas(
     }
 }
 
-/// The members kept, each at its boot, once every one is known; `to` becomes the primary and a
-/// `Shadow` stays one. Polls until `deadline`: a peer's boot arrives with its handshake.
+/// The boot a promote pins a kept member at when no link to it came up (D4, A-R398): `0`,
+/// which no process runs, since [`crate::db::next_boot`] starts at 1. F1 then never counts that
+/// copy, so a promote with one live copy commits `ReadOnly` (`mode_for(1)`) and never admits a
+/// write. When the member starts again its live boot is above this pin, so the owner re-plans
+/// it in (`rejoin_if_stale`).
+pub(crate) const UNLINKED_BOOT: BootId = BootId(0);
+
+/// The members kept, each at its boot; `to` becomes the primary and a `Shadow` stays one. Polls
+/// until `deadline`: a peer's boot arrives with its handshake. `to`'s boot is required. Another
+/// member with no handshake after a quarter of the promote's time is dead or cut off: it is
+/// pinned at [`UNLINKED_BOOT`] and logged `promote_member_unlinked`, rather than refusing the
+/// promote that S2-5's lone survivor needs (D4).
 async fn kept_boots(
     ctx: &PromoteCtx,
     dropped: NodeId,
@@ -1993,20 +2003,27 @@ async fn kept_boots(
             ..*member
         })
         .collect();
+    let unlinked_after = tokio::time::Instant::now() + ctx.within / 4;
     loop {
         let missing: Vec<u32> = kept
             .iter()
             .filter(|member| (ctx.member_boot)(member.node).is_none())
             .map(|member| member.node.0)
             .collect();
-        if missing.is_empty() {
+        let target_known = !missing.contains(&ctx.to.0);
+        if missing.is_empty() || (target_known && tokio::time::Instant::now() >= unlinked_after) {
+            if !missing.is_empty() {
+                tracing::warn!(
+                    unlinked = ?missing,
+                    boot = UNLINKED_BOOT.0,
+                    "promote_member_unlinked"
+                );
+            }
             return Ok(kept
                 .into_iter()
-                .filter_map(|member| {
-                    Some(Member {
-                        boot: (ctx.member_boot)(member.node)?,
-                        ..member
-                    })
+                .map(|member| Member {
+                    boot: (ctx.member_boot)(member.node).unwrap_or(UNLINKED_BOOT),
+                    ..member
                 })
                 .collect());
         }
@@ -3416,6 +3433,61 @@ mod tests {
             stopped.to_string(),
             "node 2 stopped before the heal reached it",
             "{stopped:?}"
+        );
+    }
+
+    /// D4 (A-R398, arch-s2 S2-5 non-owner survivor): nodes 1 and 2 are dead, so only node 3's
+    /// boot is known. `promote 3` still plans two members, node 3 primary and node 2 pinned at
+    /// [`UNLINKED_BOOT`], which no process runs, so F1 counts only node 3 and commits
+    /// `ReadOnly` (`mode_for(1)`). It used to wait out its whole time for node 2's handshake and
+    /// refuse "start node 2", so a survivor whose peers are both dead could never serve reads.
+    /// The target's own boot is still required: the row above, which names it, stays refused.
+    /// Cut: a member with no handshake is refused `PeersUnknown` again, red.
+    /// Unit (~1 s): `MemStore`, a 600 ms promote.
+    #[test]
+    fn m10_s2_d4_a_promote_with_its_other_member_dead_plans_it_unlinked_and_sends_the_plan() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(3),
+            None,
+            members(),
+            Arc::new(|node: NodeId| (node == NodeId(3)).then_some(OPEN_2)),
+            Duration::from_millis(600),
+        );
+        let stopped = answer.expect_err("nothing commits here");
+        assert!(
+            stopped
+                .to_string()
+                .contains("node 3 did not commit partition 1"),
+            "{stopped}"
+        );
+        let plans: Vec<&RecoveryPlan> = sent
+            .iter()
+            .filter_map(|(node, msg)| match msg {
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::Plan(plan)),
+                    ..
+                } if *node == NodeId(3) => Some(&**plan),
+                _ => None,
+            })
+            .collect();
+        let [plan] = plans.as_slice() else {
+            panic!("one plan, to node 3: {sent:?}");
+        };
+        assert_eq!(
+            plan.config
+                .members
+                .iter()
+                .map(|member| (member.node, member.role, member.boot))
+                .collect::<Vec<_>>(),
+            [
+                (NodeId(2), ReplicaRole::RegularSecondary, UNLINKED_BOOT),
+                (NodeId(3), ReplicaRole::Primary, OPEN_2)
+            ]
         );
     }
 

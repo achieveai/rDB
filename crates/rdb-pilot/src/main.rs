@@ -49,7 +49,9 @@
 //! prints `put seq=<seq> request=<id>`; `--get` prints `get value=<text>` or `get absent`.
 //! A put that gets no answer prints `put <error> request=<id>: ...` and then the request's
 //! `status ...`; with `--retry-for S` it then sends the same request again until answered,
-//! printing `retry ok seq=<seq> outcome=<Published|RecoveredApplied>` (scenario S2-7).
+//! printing `retry ok seq=<seq> outcome=<Published|RecoveredApplied>` (scenario S2-7). A
+//! `GENERATION_CHANGED` resend is never sent again: the pilot asks `status` until it says, and
+//! prints `retry settled seq=<seq> ...` or `retry settled expired ...` (D5).
 //! `--request-id N` sends the put under the app's own id `app_request_id(N)`, so two pilots
 //! with different `--client-id` can send the same id (scenario S2-8).
 //! `scripts/local-rdb.sh up` prints the exact command for its run.
@@ -69,7 +71,10 @@ use rdb_api::net::faults::Faults;
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
-use rdb_api::{BootId, ClientId, Db, DbConfig, NodeId, PutError, Timeouts, TxnRequest, TxnStatus};
+use rdb_api::{
+    ApiError, BootId, ClientId, Db, DbConfig, ErrorKind, NodeId, PutError, PutOk, Timeouts,
+    TxnRequest, TxnStatus,
+};
 
 /// The ack journal's file name, inside the rDB folder.
 const JOURNAL: &str = "pilot_kv.journal";
@@ -590,36 +595,105 @@ fn status_line(status: &TxnStatus) -> String {
 /// `--retry-for`: send `request` again, same identity and payload, until it is answered or
 /// `within` passes. Prints `retry <i> <error>` for each refusal and `retry ok seq=..
 /// outcome=..` for the answer: `RecoveredApplied` says the first send had applied and this one
-/// applied nothing. Exit 1 when it is still unanswered.
+/// applied nothing. A `GENERATION_CHANGED` refusal proves this send wrote nothing, so it is never
+/// sent again: the pilot asks `Db::status` with the generation it was sent under, as embed.md's
+/// "did my write land?" says (D5, A-R398). Exit 1 when it is still unanswered.
 fn retry(db: &Db, request: TxnRequest, within: Duration) -> Result<(), ExitCode> {
+    let (id, sent_in) = (request.identity.request, request.expected_generation);
+    settle(
+        within,
+        Duration::from_millis(500),
+        || db.resend_within(request.clone(), Duration::from_secs(10)),
+        || db.status(id, sent_in),
+        &mut |line| println!("{line}"),
+    )
+}
+
+/// [`retry`]'s loop over a resend and a status look, so a row can drive it without a cluster.
+/// `status_pause`: the wait between two status looks that settle nothing.
+fn settle(
+    within: Duration,
+    status_pause: Duration,
+    mut resend: impl FnMut() -> Result<PutOk, PutError>,
+    mut status: impl FnMut() -> Result<TxnStatus, ApiError>,
+    say: &mut dyn FnMut(String),
+) -> Result<(), ExitCode> {
     let deadline = Instant::now() + within;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match db.resend_within(request.clone(), Duration::from_secs(10)) {
+        let error = match resend() {
             Ok(ok) => {
                 let outcome = variant(&ok.outcome);
                 tracing::info!(attempt, seq = ok.seq.0, outcome, "pilot_retry_answered");
-                println!(
+                say(format!(
                     "retry ok seq={} outcome={outcome} attempt={attempt}",
                     ok.seq.0
-                );
+                ));
                 return Ok(());
             }
-            Err(error) => {
-                let name = error.error.name();
-                tracing::warn!(attempt, error = name, "pilot_retry_refused");
-                println!("retry {attempt} {}: {}", name.to_lowercase(), error.error);
-                if Instant::now() >= deadline {
-                    return Err(ExitCode::from(1));
-                }
-                let pause = error
-                    .error
-                    .retry_after
-                    .unwrap_or(Duration::from_millis(500));
-                std::thread::sleep(pause.min(Duration::from_secs(2)));
-            }
+            Err(error) => error.error,
+        };
+        let name = error.name();
+        tracing::warn!(attempt, error = name, "pilot_retry_refused");
+        say(format!("retry {attempt} {}: {error}", name.to_lowercase()));
+        if error.kind == ErrorKind::GenerationChanged {
+            return settle_by_status(deadline, status_pause, &mut status, say);
         }
+        if Instant::now() >= deadline {
+            return Err(ExitCode::from(1));
+        }
+        let pause = error.retry_after.unwrap_or(Duration::from_millis(500));
+        std::thread::sleep(pause.min(Duration::from_secs(2)));
+    }
+}
+
+/// After a `GENERATION_CHANGED`: ask `status` until it says what became of the request, never
+/// sending it again. Prints each answer as `status ...`, then `retry settled ...`.
+fn settle_by_status(
+    deadline: Instant,
+    pause: Duration,
+    status: &mut dyn FnMut() -> Result<TxnStatus, ApiError>,
+    say: &mut dyn FnMut(String),
+) -> Result<(), ExitCode> {
+    loop {
+        match status() {
+            Ok(answer) => {
+                say(format!("status {}", status_line(&answer)));
+                match answer {
+                    TxnStatus::Resolved(result) => {
+                        tracing::info!(seq = result.seq.0, "pilot_retry_settled");
+                        say(format!(
+                            "retry settled seq={} outcome={}: an earlier send applied it; nothing \
+                             was sent again",
+                            result.seq.0,
+                            variant(&result.outcome)
+                        ));
+                        return Ok(());
+                    }
+                    TxnStatus::Expired => {
+                        tracing::info!("pilot_retry_settled_expired");
+                        say(
+                            "retry settled expired: too old to settle; read the object to see \
+                             its value"
+                                .to_owned(),
+                        );
+                        return Ok(());
+                    }
+                    TxnStatus::Unknown | TxnStatus::Unresolved { .. } => {}
+                }
+            }
+            Err(error) => say(format!("status {}: {error}", error.name().to_lowercase())),
+        }
+        if Instant::now() >= deadline {
+            say(
+                "retry unsettled: status did not say; it is not proof that nothing landed, so \
+                 read the object"
+                    .to_owned(),
+            );
+            return Err(ExitCode::from(1));
+        }
+        std::thread::sleep(pause);
     }
 }
 
@@ -1137,6 +1211,57 @@ mod tests {
         assert!(with(&["--retry-for", "soon"]).is_err());
         assert!(with(&["--put", "novalue"]).is_err());
         assert!(with(&["--nodes", "x=a:1", "--cert-dir", "C"]).is_err());
+    }
+
+    /// D5 (A-R398, arch-s2 S2-7 "a retry across a failover applies once"): an `UNAVAILABLE`
+    /// resend is sent again, but a `GENERATION_CHANGED` one never is. The pilot asks `status`
+    /// instead, until it says, as embed.md's "did my write land?" does. On the walk the pilot
+    /// resent 169 times and never asked. Cut: the `GENERATION_CHANGED` arm removed, so the third
+    /// resend panics here, red. Unit (~20 ms): no `Db`.
+    #[test]
+    fn d5_a_generation_changed_resend_is_settled_by_status_and_never_sent_again() {
+        let mut resends = 0;
+        let mut looks = 0;
+        let mut lines = Vec::new();
+        let answer = settle(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                resends += 1;
+                let (kind, retry_after) = match resends {
+                    1 => (ErrorKind::Unavailable, Some(Duration::from_millis(1))),
+                    2 => (ErrorKind::GenerationChanged, None),
+                    n => panic!("resend {n} after GENERATION_CHANGED"),
+                };
+                let mut error = ApiError::new(kind, "refused");
+                error.retry_after = retry_after;
+                Err(PutError {
+                    error,
+                    request: None,
+                })
+            },
+            || {
+                looks += 1;
+                Ok(if looks == 1 {
+                    TxnStatus::Unknown
+                } else {
+                    TxnStatus::Expired
+                })
+            },
+            &mut |line| lines.push(line),
+        );
+        assert!(answer.is_ok(), "{lines:?}");
+        assert_eq!((resends, looks), (2, 2), "{lines:?}");
+        assert!(
+            lines[1].starts_with("retry 2 generation_changed"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[2..4],
+            ["status unknown", "status expired"],
+            "{lines:?}"
+        );
+        assert!(lines[4].starts_with("retry settled expired"), "{lines:?}");
     }
 
     /// The marked span of an example, as embed.md's code block for it must read.
