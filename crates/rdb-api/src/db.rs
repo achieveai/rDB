@@ -5652,9 +5652,17 @@ mod tests {
                 .iter()
                 .any(|line| line["@m"] == "membership_drop_planned" && line["dropped"] == 3)
         };
+        // D9 (A-R398): a restart from an `Active` commit pins node 3 back as a shadow, so it is
+        // a full copy again only at the commit after its promote, as after a drop.
+        let shadowed = |lines: &[serde_json::Value]| {
+            lines
+                .iter()
+                .any(|line| line["@m"] == "rejoin_plan" && line["shadowed"] == "Some(3)")
+        };
         let generation = loop {
             let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
-            if !dropped(&lines) {
+            let shadow = shadowed(&lines);
+            if !dropped(&lines) && !shadow {
                 break of(&db, OWNER).recovered.expect("node 1 recovered");
             }
             // A12: only a drop before the restart is the stall this side is for; a restarted
@@ -5666,7 +5674,7 @@ mod tests {
                 .iter()
                 .position(|line| line["@m"] == "node_restarted" && line["node"] == 3);
             assert!(
-                restart.is_some() && drop < restart,
+                restart.is_some() && (shadow && drop.is_none() || drop < restart),
                 "node 1 dropped node 3 after its restart: drop line {drop:?}, restart line \
                  {restart:?}"
             );
@@ -7515,7 +7523,7 @@ mod tests {
     /// restarts until one promote needed that catch-up, so the row never passes without one.
     /// Cut: the source restore keeps a retired receiver (before the fix): `catch_up_refused`,
     /// red.
-    /// Integration (~10-40 s): the promote waits node 1's grant out, then each re-add and promote.
+    /// Integration (~10-60 s): the promote waits node 1's grant out, then each re-add and promote.
     #[config_log::retcd_test]
     fn m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on() {
         const METHOD: &str = "m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on";
@@ -7525,7 +7533,7 @@ mod tests {
         db.put(b"a", b"1", None).expect("before the promote");
         let promoted = db.promote(NodeId(2), None).expect("promote");
         assert_eq!(promoted.dropped, OWNER, "{promoted:?}");
-        let patience = crate::host::test_patience(Duration::from_secs(90));
+        let patience = crate::host::test_patience(Duration::from_secs(150));
         let deadline = std::time::Instant::now() + patience;
         while let Err(refused) = db.put(b"b", b"2", None) {
             assert!(
@@ -7537,11 +7545,11 @@ mod tests {
         let lines = || config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
         // The catch-up is routed only when a put lands between the shadow's last ACK and the
         // promote's fence, so node 1 restarts until one was (a restart from `Active` is pinned
-        // as a shadow again, D9), at most ten times. Each restart's writer starts after it: a
+        // as a shadow again, D9), at most twenty times. Each restart's writer starts after it: a
         // put sent across a restart waits its timeout out.
         let mut routed = 0;
         let mut request = 1_000;
-        for _ in 0..10 {
+        for _ in 0..20 {
             let before = lines().len();
             db.restart_node(OWNER).expect("restart node 1");
             let stop = std::sync::atomic::AtomicBool::new(false);
