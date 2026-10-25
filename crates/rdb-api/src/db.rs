@@ -4513,8 +4513,15 @@ mod tests {
         );
         let refused = db.get(b"a").expect_err("node 1 is cut from rEtcd");
         assert_eq!(refused.kind, ErrorKind::LeaseExpired, "{refused:?}");
-        assert!(cut.join().expect("node 1's answerer"), "node 1 got the first get");
-        assert_eq!(db.route.owner(), NodeId(2), "LEASE_EXPIRED re-read partitions/1");
+        assert!(
+            cut.join().expect("node 1's answerer"),
+            "node 1 got the first get"
+        );
+        assert_eq!(
+            db.route.owner(),
+            NodeId(2),
+            "LEASE_EXPIRED re-read partitions/1"
+        );
 
         let promoted = answer(two_mailbox, ReadServiceOutcome::Served);
         db.get(b"a").expect("node 2 serves the retry");

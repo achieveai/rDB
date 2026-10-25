@@ -2529,7 +2529,7 @@ fn a_reply_the_waiting_call_cannot_take_answers_it_with_the_host_fault() {
                 },
             )
         } else {
-            host.previous_answer(identity(n), Ok(SnapshotHandle(7)))
+            host.previous_answer(PartitionId(1), identity(n), Ok(SnapshotHandle(7)))
         }
         .expect_err(name);
         match answered_now(&answer) {
@@ -5703,4 +5703,151 @@ fn m10_s2_a_revocation_persisted_before_a_restart_is_restored_to_a1_at_start() {
         [serde_json::json!(1), serde_json::json!(1)],
         "the direct call, then `run` at the second start, each replayed the one revocation"
     );
+}
+
+/// A-R399 (tester-final D3, S2-3 cut arm): node 1 is cut from rEtcd, its peers are not. Its
+/// grant runs out and A1 fences it for good; the watches stop with the fence (A-R96). While
+/// it is cut, `lr promote 2 --drop 1` freezes `grants/1` and names node 2 in `partitions/1`.
+/// Then the cut ends. Returns the trio once node 1 has read the owner after the fence, and
+/// the put node 1 answered while it was cut.
+fn cut_owner_promoted_away(dir: &std::path::Path) -> (Trio, Answer) {
+    use crate::net::faults::{CutStore, Faults};
+    use config_core::{ConfigStore as _, GetRequest, MutationOutcome, PutRequest};
+    use rdb_core::authority::grant::GrantRecord;
+    use rdb_core::authority::partition::{PartitionRecord, PartitionRoot};
+    use rdb_core::contracts::control::ControlKey;
+
+    let mut trio = Trio::new(dir, |host| {
+        Trio::fast(host);
+        host.budgets.grant_millis = 600;
+        host.budgets.renew_millis = 100;
+    });
+    // Node 1 alone talks to the store through a cut it can be given, as `lr cut-control 1`.
+    let faults = Faults::new();
+    let cut: Arc<dyn config_core::ConfigStore> =
+        CutStore::new(Arc::clone(&trio.store), Arc::clone(&faults));
+    trio.nodes[0].0.control =
+        ControlAdapter::new(cut, trio.rt.handle().clone(), Arc::clone(&trio.links));
+    trio.bootstrap();
+    trio.ready();
+    faults.apply("cut-control");
+    trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
+    let cut_answer = trio.ask(put(1, b"a", b"1", None));
+
+    // The promote, made by another process while node 1 cannot hear it.
+    let read = |key: &Bytes| {
+        trio.rt
+            .block_on(trio.mem.get(GetRequest { key: key.clone() }))
+            .expect("get")
+            .record
+            .expect("the record exists")
+    };
+    let grants = Bytes::from(ControlKey::Grant(NodeId(1)).encode());
+    let found = read(&grants);
+    let mut grant = GrantRecord::decode(&found.value).expect("a grant record");
+    grant.frozen = true;
+    let partitions = Bytes::from(ControlKey::Partition(PartitionId(1)).encode());
+    let owned = read(&partitions);
+    let mut record = PartitionRecord::decode(&owned.value).expect("a partition record");
+    record.owner = NodeId(2);
+    // The trio's bootstrap writes no root; keep one when there is.
+    let value = PartitionRoot::decode(&owned.value)
+        .map_or_else(|| record.encode(), |root| record.encode_with(&root));
+    for (key, value, revision) in [
+        (grants, grant.encode(), found.mod_revision),
+        (partitions, value, owned.mod_revision),
+    ] {
+        let put = trio
+            .rt
+            .block_on(trio.mem.put(PutRequest {
+                key,
+                value,
+                expected_mod_revision: Some(revision),
+                dedup: None,
+            }))
+            .expect("the promote's put");
+        assert_eq!(put.outcome, MutationOutcome::Applied);
+    }
+
+    faults.apply("");
+    trio.until("node 1 read the owner after its fence", |trio| {
+        trio.nodes[0]
+            .0
+            .owner_after_fence
+            .get(&PartitionId(1))
+            .copied()
+    });
+    (trio, cut_answer)
+}
+
+/// A-R399 (tester-final D3): the old owner learns it was dropped. While cut it refuses a put
+/// `LEASE_EXPIRED`, provably mutating nothing; once the cut ends it reads `partitions/1`, logs
+/// `host_owner_learned` with node 2, and refuses the next put `NOT_PRIMARY` with node 2 as the
+/// hint, still mutating nothing, so an app routed here re-reads the owner.
+/// Cut: the fence starts no owner read (`read_owner_after_fence` not called): the wait for
+/// the read times out, red.
+/// Integration (~3 s): bootstrap's discovery window, a fence on a 600 ms grant, the read.
+#[config_log::retcd_test]
+fn m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, cut) = cut_owner_promoted_away(dir.path());
+    let Answer::Error { error, .. } = cut else {
+        panic!("a put while cut: {cut:?}");
+    };
+    assert_eq!(
+        (error.kind, error.no_mutation),
+        (ErrorKind::LeaseExpired, true),
+        "while cut: {error:?}"
+    );
+    assert_eq!(
+        trio.nodes[0].0.owner_after_fence.get(&PartitionId(1)),
+        Some(&Some(NodeId(2))),
+        "node 1 read node 2 as owner"
+    );
+    match trio.ask(put(2, b"a", b"2", None)) {
+        Answer::Error { error, .. } => {
+            assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::NotPrimary, RetryRule::RefreshRoute, true),
+                "{error:?}"
+            );
+            assert!(error.detail.contains("names node 2"), "{error:?}");
+        }
+        other => panic!("a put after the read: {other:?}"),
+    }
+}
+
+/// A-R399 condition (3): reading the owner never admits a write. After the read, node 1 stays
+/// fenced and not admitting, and every put for half a second is refused with nothing
+/// mutated; its engine holds nothing past what it held at the fence.
+/// Cut: `redirect` sets `no_mutation = false` on its `NOT_PRIMARY`: put 10 is refused claiming
+/// it may have mutated, red. (The row above goes red too.)
+/// Integration (~3.5 s): as the row above, then half a second of puts.
+#[config_log::retcd_test]
+fn m10_s2_a_fenced_owner_never_admits_a_put_after_it_reads_the_owner() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = cut_owner_promoted_away(dir.path());
+    let before = trio.status(0);
+    let until = Instant::now() + Duration::from_millis(500);
+    let mut request = 10;
+    while Instant::now() < until {
+        match trio.ask(put(request, b"a", b"3", None)) {
+            Answer::Error { error, .. } => {
+                assert!(error.no_mutation, "put {request}: {error:?}");
+                assert!(
+                    matches!(error.kind, ErrorKind::NotPrimary | ErrorKind::LeaseExpired),
+                    "put {request}: {error:?}"
+                );
+            }
+            other => panic!("put {request} after the read was not refused: {other:?}"),
+        }
+        request += 1;
+    }
+    let after = trio.status(0);
+    assert_eq!(
+        (after.fence.is_some(), after.admits),
+        (true, Some(false)),
+        "{after:?}"
+    );
+    assert_eq!(after.holds, before.holds, "nothing applied after the read");
 }

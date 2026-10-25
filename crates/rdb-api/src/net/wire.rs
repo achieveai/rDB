@@ -372,6 +372,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         local @ (Msg::Control { .. }
         | Msg::Fault { .. }
         | Msg::Activated { .. }
+        | Msg::OwnerLearned { .. }
         | Msg::Inject { .. }
         | Msg::PeerBooted { .. }
         | Msg::Synced(_)
@@ -389,6 +390,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Control { .. } => "Control",
         Msg::Fault { .. } => "Fault",
         Msg::Activated { .. } => "Activated",
+        Msg::OwnerLearned { .. } => "OwnerLearned",
         Msg::Inject { .. } => "Inject",
         Msg::PeerBooted { .. } => "PeerBooted",
         Msg::Stop => "Stop",

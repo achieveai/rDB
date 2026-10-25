@@ -229,6 +229,64 @@ impl ControlAdapter {
         calls.push(task);
     }
 
+    /// A-R399 (tester-final D3): after a node fence, read who `partitions/{partition}` names as
+    /// owner, for the host's refusals only. Retries at [`retry_backoff`] of the attempt while
+    /// the store does not answer (the node may still be cut from rEtcd), and stops at the first
+    /// answer: [`Msg::OwnerLearned`] with the owner, or `None` when the record is absent or does
+    /// not decode. It never posts a control event, so A1 never hears it. Tracked with the
+    /// node's calls, so a restart abandons it.
+    pub fn read_owner_after_fence(&self, node: NodeId, boot: BootId, partition: PartitionId) {
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                let key = ControlKey::Partition(partition).encode();
+                let mut attempt = 0_u32;
+                let owner = loop {
+                    let read = store
+                        .get(GetRequest {
+                            key: Bytes::from(key.clone()),
+                        })
+                        .await;
+                    match read {
+                        Ok(read) => {
+                            break read.record.and_then(|found| {
+                                rdb_core::authority::partition::PartitionRecord::decode(
+                                    &found.value,
+                                )
+                                .map(|record| record.owner)
+                            });
+                        }
+                        Err(error) => {
+                            attempt = attempt.saturating_add(1);
+                            tracing::debug!(
+                                node = node.0,
+                                partition = partition.0,
+                                attempt,
+                                %error,
+                                "host_owner_read_retry"
+                            );
+                            tokio::time::sleep(retry_backoff(attempt)).await;
+                        }
+                    }
+                };
+                let msg = Msg::OwnerLearned {
+                    boot,
+                    partition,
+                    owner,
+                };
+                if links.post(node, msg).is_err() {
+                    tracing::debug!(node = node.0, "control_completion_unclaimed");
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
     /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
     /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
     /// puts its count back to 0 before it answers, and the only reloads ever stopped early are
