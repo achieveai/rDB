@@ -40,6 +40,19 @@ fn config(dir: &std::path::Path) -> DbConfig {
     }
 }
 
+/// A-R395: [`config`] with the stuck-sync limit at the spec's 5 s scaled as a wait
+/// ([`test_patience`]; equal to the spec at scale 1), for the rows whose subject is a slow
+/// sync's tolerance, not the stuck limit. Beside 3 suite loops a held 1-3 s sync stayed in
+/// flight past an unscaled 5 s and faulted its node (A-R393 soak: 7 such reds in 15 lane runs).
+/// The stuck row keeps the real 5 s.
+fn config_slow_tolerant(dir: &std::path::Path) -> DbConfig {
+    let stuck = test_patience(Duration::from_millis(
+        rdb_storage::DEFAULT_SYNC_STUCK_MILLIS,
+    ));
+    let mut config = config(dir);
+    config.storage.sync_stuck_millis = Some(u64::try_from(stuck.as_millis()).unwrap_or(u64::MAX));
+    config
+}
 /// The `Db` rows' `fast()`: `host::test_budgets` (A-R392).
 fn fast() -> Budgets {
     crate::host::test_budgets()
@@ -158,7 +171,7 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     {
-        let mut db = open(&rt, config(dir.path()), &store, fast());
+        let mut db = open(&rt, config_slow_tolerant(dir.path()), &store, fast());
         admits_within(&db, "the first open", Duration::from_secs(10));
         db.put(b"a", b"1", None).expect("put a");
         db.shutdown();
@@ -167,7 +180,7 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
         slow_sync(&node_dir(dir.path(), node), Duration::from_secs(1), true);
     }
     tracing::info!("f4_slow_armed");
-    let mut db = open(&rt, config(dir.path()), &store, fast());
+    let mut db = open(&rt, config_slow_tolerant(dir.path()), &store, fast());
     admits_within(&db, "the reopen", Duration::from_secs(30));
     let read = db.get(b"a").expect("get a");
     assert_eq!(
@@ -525,7 +538,12 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    let mut db = open(&rt, config(dir.path()), &store, Budgets::SPEC_DEFAULTS);
+    let mut db = open(
+        &rt,
+        config_slow_tolerant(dir.path()),
+        &store,
+        Budgets::SPEC_DEFAULTS,
+    );
     admits_within(&db, "the open", Duration::from_secs(10));
     db.put(b"a", b"1", None).expect("put a");
     let before = status_of(&db, 1).authority;
@@ -613,7 +631,8 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
 /// product budgets. Durability then ages past L1's pause age again and again, so puts may be
 /// refused `PROTECTION_PAUSED` for most of the run; that is L1 doing its job, not a stall. What
 /// must hold: the owner keeps its grant (same grant id, no fence), no node faults (3 s is under
-/// the 5 s stuck limit), no node-thread step goes over 500 ms, and nothing waits on a held sync.
+/// the 5 s stuck limit, scaled as a wait here by A-R395), no node-thread step goes over 500 ms,
+/// and nothing waits on a held sync.
 /// Cut: every sync inline on the node thread, red (node 1 lost its grant: grant 1, then 2).
 /// Integration (~15 s): a fresh open, 12 s of held syncs, then a stop that waits the last out.
 #[config_log::retcd_test]
@@ -623,7 +642,12 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    let mut db = open(&rt, config(dir.path()), &store, Budgets::SPEC_DEFAULTS);
+    let mut db = open(
+        &rt,
+        config_slow_tolerant(dir.path()),
+        &store,
+        Budgets::SPEC_DEFAULTS,
+    );
     admits_within(&db, "the open", Duration::from_secs(10));
     db.put(b"a", b"1", None).expect("put a");
     let before = status_of(&db, 1).authority;
