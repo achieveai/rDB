@@ -603,6 +603,126 @@ fn m10_s2_epoch_revocations_survive_a_reopen_and_move_a_format_1_copy_to_2() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
+/// One commit of `writes` into lineage (1, 1) at `seq`.
+fn commit_dedup(
+    engine: &mut RocksEngine,
+    seq: u64,
+    writes: Vec<rdb_core::contracts::storage::Write>,
+) {
+    engine
+        .commit(rdb_core::contracts::storage::Batch {
+            id: rdb_core::contracts::ids::BatchId(rdb_core::transaction::BATCH_TAG | seq),
+            partition: PartitionId(1),
+            generation: Generation(1),
+            seq: Seq(seq),
+            writes,
+        })
+        .expect("commit");
+}
+
+/// A `Dedup` put of `identity` under `affinity`, with `value`.
+fn dedup_put(
+    affinity: u64,
+    request: u64,
+    value: bytes::Bytes,
+) -> rdb_core::contracts::storage::Write {
+    use rdb_core::contracts::ids::{AffinityId, ClientId, RequestId, RequestIdentity, TenantId};
+    rdb_core::contracts::storage::Write {
+        ns: Namespace::Dedup,
+        key: rdb_core::transaction::dedup::dedup_key(
+            Generation(1),
+            AffinityId(affinity),
+            RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(request),
+            },
+        ),
+        value: Some(value),
+    }
+}
+
+/// review-s2 F-006, A-R411: an ack floor's rows parse in format 1 but mean nothing there, so a
+/// format-1 build would open the copy and re-execute a resend the floor dropped. A format-1 copy
+/// stays format 1 through plain dedup rows (a reserved-shape id under another affinity, an
+/// ordinary id under the floor affinity), and moves to 2 in the commit that first carries a
+/// floor record, or a `Dedup` delete (only a floor licenses one). A format-1 build accepts only
+/// marker 1 (gate V12), so marker 2 is its refusal. Cuts: no marker in `commit` (both copies read
+/// 1); drop the delete arm (the delete copy reads 1); drop the floor-record arm (the record copy
+/// reads 1); drop the affinity check (the plain copy reads 2); drop the `Dedup` namespace check
+/// (the plain copy's user delete reads 2). Unit, under a second.
+#[retcd_test]
+fn m10_s2_f006_an_ack_floor_moves_a_format_1_copy_to_2() {
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::transaction::dedup::{
+        dedup_value, floor_record_id, floor_value, FLOOR_AFFINITY, OPEN_MASK,
+    };
+    use rdb_storage::keys::OLDEST_FORMAT_VERSION;
+    let dir = data_dir("ack-floor-format");
+    let plain = || dedup_value(Digest([1; 32]), Seq(9), OwnerEpoch(1));
+    let record = floor_value(
+        rdb_core::contracts::ids::RequestId(5),
+        Seq(9),
+        OwnerEpoch(1),
+    );
+    let s1_copy = |name: &str| {
+        let db = dir.join(name);
+        {
+            let mut engine = RocksEngine::open(&db).expect("open");
+            write(&mut engine, 2);
+        }
+        put_raw(&db, b"format", &OLDEST_FORMAT_VERSION.to_be_bytes());
+        db
+    };
+
+    // Plain dedup rows, and a delete outside `Dedup`, leave an S1 copy format 1.
+    let db = s1_copy("plain");
+    {
+        let mut engine = RocksEngine::open(&db).expect("an S1 copy opens");
+        commit_dedup(
+            &mut engine,
+            10,
+            vec![
+                dedup_put(7, OPEN_MASK, plain()),
+                dedup_put(FLOOR_AFFINITY.0, 3, plain()),
+                rdb_core::contracts::storage::Write {
+                    ns: Namespace::User,
+                    key: bytes::Bytes::from_static(b"k"),
+                    value: None,
+                },
+            ],
+        );
+    }
+    assert_eq!(
+        marker(&db),
+        1,
+        "plain dedup rows and a user delete keep format 1"
+    );
+
+    // A floor record moves it, in the same batch.
+    let db = s1_copy("record");
+    {
+        let mut engine = RocksEngine::open(&db).expect("an S1 copy opens");
+        commit_dedup(
+            &mut engine,
+            10,
+            vec![dedup_put(FLOOR_AFFINITY.0, floor_record_id(0).0, record)],
+        );
+    }
+    assert_eq!(marker(&db), 2, "a floor record moved the marker");
+
+    // A floor's delete moves it too.
+    let db = s1_copy("delete");
+    {
+        let mut engine = RocksEngine::open(&db).expect("an S1 copy opens");
+        let mut delete = dedup_put(9, 3, plain());
+        delete.value = None;
+        commit_dedup(&mut engine, 10, vec![delete]);
+    }
+    assert_eq!(marker(&db), 2, "a dedup delete moved the marker");
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
 /// Found by the guard-deletion pass, not guessed: a lineage-scoped `metadata` key can start with
 /// the bytes `revoked` (partition `0x7265766f` is "revo", a generation whose first bytes are
 /// "ked"), and the revocation scan read it as an undecodable revocation, so a legal copy's

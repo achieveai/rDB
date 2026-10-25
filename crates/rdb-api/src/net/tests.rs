@@ -34,6 +34,7 @@ use crate::host::{
     PeerAsk, PutOp, Seen,
 };
 use crate::transport::Links;
+use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 
 /// A value of `T` decoded from zeros: every integer 0, every list empty, every enum its first
 /// variant. For contract types a link carries as they are (serde-derived in rdb-core), where
@@ -379,6 +380,8 @@ fn status() -> NodeStatus {
         stalled: Some("s".to_owned()),
         reload_pending: Some(2),
         lengths: None,
+        pinned: vec![zero()],
+        config_version: Some(zero()),
     }
 }
 
@@ -834,6 +837,316 @@ async fn a_peer_message_crosses_processes_and_a_call_is_answered_on_its_link() {
         )],
         "call 1 maps to (client 42, request 7)"
     );
+}
+
+/// M10 S2 review-s2 F-015 row: a client call node 1's process cannot decode (a value that is
+/// not CBOR) is answered at once with a named error, never left to the caller's timeout. The
+/// error says nothing ran and a resend will not help; node 1's node never sees the call.
+/// Cut: no reply on a decode failure → the caller hears nothing within `PATIENCE`.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_the_far_process_cannot_decode_is_answered_with_a_named_error() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    two.net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("2 -> 1 up");
+
+    let (reply, answer) = mpsc::channel();
+    two.net.send_wire_call(
+        NodeId(1),
+        PartitionId(1),
+        wire::WireCall::Put {
+            identity: identity(42, 9),
+            object: Bytes::from_static(b"k"),
+            change: wire::WireChange::Doc(vec![wire::WireOp::Replace(vec![0xff, 0xff])]),
+            expect: None,
+            remaining_millis: 1_000,
+        },
+        reply,
+    );
+    let started = std::time::Instant::now();
+    let answer = tokio::task::spawn_blocking(move || answer.recv_timeout(PATIENCE))
+        .await
+        .expect("join")
+        .expect("answered, not left to time out");
+    let Answer::Error { error, request } = answer else {
+        panic!("a named error: {answer:?}");
+    };
+    assert_eq!(
+        (
+            error.kind,
+            error.retry,
+            error.no_mutation,
+            request.is_none()
+        ),
+        (ErrorKind::Unavailable, RetryRule::NotWired, true, true),
+        "{error:?}"
+    );
+    assert!(
+        error.detail.contains("node 1") && error.detail.contains("could not decode"),
+        "{}",
+        error.detail
+    );
+    assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
+    assert!(
+        one.mail.try_recv().is_err(),
+        "node 1 never sees an undecodable call"
+    );
+}
+
+/// M10 S2 review-s2 F-015 row, status half: a status reply that does not decode (a role this
+/// build does not know) closes the link with the reason, so the next look fails fast and says
+/// why instead of logging the same fault on every poll. The caller's channel closes at once.
+/// Cut: log and go on (`handle` answers `Ok`, the link stays up). Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_status_reply_that_does_not_decode_closes_the_link_with_the_reason() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    two.net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("2 -> 1 up");
+
+    let mut bad = wire::WireNodeStatus::from(&status());
+    bad.role = "no such role".to_owned();
+    let (handled, caller) = two.net.status_reply_from(NodeId(1), bad);
+    let reason = handled.expect_err("the read loop closes the link");
+    assert!(
+        reason.contains("a status reply did not decode") && reason.contains("no such role"),
+        "{reason}"
+    );
+    assert!(
+        matches!(caller.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+        "the caller's channel is closed"
+    );
+}
+
+/// A frame for partition 1 that claims to come from `node`.
+fn frame_from(node: u32) -> Msg {
+    let mut frame: rdb_core::contracts::transport::Frame = zero();
+    frame.protocol = 3;
+    frame.body = Bytes::from_static(b"record");
+    Msg::Frame {
+        partition: PartitionId(1),
+        correlation: zero(),
+        from: rdb_core::contracts::transport::PeerLabel {
+            node: NodeId(node),
+            boot: BootId(u64::from(node) * 11),
+            authenticated: true,
+        },
+        frame,
+    }
+}
+
+/// An inventory ask for partition 1 that names `asker`.
+fn ask_from(asker: u32) -> Msg {
+    Msg::PeerAsk {
+        asker: NodeId(asker),
+        partition: PartitionId(1),
+        correlation: zero(),
+        ask: PeerAsk::Inventory {
+            copy: CopyId(1),
+            anchor: zero(),
+        },
+    }
+}
+
+/// The `net_msg_sender_refused` lines of `test`, as (peer, msg).
+fn sender_refusals(test: &str) -> Vec<(String, String)> {
+    config_testkit::logs::lines_for_current_test(module_path!(), test)
+        .iter()
+        .filter(|line| line["@m"].as_str() == Some("net_msg_sender_refused"))
+        .map(|line| {
+            (
+                line["peer"].as_str().unwrap_or_default().to_owned(),
+                line["msg"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// M10 S2 review-s2 F-008 row (a): node 2's process sends node 1 a frame and an ask that
+/// name node 3 as their sender. Both are refused before node 1's node sees them, and logged
+/// `net_msg_sender_refused`; the honest frame sent after them is the first thing node 1 gets.
+/// Cut: no sender check in `receive` → node 1's first message is the forged frame.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_naming_another_node_as_sender_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    two.net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("2 -> 1 up");
+
+    for forged in [frame_from(3), ask_from(3), frame_from(2)] {
+        two.links.send(NodeId(2), NodeId(1), forged).expect("sent");
+    }
+    let (got, _mail) = next(one.mail).await;
+    assert_eq!(
+        format!("{got:?}"),
+        format!("{:?}", frame_from(2)),
+        "the forged frame and ask never reach node 1"
+    );
+    assert_eq!(
+        sender_refusals("a_message_naming_another_node_as_sender_is_refused"),
+        [
+            ("node-2".to_owned(), "frame".to_owned()),
+            ("node-2".to_owned(), "peer_ask".to_owned())
+        ]
+    );
+}
+
+/// M10 S2 review-s2 F-008 row (b): an app's process sends node 1 a peer frame and an ask.
+/// Neither reaches node 1's node; the `Inspect` sent after them is the first thing it gets,
+/// and both refusals are logged. Cut: no app allow-list → node 1's first message is the frame.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_link_never_delivers_a_peer_message() {
+    let dir = config_testkit::fs::temp_dir();
+    let app = Label::App("pilot".to_owned());
+    certs::generate(dir.path(), &[Label::Node(NodeId(1)), app.clone()]).expect("certs");
+    let one = side(Spec::node(1, dir.path(), &[]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let pilot = Spec {
+        claim: Some(app.clone()),
+        cert_of: Some(app),
+        ..Spec::node(9, dir.path(), &[1]).dialling(1, addr)
+    };
+    let pilot = side(pilot, false).await;
+    pilot
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("app -> 1 up");
+
+    for peer in [frame_from(1), ask_from(1)] {
+        pilot.links.send(NodeId(9), NodeId(1), peer).expect("sent");
+    }
+    let (inspect, _inspected) = mpsc::channel();
+    pilot
+        .links
+        .post(
+            NodeId(1),
+            Msg::Inspect {
+                partition: PartitionId(1),
+                reply: inspect,
+            },
+        )
+        .expect("posted");
+    let (got, _mail) = next(one.mail).await;
+    assert!(
+        matches!(got, Msg::Inspect { .. }),
+        "an app's peer messages never reach node 1: {got:?}"
+    );
+    assert_eq!(
+        sender_refusals("an_app_link_never_delivers_a_peer_message"),
+        [
+            ("app-pilot".to_owned(), "frame".to_owned()),
+            ("app-pilot".to_owned(), "peer_ask".to_owned())
+        ]
+    );
+}
+
+/// M10 S2 review-s2 F-008 row: which kinds each label may send, checked on every kind. An app
+/// may send a call, an `Inspect` and a promote's plan or fence, no other recovery event (C-3);
+/// a node may not name another
+/// node as sender, and kinds that name no sender pass. Unit.
+#[test]
+fn a_sender_is_held_to_its_certificate_label() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    let to = NodeId(1);
+    let on_wire = |msg: Msg| match wire::outbound(to, msg).map_err(|refused| refused.0.to_string())
+    {
+        Ok(Outbound::Plain(wire)) => wire,
+        other => panic!("a plain message: {other:?}"),
+    };
+    let app = Label::App("pilot".to_owned());
+    let node2 = Label::Node(NodeId(2));
+    let client = WireMsg::Client {
+        to,
+        partition: PartitionId(1),
+        call: wire::WireCall::Status {
+            identity: identity(1, 1),
+            generation: None,
+        },
+        reply: 1,
+    };
+    let inspect = WireMsg::Inspect {
+        to,
+        partition: PartitionId(1),
+        reply: 2,
+    };
+    let routed = |event: RecoveryEvent| {
+        on_wire(Msg::Routed {
+            partition: PartitionId(1),
+            correlation: zero(),
+            kind: KernelEvent::Recovery(event),
+        })
+    };
+    // A promote sends a plan and a fence (A-R415 C-3); an app may send no other recovery event.
+    let plan = routed(RecoveryEvent::Plan(Box::new(crate::admin::recovery_plan(
+        zero(),
+        zero(),
+        Vec::new(),
+        zero(),
+        zero(),
+        zero(),
+    ))));
+    let fence = routed(RecoveryEvent::FenceProven(Box::new(zero())));
+    let inventory_failed = routed(RecoveryEvent::InventoryFailed { copy: CopyId(1) });
+    let probe = routed(RecoveryEvent::ProbeUnavailable {
+        copy: CopyId(1),
+        seq: zero(),
+    });
+    for allowed in [&client, &inspect, &plan, &fence] {
+        assert_eq!(super::sender_refused(&app, allowed), None, "{allowed:?}");
+        assert_eq!(super::sender_refused(&node2, allowed), None, "{allowed:?}");
+    }
+    let progress = on_wire(Msg::Routed {
+        partition: PartitionId(1),
+        correlation: zero(),
+        kind: zero(),
+    });
+    assert!(
+        matches!(
+            &progress,
+            WireMsg::Routed {
+                kind: rdb_core::contracts::event::KernelEvent::PeerProgress { .. },
+                ..
+            }
+        ),
+        "{progress:?}"
+    );
+    for peer in [
+        on_wire(frame_from(2)),
+        on_wire(ask_from(2)),
+        progress,
+        inventory_failed,
+        probe,
+    ] {
+        assert!(
+            super::sender_refused(&app, &peer).is_some(),
+            "app sends {peer:?}"
+        );
+        assert_eq!(super::sender_refused(&node2, &peer), None, "{peer:?}");
+    }
+    for forged in [on_wire(frame_from(3)), on_wire(ask_from(3))] {
+        let reason = super::sender_refused(&node2, &forged).expect("forged");
+        assert!(reason.contains("node 3"), "{reason}");
+    }
 }
 
 /// The reason node 1's dialler holds for node `to`, once it is refused. Polls until the link is

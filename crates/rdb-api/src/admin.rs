@@ -87,7 +87,9 @@ pub enum BootstrapError {
     NodeStopped,
 }
 
-/// The rf3 member set: node 1 primary as copy 0, nodes 2 and 3 regular secondaries.
+/// The rf3 member set: node 1 primary as copy 0, nodes 2 and 3 regular secondaries. For open
+/// and bootstrap only: it holds no shadow, so a promote reads the live roles from its target
+/// instead (review-s2 F-004, A-R412).
 #[must_use]
 pub fn members() -> Vec<Member> {
     (1..=3u8)
@@ -1620,6 +1622,33 @@ pub enum PromoteError {
         /// The promote's bound.
         within_ms: u128,
     },
+    /// `to` answered holding no configuration: it has landed none since its restart, so its
+    /// members' roles are unknown and a shadow could be pinned regular. Nothing was written,
+    /// and running it again will not help until a configuration lands (A-R415 C-1, A-R416).
+    #[error(
+        "node {node} holds no configuration since its restart, so the promote cannot tell which \
+         members are still catching up; nothing was changed. A promote needs a node that has \
+         landed a configuration since it started: start the node that owned partition 1"
+    )]
+    Unconfigured {
+        /// The node asked for.
+        node: u32,
+    },
+    /// `to`'s configuration is not the one `partitions/1` names, so its roles may be out of
+    /// date (A-R415 C-2). Nothing was written.
+    #[error(
+        "node {node} holds configuration version {held}, but partitions/1 is at version \
+         {current}, so its members' roles may be out of date; nothing was changed. Wait until \
+         node {node} has landed version {current}, then promote again"
+    )]
+    StaleMembers {
+        /// The node asked for.
+        node: u32,
+        /// The version it holds.
+        held: u64,
+        /// `partitions/1`'s version.
+        current: u64,
+    },
     /// The control store refused, or the promote ran out of time after it wrote: the detail
     /// says which, and the step.
     #[error("control store: {0}")]
@@ -1649,15 +1678,18 @@ impl PromoteError {
                 | Self::AlreadyOwner { .. }
                 | Self::DropIsTarget
                 | Self::PeersUnknown { .. }
+                | Self::Unconfigured { .. }
+                | Self::StaleMembers { .. }
         )
     }
 }
 
 impl From<PromoteError> for ApiError {
     /// A-R256: a refused argument is `INVALID_ARGUMENT`; anything else `UNAVAILABLE`. Each of
-    /// those texts but `Record`'s ends "promote again", and promoting again picks up where this
-    /// one stopped, so its retry rule is `BoundedJitter`: the step says to try again and agrees
-    /// with the text. A record this build cannot read is `NotWired`: retrying will not help.
+    /// those texts but `Record`'s and `Unconfigured`'s ends "promote again", and promoting again
+    /// picks up where this one stopped, so its retry rule is `BoundedJitter`: the step says to
+    /// try again and agrees with the text. A record this build cannot read, or a `to` with no configuration since its
+    /// restart, is `NotWired`: retrying will not help.
     fn from(error: PromoteError) -> Self {
         let no_mutation = error.no_mutation();
         let retry = match &error {
@@ -1665,8 +1697,9 @@ impl From<PromoteError> for ApiError {
             | PromoteError::NotAMember { .. }
             | PromoteError::AlreadyOwner { .. }
             | PromoteError::DropIsTarget => return Self::invalid(error.to_string()),
-            PromoteError::Record(_) => RetryRule::NotWired,
+            PromoteError::Record(_) | PromoteError::Unconfigured { .. } => RetryRule::NotWired,
             PromoteError::PeersUnknown { .. }
+            | PromoteError::StaleMembers { .. }
             | PromoteError::Unreachable { .. }
             | PromoteError::Control(_) => RetryRule::BoundedJitter,
         };
@@ -1691,12 +1724,51 @@ pub(crate) struct PromoteCtx {
     pub(crate) drop: Option<NodeId>,
     /// How long the whole promote may take, the prior grant's expiry and the commit included.
     pub(crate) within: Duration,
-    /// The members partition 1 is pinned to now.
+    /// The members partition 1 is pinned to now, with their roles. `Db::promote` reads them from
+    /// `to`'s newest configuration, never from [`members`], which holds no shadow.
     pub(crate) members: Vec<Member>,
+    /// The version of the configuration `members` comes from. `promote` refuses
+    /// [`PromoteError::StaleMembers`] when it is not `partitions/1`'s (A-R415 C-2).
+    pub(crate) members_version: ConfigVersion,
     /// The boot each member runs at, as for a heal ([`HealCtx::member_boot`]).
     pub(crate) member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
     /// Deliver a message to a node's host.
     pub(crate) send: Arc<dyn Fn(NodeId, Msg) -> Result<(), NodeStopped> + Send + Sync>,
+}
+
+/// The members a promote of `to` plans with, their roles, and the version of the configuration
+/// they come from: `to`'s own newest configuration, from its status `looked` (`None`: it did
+/// not answer within `within`). Never [`members`], which holds no shadow, so a shadow `to` is
+/// refused and a kept shadow stays one (review-s2 F-004, A-R412). `promote` refuses the set
+/// when its version is not `partitions/1`'s (A-R415 C-2). Refused before anything is written.
+///
+/// # Errors
+///
+/// - [`PromoteError::PeersUnknown`] naming `to` when it did not answer.
+/// - [`PromoteError::Unconfigured`] when it answered holding no configuration: it has landed
+///   none since its restart (A-R415 C-1, A-R416).
+pub(crate) fn promote_members(
+    to: NodeId,
+    looked: Option<crate::host::NodeStatus>,
+    within: Duration,
+) -> Result<(Vec<Member>, ConfigVersion), PromoteError> {
+    let error = match looked {
+        // `!pinned.is_empty()` is unreachable today (the host fills `pinned` and
+        // `config_version` from one committed config, which always has members); kept so a
+        // later split refuses here instead of pinning nobody. Defensive, no row.
+        Some(crate::host::NodeStatus {
+            pinned,
+            config_version: Some(version),
+            ..
+        }) if !pinned.is_empty() => return Ok((pinned, version)),
+        Some(_) => PromoteError::Unconfigured { node: to.0 },
+        None => PromoteError::PeersUnknown {
+            nodes: vec![to.0],
+            within_ms: within.as_millis(),
+        },
+    };
+    tracing::warn!(to = to.0, %error, "promote_members_unknown");
+    Err(error)
 }
 
 /// The correlation a promote's two events carry.
@@ -1749,6 +1821,13 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
     if ctx.to == prior {
         return Err(PromoteError::AlreadyOwner { node: ctx.to.0 });
     }
+    if ctx.members_version != record.config_version {
+        return Err(PromoteError::StaleMembers {
+            node: ctx.to.0,
+            held: ctx.members_version.0,
+            current: record.config_version.0,
+        });
+    }
     if dropped == ctx.to {
         return Err(PromoteError::DropIsTarget);
     }
@@ -1762,6 +1841,10 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         "promote_started"
     );
     let members = kept_boots(&ctx, dropped, deadline).await?;
+    tracing::info!(
+        members = ?members.iter().map(|m| (m.node.0, m.boot.0, m.role)).collect::<Vec<_>>(),
+        "promote_members_kept"
+    );
 
     // 3. Fencing.
     if record.lifecycle != PartitionLifecycle::Fencing {
@@ -3085,6 +3168,7 @@ mod tests {
             drop,
             within,
             members,
+            members_version: CONFIG_VERSION,
             member_boot: boots,
             send: Arc::new(move |node, msg| {
                 log.lock().expect("log").push((node, msg));
@@ -3362,6 +3446,7 @@ mod tests {
                 drop: None,
                 within: Duration::from_millis(600),
                 members: members(),
+                members_version: CONFIG_VERSION,
                 member_boot: all_known(),
                 send: Arc::new(|node, _| Err(NodeStopped(node))),
             };
