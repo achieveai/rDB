@@ -3494,6 +3494,95 @@ mod guide_did_it_land {
         db.shutdown();
     }
 
+    /// A-R394 E2 (tester tc2 S5), three-process mode: a txn answered `UNKNOWN_OUTCOME` (links to
+    /// both secondaries held) is saved, both secondaries restart before either confirms it, and
+    /// the owner, which never restarted, carries it into the new generation. After the app
+    /// restarts, its resend is `GENERATION_CHANGED`, and `status` with the generation it was
+    /// sent in, and with none, answers `Resolved`: the owner folds its own `Unknown` entry by
+    /// the recovery's cutoff, as an embedded reopen's seed does from the durable row. The guide's
+    /// `did_it_land` answers `Yes`. Integration (~4 s): one fresh open until ready, two node
+    /// restarts, two app opens.
+    #[config_log::retcd_test]
+    fn m10_r394_e2_a_write_carried_across_a_secondary_restart_is_resolved_by_status() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let app_dir = config_testkit::fs::temp_dir();
+        let mut nodes = ready_nodes(&rt, dir.path(), &store);
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let open_app = || {
+            rt.block_on(Db::open_with(
+                app_config(app_dir.path(), nodes.links(), ClientId(2)),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                budgets,
+            ))
+            .expect("the app-only open")
+        };
+        let mut app = open_app();
+        app.put(b"x", b"1", None).expect("put x");
+        nodes.links().hold(NodeId(1), NodeId(2));
+        nodes.links().hold(NodeId(1), NodeId(3));
+        let put = TxnPut {
+            group: rdb_api::db::DEFAULT_GROUP,
+            object: b"z",
+            value: b"1",
+            if_version: None,
+        };
+        let unknown = app
+            .txn(&[put], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let saved = *unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+        let (id, sent_in) = (saved.identity.request, saved.expected_generation);
+        app.shutdown();
+        drop(app);
+
+        nodes.restart_node(NodeId(2)).expect("node 2 restarts");
+        nodes.restart_node(NodeId(3)).expect("node 3 restarts");
+        nodes.links().heal_all();
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+        while nodes.get(b"z").ok().and_then(|got| got.value).is_none() {
+            assert!(
+                Instant::now() < until,
+                "z never published after the restarts"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while let Err(refused) = nodes.put(b"w", b"1", None) {
+            assert!(Instant::now() < until, "writes never resumed: {refused}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut app = open_app();
+        let resent = app
+            .resend(saved.clone())
+            .expect_err("sent under the generation before the restarts");
+        assert_eq!(
+            resent.error.kind,
+            ErrorKind::GenerationChanged,
+            "the arm this row pins: {resent:?}"
+        );
+        for generation in [sent_in, None] {
+            let status = app.status(id, generation).expect("status answers");
+            assert!(
+                matches!(status, TxnStatus::Resolved(_)),
+                "z landed, so status({generation:?}) is Resolved: {status:?}"
+            );
+        }
+        let landed = did_it_land(&app, saved)
+            .unwrap_or_else(|error| panic!("never an Err after a generation change: {error}"));
+        assert_eq!(landed, Landed::Yes, "z landed across the restarts");
+        let (_, value) = nodes.get(b"z").expect("get z").value.expect("z is there");
+        assert_eq!(value.as_ref(), b"1");
+        app.shutdown();
+        nodes.shutdown();
+    }
+
     /// critic-w5g A2, through `Db::call` itself: an app's txn waits at the owner (links to the
     /// secondaries held), and the process holding the copies shuts down under it, as `lr down`
     /// does. The app's call is answered `UNAVAILABLE` naming node 1 as gone out of reach, with
@@ -3552,7 +3641,7 @@ mod guide_did_it_land {
 /// host fault to report. The same drop by a node of this process stays a host fault.
 #[test]
 fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_host_fault() {
-    let lost = unanswered(false, NodeId(1));
+    let lost = unanswered(false, NodeId(1), true);
     let text = lost.to_string();
     assert_eq!(
         (lost.kind, lost.retry, lost.no_mutation),
@@ -3569,7 +3658,7 @@ fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_hos
     );
     assert!(!text.contains("report this message"), "{text}");
     assert!(!text.contains("host fault"), "{text}");
-    let local = unanswered(true, NodeId(1)).to_string();
+    let local = unanswered(true, NodeId(1), true).to_string();
     assert!(
         local.contains("host fault: the owner dropped the call unanswered"),
         "{local}"

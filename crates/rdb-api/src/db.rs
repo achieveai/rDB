@@ -1486,7 +1486,12 @@ impl Db {
             if let Some(note) = self.restart_note().filter(|_| self.owner_restarted()) {
                 return Err(ReadyError::Stopped { note });
             }
-            if let Some(owner) = self.inspect(self.route.owner()) {
+            let looked = self.look(self.route.owner());
+            if looked == Err(Unlooked::NoLink) {
+                // What is known now: the owner is not reachable, whatever an earlier look saw.
+                NO_LINK.clone_into(&mut phase);
+            }
+            if let Ok(owner) = looked {
                 if owner.admits == Some(true) {
                     self.ready_seen.store(true, Ordering::Relaxed);
                     return Ok(());
@@ -1647,6 +1652,9 @@ impl Db {
         // (A-R287 P1, tester-s2 F-T1). Re-read `partitions/1` and, if it names a new owner,
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
+        // Only these two carry a write to the owner. A compile, a read and a status look write
+        // nothing, so losing the owner under one applied nothing (A-R394 E1).
+        let writes = matches!(call, ClientCall::Put { .. } | ClientCall::Resend { .. });
         let mut sent = self.send_call(owner, call);
         if let (Err(_), Some(call)) = (&sent, spare) {
             self.refresh_owner();
@@ -1686,6 +1694,7 @@ impl Db {
                 error: unanswered(
                     lock(&self.nodes).iter().any(|handle| handle.node == owner),
                     owner,
+                    writes,
                 ),
                 request: None,
             }),
@@ -2552,6 +2561,13 @@ impl Db {
     /// `node`'s state for partition 1, or `None` when it does not answer within the read
     /// timeout.
     fn inspect(&self, node: NodeId) -> Option<NodeStatus> {
+        self.look(node).ok()
+    }
+
+    /// [`Self::inspect`], saying why there is no answer: [`Unlooked::NoLink`] when the look
+    /// could not be sent (no link to `node` is up), [`Unlooked::NoAnswer`] when it was sent and
+    /// not answered in the read timeout (tester tc2 P1, A-R394).
+    fn look(&self, node: NodeId) -> Result<NodeStatus, Unlooked> {
         let (reply, answer) = mpsc::channel();
         self.send_to(
             node,
@@ -2560,12 +2576,14 @@ impl Db {
                 reply,
             },
         )
-        .ok()?;
-        let status = answer.recv_timeout(self.timeouts.read).ok()?;
+        .map_err(|_| Unlooked::NoLink)?;
+        let status = answer
+            .recv_timeout(self.timeouts.read)
+            .map_err(|_| Unlooked::NoAnswer)?;
         if node == self.route.owner() {
             *lock(&self.opened.stuck) = stuck_recovery(&status);
         }
-        Some(status)
+        Ok(status)
     }
 
     /// A resend's or retry's answer under `request`: whatever refused it, the request may have
@@ -3044,11 +3062,15 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
 /// The refusal for a call `owner` dropped unanswered (F-001). A node of this process that drops
 /// one is a host fault. One in another process went out of reach, most often because its
 /// process stopped (`lr down`): `UNAVAILABLE`, wait and retry, never "report this" (tc1 D1).
-fn unanswered(local: bool, owner: NodeId) -> ApiError {
+/// `writes`: the call carried a write, which may then have applied; a call that writes nothing
+/// (a compile, a read, a status look) applied nothing (A-R394 E1).
+fn unanswered(local: bool, owner: NodeId, writes: bool) -> ApiError {
     if local {
         ApiError::host("the owner dropped the call unanswered")
-    } else {
+    } else if writes {
         ApiError::owner_lost(owner)
+    } else {
+        ApiError::owner_lost_unsent(owner)
     }
 }
 
@@ -3303,14 +3325,26 @@ fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
 
 /// [`ReadyError::TimedOut`]'s phase when the owner answered no status look in the time.
 const NO_ANSWER: &str = "unknown";
+/// [`ReadyError::TimedOut`]'s phase when the last look could not be sent: no link to the owner.
+const NO_LINK: &str = "unreachable";
 /// [`ReadyError::TimedOut`]'s phase when the owner runs no recovery.
 const NO_RECOVERY: &str = "none";
+
+/// Why [`Db::look`] has no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unlooked {
+    /// The look could not be sent: no link to the node is up.
+    NoLink,
+    /// The look was sent and not answered in the read timeout.
+    NoAnswer,
+}
 
 /// [`ReadyError::TimedOut`]'s text (A-R230 Q3, #59): it never says "unknown", which read as a
 /// fault while node 1 was busy syncing, it names the owner, and it ends with the step.
 fn timed_out_text(within_ms: u128, owner: NodeId, phase: &str) -> String {
     let seen = match phase {
         NO_ANSWER => error::ReadySeen::NoAnswer,
+        NO_LINK => error::ReadySeen::NoLink,
         NO_RECOVERY => error::ReadySeen::NoRecovery,
         phase => error::ReadySeen::Phase(phase),
     };
@@ -4265,6 +4299,108 @@ mod tests {
         assert!(took < put / 2, "answered in {took:?}, not at the timeout");
         assert!(refused.request.is_none(), "nothing was sent to resend");
         db.shutdown();
+    }
+
+    /// A-R394 E1 (tester tc2 S4 d, e): the owner runs in another process and goes out of reach
+    /// while a call that writes nothing waits: a put's compile, before the write itself is sent,
+    /// a status look, and a get. Each is `UNAVAILABLE`, `no_mutation`, no request handed back,
+    /// and its text says nothing was applied, never "may have applied ... `Db::resend`", which
+    /// would contradict both. A resend that goes out of reach keeps the other text
+    /// (`m10_r357_d1_an_app_whose_owner_shuts_down_mid_call_is_told_unavailable`).
+    /// Unit (~10 ms): no node thread; the owner's mailbox is a link this test drops calls from.
+    #[test]
+    fn m10_r394_e1_an_owner_lost_before_the_write_was_sent_says_nothing_was_applied() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (tx, mailbox) = mpsc::channel();
+        links.register(OWNER, tx, crate::host::BOOT);
+        std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                drop(msg);
+            }
+        });
+        let db = Db {
+            nodes: Mutex::new(Vec::new()),
+            respawn: None,
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts::default(),
+            next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
+            client: DEFAULT_CLIENT,
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+            route: Route::default(),
+        };
+        let unsent = |what: &str, error: &ApiError| {
+            let text = error.to_string();
+            assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery, true),
+                "{what}: {text}"
+            );
+            assert!(
+                text.contains("node 1, the owner, went out of reach while this call waited"),
+                "{what}: {text}"
+            );
+            assert!(text.contains("nothing was applied"), "{what}: {text}");
+            assert!(!text.contains("may have applied"), "{what}: {text}");
+            assert!(!text.contains("Db::resend"), "{what}: {text}");
+        };
+
+        let put = db
+            .put(b"a", b"1", None)
+            .expect_err("the compile was dropped");
+        unsent("put", &put.error);
+        assert!(put.request.is_none(), "nothing was compiled to resend");
+        let status = db
+            .status(RequestId(1), None)
+            .expect_err("the look was dropped");
+        unsent("status", &status);
+        let get = db.get(b"a").expect_err("the get was dropped");
+        unsent("get", &get);
+    }
+
+    /// A-R394 P1 (tester tc2 S4 c): `wait_ready` with no link to the owner up (its process is
+    /// stopped) times out saying node 1 is not reachable, never that it "may be busy", which
+    /// is the text for a look that was sent and not answered.
+    /// Unit (~60 ms): no node thread; node 1 is registered nowhere, so no look can be sent.
+    #[test]
+    fn m10_r394_p1_a_wait_with_no_link_to_the_owner_says_it_is_not_reachable() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let db = Db {
+            nodes: Mutex::new(Vec::new()),
+            respawn: None,
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts::default(),
+            next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
+            client: DEFAULT_CLIENT,
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+            route: Route::default(),
+        };
+        let text = db
+            .wait_ready(Duration::from_millis(50))
+            .expect_err("node 1 is not reachable")
+            .to_string();
+        assert!(
+            text.contains("node 1 is not reachable from this process: no link to it is up"),
+            "{text}"
+        );
+        assert!(!text.contains("may be busy"), "{text}");
     }
 
     /// F-011 (S0 review): a get P1 refuses takes its retry rule from the kernel's table, as a
@@ -6933,7 +7069,8 @@ mod tests {
             ))
         );
 
-        // A promote moved the route to node 2, which answers nothing here: the text names it.
+        // A promote moved the route to node 2, which no link reaches here: the text names it,
+        // and says it is not reachable rather than busy (A-R394 P1).
         db.route.owner.store(2, Ordering::Relaxed);
         let promoted = db.wait_ready(Duration::from_millis(60));
         assert!(
@@ -6949,8 +7086,8 @@ mod tests {
         assert_eq!(
             promoted.map_err(|error| error.to_string()),
             Err(format!(
-                "node 2 did not admit writes within 60 ms; node 2 answered no status look in \
-                 that time (it may be busy, for example syncing its copies){step}"
+                "node 2 did not admit writes within 60 ms; node 2 is not reachable from this \
+                 process: no link to it is up (its process may have stopped){step}"
             ))
         );
         drop(db);

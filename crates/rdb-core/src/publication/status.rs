@@ -18,7 +18,7 @@ use crate::contracts::errors::ErrorKind;
 use crate::contracts::ids::{ClientId, Generation, RequestId, RequestIdentity, Seq, TenantId};
 use crate::contracts::publication::{AckFloor, StatusEntry, StatusOutcome};
 use crate::contracts::recovery::RetainedStatusMap;
-use crate::contracts::txn::{Outcome as TxnOutcome, TxnResult, TxnStatus};
+use crate::contracts::txn::{Durability, Outcome as TxnOutcome, TxnResult, TxnStatus};
 use crate::transaction::dedup::{open_base, APP_ID_MIN};
 use crate::transaction::RETENTION_CAP_ENTRIES;
 
@@ -193,11 +193,31 @@ impl StatusIndex {
             .iter_mut()
             .filter(|((gen, _), _)| *gen == generation);
         for (_, entry) in held {
-            let (StatusOutcome::Published { result }, Some(seq)) = (entry.outcome, entry.seq)
-            else {
-                continue;
-            };
-            entry.outcome = recovered_outcome(map, seq, result);
+            match (entry.outcome, entry.seq) {
+                (StatusOutcome::Published { result }, Some(seq)) => {
+                    entry.outcome = recovered_outcome(map, seq, result);
+                }
+                // Applied here and never confirmed (the post-apply deadline answered it
+                // `Unknown`), then carried into the new lineage by the cutoff: it landed
+                // (A-R394 E2). Only that answer moves it; a discarded or past-cutoff one stays
+                // `Unknown`, which never proves nonexecution. The result is the one the status
+                // seed builds from the same record's dedup row.
+                (StatusOutcome::Unknown, Some(seq)) => {
+                    let result = TxnResult {
+                        partition: entry.lineage.partition,
+                        owner_epoch: entry.lineage.owner_epoch,
+                        generation: entry.lineage.generation,
+                        seq,
+                        outcome: TxnOutcome::Published,
+                        durability: Durability::BufferedOnTwo,
+                    };
+                    let recovered = recovered_outcome(map, seq, result);
+                    if matches!(recovered, StatusOutcome::RecoveredApplied { .. }) {
+                        entry.outcome = recovered;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
