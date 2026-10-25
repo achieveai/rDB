@@ -1,7 +1,7 @@
 //! M10 S2 part (b): a live owner re-plans a partition without a copy that has held its writes
 //! up for `peer_drop_after_millis` (rulings A-R277, A-R281, A-R282).
 
-use super::trio::{logged, Trio};
+use super::trio::{current_thread, host_over, logged, Trio};
 use super::*;
 use rdb_core::contracts::errors::RetryRule;
 use rdb_core::contracts::ids::{ClientId, RequestId, TenantId};
@@ -1030,25 +1030,20 @@ fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
     tracing::info!(waited, "b6_repair_after_heal_ms");
 }
 
-/// b26 (A-R381, A-R383, parked by A-R386): a `ReadOnly` commit drops nothing. Every regular
-/// copy is outside its barrier, so a blame there picks a copy almost at random, the healthy one
-/// included. The trio starts with node 1's links to nodes 2 and 3 held, so F1 commits
-/// `ReadOnly` on nodes 1, 2 and 3 at cutoff 0. Node 2 then dies and the link 1-3 heals: node 3
-/// answers, and the commit is repaired to `DegradedRf2` on the same members with node 3 in the
-/// barrier. Only there does the drop clock run, and it drops node 2, the copy really missing.
-///
-/// Known gap, so ignored: a copy missed at formation never lands. Node 3 holds no generation 0,
-/// so it logs `land_link_refused{reason=anchor_generation_absent}`, its post-commit sync stays
-/// `sync_deferred`, and every repair's inventory fails the same way and commits `ReadOnly`
-/// again. The landing fix (critic-w9 "A-R383 re-plan", option (c)): treat an empty copy as head
-/// 0 at the root, as `inventory_reported_empty` already does. This body is the acceptance row
-/// for that fix, together with A-R381's `ReadOnly` gate in `holding_up` and A-R383's repair
-/// past a pinned rebuild that only unanswering members hold.
-/// Cuts, once it runs: `holding_up` blames in `ReadOnly`, red (a drop while `ReadOnly`, node 3
-/// dropped, seen 2026-10-24); the repair skipped whenever the rebuild is pinned, red (no repair).
+/// b26 (#69: A-R381, A-R383 as A-R426 rules it, critic-w9 option (c)): a `ReadOnly` commit drops
+/// nothing. Every regular copy is outside its barrier, so a blame there picks a copy almost at
+/// random, the healthy one included. The trio starts with node 1's links to nodes 2 and 3 held,
+/// so F1 commits `ReadOnly` on nodes 1, 2 and 3 at cutoff 0, and nodes 2 and 3, missed at
+/// formation, hold no lineage. Node 2 then dies and the link 1-3 heals: node 3 lands as an empty
+/// copy (head 0 at the root), F1's pinned rebuild stalls on node 2 alone, which does not answer,
+/// and the commit is repaired for node 3 to `DegradedRf2` on the same members with node 3 in the
+/// barrier. Only there does the drop clock run, and it drops node 2, the copy really missing;
+/// then a put lands. This is the tester's #69 walk shape.
+/// Cuts: `holding_up` blames in `ReadOnly`, red (a drop while `ReadOnly`, node 3 dropped); the
+/// repair skipped whenever the rebuild is pinned, red (no repair); `land_at` refuses an empty
+/// copy, red (every repair commits `ReadOnly` again).
 /// Integration (~5 s): the held bootstrap, three drop clocks of `ReadOnly`, the repair, the drop.
 #[config_log::retcd_test]
-#[ignore = "known gap: a copy missed at formation never lands; issue pending"]
 fn m10_s2_b26_a_read_only_commit_drops_nothing_until_repaired() {
     const METHOD: &str = "m10_s2_b26_a_read_only_commit_drops_nothing_until_repaired";
     let dir = config_testkit::fs::temp_dir();
@@ -1101,6 +1096,15 @@ fn m10_s2_b26_a_read_only_commit_drops_nothing_until_repaired() {
     let dropped = logged!(METHOD, "membership_drop_planned");
     assert_eq!(dropped.len(), 1, "one drop: {dropped:?}");
     assert_eq!(dropped[0]["dropped"], 2, "node 2 dropped: {dropped:?}");
+    assert_eq!(
+        planned[0]["outside"], "[3]",
+        "the repair was for node 3: {planned:?}"
+    );
+    trio.ready();
+    match trio.ask(put(1)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after node 2's drop: {other:?}"),
+    }
 }
 
 /// A-R319 defect 2 (W5's probe, k546): a `ReadOnly` commit takes no write whatever L1 says,
@@ -1127,6 +1131,108 @@ fn a_read_only_repair_counts_regular_secondaries_only() {
         member(3, ReplicaRole::Shadow),
     ];
     assert_eq!(regular_secondaries(&members), vec![NodeId(2)]);
+}
+
+/// #69, A-R383 as critic-bb rules it (A-R426 M8): F1's pinned rebuild holds a `ReadOnly`
+/// commit's repair back until F1 reports a stall for that generation, and then only while a
+/// copy that stall named answers. Members as b26's: node 2 holds copy 1, node 3 copy 2.
+/// Cuts, each red: the repair skipped whenever pinned (the unanswering case holds); a repair
+/// with no stall reported (the no-stall case and an older generation's stall run); the answered
+/// test dropped (the answering stalled copy runs). Unit.
+#[test]
+fn a_pinned_rebuild_holds_the_repair_until_its_stall_names_only_silent_copies() {
+    let member = |n: u8, role| Member {
+        copy: CopyId(n - 1),
+        node: NodeId(u32::from(n)),
+        boot: BOOT,
+        role,
+    };
+    let members = [
+        member(1, ReplicaRole::Primary),
+        member(2, ReplicaRole::RegularSecondary),
+        member(3, ReplicaRole::RegularSecondary),
+    ];
+    let pinned = Some(Generation(1));
+    let stall = |generation: u64, copies: &[u8]| {
+        (
+            Generation(generation),
+            copies
+                .iter()
+                .map(|copy| CopyId(*copy))
+                .collect::<BTreeSet<_>>(),
+        )
+    };
+    let node3 = [NodeId(3)];
+    let both = [NodeId(2), NodeId(3)];
+    assert!(
+        !rebuild_holds_repair(None, None, &node3, &members),
+        "not pinned"
+    );
+    assert!(
+        rebuild_holds_repair(pinned, None, &node3, &members),
+        "pinned, no stall yet"
+    );
+    assert!(
+        rebuild_holds_repair(pinned, Some(&stall(0, &[1])), &node3, &members),
+        "a stall of an older generation is no stall of this one"
+    );
+    assert!(
+        !rebuild_holds_repair(pinned, Some(&stall(1, &[1])), &node3, &members),
+        "the stalled copy (node 2) does not answer: repair"
+    );
+    assert!(
+        rebuild_holds_repair(pinned, Some(&stall(1, &[1])), &both, &members),
+        "the stalled copy answers: the rebuild may still finish"
+    );
+    assert!(
+        rebuild_holds_repair(pinned, None, &[], &members),
+        "the early check, before any probe"
+    );
+}
+
+/// A-R426 M8: the stall [`rebuild_holds_repair`] reads is F1's latest step's list, replaced at
+/// each step that names a copy, so a copy that proved since is no longer in it (the walk's
+/// `unproven=[1,2]` then `[1]`). [`RebuildWatch::unproven`] keeps both. Cut: the list in
+/// `report_unproven` extended instead of replaced, red ({1, 2} where {1} is due). Unit.
+#[test]
+fn the_latest_stall_is_the_last_step_s_list_only() {
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    let partition = PartitionId(1);
+    host.rebuilds.insert(
+        partition,
+        RebuildWatch {
+            generation: Generation(1),
+            mode: PartitionMode::ReadOnly,
+            cutoff: Seq(0),
+            required: vec![CopyId(0), CopyId(1), CopyId(2)],
+            since: host.clock.now(),
+            pinned: true,
+            unproven: BTreeSet::new(),
+            unreported: false,
+        },
+    );
+    host.rebuild_stalled(partition, CopyId(1));
+    host.rebuild_stalled(partition, CopyId(2));
+    host.report_unproven();
+    let copies = |list: &[u8]| {
+        list.iter()
+            .map(|copy| CopyId(*copy))
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        host.latest_stall.get(&partition),
+        Some(&(Generation(1), copies(&[1, 2])))
+    );
+    host.rebuild_stalled(partition, CopyId(1));
+    host.report_unproven();
+    assert_eq!(
+        host.latest_stall.get(&partition),
+        Some(&(Generation(1), copies(&[1]))),
+        "copy 2 proved since the first stall"
+    );
+    assert_eq!(host.rebuilds[&partition].unproven, copies(&[1, 2]));
 }
 
 #[test]
@@ -2515,15 +2621,18 @@ fn m10_s2_adv2_a_restart_beside_an_unlinked_member_is_not_shadowed() {
 
 /// ADV-3 (A-R406): D9's promote whose barrier never completes. A wiped node 3 restarts under
 /// an `Active` owner and is pinned a shadow; it catches up and node 1 starts its promote. Once
-/// F1 is past the inventory (synchronizing or at the barrier), node 3 is held: its links stay
-/// up but nothing crosses them, so it proves nothing. F1 commits the promote without node 3's
+/// node 3 has answered F1's inventory, while the window is still open, it is held: its links
+/// stay up but nothing crosses them, so it proves nothing. Until #69 the shadow's new generation
+/// was never linked, so its inventory failed `anchor_generation_unlinked` and the hold, then
+/// placed after the window, never mattered. F1 commits the promote without node 3's
 /// proof, `DegradedRf2`, so L1 still counts nodes 1 and 2 only, and writes land there. While
 /// node 3 stays held, through the drop clock and past it, no commit is ever `Active`: a copy
 /// that has proved nothing is never counted, and the drop clock leaves it out (b7): nodes 1
 /// and 2, `DegradedRf2`.
 /// Cut: `restart_shadowed` returns `None`, red (node 3 is never pinned a shadow).
-/// Integration (~6 s): bootstrap's window, the restart's re-plan, the promote's, the drop
-/// clock while held.
+/// Integration (~20 s): bootstrap's window, the restart's re-plan, the promote's barrier retries
+/// until F1 gives node 3 up (~14 s since #69: node 3 answered the inventory), the drop clock
+/// while held.
 #[config_log::retcd_test]
 fn m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two() {
     const METHOD: &str =
@@ -2544,18 +2653,24 @@ fn m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two() 
             .map(|(generation, _, _)| generation)
     });
 
-    trio.until("node 1 waits on node 3 for its promote", |trio| {
+    // #69: node 3's shadow is linked at its landing now, so once the window closes it proves
+    // the cutoff within one step and no poll lands between. Hold it once it has answered the
+    // promote's inventory and before the window closes: past its inventory, before any proof.
+    trio.until("node 3 answered the promote's inventory", |trio| {
         let phase = trio.nodes[0]
             .0
             .recoveries
             .get(&PartitionId(1))
             .map(Recovery::phase);
-        let promoting = !logged!(METHOD, "shadow_promote").is_empty();
-        let past_inventory = matches!(
-            phase,
-            Some(RecoveryPhase::Synchronizing | RecoveryPhase::Barrier)
-        );
-        (promoting && past_inventory).then_some(())
+        let promoted_at = logged!(METHOD, "shadow_promote")
+            .first()
+            .map(|line| line["@t"].as_str().unwrap_or_default().to_owned())?;
+        let answered = logged!(METHOD, "inventory_reported")
+            .into_iter()
+            .any(|line| {
+                line["node"] == 3 && line["@t"].as_str().unwrap_or_default() > promoted_at.as_str()
+            });
+        (answered && phase == Some(RecoveryPhase::Collecting)).then_some(())
     });
     hold_three(&trio);
 
