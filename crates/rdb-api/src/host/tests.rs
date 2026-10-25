@@ -5901,6 +5901,7 @@ fn m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing() {
         seen: Seen::Absent,
         generation: Generation(1),
         at: Seq(0),
+        recovery_mode: false,
     };
     let p1 = PartitionId(1);
 

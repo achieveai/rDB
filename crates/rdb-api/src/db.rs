@@ -4515,6 +4515,7 @@ mod tests {
                         seen: Seen::Absent,
                         generation: Generation(3),
                         at: Seq(1),
+                        recovery_mode: false,
                     })
                     .expect("the get waits");
                 true
