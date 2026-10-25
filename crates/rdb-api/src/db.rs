@@ -3786,15 +3786,42 @@ mod tests {
         )
     }
 
-    /// The spec's budgets with L1's waits cut short, so a fresh partition admits writes within
-    /// [`admits`]'s patience (the spec holds a resume for 5 s).
-    fn fast() -> Budgets {
-        Budgets {
-            resume_hold_millis: 50,
-            warn_age_millis: 200,
-            pause_age_millis: 400,
-            ..Budgets::SPEC_DEFAULTS
+    /// A new put as `docs/rdb/embed.md` tells an app to send one: a `PROTECTION_PAUSED` refusal
+    /// with `no_mutation` true wrote nothing, so the same put is sent again after a short wait.
+    /// Any other refusal, or a pause that outlasts the patience, fails the row. For a put a row
+    /// needs to land on a host whose fsyncs may outlast L1's pause age: A-R391 (every copy's
+    /// sync took 530-628 ms against 400 ms) and A-R392 (D18's puts before its stall).
+    pub(super) fn put_through_pauses(db: &Db, object: &[u8], value: &[u8], case: &str) {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+        let mut paused = 0_u32;
+        loop {
+            match db.put(object, value, None) {
+                Ok(_) => break,
+                Err(refused)
+                    if refused.error.kind == ErrorKind::ProtectionPaused
+                        && refused.error.no_mutation
+                        && Instant::now() < deadline =>
+                {
+                    paused += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(refused) => panic!("{case}: {refused:?} after {paused} paused sends"),
+            }
         }
+        tracing::info!(case, paused, "test_put_through_pauses");
+    }
+
+    /// The spec's budgets with the resume hold cut short, so a fresh partition admits writes
+    /// within [`admits`]'s patience (the spec holds a resume for 5 s), and L1's ages scaled
+    /// (`host::test_budgets`, A-R392).
+    fn fast() -> Budgets {
+        crate::host::test_budgets()
+    }
+
+    /// [`fast`] with L1 pausing at 400 ms, for a row whose subject is an L1 pause or its
+    /// absence past the pause age (`host::test_budgets_pausing`, A-R392).
+    fn fast_pause() -> Budgets {
+        crate::host::test_budgets_pausing()
     }
 
     fn config(dir: &std::path::Path) -> DbConfig {
@@ -3836,12 +3863,8 @@ mod tests {
             .build()
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let budgets = Budgets {
-            resume_hold_millis: 50,
-            warn_age_millis: 200,
-            pause_age_millis: 400,
-            ..Budgets::SPEC_DEFAULTS
-        };
+        // The pause must answer UNKNOWN well inside the 5 s put timeout, at every scale.
+        let budgets = fast_pause();
         let config = DbConfig {
             ack_floor: true,
             dir: dir.path().to_path_buf(),
@@ -5215,7 +5238,7 @@ mod tests {
     /// The done-when scenario of slice 2 (A-R278, A-R323), beside W5's row above: writes keep
     /// going while node 3 is away, then node 3 restarts and catches up from the live owner and
     /// rejoins as a full copy. Node 3 is cut off both ways and puts go on through node 1 until
-    /// the owner pauses them for the unheard copy, at most 200. Node 3 restarts, its links
+    /// the owner pauses them for the unheard copy, at most 2,000. Node 3 restarts, its links
     /// heal, node 1 re-plans with it, writes resume, and every write reads back. After shutdown,
     /// node 3's store holds node 1's generation through the same head with the same record
     /// digest there. No catch-up was refused and no rejoin abandoned. Cut: `restore_dormant`
@@ -5260,7 +5283,7 @@ mod tests {
                 config(dir.path()),
                 store,
                 rt.handle().clone(),
-                fast(),
+                fast_pause(),
             ))
             .expect("open");
         admits(&db, "after the open");
@@ -5279,11 +5302,15 @@ mod tests {
             db.links().drop_direction(other, NodeId(3));
         }
         let mut landed = 0_u32;
+        let mut paused = false;
         let paused_by = std::time::Instant::now() + patience;
-        while landed < 200 {
+        while landed < 2_000 {
             match db.put(format!("away-{landed}").as_bytes(), b"1", None) {
                 Ok(_) => landed += 1,
-                Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => break,
+                Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => {
+                    paused = true;
+                    break;
+                }
                 Err(refused) => panic!("a put with node 3 away, after {landed}: {refused:?}"),
             }
             assert!(
@@ -5292,6 +5319,13 @@ mod tests {
             );
         }
         assert!(landed >= 1, "no put landed with node 3 away");
+        // A-R392: the loop ends on the pause, not the cap. 200 puts once landed in 370 ms, under
+        // the 400 ms pause age, and the pause went unchecked; 2,000 leaves room, and a budget
+        // that outlasts them is red.
+        assert!(
+            paused,
+            "{landed} puts landed with node 3 away and node 1 never paused"
+        );
         let before = of(&db, OWNER).recovered.expect("node 1 recovered");
         if drop_first {
             let dropped_by =
@@ -5443,7 +5477,7 @@ mod tests {
                 config(dir.path()),
                 store,
                 rt.handle().clone(),
-                fast(),
+                fast_pause(),
             ))
             .expect("open");
         admits(&db, "after the open");
@@ -9398,7 +9432,10 @@ mod tests {
     /// a loop once its copy is durable past the primary's floor and through every put it applied
     /// (A-R389: a put it had not synced would pause L1 rightly, on its own exposure). Cut:
     /// `run_due` before that drain, and L1 pauses on stale progress. Integration (~3 s): one
-    /// open, puts until the stall fires, then twice the pause age.
+    /// open, puts until the stall fires, then twice the pause age. A-R392: the row keeps the
+    /// 400 ms pause age (`fast_pause`), since a scaled one would need a stall past the 3 s grant.
+    /// Its puts before the stall resend a pause as the guide says, and the stall fires only while
+    /// L1 admits, so a pause before it cannot make the row pass without testing anything.
     #[config_log::retcd_test]
     fn m10_d18_a_stall_of_node_1_alone_does_not_pause_writes_its_peers_made_durable() {
         const METHOD: &str =
@@ -9406,10 +9443,17 @@ mod tests {
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let dir = config_testkit::fs::temp_dir();
-        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast_pause(),
+            ))
+            .expect("open");
         admits(&db, "the open");
         let node_1 = dir.path().join("nodes").join("1");
-        let pause_age = Duration::from_millis(fast().pause_age_millis);
+        let pause_age = Duration::from_millis(fast_pause().pause_age_millis);
         let stall = Duration::from_millis(1_000);
         crate::host::stall_loop_once(&node_1, Seq(2), stall);
         // The stall waits for node 1's own fsync to beat the peers' acks, which a put need not
@@ -9418,8 +9462,12 @@ mod tests {
             if !crate::host::stall_loop_armed(&node_1) {
                 break;
             }
-            db.put(format!("k{i}").as_bytes(), b"v", None)
-                .expect("a put before the stall");
+            put_through_pauses(
+                &db,
+                format!("k{i}").as_bytes(),
+                b"v",
+                "a put before the stall",
+            );
             std::thread::sleep(Duration::from_millis(150));
         }
         assert!(

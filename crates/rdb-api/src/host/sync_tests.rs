@@ -40,14 +40,9 @@ fn config(dir: &std::path::Path) -> DbConfig {
     }
 }
 
-/// The spec's budgets with L1's waits cut short, as the `Db` rows' `fast()`.
+/// The `Db` rows' `fast()`: `host::test_budgets` (A-R392).
 fn fast() -> Budgets {
-    Budgets {
-        resume_hold_millis: 50,
-        warn_age_millis: 200,
-        pause_age_millis: 400,
-        ..Budgets::SPEC_DEFAULTS
-    }
+    crate::host::test_budgets()
 }
 
 fn open(
@@ -106,6 +101,20 @@ fn num(line: &Line, field: &str) -> u64 {
     line[field]
         .as_u64()
         .unwrap_or_else(|| panic!("{field} on {line}"))
+}
+
+/// A line's `@t` (`YYYY-MM-DDTHH:MM:SS.fffffffZ`) as seconds since that day's UTC midnight, plus
+/// a day per day of the month, so two lines of one row compare across a midnight.
+fn log_secs(line: &Line) -> f64 {
+    let at = line["@t"]
+        .as_str()
+        .unwrap_or_else(|| panic!("@t on {line}"));
+    let field = |range: std::ops::Range<usize>| -> f64 {
+        at.get(range)
+            .and_then(|text| text.trim_end_matches('Z').parse().ok())
+            .unwrap_or_else(|| panic!("@t {at}"))
+    };
+    field(8..10) * 86_400.0 + field(11..13) * 3_600.0 + field(14..16) * 60.0 + field(17..at.len())
 }
 
 /// The index of the first line at or after `from` that is `msg` and matches `also`.
@@ -641,11 +650,15 @@ fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
     let dir = config_testkit::fs::temp_dir();
     let mut db = open(&rt, config(dir.path()), &store, Budgets::SPEC_DEFAULTS);
     admits_within(&db, "the open", Duration::from_secs(10));
-    db.put(b"a", b"1", None).expect("put a");
+    // A-R392: armed before `put a`, whose own sync is the one held. Armed after it, a test
+    // thread slower than node 1's 100 ms flush duty let that sync run unheld, and with nothing
+    // else to sync no sync came at all ("no test_sync_slowed"). A put does not wait for its
+    // own fsync, so `put a` still lands.
     let one = node_dir(dir.path(), 1);
     tracing::info!("f4_slow_armed");
     let armed = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
     slow_sync(&one, Duration::from_secs(8), false);
+    db.put(b"a", b"1", None).expect("put a");
     wait_for_line(
         METHOD,
         armed,
@@ -658,10 +671,7 @@ fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
         node.fault.is_some()
     });
     let fault_after = held.elapsed();
-    assert!(
-        fault_after >= Duration::from_millis(5_000 - 300),
-        "node 1 faulted {fault_after:?} after its sync was held, before the 5 s limit: {faulted:?}"
-    );
+    tracing::info!(?fault_after, ?faulted, "f4_fault_observed");
 
     let promoted = db.promote(NodeId(2), None).expect("promote node 2");
     let patience = test_patience(Duration::from_secs(10));
@@ -701,6 +711,19 @@ fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
         num(line, "node") == 1
     });
     let fault = next(&lines, armed, "host_fault", &|line| num(line, "node") == 1);
+    // No sooner than the limit, on the log's own clock: from the held sync's start
+    // (`test_sync_slowed`, logged as it begins to sleep) to `wal_sync_stuck`. A-R392: since the
+    // arm moved before `put a`, the held sync can start before the test thread waits for it, so
+    // the thread's own `held` instant runs late (4.47 s seen) and bounds only from above.
+    let slowed = next(&lines, armed, "test_sync_slowed", &|line| {
+        num(line, "node") == 1
+    })
+    .expect("node 1's held sync");
+    let stuck_after = stuck.map(|stuck| log_secs(&lines[stuck]) - log_secs(&lines[slowed]));
+    assert!(
+        stuck_after.is_some_and(|after| after >= (5_000.0 - 300.0) / 1_000.0),
+        "node 1 faulted {stuck_after:?} s after its sync was held, before the 5 s limit"
+    );
     assert!(
         stuck.is_some_and(|stuck| fault.is_some_and(|fault| stuck < fault)),
         "node 1: wal_sync_stuck {stuck:?}, host_fault {fault:?}"
@@ -721,7 +744,7 @@ fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
         after_fault.is_some() && lost.is_none() && faults == 1,
         "node 1: sync_finished_after_fault {after_fault:?}, sync_lost_at_stop {lost:?}, host_fault lines {faults}"
     );
-    tracing::info!(?fault_after, ?took_over, "f4_b2_checked");
+    tracing::info!(?fault_after, ?stuck_after, ?took_over, "f4_b2_checked");
 }
 
 /// critic-f4 R1 (#42, A-R249): a revocation counts only once it is durable, and on the syncer

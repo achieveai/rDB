@@ -331,12 +331,7 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
         // The spec holds a resume for 5 s; a restart waits for ready, so cut that short.
-        let fast = rdb_core::contracts::event::Budgets {
-            resume_hold_millis: 50,
-            warn_age_millis: 200,
-            pause_age_millis: 400,
-            ..rdb_core::contracts::event::Budgets::SPEC_DEFAULTS
-        };
+        let fast = crate::host::test_budgets();
         let config = DbConfig {
             ack_floor: true,
             dir: dir.path().to_path_buf(),

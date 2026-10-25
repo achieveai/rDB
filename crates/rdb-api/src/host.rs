@@ -282,6 +282,39 @@ pub(crate) fn test_patience(base: Duration) -> Duration {
     base * config_testkit::poll::deadline_scale()
 }
 
+/// The `Db` rows' budgets where L1's timing is not the subject (A-R392): the spec's, with the
+/// resume hold cut to 50 ms so a fresh partition admits at once, and L1's warn and pause ages
+/// scaled as a wait. At scale 1 they equal the spec's 1 s and 2 s exactly. The scale stretches
+/// deadlines only (AGENTS.md); this is the one protection budget that also stretches, because
+/// its age is measured against fsyncs and loop turns that a loaded host stalls for 0.5-2.8 s.
+/// A 400 ms pause age turned each such stall into a correct pause that the row did not expect
+/// (A-R291, A-R293, A-R313, A-R389, A-R391); A-R313 first scaled them this way, on one row.
+/// A row that asserts L1's timing takes [`test_budgets_pausing`] instead, or fixed literals
+/// (Trio's `fast_pause`, the spec-budget rows in `sync_tests`).
+#[cfg(test)]
+pub(crate) fn test_budgets() -> Budgets {
+    let millis = |base: u64| {
+        u64::try_from(test_patience(Duration::from_millis(base)).as_millis()).unwrap_or(u64::MAX)
+    };
+    Budgets {
+        resume_hold_millis: 50,
+        warn_age_millis: millis(Budgets::SPEC_DEFAULTS.warn_age_millis),
+        pause_age_millis: millis(Budgets::SPEC_DEFAULTS.pause_age_millis),
+        ..Budgets::SPEC_DEFAULTS
+    }
+}
+
+/// [`test_budgets`], with L1 warning at 200 ms and pausing at 400 ms at every scale: for the rows
+/// whose subject is an L1 pause, or its absence past the pause age (A-R392's opt-in list).
+#[cfg(test)]
+pub(crate) fn test_budgets_pausing() -> Budgets {
+    Budgets {
+        warn_age_millis: 200,
+        pause_age_millis: 400,
+        ..test_budgets()
+    }
+}
+
 /// Fail a test row at once when `status` shows F1 in a terminal phase. `Blocked` lasts until a
 /// fresh fence, which no row sends, and `Quarantined` for good, so nothing a row waits on can
 /// follow; waiting out its patience only hides why (lead ruling (c), 2026-10-07: a 300 ms CAS
@@ -1406,9 +1439,10 @@ struct InFlight {
 
 /// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
 /// an iteration, when its own copy of partition 1 is durable further than the primary's floor,
-/// at least through the `Seq` given, and through everything it has applied (A-R389). So the
-/// peers' answers that would raise the floor land in its mailbox while it sleeps, and nothing
-/// but those answers is needed to make every record safe. Crate tests only.
+/// at least through the `Seq` given, and through everything it has applied (A-R389), while L1
+/// admits (A-R392). So the peers' answers that would raise the floor land in its mailbox while
+/// it sleeps, and nothing but those answers is needed to make every record safe. Crate tests
+/// only.
 #[cfg(test)]
 static STALL_LOOP: Mutex<Vec<(PathBuf, Seq, Duration)>> = Mutex::new(Vec::new());
 
@@ -2073,7 +2107,7 @@ impl Host {
 
     /// [`STALL_LOOP`]: sleep once, armed for this copy, when its own copy of partition 1 is
     /// durable through the armed `Seq`, through all it has applied, and further than the primary's
-    /// floor.
+    /// floor, while L1 admits.
     #[cfg(test)]
     fn stall_loop(&mut self) {
         let partition = PartitionId(1);
@@ -2098,6 +2132,17 @@ impl Host {
         let applied = self.engine.buffered_applied(partition, generation).0;
         let through = armed[at].1;
         if own < through.0 || own <= floor || own < applied {
+            return;
+        }
+        // A-R392: and L1 admitting. A stall that begins paused can log no new `allow=false`
+        // after it, so the row would pass without testing anything.
+        let now = self.clock.now();
+        let admitting = self
+            .l1
+            .get(&partition)
+            .and_then(|l1| l1.protection.admission_state(now))
+            .is_some_and(|state| state.allow);
+        if !admitting {
             return;
         }
         let (_, _, pause) = armed.remove(at);

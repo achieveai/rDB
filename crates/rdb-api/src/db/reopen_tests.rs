@@ -7,7 +7,7 @@
 //!   read-then-CAS, and a reopened `Db` takes a fresh grant in the same boot after a control store
 //!   outage (A-R96).
 
-use super::tests::{owner_status, owner_when};
+use super::tests::{owner_status, owner_when, put_through_pauses};
 use super::*;
 
 fn config(dir: &Path) -> DbConfig {
@@ -34,7 +34,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
-/// L1's waits cut short, as `tests::fast` does, so a fresh open is ready quickly.
+/// The budgets of `tests::fast` (`host::test_budgets`, A-R392): a fresh open is ready quickly.
 ///
 /// Window kind: claims what is reported (A-R244, the A-R237 rule). Every row here claims an
 /// outcome (what an open refuses, keeps or reads back), never how long F1's discovery window
@@ -43,12 +43,9 @@ fn runtime() -> tokio::runtime::Runtime {
 /// stays the spec's.
 fn fast() -> Budgets {
     Budgets {
-        resume_hold_millis: 50,
-        warn_age_millis: 200,
-        pause_age_millis: 400,
         discovery_window_millis: Budgets::SPEC_DEFAULTS.discovery_window_millis
             * u64::from(config_testkit::poll::deadline_scale()),
-        ..Budgets::SPEC_DEFAULTS
+        ..crate::host::test_budgets()
     }
 }
 
@@ -413,32 +410,6 @@ fn reads_back_and_writes(db: &Db, case: &str) {
         Some(Bytes::from_static(b"2")),
         "{case}"
     );
-}
-
-/// A new put as `docs/rdb/embed.md` tells an app to send one: a `PROTECTION_PAUSED` refusal
-/// with `no_mutation` true wrote nothing, so the same put is sent again after a short wait.
-/// Any other refusal, or a pause that outlasts the patience, fails the row. A-R391: with the
-/// rows' 400 ms `pause_age_millis`, a WAL sync slower than that on every copy (530-628 ms in
-/// int gate k680) leaves the write before this one unsafe past the pause age. The owner then
-/// pauses and refuses this put, which is the product working, not a fault in the heal.
-fn put_through_pauses(db: &Db, object: &[u8], value: &[u8], case: &str) {
-    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
-    let mut paused = 0_u32;
-    loop {
-        match db.put(object, value, None) {
-            Ok(_) => break,
-            Err(refused)
-                if refused.error.kind == ErrorKind::ProtectionPaused
-                    && refused.error.no_mutation
-                    && Instant::now() < deadline =>
-            {
-                paused += 1;
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(refused) => panic!("{case}: {refused:?} after {paused} paused sends"),
-        }
-    }
-    tracing::info!(case, paused, "test_put_through_pauses");
 }
 
 /// S1-5 (#45): the store answers "unknown" to the reopen's recovery CAS. Whether it applied
