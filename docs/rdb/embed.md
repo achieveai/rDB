@@ -459,6 +459,8 @@ loses data. A write made meanwhile is refused.
   case for a resend, whatever the refusal. Send the **same** request again with
   `db.resend(..)` (the request is in `refused.request`), or ask `db.status(..)`. Never send it
   as a new write under a new id: it could apply twice.
+- **`GENERATION_CHANGED` is the exception:** never replay it as it is. A resend is refused
+  the same way, so ask `db.status(..)` with its request id whether an earlier send applied it.
 
 What each refusal means, and when to retry:
 

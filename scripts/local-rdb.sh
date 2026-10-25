@@ -364,11 +364,13 @@ pair() { # A-B -> "A B"
 # Verbs
 # ------------------------------------------------------------------------------------------
 
+# awk reads the whole list. `grep -q` stopped at the first match, the lister died of SIGPIPE,
+# and under pipefail that made a port in use read as free (critic-w5g N1).
 port_free() {
     if is_msys; then
-        ! netstat -ano -p TCP | awk '{print $2, $4}' | grep -q "[:.]$1 LISTENING"
+        netstat -ano -p TCP | awk -v p="$1" '$4 == "LISTENING" && $2 ~ ("[:.]" p "$") { f = 1 } END { exit f }'
     else
-        ! (ss -ltn 2>/dev/null | grep -q ":$1 ")
+        ss -ltn 2>/dev/null | awk -v p="$1" '$4 ~ (":" p "$") { f = 1 } END { exit f }'
     fi
 }
 
