@@ -2696,6 +2696,15 @@ fn m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up() {
         [("held_past_base".into(), shadowed.0.into())],
         "node 3 met the cutoff with its tail"
     );
+    // So the tail never joined the new generation: it is not linked onto the tail's.
+    assert!(
+        trio.nodes[2]
+            .0
+            .engine
+            .link(PartitionId(1), shadowed)
+            .is_none_or(|link| link.parent != held),
+        "generation {shadowed:?} linked onto the tail's {held:?}"
+    );
     let promotes = logged!(METHOD, "shadow_promote");
     assert_eq!(promotes.len(), 1, "one promote: {promotes:?}");
     assert!(

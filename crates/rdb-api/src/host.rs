@@ -1297,6 +1297,9 @@ pub(crate) fn drop_first_caught_up(node_dir: &std::path::Path) {
 /// stops at: a bounded backoff, kept until F1's post-commit sync reaches this copy.
 const CAUGHT_UP_RESEND_FIRST_MILLIS: u64 = 1_000;
 const CAUGHT_UP_RESEND_MAX_MILLIS: u64 = 8_000;
+/// The re-send that logs one warn, `caught_up_resend_unanswered`, and goes on: a count cap
+/// would bring back the silent stall after a long link hold (A-R422).
+const CAUGHT_UP_RESEND_WARN_AT: u32 = 16;
 
 /// A landing's `CopyCaughtUp`, kept for [`Host::resend_caught_up`] until F1 has it.
 #[derive(Debug)]
@@ -2272,6 +2275,10 @@ impl Host {
             self.timers.values().map(|(_, at, _)| *at).min(),
             self.l1.values().filter_map(|l1| l1.next_eval).min(),
             self.delayed.keys().next().map(|(at, _)| *at),
+            self.caught_up_resends
+                .values()
+                .map(|resend| resend.next)
+                .min(),
         ]
         .into_iter()
         .flatten()
@@ -2755,6 +2762,36 @@ impl Host {
         }
     }
 
+    /// #59 item 4: keep a landing's `CopyCaughtUp` for [`Self::resend_caught_up`], but only
+    /// when F1 can use it: the pin names this copy a regular secondary and the commit is not
+    /// `Active`, so F1 has a rebuild to pin (A-R422). A shadow's, or one for an `Active`
+    /// commit, is sent once and never re-sent.
+    fn track_caught_up(
+        &mut self,
+        result: &RecoveryResult,
+        event: &RecoveryEvent,
+        emitter: NodeId,
+        site: Site,
+    ) {
+        let regular =
+            result.committed.pinned_config.members.iter().any(|member| {
+                member.node == self.node && member.role == ReplicaRole::RegularSecondary
+            });
+        if !regular || result.mode == PartitionMode::Active {
+            return;
+        }
+        self.caught_up_resends.insert(
+            (site.partition, result.new_generation),
+            CaughtUpResend {
+                event: event.clone(),
+                emitter,
+                correlation: site.correlation,
+                attempt: 0,
+                next: self.clock.now().plus_millis(CAUGHT_UP_RESEND_FIRST_MILLIS),
+            },
+        );
+    }
+
     /// #59 item 4: re-send each landing's `CopyCaughtUp` that is due, to the F1 that committed,
     /// under its correlation, doubling the wait from [`CAUGHT_UP_RESEND_FIRST_MILLIS`] up to
     /// [`CAUGHT_UP_RESEND_MAX_MILLIS`]. F1 takes a repeat as it takes the first: required and
@@ -2779,6 +2816,16 @@ impl Host {
                 attempt = resend.attempt,
                 "caught_up_resent"
             );
+            if resend.attempt == CAUGHT_UP_RESEND_WARN_AT {
+                tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    emitter = resend.emitter.0,
+                    attempts = resend.attempt,
+                    "caught_up_resend_unanswered"
+                );
+            }
             let msg = Msg::Routed {
                 partition,
                 correlation: resend.correlation,
@@ -5845,6 +5892,16 @@ impl Host {
             self.stamp_retirement(partition, result.new_generation);
         }
         self.restore_marks(partition, result.new_generation)?;
+        // #59 item 4: the `CopyCaughtUp` below is kept for re-sending before the deferred
+        // syncs are answered, so a post-commit sync F1 sent before this landing ends it too
+        // (A-R422).
+        if first {
+            self.caught_up_resends
+                .retain(|(p, g), _| *p != partition || *g >= landed_generation);
+        }
+        if let Some(event) = &caught_up {
+            self.track_caught_up(&result, event, emitter, site);
+        }
         self.answer_deferred_syncs(partition, result.new_generation);
         self.acquire_after_link(&result, site);
         self.committed.insert(partition, result.clone());
@@ -5860,21 +5917,7 @@ impl Host {
         // shape; F1's `Committed` arm pins it and syncs it like any required copy.
         // #59 item 4: a lost one is re-sent on a backoff until F1's post-commit sync for this
         // generation reaches this copy ([`Self::resend_caught_up`]); a newer landing ends it.
-        if first {
-            self.caught_up_resends
-                .retain(|(p, g), _| *p != partition || *g >= landed_generation);
-        }
         if let Some(event) = caught_up {
-            self.caught_up_resends.insert(
-                (partition, landed_generation),
-                CaughtUpResend {
-                    event: event.clone(),
-                    emitter,
-                    correlation: site.correlation,
-                    attempt: 0,
-                    next: self.clock.now().plus_millis(CAUGHT_UP_RESEND_FIRST_MILLIS),
-                },
-            );
             #[cfg(test)]
             {
                 let mut dropped = DROP_CAUGHT_UP

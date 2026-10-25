@@ -558,9 +558,7 @@ fn m10_s2_59_a_landing_whose_receiver_is_refused_faults_by_name() {
 /// #59 item 7 (arch-s2 arm 2, critic-d7fix follow-up A2): two commits land outside the barrier
 /// in one boot, each at the cutoff. The first installs a receiver at generation 2. The second
 /// links generation 3 onto 2 and keeps that live receiver (`land_receiver_kept`), which its
-/// `Recovered` re-anchors from its own ladder, and still answers `CopyCaughtUp`. The trio row
-/// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up` reaches the same arm
-/// end to end (a shadow's receiver kept at its promote).
+/// `Recovered` re-anchors from its own ladder, and still answers `CopyCaughtUp`.
 /// Cut: the live receiver is replaced like a dormant one, red (generation 3 installed).
 /// Unit, about 2.5 s (the trio's bootstrap window).
 #[config_log::retcd_test]
@@ -615,6 +613,103 @@ fn m10_s2_59_a_second_landing_in_one_boot_keeps_the_live_receiver() {
         .collect();
     assert_eq!(kept, [(3.into(), 2.into(), false.into())]);
     assert_eq!(logged!(METHOD, "land_receiver_installed").len(), 1);
+}
+
+/// #59 item 4 (A-R422 F1): F1 may sync a copy after the commit before the copy lands; the
+/// sync waits in `deferred_syncs` and is answered at the landing. That sync is the one that
+/// ends the landing's `CopyCaughtUp` re-sends, so the re-send is kept before it is answered:
+/// with the first send lost, the landing ends with no re-send left (`caught_up_resend_done`).
+/// Item 2: a re-send is kept only when F1 can use it, so with no sync waiting it is kept for
+/// a regular secondary under a non-`Active` commit, and not for an `Active` commit or a
+/// shadow. Cut: the re-send is kept after `answer_deferred_syncs`, red (one left).
+/// Unit, about 2.5 s per case (the trio's bootstrap window).
+#[config_log::retcd_test]
+fn m10_s2_59_a_post_commit_sync_before_the_landing_ends_the_re_sends() {
+    const METHOD: &str = "m10_s2_59_a_post_commit_sync_before_the_landing_ends_the_re_sends";
+    let rt = current_thread();
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: CorrelationId(0),
+    };
+    // (sync waiting, mode, node 2's role in the pin) -> re-sends kept after the landing.
+    let cases = [
+        (
+            true,
+            PartitionMode::DegradedRf2,
+            ReplicaRole::RegularSecondary,
+            0,
+        ),
+        (
+            false,
+            PartitionMode::DegradedRf2,
+            ReplicaRole::RegularSecondary,
+            1,
+        ),
+        (
+            false,
+            PartitionMode::Active,
+            ReplicaRole::RegularSecondary,
+            0,
+        ),
+        (false, PartitionMode::DegradedRf2, ReplicaRole::Shadow, 0),
+    ];
+    for (waiting, mode, role, kept) in cases {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        let mut result = landing_at(2, digests[1]);
+        result.barrier = rdb_core::contracts::recovery::RecoveryBarrier::try_new(
+            &[],
+            &BTreeSet::new(),
+            Seq(2),
+            digests[1],
+        )
+        .expect("an empty barrier");
+        result.mode = mode.clone();
+        let member = result
+            .committed
+            .pinned_config
+            .members
+            .iter_mut()
+            .find(|member| member.node == NodeId(2))
+            .expect("node 2 is pinned");
+        member.role = role;
+        let copy = member.copy;
+        let mut host = host_over(&path, &rt);
+        if waiting {
+            host.deferred_syncs.insert(
+                (PartitionId(1), Generation(2)),
+                (
+                    NodeId(1),
+                    CorrelationId(0),
+                    PeerAsk::Sync {
+                        copy,
+                        cutoff: Seq(2),
+                        generation: Generation(2),
+                        post_commit: true,
+                    },
+                ),
+            );
+            crate::host::drop_first_caught_up(&path);
+        }
+        host.land(Box::new(result), site, NodeId(1)).expect("land");
+        assert_eq!(
+            host.caught_up_resends.len(),
+            kept,
+            "sync waiting {waiting}, {mode:?}, {role:?}"
+        );
+    }
+    let done = logged!(METHOD, "caught_up_resend_done");
+    assert_eq!(
+        done.len(),
+        1,
+        "the waiting sync ended the re-sends: {done:?}"
+    );
+    assert_eq!(logged!(METHOD, "test_caught_up_dropped").len(), 1);
 }
 
 /// A-R177 rows 3-5 (critic-f5 C2): the guards refuse before anything is written, each by
