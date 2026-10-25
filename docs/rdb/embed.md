@@ -566,7 +566,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - Nothing is lost: the other copies hold every acknowledged write.
   - Checked in rDB's simulator (`m10_d3_a_copy_behind_two_writeless_reopens_catches_up`) and on
     one node's storage (`a_copy_that_missed_two_writeless_generations_links_the_newest_onto_its_own`).
-    A check of the same case through a real open of a folder is still owed (issue #59).
+    Checked through a real open of its folder too
+    (`m10_s2_59_a_copy_behind_two_writeless_reopens_catches_up_through_a_real_open`).
 - **The host is starved** (CPU or disk saturated by other work). Timers run late, so writes
   can pause and then recover once the host has room.
 - **rEtcd stalls for more than about 2 s,** for example during its own leader election. Node
@@ -650,6 +651,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     `promote` answers `Unconfigured` ("node N holds no configuration since its restart"). The
     member list is kept in memory only. To recover, bring back the owner's node or restore its
     copy.
+  - **It also fires when only the node you promote has restarted** while the owner is down.
+    The way round: promote a node that has not restarted since the owner stopped.
   - **The old owner does not say "moved" yet.** After a promote while the old owner still
     runs, it answers `LEASE_EXPIRED` for 10 s or more, never `NOT_PRIMARY`. That answer means
     nothing was written: wait and send again, as its step says.

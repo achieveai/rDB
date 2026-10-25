@@ -453,6 +453,12 @@ The offline backup export (`snapshot::export_snapshot`) refuses a directory that
 marker; opening the store once redoes the install. Rows: `f001_*` in
 `config-storage/tests/m5_snapshot.rs`.
 
+Limit (review-s2 Q-R1, A-R418): the build's wait for an install, `INSTALL_PATIENCE` (300 s),
+counts from the build's start, not from each `InstallInFlight`. So an export plus an install
+that together take about 300 s spend every build attempt at once, and the node stops with a
+fatal error. It needs a restart; no data is lost. rEtcd's state today is far below the size
+such a build needs. Restarting the clock at each `InstallInFlight` is a follow-up.
+
 Store open also sets RocksDB `max_background_jobs = 16` (4 flush threads instead of 1, shared by
 every store in the process). With both changes `m5_snapshot_cluster` passed 20 of 20 runs under
 the same load.

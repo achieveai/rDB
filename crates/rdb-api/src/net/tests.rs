@@ -1060,8 +1060,9 @@ async fn an_app_link_never_delivers_a_peer_message() {
 }
 
 /// M10 S2 review-s2 F-008 row: which kinds each label may send, checked on every kind. An app
-/// may send a call, an `Inspect` and a promote's plan or fence, no other recovery event (C-3);
-/// a node may not name another
+/// may send a call, an `Inspect` and a promote's plan or fence, no other recovery event (C-3),
+/// and no catch-up, restore or landing (review-s2 F-008 gap, A-R418: each is listed, so an
+/// allow-list edit that names one goes red); a node may not name another
 /// node as sender, and kinds that name no sender pass. Unit.
 #[test]
 fn a_sender_is_held_to_its_certificate_label() {
@@ -1130,12 +1131,36 @@ fn a_sender_is_held_to_its_certificate_label() {
         ),
         "{progress:?}"
     );
+    let catch_up = on_wire(Msg::CatchUp {
+        asker: NodeId(2),
+        partition: PartitionId(1),
+        correlation: zero(),
+        from: CopyId(2),
+        to: CopyId(1),
+        through: zero(),
+        credential: zero(),
+        seed: seed(),
+    });
+    let restore = on_wire(Msg::Restore {
+        partition: PartitionId(1),
+        seed: seed(),
+    });
+    let landing = on_wire(Msg::Landed {
+        result: Box::new(landed()),
+        partition: PartitionId(1),
+        correlation: zero(),
+        emitter: NodeId(2),
+        not_before: zero(),
+    });
     for peer in [
         on_wire(frame_from(2)),
         on_wire(ask_from(2)),
         progress,
         inventory_failed,
         probe,
+        catch_up,
+        restore,
+        landing,
     ] {
         assert!(
             super::sender_refused(&app, &peer).is_some(),

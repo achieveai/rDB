@@ -1628,7 +1628,8 @@ pub enum PromoteError {
     #[error(
         "node {node} holds no configuration since its restart, so the promote cannot tell which \
          members are still catching up; nothing was changed. A promote needs a node that has \
-         landed a configuration since it started: start the node that owned partition 1"
+         landed a configuration since it started: start the node that owned partition 1, or \
+         promote a node that has not restarted since that node stopped"
     )]
     Unconfigured {
         /// The node asked for.

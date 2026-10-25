@@ -2421,6 +2421,13 @@ fn m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_names_the_limit() 
         "{}",
         refused.detail
     );
+    assert!(
+        refused
+            .detail
+            .ends_with("or promote a node that has not restarted since that node stopped"),
+        "the step names the way round (review-s2 Q-R2): {}",
+        refused.detail
+    );
     assert_eq!(
         partition_revision(&rt, &store),
         before,
@@ -2517,6 +2524,126 @@ fn m10_s2_a_node_process_whose_copy_is_behind_an_activated_generation_joins() {
     assert!(
         !logged.iter().any(|m| m == "db_open_rolled_forward"),
         "a joining copy is not rolled forward: {logged:?}"
+    );
+}
+
+/// #59 (A-R374, A-R418): the real-open twin of the simulator's
+/// `m10_d3_a_copy_behind_two_writeless_reopens_catches_up` and the host's
+/// `a_copy_that_missed_two_writeless_generations_links_the_newest_onto_its_own`. Node 3 is cut
+/// off across two reopens that write nothing: its copy is kept as it was before them, as a
+/// stopped process leaves it, and they move `partitions/1` to generation 3. It comes back
+/// through a real open of its folder, three node processes on one `Links`, its own open
+/// joining. Node 1 heals into generation 4. Node 3's inventory for generation 3 links 3 straight
+/// onto the generation 1 it holds (`inventory_link_inherited from=1`, the host row's jump), and
+/// it lands 4 on that. The write made before reads back, a new one lands, and node 3 holds it
+/// durable in generation 4 with node 1's digest: nothing acknowledged is lost.
+/// Integration (~10 s): one fresh open, two reopens until ready (~3 s each), three node opens
+/// until ready.
+#[config_log::retcd_test]
+fn m10_s2_59_a_copy_behind_two_writeless_reopens_catches_up_through_a_real_open() {
+    const METHOD: &str =
+        "m10_s2_59_a_copy_behind_two_writeless_reopens_catches_up_through_a_real_open";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let nodes_dir = dir.path().join("nodes");
+    written_and_closed(&rt, dir.path(), &store);
+    let third = nodes_dir.join("3");
+    let cut_off = config_testkit::fs::temp_dir();
+    copy_dir(&third, cut_off.path());
+
+    for reopen in [2_u64, 3] {
+        let mut db = open(&rt, dir.path(), &store).expect("a writeless reopen");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the writeless reopen is ready");
+        db.shutdown();
+        drop(db);
+        assert_eq!(
+            stored_generation(&rt, &store),
+            Some(reopen),
+            "no write, one generation on"
+        );
+    }
+    std::fs::remove_dir_all(&third).expect("remove node 3's copy");
+    copy_dir(cut_off.path(), &third);
+
+    let links = Links::new();
+    let mut nodes: Vec<Db> = [1, 2, 3]
+        .into_iter()
+        .map(|node| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    links: Some(Arc::clone(&links)),
+                    ..node_config(dir.path(), &[node])
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .unwrap_or_else(|e| panic!("node {node}'s process opens: {e}"))
+        })
+        .collect();
+    nodes[0]
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("node 1's process heals and is ready");
+    reads_back_and_writes(&nodes[0], "node 1's process");
+    let newest = Generation(stored_generation(&rt, &store).expect("partitions/1"));
+    assert_eq!(newest, Generation(4), "the heal moved the database on once");
+    let published = owner_status(&nodes[0], "node 1")
+        .published
+        .expect("node 1 publishes");
+    assert_eq!(published.0, newest, "{published:?}");
+
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        let held = nodes[2]
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == NodeId(3))
+            .and_then(|status| status.holds);
+        if held.is_some_and(|held| held.generation == newest && held.durable >= published.1 .0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 3 never caught up to {published:?}: {held:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for db in &mut nodes {
+        db.shutdown();
+    }
+    drop(nodes);
+
+    let joined: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "db_open_joining")
+        .collect();
+    assert_eq!(joined.len(), 1, "node 3's open joins: {joined:?}");
+    assert_eq!(joined[0]["generation"], 3, "{joined:?}");
+
+    let owner = RocksEngine::open_existing(nodes_dir.join("1")).expect("node 1's copy");
+    let caught = RocksEngine::open_existing(&third).expect("node 3's copy");
+    assert_eq!(
+        (
+            caught
+                .link(PARTITION, Generation(3))
+                .map(|link| link.parent),
+            caught.link(PARTITION, newest).map(|link| link.parent),
+        ),
+        (Some(Generation(1)), Some(Generation(3))),
+        "node 3 links the newest generation it missed onto the generation 1 it held, skipping \
+         2, and lands the heal's generation 4 on that"
+    );
+    assert_eq!(
+        caught.durable(PARTITION, newest).0,
+        published.1 .0,
+        "node 3 holds the new write durable"
+    );
+    assert_eq!(
+        digest_at(&caught, newest, published.1),
+        digest_at(&owner, newest, published.1),
+        "node 3 holds what node 1 holds"
     );
 }
 
