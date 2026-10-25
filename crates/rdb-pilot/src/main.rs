@@ -27,7 +27,9 @@
 //! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`), or with
 //! `--nodes` a node refused the link (`links down after Ss: node N: refused: ...`: another CA, the
 //! wrong node at that address, something that is not TLS, a newer protocol); 4 `--verify`
-//! found a journalled key missing or wrong; 5 not ready in time.
+//! found a journalled key missing or wrong; 5 not ready in time; 6 a `--retry-for` put whose
+//! status answered `Expired`: too old to settle, so whether it landed is not known (read the
+//! object). The same list ends the usage text that a bad argument, `--help` included, prints.
 //!
 //! Logs go to `L/pilot_kv.jsonl` (default `D` with `.logs` appended) and never carry key or
 //! value text (ADR-0013, A-R154): the pilot logs counts and indices only.
@@ -79,6 +81,10 @@ use rdb_api::{
 /// The ack journal's file name, inside the rDB folder.
 const JOURNAL: &str = "pilot_kv.journal";
 
+/// The exit code of a `--retry-for` put whose status answered `Expired` (A-R401 F5): too old to
+/// settle, so whether it landed is not known. Not 0, so a kit never reads it as "applied once".
+const EXPIRED: u8 = 6;
+
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     dir: PathBuf,
@@ -105,7 +111,12 @@ struct Args {
 const USAGE: &str = "usage: pilot_kv --dir D --control host:port[,host:port...] [--log-dir L] \
                      [--ready-secs S] [--write N] [--reopens K] [--verify] [--bench] \
                      [--nodes 1=ADDR,2=ADDR,3=ADDR --cert-dir C [--app NAME] [--client-id N]] \
-                     [--put KEY=VALUE [--request-id N] [--retry-for S]] [--get KEY]";
+                     [--put KEY=VALUE [--request-id N] [--retry-for S]] [--get KEY]\n\
+                     exits: 0 done; 1 a write or read failed, or a retry still unsettled; \
+                     2 bad arguments or setup; 3 the folder or a link was refused; \
+                     4 --verify found a key missing or wrong; 5 not ready in time; \
+                     6 a retried put's status answered Expired: whether it landed is not \
+                     known, read the object";
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut dir = None;
@@ -678,7 +689,7 @@ fn settle_by_status(
                              its value"
                                 .to_owned(),
                         );
-                        return Ok(());
+                        return Err(ExitCode::from(EXPIRED));
                     }
                     TxnStatus::Unknown | TxnStatus::Unresolved { .. } => {}
                 }
@@ -1217,7 +1228,8 @@ mod tests {
     /// resend is sent again, but a `GENERATION_CHANGED` one never is. The pilot asks `status`
     /// instead, until it says, as embed.md's "did my write land?" does. On the walk the pilot
     /// resent 169 times and never asked. Cut: the `GENERATION_CHANGED` arm removed, so the third
-    /// resend panics here, red. Unit (~20 ms): no `Db`.
+    /// resend panics here, red. `Expired` exits 6, never 0 (A-R401 F5); cut: it
+    /// answers `Ok` again, red. Unit (~20 ms): no `Db`.
     #[test]
     fn d5_a_generation_changed_resend_is_settled_by_status_and_never_sent_again() {
         let mut resends = 0;
@@ -1250,7 +1262,7 @@ mod tests {
             },
             &mut |line| lines.push(line),
         );
-        assert!(answer.is_ok(), "{lines:?}");
+        assert_eq!(answer, Err(ExitCode::from(EXPIRED)), "{lines:?}");
         assert_eq!((resends, looks), (2, 2), "{lines:?}");
         assert!(
             lines[1].starts_with("retry 2 generation_changed"),

@@ -861,6 +861,10 @@ pub enum Answer {
         generation: Generation,
         /// The position of that view.
         at: Seq,
+        /// The node served it from a recovery `ReadOnly` generation (spec §8.4 step 4): a lone
+        /// copy's declared cutoff, which may lack writes acknowledged just before the loss
+        /// (A-R401 F3, A-R402).
+        recovery_mode: bool,
     },
     /// A put compiled and not sent. Send it with [`ClientCall::Resend`].
     Compiled(TxnRequest),
@@ -876,6 +880,17 @@ pub enum Answer {
         /// [`ClientCall::Resend`] caller already holds what it sent.
         request: Option<TxnRequest>,
     },
+}
+
+impl Answer {
+    /// This answer, with a read's `recovery_mode` set to `on`. Any other answer is unchanged.
+    #[must_use]
+    fn in_mode(mut self, on: bool) -> Self {
+        if let Self::Read { recovery_mode, .. } = &mut self {
+            *recovery_mode = on;
+        }
+        self
+    }
 }
 
 /// One node's state for one partition, for `nodes` and the ready poller.
@@ -7938,7 +7953,8 @@ impl Host {
             },
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
                 .read_answer(partition, *outcome, *value, &root, &look)
-                .map_err(|detail| fail_waiter(&pending.reply, detail))?,
+                .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .in_mode(self.recovery_mode(partition)),
             (reply, kind) => {
                 return Err(fail_waiter(
                     &pending.reply,
@@ -8029,6 +8045,7 @@ impl Host {
                 seen: Seen::Absent,
                 generation: Generation(0),
                 at: Seq::ZERO,
+                recovery_mode: false,
             },
             Ok(handle) => {
                 let view = self.bound.get(&handle).ok_or_else(|| {
@@ -8045,10 +8062,19 @@ impl Host {
                     ReadServiceOutcome::Served,
                 )
                 .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .in_mode(self.recovery_mode(crate::admin::PARTITION))
             }
         };
         let _ = pending.reply.send(answer);
         self.release_queued(identity)
+    }
+
+    /// Whether this node's last committed recovery of `partition` is `ReadOnly`: its reads then
+    /// serve a lone copy's declared cutoff (spec §8.4 step 4, A-R402).
+    fn recovery_mode(&self, partition: PartitionId) -> bool {
+        self.committed
+            .get(&partition)
+            .is_some_and(|committed| committed.mode == PartitionMode::ReadOnly)
     }
 
     /// §4.2: the bytes come from the step view P1 just answered from, re-checked against the
@@ -8071,6 +8097,7 @@ impl Host {
                 seen: Seen::Absent,
                 generation,
                 at,
+                recovery_mode: false,
             });
         };
         let key = root.as_bytes();
@@ -8875,6 +8902,7 @@ fn object_answer_unchecked(
             seen,
             generation,
             at,
+            recovery_mode: false,
         },
         Err(error) => {
             let chunk = upload.zip(damaged_chunk(&error));

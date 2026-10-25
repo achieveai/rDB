@@ -1040,6 +1040,7 @@ fn a_read_waits_at_the_barrier_while_the_previous_view_answers_at_once() {
             seen,
             generation,
             at,
+            ..
         } => assert_eq!(
             (outcome, doc_bytes(seen), generation, at),
             (

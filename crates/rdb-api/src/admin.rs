@@ -1805,6 +1805,22 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         now = decided.0,
         "promote_expiry_proven"
     );
+    // A member pinned unlinked whose handshake came during the wait is pinned at its boot after
+    // all, so F1 can count it (A-R401 F1). One that is still unlinked stays at `UNLINKED_BOOT`.
+    let members: Vec<Member> = members
+        .into_iter()
+        .map(|member| match (ctx.member_boot)(member.node) {
+            Some(boot) if member.boot == UNLINKED_BOOT => {
+                tracing::info!(
+                    node = member.node.0,
+                    boot = boot.0,
+                    "promote_member_linked_late"
+                );
+                Member { boot, ..member }
+            }
+            _ => member,
+        })
+        .collect();
 
     // 6. The record again, after the freeze, and the plan.
     let (fenced, fenced_root, control_revision, read_revision) =
@@ -1972,10 +1988,19 @@ async fn cas(
 }
 
 /// The boot a promote pins a kept member at when no link to it came up (D4, A-R398): `0`,
-/// which no process runs, since [`crate::db::next_boot`] starts at 1. F1 then never counts that
-/// copy, so a promote with one live copy commits `ReadOnly` (`mode_for(1)`) and never admits a
-/// write. When the member starts again its live boot is above this pin, so the owner re-plans
-/// it in (`rejoin_if_stale`).
+/// which no process runs, since [`crate::db::next_boot`] starts at 1.
+///
+/// What it does, by F1's rules (critic-d4 Q1, A-R401 F1):
+/// - A dead member never answers F1's inventory query, so `recovery::select` counts only the
+///   live copies, and a lone survivor commits `ReadOnly` (`mode_for(1)`): no write is admitted.
+///   The pin plays no part in the mode.
+/// - A live member pinned here that does answer is counted, but its durability proof carries
+///   its real boot, which the barrier never matches to `0`: the barrier ends incomplete and
+///   nothing commits. The promote then fails "did not commit"; promoting again pins its real
+///   boot. `promote` re-reads the boot after the expiry wait, so a handshake that comes late
+///   is taken in that same run.
+/// - When the member starts again, the owner's `repair_duty` of the `ReadOnly` commit probes
+///   it as a pinned regular secondary and re-plans it at the boot its link reports.
 pub(crate) const UNLINKED_BOOT: BootId = BootId(0);
 
 /// The members kept, each at its boot; `to` becomes the primary and a `Shadow` stays one. Polls
@@ -3489,6 +3514,49 @@ mod tests {
                 (NodeId(3), ReplicaRole::Primary, OPEN_2)
             ]
         );
+    }
+
+    /// A-R401 F1 (critic-d4 Q1): node 2's handshake comes after the promote pinned it unlinked
+    /// but before the grant's expiry is proven. The plan sent then pins node 2 at its real
+    /// boot, so F1 can count it, instead of at [`UNLINKED_BOOT`], which a live copy's proof
+    /// never matches. Cut: no re-read after the expiry wait, red (node 2 at boot 0).
+    /// Unit (~1 s): `MemStore`, a 600 ms promote; node 2 links at 250 ms, after the 150 ms
+    /// unlinked bound.
+    #[test]
+    fn m10_s2_f1_a_member_that_links_during_the_expiry_wait_is_planned_at_its_boot() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let started = std::time::Instant::now();
+        let (_, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(3),
+            None,
+            members(),
+            Arc::new(move |node: NodeId| {
+                (node == NodeId(3) || started.elapsed() >= Duration::from_millis(250))
+                    .then_some(OPEN_2)
+            }),
+            Duration::from_millis(600),
+        );
+        let boots: Vec<(NodeId, BootId)> = sent
+            .iter()
+            .find_map(|(_, msg)| match msg {
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::Plan(plan)),
+                    ..
+                } => Some(
+                    plan.config
+                        .members
+                        .iter()
+                        .map(|member| (member.node, member.boot))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("a plan was sent");
+        assert_eq!(boots, [(NodeId(2), OPEN_2), (NodeId(3), OPEN_2)]);
     }
 
     /// A-R262: an `UNAVAILABLE` promote refusal says to promote again, and its next step agrees:
