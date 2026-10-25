@@ -328,6 +328,10 @@ Then ask:
   `get`, or give up and report it. A request of the current open still in flight can answer
   `Unknown` until it publishes. Ask again a few times within a few seconds at most. Never poll
   `status` forever.
+- **After `GENERATION_CHANGED`, a `NotKnown` that stays means: read the object.** `did_it_land`
+  then asks `status` about the first send. If it still answers `NotKnown` after a few asks over
+  a few seconds, asking more will not settle it. Read the object: its value is the answer.
+  Never send the request as a new write.
 
 `crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
 
@@ -472,9 +476,16 @@ What each refusal means, and when to retry:
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
 | `UNAVAILABLE`, "went out of reach while this call waited" | The owner's process stopped mid-call. | Once it is back. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
+| `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
 
 `did_it_land` above does the "ask" part. Keep resending the same request and it lands once the
 pause ends.
+
+**Limit a retry loop by time, not by count.** With three processes, a write whose owner link
+is down first asks rEtcd who owns the partition now, and waits up to `Timeouts::read` (1 s)
+for that answer. With rEtcd down too, each refused `put` took about 0.8 s. A loop of 2,000
+retries then runs for about 27 minutes and looks like a hang. Stop retrying a set time after
+the first refusal.
 
 Measured with three processes on the dev host (local-cluster.md section 5 has the walk), an
 app writing all the time:
@@ -487,6 +498,11 @@ app writing all the time:
 
 Every acknowledged write read back afterwards (28,734, 6,217 and 13,644 of them, 0 missing).
 One run each, on a busy host: treat the times as rough.
+
+A later walk killed node 2 and started it 20 s later. The kill showed `PROTECTION_PAUSED`,
+`LEASE_EXPIRED`, `UNAVAILABLE` "not yet marked activated", `PROTECTION_PAUSED`. The start gave
+two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNAVAILABLE`.
+31,428 of 31,428 acknowledged writes read back.
 
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
   new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
@@ -519,6 +535,17 @@ One run each, on a busy host: treat the times as rough.
   The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
   one more copy and the partition becomes read-only. A copy wiped after forming is not
   affected: it rejoins through the heal.
+- **With 2 of 3 copies down, an app can read but not write.** Node 1 then finishes its
+  recovery with only its own copy. That is what `wait_ready`'s "node 1's recovery phase is
+  Committed" (or `Rebuilding`) means here: the recovery is done, but with too few copies to take
+  writes. So `wait_ready` never returns `Ok`, and the sample's `?` exits after 60 s.
+  - `get` and `read` do not need `wait_ready`. To start for reads, treat
+    `ReadyError::TimedOut` as "no writes yet" and keep the `Db`, instead of returning the error.
+  - A write is refused `RECOVERY_READ_ONLY` ("reads still work; writes return when the lost
+    copies are back"). Its `no_mutation` is false, so resend that same request later.
+  - Writes return once a second copy is back.
+  - Seen in an embedded run with node 1's links to 2 and 3 held (`rdb_dev --hold 1-2,1-3`):
+    `get` answered, `put` was refused as above.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
@@ -549,7 +576,10 @@ One run each, on a busy host: treat the times as rough.
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
 - **A restarted secondary rejoins by itself** once the owner re-plans: writes pause briefly,
-  then resume. **A restarted owner stays out until the folder is opened again.** See section 5.
+  then resume. **Embedded only: a restarted owner stays out until the folder is opened
+  again.** That is node 1 restarted inside this open (`Db::restart_node`); see section 5. With
+  three processes, a restarted owner process comes back and serves with no app reopen: writes
+  were refused for 3.6 s (`lr restart 1`, local-cluster.md section 5).
 - **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
