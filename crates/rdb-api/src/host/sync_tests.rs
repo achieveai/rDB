@@ -40,6 +40,19 @@ fn config(dir: &std::path::Path) -> DbConfig {
     }
 }
 
+/// A-R395: [`config`] with the stuck-sync limit at the spec's 5 s scaled as a wait
+/// ([`test_patience`]; equal to the spec at scale 1), for the rows whose subject is a slow
+/// sync's tolerance, not the stuck limit. Beside 3 suite loops a held 1-3 s sync stayed in
+/// flight past an unscaled 5 s and faulted its node (A-R393 soak: 7 such reds in 15 lane runs).
+/// The stuck row keeps the real 5 s.
+fn config_slow_tolerant(dir: &std::path::Path) -> DbConfig {
+    let stuck = test_patience(Duration::from_millis(
+        rdb_storage::DEFAULT_SYNC_STUCK_MILLIS,
+    ));
+    let mut config = config(dir);
+    config.storage.sync_stuck_millis = Some(u64::try_from(stuck.as_millis()).unwrap_or(u64::MAX));
+    config
+}
 /// The `Db` rows' `fast()`: `host::test_budgets` (A-R392).
 fn fast() -> Budgets {
     crate::host::test_budgets()
@@ -143,11 +156,12 @@ fn slow_steps(lines: &[Line], from: usize) -> Vec<&Line> {
 /// recovery `Sync` answers go through the syncer. Each continuation runs only after a sync that
 /// began after its write: a `link_synced` (and the acquire it releases, node 1's `activate`)
 /// follows a held sync begun after its `link_sync_requested`, and each pre-commit
-/// `sync_proven` follows a held sync begun after its `holder_sync_requested`. Meanwhile no
-/// node thread takes a step over 500 ms, and the reopen admits writes and reads back.
+/// `sync_proven` follows a held sync begun after its `holder_sync_requested`. Every held sync
+/// runs on its node's syncer thread, and the reopen admits writes and reads back.
 /// Cut: `land` schedules the acquire without waiting on `link_pending`, red (node 1 wrote `b`
 /// with no `link_synced`). Cut: the holder answers before `Msg::Synced`, red (`sync_proven` before the
-/// held sync). Cut: the link or holder sync inline on the node thread, red (a step over 500 ms).
+/// held sync). Cut: the link or holder sync inline on the node thread, red (a held sync logged by
+/// `rdb-node-N`).
 /// Integration (~10 s): a fresh open, then a reopen whose every sync is held 1 s.
 #[config_log::retcd_test]
 fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps_stepping() {
@@ -157,7 +171,7 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     {
-        let mut db = open(&rt, config(dir.path()), &store, fast());
+        let mut db = open(&rt, config_slow_tolerant(dir.path()), &store, fast());
         admits_within(&db, "the first open", Duration::from_secs(10));
         db.put(b"a", b"1", None).expect("put a");
         db.shutdown();
@@ -166,7 +180,7 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
         slow_sync(&node_dir(dir.path(), node), Duration::from_secs(1), true);
     }
     tracing::info!("f4_slow_armed");
-    let mut db = open(&rt, config(dir.path()), &store, fast());
+    let mut db = open(&rt, config_slow_tolerant(dir.path()), &store, fast());
     admits_within(&db, "the reopen", Duration::from_secs(30));
     let read = db.get(b"a").expect("get a");
     assert_eq!(
@@ -182,10 +196,20 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
 
     let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
     let armed = next(&lines, 0, "f4_slow_armed", &|_| true).expect("the marker");
-    let slow = slow_steps(&lines, armed);
+    // A-R393: every held sync ran on its node's syncer, as the thread that logged it says. Not
+    // a step's length: a loaded host starves a node thread past 500 ms with no sync in the
+    // step (2 of 25 runs beside 3 suite loops); a held sync on the node thread is red here at
+    // any load.
+    let inline: Vec<&Line> = lines[armed..]
+        .iter()
+        .filter(|line| {
+            is(line, "test_sync_slowed")
+                && line["thread"] != format!("rdb-sync-{}", num(line, "node")).as_str()
+        })
+        .collect();
     assert!(
-        slow.is_empty(),
-        "node-thread steps over {STEP_LIMIT_MILLIS} ms: {slow:?}"
+        inline.is_empty(),
+        "held syncs off their node's syncer: {inline:?}"
     );
     let waited = waited_on_a_sync(&lines, armed);
     assert!(
@@ -226,27 +250,40 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
     }
     assert!(links > 0, "the reopen requested no link sync");
 
+    // Each pre-commit `sync_proven` is paired with its own ask: the earliest matching ask not
+    // yet answered, since a node answers its asks in order (`sync_next` is FIFO). A-R393: a
+    // `barrier_retry` re-asks the same cutoff while the first ask's sync is held; that re-ask
+    // waits for the next sync, and pairing it with the next `sync_proven` after it took the
+    // first ask's answer for its own (red under load, though both answers were sound).
     let mut answers = 0;
+    let mut paired: Vec<usize> = Vec::new();
     for at in (armed..lines.len())
-        .filter(|&at| is(&lines[at], "holder_sync_requested") && lines[at]["post_commit"] == false)
+        .filter(|&at| is(&lines[at], "sync_proven") && lines[at]["post_commit"] == false)
     {
-        let asked = &lines[at];
-        let node = num(asked, "node");
+        let proven = &lines[at];
+        let node = num(proven, "node");
         let same = |line: &Line| {
             num(line, "node") == node
-                && num(line, "copy") == num(asked, "copy")
-                && num(line, "cutoff") == num(asked, "cutoff")
+                && num(line, "copy") == num(proven, "copy")
+                && num(line, "cutoff") == num(proven, "cutoff")
+                && num(line, "generation") == num(proven, "generation")
                 && line["post_commit"] == false
         };
-        let Some(proven) = next(&lines, at, "sync_proven", &same) else {
-            continue;
-        };
-        let held = next(&lines, at, "test_sync_slowed", &|line| {
+        let asked = (armed..at)
+            .find(|&ask| {
+                is(&lines[ask], "holder_sync_requested")
+                    && same(&lines[ask])
+                    && !paired.contains(&ask)
+            })
+            .unwrap_or_else(|| panic!("node {node}: sync_proven with no ask before it: {proven}"));
+        paired.push(asked);
+        let held = next(&lines, asked, "test_sync_slowed", &|line| {
             num(line, "node") == node
         });
         assert!(
-            held.is_some_and(|held| held < proven),
-            "node {node}: sync_proven without a held sync begun after its ask: {asked}"
+            held.is_some_and(|held| held < at),
+            "node {node}: sync_proven without a held sync begun after its ask: {}",
+            lines[asked]
         );
         answers += 1;
     }
@@ -279,48 +316,70 @@ fn wait_for_line(
 /// dropped its `Msg::Synced`, so the engine still counted the sync in flight and the clean
 /// stop's synced final marks logged `synced_write_during_sync`. Now the stop finishes that sync
 /// first (`sync_finished_at_stop`), and nothing logs a write that waited on a sync.
+/// A-R393: an attempt whose stop came only after node 1's held syncs had all returned (a
+/// starved test thread, 3 s late in 1 of 25 runs beside 3 suite loops) had no sync in flight
+/// to finish, so it proves nothing and the row tries again, up to 3 times.
 /// Cut: drop `finish_sync_at_stop` from the stop, red (no `sync_finished_at_stop`, and the final
 /// marks log `synced_write_during_sync`).
-/// Integration (~2 s): a fresh open, then a stop while node 1's sync is held 1 s.
+/// Integration (~2 s per attempt): a fresh open, then a stop while node 1's sync is held 1 s.
 #[config_log::retcd_test]
 fn m10_f4_a_stop_with_a_sync_in_flight_finishes_it_before_the_final_marks() {
     const METHOD: &str = "m10_f4_a_stop_with_a_sync_in_flight_finishes_it_before_the_final_marks";
     let rt = runtime();
-    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-    let dir = config_testkit::fs::temp_dir();
-    let mut db = open(&rt, config(dir.path()), &store, fast());
-    admits_within(&db, "the open", Duration::from_secs(10));
-    db.put(b"a", b"1", None).expect("put a");
-    let one = node_dir(dir.path(), 1);
-    tracing::info!("f4_slow_armed");
-    slow_sync(&one, Duration::from_secs(1), true);
-    let armed = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
-    wait_for_line(
-        METHOD,
-        armed,
-        "test_sync_slowed",
-        &|line| num(line, "node") == 1,
-        Duration::from_secs(5),
-    );
-    db.shutdown();
-    clear_slow_sync(&one);
+    for attempt in 1..=3 {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open(&rt, config(dir.path()), &store, fast());
+        admits_within(&db, "the open", Duration::from_secs(10));
+        // A-R393, as A-R392 for the stuck row: armed before `put a`, whose own sync is the one
+        // held. Armed after it, a slow test thread let that sync run unheld, and with nothing
+        // else to sync no held sync came at all. A put does not wait for its own fsync.
+        let one = node_dir(dir.path(), 1);
+        tracing::info!(attempt, "f4_slow_armed");
+        let armed = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+        slow_sync(&one, Duration::from_secs(1), true);
+        db.put(b"a", b"1", None).expect("put a");
+        wait_for_line(
+            METHOD,
+            armed,
+            "test_sync_slowed",
+            &|line| num(line, "node") == 1,
+            Duration::from_secs(5),
+        );
+        db.shutdown();
+        clear_slow_sync(&one);
 
-    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-    let finished = next(&lines, armed, "sync_finished_at_stop", &|line| {
-        num(line, "node") == 1 && line["ok"] == true
-    });
-    let marks = next(&lines, armed, "host_duty", &|line| {
-        num(line, "node") == 1 && line["kind"] == "final_marks"
-    });
-    assert!(
-        finished.is_some_and(|finished| marks.is_some_and(|marks| finished < marks)),
-        "node 1 stopped with a sync in flight: finished {finished:?}, final marks {marks:?}"
-    );
-    let waited = waited_on_a_sync(&lines, armed);
-    assert!(
-        waited.is_empty(),
-        "a write or sync waited on a sync in flight: {waited:?}"
-    );
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let of_one = |line: &Line| num(line, "node") == 1;
+        let finished = next(&lines, armed, "sync_finished_at_stop", &|line| {
+            of_one(line) && line["ok"] == true
+        });
+        let marks = next(&lines, armed, "host_duty", &|line| {
+            of_one(line) && line["kind"] == "final_marks"
+        });
+        // Every held sync of node 1 returned on its node thread before the final marks: the
+        // stop found none in flight. A dropped `Msg::Synced` logs no `wal_sync_slow`, so the
+        // cut never reads as late.
+        let late = marks.is_some_and(|marks| {
+            held_syncs(&lines, armed, 1)
+                .iter()
+                .all(|&(_, returned)| returned < marks)
+        });
+        if finished.is_none() && late && attempt < 3 {
+            tracing::info!(attempt, "f4_stop_came_after_the_held_syncs");
+            continue;
+        }
+        assert!(
+            finished.is_some_and(|finished| marks.is_some_and(|marks| finished < marks)),
+            "node 1 stopped with a sync in flight: finished {finished:?}, final marks {marks:?}"
+        );
+        let waited = waited_on_a_sync(&lines, armed);
+        assert!(
+            waited.is_empty(),
+            "a write or sync waited on a sync in flight: {waited:?}"
+        );
+        return;
+    }
 }
 
 /// The index ranges `[slowed, returned)` of node `node`'s held syncs at or after `from`: each
@@ -479,7 +538,12 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    let mut db = open(&rt, config(dir.path()), &store, Budgets::SPEC_DEFAULTS);
+    let mut db = open(
+        &rt,
+        config_slow_tolerant(dir.path()),
+        &store,
+        Budgets::SPEC_DEFAULTS,
+    );
     admits_within(&db, "the open", Duration::from_secs(10));
     db.put(b"a", b"1", None).expect("put a");
     let before = status_of(&db, 1).authority;
@@ -567,9 +631,11 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
 /// product budgets. Durability then ages past L1's pause age again and again, so puts may be
 /// refused `PROTECTION_PAUSED` for most of the run; that is L1 doing its job, not a stall. What
 /// must hold: the owner keeps its grant (same grant id, no fence), no node faults (3 s is under
-/// the 5 s stuck limit), no node-thread step goes over 500 ms, and nothing waits on a held sync.
+/// the 5 s stuck limit, scaled as a wait here by A-R395), no node-thread step goes over 500 ms,
+/// and nothing waits on a held sync.
 /// Cut: every sync inline on the node thread, red (node 1 lost its grant: grant 1, then 2).
-/// Integration (~15 s): a fresh open, 12 s of held syncs, then a stop that waits the last out.
+/// Integration (~15 s): a fresh open, 12 s of held syncs (more under load, until 3 begin on
+/// each node, A-R395), then a stop that waits the last out.
 #[config_log::retcd_test]
 fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_grant() {
     const METHOD: &str =
@@ -577,7 +643,12 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    let mut db = open(&rt, config(dir.path()), &store, Budgets::SPEC_DEFAULTS);
+    let mut db = open(
+        &rt,
+        config_slow_tolerant(dir.path()),
+        &store,
+        Budgets::SPEC_DEFAULTS,
+    );
     admits_within(&db, "the open", Duration::from_secs(10));
     db.put(b"a", b"1", None).expect("put a");
     let before = status_of(&db, 1).authority;
@@ -587,7 +658,23 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
         slow_sync(&node_dir(dir.path(), node), Duration::from_secs(3), true);
     }
     let start = Instant::now();
-    let sent = puts_at_50_per_s(&db, start, &|_| start.elapsed() > Duration::from_secs(12));
+    // A-R395: 12 s, then on until every node has begun 3 held syncs, within the scaled 12 s.
+    // Beside 3 suite loops a held sync's own fsync ran 6.7 s past its 3 s hold, so 12 s held
+    // only 2 per node. At scale 1 the bound is the 12 s it was.
+    let bound = test_patience(Duration::from_secs(12));
+    let checked = std::cell::Cell::new(start);
+    let sent = puts_at_50_per_s(&db, start, &|_| {
+        let elapsed = start.elapsed();
+        if elapsed <= Duration::from_secs(12)
+            || checked.get().elapsed() < Duration::from_millis(200)
+        {
+            return elapsed > bound;
+        }
+        checked.set(Instant::now());
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let armed = next(&lines, 0, "f4_slow_armed", &|_| true).expect("the marker");
+        elapsed > bound || (1..=3).all(|node| held_syncs(&lines, armed, node).len() >= 3)
+    });
     let statuses: Vec<NodeStatus> = (1..=3).map(|node| status_of(&db, node)).collect();
     for node in 1..=3 {
         clear_slow_sync(&node_dir(dir.path(), node));
