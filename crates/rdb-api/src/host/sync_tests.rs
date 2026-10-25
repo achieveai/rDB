@@ -634,7 +634,8 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
 /// the 5 s stuck limit, scaled as a wait here by A-R395), no node-thread step goes over 500 ms,
 /// and nothing waits on a held sync.
 /// Cut: every sync inline on the node thread, red (node 1 lost its grant: grant 1, then 2).
-/// Integration (~15 s): a fresh open, 12 s of held syncs, then a stop that waits the last out.
+/// Integration (~15 s): a fresh open, 12 s of held syncs (more under load, until 3 begin on
+/// each node, A-R395), then a stop that waits the last out.
 #[config_log::retcd_test]
 fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_grant() {
     const METHOD: &str =
@@ -657,7 +658,23 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
         slow_sync(&node_dir(dir.path(), node), Duration::from_secs(3), true);
     }
     let start = Instant::now();
-    let sent = puts_at_50_per_s(&db, start, &|_| start.elapsed() > Duration::from_secs(12));
+    // A-R395: 12 s, then on until every node has begun 3 held syncs, within the scaled 12 s.
+    // Beside 3 suite loops a held sync's own fsync ran 6.7 s past its 3 s hold, so 12 s held
+    // only 2 per node. At scale 1 the bound is the 12 s it was.
+    let bound = test_patience(Duration::from_secs(12));
+    let checked = std::cell::Cell::new(start);
+    let sent = puts_at_50_per_s(&db, start, &|_| {
+        let elapsed = start.elapsed();
+        if elapsed <= Duration::from_secs(12)
+            || checked.get().elapsed() < Duration::from_millis(200)
+        {
+            return elapsed > bound;
+        }
+        checked.set(Instant::now());
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let armed = next(&lines, 0, "f4_slow_armed", &|_| true).expect("the marker");
+        elapsed > bound || (1..=3).all(|node| held_syncs(&lines, armed, node).len() >= 3)
+    });
     let statuses: Vec<NodeStatus> = (1..=3).map(|node| status_of(&db, node)).collect();
     for node in 1..=3 {
         clear_slow_sync(&node_dir(dir.path(), node));
