@@ -391,6 +391,12 @@ impl RdbError {
     /// After apply every `DenyReason` answers `UnknownOutcome` instead
     /// ([`crate::contracts::authority::DenyReason::client_error_kind`]).
     ///
+    /// `RecoveryReadOnly` proves it too (M10 S2, lead ruling A-R401 F4, ADR-rdb-0004 §5 amendment
+    /// of 2026-10-24), with the same retry rule. Its one producer, `admission::freeze_error` of
+    /// `FreezeCause::RecoveryReadOnly`, answers only before apply: admission check 7, the frozen
+    /// queue's dispatch reply, an undispatched check, and a drain of the queue. A dispatched write
+    /// is kept, never answered with it (K-A-46).
+    ///
     /// `GenerationChanged` proves it too (M10 S2, lead rulings A-R296 and A-R298, ADR-rdb-0004 §5
     /// amendment of 2026-10-23), though its retry rule is `Reconcile`. Every producer refuses
     /// before apply: admission checks 5 and 6, the `StorageDispatch` check, the dedup lookup of a
@@ -419,6 +425,7 @@ impl RdbError {
             Self::ProtectionPaused { .. }
                 | Self::GenerationChanged { .. }
                 | Self::LeaseExpired { .. }
+                | Self::RecoveryReadOnly { .. }
         )
     }
 

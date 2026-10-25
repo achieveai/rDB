@@ -332,6 +332,7 @@ fn answers() -> Vec<Answer> {
             seen,
             generation: zero(),
             at: zero(),
+            recovery_mode: true,
         })
         .collect();
     let mut error = ApiError::host("boom");
@@ -753,6 +754,7 @@ async fn a_peer_message_crosses_processes_and_a_call_is_answered_on_its_link() {
         }),
         generation: zero(),
         at: zero(),
+        recovery_mode: true,
     };
     let expected = format!("{answered:?}");
     let host = tokio::task::spawn_blocking(move || {

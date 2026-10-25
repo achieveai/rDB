@@ -372,6 +372,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         local @ (Msg::Control { .. }
         | Msg::Fault { .. }
         | Msg::Activated { .. }
+        | Msg::OwnerLearned { .. }
         | Msg::Inject { .. }
         | Msg::PeerBooted { .. }
         | Msg::Synced(_)
@@ -389,6 +390,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Control { .. } => "Control",
         Msg::Fault { .. } => "Fault",
         Msg::Activated { .. } => "Activated",
+        Msg::OwnerLearned { .. } => "OwnerLearned",
         Msg::Inject { .. } => "Inject",
         Msg::PeerBooted { .. } => "PeerBooted",
         Msg::Stop => "Stop",
@@ -1499,6 +1501,7 @@ pub enum WireAnswer {
         seen: WireSeen,
         generation: Generation,
         at: Seq,
+        recovery_mode: bool,
     },
     Compiled(TxnRequest),
     Unchanged,
@@ -1524,12 +1527,14 @@ impl WireAnswer {
                 seen,
                 generation,
                 at,
+                recovery_mode,
             } => match WireSeen::try_from(seen) {
                 Ok(seen) => Self::Read {
                     outcome: *outcome,
                     seen,
                     generation: *generation,
                     at: *at,
+                    recovery_mode: *recovery_mode,
                 },
                 Err(error) => Self::Error {
                     error: WireApiError::from(&ApiError::host(&error.to_string())),
@@ -1557,12 +1562,14 @@ impl WireAnswer {
                 seen,
                 generation,
                 at,
+                recovery_mode,
             } => match Seen::try_from(seen) {
                 Ok(seen) => Answer::Read {
                     outcome,
                     seen,
                     generation,
                     at,
+                    recovery_mode,
                 },
                 Err(error) => Answer::Error {
                     error: ApiError::host(&error.to_string()),

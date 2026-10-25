@@ -298,6 +298,11 @@ pub struct GetOk {
     pub at: Seq,
     /// Whether it waited at the barrier for an in-flight write.
     pub waited: bool,
+    /// Served from a recovery read-only generation (spec §8.4 step 4, A-R402): the partition
+    /// recovered with one copy, after `admin promote` to a lone survivor, say. The answer is
+    /// that copy's declared cutoff and may lack writes acknowledged just before the loss.
+    /// `false` for every other read.
+    pub recovery_mode: bool,
 }
 
 /// A served [`Db::read`].
@@ -311,6 +316,11 @@ pub struct ReadOk {
     pub at: Seq,
     /// Whether it waited at the barrier for an in-flight write.
     pub waited: bool,
+    /// Served from a recovery read-only generation (spec §8.4 step 4, A-R402): the partition
+    /// recovered with one copy, after `admin promote` to a lone survivor, say. The answer is
+    /// that copy's declared cutoff and may lack writes acknowledged just before the loss.
+    /// `false` for every other read.
+    pub recovery_mode: bool,
 }
 
 /// A refused write, with the request so the caller can send it again (`retry`).
@@ -535,6 +545,28 @@ impl Route {
     fn owner(&self) -> NodeId {
         NodeId(self.owner.load(Ordering::Relaxed))
     }
+}
+
+/// The kind a node refused a call with, for a put's or a status look's error and a read's
+/// rejection alike; `None` for an answer that is not a refusal.
+const fn refusal_kind(answer: &Answer) -> Option<ErrorKind> {
+    match answer {
+        Answer::Error { error, .. } => Some(error.kind),
+        Answer::Read {
+            outcome: ReadServiceOutcome::Rejected(kind),
+            ..
+        } => Some(*kind),
+        _ => None,
+    }
+}
+
+/// Whether a refusal of this kind makes the route re-read `partitions/1`. `NOT_PRIMARY` names
+/// another owner (A-R226 h2). `LEASE_EXPIRED` is an owner that lost its grant and may have been
+/// promoted away by a process that told nobody here: an owner cut from rEtcd says only that,
+/// for as long as the cut lasts, so a route that waits for `NOT_PRIMARY` never leaves it
+/// (A-R399, tester-final D2). The re-read is bounded by [`OWNER_REREAD_GAP`] either way.
+const fn rereads_owner(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::NotPrimary | ErrorKind::LeaseExpired)
 }
 
 /// The node `partitions/1` names as owner, its instance, and the record's mod revision.
@@ -1680,10 +1712,8 @@ impl Db {
         };
         match answer.recv_timeout(wait) {
             Ok(answer) => {
-                if let Answer::Error { error, .. } = &answer {
-                    if error.kind == ErrorKind::NotPrimary {
-                        self.refresh_owner();
-                    }
+                if refusal_kind(&answer).is_some_and(rereads_owner) {
+                    self.refresh_owner();
                 }
                 Some(answer)
             }
@@ -2265,11 +2295,13 @@ impl Db {
                 seen,
                 generation,
                 at,
+                recovery_mode,
             }) => Ok(ReadOk {
                 seen,
                 generation,
                 at,
                 waited: outcome == ReadServiceOutcome::WaitedAtBarrier,
+                recovery_mode,
             }),
             Some(Answer::Error { error, .. }) => Err(error),
             Some(other) => Err(ApiError::host(&format!(
@@ -3034,6 +3066,7 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
         generation: read.generation,
         at: read.at,
         waited: read.waited,
+        recovery_mode: read.recovery_mode,
     })
 }
 
@@ -4403,6 +4436,116 @@ mod tests {
         assert!(!text.contains("may be busy"), "{text}");
     }
 
+    /// A-R399 (tester-final D2, S2-3 cut arm): an owner cut from rEtcd and promoted away by
+    /// another process answers `LEASE_EXPIRED` for as long as the cut lasts, never
+    /// `NOT_PRIMARY`. An app opened before the promote must re-read `partitions/1` on that answer
+    /// and send its next call to the owner the record names. Node 1 refuses a get with
+    /// `LEASE_EXPIRED`; `partitions/1` names node 2; the next get must reach node 2's mailbox.
+    /// Cut: `rereads_owner` answers only `NOT_PRIMARY`; the second get goes to node 1 again and
+    /// this goes red.
+    /// Unit (~20 ms): no node thread; both mailboxes are answered by hand.
+    #[test]
+    fn m10_s2_lease_expired_from_a_cut_owner_rereads_the_owner_and_reroutes() {
+        use config_core::PutRequest;
+        use rdb_core::authority::partition::RecordMode;
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::ids::{OwnerEpoch, Revision};
+
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let record = PartitionRecord {
+            partition: PARTITION,
+            owner: NodeId(2),
+            generation: Generation(3),
+            owner_epoch: OwnerEpoch(3),
+            config_version: admin::CONFIG_VERSION,
+            lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+        };
+        let root = PartitionRoot {
+            mode: RecordMode::Active,
+            owner_boot: BootId(5),
+            base_seq: Seq(7),
+            base_digest: Digest::ROOT,
+            predecessor_generation: Generation(2),
+            predecessor_cutoff: Seq(7),
+            instance: [7; INSTANCE_LEN],
+            run: Revision(1),
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: record.encode_with(&root),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put partitions/1");
+        let links = Links::new();
+        let (one, one_mailbox) = NodeHandle::unanswered(OWNER);
+        let (two, two_mailbox) = NodeHandle::unanswered(NodeId(2));
+        let mut db = Db {
+            nodes: Mutex::new(vec![one, two]),
+            respawn: None,
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts {
+                read: crate::host::test_patience(Duration::from_secs(1)),
+                ..Timeouts::default()
+            },
+            next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
+            client: DEFAULT_CLIENT,
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+            route: Route {
+                refresh: Some((Arc::clone(&store), rt.handle().clone())),
+                ..Route::default()
+            },
+        };
+        let answer = |mailbox: mpsc::Receiver<Msg>, outcome: ReadServiceOutcome| {
+            std::thread::spawn(move || {
+                let Ok(Msg::Client(Client { reply, .. })) =
+                    mailbox.recv_timeout(Duration::from_secs(5))
+                else {
+                    return false;
+                };
+                reply
+                    .send(Answer::Read {
+                        outcome,
+                        seen: Seen::Absent,
+                        generation: Generation(3),
+                        at: Seq(1),
+                        recovery_mode: false,
+                    })
+                    .expect("the get waits");
+                true
+            })
+        };
+        let cut = answer(
+            one_mailbox,
+            ReadServiceOutcome::Rejected(ErrorKind::LeaseExpired),
+        );
+        let refused = db.get(b"a").expect_err("node 1 is cut from rEtcd");
+        assert_eq!(refused.kind, ErrorKind::LeaseExpired, "{refused:?}");
+        assert!(
+            cut.join().expect("node 1's answerer"),
+            "node 1 got the first get"
+        );
+        assert_eq!(
+            db.route.owner(),
+            NodeId(2),
+            "LEASE_EXPIRED re-read partitions/1"
+        );
+
+        let promoted = answer(two_mailbox, ReadServiceOutcome::Served);
+        db.get(b"a").expect("node 2 serves the retry");
+        assert!(
+            promoted.join().expect("node 2's answerer"),
+            "the retry reached node 2"
+        );
+        db.shutdown();
+    }
+
     /// F-011 (S0 review): a get P1 refuses takes its retry rule from the kernel's table, as a
     /// put does. PROTECTION_PAUSED and LEASE_EXPIRED are `RetryAfterRecovery` (spec §5.4,
     /// ADR-rdb-0004 §5), not the `BoundedJitter` of a kind `ApiError::new` does not list. P1's
@@ -4456,6 +4599,7 @@ mod tests {
                         seen: Seen::Absent,
                         generation: Generation(1),
                         at: Seq(1),
+                        recovery_mode: false,
                     })
                     .expect("the get waits");
             }
@@ -7102,6 +7246,9 @@ mod tests {
     /// outside the barrier. While it stays so, node 2's status names the stall although L1
     /// admits, since a read-only commit takes no write whatever L1 says. Once the link heals,
     /// node 2 re-plans the same members, and a put lands at a later generation.
+    /// A-R402 (F3): a read before the promote and one after the repair answer
+    /// `recovery_mode=false`; one while node 2 is read-only answers `true`. Cut: the host always
+    /// answers `false`, red.
     /// Cuts: `repair_duty` returns at once, red (still refused after the heal); `rebuild_check`
     /// stays quiet while L1 admits a read-only commit, red (no stall line).
     /// Integration (~10 s): the promote waits node 1's grant out, then the 5 s rebuild pin wait.
@@ -7120,6 +7267,10 @@ mod tests {
             .expect("open");
         admits(&db, "after the open");
         db.put(b"a", b"1", None).expect("put a");
+        assert!(
+            !db.get(b"a").expect("get a").recovery_mode,
+            "an rf3 read is no recovery read"
+        );
         lock(&db.nodes)
             .iter_mut()
             .find(|handle| handle.node == OWNER)
@@ -7148,6 +7299,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(stalled.contains("mode=ReadOnly"), "{stalled}");
+        // A-R402 (F3): the one-copy commit's reads say they serve a declared cutoff.
+        let lone = db.get(b"a").expect("node 2 serves reads");
+        assert!(lone.recovery_mode, "{lone:?}");
+        assert_eq!(
+            lone.value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"1"))
+        );
 
         assert!(
             db.links().heal(NodeId(2), NodeId(3)) > 0,
@@ -7168,6 +7326,10 @@ mod tests {
         assert!(
             landed.generation > promoted.generation,
             "{landed:?} after {promoted:?}"
+        );
+        assert!(
+            !db.get(b"b").expect("get b").recovery_mode,
+            "a read-write generation's read is no recovery read"
         );
         tracing::info!(
             waited_ms = healed.elapsed().as_millis(),

@@ -378,6 +378,20 @@ pub enum Msg {
         /// The generation now marked.
         generation: Generation,
     },
+    /// A-R399: who `partitions/{partition}` names as owner, read once after a node fence
+    /// ([`ControlAdapter::read_owner_after_fence`]). `None`: the record is absent or does not
+    /// decode. Changes only how this node refuses a client while fenced; dropped unless `boot`
+    /// is the node's own, as [`Msg::Control`].
+    OwnerLearned {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// The node fence the read was begun under ([`Host`]'s `owner_fence`).
+        fence: u64,
+        /// The owner the record names.
+        owner: Option<NodeId>,
+    },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
         /// The partition.
@@ -861,6 +875,10 @@ pub enum Answer {
         generation: Generation,
         /// The position of that view.
         at: Seq,
+        /// The node served it from a recovery `ReadOnly` generation (spec §8.4 step 4): a lone
+        /// copy's declared cutoff, which may lack writes acknowledged just before the loss
+        /// (A-R401 F3, A-R402).
+        recovery_mode: bool,
     },
     /// A put compiled and not sent. Send it with [`ClientCall::Resend`].
     Compiled(TxnRequest),
@@ -876,6 +894,17 @@ pub enum Answer {
         /// [`ClientCall::Resend`] caller already holds what it sent.
         request: Option<TxnRequest>,
     },
+}
+
+impl Answer {
+    /// This answer, with a read's `recovery_mode` set to `on`. Any other answer is unchanged.
+    #[must_use]
+    fn in_mode(mut self, on: bool) -> Self {
+        if let Self::Read { recovery_mode, .. } = &mut self {
+            *recovery_mode = on;
+        }
+        self
+    }
 }
 
 /// One node's state for one partition, for `nodes` and the ready poller.
@@ -1814,6 +1843,13 @@ struct Host {
     /// a re-asked revocation persists twice, and a late second proof must not plan from a later
     /// epoch (critic-degraded A-4, ruling A-R321).
     revocation_persisted: Option<OwnerEpoch>,
+    /// A-R399 (tester-final D3): per partition, the owner `partitions/{p}` named when this node
+    /// read it after its last node fence; absent until that read answers. Read only while A1 is
+    /// fenced, to refuse a client `NOT_PRIMARY` naming that owner instead of `LEASE_EXPIRED`.
+    owner_after_fence: BTreeMap<PartitionId, Option<NodeId>>,
+    /// How many node fences this node has had: each one's owner reads carry it, so a read
+    /// begun under an earlier fence, answering late, is dropped (critic-d3 A3).
+    owner_fence: u64,
     /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
     blamed: BTreeMap<PartitionId, Blame>,
     /// How many of A1's next `DrainProof`s this host loses, as if A1 never answered. Crate
@@ -1966,6 +2002,8 @@ impl Host {
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
             revocation_persisted: None,
+            owner_after_fence: BTreeMap::new(),
+            owner_fence: 0,
             blamed: BTreeMap::new(),
             #[cfg(test)]
             drain_proofs_to_lose: 0,
@@ -2198,6 +2236,7 @@ impl Host {
             Msg::Control { event, .. } => format!("control/{}", head(&format!("{event:?}"))),
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
             Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
+            Msg::OwnerLearned { .. } => "owner_learned".to_owned(),
             _ => "other".to_owned(),
         };
         tracing::info!(
@@ -2242,7 +2281,10 @@ impl Host {
             return;
         }
         let outcome = match msg {
-            Msg::Control { boot, .. } | Msg::Fault { boot, .. } | Msg::Activated { boot, .. }
+            Msg::Control { boot, .. }
+            | Msg::Fault { boot, .. }
+            | Msg::Activated { boot, .. }
+            | Msg::OwnerLearned { boot, .. }
                 if boot != self.boot =>
             {
                 self.drop_stale(&msg, boot);
@@ -2270,6 +2312,34 @@ impl Host {
                 ..
             } => {
                 self.activated(partition, generation);
+                Ok(())
+            }
+            Msg::OwnerLearned {
+                partition,
+                fence,
+                owner,
+                ..
+            } => {
+                // A read begun under an earlier fence, or answering after A1 left Fenced, says
+                // nothing about this fence (critic-d3 A3).
+                if fence != self.owner_fence || fence_of(self.authority.state()).is_none() {
+                    tracing::debug!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        fence,
+                        current = self.owner_fence,
+                        "host_owner_learned_stale"
+                    );
+                } else {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        owner = owner.map(|owner| owner.0),
+                        fence,
+                        "host_owner_learned"
+                    );
+                    self.owner_after_fence.insert(partition, owner);
+                }
                 Ok(())
             }
             Msg::Inject {
@@ -3352,6 +3422,47 @@ impl Host {
         }
     }
 
+    /// A-R399 (tester-final D3): a fenced node whose after-fence read of `partitions/{p}` named
+    /// another owner refuses a client `NOT_PRIMARY` with that owner as the hint, where it would
+    /// have refused `LEASE_EXPIRED`, so an app routed here re-reads the owner and leaves. Only
+    /// the refusal changes: an answer that is not a `LEASE_EXPIRED` refusal provably mutating
+    /// nothing, a node not fenced, a read not answered yet, or one naming this node or no one
+    /// goes out as it came. A1 is never told; nothing is admitted or made durable here.
+    fn redirect(&self, partition: PartitionId, answer: Answer) -> Answer {
+        let expired = match &answer {
+            Answer::Error { error, .. } => {
+                error.kind == ErrorKind::LeaseExpired && error.no_mutation
+            }
+            Answer::Read { outcome, .. } => {
+                *outcome == ReadServiceOutcome::Rejected(ErrorKind::LeaseExpired)
+            }
+            _ => false,
+        };
+        if !expired || fence_of(self.authority.state()).is_none() {
+            return answer;
+        }
+        let Some(Some(owner)) = self.owner_after_fence.get(&partition).copied() else {
+            return answer;
+        };
+        if owner == self.node {
+            return answer;
+        }
+        let request = match answer {
+            Answer::Error { request, .. } => request,
+            _ => None,
+        };
+        let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+            partition,
+            hint: Some(owner),
+        });
+        error.no_mutation = true;
+        error.detail = format!(
+            "node {} lost its grant, and partitions/{} names node {} as owner; nothing was sent",
+            self.node.0, partition.0, owner.0
+        );
+        Answer::Error { error, request }
+    }
+
     /// A-R183 (critic-d6b candidate 3): how long until the trim duty can first free a dedup
     /// entry of `partition`: the earliest scheduled free, at the trim tick that runs it. A lower
     /// bound, "not before": an admitted write may take the room first.
@@ -3536,6 +3647,16 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
+        // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
+        // history; a later fence of either scope must not reuse it.
+        if fence_of(self.authority.state()).is_none() && !self.owner_after_fence.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                forgot = self.owner_after_fence.len(),
+                "host_owner_forgotten"
+            );
+            self.owner_after_fence.clear();
+        }
     }
 
     /// `txn_dispatch`: T1 hands `batch` to storage. The binding tick is `decided_at`, when A1
@@ -4082,7 +4203,7 @@ impl Host {
                     self.transaction.kernel(self.node, partition).is_some()
                         || self.publication.kernel(self.node, partition).is_some()
                 });
-                for partition in sites {
+                for &partition in &sites {
                     let event = KernelEvent::Authority(AuthorityEvent::Fence {
                         scope: *scope,
                         reason: *reason,
@@ -4092,6 +4213,30 @@ impl Host {
                 }
                 if *scope == FenceScope::Node {
                     self.schedule_acquire_after_fence(site);
+                    // A-R399: what each fenced partition's record names now, for the
+                    // refusals alone; a new fence forgets the last answer and reads again, and
+                    // a read begun under an earlier fence is dropped when it answers. Every
+                    // served partition, not the fence's own site alone: A1 may site a node fence
+                    // at partition 0, which no T1 or P1 serves, and the fan-out leaves the site
+                    // out.
+                    let mut fenced = sites;
+                    if self.transaction.kernel(self.node, site.partition).is_some()
+                        || self.publication.kernel(self.node, site.partition).is_some()
+                    {
+                        fenced.push(site.partition);
+                    }
+                    fenced.sort_unstable();
+                    fenced.dedup();
+                    self.owner_fence += 1;
+                    for partition in fenced {
+                        self.owner_after_fence.remove(&partition);
+                        self.control.read_owner_after_fence(
+                            self.node,
+                            self.boot,
+                            partition,
+                            self.owner_fence,
+                        );
+                    }
                 }
             }
             KernelEffect::SetAdmission(state) => {
@@ -4121,7 +4266,7 @@ impl Host {
             KernelEffect::Publication(effect) => {
                 return match effect {
                     PublicationEffect::Snapshot { identity, handle } => {
-                        self.previous_answer(*identity, *handle)
+                        self.previous_answer(site.partition, *identity, *handle)
                     }
                     PublicationEffect::Status(_)
                     | PublicationEffect::Mode { .. }
@@ -7546,10 +7691,13 @@ impl Host {
                     return Ok(());
                 }
                 Err(error) => {
-                    let _ = reply.send(Answer::Error {
-                        error,
-                        request: None,
-                    });
+                    let _ = reply.send(self.redirect(
+                        partition,
+                        Answer::Error {
+                            error,
+                            request: None,
+                        },
+                    ));
                     return Ok(());
                 }
             },
@@ -7583,7 +7731,7 @@ impl Host {
                     kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
                     "client_compile"
                 );
-                let _ = reply.send(answer);
+                let _ = reply.send(self.redirect(partition, answer));
                 return Ok(());
             }
             ClientCall::Resend { request } => (
@@ -8030,7 +8178,8 @@ impl Host {
             },
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
                 .read_answer(partition, *outcome, *value, &root, &look)
-                .map_err(|detail| fail_waiter(&pending.reply, detail))?,
+                .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .in_mode(self.recovery_mode(partition)),
             (reply, kind) => {
                 return Err(fail_waiter(
                     &pending.reply,
@@ -8041,6 +8190,7 @@ impl Host {
                 ));
             }
         };
+        let answer = self.redirect(partition, answer);
         // The caller stopped waiting, at its own deadline, before the answer came: the answer is
         // lost here. A write's caller then holds `UNKNOWN_OUTCOME`, which `status` settles.
         if pending.reply.send(answer).is_err() {
@@ -8087,8 +8237,10 @@ impl Host {
 
     /// P1's answer to a `ReadPrevious`: the kept view it handed out, read for the asked object,
     /// or why there is none. A handle storage never bound is a host fault.
+    /// `partition` is the site whose P1 answered, so `recovery_mode` reads that partition.
     fn previous_answer(
         &mut self,
+        partition: PartitionId,
         identity: RequestIdentity,
         handle: Result<SnapshotHandle, ErrorKind>,
     ) -> Result<(), Fault> {
@@ -8121,6 +8273,7 @@ impl Host {
                 seen: Seen::Absent,
                 generation: Generation(0),
                 at: Seq::ZERO,
+                recovery_mode: false,
             },
             Ok(handle) => {
                 let view = self.bound.get(&handle).ok_or_else(|| {
@@ -8137,10 +8290,20 @@ impl Host {
                     ReadServiceOutcome::Served,
                 )
                 .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .in_mode(self.recovery_mode(partition))
             }
         };
+        let answer = self.redirect(partition, answer);
         let _ = pending.reply.send(answer);
         self.release_queued(identity)
+    }
+
+    /// Whether this node's last committed recovery of `partition` is `ReadOnly`: its reads then
+    /// serve a lone copy's declared cutoff (spec §8.4 step 4, A-R402).
+    fn recovery_mode(&self, partition: PartitionId) -> bool {
+        self.committed
+            .get(&partition)
+            .is_some_and(|committed| committed.mode == PartitionMode::ReadOnly)
     }
 
     /// §4.2: the bytes come from the step view P1 just answered from, re-checked against the
@@ -8163,6 +8326,7 @@ impl Host {
                 seen: Seen::Absent,
                 generation,
                 at,
+                recovery_mode: false,
             });
         };
         let key = root.as_bytes();
@@ -8846,6 +9010,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Control { .. } => "control",
         Msg::Fault { .. } => "fault",
         Msg::Activated { .. } => "activated",
+        Msg::OwnerLearned { .. } => "owner_learned",
         Msg::Inject { .. } => "inject",
         Msg::Frame { .. } => "frame",
         Msg::PeerAsk { .. } => "peer_ask",
@@ -8967,6 +9132,7 @@ fn object_answer_unchecked(
             seen,
             generation,
             at,
+            recovery_mode: false,
         },
         Err(error) => {
             let chunk = upload.zip(damaged_chunk(&error));
