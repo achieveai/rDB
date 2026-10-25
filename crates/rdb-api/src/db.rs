@@ -1145,6 +1145,14 @@ impl Db {
                     other => refused(other),
                 })?;
                 for node in &roll.copies {
+                    // #62: a crash part way through the roll-forward, in one process.
+                    #[cfg(test)]
+                    if roll_stops_before(&config.dir, *node) {
+                        return Err(OpenError::Node(format!(
+                            "test hook: roll forward stopped before node {}",
+                            node.0
+                        )));
+                    }
                     claim
                         .engines
                         .get_mut(node)
@@ -3881,6 +3889,26 @@ fn send_wait(deadline: Duration) -> Duration {
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Test-only (#62): open directories whose next roll-forward stops before it links the named
+/// node's copy, as a process that crashed part way through the loop would. Used once.
+#[cfg(test)]
+static ROLL_STOP: Mutex<Vec<(PathBuf, NodeId)>> = Mutex::new(Vec::new());
+
+/// Test-only: the next roll-forward of the open of `dir` stops before node `node`'s copy.
+#[cfg(test)]
+fn stop_roll_before(dir: &Path, node: NodeId) {
+    lock(&ROLL_STOP).push((dir.to_path_buf(), node));
+}
+
+/// Whether the roll-forward of the open of `dir` stops here; a hit disarms the hook.
+#[cfg(test)]
+fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
+    let mut stops = lock(&ROLL_STOP);
+    let before = stops.len();
+    stops.retain(|(at, stop)| !(at == dir && *stop == node));
+    stops.len() != before
 }
 
 #[cfg(test)]
@@ -11015,6 +11043,106 @@ mod tests {
         );
         ready_and_reads_back(&db, "after the cut flatten");
         db.shutdown();
+    }
+
+    /// Generation 2 committed and its process died before linking it (`AfterCommit::Fault`);
+    /// then the open that rolls it forward stopped after `k` of the 3 copies (#62). Returns
+    /// with `k` copies at generation 2 and the rest at generation 1.
+    fn rolled_forward_part_way(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+        k: u32,
+    ) {
+        wrote_a_and_quit(rt, dir, store);
+        crate::host::set_after_commit(dir, Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(rt, dir, store).expect("the reopen cut short");
+        until_stored(rt, store, 2);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir, None);
+        stop_roll_before(dir, NodeId(k + 1));
+        match open_fast(rt, dir, store) {
+            Err(OpenError::Node(text)) if text.starts_with("test hook") => {}
+            other => panic!(
+                "k={k}: the roll-forward stops part way, not {:?}",
+                other.map(|_| "Db")
+            ),
+        }
+        for n in 1..=3u32 {
+            let engine = RocksEngine::open_existing(dir.join("nodes").join(n.to_string()))
+                .expect("open a copy");
+            assert_eq!(
+                engine.lineages().contains(&(PARTITION, Generation(2))),
+                n <= k,
+                "k={k}: node {n}"
+            );
+        }
+    }
+
+    /// #62 (A-R426): a process crashed part way through an open's roll-forward, after k of the
+    /// 3 copies were linked to generation 2. The next open finishes it: a copy serves the
+    /// record's generation, so `check` takes the heal path (no second roll-forward), F1 commits
+    /// mode `Active` (the issue predicted `ReadOnly`), a=1 reads back, a put lands, and every
+    /// copy holds the generation N this open commits. For k = 1 and k = 2. Cut: `check` counts the generation held only
+    /// when every copy serves it; the mix goes to `roll_forward_copies`, which refuses it
+    /// `Stale` ("a copy holds generation 2"), red.
+    /// Integration (~4 s per k): a fresh open, a reopen cut at its commit, a roll-forward cut
+    /// part way, an open until ready.
+    #[config_log::retcd_test]
+    fn m10_bb_62_an_open_after_a_roll_forward_cut_part_way_finishes_it_and_writes() {
+        const METHOD: &str =
+            "m10_bb_62_an_open_after_a_roll_forward_cut_part_way_finishes_it_and_writes";
+        let rt = runtime();
+        for k in 1..=2u32 {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let dir = config_testkit::fs::temp_dir();
+            rolled_forward_part_way(&rt, dir.path(), &store, k);
+            let mut db = open_fast(&rt, dir.path(), &store)
+                .unwrap_or_else(|error| panic!("k={k}: the open: {error}"));
+            // A copy serves generation 2, so `check` heals instead of rolling forward again.
+            assert!(rolled_forward(METHOD).is_empty(), "k={k}");
+            ready_and_reads_back(&db, &format!("k={k}"));
+            let owner = owner_status(&db, &format!("k={k}"));
+            assert_eq!(
+                owner.recovery.as_deref(),
+                Some("Committed"),
+                "k={k}: {owner:?}"
+            );
+            let n = owner.recovered.expect("node 1 recovered a generation");
+            // The issue predicted `ReadOnly`; F1 commits this open's generation `Active`.
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+            let last = lines
+                .iter()
+                .rev()
+                .find(|line| line["@m"] == "recovered")
+                .expect("a recovered line");
+            assert_eq!(
+                (last["generation"].as_u64(), last["mode"].as_str()),
+                (Some(n.0), Some("Active")),
+                "k={k}: {last}"
+            );
+            // Every copy ends at generation N.
+            let patience = crate::host::test_patience(Duration::from_secs(10));
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                let held: Vec<_> = db
+                    .node_status()
+                    .into_iter()
+                    .map(|status| (status.node, status.holds.map(|held| held.generation)))
+                    .collect();
+                if held.len() == 3 && held.iter().all(|(_, at)| *at == Some(n)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "k={k}: not every copy at generation {} within {patience:?}: {held:?}",
+                    n.0
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            db.shutdown();
+        }
     }
 
     /// Ruling A-R184 (critic-rollfwd row 3, F2): once a host marked a generation activated, it
