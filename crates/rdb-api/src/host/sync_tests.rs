@@ -143,11 +143,12 @@ fn slow_steps(lines: &[Line], from: usize) -> Vec<&Line> {
 /// recovery `Sync` answers go through the syncer. Each continuation runs only after a sync that
 /// began after its write: a `link_synced` (and the acquire it releases, node 1's `activate`)
 /// follows a held sync begun after its `link_sync_requested`, and each pre-commit
-/// `sync_proven` follows a held sync begun after its `holder_sync_requested`. Meanwhile no
-/// node thread takes a step over 500 ms, and the reopen admits writes and reads back.
+/// `sync_proven` follows a held sync begun after its `holder_sync_requested`. Every held sync
+/// runs on its node's syncer thread, and the reopen admits writes and reads back.
 /// Cut: `land` schedules the acquire without waiting on `link_pending`, red (node 1 wrote `b`
 /// with no `link_synced`). Cut: the holder answers before `Msg::Synced`, red (`sync_proven` before the
-/// held sync). Cut: the link or holder sync inline on the node thread, red (a step over 500 ms).
+/// held sync). Cut: the link or holder sync inline on the node thread, red (a held sync logged by
+/// `rdb-node-N`).
 /// Integration (~10 s): a fresh open, then a reopen whose every sync is held 1 s.
 #[config_log::retcd_test]
 fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps_stepping() {
@@ -182,10 +183,20 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
 
     let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
     let armed = next(&lines, 0, "f4_slow_armed", &|_| true).expect("the marker");
-    let slow = slow_steps(&lines, armed);
+    // A-R393: every held sync ran on its node's syncer, as the thread that logged it says. Not
+    // a step's length: a loaded host starves a node thread past 500 ms with no sync in the
+    // step (2 of 25 runs beside 3 suite loops); a held sync on the node thread is red here at
+    // any load.
+    let inline: Vec<&Line> = lines[armed..]
+        .iter()
+        .filter(|line| {
+            is(line, "test_sync_slowed")
+                && line["thread"] != format!("rdb-sync-{}", num(line, "node")).as_str()
+        })
+        .collect();
     assert!(
-        slow.is_empty(),
-        "node-thread steps over {STEP_LIMIT_MILLIS} ms: {slow:?}"
+        inline.is_empty(),
+        "held syncs off their node's syncer: {inline:?}"
     );
     let waited = waited_on_a_sync(&lines, armed);
     assert!(
@@ -226,27 +237,40 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
     }
     assert!(links > 0, "the reopen requested no link sync");
 
+    // Each pre-commit `sync_proven` is paired with its own ask: the earliest matching ask not
+    // yet answered, since a node answers its asks in order (`sync_next` is FIFO). A-R393: a
+    // `barrier_retry` re-asks the same cutoff while the first ask's sync is held; that re-ask
+    // waits for the next sync, and pairing it with the next `sync_proven` after it took the
+    // first ask's answer for its own (red under load, though both answers were sound).
     let mut answers = 0;
+    let mut paired: Vec<usize> = Vec::new();
     for at in (armed..lines.len())
-        .filter(|&at| is(&lines[at], "holder_sync_requested") && lines[at]["post_commit"] == false)
+        .filter(|&at| is(&lines[at], "sync_proven") && lines[at]["post_commit"] == false)
     {
-        let asked = &lines[at];
-        let node = num(asked, "node");
+        let proven = &lines[at];
+        let node = num(proven, "node");
         let same = |line: &Line| {
             num(line, "node") == node
-                && num(line, "copy") == num(asked, "copy")
-                && num(line, "cutoff") == num(asked, "cutoff")
+                && num(line, "copy") == num(proven, "copy")
+                && num(line, "cutoff") == num(proven, "cutoff")
+                && num(line, "generation") == num(proven, "generation")
                 && line["post_commit"] == false
         };
-        let Some(proven) = next(&lines, at, "sync_proven", &same) else {
-            continue;
-        };
-        let held = next(&lines, at, "test_sync_slowed", &|line| {
+        let asked = (armed..at)
+            .find(|&ask| {
+                is(&lines[ask], "holder_sync_requested")
+                    && same(&lines[ask])
+                    && !paired.contains(&ask)
+            })
+            .unwrap_or_else(|| panic!("node {node}: sync_proven with no ask before it: {proven}"));
+        paired.push(asked);
+        let held = next(&lines, asked, "test_sync_slowed", &|line| {
             num(line, "node") == node
         });
         assert!(
-            held.is_some_and(|held| held < proven),
-            "node {node}: sync_proven without a held sync begun after its ask: {asked}"
+            held.is_some_and(|held| held < at),
+            "node {node}: sync_proven without a held sync begun after its ask: {}",
+            lines[asked]
         );
         answers += 1;
     }
@@ -290,11 +314,14 @@ fn m10_f4_a_stop_with_a_sync_in_flight_finishes_it_before_the_final_marks() {
     let dir = config_testkit::fs::temp_dir();
     let mut db = open(&rt, config(dir.path()), &store, fast());
     admits_within(&db, "the open", Duration::from_secs(10));
-    db.put(b"a", b"1", None).expect("put a");
+    // A-R393, as A-R392 for the stuck row: armed before `put a`, whose own sync is the one
+    // held. Armed after it, a slow test thread let that sync run unheld, and with nothing else
+    // to sync no held sync came at all. A put does not wait for its own fsync.
     let one = node_dir(dir.path(), 1);
     tracing::info!("f4_slow_armed");
-    slow_sync(&one, Duration::from_secs(1), true);
     let armed = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    slow_sync(&one, Duration::from_secs(1), true);
+    db.put(b"a", b"1", None).expect("put a");
     wait_for_line(
         METHOD,
         armed,
