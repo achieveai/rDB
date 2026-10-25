@@ -6791,3 +6791,27 @@ fn m9_s3k_05_a_second_failure_on_a_trimmed_key_keeps_its_own_window() {
     h.now = t2 + R;
     let _ = h.admit(req);
 }
+
+/// M10 S2 (lead ruling A-R401 F4, critic-d4 Q3). A put refused because the partition recovered
+/// `ReadOnly` was refused at admission, before apply: its `RECOVERY_READ_ONLY` proves it wrote
+/// nothing. Every producer of it is pre-apply (`freeze_error(FreezeCause::RecoveryReadOnly)`:
+/// admission check 7, the frozen queue's dispatch reply, an undispatched check, a drain). It
+/// said "not proven" before, the `LeaseExpired` shape A-R342 closed. Cut: drop it from
+/// `RdbError::proves_no_mutation`, red.
+#[retcd_test]
+fn a_recovery_read_only_refusal_proves_no_mutation() {
+    let mut h = H::live();
+    let _ = h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+        Generation(8),
+        2,
+        u64::MAX,
+    )))));
+    let effects = h.step(submit(put(1, b"k", b"v")));
+    assert_eq!(
+        proofs(&effects),
+        vec![(1, ErrorKind::RecoveryReadOnly, true)],
+        "{effects:?}"
+    );
+}

@@ -551,8 +551,15 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - `get` and `read` do not need `wait_ready`. To start for reads, treat
     `ReadyError::TimedOut` as "no writes yet" and keep the `Db`, instead of returning the error.
   - A write is refused `RECOVERY_READ_ONLY` ("reads still work; writes return when the lost
-    copies are back"). Its `no_mutation` is false, so resend that same request later.
+    copies are back"). Its `no_mutation` is true: this send wrote nothing (A-R401). Resend
+    that same request later; a resend reports `no_mutation` false, as every resend does,
+    because an earlier send may have applied it.
   - Writes return once a second copy is back.
+  - **Reads say when they come from a read-only recovery.** `GetOk::recovery_mode` and
+    `ReadOk::recovery_mode` are true whenever the partition serves read-only after a recovery
+    with one copy, the old owner's included. Most at risk: after `admin promote` to a lone copy
+    that was not the owner, reads serve that copy's prefix, so a write acknowledged just before
+    the loss may be missing.
   - Seen in an embedded run with node 1's links to 2 and 3 held (`rdb_dev --hold 1-2,1-3`):
     `get` answered, `put` was refused as above.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,

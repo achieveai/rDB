@@ -298,6 +298,11 @@ pub struct GetOk {
     pub at: Seq,
     /// Whether it waited at the barrier for an in-flight write.
     pub waited: bool,
+    /// Served from a recovery read-only generation (spec §8.4 step 4, A-R402): the partition
+    /// recovered with one copy, after `admin promote` to a lone survivor, say. The answer is
+    /// that copy's declared cutoff and may lack writes acknowledged just before the loss.
+    /// `false` for every other read.
+    pub recovery_mode: bool,
 }
 
 /// A served [`Db::read`].
@@ -311,6 +316,11 @@ pub struct ReadOk {
     pub at: Seq,
     /// Whether it waited at the barrier for an in-flight write.
     pub waited: bool,
+    /// Served from a recovery read-only generation (spec §8.4 step 4, A-R402): the partition
+    /// recovered with one copy, after `admin promote` to a lone survivor, say. The answer is
+    /// that copy's declared cutoff and may lack writes acknowledged just before the loss.
+    /// `false` for every other read.
+    pub recovery_mode: bool,
 }
 
 /// A refused write, with the request so the caller can send it again (`retry`).
@@ -2285,11 +2295,13 @@ impl Db {
                 seen,
                 generation,
                 at,
+                recovery_mode,
             }) => Ok(ReadOk {
                 seen,
                 generation,
                 at,
                 waited: outcome == ReadServiceOutcome::WaitedAtBarrier,
+                recovery_mode,
             }),
             Some(Answer::Error { error, .. }) => Err(error),
             Some(other) => Err(ApiError::host(&format!(
@@ -3054,6 +3066,7 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
         generation: read.generation,
         at: read.at,
         waited: read.waited,
+        recovery_mode: read.recovery_mode,
     })
 }
 
@@ -4585,6 +4598,7 @@ mod tests {
                         seen: Seen::Absent,
                         generation: Generation(1),
                         at: Seq(1),
+                        recovery_mode: false,
                     })
                     .expect("the get waits");
             }
@@ -7228,6 +7242,9 @@ mod tests {
     /// outside the barrier. While it stays so, node 2's status names the stall although L1
     /// admits, since a read-only commit takes no write whatever L1 says. Once the link heals,
     /// node 2 re-plans the same members, and a put lands at a later generation.
+    /// A-R402 (F3): a read before the promote and one after the repair answer
+    /// `recovery_mode=false`; one while node 2 is read-only answers `true`. Cut: the host always
+    /// answers `false`, red.
     /// Cuts: `repair_duty` returns at once, red (still refused after the heal); `rebuild_check`
     /// stays quiet while L1 admits a read-only commit, red (no stall line).
     /// Integration (~10 s): the promote waits node 1's grant out, then the 5 s rebuild pin wait.
@@ -7246,6 +7263,10 @@ mod tests {
             .expect("open");
         admits(&db, "after the open");
         db.put(b"a", b"1", None).expect("put a");
+        assert!(
+            !db.get(b"a").expect("get a").recovery_mode,
+            "an rf3 read is no recovery read"
+        );
         lock(&db.nodes)
             .iter_mut()
             .find(|handle| handle.node == OWNER)
@@ -7274,6 +7295,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(stalled.contains("mode=ReadOnly"), "{stalled}");
+        // A-R402 (F3): the one-copy commit's reads say they serve a declared cutoff.
+        let lone = db.get(b"a").expect("node 2 serves reads");
+        assert!(lone.recovery_mode, "{lone:?}");
+        assert_eq!(
+            lone.value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"1"))
+        );
 
         assert!(
             db.links().heal(NodeId(2), NodeId(3)) > 0,
@@ -7294,6 +7322,10 @@ mod tests {
         assert!(
             landed.generation > promoted.generation,
             "{landed:?} after {promoted:?}"
+        );
+        assert!(
+            !db.get(b"b").expect("get b").recovery_mode,
+            "a read-write generation's read is no recovery read"
         );
         tracing::info!(
             waited_ms = healed.elapsed().as_millis(),

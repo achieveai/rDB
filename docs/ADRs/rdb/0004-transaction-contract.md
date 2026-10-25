@@ -303,6 +303,18 @@ proves no mutation by this submission.** It keeps its retry rule, reconcile.
   `no_deny_reason_after_apply_is_paused_or_proves_no_mutation` in
   `rdb-core/tests/transaction_t1.rs`.
 
+**Amended 2026-10-24 (M10 S2, lead ruling A-R401 F4; critic-d4 Q3): `RECOVERY_READ_ONLY` proves
+no mutation by this submission.** It keeps its retry rule.
+- Why it holds: its one producer, `admission::freeze_error` of `FreezeCause::RecoveryReadOnly`,
+  answers only before apply: §3 check 7, the frozen queue's dispatch reply, an undispatched
+  check, and a drain of the queue. A dispatched write is kept, never answered with it (K-A-46).
+- Why it matters: S2-5's lone survivor refuses every write this way, and each refusal said "not
+  proven" although nothing was written.
+- What it does not change: the proof covers this send only (#35, above). A resend still reports
+  no proof to the app (`Db::retried`).
+- Pinned by `a_recovery_read_only_refusal_proves_no_mutation` in
+  `rdb-core/tests/transaction_t1.rs`.
+
 ### 6. The local apply never returns success
 
 Spec §5.2 step 6: success is returned only after one regular-secondary buffered ACK plus an
