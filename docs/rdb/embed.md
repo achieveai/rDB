@@ -281,7 +281,10 @@ To ask later, you need something saved before the process stopped. There are two
 - **Save a request whose answer was not definitive, and only that.** That is any refusal with
   `no_mutation` false that hands the request back in `refused.request`, boxed: save
   `*request`. `UNKNOWN_OUTCOME` is the common one; `UNAVAILABLE` "went out of reach while this
-  call waited" is another. A `TxnRequest`
+  call waited ...; a write sent here may have applied" is another. That refusal has a second
+  form, with `no_mutation` true, no request, and the words "this call writes nothing ... so
+  nothing was applied": the owner went away before the write was sent. There is nothing to
+  save; send the write again, as new, once the owner is back. A `TxnRequest`
   serializes with `serde_json` (in the `Cargo.toml` of section 2). Write it to a file and sync
   it (`File::sync_data`). **Delete it on any definitive answer**: `Ok`, or a refusal with
   `no_mutation` true. Never save a request after `Ok`: the ack floor (below) drops its answer
@@ -310,6 +313,10 @@ Then ask:
 
 - **Ask `db.status(id, generation)`.** `Resolved` means it landed. Its `outcome` is
   `RecoveredApplied` when the answer comes from history kept across the reopen.
+- **With three processes, after a node restart,** a resend answers `GENERATION_CHANGED`. Then
+  `status`, with the generation it was sent in or with none, answers `Resolved` (outcome
+  `RecoveredApplied`) for a write the new generation kept. Row
+  `m10_r394_e2_a_write_carried_across_a_secondary_restart_is_resolved_by_status` runs it.
 - **The second argument is the generation the request was sent under**: the request's
   `expected_generation`, or the `generation` of its answer. Pass `None` when you do not know it,
   as after `put_saved`. A request that landed still answers `Resolved`. Only the not-landed
@@ -329,9 +336,10 @@ Then ask:
   `Unknown` until it publishes. Ask again a few times within a few seconds at most. Never poll
   `status` forever.
 - **After `GENERATION_CHANGED`, a `NotKnown` that stays means: read the object.** `did_it_land`
-  then asks `status` about the first send. If it still answers `NotKnown` after a few asks over
-  a few seconds, asking more will not settle it. Read the object: its value is the answer.
-  Never send the request as a new write.
+  then asks `status` about the first send. A write the new generation kept answers `Yes`, as
+  above. If it still answers `NotKnown` after a few asks over a few seconds, the write was cut
+  off or is not known, and asking more will not settle it. Read the object: its value is the
+  answer. Never send the request as a new write.
 
 `crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
 
@@ -474,7 +482,8 @@ What each refusal means, and when to retry:
 | `LEASE_EXPIRED` | The owner's permission to write ran out. | After `db.wait_ready(..)`. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
-| `UNAVAILABLE`, "went out of reach while this call waited" | The owner's process stopped mid-call. | Once it is back. |
+| `UNAVAILABLE`, "went out of reach ...; a write sent here may have applied" | The owner's process stopped after the write was sent (`no_mutation` false). | Once it is back: `db.resend(..)` the request, or ask `db.status(..)`. |
+| `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
 
@@ -494,7 +503,7 @@ app writing all the time:
 |---|---|---|
 | A secondary killed and left down for 60 s | 15.4 s, then writes resumed **with the copy still down** | `PROTECTION_PAUSED`, `LEASE_EXPIRED`, `PROTECTION_PAUSED` |
 | A secondary restarted (`lr restart 2`) | 8.6 s | `UNKNOWN_OUTCOME`, `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED` |
-| The owner restarted (`lr restart 1`) | 3.6 s | `UNAVAILABLE` (went out of reach), `PROTECTION_PAUSED` |
+| The owner restarted (`lr restart 1`) | 3.6 s | `UNAVAILABLE` (went out of reach, either form), `PROTECTION_PAUSED` |
 
 Every acknowledged write read back afterwards (28,734, 6,217 and 13,644 of them, 0 missing).
 One run each, on a busy host: treat the times as rough.
@@ -652,6 +661,13 @@ column says what to change before the next open.
 | `OpenError::Control` | rEtcd did not answer, or failed, a read or the open count the open needs (a leader change, say) | Open again once rEtcd is up |
 | `OpenError::Bootstrap` | A new folder's first open could not set it up in rEtcd | Check that rEtcd is running and reachable, then open again |
 | `ReadyError::TimedOut` | The node that owns partition 1 did not admit writes in time. The message names that node (its `owner` field: node 1 normally, node 2 after `lr promote 2`) and what it last answered | Shut down and open again, once. If it times out again, stop and report it with the message; do not retry in a loop |
+
+What a `TimedOut` message says the owner last answered:
+
+- "node N is not reachable from this process: no link to it is up": node N's process is not
+  running, or cannot be reached. Start it.
+- "node N answered no status look in that time (it may be busy ...)": node N was reached and did
+  not answer. Wait longer.
 
 `pilot_kv` prints `open refused: <Variant>: <detail>` and exits 3 for an `OpenError` or a
 failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked` and

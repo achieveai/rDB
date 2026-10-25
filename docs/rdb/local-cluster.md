@@ -278,8 +278,10 @@ worth reading.
 
   Every acknowledged write read back (0 missing). The refusals the app saw, and what to do with
   each, are in embed.md, "When writes pause". A write sent to the owner as it stops answers
-  `UNAVAILABLE (node 1, the owner, went out of reach while this call waited ...)`: resend that
-  same request once it is back. A read with the owner down is refused after 1 s
+  `UNAVAILABLE (node 1, the owner, went out of reach while this call waited ...)`. With
+  `no_mutation` false ("a write sent here may have applied"), resend that same request once it
+  is back. With `no_mutation` true ("this call writes nothing"), nothing was applied: send it
+  again as a new write. A read with the owner down is refused after 1 s
   (`Timeouts::read`): `UNAVAILABLE (node 1, the owner, is not reachable ...; nothing was sent)`.
 - **`lr down` stops writes until `up --resume`.** An app open across it gets the `UNAVAILABLE`
   lines above for every write and read. The walk did not keep an app open across
