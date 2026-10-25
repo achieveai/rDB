@@ -156,8 +156,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 - On success it prints `read back hello at version N`. Run it a second time: the same code
   reopens the folder (section 5), the `put` writes a new version over the old one, and the line
   shows a higher `N`. `got.value` is `Some((version, bytes))`, or `None` for an absent object.
-- A refused `put` hands back its request in `refused.request`, so you can send it again with
-  `db.resend`. The sample just returns the reason.
+- A refused `put` says how to send it again in `refused.error.no_mutation`. False: it may have
+  applied, so send the same request, from `refused.request`, with `db.resend`. True: it wrote
+  nothing, so send it as a new write (section 5, "When writes pause"). The sample just returns
+  the reason.
 - Open-to-ready took about 2.7-2.9 s on the dev host for a new folder, and about 5.5 s for a
   reopen (`pilot_kv`, see section 7). Most of it is fixed waits inside rDB, not work. Do not treat
   those figures as a promise.
@@ -471,7 +473,9 @@ loses data. A write made meanwhile is refused.
 **What happened to the write is in `refused.error.no_mutation`, not in the refusal's name.**
 
 - **`no_mutation` true:** this send wrote nothing, and no earlier send exists: a first send of
-  a new write. Retry it as the step says.
+  a new write. Send it again as a **new** write (`db.put`, `db.txn` or `db.write`), not with
+  `db.resend`. The ack floor counts this refusal as settled: once a later write is answered, a
+  resend of it answers `STATUS_EXPIRED` and applies nothing, so the write is lost.
 - **`no_mutation` false:** an earlier send of this request may have applied. This is always the
   case for a resend, whatever the refusal. Send the **same** request again with
   `db.resend(..)` (the request is in `refused.request`), or ask `db.status(..)`. Never send it
@@ -479,7 +483,8 @@ loses data. A write made meanwhile is refused.
 - **`GENERATION_CHANGED` is the exception:** never replay it as it is. A resend is refused
   the same way, so ask `db.status(..)` with its request id whether an earlier send applied it.
 
-What each refusal means, and when to retry:
+What each refusal means, and when to retry. How to retry follows `no_mutation`, as above: a
+first send refused with it true goes again as a new write, and anything else as a resend.
 
 | Refusal | Why | When to retry |
 |---|---|---|
@@ -493,8 +498,9 @@ What each refusal means, and when to retry:
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
 
-`did_it_land` above does the "ask" part. Keep resending the same request and it lands once the
-pause ends.
+`did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
+is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
+nothing (`no_mutation` true) is sent again as a new write; it lands once the pause ends.
 
 **Limit a retry loop by time, not by count.** With three processes, a write whose owner link
 is down first asks rEtcd who owns the partition now, and waits up to `Timeouts::read` (1 s)
@@ -548,18 +554,19 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   answer the `Db` re-reads who owns the partition, at most once every 250 ms. So it follows a
   promote made elsewhere, and your retries go to the new owner.
 - **The cut ends after a promote.** The old owner is now fenced. It reads the owner record
-  and answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true. A resend is
-  safe. Its log shows `host_owner_learned`.
+  and answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true: this send
+  wrote nothing. A first send goes again as a new write; a resend, whose answer has
+  `no_mutation` false, goes again as a resend. Its log shows `host_owner_learned`.
 - **The old owner starts again after a promote.** It is added back automatically, as a
   standby first.
-- **The exception: a copy cut off across two or more reopens with no writes in between.** That
-  copy stays behind, and writes stay paused:
-  - A plain reopen does not help, even with every link up. Reads still work.
-  - A `put` is refused with `PROTECTION_PAUSED`, retry rule "retry after recovery". Waiting does
-    not clear it in this release; a later release catches the copy up across those reopens.
+- **A copy cut off across two or more reopens with no writes in between.** When it is back, it
+  catches up by itself, as a copy behind one reopen does:
+  - It links each generation it missed onto the data it holds, and takes the writes it lacks.
+    Writes may pause until it has, then go on.
   - Nothing is lost: the other copies hold every acknowledged write.
-  - How this case behaves is checked in rDB's simulator only. A check of the same case
-    against a real open of a folder is still owed (issue #59).
+  - Checked in rDB's simulator (`m10_d3_a_copy_behind_two_writeless_reopens_catches_up`) and on
+    one node's storage (`a_copy_that_missed_two_writeless_generations_links_the_newest_onto_its_own`).
+    A check of the same case through a real open of a folder is still owed (issue #59).
 - **The host is starved** (CPU or disk saturated by other work). Timers run late, so writes
   can pause and then recover once the host has room.
 - **rEtcd stalls for more than about 2 s,** for example during its own leader election. Node
@@ -584,9 +591,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - `get` and `read` do not need `wait_ready`. To start for reads, treat
     `ReadyError::TimedOut` as "no writes yet" and keep the `Db`, instead of returning the error.
   - A write is refused `RECOVERY_READ_ONLY` ("reads still work; writes return when the lost
-    copies are back"). Its `no_mutation` is true: this send wrote nothing (A-R401). Resend
-    that same request later; a resend reports `no_mutation` false, as every resend does,
-    because an earlier send may have applied it.
+    copies are back"). Its `no_mutation` is true: this send wrote nothing (A-R401). Send it
+    again later as a new write, not with `db.resend`. A resend reports `no_mutation` false, as
+    every resend does, because an earlier send may have applied it: that one is resent.
   - Writes return once a second copy is back.
   - **Reads say when they come from a read-only recovery.** `GetOk::recovery_mode` and
     `ReadOk::recovery_mode` are true whenever the partition serves read-only after a recovery
@@ -624,6 +631,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   full read of the object, and a clear of it are all refused `INCOMPATIBLE_VERSION`, with
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
+- **Rolling back to an older build is not always possible.** Once this build has written an
+  ack floor or an epoch revocation into a folder, its copies are format 2. A format-1 build
+  refuses to open them, and its error names the format range it reads. So roll back only onto
+  a folder this build has written neither into. Otherwise, restore a backup taken before the
+  upgrade.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
@@ -676,14 +688,14 @@ report it with the message.
 |---|---|---|
 | `ReadyError::Heal` | The reopen's repair failed. The message says why: for example, the last run's grant is still held by another open of this folder's data | Do what the message says (often: shut that other open down), then open again |
 | `ReadyError::Stopped` | Node 1 restarted in this open | Shut this `Db` down and open the folder again |
-| `ReadyError::Blocked` | The open's recovery stopped before node 1 took writes; the message names why (often a copy answered too late) | Shut this `Db` down and open the folder again, once. If that open is blocked too, stop and report it with the message; do not retry in a loop |
-| `ReadyError::Faulted` | Node 1 stopped on a fault, and it takes no writes in this open; the message carries the fault (a storage or link step that failed, say) | Shut this `Db` down and open the folder again, once. If that open stops the same way, stop and report it with the message; do not delete the folder |
+| `ReadyError::Blocked` | The open's recovery stopped before the owner (the message names its node) took writes; the message names why (often a copy answered too late) | Shut this `Db` down and open the folder again, once. If that open is blocked too, stop and report it with the message; do not retry in a loop |
+| `ReadyError::Faulted` | The owner (the message names its node) stopped on a fault, and it takes no writes in this open; the message carries the fault (a storage or link step that failed, say) | Shut this `Db` down and open the folder again, once. If that open stops the same way, stop and report it with the message; do not delete the folder |
 
 **Not fixed by opening again.**
 
 | Error | When | What to do |
 |---|---|---|
-| `ReadyError::Quarantined` | The copies' histories disagree, so node 1 takes no writes. The acknowledged data is kept | Do not delete the folder, and do not keep opening it. This build has no repair command yet: stop and report it with the message |
+| `ReadyError::Quarantined` | The copies' histories disagree, so the owner (the message names its node) takes no writes. The acknowledged data is kept | Do not delete the folder, and do not keep opening it. This build has no repair command yet: stop and report it with the message |
 
 **Fix the cause first.** Opening again unchanged gives the same error; the "what to do"
 column says what to change before the next open.

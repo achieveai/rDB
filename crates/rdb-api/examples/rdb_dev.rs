@@ -4721,7 +4721,7 @@ fn wait_ready_line(
             ("blocked", Err(format!("stopped waiting for ready: {e}")))
         }
         // A-R196(2a): its text says the data is kept and a reopen will not help.
-        Err(e @ ReadyError::Quarantined) => (
+        Err(e @ ReadyError::Quarantined { .. }) => (
             "quarantined",
             Err(format!("stopped waiting for ready: {e}")),
         ),
@@ -7566,10 +7566,12 @@ mod tests {
                 note: "node 1 restarted".to_owned(),
             },
             ReadyError::Blocked {
+                owner: NodeId(1),
                 reason: "BarrierIncomplete".to_owned(),
             },
-            ReadyError::Quarantined,
+            ReadyError::Quarantined { owner: NodeId(1) },
             ReadyError::Faulted {
+                owner: NodeId(1),
                 fault: "after-commit hook".to_owned(),
             },
         ];

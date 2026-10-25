@@ -7,7 +7,7 @@
 //!   read-then-CAS, and a reopened `Db` takes a fresh grant in the same boot after a control store
 //!   outage (A-R96).
 
-use super::tests::{owner_status, owner_when, put_through_pauses};
+use super::tests::{digest_at, owner_status, owner_when, put_through_pauses, stored_root};
 use super::*;
 
 fn config(dir: &Path) -> DbConfig {
@@ -2462,6 +2462,108 @@ fn m10_s2_a_node_process_whose_copy_is_behind_an_activated_generation_joins() {
     );
 }
 
+/// review-s2 F-009 (L3): a node process whose copy is staged into the generation `partitions/1`
+/// names, and never switched in, does not hold that generation but is not behind it either: its
+/// open never joins. It rolls the generation forward or is refused `Stale`, as the full open of
+/// PR #60 F1 does. Node 2's copy is staged into generation 32 by a flatten cut short before its
+/// switch (32 levels, built offline as that row builds them), and `partitions/1` names 32 with
+/// node 1 as owner; node 2's process opens alone. Cut: the joining branch reads `behind`
+/// through `serves()` (a staged copy left out), and the open logs `db_open_joining`, red.
+/// Integration (~4 s): a fresh open, a reopen until ready, one node-process open.
+#[config_log::retcd_test]
+fn m10_s2_f009_a_node_process_whose_copy_is_staged_into_the_generation_never_joins() {
+    const METHOD: &str =
+        "m10_s2_f009_a_node_process_whose_copy_is_staged_into_the_generation_never_joins";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let nodes = dir.path().join("nodes");
+    written_and_closed(&rt, dir.path(), &store);
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen to generation 2");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("generation 2 is ready");
+    db.shutdown();
+    drop(db);
+
+    // Generations 3..=31 on every copy at generation 2's head; node 2 stages 32 and stops
+    // before the switch.
+    let (record, root, revision) = stored_root(&rt, &store);
+    assert_eq!(record.generation, Generation(2), "{record:?}");
+    let mut head = None;
+    for n in 1..=3u32 {
+        let mut engine =
+            RocksEngine::open_existing(nodes.join(n.to_string())).expect("open a copy");
+        let applied = Seq(engine.buffered_applied(PARTITION, Generation(2)).0);
+        assert!(head.is_none_or(|head| head == applied), "copies differ");
+        head = Some(applied);
+        for to in 3..=31 {
+            engine
+                .inherit(PARTITION, Generation(to - 1), Generation(to), applied)
+                .expect("link a level");
+        }
+        if n == 2 {
+            engine.inject_fault(rdb_storage::InjectedFault::Switch);
+            let cut = engine.inherit(PARTITION, Generation(31), Generation(32), applied);
+            assert!(
+                matches!(cut, Err(rdb_storage::InheritError::Storage(_))),
+                "{cut:?}"
+            );
+            assert_eq!(
+                engine.staging(PARTITION, Generation(32)),
+                Some((Generation(31), applied))
+            );
+            assert!(engine.lineages().contains(&(PARTITION, Generation(32))));
+        }
+    }
+    let head = head.expect("three copies");
+    let digest = {
+        let engine = RocksEngine::open_existing(nodes.join("1")).expect("node 1");
+        digest_at(&engine, Generation(31), head)
+    };
+    let moved = PartitionRoot {
+        base_seq: head,
+        base_digest: digest,
+        predecessor_generation: Generation(31),
+        predecessor_cutoff: head,
+        ..root
+    };
+    let record = PartitionRecord {
+        generation: Generation(32),
+        ..record
+    };
+    assert_eq!(
+        record.owner,
+        NodeId(1),
+        "node 2 is not the owner: {record:?}"
+    );
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        value: record.encode_with(&moved),
+        expected_mod_revision: Some(revision),
+        dedup: None,
+    }))
+    .expect("move partitions/1 to generation 32");
+
+    let opened = open_node(&rt, dir.path(), &store, &[2]);
+    let answer = match opened {
+        Ok(mut db) => {
+            db.shutdown();
+            "opened".to_owned()
+        }
+        Err(error @ OpenError::Stale { .. }) => error.to_string(),
+        Err(other) => panic!("rolled forward or Stale, not: {other:?}"),
+    };
+    let logged = messages(METHOD);
+    assert!(
+        !logged.iter().any(|m| m == "db_open_joining"),
+        "a staged copy is not behind: {answer}; {logged:?}"
+    );
+    assert!(
+        answer != "opened" || logged.iter().any(|m| m == "db_open_rolled_forward"),
+        "an open that passed rolled forward: {logged:?}"
+    );
+}
+
 /// A-R231(a): `DbConfig::local` names each of nodes 1-3 at most once, and a `Db` that runs no
 /// node needs `links`. Each is refused before anything opens. Unit (~10 ms).
 #[config_log::retcd_test]
@@ -3639,6 +3741,9 @@ mod guide_did_it_land {
 /// A-R357 D1 (tester tc1): a call the owner in another process never answered, because its
 /// link dropped while the call waited (`lr down`), is `UNAVAILABLE`: wait and retry, never a
 /// host fault to report. The same drop by a node of this process stays a host fault.
+/// review-s2 F-003: the write may have applied, so its one step is to resend the same request or
+/// ask its status once the owner is back; it said "wait a few seconds and try again", which an
+/// app follows with a new id.
 #[test]
 fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_host_fault() {
     let lost = unanswered(false, NodeId(1), true);
@@ -3653,9 +3758,13 @@ fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_hos
         "{text}"
     );
     assert!(
-        text.contains("next: the database is not serving right now: wait"),
+        text.contains(
+            "next: once the owner is back, send the same request again with `Db::resend`, or \
+             ask `Db::status`; never send it under a new request id"
+        ),
         "{text}"
     );
+    assert!(!text.contains("try again"), "{text}");
     assert!(!text.contains("report this message"), "{text}");
     assert!(!text.contains("host fault"), "{text}");
     let local = unanswered(true, NodeId(1), true).to_string();

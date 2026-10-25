@@ -3496,7 +3496,8 @@ impl Host {
         });
         error.no_mutation = true;
         error.detail = format!(
-            "node {} lost its grant, and partitions/{} names node {} as owner; nothing was sent",
+            "node {} lost its grant, and partitions/{} names node {} as owner; this send wrote \
+             nothing",
             self.node.0, partition.0, owner.0
         );
         Answer::Error { error, request }
