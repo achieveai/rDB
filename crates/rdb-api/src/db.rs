@@ -5662,8 +5662,17 @@ mod tests {
         let generation = loop {
             let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
             let shadow = shadowed(&lines);
+            // ADV-4 (A-R406): node 3 comes back only through one of the two; name it when neither.
             if !dropped(&lines) && !shadow {
-                break of(&db, OWNER).recovered.expect("node 1 recovered");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "node 1 re-planned past generation {} but neither shadowed node 3 at its \
+                     restart (D9: no rejoin_plan shadowed=Some(3)) nor dropped it (A-R370: no \
+                     membership_drop_planned dropped=3) within {patience:?}",
+                    before.0
+                );
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
             }
             // A12: only a drop before the restart is the stall this side is for; a restarted
             // copy dropped afterwards is a fault, even when the re-add then repairs it.

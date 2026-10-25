@@ -1153,18 +1153,24 @@ fn a_secondary_restarted_behind_a_live_owner_catches_up_from_the_owner_and_rejoi
         let (next, landed) = three_dies_and_misses_puts(&mut trio, request);
         assert!(landed >= 1, "round {round}: node 3 missed no put");
         let boot = restart_three(&mut trio, dir.path(), regular_rejoin);
-        let rejoined = trio.until("node 1 commits the rejoin with all three", |trio| {
+        let (rejoined, role) = trio.until("node 1 commits the rejoin with all three", |trio| {
             let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
-            let nodes: Vec<(u32, BootId)> = committed
+            let three = committed
                 .committed
                 .pinned_config
                 .members
                 .iter()
-                .map(|member| (member.node.0, member.boot))
-                .collect();
-            (committed.new_generation > generation && nodes.contains(&(3, boot)))
-                .then_some(committed.new_generation)
+                .find(|member| member.node == NodeId(3) && member.boot == boot)?;
+            (committed.new_generation > generation)
+                .then_some((committed.new_generation, three.role))
         });
+        // ADV-4 (A-R406): name the path when the restart was shadowed after all.
+        assert_eq!(
+            role,
+            ReplicaRole::RegularSecondary,
+            "round {round}: node 3 rejoined as {role:?}; this row is F1's regular rejoin, which \
+             `regular_rejoin` keeps by turning D9's shadow off"
+        );
         assert_eq!(rejoined, generation.next(), "round {round}: one re-plan");
         assert!(
             trio.nodes[0]
@@ -1268,4 +1274,100 @@ fn a_target_restore_beside_a_serving_primary_installs_nothing() {
         "a source restore installs the dormant receiver"
     );
     assert_eq!(logged!(METHOD, "dormant_ladder_built").len(), 1);
+}
+
+/// MAT-2 (A-R406, D10's host half): an owner promoted from a secondary still holds that side's
+/// receiver, which the promote's `Recovered` retired (B-R58a). A source restore beside the
+/// serving primary replaces it with a fresh dormant receiver, so R1 sources the catch-up F1
+/// routes there instead of refusing it `NotASource`. Node 1 serves the partition after
+/// bootstrap; a receiver built for its copy and retired by the committed pin, which names that
+/// copy the primary, stands in for the promoted side's.
+/// Cut: `restore_dormant`'s `stale` forced false, red (the retired receiver is kept and the
+/// catch-up is refused `NotASource`).
+/// Integration (~3 s): bootstrap's discovery window, then direct calls.
+#[config_log::retcd_test]
+fn m10_s2_mat2_a_retired_receiver_beside_a_serving_primary_is_replaced_for_a_source() {
+    use rdb_core::contracts::ids::Revision;
+    const METHOD: &str =
+        "m10_s2_mat2_a_retired_receiver_beside_a_serving_primary_is_replaced_for_a_source";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let through = Seq(trio.until("node 1 wrote past the root", |trio| {
+        trio.head().filter(|head| *head > 0)
+    }));
+    let committed = trio.until("node 1 committed", |trio| {
+        trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+    });
+    let config = committed.committed.pinned_config.clone();
+    let copy_of = |n: u32| {
+        config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(n))
+            .map(|member| member.copy)
+            .expect("a member")
+    };
+    let (from, to) = (copy_of(1), copy_of(3));
+    let seed = DormantSeed {
+        config: config.clone(),
+        lineage: Lineage {
+            partition: PartitionId(1),
+            generation: committed.new_generation,
+            owner_epoch: OwnerEpoch(1),
+        },
+        revision: Revision(1),
+    };
+    let one = &mut trio.nodes[0].0;
+    assert!(
+        one.replication
+            .primary(NodeId(1), PartitionId(1))
+            .is_some_and(|primary| !primary.tracker().retired()),
+        "node 1 serves the partition"
+    );
+    let mut stale = one
+        .dormant_receiver(PartitionId(1), &seed)
+        .expect("a receiver for node 1's copy");
+    let _ = stale.on_recovered(&committed);
+    assert!(stale.retired(), "the pin names node 1's copy the primary");
+    one.replication.install_receiver(stale);
+
+    let credential = FenceCredential {
+        partition: PartitionId(1),
+        prior_generation: committed.new_generation,
+        prior_owner_epoch: OwnerEpoch(1),
+        control_revision: Revision(u64::MAX),
+        sender: from,
+    };
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: CorrelationId(u64::MAX),
+    };
+    one.source_catch_up(NodeId(2), site, (from, to, through), credential, &seed);
+    one.drain();
+
+    // Refusal first, so the cut fails on R1's answer itself.
+    let refused = logged!(METHOD, "catch_up_refused");
+    assert!(
+        refused.is_empty(),
+        "R1 refused node 1's catch-up: {refused:?}"
+    );
+    assert!(
+        one.replication
+            .source(NodeId(1), PartitionId(1), to)
+            .is_some(),
+        "R1 sources no catch-up from node 1"
+    );
+    let held = one.replication.receiver(NodeId(1), PartitionId(1));
+    assert!(
+        held.is_some_and(|receiver| receiver.is_dormant() && !receiver.retired()),
+        "the retired receiver was kept"
+    );
+    assert!(
+        logged!(METHOD, "dormant_restored")
+            .iter()
+            .any(|line| line["node"] == 1),
+        "node 1 restored no dormant receiver"
+    );
 }

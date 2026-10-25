@@ -4622,8 +4622,9 @@ impl Host {
     /// writes go on with the two regular copies while R1 catches it up, and
     /// [`Self::shadow_duty`] promotes it once it reaches the cutoff (two short re-plans, the
     /// `behind` case's). Only from an `Active` commit, for a plain restart (no drop, not the
-    /// promote), and only when two regular copies whose pinned boot is current stay pinned:
-    /// otherwise the rejoiner stays regular, as before.
+    /// promote), and only when two regular copies whose pinned boot is current, and which
+    /// this owner can reach (ADV-2, A-R406: a held peer would leave a read-only plan), stay
+    /// pinned: otherwise the rejoiner stays regular, as before.
     fn restart_shadowed(&self, committed: &RecoveryResult, replan: Replan) -> Option<NodeId> {
         if !self.restart_shadow
             || replan.promote
@@ -4648,10 +4649,11 @@ impl Host {
             .filter(|member| member.node != restarted.node && member.role != ReplicaRole::Shadow)
             .filter(|member| {
                 member.node == self.node
-                    || self
-                        .links
-                        .boot_of(member.node)
-                        .is_some_and(|live| live == member.boot)
+                    || (self.linked(member.node)
+                        && self
+                            .links
+                            .boot_of(member.node)
+                            .is_some_and(|live| live == member.boot))
             })
             .count();
         (current >= 2).then_some(restarted.node)

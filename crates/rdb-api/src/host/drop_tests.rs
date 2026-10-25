@@ -571,6 +571,13 @@ fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
             .map(Recovery::phase);
         (phase == Some(RecoveryPhase::Synchronizing)).then_some(())
     });
+    // ADV-4 (A-R406): name the path when the restart was shadowed after all.
+    let plans = logged!(METHOD, "rejoin_plan");
+    assert!(
+        plans.iter().all(|plan| plan["shadowed"] == "None"),
+        "b10 is F1's regular rejoin, which `restart_shadow = false` keeps; a plan shadowed \
+         node 3: {plans:?}"
+    );
     hold_three(&trio);
 
     let after = dropped_three(&mut trio, before);
@@ -2136,11 +2143,27 @@ fn m10_s2_d9_a_wiped_secondary_rejoins_as_a_shadow_and_writes_go_on() {
         Some((committed.new_generation, three.role, committed.mode.clone()))
     });
     assert!(shadowed > before, "{shadowed:?}");
+
+    // Writes go on while the new copy cannot catch up: the 1-3 link is held from the
+    // restart's commit, and a put lands at that generation on nodes 1 and 2. Asked before the
+    // role, so the cut fails on the write itself.
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.ready();
+    match trio.ask(put(21)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, shadowed),
+        other => panic!("a put while node 3 is held off after its restart: {other:?}"),
+    }
     assert_eq!(
         (role, mode),
         (ReplicaRole::Shadow, PartitionMode::DegradedRf2),
         "the wiped copy is pinned as a shadow, not counted"
     );
+    assert_eq!(
+        role_of_three(&trio),
+        Some(ReplicaRole::Shadow),
+        "node 3 was promoted while held off"
+    );
+    trio.links.heal(NodeId(1), NodeId(3));
 
     let (promoted, mode, members) = trio.until("node 1 pinned node 3 as regular", |trio| {
         (role_of_three(trio) == Some(ReplicaRole::RegularSecondary))
@@ -2152,7 +2175,7 @@ fn m10_s2_d9_a_wiped_secondary_rejoins_as_a_shadow_and_writes_go_on() {
     });
     assert_eq!((mode, members), (PartitionMode::Active, vec![1, 2, 3]));
     trio.ready();
-    match trio.ask(put(21)) {
+    match trio.ask(put(22)) {
         Answer::Txn { result, .. } => assert_eq!(result.generation, promoted),
         other => panic!("a put after the promote: {other:?}"),
     }
@@ -2168,4 +2191,135 @@ fn m10_s2_d9_a_wiped_secondary_rejoins_as_a_shadow_and_writes_go_on() {
         "the restart's plan shadowed node 3: {plans:?}"
     );
     assert!(logged!(METHOD, "membership_drop_planned").is_empty());
+}
+
+/// ADV-2 (A-R406): a restart under an `Active` owner is shadowed only when two *linked*
+/// regular members are current. With node 2 held off node 1, a restarted node 3 is not
+/// pinned a shadow: a shadow plan would leave node 1 the only counted copy it can reach, and
+/// the app would read `RECOVERY_READ_ONLY` though node 3 is back.
+/// Cut: drop `restart_shadowed`'s `linked` filter, red (node 3 shadowed, `ReadOnly`).
+/// Integration (~3 s): bootstrap's window, the restart's re-plan.
+#[config_log::retcd_test]
+fn m10_s2_adv2_a_restart_beside_an_unlinked_member_is_not_shadowed() {
+    const METHOD: &str = "m10_s2_adv2_a_restart_beside_an_unlinked_member_is_not_shadowed";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.links.hold(NodeId(1), NodeId(2));
+    let boot = restart_as(&mut trio, dir.path(), 3, false);
+    let (generation, role, mode) = trio.until("node 1 pinned node 3 at its new boot", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+        let three = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.boot == boot)?;
+        Some((committed.new_generation, three.role, committed.mode.clone()))
+    });
+    assert!(generation > before, "{generation:?}");
+    assert_eq!(
+        (role, mode),
+        (ReplicaRole::RegularSecondary, PartitionMode::DegradedRf2),
+        "node 3 shadowed beside an unlinked node 2"
+    );
+    let plans = logged!(METHOD, "rejoin_plan");
+    assert!(
+        plans.iter().all(|plan| plan["shadowed"] != "Some(3)"),
+        "the restart's plan shadowed node 3: {plans:?}"
+    );
+}
+
+/// ADV-3 (A-R406): D9's promote whose barrier never completes. A wiped node 3 restarts under
+/// an `Active` owner and is pinned a shadow; it catches up and node 1 starts its promote. Once
+/// F1 is past the inventory (synchronizing or at the barrier), node 3 is held: its links stay
+/// up but nothing crosses them, so it proves nothing. F1 commits the promote without node 3's
+/// proof, `DegradedRf2`, so L1 still counts nodes 1 and 2 only, and writes land there. While
+/// node 3 stays held, through the drop clock and past it, no commit is ever `Active`: a copy
+/// that has proved nothing is never counted, and the drop clock leaves it out (b7): nodes 1
+/// and 2, `DegradedRf2`.
+/// Cut: `restart_shadowed` returns `None`, red (node 3 is never pinned a shadow).
+/// Integration (~6 s): bootstrap's window, the restart's re-plan, the promote's, the drop
+/// clock while held.
+#[config_log::retcd_test]
+fn m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two() {
+    const METHOD: &str =
+        "m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    for request in 1..=20 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} with every copy up: {other:?}"),
+        }
+    }
+    restart_as(&mut trio, dir.path(), 3, true);
+    let shadowed = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow))
+            .then(|| commit_of(trio))
+            .flatten()
+            .map(|(generation, _, _)| generation)
+    });
+
+    trio.until("node 1 waits on node 3 for its promote", |trio| {
+        let phase = trio.nodes[0]
+            .0
+            .recoveries
+            .get(&PartitionId(1))
+            .map(Recovery::phase);
+        let promoting = !logged!(METHOD, "shadow_promote").is_empty();
+        let past_inventory = matches!(
+            phase,
+            Some(RecoveryPhase::Synchronizing | RecoveryPhase::Barrier)
+        );
+        (promoting && past_inventory).then_some(())
+    });
+    hold_three(&trio);
+
+    let (promoted, mode) = trio.until("node 1 committed the promote", |trio| {
+        commit_of(trio)
+            .filter(|(generation, _, _)| *generation > shadowed)
+            .map(|(generation, mode, _)| (generation, mode))
+    });
+    assert_eq!(
+        mode,
+        PartitionMode::DegradedRf2,
+        "the promote counted node 3 before it proved anything"
+    );
+    trio.ready();
+    match trio.ask(put(21)) {
+        Answer::Txn { result, .. } => assert!(result.generation >= promoted, "{result:?}"),
+        other => panic!("a put while node 3 is held after its promote: {other:?}"),
+    }
+
+    // Held through the drop clock and a margin: no commit counts node 3.
+    let until = trio
+        .clock
+        .now()
+        .plus_millis(DROP_AFTER_MILLIS + 4 * test_discovery_window_millis());
+    let mut active = None;
+    trio.until("the drop clock to pass while node 3 is held", |trio| {
+        if let Some(commit) = commit_of(trio).filter(|(_, mode, _)| *mode == PartitionMode::Active)
+        {
+            active.get_or_insert(commit);
+        }
+        (trio.clock.now() >= until).then_some(())
+    });
+    assert_eq!(active, None, "a commit counted node 3 while it was held");
+    trio.ready();
+    match trio.ask(put(22)) {
+        Answer::Txn { result, .. } => assert!(result.generation >= promoted, "{result:?}"),
+        other => panic!("a put after the drop clock, node 3 held: {other:?}"),
+    }
+
+    // The stalled regular copy is dropped by the clock (b7), and nothing else: nodes 1 and 2.
+    assert_eq!(
+        commit_of(&trio).map(|(_, mode, members)| (mode, members)),
+        Some((PartitionMode::DegradedRf2, vec![1, 2])),
+        "node 3, held, was not dropped"
+    );
+    let dropped = logged!(METHOD, "rejoin_plan");
+    assert!(
+        dropped.iter().any(|plan| plan["dropped"] == "Some(3)"),
+        "{dropped:?}"
+    );
 }
