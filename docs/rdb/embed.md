@@ -524,6 +524,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
   new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
   walk, 15 s after the kill, while the copy stayed down.
+- **A copy cut off long enough to be dropped stays out after the link heals.** That is the
+  copy rDB stopped waiting for, in the bullet above. Writes keep working on the other two
+  copies. Healing the link alone does not add it back. Restart that node: `lr restart N` with
+  three processes, or `db.restart_node(NodeId(N))` embedded. It comes back as a standby first,
+  then as a full copy.
 - **A restarted copy waits about 5 s before it counts again.** Once it has caught up, it must
   stay within 250 ms of the owner for 5 s in a row before writes resume (`resume_hold_millis`
   and `resume_lag_millis`). Falling behind again restarts the 5 s. That wait was most of the
@@ -614,8 +619,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   (`repair_element`) comes with a later release.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
-  folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`); see section 5. With
-  three processes, a restarted owner process comes back and serves with no app reopen: writes
+  folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
+  see section 5. With three processes, a restarted owner process comes back and serves with no app reopen: writes
   were refused for 3.6 s (`lr restart 1`, local-cluster.md section 5).
 - **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.

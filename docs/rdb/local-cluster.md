@@ -59,6 +59,8 @@ works as written. `--run DIR` picks another run.
 | `start N` | Starts node N and waits for `rdb_node ready`. Exit 1 with the node's reason if it is not ready. |
 | `restart N` | `stop N`, then `start N`, with the same wait for ready. |
 | `kill N` | Kills node N at once, like a crash. Prints `lr: node N killed (pid ...)`. |
+| `hold A-B` | Holds every frame between nodes A and B: a cut link (a delay, never a loss). |
+| `heal A-B` | Lifts that hold. If the cut lasted long enough that a copy was dropped, `heal` alone does not add it back. Writes keep working on the other two copies. Run `lr restart N` for the dropped node; it comes back as a standby first, then as a full copy. |
 | `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. The node left out is added back automatically when it starts again. |
 | `down` | Stops the nodes and rEtcd. The run folder stays, with its data and logs. |
 | `up --resume` | Starts the last run again after a `down`: its rEtcd, then nodes 1, 2 and 3, with its own ports and binary paths (a later `up` rebuilds those binaries in place). The data written before `down` is still there. A run that is still up is refused: "the run is up; 'lr down' first". Plain `up` always makes a **new**, empty run. |
