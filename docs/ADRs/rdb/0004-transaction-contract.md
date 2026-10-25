@@ -315,6 +315,18 @@ no mutation by this submission.** It keeps its retry rule.
 - Pinned by `a_recovery_read_only_refusal_proves_no_mutation` in
   `rdb-core/tests/transaction_t1.rs`.
 
+**Noted 2026-10-24 (M10 S2, lead rulings A-R398 and A-R399; docs only, no rule change): a fenced
+former owner also answers `NOT_PRIMARY`.** The row above, its retry rule and its class are
+unchanged.
+- The producer: an owner fenced while cut off from rEtcd reads `partitions/{p}` once the cut
+  ends. If that names another node, it answers `NOT_PRIMARY` with that node as the hint, in place
+  of the `LEASE_EXPIRED` it would give (`host_owner_learned` in its log).
+- It rewrites only a `LEASE_EXPIRED` that already proved no mutation, so the `NOT_PRIMARY` keeps
+  `no_mutation` true and the request a resend carries.
+- Pinned by `m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner`
+  and `m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing` in
+  `rdb-api/src/host/tests.rs`.
+
 ### 6. The local apply never returns success
 
 Spec §5.2 step 6: success is returned only after one regular-secondary buffered ACK plus an
