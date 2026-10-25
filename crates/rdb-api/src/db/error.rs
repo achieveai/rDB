@@ -158,6 +158,26 @@ impl ApiError {
         }
     }
 
+    /// [`Self::owner_lost`] for a call that writes nothing: a read, a status look, or a write's
+    /// compile, which answers before the write itself is sent (tester tc2 E1, A-R394). Nothing
+    /// was applied, so `no_mutation`, and there is no request to resend.
+    #[must_use]
+    pub fn owner_lost_unsent(node: NodeId) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: true,
+            detail: format!(
+                "node {}, the owner, went out of reach while this call waited for its answer (its \
+                 process may have stopped); this call writes nothing (a read, a status look, or \
+                 a write's first step, before the write is sent), so nothing was applied: retry \
+                 it once node {} is back or another node is promoted",
+                node.0, node.0
+            ),
+            retry_after: None,
+        }
+    }
+
     /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
     #[must_use]
     pub fn host(detail: &str) -> Self {
@@ -323,6 +343,9 @@ pub(crate) enum ReadySeen<'a> {
     /// The owner answered no status look in the time: it may be busy, for example syncing its
     /// copies to the barrier. Never "unknown": that read as a fault (tester-s2, #59).
     NoAnswer,
+    /// The last look could not be sent: no link to the owner is up, as when its process is
+    /// stopped. Never "may be busy": nothing reached it (tester tc2 P1, A-R394).
+    NoLink,
     /// The owner answered and runs no recovery.
     NoRecovery,
     /// The owner's recovery phase, as it names it.
@@ -336,6 +359,10 @@ pub(crate) fn ready_timed_out_text(within_ms: u128, owner: u32, seen: ReadySeen<
         ReadySeen::NoAnswer => format!(
             "node {owner} answered no status look in that time (it may be busy, for example \
              syncing its copies)"
+        ),
+        ReadySeen::NoLink => format!(
+            "node {owner} is not reachable from this process: no link to it is up (its process \
+             may have stopped)"
         ),
         ReadySeen::NoRecovery => format!("node {owner} runs no recovery"),
         ReadySeen::Phase(phase) => format!("node {owner}'s recovery phase is {phase}"),
@@ -528,6 +555,7 @@ mod tests {
         let texts = [
             ready_timed_out_text(5_000, 2, ReadySeen::NoAnswer),
             ready_timed_out_text(5_000, 2, ReadySeen::NoRecovery),
+            ready_timed_out_text(5_000, 2, ReadySeen::NoLink),
             ready_timed_out_text(5_000, 2, ReadySeen::Phase("Fencing")),
             not_this_store_text("the copies hold data, but the store has no partitions/1"),
             copies_disagree_text("aa, bb"),
@@ -546,7 +574,9 @@ mod tests {
             assert!(!text.contains('\n') && !text.contains("  "), "{text:?}");
         }
         assert!(texts[0].contains("may be busy"), "{}", texts[0]);
-        assert!(texts[2].contains("phase is Fencing"), "{}", texts[2]);
+        assert!(texts[2].contains("not reachable"), "{}", texts[2]);
+        assert!(!texts[2].contains("may be busy"), "{}", texts[2]);
+        assert!(texts[3].contains("phase is Fencing"), "{}", texts[3]);
     }
 
     /// #59, A-R230: `CORRUPT_HISTORY` names the object and the damaged element's key for the

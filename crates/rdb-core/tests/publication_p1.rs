@@ -2904,6 +2904,59 @@ fn m7a_172_recovery_folds_status_by_sequence_not_by_presence() {
     }
 }
 
+/// A-R394 E2, M7A-172's twin for entries the post-apply deadline left `Unknown`: applied here,
+/// never confirmed, then a recovery. One the cutoff retained landed, so it folds to
+/// `RecoveredApplied` with the result the status seed builds; one above the cutoff stays
+/// `Unknown`, under every map, and never becomes `StatusExpired`, the answer for a dropped
+/// one. An uncertain map moves none.
+#[retcd_test]
+fn m10_r394_e2_recovery_folds_an_unknown_entry_the_cutoff_retained() {
+    let entry = |seq: u64| StatusEntry {
+        request: req(seq),
+        lineage: lineage(),
+        seq: Some(Seq(seq)),
+        record_digest: Some(d(seq)),
+        outcome: StatusOutcome::Unknown,
+        snapshot: None,
+        at: Tick::ZERO,
+    };
+    let map = |uncertain, discarded_from: Option<u64>| RetainedStatusMap {
+        predecessor_generation: GEN,
+        predecessor_cutoff: Seq(10),
+        retained_through: Seq(10),
+        discarded_from: discarded_from.map(Seq),
+        uncertain,
+    };
+    let applied = |seq: u64| StatusOutcome::RecoveredApplied {
+        result: result(P, seq),
+    };
+    let unknown = StatusOutcome::Unknown;
+    for (m, want) in [
+        (
+            map(false, Some(11)),
+            [applied(9), applied(10), unknown, unknown],
+        ),
+        (map(true, Some(11)), [unknown; 4]),
+        (
+            map(false, None),
+            [applied(9), applied(10), unknown, unknown],
+        ),
+    ] {
+        let mut index = StatusIndex::new(GEN);
+        for seq in 9..=12 {
+            index.record(entry(seq)).expect("under the cap");
+        }
+        index.fold_recovered(&m);
+        let got: Vec<_> = (9..=12).map(|seq| index.lookup(req(seq), GEN)).collect();
+        assert_eq!(got, want, "{m:?}");
+        assert_eq!(
+            index.lookup_any(req(10)),
+            want[1],
+            "{m:?}: no generation named"
+        );
+    }
+}
+
 // ---- reads ------------------------------------------------------------------------------------
 
 /// A fresh read waits behind the candidate and is served at the new published position.
