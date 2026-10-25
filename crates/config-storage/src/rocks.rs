@@ -3482,7 +3482,13 @@ impl RaftSnapshotBuilder<TypeConfig> for RocksSnapshotBuilder {
             let result = self
                 .shared
                 .run(|s| match capture_view(s)? {
-                    Some(view) => export_snapshot(s, view),
+                    Some(view) => {
+                        let exported = export_snapshot(s, view)?;
+                        if !matches!(exported, Exported::InstallInFlight) {
+                            s.faults.after_snapshot_export();
+                        }
+                        Ok(exported)
+                    }
                     None => Ok(Exported::InstallInFlight),
                 })
                 .await;
