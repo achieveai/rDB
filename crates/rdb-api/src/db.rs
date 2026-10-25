@@ -278,7 +278,9 @@ pub struct PutOk {
     pub seq: Seq,
     /// `Published`, or `RecoveredApplied` for an answer from retained history.
     pub outcome: Outcome,
-    /// What was true when the reply was sent.
+    /// The v1 success class (spec §5.1). For `Published`, what was true when the reply was
+    /// sent. For `RecoveredApplied`, not a live copy count: the partition's mode says how many
+    /// copies hold it (bug bash #68-A3, A-R426).
     pub durability: Durability,
     /// The request as sent, so the caller can [`Db::resend`] it.
     pub sent: Box<TxnRequest>,
