@@ -982,20 +982,6 @@ impl FaultInjector for PauseAt {
     }
 }
 
-/// Replicates the store's retention order: snapshots sort descending by build time, then by the
-/// index they cover. Used to prove a retention row is not vacuous — if the snapshot the test
-/// expects to win the ordering does not actually win it, the row proves nothing.
-fn sorts_newer(a: &str, b: &str) -> bool {
-    fn key(id: &str) -> (u64, u64) {
-        let mut parts = id.split('-').map(|p| p.parse::<u64>().unwrap_or(0));
-        let index = parts.next().unwrap_or(0);
-        let _term = parts.next();
-        let built = parts.next().unwrap_or(0);
-        (built, index)
-    }
-    key(a) > key(b)
-}
-
 /// M5-24e (finding C5-05): the install window between "the bytes are accepted" and "the marker
 /// is durable" still counts as activity.
 ///
@@ -1074,6 +1060,11 @@ async fn m5_24e_purge_inside_the_install_window_is_deferred() {
 /// The marker is held open by failing the install at its final batch rather than by pausing a
 /// concurrent one: Windows refuses to unlink a file the installing thread still has open, which
 /// would make the row pass for the wrong reason.
+///
+/// Since F-001 a build never publishes, and so never prunes, while the install marker is set,
+/// and a failed install poisons the store (critic-f A-1). So the local build that used to prune
+/// here is now refused, and refused **at once**: before the poison, the marker mirror stayed set
+/// and the build waited `INSTALL_PATIENCE` (300 s) for an install that would never commit.
 #[retcd_test]
 async fn m5_15a_prune_never_removes_the_in_progress_install_file() {
     let src_dir = tempfile::tempdir().unwrap();
@@ -1108,11 +1099,14 @@ async fn m5_15a_prune_never_removes_the_in_progress_install_file() {
             "the marker's file was published before the failure"
         );
 
-        let local = build(&dst).await.expect("a local build still succeeds");
         assert!(
-            sorts_newer(&local.snapshot_id, &meta.snapshot_id),
-            "the local build must outrank the incoming one, or retention never reaches it"
+            dst.is_poisoned(),
+            "an install that failed mid-replacement poisons the store"
         );
+        let local = tokio::time::timeout(CAPTURE_PATIENCE, build(&dst))
+            .await
+            .expect("a build after a failed install ends at once, not after the install wait");
+        assert!(local.is_err(), "a poisoned store publishes nothing");
         assert!(
             installed_file.exists(),
             "retention must skip the snapshot the install marker points at"
@@ -1591,5 +1585,441 @@ async fn a_r286_store_opens_with_more_background_jobs() {
             text.lines().any(|l| l.trim() == "max_background_jobs=16"),
             "the store's RocksDB options must carry max_background_jobs=16"
         );
+    }
+}
+
+// --- F-001: a build that overlaps an install --------------------------------------------------
+
+/// Bounds every wait in the F-001 rows, so a red row fails instead of hanging.
+const RACE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One handshake: the store's thread says "reached" and may wait for "release".
+struct Handshake {
+    reached_tx: std::sync::mpsc::SyncSender<()>,
+    reached_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    release_tx: std::sync::mpsc::SyncSender<()>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Handshake {
+    fn new() -> Self {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        Self {
+            reached_tx,
+            reached_rx: Mutex::new(reached_rx),
+            release_tx,
+            release_rx: Mutex::new(release_rx),
+        }
+    }
+
+    /// Called on the store's thread. `hold` decides whether it also waits for the release.
+    fn arrive(&self, hold: bool) {
+        self.reached_tx.send(()).expect("the test is still waiting");
+        if hold {
+            let _ = self.release_rx.lock().unwrap().recv_timeout(RACE_PATIENCE);
+        }
+    }
+
+    fn release(&self) {
+        let _ = self.release_tx.try_send(());
+    }
+}
+
+/// Drives an install and a build against each other (F-001). Optionally parks the first
+/// crossing of `pause` (an install boundary), and signals — optionally holding — the first
+/// snapshot capture right after its checkpoint exists.
+struct InstallRace {
+    pause: Option<Boundary>,
+    /// Fails every crossing of this boundary (with `FaultAction::Fail`, which does not poison).
+    fail: Option<Boundary>,
+    hold_capture: bool,
+    boundary_seen: AtomicU64,
+    capture_seen: AtomicU64,
+    install: Handshake,
+    capture: Handshake,
+}
+
+impl InstallRace {
+    fn new(pause: Option<Boundary>, fail: Option<Boundary>, hold_capture: bool) -> Arc<Self> {
+        Arc::new(Self {
+            pause,
+            fail,
+            hold_capture,
+            boundary_seen: AtomicU64::new(0),
+            capture_seen: AtomicU64::new(0),
+            install: Handshake::new(),
+            capture: Handshake::new(),
+        })
+    }
+
+    /// Wait until the install (`capture == false`) or the capture has reached its hook.
+    async fn reached(self: &Arc<Self>, capture: bool) {
+        let me = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let which = if capture { &me.capture } else { &me.install };
+            which
+                .reached_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(RACE_PATIENCE)
+                .expect("the operation reaches its hook")
+        })
+        .await
+        .expect("wait task joins");
+    }
+
+    fn release_all(&self) {
+        self.install.release();
+        self.capture.release();
+    }
+}
+
+impl FaultInjector for InstallRace {
+    fn before(&self, boundary: Boundary) -> FaultAction {
+        if Some(boundary) == self.pause && self.boundary_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.install.arrive(true);
+        }
+        if Some(boundary) == self.fail {
+            return FaultAction::Fail;
+        }
+        FaultAction::Proceed
+    }
+
+    fn during_snapshot_capture(&self) {
+        if self.capture_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.capture.arrive(self.hold_capture);
+        }
+    }
+}
+
+/// The KV keys `/m5/1..=n`, which is what `seed(n)` leaves applied at index `n`.
+fn seeded_keys(n: u64) -> std::collections::BTreeSet<Vec<u8>> {
+    (1..=n).map(|i| format!("/m5/{i}").into_bytes()).collect()
+}
+
+/// One published `.snap`: its path, its header's applied id, and the KV keys its body holds.
+type PublishedBody = (
+    String,
+    Option<LogId<RaftNodeId>>,
+    std::collections::BTreeSet<Vec<u8>>,
+);
+
+/// Every published `.snap` under `dir/snapshots`.
+fn published_bodies(dir: &Path) -> Vec<PublishedBody> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir.join("snapshots")).expect("snapshot dir lists") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("snap") {
+            continue;
+        }
+        let mut reader = SnapshotReader::open(&path).expect("published snapshot opens");
+        let header = reader.header().clone();
+        let mut keys = std::collections::BTreeSet::new();
+        while let Some(record) = reader.next_record().expect("record reads") {
+            if header.cfs[usize::from(record.cf)] == CF_KV {
+                keys.insert(record.key);
+            }
+        }
+        reader.verify_to_end().expect("counts and digest match");
+        out.push((path.display().to_string(), header.last_applied, keys));
+    }
+    out
+}
+
+/// "Every published snapshot's header describes exactly its body": each `.snap` whose header
+/// says index `n` holds exactly the records `seed` left applied at `n`. A header and a body
+/// taken from the same mid-install checkpoint pass the counts and the digest, so this compares
+/// the body with the state the header names, not with itself.
+fn assert_headers_match_bodies(dir: &Path) {
+    let published = published_bodies(dir);
+    assert!(!published.is_empty(), "the row published nothing to check");
+    for (file, last_applied, keys) in published {
+        let index = last_applied.map_or(0, |l| l.index);
+        assert_eq!(
+            keys,
+            seeded_keys(index),
+            "{file}: the header says index {index}, the body holds another state"
+        );
+    }
+}
+
+/// Whether a build's checkpoint directory still exists under `dir/snapshots`.
+fn build_view_exists(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join("snapshots"))
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(config_storage::snapshot::BUILD_VIEW_PREFIX)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// F-001 (mid-install half): a build whose checkpoint lands inside an install never publishes
+/// it.
+///
+/// The install is parked after it cleared the data column families, so the checkpoint holds the
+/// old header (index 3) over an empty body. The row waits until the build is done with that
+/// checkpoint (its directory is gone) while the install is still parked, and reads what was
+/// published by then. Nothing may be: a build that exported the view published a snapshot that
+/// says index 3 and holds no records, and a lagging follower would install it.
+#[retcd_test]
+async fn f001_a_build_inside_an_install_never_publishes_the_mid_install_view() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let meta = build(&src).await.expect("source build succeeds");
+
+        let race = InstallRace::new(Some(Boundary::AfterInstallDropCf), None, false);
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
+        seed(&dst, 3).await;
+
+        let bytes = std::fs::read(snap_path(&src, &meta)).unwrap();
+        let file = {
+            let mut file = dst
+                .state_machine()
+                .begin_receiving_snapshot()
+                .await
+                .expect("receive slot");
+            file.write_all(&bytes).await.unwrap();
+            file
+        };
+        let installing = {
+            let dst = dst.clone();
+            let meta = meta.clone();
+            tokio::spawn(async move { dst.state_machine().install_snapshot(&meta, file).await })
+        };
+        race.reached(false).await;
+
+        let building = {
+            let dst = dst.clone();
+            tokio::spawn(async move { build(&dst).await })
+        };
+        race.reached(true).await;
+
+        // The checkpoint is mid-install. Wait until the build is done with it.
+        let deadline = std::time::Instant::now() + RACE_PATIENCE;
+        while build_view_exists(dst_dir.path()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let view_released = !build_view_exists(dst_dir.path());
+        let published_mid_install = dst.metrics().snapshot_publications;
+        let current_mid_install = dst.snapshot_meta().map(|m| m.last_log_id);
+
+        // Nothing is asserted until both tasks have joined, so a red row fails, not hangs.
+        race.release_all();
+        installing
+            .await
+            .expect("the install task joins")
+            .expect("the install succeeds");
+        let built = building
+            .await
+            .expect("the build task joins")
+            .expect("the build succeeds");
+
+        assert!(view_released, "the build finished with its checkpoint");
+        assert_eq!(
+            (published_mid_install, current_mid_install),
+            (0, None),
+            "nothing is published from a checkpoint taken inside an install"
+        );
+        assert_eq!(
+            built.last_log_id, meta.last_log_id,
+            "the build captured again after the install"
+        );
+        assert_eq!(
+            dst.snapshot_meta().map(|m| m.last_log_id),
+            Some(meta.last_log_id),
+            "the current snapshot covers the installed state"
+        );
+        assert_eq!(dst.reader().last_applied(), meta.last_log_id);
+        assert_eq!(
+            dst.metrics().snapshot_build_retries,
+            0,
+            "waiting for an install spends no build attempt"
+        );
+        assert_headers_match_bodies(dst_dir.path());
+    }
+}
+
+/// F-001 (newer-snapshot half): a build never replaces a newer `current_snapshot` with an older
+/// view.
+///
+/// The build's checkpoint is taken before the install starts — a consistent image of index 3 —
+/// and held while an install of index 6 runs to completion. Publishing the view afterwards would
+/// move this node's current snapshot back to index 3 under an applied state of 6: it would serve
+/// lagging followers the old state, and OpenRaft, whose own snapshot meta never moves backwards,
+/// may already have purged the log entries the older snapshot needs.
+#[retcd_test]
+async fn f001_a_build_never_replaces_a_newer_installed_snapshot() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let meta = build(&src).await.expect("source build succeeds");
+
+        let race = InstallRace::new(None, None, true);
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
+        seed(&dst, 3).await;
+
+        let building = {
+            let dst = dst.clone();
+            tokio::spawn(async move { build(&dst).await })
+        };
+        race.reached(true).await;
+
+        // The checkpoint holds index 3. Install index 6 while it is held.
+        let installed = transfer(&src, &dst, &meta, |_| {}).await;
+
+        race.release_all();
+        let built = building
+            .await
+            .expect("the build task joins")
+            .expect("the build succeeds");
+        installed.expect("the install succeeds");
+
+        assert_eq!(
+            dst.snapshot_meta().map(|m| (m.snapshot_id, m.last_log_id)),
+            Some((meta.snapshot_id.clone(), meta.last_log_id)),
+            "the installed snapshot stays current"
+        );
+        assert_eq!(
+            built.last_log_id, meta.last_log_id,
+            "the build hands OpenRaft the current snapshot, not the older view"
+        );
+        assert_eq!(
+            dst.metrics().snapshot_publications,
+            1,
+            "only the install published; the older view did not"
+        );
+        assert_headers_match_bodies(dst_dir.path());
+    }
+}
+
+/// F-001 (offline backup): `export_snapshot` refuses a directory whose install stopped half-way.
+///
+/// The install crashes after clearing the data column families, so the directory holds the old
+/// header fields over an empty body and a durable marker. An export of it would be a backup of
+/// a state no node had, with counts and a digest that agree. After one open redoes the install,
+/// the same export succeeds and covers the installed state.
+#[retcd_test]
+async fn f001_offline_export_refuses_a_half_installed_store() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("backup.snap");
+    let meta;
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        meta = build(&src).await.expect("source build succeeds");
+        let dst = open_as(
+            dst_dir.path(),
+            identity_for(7, 2),
+            FailAt::new(Boundary::AfterInstallDropCf, FaultAction::Crash),
+        );
+        seed(&dst, 3).await;
+        assert!(
+            transfer(&src, &dst, &meta, |_| {}).await.is_err(),
+            "the crash stops the install half-way"
+        );
+    }
+
+    let refused = config_storage::export_snapshot(dst_dir.path(), &out);
+    let detail = refused
+        .expect_err("a half-installed store is not backed up")
+        .to_string();
+    assert!(
+        detail.contains("install"),
+        "the refusal names the interrupted install: {detail}"
+    );
+    assert!(!out.exists(), "no backup file is written");
+
+    // One open redoes the install; then the backup covers the installed state.
+    drop(open_as(
+        dst_dir.path(),
+        identity_for(7, 2),
+        Arc::new(NoFaults),
+    ));
+    let header = config_storage::export_snapshot(dst_dir.path(), &out)
+        .expect("the finished store is backed up");
+    assert_eq!(header.last_applied, meta.last_log_id);
+    assert_eq!(header.counts.get(CF_KV).copied(), Some(6));
+}
+
+/// F-001 / critic-f A-1: a build that is already waiting on an install stops waiting when that
+/// install fails.
+///
+/// The install is parked after its clear; the build captures mid-install and waits. Then the
+/// install is released and fails at its final batch, which poisons the store and leaves the
+/// marker mirror set. The waiting build must end at once with an error, not wait out
+/// `INSTALL_PATIENCE` (300 s) for an install that will never commit.
+#[retcd_test]
+async fn f001_a_waiting_build_ends_when_the_install_fails() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let meta = build(&src).await.expect("source build succeeds");
+
+        let race = InstallRace::new(
+            Some(Boundary::AfterInstallDropCf),
+            Some(Boundary::BeforeInstallFinalBatch),
+            false,
+        );
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
+        seed(&dst, 3).await;
+
+        let bytes = std::fs::read(snap_path(&src, &meta)).unwrap();
+        let file = {
+            let mut file = dst
+                .state_machine()
+                .begin_receiving_snapshot()
+                .await
+                .expect("receive slot");
+            file.write_all(&bytes).await.unwrap();
+            file
+        };
+        let installing = {
+            let dst = dst.clone();
+            let meta = meta.clone();
+            tokio::spawn(async move { dst.state_machine().install_snapshot(&meta, file).await })
+        };
+        race.reached(false).await;
+
+        let mut building = {
+            let dst = dst.clone();
+            tokio::spawn(async move { build(&dst).await })
+        };
+        race.reached(true).await;
+        // The build is done with its mid-install checkpoint, so it is waiting on the install.
+        let deadline = std::time::Instant::now() + RACE_PATIENCE;
+        while build_view_exists(dst_dir.path()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        race.release_all();
+        let install = installing.await.expect("the install task joins");
+        let ended = tokio::time::timeout(CAPTURE_PATIENCE, &mut building).await;
+        if ended.is_err() {
+            building.abort();
+        }
+
+        assert!(install.is_err(), "the install fails at its final batch");
+        assert!(dst.is_poisoned(), "a failed install poisons the store");
+        let built = ended
+            .expect("the waiting build ends when the install fails")
+            .expect("the build task joins");
+        assert!(
+            built.is_err(),
+            "nothing is built from a half-replaced store"
+        );
+        assert!(dst.snapshot_meta().is_none(), "nothing was published");
     }
 }

@@ -429,9 +429,29 @@ The Decision's "captured inside `get_snapshot_builder()`" no longer holds. Two f
 
 Now `get_snapshot_builder` only hands over the store. Each `build_snapshot` attempt takes a fresh
 checkpoint, then reads `last_applied`, membership and the header fields **from that checkpoint**,
-never from the live state machine. Apply writes records and metadata in one batch, so the
-metadata always describes the captured data, wherever the capture runs. A2's goal is kept: the
-export never reads live state, and no mutex serializes writes for the build.
+never from the live state machine. Apply writes records and metadata in one batch, so a
+checkpoint taken between applies describes its own data, wherever the capture runs. A2's goal
+is kept: the export never reads live state, and no mutex serializes writes for the build.
+
+**Correction (2026-10-25, F-001, ruling A-R413).** "The metadata always describes the captured
+data" was false for one writer: a snapshot install. An install clears the data column families
+and streams records in several batches, and moves `last_applied`, the other header fields and
+`current_snapshot` only in its final batch. A build runs in OpenRaft's spawned task and can
+overlap an install, so its checkpoint could hold the old header over cleared or half-written
+records. Its counts and digest agree with that body, so nothing downstream could tell. And the
+build's publish could replace a newer, installed `current_snapshot` with its older view. The
+build now handles both:
+
+1. A checkpoint that holds the `install_in_progress` marker is discarded. The build waits for
+   the install to commit and captures again. This spends no build attempt.
+2. At publish, under the state-machine lock, the build refuses if an install is in flight or
+   if `current_snapshot` already covers more than its view. When it is newer, the build hands
+   OpenRaft the current snapshot instead. The lock is held for that one write, as `apply` holds
+   it for its batch. The checkpoint itself stays outside the lock.
+
+The offline backup export (`snapshot::export_snapshot`) refuses a directory that holds the
+marker; opening the store once redoes the install. Rows: `f001_*` in
+`config-storage/tests/m5_snapshot.rs`.
 
 Store open also sets RocksDB `max_background_jobs = 16` (4 flush threads instead of 1, shared by
 every store in the process). With both changes `m5_snapshot_cluster` passed 20 of 20 runs under
