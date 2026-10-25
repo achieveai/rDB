@@ -646,6 +646,13 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
   can promote too. **The dropped node is added back automatically when it starts again, or at
   the next reopen heal; membership is fixed at three nodes.**
+  - **After every node restarts, a promote can be refused.** If the owner's copy is lost too,
+    `promote` answers `Unconfigured` ("node N holds no configuration since its restart"). The
+    member list is kept in memory only. To recover, bring back the owner's node or restore its
+    copy.
+  - **The old owner does not say "moved" yet.** After a promote while the old owner still
+    runs, it answers `LEASE_EXPIRED` for 10 s or more, never `NOT_PRIMARY`. That answer means
+    nothing was written: wait and send again, as its step says.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry
