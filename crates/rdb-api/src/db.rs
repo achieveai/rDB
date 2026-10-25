@@ -356,13 +356,19 @@ pub enum OpenError {
          Restore that copy from a backup of this directory, then open it again"
     )]
     CopyMissing(PathBuf),
-    /// The copies hold data but name no rDB instance: an M9 directory, which this build does not
-    /// open. Nothing was started and nothing was removed. The text names the next step (tester
-    /// S1-8 walk, 066ab6e); no tool migrates M9 data, so it offers none.
+    /// A copy holds data but names no rDB instance, which this build does not open. Nothing was
+    /// started and nothing was removed. Two causes, and the text names the next step for each
+    /// (tester S1-8 walk, 066ab6e; #59 item 11): no copy names one, so M9 wrote the folder and no
+    /// tool migrates it; or the others name one and this copy lost its binding. Its fix today is
+    /// a backup, or for a node process an emptied copy, which rejoins (ruling A-R328). No admin
+    /// rebuild verb exists, so the text names none.
     #[error(
-        "{0} holds data but names no rDB instance (an M9 directory); this build does not open it. \
-         Open it with the M9 build that wrote it, or start a new database in an empty folder: \
-         this build does not migrate M9 data"
+        "{0} holds data but names no rDB instance; this build does not open it. If no copy in \
+         this folder names one, an M9 build wrote the folder: open it with that build, or start \
+         a new database in an empty folder, because this build does not migrate M9 data. If the \
+         other copies name one, {0} lost its binding: restore {0} from a backup of this folder, \
+         or, for a node process, empty {0} and start that node again, and it rejoins from the \
+         other copies"
     )]
     Unbound(PathBuf),
     /// The copies and the control store do not belong together: the copies name different
@@ -932,7 +938,7 @@ impl Db {
     ///
     /// [`OpenError`]. Every check runs before a node starts, and a refused check removes
     /// nothing: [`OpenError::InUse`] when another open holds a copy's lock,
-    /// [`OpenError::CopyMissing`], [`OpenError::Unbound`] for an M9 directory,
+    /// [`OpenError::CopyMissing`], [`OpenError::Unbound`] for an unbound copy with data,
     /// [`OpenError::Mismatch`] when the copies and `store` do not belong together, and
     /// [`OpenError::Stale`] when no copy holds the generation `partitions/1` names. An open that
     /// created `nodes/` and then fails, or whose future is dropped unfinished, stops every node
@@ -6738,7 +6744,12 @@ mod tests {
             (read.kind, read.detail.as_str()),
             (
                 ErrorKind::CorruptHistory,
-                "object \"a\": header bytes 0..8 and the payload do not hash to the stored digest"
+                format!(
+                    "object \"a\": header bytes 0..8 and the payload do not hash to the stored \
+                     digest; next: {}",
+                    error::DAMAGED_OBJECT_STEP
+                )
+                .as_str()
             ),
             "{read:?}"
         );

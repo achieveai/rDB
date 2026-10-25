@@ -433,6 +433,24 @@ fn m10_d7_b_lags_its_a1_view_lands_before_c_s_frame_and_the_frame_is_staged() {
         Some(cases::PLAN_AT + 1 + FRAME_DELAY),
         "then C's frame lands and B applies the cutoff record"
     );
+
+    // #59 item 9: A1's view raises a lower held epoch (`view_refusal` installs it), so a seed
+    // restored at epoch 0 is repaired before C's frame and every assert above stays green. The
+    // epoch the receiver was restored at is asserted directly: the credential's prior epoch,
+    // which is at least 1.
+    let (_, _, sample) = plan.survivors.first().expect("placed");
+    let prior_epoch = sample.anchor_seen.lineage.owner_epoch.0;
+    assert!(prior_epoch >= 1, "the prior lineage has an owner epoch");
+    let restored_epoch: Vec<(u64, u64)> = logged(METHOD, "dormant_restored")
+        .iter()
+        .filter_map(|line| Some((line["node"].as_u64()?, line["owner_epoch"].as_u64()?)))
+        .filter(|(node, _)| *node == u64::from(B_NODE.0))
+        .collect();
+    assert_eq!(
+        restored_epoch,
+        vec![(u64::from(B_NODE.0), prior_epoch)],
+        "B's dormant receiver is restored at the credential's prior epoch, not one A1 repairs"
+    );
 }
 
 /// [`plan`] with A an empty copy of this partition: its store holds no record of generation 1,

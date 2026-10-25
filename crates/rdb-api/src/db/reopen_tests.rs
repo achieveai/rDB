@@ -646,9 +646,12 @@ fn m10_s1_8_an_m9_directory_says_to_use_the_m9_build_or_a_new_folder() {
     };
     assert_eq!(
         refused.to_string(),
-        "nodes/1 holds data but names no rDB instance (an M9 directory); this build does not open \
-         it. Open it with the M9 build that wrote it, or start a new database in an empty folder: \
-         this build does not migrate M9 data",
+        "nodes/1 holds data but names no rDB instance; this build does not open it. If no copy in \
+         this folder names one, an M9 build wrote the folder: open it with that build, or start a \
+         new database in an empty folder, because this build does not migrate M9 data. If the \
+         other copies name one, nodes/1 lost its binding: restore nodes/1 from a backup of this \
+         folder, or, for a node process, empty nodes/1 and start that node again, and it rejoins \
+         from the other copies",
         "the text names the next step"
     );
     assert_eq!(
@@ -910,10 +913,13 @@ fn m10_cut_one_unbound_copy_with_data_is_refused_and_stays_unbound() {
         Err(error @ OpenError::Unbound(_)) => error,
         other => panic!("Unbound, not {:?}", other.map(|_| "Db")),
     };
+    // #59 item 11: beside bound copies it is not an M9 folder, and the text ends with the
+    // step that works today for a copy that lost its binding (no admin rebuild verb exists).
     assert!(
-        refused.to_string().starts_with(
-            "nodes/3 holds data but names no rDB instance (an M9 directory); this build does not \
-             open it."
+        refused.to_string().ends_with(
+            "If the other copies name one, nodes/3 lost its binding: restore nodes/3 from a \
+             backup of this folder, or, for a node process, empty nodes/3 and start that node \
+             again, and it rejoins from the other copies"
         ),
         "{refused}"
     );

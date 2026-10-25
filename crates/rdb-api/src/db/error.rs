@@ -39,6 +39,14 @@ const RUN_AGAIN: &str = "run it again to read where it stands";
 pub(crate) const QUARANTINED_STEP: &str =
     "do not delete the folder; stop and report it with this message";
 
+/// The step a damaged object's root (a document, or a map's or set's own root) ends its
+/// `CORRUPT_HISTORY` with ([`corrupt_history`]), in place of the map or set entry's step: no
+/// key can be written over, so only a clear helps (A-R420, tester-q G1/G2). It names the API
+/// and the `rdb_dev` command, since the reader may be either.
+pub(crate) const DAMAGED_OBJECT_STEP: &str =
+    "the object's own stored value is damaged, so delete the whole object with `Change::Clear` \
+     (in rdb_dev: `admin clear <object>`), then write it again";
+
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
     /// step. See [`ApiError::explain`].
@@ -237,7 +245,11 @@ impl ApiError {
         let write_unknown =
             self.kind == ErrorKind::UnknownOutcome && self.retry == RetryRule::QueryStatus;
         let reopen = self.detail.ends_with(OPEN_AGAIN) && !write_unknown;
-        if reopen || self.detail.ends_with(RUN_AGAIN) || self.detail.ends_with(QUARANTINED_STEP) {
+        if reopen
+            || self.detail.ends_with(RUN_AGAIN)
+            || self.detail.ends_with(QUARANTINED_STEP)
+            || self.detail.ends_with(DAMAGED_OBJECT_STEP)
+        {
             return None;
         }
         Some(step_for(self.kind, self.retry, self.no_mutation))
@@ -463,11 +475,18 @@ pub(crate) fn copies_disagree_text(named: &str) -> String {
 /// `CORRUPT_HISTORY` for a read of `object` that met `corrupt` (#59, A-R230): it names the object,
 /// and an element's key when [`rdb_value::Corrupt::Element`] carries one, for the caller only.
 /// A log line names neither; `host.rs` logs the damage code and `key_hex`.
+///
+/// Only a map's or set's entry keeps the kind's step (write over its key). Anything else is the
+/// object's own value, a document's included, and ends with [`DAMAGED_OBJECT_STEP`] (A-R420).
 pub(crate) fn corrupt_history(object: &[u8], corrupt: &rdb_value::Corrupt) -> ApiError {
-    ApiError::new(
-        ErrorKind::CorruptHistory,
-        format!("object \"{}\": {corrupt}", object.escape_ascii()),
-    )
+    let object = object.escape_ascii();
+    let detail = match corrupt {
+        rdb_value::Corrupt::Element { .. } | rdb_value::Corrupt::Entry { .. } => {
+            format!("object \"{object}\": {corrupt}")
+        }
+        _ => format!("object \"{object}\": {corrupt}; next: {DAMAGED_OBJECT_STEP}"),
+    };
+    ApiError::new(ErrorKind::CorruptHistory, detail)
 }
 
 /// The open counter's refusal for good, for `admin::CounterError::Exhausted`.
@@ -665,6 +684,31 @@ mod tests {
         );
         assert!(text.contains("\"b\""), "{text}");
         assert!(text.ends_with("(embed.md, Known limits))"), "{text}");
+        assert!(!text.contains("admin clear"), "{text}");
+    }
+
+    /// A-R420 (tester-q G1/G2): a damaged document has no key to write over, so its
+    /// `CORRUPT_HISTORY` leads with the clear, naming the API and the `rdb_dev` command, and
+    /// gives no map or set advice. Cut: `corrupt_history` without its document arm, red.
+    #[test]
+    fn a_damaged_document_says_to_clear_it() {
+        let corrupt = rdb_value::Corrupt::VersionWithoutValue;
+        let error = corrupt_history(b"d", &corrupt);
+        assert_eq!(error.kind, ErrorKind::CorruptHistory);
+        assert_eq!(
+            error.next_step(),
+            None,
+            "the detail already ends with its step"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "CORRUPT_HISTORY (object \"d\": {corrupt}; next: the object's own stored value is \
+                 damaged, so delete the whole object with `Change::Clear` (in rdb_dev: `admin \
+                 clear <object>`), then write it again)"
+            )
+        );
+        assert!(!error.explain().contains("write over its key"));
     }
 
     /// A-R230 (tester-s2): a refused read said `UNKNOWN_OUTCOME` and to query a status, but a read

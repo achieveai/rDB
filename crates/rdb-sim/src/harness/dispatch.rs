@@ -2489,6 +2489,7 @@ impl Dispatcher {
                         partition = partition.0,
                         copy = receiver.copy().0,
                         generation = receiver.lineage().generation.0,
+                        owner_epoch = receiver.lineage().owner_epoch.0,
                         head = receiver.applied_head().seq.0,
                         revision = seed.revision.0,
                         "dormant_restored"

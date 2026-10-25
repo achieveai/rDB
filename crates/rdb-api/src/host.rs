@@ -8806,28 +8806,16 @@ fn view_published(
     }
 }
 
-/// ADR-0013: the most bytes of a key a log line shows, as [`key_hex`].
-const KEY_HEX_MAX_BYTES: usize = 32;
-
-/// D9: a key as a log line carries it (ADR-0013): lowercase hex of its first
-/// [`KEY_HEX_MAX_BYTES`] bytes, never its text. The same rule as `config-core`'s and
-/// `config-engine`'s private copies.
-fn key_hex(key: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
-    for byte in key.iter().take(KEY_HEX_MAX_BYTES) {
-        // Writing to a String cannot fail.
-        write!(out, "{byte:02x}").expect("write to String");
-    }
-    out
-}
-
 /// D9: the `key_hex` a damage line names the object by: its id's, or the whole root key's
-/// when the root does not parse, with the parse fault, which names no bytes.
+/// when the root does not parse, with the parse fault, which names no bytes. The hex is
+/// `config_core::key_hex` (ADR-0013: lowercase, at most the first 32 bytes, never the text).
 fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
     match rdb_value::keys::parse(root.as_bytes()) {
-        Ok(parsed) => (key_hex(&parsed.object_id), None),
-        Err(fault) => (key_hex(root.as_bytes()), Some(fault.to_string())),
+        Ok(parsed) => (config_core::key_hex(&parsed.object_id), None),
+        Err(fault) => (
+            config_core::key_hex(root.as_bytes()),
+            Some(fault.to_string()),
+        ),
     }
 }
 
