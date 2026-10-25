@@ -653,9 +653,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     copy.
   - **It also fires when only the node you promote has restarted** while the owner is down.
     The way round: promote a node that has not restarted since the owner stopped.
-  - **The old owner does not say "moved" yet.** After a promote while the old owner still
-    runs, it answers `LEASE_EXPIRED` for 10 s or more, never `NOT_PRIMARY`. That answer means
-    nothing was written: wait and send again, as its step says.
+  - **The old owner says "moved" within about a second.** While the promote waits out its
+    permission to write, the old owner answers `LEASE_EXPIRED`. Once the promote is done,
+    the old owner answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true. It
+    re-reads the owner record every 250 ms until then. Either answer means nothing was
+    written: send again, as its step says. Its log shows `host_owner_learned`.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry
