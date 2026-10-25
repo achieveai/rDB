@@ -17,12 +17,13 @@ members = [
     "crates/rdb-storage",
     "crates/rdb-value",
     "crates/rdb-api",
+    "crates/rdb-pilot",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/gautambhakar/rEtcd"
 

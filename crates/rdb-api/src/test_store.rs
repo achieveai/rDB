@@ -44,6 +44,13 @@ async fn park_at<'g>(gate: &'g Semaphore, parked: &Notify) -> SemaphorePermit<'g
 /// What the store does to the calls still to come.
 #[derive(Debug, Default)]
 pub(crate) struct Script {
+    /// Puts still to let through before the put steps below apply (M10: an open's counter put
+    /// comes before its bootstrap put).
+    pub(crate) pass_puts: u32,
+    /// Puts still to go past a [`Scripted::gated`] store's gate without waiting (M10).
+    pub(crate) pass_gate: u32,
+    /// Gets still to let through before `fail_gets` applies.
+    pub(crate) pass_gets: u32,
     /// Puts still to apply and then answer `DeadlineExceededUnknownOutcome`.
     pub(crate) lose_put_replies: u32,
     /// Puts still to answer `DeadlineExceededUnknownOutcome` without applying.
@@ -64,6 +71,9 @@ pub(crate) struct Script {
     pub(crate) hold_watches: u32,
     /// The next delete fails with this, without deleting (M9 S2b review F-024).
     pub(crate) fail_delete_with: Option<ConfigError>,
+    /// When set, only puts on a key that starts with this take the put steps above (`pass_puts`, `drop_puts`,
+    /// `lose_put_replies`); a put on any other key goes straight through (A-R184).
+    pub(crate) only_prefix: Option<Vec<u8>>,
 }
 
 /// Whether a blocked list has read, and whether blocked lists may answer.
@@ -175,6 +185,11 @@ impl Scripted {
     }
 
     /// Let puts through, one at a time.
+    /// Replace what the store does to the calls still to come.
+    pub(crate) fn rescript(&self, script: Script) {
+        *self.script.lock().expect("script") = script;
+    }
+
     pub(crate) fn release(&self) {
         self.gate.add_permits(1);
     }
@@ -195,7 +210,7 @@ impl ConfigStore for Scripted {
         'a: 'b,
         Self: 'b,
     {
-        if self.take(|script| &mut script.fail_gets) {
+        if !self.take(|script| &mut script.pass_gets) && self.take(|script| &mut script.fail_gets) {
             return Box::pin(std::future::ready(Err(ConfigError::Unavailable {
                 reason: "scripted: the read failed".to_owned(),
             })));
@@ -240,12 +255,24 @@ impl ConfigStore for Scripted {
         Self: 'b,
     {
         Box::pin(async move {
-            let _permit = park_at(&self.gate, &self.put_arrived).await;
-            if self.take(|script| &mut script.drop_puts) {
+            let _permit = if self.take(|script| &mut script.pass_gate) {
+                None
+            } else {
+                Some(park_at(&self.gate, &self.put_arrived).await)
+            };
+            let keyed = self
+                .script
+                .lock()
+                .expect("script")
+                .only_prefix
+                .as_ref()
+                .is_none_or(|prefix| request.key.starts_with(prefix));
+            let scripted = keyed && !self.take(|script| &mut script.pass_puts);
+            if scripted && self.take(|script| &mut script.drop_puts) {
                 return Err(ConfigError::DeadlineExceededUnknownOutcome);
             }
             let response = self.inner.put(request).await?;
-            if self.take(|script| &mut script.lose_put_replies) {
+            if scripted && self.take(|script| &mut script.lose_put_replies) {
                 return Err(ConfigError::DeadlineExceededUnknownOutcome);
             }
             Ok(response)

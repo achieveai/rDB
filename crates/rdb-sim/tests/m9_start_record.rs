@@ -438,11 +438,12 @@ fn m9_d3_00_a_copy_back_after_a_degraded_empty_start_keeps_seq_one_and_publishes
     assert!(healthy, "L1 is healthy again after the re-emit");
 }
 
-/// The optional D3 row, in a **non-default configuration**: the resume hold is lowered to 1 s and
-/// the activation CAS is held 1.8 s (its deadline is the 2 s discovery window). L1 then resumes
-/// in `DegradedRf2` and two client writes publish at seq 2 and 3 before the `Active` re-emit,
-/// so the re-emit meets a published tail and owed replies, not only the start record. B, C and
-/// A hold seq 1, so the cutoff is 1 and there is no start record.
+/// The optional D3 row, in a **non-default configuration**: the activation CAS is held 1.8 s (its
+/// deadline is the 2 s discovery window). L1 then resumes (its first resume skips the hold,
+/// A-R165) in `DegradedRf2` and two client writes publish at seq 2 and 3 before the `Active`
+/// re-emit, so the re-emit meets a published tail and owed replies, not only the start record.
+/// B, C and A hold seq 1, so the cutoff is 1 and there is no start record. The re-emit no longer
+/// pauses writes (A-R197), so the 1 s resume hold this row once set is gone.
 const D3_HOLD_WRITES: [u64; 5] = [5_300, 5_500, 9_000, 11_000, 14_000];
 const D3_HOLD_MAX_TICKS: u64 = 16_000;
 
@@ -496,10 +497,6 @@ fn d3_hold() -> RunPlan {
         taken: None,
     });
     plan.steps.sort_by_key(|step| step.at);
-    plan.overrides.push(BudgetOverride {
-        name: BudgetName::ResumeHold,
-        millis: 1_000,
-    });
     plan.seed.extend(
         D3_HOLD_WRITES
             .iter()
@@ -524,6 +521,25 @@ fn m9_d3_09_non_default_hold_writes_published_before_the_re_emit_are_kept() {
         .find(|(_, mode, _)| *mode == PartitionMode::Active)
         .map(|(at, ..)| *at)
         .expect("the result is re-emitted active once A is back");
+    // A-R197 (D12): the re-emit restates the tracker, so L1 keeps admitting across it. Before,
+    // it paused writes again, and this row needed a 1 s resume hold to publish the later ones.
+    let refused_after: Vec<u64> = trace
+        .events
+        .iter()
+        .filter(|event| event.node == B_NODE && event.logical_tick >= active)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::SetAdmission { state },
+                ..
+            } if !state.allow => Some(event.logical_tick),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        refused_after.is_empty(),
+        "no SetAdmission{{allow:false}} on the primary after the re-emit at t{active}: \
+         {refused_after:?}"
+    );
     let generation = Generation(2);
     let published_before: Vec<Seq> = trace
         .events
@@ -818,7 +834,10 @@ fn written(replies: &[ReplyEffect]) -> Vec<(RequestId, Seq)> {
 }
 
 /// F1, step 2 (P > C): B and C hold 20 records and commit `DegradedRf2` at cutoff 20 while A is
-/// cut. A returns at t4000 and catches the new generation up one record per 100 ms round trip.
+/// cut. A holds 19: it lands outside the barrier below the cutoff, so it links nothing (A-R185
+/// C2), returns at t4000 and catches the new generation up one record per 100 ms round trip. A
+/// copy that held all 20 would link at the cutoff when it lands and copy nothing
+/// (`m10_land_link`), so it would never exercise the catch-up this row is about.
 const F1_HEAD: u64 = 20;
 const F1_BACK: u64 = 4_000;
 const F1_WRITES: [u64; 5] = [F1_BACK + 1_300, F1_BACK + 1_500, 9_000, 11_000, 14_000];
@@ -829,10 +848,10 @@ fn f1_slow_catch_up() -> RunPlan {
     let from_b: Vec<_> = plan
         .preloads
         .iter()
-        .filter(|(node, _)| *node == B_NODE)
+        .filter(|(node, batch)| *node == B_NODE && batch.seq.0 < F1_HEAD)
         .map(|(_, batch)| batch.clone())
         .collect();
-    let (_, _, generation, durable) = *plan
+    let (_, _, generation, _) = *plan
         .preload_durable
         .iter()
         .find(|(node, ..)| *node == B_NODE)
@@ -840,7 +859,7 @@ fn f1_slow_catch_up() -> RunPlan {
     plan.preloads
         .extend(from_b.into_iter().map(|batch| (A_NODE, batch)));
     plan.preload_durable
-        .push((A_NODE, PARTITION, generation, durable));
+        .push((A_NODE, PARTITION, generation, DurableSeq(F1_HEAD - 1)));
     for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
         plan.network_ops.push(NetworkOp::SetLink {
             a,
@@ -883,6 +902,10 @@ fn f1_slow_catch_up() -> RunPlan {
 /// catches up, and the catch-up's last ACK both pins the rebuild at the cutoff and first makes
 /// the copy heard. At cutoff 0 the start record bypasses `admit` and P = 1 > C = 0; that is
 /// `m9_f1_01`.
+///
+/// A-R185b: A holds 19 records, one below the cutoff, on purpose. A copy holding 20 links at
+/// landing and never catches up (`m10_land_link`), so this row would no longer test the pin.
+/// Do not restore 20.
 #[retcd_test]
 fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_for_it() {
     let (replies, trace, violations) = run_judged(&f1_slow_catch_up());

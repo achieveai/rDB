@@ -17,13 +17,17 @@
 //! `Unknown` or `Unavailable` it is resolved by a read, then the same CAS at the revision the read found our own bytes at
 //! ([`Cas::ours_at`], [`Cas::repropose`]). Nothing lands on a read; only that CAS's `Committed`
 //! does. Any other record on that read still goes through [`Cas::on_read`]. The recovery CAS
-//! stays terminal: its record binds no run id, so our bytes cannot be told from a peer's (F-g).
+//! resolves the same way when it carries a layout-3 root (M10 S1-5, achieveai/rDB#45, ruling
+//! A-R182): the root binds the run id and the cutoff, so [`Cas::ours_at`] tells our bytes from a
+//! peer's. Without a root it stays terminal: a layout-2 record binds no run id (F-g).
 //!
 //! Every request carries a fresh [`ControlRequestId`] from [`Requests`], and only an answer
 //! echoing the outstanding one is this proposal's (lead ledger L-R177hs): a re-run's CAS and an
 //! abandoned run's CAS are on the same key, so the key alone cannot tell their answers apart.
 
-use crate::authority::partition::PartitionRecord;
+use bytes::Bytes;
+
+use crate::authority::partition::{PartitionRecord, PartitionRoot};
 use crate::contracts::authority::BlockReason;
 use crate::contracts::control::{CasOutcome, ControlEffect, ControlKey, ReadOutcome};
 use crate::contracts::ids::{ControlRequestId, OwnerEpoch, PartitionId, Revision};
@@ -78,6 +82,8 @@ pub(crate) enum CasStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Cas {
     record: PartitionRecord,
+    /// Its layout-3 root, when F1 is bound to an rDB instance (M10, arch R3b).
+    root: Option<PartitionRoot>,
     /// The owner epoch this proposal supersedes. A record above it on the re-read is a peer's.
     prior_epoch: OwnerEpoch,
     rereading: bool,
@@ -89,16 +95,18 @@ pub(crate) struct Cas {
 }
 
 impl Cas {
-    /// A proposal of `record` over ownership at `prior_epoch`, sent as `request`, unanswered at
-    /// `deadline` read as `Unknown`.
+    /// A proposal of `record`, with `root` when there is one, over ownership at `prior_epoch`,
+    /// sent as `request`, unanswered at `deadline` read as `Unknown`.
     pub(crate) const fn new(
         record: PartitionRecord,
+        root: Option<PartitionRoot>,
         prior_epoch: OwnerEpoch,
         request: ControlRequestId,
         deadline: Tick,
     ) -> Self {
         Self {
             record,
+            root,
             prior_epoch,
             rereading: false,
             request,
@@ -117,8 +125,33 @@ impl Cas {
             request: self.request,
             key: key(self.record.partition),
             expected: Some(expected),
-            value: Some(self.record.encode()),
+            value: Some(self.body()),
         }
+    }
+
+    /// The bytes this proposal writes: layout 3 with its root, or layout 2 without one.
+    fn body(&self) -> Bytes {
+        self.root.map_or_else(
+            || self.record.encode(),
+            |root| self.record.encode_with(&root),
+        )
+    }
+
+    /// Whether `value` is this proposal's record from the same run. The mode is not compared:
+    /// the activation finds the recovery CAS's `Committed` bytes when it has not landed yet.
+    fn same_run(&self, value: &[u8]) -> bool {
+        let record = PartitionRecord::decode(value).is_some_and(|read| read == self.record);
+        let root = PartitionRoot::decode(value);
+        record
+            && match self.root {
+                None => root.is_none(),
+                Some(ours) => root.is_some_and(|read| {
+                    PartitionRoot {
+                        mode: ours.mode,
+                        ..read
+                    } == ours
+                }),
+            }
     }
 
     /// The re-read that classifies a conflict, sent as `request`, which is outstanding from now.
@@ -159,8 +192,7 @@ impl Cas {
     pub(crate) fn ours_at(&self, outcome: &ReadOutcome, floor: Revision) -> Option<Revision> {
         match outcome {
             ReadOutcome::Found { revision, value }
-                if *revision >= floor
-                    && PartitionRecord::decode(value).is_some_and(|read| read == self.record) =>
+                if *revision >= floor && self.same_run(value) =>
             {
                 Some(*revision)
             }

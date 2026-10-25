@@ -337,15 +337,20 @@ fn fresh(cutoff: u64) -> Protection {
 }
 
 /// Plan §7's golden fixture: `Healthy` with an empty queue and a qualifying secondary, reached
-/// through the real resume path at tick [`T0`].
+/// through the real resume path at tick [`T0`]. It is the generation's first resume, which skips
+/// the hold (A-R165), so the peers first report at `T0`; until then their lag is infinite.
 fn golden() -> Protection {
     let mut p = fresh(0);
+    // R1's report that the cutoff is durable: an unreported predicate holds nothing (A-R167).
+    step(&mut p, 0, durable(&[(C1, 0)]));
     step(&mut p, 0, edge(QualificationDirection::Gained));
     assert_eq!(health(&mut p, 0), ignored(ReplicaIgnoreReason::ResumeHeld));
     assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
     for t in (100..=T0).step_by(100) {
-        step(&mut p, t, progress(B));
-        step(&mut p, t, progress(C));
+        if t == T0 {
+            step(&mut p, t, progress(B));
+            step(&mut p, t, progress(C));
+        }
         let effects = health(&mut p, t);
         if t < T0 {
             assert_eq!(effects, ignored(ReplicaIgnoreReason::ResumeHeld), "t={t}");
@@ -813,9 +818,13 @@ fn m7b_77_barrier_invalidated_during_reprotecting_returns_to_paused() {
 }
 
 /// An instance in `Reprotecting{below_since: None}` at `start`, barrier 0, domain `{B, C}`, no
-/// peer heard from since construction.
+/// peer heard from since construction. A `Lost` edge first makes this a later resume, which holds
+/// (A-R165): the generation's first resume would skip the hold these rows measure.
 fn reprotecting_at(start: u64) -> Protection {
     let mut p = fresh(0);
+    // R1's report that the cutoff is durable: an unreported predicate holds nothing (A-R167).
+    step(&mut p, start, durable(&[(C1, 0)]));
+    step(&mut p, start, edge(QualificationDirection::Lost));
     step(&mut p, start, edge(QualificationDirection::Gained));
     health(&mut p, start);
     assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
@@ -961,10 +970,13 @@ fn m7b_131_self_is_not_in_the_lag_domain_and_copy_lost_shrinks_it() {
     assert_eq!(p.lag_domain(), vec![B]);
     assert_eq!(state(&p, 0).lost_copies, vec![C]);
 
+    step(&mut p, 0, durable(&[(C1, 0)]));
     step(&mut p, 0, edge(QualificationDirection::Gained));
     health(&mut p, 0);
+    // C never reports, so C in the domain would be infinite lag and no resume. The generation's
+    // first resume skips the hold (A-R165), so B alone resumes at the first evaluation.
     let only_b = |copy: CopyId, _| copy == B;
-    assert_eq!(run(&mut p, 0, 10_000, only_b), Some(5_100));
+    assert_eq!(run(&mut p, 0, 10_000, only_b), Some(100));
 }
 
 /// A `PeerProgress` from a node in no member slot is refused, not stored.
@@ -1025,8 +1037,10 @@ fn m7b_83_health_eval_never_re_allows_admission_by_itself() {
 }
 
 /// M7B-141: a fresh instance starts `Paused` at the `Recovered` cutoff and publishes the reject
-/// at construction; no admission before the first `Gained` and the durable barrier, then
-/// `Reprotecting` and the hold.
+/// at construction; no admission before the first `Gained` and the durable barrier. The first
+/// resume of the generation still passes through `Reprotecting` and still needs lag below
+/// `resume_lag_millis`, but skips the hold (ruling A-R165, ADR-0006 amendment 2026-10-23). A
+/// later pause in the same generation holds the full `resume_hold_millis`.
 #[retcd_test]
 fn m7b_141_protection_starts_paused_at_recovered_and_resumes_only_through_reprotecting() {
     let mut p = Protection::new();
@@ -1057,7 +1071,60 @@ fn m7b_141_protection_starts_paused_at_recovered_and_resumes_only_through_reprot
     step(&mut p, 2_500, edge(QualificationDirection::Gained));
     health(&mut p, 2_500);
     assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
-    assert_eq!(run(&mut p, 2_500, 20_000, |_, _| true), Some(7_600));
+    // First resume: no peer heard from is infinite lag, so it waits for lag below 250 ms...
+    assert_eq!(run(&mut p, 2_500, 3_000, |_, _| false), None);
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
+    // ...and then resumes at the first evaluation that sees it, with no hold.
+    assert_eq!(run(&mut p, 3_000, 20_000, |_, _| true), Some(3_100));
+    assert_eq!(p.mode(), Some(Mode::Healthy));
+
+    // A later pause in the same generation holds the full 5 s.
+    let effects = step(&mut p, 3_500, edge(QualificationDirection::Lost));
+    assert!(!admission(&effects).allow);
+    step(&mut p, 3_500, edge(QualificationDirection::Gained));
+    health(&mut p, 3_500);
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
+    assert_eq!(run(&mut p, 3_500, 20_000, |_, _| true), Some(8_600));
+}
+
+/// Regression, ruling A-R167: a predicate R1 has not reported in this generation is durable
+/// through nothing, barrier 0 included. Found by INV-LAG on `m9_k1_00` once the first resume
+/// skipped the hold: at cutoff 0 the barrier test read an unreported 0 as "durable through 0",
+/// and the 5 s hold had been what gave the copy time to report. Run with the hold at 0 so the
+/// barrier alone gates the resume.
+#[retcd_test]
+fn an_unreported_predicate_blocks_resume_even_at_barrier_0() {
+    const NO_HOLD: Budgets = Budgets {
+        resume_hold_millis: 0,
+        ..Budgets::SPEC_DEFAULTS
+    };
+    let mut p = Protection::new();
+    let event = Event {
+        id: EventId(0),
+        at: Tick(0),
+        node: NODE_A,
+        boot: BootId(1),
+        partition: PARTITION,
+        correlation: CorrelationId(42),
+        kind: EventKind::Kernel(recovered(config(C1, &[]), 0, GEN)),
+    };
+    let built = StepCtx {
+        budgets: &NO_HOLD,
+        ..ctx(0, NODE_A)
+    };
+    p.step(&built, &event).expect("a Recovered is L1's");
+    step(&mut p, 0, edge(QualificationDirection::Gained));
+
+    assert_eq!(
+        health(&mut p, 0),
+        ignored(ReplicaIgnoreReason::BarrierNotDurable)
+    );
+    assert_eq!(run(&mut p, 0, 2_000, |_, _| true), None);
+    assert_eq!(p.mode(), Some(Mode::Paused));
+
+    // Once R1 reports, one evaluation enters Reprotecting and the next resumes.
+    step(&mut p, 2_000, durable(&[(C1, 0)]));
+    assert_eq!(run(&mut p, 2_000, 4_000, |_, _| true), Some(2_200));
 }
 
 /// F1's activation re-emits `Recovered` for the same generation (design §5.6a); L1 is
@@ -1580,9 +1647,12 @@ fn a_drain_returns_warn_to_healthy_in_the_draining_step() {
 // ---------------------------------------------------------------------------------------------
 
 /// `Recovered{cutoff 40}`, `Gained` at 10 and `DurableAdvanced{C1: 40}` at 20: `Paused` with its
-/// barrier durable, a qualifying secondary and nothing queued (tester probes s15 and d04).
+/// barrier durable, a qualifying secondary and nothing queued (tester probes s15 and d04). A
+/// `Lost` edge at 10 first makes the resume a later one, which holds (A-R165): these probes
+/// measure the hold, and the generation's first resume skips it.
 fn paused_with_barrier_40_durable() -> Protection {
     let mut p = fresh(40);
+    step(&mut p, 10, edge(QualificationDirection::Lost));
     step(&mut p, 10, edge(QualificationDirection::Gained));
     step(&mut p, 20, durable(&[(C1, 40)]));
     p

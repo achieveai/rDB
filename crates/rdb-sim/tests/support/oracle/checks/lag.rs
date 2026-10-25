@@ -263,12 +263,25 @@ fn resume_is_legal(
 }
 
 /// Whether `node`'s recorded durable prefix runs past `barrier`, the start record excepted.
+///
+/// A resume barrier is a position in the generation in force at resume, the newest one any node
+/// has made durable, so only a durable mark of that generation is compared with it (A-R185d). A
+/// copy still durable in a prior generation past the new generation's cutoff holds other
+/// records, not more of these: a late copy a recovery left outside its barrier does exactly that
+/// (`m10_land_link`). The simulator's trace carries no `lineage_root` to name the generation, so
+/// the flush stream does.
 fn overshoots(
     part: &crate::support::oracle::model::PartitionModel,
     node: NodeId,
     barrier: Seq,
 ) -> bool {
-    part.durable.get(&node).is_some_and(|(_, durable_seq)| {
+    let newest = part
+        .durable_by_generation
+        .keys()
+        .map(|(_, generation)| *generation)
+        .max();
+    let durable = newest.and_then(|generation| part.durable_by_generation.get(&(node, generation)));
+    durable.is_some_and(|(_, durable_seq)| {
         *durable_seq > barrier && !start_record_only(part, barrier, *durable_seq)
     })
 }

@@ -65,6 +65,11 @@ type Reloading = (JoinHandle<()>, Arc<AtomicU32>);
 /// The reload of each (node, prefix), shared with the reloads themselves.
 type Reloads = Arc<Mutex<BTreeMap<(NodeId, ControlPrefix), Reloading>>>;
 
+/// The newest watch of a family, and how many watches of that family in a row have ended
+/// having served nothing. The count outlives the watch: the next watch of the family takes it
+/// over, and waits [`retry_backoff`] of it before it opens (M10 S1, the M9 S2a carry).
+type Watching = (JoinHandle<()>, Arc<AtomicU32>);
+
 /// The control binding for every node of one process.
 pub struct ControlAdapter {
     store: Arc<dyn ConfigStore>,
@@ -73,7 +78,9 @@ pub struct ControlAdapter {
     /// The gets and CASes still running, per asking node, so a restart abandons only that
     /// node's (M9 S2b, critic M2).
     tasks: Mutex<BTreeMap<NodeId, Vec<JoinHandle<()>>>>,
-    watches: Mutex<BTreeMap<(NodeId, ControlPrefix), JoinHandle<()>>>,
+    /// The watch of each (node, prefix). A newer one aborts the one it replaces and takes over
+    /// its count of unserved watches.
+    watches: Mutex<BTreeMap<(NodeId, ControlPrefix), Watching>>,
     /// The reload of each (node, prefix). A newer one aborts the one it replaces.
     reloads: Reloads,
 }
@@ -149,10 +156,16 @@ impl ControlAdapter {
             return;
         }
         if let ControlEffect::Watch { prefix, from } = effect {
-            let task = self
-                .rt
-                .spawn(watch(store, links, site, prefix, from).instrument(Span::current()));
-            if let Some(old) = lock(&self.watches).insert((node, prefix), task) {
+            let mut watches = lock(&self.watches);
+            let unserved = watches.get(&(node, prefix)).map_or_else(
+                || Arc::new(AtomicU32::new(0)),
+                |(_, count)| Arc::clone(count),
+            );
+            let task = self.rt.spawn(
+                watch(store, links, site, prefix, from, Arc::clone(&unserved))
+                    .instrument(Span::current()),
+            );
+            if let Some((old, _)) = watches.insert((node, prefix), (task, unserved)) {
                 old.abort();
             }
             return;
@@ -162,6 +175,50 @@ impl ControlAdapter {
                 match call(&*store, site, effect).await {
                     Ok(event) => post(&links, site, event),
                     Err((kind, detail)) => fault(&links, site, kind, detail),
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
+    /// Ruling A-R184: mark `generation` activated in `instance`'s open counter for `node`,
+    /// running at `boot`, before its first acquire under that generation. Answers
+    /// [`Msg::Activated`] once the mark is durable, or faults the node when it cannot be made.
+    /// Tracked with the node's calls, so a restart abandons it.
+    pub fn activate(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        instance: [u8; rdb_core::authority::partition::INSTANCE_LEN],
+        generation: rdb_core::contracts::ids::Generation,
+    ) {
+        let site = Site {
+            node,
+            boot,
+            partition,
+            correlation: CorrelationId::default(),
+        };
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                match crate::admin::activate(&*store, &instance, generation).await {
+                    Ok(_) => {
+                        let msg = Msg::Activated {
+                            boot,
+                            partition,
+                            generation,
+                        };
+                        if links.post(node, msg).is_err() {
+                            tracing::debug!(node = node.0, "control_completion_unclaimed");
+                        }
+                    }
+                    Err(error) => fault(&links, site, "activate", error.to_string()),
                 }
             }
             .instrument(Span::current()),
@@ -195,7 +252,7 @@ impl ControlAdapter {
     /// reloads, calls}`.
     pub fn forget_node(&self, node: NodeId, boot: BootId) {
         let mut watches = 0_usize;
-        lock(&self.watches).retain(|(at, _), task| {
+        lock(&self.watches).retain(|(at, _), (task, _)| {
             let mine = *at == node;
             if mine {
                 task.abort();
@@ -232,7 +289,7 @@ impl ControlAdapter {
     /// Stop every watch and abandon every call still running, reloads included. Called before
     /// the store goes.
     pub fn shutdown(&self) {
-        for (_, task) in std::mem::take(&mut *lock(&self.watches)) {
+        for (_, (task, _)) in std::mem::take(&mut *lock(&self.watches)) {
             task.abort();
         }
         for (_, (task, _)) in std::mem::take(&mut *lock(&self.reloads)) {
@@ -390,18 +447,20 @@ async fn call(
     }
 }
 
-/// The first wait before a reload's list is sent again, doubled per attempt.
-const RELOAD_BACKOFF_BASE_MILLIS: u64 = 50;
+/// The first wait before a reload's list, or a watch after one that served nothing, is sent
+/// again, doubled per attempt.
+const RETRY_BACKOFF_BASE_MILLIS: u64 = 50;
 /// The longest wait between two attempts (M9 S2a ruling, critic A3).
-const RELOAD_BACKOFF_CAP_MILLIS: u64 = 2_000;
+const RETRY_BACKOFF_CAP_MILLIS: u64 = 2_000;
 
 /// How long to wait after failed attempt `attempt` (1-based): 50, 100, 200 ms ... capped at 2 s.
-fn reload_backoff(attempt: u32) -> std::time::Duration {
+/// A reload's lists and a family's re-watches both wait this.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
     // Shift at most 16: `checked_shl` only refuses a shift of 64 or more, and bits shifted out
     // below that are lost, so `50 << 63` is 0 — a zero wait at attempt 64 (M9 S2a row
     // `a_reload_waits_twice_as_long_each_time_up_to_two_seconds`). 50 << 16 is far past the cap.
-    let doubled = RELOAD_BACKOFF_BASE_MILLIS << attempt.saturating_sub(1).min(16);
-    std::time::Duration::from_millis(doubled.min(RELOAD_BACKOFF_CAP_MILLIS))
+    let doubled = RETRY_BACKOFF_BASE_MILLIS << attempt.saturating_sub(1).min(16);
+    std::time::Duration::from_millis(doubled.min(RETRY_BACKOFF_CAP_MILLIS))
 }
 
 /// Whether a failed list may be sent again: the store could not be reached, did not answer in
@@ -473,7 +532,7 @@ async fn reload_once(store: &dyn ConfigStore, site: Site, prefix: ControlPrefix)
 }
 
 /// `Reload`: list until the store answers, then post the snapshot. A transient failure waits
-/// [`reload_backoff`] and tries again, logged as `control_reload_retry` and counted
+/// [`retry_backoff`] and tries again, logged as `control_reload_retry` and counted
 /// in `failed` for `Db::node_status`; anything else faults the node, as before (M9 S2a, 2f).
 ///
 /// It answers, snapshot or fault, only while `reloads` still holds its own `failed` for the
@@ -502,7 +561,7 @@ async fn reload(
                     %error,
                     "control_reload_retry"
                 );
-                tokio::time::sleep(reload_backoff(attempt)).await;
+                tokio::time::sleep(retry_backoff(attempt)).await;
             }
         }
     };
@@ -637,14 +696,52 @@ fn cas_outcome(
     }
 }
 
+/// Count a watch that is ending: one more unserved in a row when it served nothing and stayed
+/// open less than the longest wait, else none. A watch that stayed open that long is not a
+/// tight loop, even when its family was quiet the whole time; without that, an idle family
+/// whose stream ends at each rEtcd leader change would creep to the 2 s wait over a day.
+fn count_end(unserved: &AtomicU32, served: bool, opened: tokio::time::Instant) {
+    let long = opened.elapsed() >= std::time::Duration::from_millis(RETRY_BACKOFF_CAP_MILLIS);
+    if served || long {
+        unserved.store(0, Ordering::Relaxed);
+    } else {
+        let _ = unserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
+    }
+}
+
+/// `Watch`: open the stream and post what it delivers. When the watches of this family before
+/// it ended having served nothing, `unserved` in a row, it first waits [`retry_backoff`] of
+/// that count, logged as `control_watch_backoff{node, prefix, from, unserved, millis}`. A1's own
+/// re-watch timer is a fixed 50 ms, so without this wait a store that refuses or ends every
+/// watch — an rEtcd election, a voter stopped — is asked again every 50 ms for as long as it
+/// lasts (M9 S2a carry, tester-s2). Any delivered event or progress mark sets the count back to
+/// 0 at once, so a watch replaced while it serves leaves no wait behind it.
 async fn watch(
     store: Arc<dyn ConfigStore>,
     links: Arc<Links>,
     site: Site,
     prefix: ControlPrefix,
     from: Revision,
+    unserved: Arc<AtomicU32>,
 ) {
     let name = prefix.encode();
+    let before = unserved.load(Ordering::Relaxed);
+    if before > 0 {
+        let wait = retry_backoff(before);
+        tracing::info!(
+            node = site.node.0,
+            prefix = name,
+            from = from.0,
+            unserved = before,
+            millis = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            "control_watch_backoff"
+        );
+        tokio::time::sleep(wait).await;
+    }
+    let opened_at = tokio::time::Instant::now();
+    let mut served = false;
     let started = Instant::now();
     let opened = store
         .watch(WatchRequest {
@@ -660,6 +757,7 @@ async fn watch(
         }
         Err(error) => {
             log_watch(site, name, "refused", from, started);
+            count_end(&unserved, false, opened_at);
             terminate(&links, site, prefix, from, &error);
             return;
         }
@@ -696,12 +794,19 @@ async fn watch(
                 }
             }
             Err(error) => {
+                count_end(&unserved, served, opened_at);
                 terminate(&links, site, prefix, cursor, &error);
                 return;
             }
         };
+        if !served {
+            served = true;
+            unserved.store(0, Ordering::Relaxed);
+        }
         post(&links, site, event);
     }
+    // Counted before the end is posted: A1 may ask for the next watch as soon as it hears it.
+    count_end(&unserved, served, opened_at);
     terminate(
         &links,
         site,
@@ -1187,7 +1292,7 @@ mod tests {
     fn a_reload_waits_twice_as_long_each_time_up_to_two_seconds() {
         let waits: Vec<u128> = [1, 2, 3, 6, 7, 8, 40, 64, 65, u32::MAX]
             .into_iter()
-            .map(|attempt| reload_backoff(attempt).as_millis())
+            .map(|attempt| retry_backoff(attempt).as_millis())
             .collect();
         assert_eq!(
             waits,
@@ -1195,7 +1300,7 @@ mod tests {
         );
     }
 
-    /// PR #38 review F-001: the retry loop really waits what [`reload_backoff`] computes. On
+    /// PR #38 review F-001: the retry loop really waits what [`retry_backoff`] computes. On
     /// paused time the gap between one list and the next is exact: 50 ms after the first
     /// failure, doubling, then held at the 2 s cap, and the snapshot follows the first list
     /// that answers.
@@ -1651,10 +1756,44 @@ mod tests {
     type Reply<'a, T> =
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConfigError>> + Send + 'a>>;
 
-    /// A store that serves one scripted watch stream per prefix and nothing else. `MemStore`
-    /// refuses every watch, so without this no lib test reaches the body of [`watch`].
-    /// Written out by hand because `async-trait` is not a dependency of this crate.
-    struct ScriptedWatch(Mutex<BTreeMap<String, Vec<Result<WatchItem, ConfigError>>>>);
+    /// One scripted watch.
+    enum Stream {
+        /// The open is refused `Unavailable`, as a voter with no leader refuses it.
+        Refused,
+        /// The stream's items, then this long open with nothing more, then its end.
+        Open(Vec<Result<WatchItem, ConfigError>>, std::time::Duration),
+    }
+
+    impl Stream {
+        /// `items`, then the end at once.
+        fn of(items: Vec<Result<WatchItem, ConfigError>>) -> Self {
+            Self::Open(items, std::time::Duration::ZERO)
+        }
+    }
+
+    /// A store that serves scripted watch streams and nothing else: per prefix, each watch
+    /// takes the next stream, and once they run out gets one that ends at once with nothing.
+    /// It records when each watch arrived, on tokio's clock. `MemStore` refuses every watch, so
+    /// without this no lib test reaches the body of [`watch`]. Written out by hand because
+    /// `async-trait` is not a dependency of this crate.
+    struct ScriptedWatch {
+        streams: Mutex<BTreeMap<String, std::collections::VecDeque<Stream>>>,
+        arrivals: Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl ScriptedWatch {
+        fn new(streams: BTreeMap<String, Vec<Stream>>) -> Self {
+            Self {
+                streams: Mutex::new(
+                    streams
+                        .into_iter()
+                        .map(|(prefix, streams)| (prefix, streams.into()))
+                        .collect(),
+                ),
+                arrivals: Mutex::new(Vec::new()),
+            }
+        }
+    }
 
     fn unserved<'a, T: Send + 'a>() -> Reply<'a, T> {
         Box::pin(std::future::ready(Err(ConfigError::Unavailable {
@@ -1704,9 +1843,26 @@ mod tests {
             'a: 'b,
             Self: 'b,
         {
+            lock(&self.arrivals).push(tokio::time::Instant::now());
             let prefix = String::from_utf8_lossy(&request.prefix).into_owned();
-            let items = lock(&self.0).remove(&prefix).unwrap_or_default();
-            let stream: config_core::WatchStream = Box::pin(futures::stream::iter(items));
+            let next = lock(&self.streams)
+                .get_mut(&prefix)
+                .and_then(std::collections::VecDeque::pop_front)
+                .unwrap_or_else(|| Stream::of(Vec::new()));
+            let Stream::Open(items, open_for) = next else {
+                return Box::pin(std::future::ready(Err(ConfigError::Unavailable {
+                    reason: "scripted: the watch was refused".to_owned(),
+                })));
+            };
+            // Only a stream that stays open needs tokio's clock.
+            let quiet = futures::stream::once(async move {
+                if !open_for.is_zero() {
+                    tokio::time::sleep(open_for).await;
+                }
+            })
+            .filter_map(|()| std::future::ready(None));
+            let stream: config_core::WatchStream =
+                Box::pin(futures::stream::iter(items).chain(quiet));
             Box::pin(std::future::ready(Ok(stream)))
         }
     }
@@ -1745,7 +1901,11 @@ mod tests {
                 vec![event(7, "grants/x"), event(8, "grants/1")],
             ),
         ]);
-        let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch(Mutex::new(script)));
+        let script = script
+            .into_iter()
+            .map(|(prefix, items)| (prefix, vec![Stream::of(items)]))
+            .collect();
+        let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch::new(script));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
         links.register(NodeId(1), tx);
@@ -1759,6 +1919,7 @@ mod tests {
                 SITE,
                 prefix,
                 Revision(from),
+                Arc::new(AtomicU32::new(0)),
             ));
             rx.try_iter()
                 .map(|msg| match msg {
@@ -1821,5 +1982,156 @@ mod tests {
             [Err("control_key_undecodable")],
             "an unknown key faults the node and nothing after it is delivered"
         );
+    }
+
+    /// Drive node 1's partitions watch the way A1 does, minus its own 50 ms timer: each time
+    /// a watch ends, submit the next one at once; with `replace`, also each time one delivers a
+    /// change, replacing it while it serves. The store serves `streams` in turn. Returns
+    /// the gaps, in ms, between the first `watches` watches reaching the store. On paused time,
+    /// so it costs no wall time; the mailbox is polled each 1 ms, so a gap can read up to 1 ms
+    /// over the wait itself.
+    fn rewatch_gaps(streams: Vec<Stream>, watches: usize, replace: bool) -> Vec<u128> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let prefix = ControlPrefix::Partitions;
+        let store = Arc::new(ScriptedWatch::new(BTreeMap::from([(
+            prefix.encode().to_owned(),
+            streams,
+        )])));
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        let rewatch = || {
+            adapter.submit(
+                NodeId(1),
+                crate::host::BOOT,
+                PartitionId(1),
+                CorrelationId(0),
+                ControlEffect::Watch {
+                    prefix,
+                    from: Revision(0),
+                },
+            );
+        };
+        rewatch();
+        rt.block_on(async {
+            while lock(&store.arrivals).len() < watches {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        Msg::Control {
+                            event: ControlEvent::WatchTerminated { .. },
+                            ..
+                        } => rewatch(),
+                        Msg::Control {
+                            event: ControlEvent::Watched { .. },
+                            ..
+                        } if replace => rewatch(),
+                        _ => {}
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        adapter.shutdown();
+        let arrivals = lock(&store.arrivals).clone();
+        arrivals[..watches]
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).as_millis())
+            .collect()
+    }
+
+    /// Whether each gap is its expected wait, or at most the 1 ms poll over it.
+    fn waited(gaps: &[u128], expected: &[u128]) -> bool {
+        gaps.len() == expected.len()
+            && gaps
+                .iter()
+                .zip(expected)
+                .all(|(gap, wait)| (*wait..=wait + 1).contains(gap))
+    }
+
+    /// M9 S2a carry (tester-s2): during an rEtcd election every watch ended at once, and A1
+    /// re-watched every 50 ms for as long as it lasted, because only a reload backed off. A
+    /// watch that ends having served nothing now makes the next watch of its family wait, 50 ms
+    /// after the first such end and doubling up to 2 s, as a reload does. Each way a store
+    /// serves nothing: it refuses the open (the walk saw `outcome=refused`), the stream fails
+    /// first thing, or it ends at once.
+    #[test]
+    fn a_rewatch_after_watches_that_served_nothing_waits_twice_as_long_each_time() {
+        let expected = [50, 100, 200, 400, 800, 1600, 2000, 2000, 2000];
+        let refused = rewatch_gaps((0..10).map(|_| Stream::Refused).collect(), 10, false);
+        assert!(
+            waited(&refused, &expected),
+            "refused: {refused:?}, expected {expected:?}"
+        );
+        let failed = rewatch_gaps(
+            (0..10)
+                .map(|_| Stream::of(vec![Err(ConfigError::NotLeader { hint: None })]))
+                .collect(),
+            10,
+            false,
+        );
+        assert!(
+            waited(&failed, &expected),
+            "failed: {failed:?}, expected {expected:?}"
+        );
+        let ended = rewatch_gaps(Vec::new(), 10, false);
+        assert!(
+            waited(&ended, &expected),
+            "ended: {ended:?}, expected {expected:?}"
+        );
+    }
+
+    /// A watch replaced while it serves leaves no wait behind it, though it never ends: its
+    /// first delivery puts the count back to 0 then, not at its end. An unserved watch (50 ms
+    /// before the next), then one that delivers a change and stays open; the change is answered
+    /// with a new watch, which opens at once.
+    #[test]
+    fn a_watch_replaced_while_it_serves_leaves_no_wait() {
+        let serving = Stream::Open(
+            vec![Ok(WatchItem::Event(config_core::MutationEvent {
+                revision: 4,
+                key: Bytes::from_static(b"partitions/1"),
+                kind: config_core::MutationEventKind::Delete,
+            }))],
+            std::time::Duration::from_secs(60),
+        );
+        let gaps = rewatch_gaps(vec![Stream::of(Vec::new()), serving], 3, true);
+        assert!(waited(&gaps, &[50, 0]), "{gaps:?}, expected [50, 0]");
+    }
+
+    /// The wait is for a store that serves nothing, never for a family that is merely quiet. A
+    /// watch that delivers a change puts the count back to 0, so the next watch opens at once;
+    /// so does one that stayed open the longest wait, 2 s, with nothing to deliver. One that
+    /// ends 1 ms short of that still counts. Watches, in turn: two unserved (50, then 100 ms
+    /// before the next), one that serves (0 ms), one unserved (50 ms), one open 2 s (none: its
+    /// 2 s life is the gap), one open 1999 ms (its life plus 50 ms), one unserved (100 ms).
+    #[test]
+    fn a_rewatch_waits_only_after_watches_that_served_nothing_and_ended_soon() {
+        let served = Stream::of(vec![Ok(WatchItem::Event(config_core::MutationEvent {
+            revision: 4,
+            key: Bytes::from_static(b"partitions/1"),
+            kind: config_core::MutationEventKind::Delete,
+        }))]);
+        let quiet = |millis| Stream::Open(Vec::new(), std::time::Duration::from_millis(millis));
+        let streams = vec![
+            Stream::of(Vec::new()),
+            Stream::of(Vec::new()),
+            served,
+            Stream::of(Vec::new()),
+            quiet(2_000),
+            quiet(1_999),
+            Stream::of(Vec::new()),
+        ];
+        let gaps = rewatch_gaps(streams, 8, false);
+        let expected = [50, 100, 0, 50, 2000, 2049, 100];
+        assert!(waited(&gaps, &expected), "{gaps:?}, expected {expected:?}");
     }
 }

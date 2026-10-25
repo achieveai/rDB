@@ -25,16 +25,17 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rdb_core::authority::partition::INSTANCE_LEN;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceScope, Lineage, PartitionMode,
-    Verdict,
+    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
+    PartitionMode, Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -47,16 +48,17 @@ use rdb_core::contracts::event::{
 use rdb_core::contracts::ids::{
     AffinityId, AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket,
     Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId,
-    RequestIdentity, Seq, SnapshotHandle, TimerId, TimerVersion,
+    RequestIdentity, Revision, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
-use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::ignore::KernelIgnoredReason;
+use rdb_core::contracts::membership::{CopyId, PartitionConfig};
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
     DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
     SurvivorInventory,
 };
 use rdb_core::contracts::storage::{
-    CapturedPrefix, Namespace, SnapshotRead, StorageEvent, StoreEffect,
+    CapturedPrefix, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
 };
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -66,10 +68,12 @@ use rdb_core::contracts::version::{API_VERSION, ENVELOPE_VERSION};
 use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
-use rdb_core::replication::Replication;
+use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
+use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-use rdb_storage::{RocksEngine, RocksSnapshot};
+use rdb_storage::{Inherited, PublishMark, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
@@ -99,10 +103,58 @@ pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 /// answers (achieveai/rDB#34).
 pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
 
-/// How long after a recovery the primary's A1 is first woken to acquire its grant. The same
-/// value as the lowering's `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first
-/// `AcquireDue` (A1's own docs).
+/// D6 (ruling A-R172): the trim duty deletes trimmed Dedup rows on disk at most once per this
+/// period: a quarter of the retention, and never less often than once a minute.
+fn trim_delete_period(retention_millis: u64) -> u64 {
+    (retention_millis / 4).min(60_000)
+}
+
+/// A-R183 C2 (critic-d6b): the most publish marks a partition keeps, besides the newest of each
+/// generation. 64 marks of 24 bytes span the whole retention in about 1.5 KB.
+const PUBLISH_MARKS: usize = 64;
+
+/// A publish mark as the host holds it: `(generation, seq, tick)`, a `published_at` entry.
+type Mark = (Generation, Seq, Tick);
+
+/// A-R183 C2: the publish marks of one partition's `published_at`, oldest first: every
+/// `step`-th entry, so at most [`PUBLISH_MARKS`] of them span the whole queue, and the newest
+/// entry of each generation, since a mark covers the seqs of one generation only.
+fn sample_marks(published: &VecDeque<Mark>) -> Vec<Mark> {
+    let step = published.len().div_ceil(PUBLISH_MARKS).max(1);
+    published
+        .iter()
+        .enumerate()
+        .filter(|&(at, &(generation, _, _))| {
+            (at + 1) % step == 0
+                || published
+                    .get(at + 1)
+                    .is_none_or(|&(next, _, _)| next != generation)
+        })
+        .map(|(_, entry)| *entry)
+        .collect()
+}
+
+/// The marks as storage keeps them.
+fn publish_marks(marks: &[Mark]) -> Vec<PublishMark> {
+    marks
+        .iter()
+        .map(|&(generation, seq, tick)| PublishMark {
+            generation,
+            seq,
+            tick,
+        })
+        .collect()
+}
+
+/// How long after a recovery the primary's A1 is first woken to acquire its grant, when the
+/// recovery did not commit `Active`. The same value as the lowering's
+/// `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first `AcquireDue` (A1's own
+/// docs).
 pub const ACQUIRE_AFTER_RECOVERED_MILLIS: u64 = 500;
+
+/// [`ACQUIRE_AFTER_RECOVERED_MILLIS`] after a recovery that committed `Active` (ruling A-R165).
+/// Not 0: the peers hear the recovery about 10 ms after the commit.
+pub const ACQUIRE_AFTER_ACTIVE_MILLIS: u64 = 50;
 
 /// The cadence H1 owes L1 (design §4.6), as `rdb_sim::harness::protection` keeps it.
 pub const HEALTH_EVAL_PERIOD_MILLIS: u64 = 50;
@@ -146,10 +198,18 @@ const AFFINITY: AffinityId = AffinityId(1);
 /// The longest the thread sleeps with nothing due, so a missed wake costs at most this.
 const IDLE_WAIT: Duration = Duration::from_millis(1_000);
 
+/// D10: the most letters `Host::run` takes from its mailbox before it runs the due duties.
+const MAIL_BEFORE_DUTIES: usize = 256;
+
+/// A-R192a: a step of a node's thread longer than this is logged at info (`host_slow_step`).
+const SLOW_STEP_MILLIS: u64 = 250;
+
 /// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
 /// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
 /// window. That CAS takes 5-20 ms here, and up to ~80 ms with the suite running in parallel;
-/// past the deadline F1 blocks for good with `BlockPromotion { reason: ControlUnknown }`, and
+/// past the deadline an unbound F1, as every `Trio` host's is, blocks for good with
+/// `BlockPromotion { reason: ControlUnknown }` (a bound one, as every `Db`'s is, reads
+/// `partitions/{p}` and resolves instead, ruling A-R182), and
 /// the row waits out its patience for a commit that cannot come (G2 at 20 ms; at 100 ms on a
 /// host also running a coverage build, 2026-10-07). So it stretches with the scale, as the
 /// waits do. Even scaled it is short of a loaded host's stalls (~470 ms, 2026-10-08), so only
@@ -219,6 +279,16 @@ pub enum Msg {
         /// Its detail.
         detail: String,
     },
+    /// Ruling A-R184: the open counter marks `generation` activated, so this node may acquire
+    /// under it and admit writes. Dropped unless `boot` is the node's own, as [`Msg::Control`].
+    Activated {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// The generation now marked.
+        generation: Generation,
+    },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
         /// The partition.
@@ -249,6 +319,32 @@ pub enum Msg {
         correlation: CorrelationId,
         /// What it asks.
         ask: PeerAsk,
+    },
+    /// F1's `CatchUp` or `CatchUpBeforeGrant`, routed to the node holding the source copy (D7).
+    CatchUp {
+        /// The node whose F1 asked: where the source's `CopyCaughtUp` goes.
+        asker: NodeId,
+        /// The partition.
+        partition: PartitionId,
+        /// The asking effect's correlation.
+        correlation: CorrelationId,
+        /// The source copy.
+        from: CopyId,
+        /// The copy to catch up.
+        to: CopyId,
+        /// Through this sequence.
+        through: Seq,
+        /// F1's credential for this transfer.
+        credential: FenceCredential,
+        /// What the source restores its dormant receiver from (A-R173).
+        seed: Box<DormantSeed>,
+    },
+    /// Restore this node's dormant receiver for a catch-up it is the target of (A-R173).
+    Restore {
+        /// The partition.
+        partition: PartitionId,
+        /// What the receiver is restored from.
+        seed: Box<DormantSeed>,
     },
     /// A kernel event routed here from another node: a recovery answer.
     Routed {
@@ -309,6 +405,34 @@ pub enum PeerAsk {
         /// landed the generation waits for the landing before it answers (D7).
         post_commit: bool,
     },
+}
+
+/// What a node restores its dormant R1 receiver from (lead ruling A-R173): the asking F1's
+/// plan configuration (this open's boots), and the lineage and control revision of the
+/// credential F1 minted from its fence proof. All three come from the heal's one
+/// `partitions/{id}` read, never from an engine (critic-d7 F4).
+#[derive(Debug, Clone)]
+pub struct DormantSeed {
+    /// The plan's configuration.
+    pub config: PartitionConfig,
+    /// The prior lineage: partition, generation and owner epoch.
+    pub lineage: Lineage,
+    /// The record's `mod_revision`: row 6R's floor.
+    pub revision: Revision,
+}
+
+impl DormantSeed {
+    fn new(config: PartitionConfig, credential: &FenceCredential) -> Self {
+        Self {
+            config,
+            lineage: Lineage {
+                partition: credential.partition,
+                generation: credential.prior_generation,
+                owner_epoch: credential.prior_owner_epoch,
+            },
+            revision: credential.control_revision,
+        }
+    }
 }
 
 /// A client call and where its answer goes.
@@ -644,7 +768,9 @@ pub struct NodeStatus {
     /// L1's mode, when live.
     pub protection: Option<String>,
     /// Whether this node admits writes now: L1 admits and A1 holds a grant. `None` while L1 is
-    /// not live. `protection` is L1 alone and `authority` A1 alone.
+    /// not live. `protection` is L1 alone and `authority` A1 alone. A transaction still waiting
+    /// to publish can refuse a put `PROTECTION_PAUSED` while this is `true`; `published` and
+    /// `in_flight` show that (D13).
     pub admits: Option<bool>,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
@@ -706,6 +832,11 @@ impl NodeHandle {
     /// [`NodeStopped`] when the node's thread has stopped; the message is dropped.
     pub fn send(&self, msg: Msg) -> Result<(), NodeStopped> {
         self.tx.send(msg).map_err(|_| NodeStopped(self.node))
+    }
+
+    /// The node's mailbox, for a task that outlives this borrow (the reopen's heal).
+    pub(crate) fn sender(&self) -> Sender<Msg> {
+        self.tx.clone()
     }
 
     /// A node with no thread: what is sent to it queues in the returned mailbox and is never
@@ -777,15 +908,40 @@ pub(crate) fn spawn_with(
 ) -> Result<NodeHandle, String> {
     let engine = RocksEngine::open(&dir)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
+    spawn_on(node, engine, links, control, clock, budgets, limits, boot)
+}
+
+/// [`spawn_with`] on an engine the caller already opened (M10, arch R3b): `Db::open` opens all
+/// three first, which takes their `LOCK`s and reads their instance, and only then knows the
+/// boot to start them at.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_on(
+    node: NodeId,
+    engine: RocksEngine,
+    links: Arc<Links>,
+    control: Arc<ControlAdapter>,
+    clock: HostClock,
+    budgets: Budgets,
+    limits: Limits,
+    boot: BootId,
+) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone());
     let mut host = Host::new(node, engine, links, control, clock);
     host.boot = boot;
     host.budgets = budgets;
     host.transaction = Transaction::with_limits(limits);
+    // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
+    // reads its own nodes' lines from its own file rather than the shared untagged one.
+    #[cfg(test)]
+    let span = tracing::Span::current();
     let join = std::thread::Builder::new()
         .name(format!("rdb-node-{}", node.0))
-        .spawn(move || host.run(&rx))
+        .spawn(move || {
+            #[cfg(test)]
+            let _span = span.enter();
+            host.run(&rx);
+        })
         .map_err(|e| format!("node {}: spawn: {e}", node.0))?;
     Ok(NodeHandle {
         node,
@@ -794,6 +950,118 @@ pub(crate) fn spawn_with(
         tx,
         join: Some(join),
     })
+}
+
+/// A partition's activation marks on one node (ruling A-R184).
+#[derive(Debug, Default, Clone, Copy)]
+struct Activation {
+    /// The newest generation this process asked the open counter to mark.
+    asked: Generation,
+    /// The newest generation the open counter is known to mark.
+    marked: Generation,
+    /// The first acquire, waiting on the mark of its generation: when it is due.
+    acquire: Option<(Generation, Site, Tick)>,
+}
+
+/// What a node does when F1 reports a commit, set by [`after_commit`] for its data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterCommit {
+    /// Abort the process: the commit is in the control store and nothing after it ran.
+    Abort,
+    /// Fault the node instead, so a crate row can go on in the same process.
+    #[cfg(test)]
+    Fault,
+}
+
+/// The data directories whose nodes act on a commit report, and how.
+static AFTER_COMMIT: Mutex<Vec<(PathBuf, AfterCommit)>> = Mutex::new(Vec::new());
+
+/// The `--abort-after-commit` hook (ruling A-R184): every node started afterwards on a copy
+/// under `dir`, spelled as the `DbConfig::dir` the open is given, aborts the whole process as
+/// soon as F1 reports a recovery committed, before the node links the new generation or marks
+/// it activated. So the reopen finds `partitions/1` at a generation no copy holds. A dev and
+/// test hook; never call it in an app.
+#[doc(hidden)]
+pub fn abort_after_commit(dir: &std::path::Path) {
+    set_after_commit(dir, Some(AfterCommit::Abort));
+}
+
+/// Set or clear what nodes under `dir` do on a commit report.
+pub(crate) fn set_after_commit(dir: &std::path::Path, what: Option<AfterCommit>) {
+    let mut hooks = AFTER_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hooks.retain(|(at, _)| at != dir);
+    if let Some(what) = what {
+        hooks.push((dir.to_path_buf(), what));
+    }
+}
+
+/// Test-only: node directories whose host sleeps once, for the time given, before it answers
+/// its next inventory ask, so F1's discovery window closes without it (A-R185, answer-first).
+#[cfg(test)]
+static PAUSE_BEFORE_INVENTORY: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+/// Test-only: the host on the copy at `node_dir` sleeps `pause` before it answers its next
+/// inventory ask, once.
+#[cfg(test)]
+pub(crate) fn pause_before_inventory(node_dir: &std::path::Path, pause: Duration) {
+    PAUSE_BEFORE_INVENTORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), pause));
+}
+
+/// Node directories whose host sleeps once, for the time given, before its next barrier sync
+/// (a `SyncWalThrough` before the commit), as a slow fsync would (D10). Empty unless
+/// [`pause_before_sync`] armed it.
+static PAUSE_BEFORE_SYNC: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+/// The `--pause-before-sync` hook (ruling A-R198): the host on the copy at `node_dir`, spelled
+/// as `DbConfig::dir` joined with `nodes/<n>`, sleeps `pause` before its next barrier sync,
+/// once, and logs `test_sync_paused` when it does. A dev and test hook; never call it in an
+/// app.
+#[doc(hidden)]
+pub fn pause_before_sync(node_dir: &std::path::Path, pause: Duration) {
+    PAUSE_BEFORE_SYNC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), pause));
+}
+
+/// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
+/// an iteration, when its own copy of partition 1 is durable further than the primary's floor
+/// and at least through the `Seq` given. So the peers' answers that would raise the floor land
+/// in its mailbox while it sleeps. Crate tests only.
+#[cfg(test)]
+static STALL_LOOP: Mutex<Vec<(PathBuf, Seq, Duration)>> = Mutex::new(Vec::new());
+
+/// Arm [`STALL_LOOP`] for the host on `node_dir`, as `DbConfig::dir` joined with `nodes/<n>`.
+#[cfg(test)]
+pub(crate) fn stall_loop_once(node_dir: &std::path::Path, through: Seq, pause: Duration) {
+    STALL_LOOP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), through, pause));
+}
+
+/// Whether the stall armed for `node_dir` has yet to fire.
+#[cfg(test)]
+pub(crate) fn stall_loop_armed(node_dir: &std::path::Path) -> bool {
+    STALL_LOOP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(dir, _, _)| dir == node_dir)
+}
+
+fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
+    AFTER_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(dir, _)| path.starts_with(dir))
+        .map(|(_, what)| *what)
 }
 
 /// The triple the next step for a partition carries.
@@ -840,6 +1108,18 @@ enum Delayed {
         identity: RequestIdentity,
         event: EventId,
     },
+}
+
+impl Delayed {
+    /// The kind, for `host_slow_step` (A-R192a).
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Event(_) => "event",
+            Self::Landing { .. } => "landing",
+            Self::RebuildCheck { .. } => "rebuild_check",
+            Self::TxnExpiry { .. } => "txn_expiry",
+        }
+    }
 }
 
 /// A recovery this node's F1 committed below `Active`, watched until it activates (D2).
@@ -906,10 +1186,39 @@ enum PendingKind {
     Previous(RootKey),
 }
 
+/// Why a node faulted, typed (A-R178): every waiter, and every call after, is refused with
+/// [`Fault::error`]. A view that read stored damage refuses as `CORRUPT_HISTORY` (retry
+/// `Quarantine`), as a compile that decodes damage does; any other fault is [`ApiError::host`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fault {
+    /// The kind of stored damage the node read, when that is why it faulted.
+    damage: Option<ErrorKind>,
+    detail: String,
+}
+
+impl Fault {
+    fn error(&self) -> ApiError {
+        match self.damage {
+            Some(kind) => ApiError::new(kind, format!("host fault: {}", self.detail)),
+            None => ApiError::host(&self.detail),
+        }
+    }
+}
+
+/// A fault that names no stored damage: [`ApiError::host`], as before A-R178.
+impl From<String> for Fault {
+    fn from(detail: String) -> Self {
+        Self {
+            damage: None,
+            detail,
+        }
+    }
+}
+
 /// Why a step produced no effects.
 enum StepError {
     Module(RdbError),
-    Host(String),
+    Host(Fault),
 }
 
 /// An empty view, for the four modules that do not read storage.
@@ -971,6 +1280,28 @@ struct Host {
     /// first, until the trim duty ages it out. Only the owner's P1 publishes, so only the owner
     /// fills it.
     published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
+    /// [`HOST_TRIM_EVERY_MILLIS`]; crate tests lower it.
+    trim_every_millis: u64,
+    /// D6 (A-R170 D, A-R172): per partition and generation, the newest trim floor `below` not yet
+    /// deleted on disk (critic-d6b C6: a restored older floor must not overwrite the newer
+    /// generation's), and per partition when the last durable delete ran. One delete per
+    /// [`trim_delete_period`] at most, with the latest floor. Each floor keeps the publish tick
+    /// of its last seq, so [`Host::mark_duty`] marks the rows it covers until they are deleted.
+    trim_floors: BTreeMap<(PartitionId, Generation), (Seq, Tick)>,
+    trim_deleted_at: BTreeMap<PartitionId, Tick>,
+    /// How many trims the duty sent and how many durable deletes ran, for the rows.
+    trims_sent: u64,
+    trim_deletes: u64,
+    /// D6 (A-R170 A, critic-d6 C1): per committed generation this node landed, when the Dedup
+    /// rows of every older generation it holds retire: one retention after the landing.
+    retire_due: BTreeMap<(PartitionId, Generation), Tick>,
+    /// A-R183 (S1-6, critic-d6b): the partitions whose durable publish marks this process has
+    /// restored, at its first landing. Marks are written only for these, so a process never
+    /// overwrites the marks an earlier one left before it has read them.
+    marks_restored: BTreeSet<PartitionId>,
+    /// A-R183 C2: per partition, the publish marks last written (or read, at the restore) and
+    /// when.
+    marks_written: BTreeMap<PartitionId, (Tick, Vec<Mark>)>,
     flushed_once: bool,
     /// Per partition, the step view and the `(generation, applied)` it was built at. Per
     /// partition, because the flusher's completions arrive on partition 0 and would otherwise
@@ -994,7 +1325,24 @@ struct Host {
     /// not landed. Answered right after the landing's inherit, so the proof is of a generation
     /// this copy holds; the latest ask wins.
     deferred_syncs: BTreeMap<(PartitionId, Generation), (NodeId, CorrelationId, PeerAsk)>,
+    /// D7: each recovery catch-up this node sources, by `(partition, target copy)`: the node
+    /// and correlation of the F1 that asked, where R1's `CopyCaughtUp` for that copy goes (the
+    /// sim's `catch_ups`, B-R59). A newer ask for the same copy replaces it, as R1's cursor does.
+    catch_ups: BTreeMap<(PartitionId, CopyId), (NodeId, CorrelationId)>,
+    /// Partitions whose dormant receiver holds its full ladder (A-R173, critic-d7 F2): built
+    /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
+    ladders: BTreeSet<PartitionId>,
+    /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
+    land_linked: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    /// The instance this node's engine is bound to when it started, whose open counter holds
+    /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
+    /// is marked, and nothing waits on a mark.
+    instance: Option<[u8; INSTANCE_LEN]>,
+    /// Per partition, the activation marks this node asked for and has (ruling A-R184).
+    activation: BTreeMap<PartitionId, Activation>,
+    /// Set by [`after_commit`] for this node's data directory: what to do on a commit report.
+    after_commit: Option<AfterCommit>,
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
     /// The stall line, per partition, once reported, up to its effect, with the mode it names;
     /// cleared when the partition activates. [`Self::status`] adds the effect as it reads the
@@ -1005,7 +1353,7 @@ struct Host {
     resends: BTreeMap<(PartitionId, CopyId), Resends>,
     /// [`STUCK_RESENDS`]; crate tests lower it.
     stuck_resends: u32,
-    fault: Option<String>,
+    fault: Option<Fault>,
     /// The tick the step being carried out was offered at, its `StepCtx::now`: the tick a
     /// module judged at, which a line about one of its effects names.
     stepped_at: Tick,
@@ -1015,6 +1363,9 @@ struct Host {
     /// Peer frames this process took from its mailbox, for `node_stopped`: what a restarted
     /// node is still sent, though it holds no role (M9 S2b, critic A5).
     frames_received: u64,
+    /// D10 (A-R196(1)): asks F1 put to a copy this node holds, answered once every effect of the
+    /// step that made them is out, so the asks to peers leave before this node's own fsync.
+    own_asks: Vec<(Site, PeerAsk)>,
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
@@ -1022,6 +1373,10 @@ struct Host {
     /// be, so P1 withholds the reply (F-014 rows).
     #[cfg(test)]
     deny_reply_checks: bool,
+    /// Each module offer, and the synced write of a clean stop's final marks, first sleep this
+    /// long, so a row can see a slow step logged (PR #60 review F8, F9).
+    #[cfg(test)]
+    step_pause: Duration,
 }
 
 impl Host {
@@ -1033,6 +1388,8 @@ impl Host {
         clock: HostClock,
     ) -> Self {
         let now = clock.now();
+        let engine_instance = engine.instance();
+        let after_commit = after_commit_for(engine.path());
         Self {
             node,
             boot: BOOT,
@@ -1058,6 +1415,14 @@ impl Host {
             next_ticket: 1,
             next_trim: now.plus_millis(HOST_TRIM_EVERY_MILLIS),
             published_at: BTreeMap::new(),
+            trim_every_millis: HOST_TRIM_EVERY_MILLIS,
+            trim_floors: BTreeMap::new(),
+            trim_deleted_at: BTreeMap::new(),
+            trims_sent: 0,
+            trim_deletes: 0,
+            retire_due: BTreeMap::new(),
+            marks_restored: BTreeSet::new(),
+            marks_written: BTreeMap::new(),
             flushed_once: false,
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -1069,7 +1434,13 @@ impl Host {
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
             deferred_syncs: BTreeMap::new(),
+            catch_ups: BTreeMap::new(),
+            ladders: BTreeSet::new(),
+            land_linked: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
+            instance: engine_instance,
+            activation: BTreeMap::new(),
+            after_commit,
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
             rebuild_pin_wait_millis: REBUILD_PIN_WAIT_MILLIS,
@@ -1079,10 +1450,13 @@ impl Host {
             stepped_at: now,
             authority_views: BTreeMap::new(),
             frames_received: 0,
+            own_asks: Vec::new(),
             #[cfg(test)]
             fail_step_view: false,
             #[cfg(test)]
             deny_reply_checks: false,
+            #[cfg(test)]
+            step_pause: Duration::ZERO,
         }
     }
 
@@ -1095,9 +1469,46 @@ impl Host {
             count = 0,
             "host_duty"
         );
-        loop {
+        'run: loop {
+            #[cfg(test)]
+            self.stall_loop();
+            // D10 (A-R196(1)): mail already here is taken before the due duties, so a deadline
+            // that came due during a stall is judged after the answers that beat it, not before.
+            // D18 (A-R206): and drained before them too. A peer frame's `DurableAdvanced` is
+            // queued only when its frame is stepped, so taken but not drained it would land
+            // behind the health eval `run_due` queues, and L1 would judge exposure on progress
+            // the mailbox already had. A drain can stall in turn (a slow barrier fsync, D10's
+            // row), so the mailbox is read again after every drain, until a read finds nothing.
+            // At most `MAIL_BEFORE_DUTIES` letters, so a busy mailbox cannot starve the duties.
+            let mut taken = 0;
+            loop {
+                if self.fault.is_none() {
+                    self.drain();
+                }
+                let before = taken;
+                while taken < MAIL_BEFORE_DUTIES {
+                    match rx.try_recv() {
+                        Ok(Msg::Stop) | Err(TryRecvError::Disconnected) => break 'run,
+                        Ok(msg) => {
+                            self.handle(msg);
+                            taken += 1;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                    }
+                }
+                if taken == before || taken == MAIL_BEFORE_DUTIES {
+                    break;
+                }
+            }
+            // PR #60 review F4: a step that faults the node ends the turn. Nothing after it
+            // runs, so no duty writes marks, links or activations for a node that has failed.
+            if self.fault.is_none() {
+                self.drain();
+            }
             if self.fault.is_none() {
                 self.run_due();
+            }
+            if self.fault.is_none() {
                 self.drain();
             }
             let wait = self.wait();
@@ -1107,6 +1518,18 @@ impl Host {
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
+        // A-R186: a clean stop writes one final synced mark set, whatever the period, so a
+        // reopen ages every write this process published from its publish tick, not from its
+        // landing. A crash or kill writes none; that tail keeps the landing plus the retention.
+        if self.fault.is_none() {
+            // PR #60 review F8: a synced write, timed like every other duty.
+            let started = Instant::now();
+            let marked = self.mark_duty(self.clock.now(), 0, "final_marks");
+            self.slow_step("duty", || "final_marks".to_owned(), started);
+            if let Err(fault) = marked {
+                self.set_fault(fault);
+            }
+        }
         tracing::info!(
             node = self.node.0,
             boot = self.boot.0,
@@ -1114,6 +1537,39 @@ impl Host {
             frames = self.frames_received,
             "node_stopped"
         );
+    }
+
+    /// [`STALL_LOOP`]: sleep once, armed for this copy, when its own copy of partition 1 is
+    /// durable through the armed `Seq` and further than the primary's floor.
+    #[cfg(test)]
+    fn stall_loop(&mut self) {
+        let partition = PartitionId(1);
+        let mut armed = STALL_LOOP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = armed
+            .iter()
+            .position(|(dir, _, _)| self.engine.path().starts_with(dir))
+        else {
+            return;
+        };
+        let Some(primary) = self.replication.primary(self.node, partition) else {
+            return;
+        };
+        let floor = primary.tracker().min_required_durable().0;
+        let own = self
+            .engine
+            .durable(partition, self.adopted(partition).generation)
+            .0;
+        let through = armed[at].1;
+        if own < through.0 || own <= floor {
+            return;
+        }
+        let (_, _, pause) = armed.remove(at);
+        drop(armed);
+        let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(node = self.node.0, own, floor, millis, "test_loop_stalled");
+        std::thread::sleep(pause);
     }
 
     /// How long to wait for mail: until the next due duty, at most [`IDLE_WAIT`].
@@ -1147,6 +1603,7 @@ impl Host {
         let what = match msg {
             Msg::Control { event, .. } => format!("control/{}", head(&format!("{event:?}"))),
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
+            Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
             _ => "other".to_owned(),
         };
         tracing::info!(
@@ -1158,13 +1615,38 @@ impl Host {
         );
     }
 
+    /// One letter, timed (A-R192a).
     fn handle(&mut self, msg: Msg) {
+        let (name, started) = (msg_name(&msg), Instant::now());
+        self.handle_msg(msg);
+        self.slow_step("mail", || name.to_owned(), started);
+    }
+
+    /// A-R192a: a step of this node's thread that took longer than [`SLOW_STEP_MILLIS`] is
+    /// logged at info, naming the step, so a silence in the log names what the thread was doing.
+    /// `what` is built only then; it names a kind, never a key or a value.
+    fn slow_step(&self, step: &'static str, what: impl FnOnce() -> String, started: Instant) {
+        let took = millis(started);
+        if took > SLOW_STEP_MILLIS {
+            tracing::info!(
+                node = self.node.0,
+                step,
+                what = what(),
+                millis = took,
+                "host_slow_step"
+            );
+        }
+    }
+
+    fn handle_msg(&mut self, msg: Msg) {
         if let Some(fault) = self.fault.clone() {
             self.answer_faulted(msg, &fault);
             return;
         }
         let outcome = match msg {
-            Msg::Control { boot, .. } | Msg::Fault { boot, .. } if boot != self.boot => {
+            Msg::Control { boot, .. } | Msg::Fault { boot, .. } | Msg::Activated { boot, .. }
+                if boot != self.boot =>
+            {
                 self.drop_stale(&msg, boot);
                 Ok(())
             }
@@ -1181,7 +1663,17 @@ impl Host {
                 self.push(site, EventKind::Control(event), false, None);
                 Ok(())
             }
-            Msg::Fault { kind, detail, .. } => Err(format!("control adapter: {kind}: {detail}")),
+            Msg::Fault { kind, detail, .. } => {
+                Err(format!("control adapter: {kind}: {detail}").into())
+            }
+            Msg::Activated {
+                partition,
+                generation,
+                ..
+            } => {
+                self.activated(partition, generation);
+                Ok(())
+            }
             Msg::Inject {
                 partition,
                 correlation,
@@ -1232,6 +1724,27 @@ impl Host {
                 self.answer_peer(asker, partition, correlation, &ask);
                 Ok(())
             }
+            Msg::CatchUp {
+                asker,
+                partition,
+                correlation,
+                from,
+                to,
+                through,
+                credential,
+                seed,
+            } => {
+                let site = Site {
+                    partition,
+                    correlation,
+                };
+                self.source_catch_up(asker, site, (from, to, through), credential, &seed);
+                Ok(())
+            }
+            Msg::Restore { partition, seed } => {
+                self.restore_dormant(partition, &seed, false);
+                Ok(())
+            }
             Msg::Routed {
                 partition,
                 correlation,
@@ -1272,16 +1785,16 @@ impl Host {
             }
             Msg::Stop => Ok(()),
         };
-        if let Err(detail) = outcome {
-            self.set_fault(detail);
+        if let Err(fault) = outcome {
+            self.set_fault(fault);
         }
     }
 
-    fn answer_faulted(&self, msg: Msg, fault: &str) {
+    fn answer_faulted(&self, msg: Msg, fault: &Fault) {
         match msg {
             Msg::Client(client) => {
                 let _ = client.reply.send(Answer::Error {
-                    error: ApiError::host(fault),
+                    error: fault.error(),
                     request: None,
                 });
             }
@@ -1292,8 +1805,25 @@ impl Host {
         }
     }
 
-    fn set_fault(&mut self, detail: String) {
-        tracing::error!(node = self.node.0, %detail, "host_fault");
+    /// Fail the node and every waiter. The first fault is the cause, so it is the one kept and
+    /// reported, and any waiter still open is answered with it; a later fault is only logged
+    /// (PR #60 review F4).
+    fn set_fault(&mut self, fault: Fault) {
+        let fault = match self.fault.take() {
+            Some(first) => {
+                tracing::error!(
+                    node = self.node.0,
+                    detail = %fault.detail,
+                    first = %first.detail,
+                    "host_fault_after_fault"
+                );
+                first
+            }
+            None => {
+                tracing::error!(node = self.node.0, detail = %fault.detail, damage = ?fault.damage, "host_fault");
+                fault
+            }
+        };
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
@@ -1305,7 +1835,7 @@ impl Host {
                 "pending_failed_by_fault"
             );
             let _ = pending.reply.send(Answer::Error {
-                error: ApiError::host(&detail),
+                error: fault.error(),
                 request,
             });
         }
@@ -1317,7 +1847,7 @@ impl Host {
                     "queued_failed_by_fault"
                 );
                 let _ = client.reply.send(Answer::Error {
-                    error: ApiError::host(&detail),
+                    error: fault.error(),
                     request: None,
                 });
             }
@@ -1330,7 +1860,7 @@ impl Host {
                 "status_failed_by_fault"
             );
             let _ = reply.send(Answer::Error {
-                error: ApiError::host(&detail),
+                error: fault.error(),
                 request: None,
             });
         }
@@ -1338,7 +1868,7 @@ impl Host {
             self.drop_deferred_sync(key, asker, "fault");
         }
         self.queue.clear();
-        self.fault = Some(detail);
+        self.fault = Some(fault);
     }
 
     // ------------------------------------------------------------------ duties
@@ -1386,18 +1916,28 @@ impl Host {
         }
         if self.next_flush <= now {
             self.next_flush = now.plus_millis(HOST_FLUSH_EVERY_MILLIS);
-            if let Err(detail) = self.flush_duty() {
-                self.set_fault(detail);
+            let started = Instant::now();
+            let flushed = self.flush_duty();
+            self.slow_step("duty", || "flush".to_owned(), started);
+            if let Err(fault) = flushed {
+                self.set_fault(fault);
                 return;
             }
         }
         if self.next_trim <= now {
-            self.next_trim = now.plus_millis(HOST_TRIM_EVERY_MILLIS);
-            self.trim_duty(now);
+            self.next_trim = now.plus_millis(self.trim_every_millis);
+            let started = Instant::now();
+            let trimmed = self.trim_duty(now);
+            self.slow_step("duty", || "trim".to_owned(), started);
+            if let Err(fault) = trimmed {
+                self.set_fault(fault);
+                return;
+            }
         }
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
         for (_, item) in due {
+            let (name, started) = (item.name(), Instant::now());
             let outcome = match item {
                 Delayed::Event(queued) => {
                     self.queue.push_back(queued);
@@ -1417,40 +1957,68 @@ impl Host {
                 }
                 Delayed::TxnExpiry { identity, event } => self.expire_txn(identity, event, now),
             };
-            if let Err(detail) = outcome {
-                self.set_fault(detail);
+            self.slow_step("delayed", || name.to_owned(), started);
+            if let Err(fault) = outcome {
+                self.set_fault(fault);
                 return;
             }
         }
     }
 
     /// The host flusher: every lineage the engine holds, through its applied prefix.
-    fn flush_duty(&mut self) -> Result<(), String> {
-        let captured: Vec<CapturedPrefix> = self
-            .engine
-            .lineages()
-            .into_iter()
-            .map(|(partition, generation)| CapturedPrefix {
-                partition,
-                generation,
-                through: self.engine.buffered_applied(partition, generation),
-            })
-            .collect();
-        if captured.is_empty() {
+    ///
+    /// A-R192b: when every lineage is already durable through its applied prefix, the sync
+    /// would move nothing, so the fsync is skipped. `Flushed` still goes out, carrying the
+    /// durable marks the engine holds, which are what that sync would have returned: every
+    /// durability proof sees the same event either way. Only this duty skips; a
+    /// `StoreEffect::Flush`, a barrier `SyncWalThrough` and a holder's sync always sync.
+    ///
+    /// A-R214: it also syncs while any write since the last sync is unsynced, as a dedup delete
+    /// or an inherit at base 0 is: those raise no applied mark, so durable == applied misses
+    /// them ([`RocksEngine::wal_synced_through_latest`]).
+    fn flush_duty(&mut self) -> Result<(), Fault> {
+        let lineages = self.engine.lineages();
+        if lineages.is_empty() {
             return Ok(());
         }
+        let synced = !self.engine.wal_synced_through_latest()
+            || lineages.iter().any(|&(partition, generation)| {
+                self.engine.durable(partition, generation).0
+                    < self.engine.buffered_applied(partition, generation).0
+            });
         let ticket = FlushTicket(self.next_ticket);
         self.next_ticket += 1;
         let started = Instant::now();
-        let kind = match self.engine.sync_wal_through(captured) {
-            Ok(durable) => StorageEvent::Flushed { ticket, durable },
-            Err(fault) => StorageEvent::FlushFailed { ticket, fault },
+        let kind = if synced {
+            let captured = lineages
+                .into_iter()
+                .map(|(partition, generation)| CapturedPrefix {
+                    partition,
+                    generation,
+                    through: self.engine.buffered_applied(partition, generation),
+                })
+                .collect();
+            match self.engine.sync_wal_through(captured) {
+                Ok(durable) => StorageEvent::Flushed { ticket, durable },
+                Err(fault) => StorageEvent::FlushFailed { ticket, fault },
+            }
+        } else {
+            let durable = lineages
+                .into_iter()
+                .map(|(partition, generation)| DurablePrefix {
+                    partition,
+                    generation,
+                    through: self.engine.durable(partition, generation),
+                })
+                .collect();
+            StorageEvent::Flushed { ticket, durable }
         };
         if self.flushed_once {
             tracing::debug!(
                 node = self.node.0,
                 kind = "flush",
                 ticket = ticket.0,
+                synced,
                 millis = millis(started),
                 "host_duty"
             );
@@ -1460,6 +2028,7 @@ impl Host {
                 node = self.node.0,
                 kind = "flush",
                 ticket = ticket.0,
+                synced,
                 period_ms = HOST_FLUSH_EVERY_MILLIS,
                 "host_duty"
             );
@@ -1478,32 +2047,59 @@ impl Host {
     /// last aged seq plus one, so no younger entry goes. A write ages from its publish, never
     /// its commit, so a write still held unpublished is never trimmed. A sweep, not a waiter.
     ///
-    /// Publish times live in this process only. A new owner, promoted or restarted, has none
-    /// for the rows it seeds, so it must age them itself (for example, stamp them at its own
-    /// activation) and retire the old generation; M10 owes that (ruling A-R105).
-    fn trim_duty(&mut self, now: Tick) {
+    /// D6 (A-R170 D, A-R172): what a trim drops from memory is deleted on disk too, so a reopen
+    /// does not seed it again. The delete runs at most once per [`trim_delete_period`], with
+    /// the latest floor; a reopen may seed what the trims since the last delete dropped.
+    ///
+    /// A-R183 (S1-6): a coarse copy of the publish times outlives the process as publish marks
+    /// ([`Self::mark_duty`]), and a reopen ages what they cover from its publish
+    /// ([`Self::restore_marks`]). The rest of what a reopen seeds is aged from the landing:
+    /// [`Self::retire_duty`] retires every older generation one retention after this node
+    /// landed the new one (A-R170 A). A fault in any delete or mark write fails the node.
+    ///
+    /// Ticks are the wall clock sampled once per process ([`HostClock`]). A forward step of the
+    /// wall clock between a quit and a reopen shortens a restored mark's window by the step,
+    /// less `clock_error_millis` (critic-d6b; the same assumption as the heal's guard 2).
+    fn trim_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        self.trim_aged(now, "trim");
+        self.trim_delete_duty(now)?;
+        self.mark_duty(
+            now,
+            trim_delete_period(self.budgets.dedup_retention_millis),
+            "marks",
+        )?;
+        self.retire_duty(now)
+    }
+
+    /// The trim duty's sweep in memory: per partition and generation, oldest first, the
+    /// `published_at` entries at least a retention old go, as one `DedupTrim` and one
+    /// `StatusTrim` below the last of them plus one, and that floor is kept for the delete. It
+    /// moves to the next generation only once a whole generation has aged, and stops at the
+    /// first entry that has not (PR #60 review F2: a restore holding several generations
+    /// trims them all at once). `kind` names the `host_duty` line.
+    fn trim_aged(&mut self, now: Tick, kind: &'static str) {
         let retention = self.budgets.dedup_retention_millis;
         let mut trims = Vec::new();
         for (partition, published) in &mut self.published_at {
-            let Some(&(generation, _, _)) = published.front() else {
-                continue;
-            };
-            let mut last = None;
-            while let Some(&(g, seq, at)) = published.front() {
-                if g != generation || at.plus_millis(retention) > now {
-                    break;
+            while let Some(&(generation, _, _)) = published.front() {
+                let mut last: Option<(Seq, Tick)> = None;
+                while let Some(&(g, seq, at)) = published.front() {
+                    if g != generation || at.plus_millis(retention) > now {
+                        break;
+                    }
+                    last = Some((seq, at));
+                    published.pop_front();
                 }
-                last = Some(seq);
-                published.pop_front();
-            }
-            if let Some(last) = last {
-                trims.push((*partition, generation, Seq(last.0 + 1)));
+                let Some((last, at)) = last else {
+                    break;
+                };
+                trims.push((*partition, generation, Seq(last.0 + 1), at));
             }
         }
-        for (partition, generation, below) in trims {
+        for (partition, generation, below, at) in trims {
             tracing::info!(
                 node = self.node.0,
-                kind = "trim",
+                kind,
                 partition = partition.0,
                 generation = generation.0,
                 below = below.0,
@@ -1526,7 +2122,363 @@ impl Host {
                 false,
                 None,
             );
+            self.trims_sent += 1;
+            self.trim_floors
+                .insert((partition, generation), (below, at));
         }
+    }
+
+    /// A-R183 (S1-6, critic-d6b): durable publish marks. A mark `(generation, seq, tick)` is a
+    /// `published_at` entry copied verbatim, so every seq of `generation` up to `seq` was
+    /// published by `tick` (C1). At most [`PUBLISH_MARKS`] plus the newest of each generation
+    /// ([`sample_marks`]), plus one per floor trimmed but not yet deleted on disk, whose rows
+    /// would otherwise lose their mark until the delete. Checked at most once per
+    /// `period` (the trim duty passes [`trim_delete_period`]; a clean stop passes 0, A-R186)
+    /// and written, synced,
+    /// only when they changed (C2), and only for a partition whose marks this process has
+    /// restored. A lost or late write only frees less. Only the owner publishes, so the other
+    /// copies write none and keep the landing plus the retention (C7). `kind` names the
+    /// `host_duty` line.
+    fn mark_duty(&mut self, now: Tick, period: u64, kind: &'static str) -> Result<(), Fault> {
+        let mut due = Vec::new();
+        for partition in &self.marks_restored {
+            let last = self.marks_written.get(partition);
+            if last.is_some_and(|(at, _)| at.plus_millis(period) > now) {
+                continue;
+            }
+            // Trimmed but not yet deleted rows are still on disk, so they keep a mark: their
+            // floor's last seq, at its publish tick (lead k205).
+            let mut marks: Vec<Mark> = self
+                .trim_floors
+                .range((*partition, Generation(0))..=(*partition, Generation(u64::MAX)))
+                .map(|(&(_, generation), &(below, at))| (generation, Seq(below.0 - 1), at))
+                .collect();
+            marks.extend(
+                self.published_at
+                    .get(partition)
+                    .map(sample_marks)
+                    .unwrap_or_default(),
+            );
+            let changed = last.is_none_or(|(_, written)| *written != marks);
+            due.push((*partition, marks, changed));
+        }
+        for (partition, marks, changed) in due {
+            if changed {
+                #[cfg(test)]
+                if kind == "final_marks" {
+                    std::thread::sleep(self.step_pause);
+                }
+                self.engine
+                    .put_publish_marks(partition, &publish_marks(&marks))
+                    .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
+                tracing::info!(
+                    node = self.node.0,
+                    kind,
+                    partition = partition.0,
+                    marks = marks.len(),
+                    newest = ?marks.last().map(|(g, seq, at)| (g.0, seq.0, at.0)),
+                    period_ms = period,
+                    "host_duty"
+                );
+            }
+            self.marks_written.insert(partition, (now, marks));
+        }
+        Ok(())
+    }
+
+    /// A-R183 (S1-6, critic-d6b): at this process's first landing on `partition`, the publish
+    /// marks an earlier process left go back to the front of `published_at`, oldest first, so
+    /// the trim duty ages what they cover from its publish. Only generations below `serving`,
+    /// and only lineages the engine holds, or the durable delete would fault the node (C3).
+    /// Each tick gains `clock_error_millis`: it was read on another process's clock (C5). Rows
+    /// above the newest mark keep the landing plus the retention ([`Self::retire_duty`]).
+    fn restore_marks(&mut self, partition: PartitionId, serving: Generation) -> Result<(), Fault> {
+        if !self.marks_restored.insert(partition) {
+            return Ok(());
+        }
+        let read = self
+            .engine
+            .publish_marks(partition)
+            .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
+        let read: Vec<Mark> = read
+            .into_iter()
+            .map(|mark| (mark.generation, mark.seq, mark.tick))
+            .collect();
+        let held = self.engine.lineages();
+        let epsilon = self.budgets.clock_error_millis;
+        let mut restored: Vec<Mark> = read
+            .iter()
+            .filter(|(generation, _, _)| {
+                *generation < serving && held.contains(&(partition, *generation))
+            })
+            .map(|&(generation, seq, at)| (generation, seq, at.plus_millis(epsilon)))
+            .collect();
+        restored.sort_unstable_by_key(|&(generation, seq, _)| (generation, seq));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            serving = serving.0,
+            read = read.len(),
+            restored = restored.len(),
+            newest = ?restored.last().map(|(g, seq, at)| (g.0, seq.0, at.0)),
+            "publish_marks_restored"
+        );
+        let published = self.published_at.entry(partition).or_default();
+        for entry in restored.into_iter().rev() {
+            published.push_front(entry);
+        }
+        self.marks_written
+            .insert(partition, (self.clock.now(), read));
+        // A-R193: what the marks show already aged is trimmed now, before this landing's
+        // `Recovered` and so before the host admits, not on the first trim tick up to
+        // [`HOST_TRIM_EVERY_MILLIS`] later. T1 and P1 keep a trim that comes before the seed.
+        self.trim_aged(self.clock.now(), "pre_trim");
+        Ok(())
+    }
+
+    /// D6 D: the latest trim floor of each partition and generation, deleted on disk once per
+    /// [`trim_delete_period`] at most (A-R172). Local and unreplicated; synced by storage.
+    fn trim_delete_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        let period = trim_delete_period(self.budgets.dedup_retention_millis);
+        let due: Vec<((PartitionId, Generation), Seq)> = self
+            .trim_floors
+            .iter()
+            .filter(|((partition, _), _)| {
+                self.trim_deleted_at
+                    .get(partition)
+                    .is_none_or(|last| last.plus_millis(period) <= now)
+            })
+            .map(|(key, &(below, _))| (*key, below))
+            .collect();
+        for ((partition, generation), below) in due {
+            self.trim_floors.remove(&(partition, generation));
+            self.trim_deleted_at.insert(partition, now);
+            let deleted = self
+                .engine
+                .delete_dedup_trimmed(partition, generation, below)
+                .map_err(|fault| {
+                    format!(
+                        "dedup trim delete of p{} g{} below {}: {fault:?}",
+                        partition.0, generation.0, below.0
+                    )
+                })?;
+            self.trim_deletes += 1;
+            tracing::info!(
+                node = self.node.0,
+                kind = "trim_delete",
+                partition = partition.0,
+                generation = generation.0,
+                below = below.0,
+                deleted,
+                period_ms = period,
+                "host_duty"
+            );
+        }
+        Ok(())
+    }
+
+    /// D6 A (A-R170, critic-d6 C1 and critic-f5 C6): one retention after this node landed a
+    /// committed generation `g`, every older generation whose Dedup rows it holds retires. T1
+    /// and P1 drop them (`RetireGeneration`), and storage deletes them at every level `g` reads
+    /// (`delete_dedup_below`, `end` = the newest retired generation plus one, never `g`).
+    ///
+    /// The generations are read from disk, never from what this node landed: a copy can hold a
+    /// generation it never landed (a missed link, A-R177). A generation this node did not
+    /// inherit retires nothing here; a later landing it does hold covers it.
+    fn retire_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        let due: Vec<(PartitionId, Generation)> = self
+            .retire_due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        for (partition, serving) in due {
+            self.retire_due.remove(&(partition, serving));
+            if !self.engine.lineages().contains(&(partition, serving)) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    serving = serving.0,
+                    "dedup_retire_not_held"
+                );
+                continue;
+            }
+            let retired = self.dedup_generations_below(partition, serving)?;
+            let Some(newest) = retired.last().copied() else {
+                continue;
+            };
+            let site = Site {
+                partition,
+                correlation: CorrelationId::default(),
+            };
+            for generation in &retired {
+                self.push(
+                    site,
+                    EventKind::Kernel(KernelEvent::RetireGeneration {
+                        generation: *generation,
+                    }),
+                    false,
+                    None,
+                );
+            }
+            self.engine
+                .delete_dedup_below(partition, serving, &(newest.0 + 1).to_be_bytes())
+                .map_err(|fault| {
+                    format!(
+                        "dedup retire delete of p{} g{} through g{}: {fault:?}",
+                        partition.0, serving.0, newest.0
+                    )
+                })?;
+            tracing::info!(
+                node = self.node.0,
+                kind = "retire",
+                partition = partition.0,
+                serving = serving.0,
+                retired = ?retired.iter().map(|g| g.0).collect::<Vec<_>>(),
+                "host_duty"
+            );
+        }
+        Ok(())
+    }
+
+    /// The generations below `serving` that hold a Dedup row lineage `(partition, serving)`
+    /// reads, oldest first. A `dedup_key` leads with its generation, so one seek finds each.
+    fn dedup_generations_below(
+        &self,
+        partition: PartitionId,
+        serving: Generation,
+    ) -> Result<Vec<Generation>, Fault> {
+        let view = self
+            .engine
+            .snapshot(partition, serving, STEP_VIEW)
+            .map_err(|fault| {
+                format!("retire view of p{} g{}: {fault:?}", partition.0, serving.0)
+            })?;
+        let mut found = Vec::new();
+        let mut from = 0_u64.to_be_bytes().to_vec();
+        while let Some((key, _)) = view.scan(Namespace::Dedup, &from, 1).into_iter().next() {
+            let Some(generation) = key
+                .get(..8)
+                .and_then(|head| <[u8; 8]>::try_from(head).ok())
+                .map(u64::from_be_bytes)
+            else {
+                return Err(Fault::from(format!(
+                    "retire scan of p{} g{}: a dedup key of {} bytes",
+                    partition.0,
+                    serving.0,
+                    key.len()
+                )));
+            };
+            if generation >= serving.0 {
+                break;
+            }
+            found.push(Generation(generation));
+            from = (generation + 1).to_be_bytes().to_vec();
+        }
+        view_whole(&view, "retire scan")?;
+        Ok(found)
+    }
+
+    /// A kernel refusal for its caller. An `OVERLOADED` from a full dedup index (admission check
+    /// 9) also says when the trim duty can first free room, as a "not before" hint
+    /// ([`ApiError::with_retry_after`]; A-R183). Its kind and retry rule stay the kernel's:
+    /// `BoundedJitter` promises safety, not timing.
+    fn refusal(&self, partition: PartitionId, error: &RdbError) -> ApiError {
+        let refused = ApiError::from_kernel(error);
+        if !matches!(error, RdbError::Overloaded { .. }) {
+            return refused;
+        }
+        let full = self
+            .transaction
+            .kernel(self.node, partition)
+            .is_some_and(|kernel| {
+                let unanswered = kernel.queue_len() + usize::from(kernel.inflight().is_some());
+                kernel.dedup().len() + unanswered >= kernel.limits().dedup_cap
+            });
+        match full.then(|| self.cap_frees_in(partition, self.clock.now())) {
+            Some(Some(after)) => refused.with_retry_after(after),
+            _ => refused,
+        }
+    }
+
+    /// A-R183 (critic-d6b candidate 3): how long until the trim duty can first free a dedup
+    /// entry of `partition`: the earliest scheduled free, at the trim tick that runs it. A lower
+    /// bound, "not before": an admitted write may take the room first.
+    ///
+    /// A-R187: only an event that frees at least one entry T1 holds counts (A-R209's
+    /// [`DedupIndex::holds_through`]; a retired generation holds none). A retire due counts when
+    /// this node holds its serving lineage, as [`Self::retire_duty`] requires, and an older
+    /// generation on disk still holds an entry. A `published_at` bucket `(g, seq, at)` counts when
+    /// `g` holds an entry at or below `seq`; it is trimmed once it and every bucket before it are
+    /// a retention old, since [`Self::trim_aged`] pops front first.
+    /// `None` when nothing counts: the hint is left out, never invented.
+    fn cap_frees_in(&self, partition: PartitionId, now: Tick) -> Option<Duration> {
+        let retention = self.budgets.dedup_retention_millis;
+        let dedup = self.transaction.kernel(self.node, partition)?.dedup();
+        let every = self.trim_every_millis.max(1);
+        // The first trim tick at or after `due`.
+        let sweep = |due: Tick| {
+            let ticks = due.0.saturating_sub(self.next_trim.0).div_ceil(every);
+            self.next_trim.plus_millis(ticks.saturating_mul(every))
+        };
+        let retire = self
+            .retire_due
+            .iter()
+            .filter(|((p, serving), _)| *p == partition && self.retire_frees(*p, *serving, dedup))
+            .map(|(_, at)| sweep(*at))
+            .min();
+        // A sweep pops front first, so a bucket waits for every bucket before it.
+        let mut runs = self.next_trim;
+        let aged = self
+            .published_at
+            .get(&partition)
+            .into_iter()
+            .flatten()
+            .find_map(|&(generation, seq, at)| {
+                runs = runs.max(sweep(at.plus_millis(retention)));
+                dedup.holds_through(generation, seq).then_some(runs)
+            });
+        let runs = retire.into_iter().chain(aged).min()?;
+        Some(Duration::from_millis(runs.0.saturating_sub(now.0)))
+    }
+
+    /// A-R187: whether the retire due for `(partition, serving)` would free an entry T1 holds.
+    /// A disk scan that fails names no free; the retire duty itself faults the node on it.
+    fn retire_frees(
+        &self,
+        partition: PartitionId,
+        serving: Generation,
+        dedup: &DedupIndex,
+    ) -> bool {
+        if !self.engine.lineages().contains(&(partition, serving)) {
+            return false;
+        }
+        match self.dedup_generations_below(partition, serving) {
+            Ok(generations) => generations
+                .into_iter()
+                .any(|generation| dedup.holds_through(generation, Seq(u64::MAX))),
+            Err(fault) => {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    serving = serving.0,
+                    fault = %fault.detail,
+                    "retry_hint_scan_failed"
+                );
+                false
+            }
+        }
+    }
+
+    /// D6 A: this node landed committed generation `generation` for the first time, so the
+    /// older generations' Dedup rows retire one retention from now (A-R170; "stamp now" is
+    /// accepted, critic-d6 F2).
+    fn stamp_retirement(&mut self, partition: PartitionId, generation: Generation) {
+        let at = self
+            .clock
+            .now()
+            .plus_millis(self.budgets.dedup_retention_millis);
+        self.retire_due.insert((partition, generation), at);
     }
 
     /// F-014: the put sent as `event` still waits at its deadline plus the margin, so P1 has
@@ -1537,7 +2489,7 @@ impl Host {
         identity: RequestIdentity,
         event: EventId,
         now: Tick,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         let Entry::Occupied(waiter) = self.pending.entry(identity) else {
             return Ok(());
         };
@@ -1722,15 +2674,15 @@ impl Host {
 
     fn drain(&mut self) {
         while let Some(queued) = self.queue.pop_front() {
-            if let Err(detail) = self.process(queued) {
-                self.set_fault(detail);
+            if let Err(fault) = self.process(queued) {
+                self.set_fault(fault);
                 return;
             }
         }
     }
 
     /// Offer one event, as the sim's `Runner::run` does.
-    fn process(&mut self, queued: Queued) -> Result<(), String> {
+    fn process(&mut self, queued: Queued) -> Result<(), Fault> {
         let Queued {
             event,
             routed,
@@ -1752,27 +2704,35 @@ impl Host {
         };
         self.answering = self.statuses.remove(&event.id);
         for module in offers {
-            match self.offer(module, &event) {
+            let started = Instant::now();
+            let stepped = match self.offer(module, &event) {
                 Ok(effects) => {
                     tracing::trace!(node = self.node.0, module = ?module, event = event_name(&event.kind), effects = effects.len(), "step");
-                    self.deliver(&effects)?;
+                    self.deliver(&effects)
                 }
                 Err(StepError::Module(error @ RdbError::Unavailable { .. })) => {
                     if (routed && route::edge(arm, module) == Edge::Named) || addressed.is_some() {
-                        return Err(format!(
+                        Err(Fault::from(format!(
                             "{module:?} declined {} it must answer: {error}",
                             event_name(&event.kind)
-                        ));
+                        )))
+                    } else {
+                        Ok(())
                     }
                 }
-                Err(StepError::Module(error)) => {
-                    return Err(format!(
-                        "{module:?} failed on {}: {error}",
-                        event_name(&event.kind)
-                    ));
-                }
-                Err(StepError::Host(detail)) => return Err(detail),
-            }
+                Err(StepError::Module(error)) => Err(Fault::from(format!(
+                    "{module:?} failed on {}: {error}",
+                    event_name(&event.kind)
+                ))),
+                Err(StepError::Host(detail)) => Err(detail),
+            };
+            // PR #60 review F9: timed whatever the offer answered, a decline or a failure too.
+            self.slow_step(
+                "module",
+                || format!("{module:?} on {}", event_name(&event.kind)),
+                started,
+            );
+            stepped?;
         }
         // P1 answers a status query in the step that takes it, START_RECORD included.
         if let Some((identity, reply)) = self.answering.take() {
@@ -1803,6 +2763,8 @@ impl Host {
 
     /// Step `module` with the adopted triple, and T1 and P1 with the step view.
     fn offer(&mut self, module: ModuleName, event: &Event) -> Result<Vec<Effect>, StepError> {
+        #[cfg(test)]
+        std::thread::sleep(self.step_pause);
         let partition = event.partition;
         let adopted = self.adopted(partition);
         let reads_storage = matches!(module, ModuleName::Transaction | ModuleName::Publication);
@@ -1841,12 +2803,20 @@ impl Host {
                 None => self.publication.step(&ctx, event),
             },
             ModuleName::Protection => step_l1(&mut self.l1, &ctx, event),
+            // F1 writes layout 3 for the instance this copy is bound to (M10, arch R3b).
             ModuleName::Recovery => self
                 .recoveries
                 .entry(partition)
-                .or_default()
+                .or_insert_with(|| Recovery::bound_to(self.engine.instance()))
                 .step(&ctx, event),
         };
+        // A step that read a faulted view decided on reads that were not whole (A-R164): its
+        // effects are dropped and the node fails.
+        if reads_storage {
+            if let Some((_, view)) = self.views.get(&partition) {
+                view_whole(view, &format!("{module:?} step")).map_err(StepError::Host)?;
+            }
+        }
         answer.map_err(StepError::Module)
     }
 
@@ -1859,13 +2829,13 @@ impl Host {
         &mut self,
         partition: PartitionId,
         generation: Generation,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_step_view) {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "step view of p{} g{}: injected",
                 partition.0, generation.0
-            ));
+            )));
         }
         let applied = self.engine.buffered_applied(partition, generation);
         let key = (generation, applied);
@@ -1888,7 +2858,9 @@ impl Host {
             partition = partition.0,
             generation = generation.0,
             applied = applied.0,
-            records = view.len(),
+            // No record count: a lazy view's `len` reads the whole lineage (dev-w2, 9531f6a).
+            // The depth instead (S1-8 D2): the levels each read walks, O(1).
+            depth = view.depth(),
             millis = millis(started),
             "step_view"
         );
@@ -1898,7 +2870,7 @@ impl Host {
 
     // ------------------------------------------------------------------ effects
 
-    fn deliver(&mut self, effects: &[Effect]) -> Result<(), String> {
+    fn deliver(&mut self, effects: &[Effect]) -> Result<(), Fault> {
         for effect in effects {
             let site = Site {
                 partition: effect.partition,
@@ -1946,10 +2918,10 @@ impl Host {
                 EffectKind::Timer(TimerEffect::Arm { id, version, at }) => {
                     if let Some((armed, _, _)) = self.timers.get(id) {
                         if version <= armed {
-                            return Err(format!(
+                            return Err(Fault::from(format!(
                                 "{:?} armed timer {} at version {} over version {}",
                                 effect.from, id.0, version.0, armed.0
-                            ));
+                            )));
                         }
                     }
                     self.timers.insert(*id, (*version, *at, site));
@@ -1960,6 +2932,13 @@ impl Host {
                     }
                 }
                 EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site)?,
+            }
+        }
+        // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
+        // its own fsync never delays theirs.
+        for (site, ask) in std::mem::take(&mut self.own_asks) {
+            if let Some(answer) = self.answer(site.partition, &ask) {
+                self.answer_here(site, answer);
             }
         }
         self.report_unproven();
@@ -1985,7 +2964,7 @@ impl Host {
         }
     }
 
-    fn store(&mut self, from: ModuleName, store: &StoreEffect, site: Site) -> Result<(), String> {
+    fn store(&mut self, from: ModuleName, store: &StoreEffect, site: Site) -> Result<(), Fault> {
         let kind = match store {
             StoreEffect::Commit(batch) => {
                 if from == ModuleName::Transaction {
@@ -2026,10 +3005,10 @@ impl Host {
             // A handle still bound is refused, never rebound (the sim's rule).
             StoreEffect::Snapshot { handle, partition } => {
                 if self.bound.contains_key(handle) {
-                    return Err(format!(
+                    return Err(Fault::from(format!(
                         "{from:?} asked to bind snapshot {} twice",
                         handle.0
-                    ));
+                    )));
                 }
                 let generation = self.adopted(*partition).generation;
                 let view = self
@@ -2046,11 +3025,9 @@ impl Host {
                 return Ok(());
             }
             StoreEffect::Release { handle } => {
-                return self
-                    .bound
-                    .remove(handle)
-                    .map(drop)
-                    .ok_or_else(|| format!("{from:?} released unbound snapshot {}", handle.0));
+                return self.bound.remove(handle).map(drop).ok_or_else(|| {
+                    format!("{from:?} released unbound snapshot {}", handle.0).into()
+                });
             }
             StoreEffect::PersistEpochRevocation { .. } => {
                 return Err(unsupported(self.node, "persist_epoch_revocation"));
@@ -2061,16 +3038,14 @@ impl Host {
     }
 
     /// One kernel effect: recorded, routed, served, or refused by name (the sim's `kernel`).
-    fn kernel(
-        &mut self,
-        from: ModuleName,
-        kernel: &KernelEffect,
-        site: Site,
-    ) -> Result<(), String> {
+    fn kernel(&mut self, from: ModuleName, kernel: &KernelEffect, site: Site) -> Result<(), Fault> {
         let node = self.node.0;
         match kernel {
             KernelEffect::Ignored { reason } => {
                 tracing::debug!(node, from = ?from, ?reason, "ignored");
+                if from == ModuleName::Replication {
+                    self.forget_refused_catch_ups(site, reason);
+                }
             }
             KernelEffect::Alert { reason } => {
                 tracing::warn!(node, from = ?from, ?reason, "alert");
@@ -2129,11 +3104,46 @@ impl Host {
                 from: first,
                 through,
             } => return self.send_envelopes(*copy, *first, *through, site),
-            KernelEffect::SendRecoveryEnvelopes { .. } => {
-                return Err(unsupported(self.node, "send_recovery_envelopes"));
-            }
-            KernelEffect::CopyCaughtUp { copy, head, .. } => {
+            KernelEffect::SendRecoveryEnvelopes {
+                copy,
+                from: first,
+                through,
+                credential,
+            } => return self.send_recovery_envelopes(*copy, (*first, *through), credential, site),
+            KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+                // A catch-up this node sourced for another node's F1 reports there (B-R59).
+                if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
+                {
+                    if asker != self.node {
+                        let msg = Msg::Routed {
+                            partition: site.partition,
+                            correlation,
+                            kind: KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp {
+                                copy: *copy,
+                                head: *head,
+                                digest: *digest,
+                            }),
+                        };
+                        if let Err(fault) = self.links.send(self.node, asker, msg) {
+                            tracing::warn!(
+                                node,
+                                asker = asker.0,
+                                ?fault,
+                                "peer_answer_unreachable"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let site = Site {
+                        partition: site.partition,
+                        correlation,
+                    };
+                    if let Some(event) = route::event_for(kernel) {
+                        self.push(site, EventKind::Kernel(event), true, None);
+                    }
+                    return Ok(());
+                }
             }
             // Recorded for the trim duty, then routed to T1 below.
             KernelEffect::Published { lineage, seq, .. } => {
@@ -2180,8 +3190,29 @@ impl Host {
     }
 
     /// F1 committed a recovery here: inherit, tell the other members, wake A1 if primary.
-    fn recovered(&mut self, result: &RecoveryResult, site: Site) -> Result<(), String> {
+    fn recovered(&mut self, result: &RecoveryResult, site: Site) -> Result<(), Fault> {
         let partition = site.partition;
+        if let Some(what) = self.after_commit {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = result.new_generation.0,
+                what = ?what,
+                "after_commit_hook"
+            );
+            match what {
+                AfterCommit::Abort => {
+                    std::process::abort();
+                }
+                #[cfg(test)]
+                AfterCommit::Fault => {
+                    return Err(Fault::from(format!(
+                        "after-commit hook: generation {} committed and not linked",
+                        result.new_generation.0
+                    )))
+                }
+            }
+        }
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -2192,7 +3223,10 @@ impl Host {
         );
         self.inherit(partition, result)?;
         self.committed.insert(partition, Box::new(result.clone()));
-        self.landed.insert((partition, result.new_generation));
+        if self.landed.insert((partition, result.new_generation)) {
+            self.stamp_retirement(partition, result.new_generation);
+        }
+        self.restore_marks(partition, result.new_generation)?;
         // In-process fan-out (lead ruling, 2026-10-07, under Decision 1): the result reaches the
         // other members as the control plane's watch of `partitions/{id}` would. M10 replaces it
         // with that watch.
@@ -2417,7 +3451,9 @@ impl Host {
     fn stall_effect(&self, partition: PartitionId, mode: &PartitionMode) -> String {
         match mode {
             PartitionMode::DegradedRf2 if self.admits(partition) == Some(false) => {
-                format!("stays {mode:?}, and its writes stay paused until the absent copy returns")
+                format!(
+                    "stays {mode:?}, and its writes stay paused until the database is opened again"
+                )
             }
             _ => format!("stays {mode:?} and does not activate"),
         }
@@ -2429,7 +3465,7 @@ impl Host {
         result: Box<RecoveryResult>,
         site: Site,
         emitter: NodeId,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         let partition = site.partition;
         let first = self.landed.insert((partition, result.new_generation));
         let barrier = in_barrier(&result, self.node);
@@ -2445,6 +3481,21 @@ impl Host {
         if first && barrier {
             self.inherit(partition, &result)?;
         }
+        // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
+        // generation now, before `Recovered` re-anchors its receiver, so it never carries an
+        // unlinked generation into the next open.
+        // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is.
+        let caught_up = if first && !barrier {
+            let caught_up = self.land_link(partition, &result);
+            self.sync_link(partition, result.new_generation)?;
+            caught_up
+        } else {
+            None
+        };
+        if first {
+            self.stamp_retirement(partition, result.new_generation);
+        }
+        self.restore_marks(partition, result.new_generation)?;
         self.answer_deferred_syncs(partition, result.new_generation);
         self.schedule_acquire(&result, site);
         self.committed.insert(partition, result.clone());
@@ -2454,7 +3505,168 @@ impl Host {
             true,
             None,
         );
+        // Then it reports itself caught up at the cutoff to the F1 that committed, in B-R59's
+        // shape; F1's `Committed` arm pins it and syncs it like any required copy.
+        if let Some(event) = caught_up {
+            let msg = Msg::Routed {
+                partition,
+                correlation: site.correlation,
+                kind: KernelEvent::Recovery(event),
+            };
+            if let Err(fault) = self.links.send(self.node, emitter, msg) {
+                tracing::warn!(
+                    node = self.node.0,
+                    emitter = emitter.0,
+                    ?fault,
+                    "peer_answer_unreachable"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Ruling A-R185 (critic-d7fix (c), C2, C3, C6): this copy landed `result` outside its
+    /// barrier, so it does not hold the new generation. When it holds its newest older
+    /// generation exactly through the cutoff, with the cutoff digest there, it links the new
+    /// generation onto it at the cutoff with [`Self::inherit_missed_link`]'s guards, and answers
+    /// the `CopyCaughtUp` to send: caught up at the cutoff, nothing to copy. Otherwise it writes
+    /// nothing, sends nothing and logs `land_link_refused{reason}`; the partition's writes then
+    /// stay paused until the database is opened again. Called once per (partition, generation):
+    /// `landed` dedups the landing.
+    fn land_link(
+        &mut self,
+        partition: PartitionId,
+        result: &RecoveryResult,
+    ) -> Option<RecoveryEvent> {
+        // The new generation's lineage, spelled once (review-r185 ADV1).
+        let lineage = result.selected.root;
+        let generation = lineage.generation;
+        let cutoff = result.selected.cutoff_seq;
+        let digest = result.selected.cutoff_digest;
+        let node = self.node.0;
+        // A copy that holds no older generation has nothing to link: expected, so info, not
+        // warn (review-r185 ADV3). Every other reason is a copy that cannot catch up here.
+        let refused = |reason: &str| {
+            if reason == "anchor_generation_absent" {
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            } else {
+                tracing::warn!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    reason,
+                    "land_link_refused"
+                );
+            }
+            None
+        };
+        let Some(copy) = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == self.node)
+            .map(|member| member.copy)
+        else {
+            return refused("not_a_member");
+        };
+        if self
+            .engine
+            .lineages()
+            .iter()
+            .any(|(p, g)| *p == partition && *g >= generation)
+        {
+            return refused("held_at_or_above_generation");
+        }
+        // R1 builds a copy outside the barrier a receiver at the root, which only a catch-up
+        // fills; linked here, the copy holds the cutoff, so it gets a receiver at the cutoff, as a
+        // barrier copy gets (`proved_head`; ruling A-R185a).
+        let anchor = LineageAnchor {
+            lineage,
+            base_seq: cutoff,
+            base_digest: digest,
+        };
+        match self.inherit_missed_link(partition, anchor) {
+            Ok(from) => {
+                self.land_linked.insert((partition, generation));
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    from = from.0,
+                    to = generation.0,
+                    base = cutoff.0,
+                    "land_link_inherited"
+                );
+                // No frame of the new generation reaches R1 before `Recovered` (pushed after
+                // this), so the receiver installed here sees nothing before it re-anchors.
+                let held = self.replication.receiver(self.node, partition);
+                if let Some(kept) = held.filter(|held| !held.is_dormant()) {
+                    // A live receiver re-anchors itself on `Recovered` from its own ladder, and a
+                    // quarantined one must stay quarantined: neither is replaced. A live one
+                    // still at the root is kept too; that needs two commits in one boot, which
+                    // slice 1 never has (critic-d7fix follow-up A2).
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        generation = generation.0,
+                        kept_generation = kept.lineage().generation.0,
+                        quarantined = kept.quarantine().is_some(),
+                        "land_receiver_kept"
+                    );
+                } else {
+                    // Claims nothing durable, as a dormant receiver does: F1's sync proves the
+                    // cutoff, and the next flush raises it (critic-d7fix follow-up A1).
+                    let durable = 0;
+                    let receiver = AppendReceiver::new(ReceiverInit {
+                        config: result.committed.pinned_config.clone(),
+                        own: copy,
+                        lineage,
+                        head: Head {
+                            seq: cutoff,
+                            digest,
+                        },
+                        durable: DurableSeq(durable),
+                    });
+                    match receiver {
+                        Ok(receiver) => {
+                            self.replication.install_receiver(receiver);
+                            tracing::info!(
+                                node,
+                                partition = partition.0,
+                                generation = generation.0,
+                                head = cutoff.0,
+                                durable,
+                                "land_receiver_installed"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                node,
+                                partition = partition.0,
+                                generation = generation.0,
+                                ?error,
+                                "land_link_receiver_refused"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(RecoveryEvent::CopyCaughtUp {
+                    copy,
+                    head: cutoff,
+                    digest,
+                })
+            }
+            Err(reason) => refused(reason.trim_start_matches("missed_generation_")),
+        }
     }
 
     /// D7: `generation` just landed, so the sync deferred for it is answered now, and one
@@ -2494,7 +3706,7 @@ impl Host {
         );
     }
 
-    fn inherit(&mut self, partition: PartitionId, result: &RecoveryResult) -> Result<(), String> {
+    fn inherit(&mut self, partition: PartitionId, result: &RecoveryResult) -> Result<(), Fault> {
         self.views.remove(&partition);
         self.engine
             .inherit(
@@ -2505,15 +3717,49 @@ impl Host {
             )
             .map(drop)
             .map_err(|e| {
-                format!(
+                Fault::from(format!(
                     "inherit p{} to g{}: {e}",
                     partition.0, result.new_generation.0
-                )
-            })
+                ))
+            })?;
+        self.sync_link(partition, result.new_generation)
+    }
+
+    /// Ruling A-R217 (review-s1 F-001): a generation's link is durable before anything can
+    /// follow it. `inherit` writes the link unsynced, and [`Self::schedule_acquire`] may next
+    /// ask the open counter to mark the generation activated. A power loss between the two
+    /// would leave the counter naming a generation no copy holds, and every later open would
+    /// be `Stale`. One sync per generation change; none when every write is synced already.
+    /// A failed sync faults the node, so nothing follows the link.
+    fn sync_link(&mut self, partition: PartitionId, generation: Generation) -> Result<(), Fault> {
+        if self.engine.wal_synced_through_latest() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.engine.sync_wal_through(Vec::new()).map_err(|fault| {
+            Fault::from(format!(
+                "sync the link of p{} g{}: {fault:?}",
+                partition.0, generation.0
+            ))
+        })?;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            millis = millis(started),
+            "link_synced"
+        );
+        Ok(())
     }
 
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
-    /// prior owner acquiring would put its fenced identity back).
+    /// prior owner acquiring would put its fenced identity back). Sooner after an `Active`
+    /// commit: [`ACQUIRE_AFTER_ACTIVE_MILLIS`], else [`ACQUIRE_AFTER_RECOVERED_MILLIS`].
+    ///
+    /// Ruling A-R184: first the primary marks each newly committed generation activated in the
+    /// open counter, every one this process hears, not only the first; the first acquire waits
+    /// for its mark ([`Msg::Activated`]), and [`Self::unactivated`] refuses writes under a
+    /// generation not yet marked, so a second recovery in one open is gated too.
     fn schedule_acquire(&mut self, result: &RecoveryResult, site: Site) {
         let primary = result
             .committed
@@ -2521,15 +3767,107 @@ impl Host {
             .members
             .iter()
             .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
-        if !primary || !self.acquire_scheduled.insert(site.partition) {
+        if !primary {
             return;
         }
-        let at = self.clock.now().plus_millis(ACQUIRE_AFTER_RECOVERED_MILLIS);
+        let generation = result.new_generation;
+        if let Some(instance) = self.instance {
+            let activation = self.activation.entry(site.partition).or_default();
+            if activation.asked < generation {
+                activation.asked = generation;
+                tracing::info!(
+                    node = self.node.0,
+                    partition = site.partition.0,
+                    kind = "activate",
+                    generation = generation.0,
+                    marked = activation.marked.0,
+                    "host_duty"
+                );
+                self.control
+                    .activate(self.node, self.boot, site.partition, instance, generation);
+            }
+        }
+        if !self.acquire_scheduled.insert(site.partition) {
+            return;
+        }
+        let wait = if result.mode == PartitionMode::Active {
+            ACQUIRE_AFTER_ACTIVE_MILLIS
+        } else {
+            ACQUIRE_AFTER_RECOVERED_MILLIS
+        };
+        let at = self.clock.now().plus_millis(wait);
+        if self.instance.is_some() {
+            let activation = self.activation.entry(site.partition).or_default();
+            if activation.marked < generation {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = site.partition.0,
+                    generation = generation.0,
+                    "acquire_waits_on_activation"
+                );
+                activation.acquire = Some((generation, site, at));
+                return;
+            }
+        }
+        self.acquire_at(site, at, wait);
+    }
+
+    /// Ruling A-R184: the open counter marks `generation` activated for `partition`. Starts the
+    /// acquire that waited on it.
+    fn activated(&mut self, partition: PartitionId, generation: Generation) {
+        let activation = self.activation.entry(partition).or_default();
+        activation.marked = activation.marked.max(generation);
+        let marked = activation.marked;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            marked = marked.0,
+            "host_activated"
+        );
+        let due = match activation.acquire {
+            Some((waits_for, _, _)) if waits_for <= marked => activation.acquire.take(),
+            _ => None,
+        };
+        if let Some((_, site, at)) = due {
+            let now = self.clock.now();
+            self.acquire_at(site, at.max(now), HostClock::millis_until(now, at));
+        }
+    }
+
+    /// Ruling A-R184: why a write to `partition` is refused here, when this primary has not yet
+    /// heard that the open counter marks its adopted generation activated. `None` on an
+    /// unbound engine, and on a node that is not the partition's primary, whose writes the
+    /// kernel refuses on its own.
+    fn unactivated(&self, partition: PartitionId) -> Option<ApiError> {
+        self.instance?;
+        self.replication.primary(self.node, partition)?;
+        let generation = self.adopted(partition).generation;
+        let marked = self
+            .activation
+            .get(&partition)
+            .map_or(Generation(0), |activation| activation.marked);
+        (generation.0 != 0 && marked < generation).then(|| ApiError {
+            kind: ErrorKind::Unavailable,
+            retry: rdb_core::RetryRule::BoundedJitter,
+            no_mutation: true,
+            detail: format!(
+                "generation {} of partition {} on node {} is not yet marked activated in the \
+                 open counter; nothing was sent",
+                generation.0, partition.0, self.node.0
+            ),
+            retry_after: None,
+        })
+    }
+
+    /// A1's first `AcquireDue` at `at`, `wait` from when it was asked for.
+    fn acquire_at(&mut self, site: Site, at: Tick, wait: u64) {
         tracing::info!(
             node = self.node.0,
             partition = site.partition.0,
             kind = "acquire_due",
             at = at.0,
+            wait_ms = wait,
             "host_duty"
         );
         let fired = TimerFired {
@@ -2572,13 +3910,13 @@ impl Host {
         first: Seq,
         through: Seq,
         site: Site,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         let partition = site.partition;
         let Some(primary) = self.replication.primary(self.node, partition) else {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "send_envelopes with no primary for p{}",
                 partition.0
-            ));
+            )));
         };
         let tracker = primary.tracker();
         let sender = tracker.lineage();
@@ -2620,6 +3958,72 @@ impl Host {
             "envelopes_sent"
         );
         self.count_resend(partition, sender.generation, copy, through, acked);
+        Ok(())
+    }
+
+    /// R1's `SendRecoveryEnvelopes` (the sim's `send_recovery_envelopes`): this node's stored
+    /// records of its receiver's generation, checked, each wrapped in the fence and unicast in
+    /// order to `copy`'s member; nothing past a gap. The frame names the credential's prior
+    /// lineage as its sender and the receiver's configuration.
+    fn send_recovery_envelopes(
+        &mut self,
+        copy: CopyId,
+        (first, through): (Seq, Seq),
+        credential: &FenceCredential,
+        site: Site,
+    ) -> Result<(), Fault> {
+        let partition = site.partition;
+        let Some(receiver) = self.replication.receiver(self.node, partition) else {
+            return Err(Fault::from(format!(
+                "send_recovery_envelopes with no receiver for p{}",
+                partition.0
+            )));
+        };
+        let stored = receiver.lineage();
+        let config = receiver.config().config_version;
+        let to = receiver
+            .config()
+            .members
+            .iter()
+            .find(|member| member.copy == copy)
+            .map(|member| member.node)
+            .ok_or_else(|| {
+                format!(
+                    "send_recovery_envelopes to copy {} not in the config",
+                    copy.0
+                )
+            })?;
+        let sender = Lineage {
+            partition: credential.partition,
+            generation: credential.prior_generation,
+            owner_epoch: credential.prior_owner_epoch,
+        };
+        let mut sent = 0u64;
+        for seq in first.0..=through.0 {
+            let Some(record) = self.stored_record(stored, Seq(seq)) else {
+                break;
+            };
+            let frame = Frame {
+                id: MessageId(self.next_frame),
+                protocol: ENVELOPE_VERSION,
+                config,
+                sender,
+                body: wire::encode_recovery_append(credential, &record),
+            };
+            self.next_frame = self.next_frame.wrapping_add(1).max(1);
+            self.send(to, frame, site);
+            sent += 1;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            to = to.0,
+            from = first.0,
+            through = through.0,
+            sent,
+            "recovery_envelopes_sent"
+        );
         Ok(())
     }
 
@@ -2753,15 +4157,35 @@ impl Host {
 
     // ------------------------------------------------------------------ recovery providers
 
-    fn recovery_effect(&mut self, effect: &RecoveryEffect, site: Site) -> Result<(), String> {
+    fn recovery_effect(&mut self, effect: &RecoveryEffect, site: Site) -> Result<(), Fault> {
         let node = self.node.0;
         match effect {
             RecoveryEffect::RecordSourceUnavailable { .. }
             | RecoveryEffect::CloseWindow
             | RecoveryEffect::Selected(_)
-            | RecoveryEffect::Quarantine(_)
-            | RecoveryEffect::BlockPromotion { .. } => {
+            | RecoveryEffect::Quarantine(_) => {
                 tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
+                Ok(())
+            }
+            // Whether the block lasts is F1's phase after the step that reported it, which is
+            // the step just taken: its effects are delivered before anything else steps. The
+            // reason alone cannot say: a control-store outage on the activation CAS resolves
+            // (A-R102), on a bound F1's recovery CAS too (A-R182), and a held fence may re-enter
+            // at once. `Blocked` lasts until a fresh fence, `Quarantined` for good.
+            RecoveryEffect::BlockPromotion { .. } => {
+                let terminal = self.recoveries.get(&site.partition).is_some_and(|f1| {
+                    matches!(
+                        f1.phase(),
+                        RecoveryPhase::Blocked(_) | RecoveryPhase::Quarantined
+                    )
+                });
+                tracing::info!(
+                    node,
+                    partition = site.partition.0,
+                    ?effect,
+                    terminal,
+                    "recovery_fact"
+                );
                 Ok(())
             }
             RecoveryEffect::RebuildStalled { copy } => {
@@ -2771,10 +4195,10 @@ impl Host {
             }
             RecoveryEffect::QueryInventory { copies } => {
                 let Some(plan) = self.plans.get(&site.partition) else {
-                    return Err(format!(
+                    return Err(Fault::from(format!(
                         "QueryInventory for p{} with no plan",
                         site.partition.0
-                    ));
+                    )));
                 };
                 let anchor = plan.anchor;
                 let holders: Vec<(CopyId, Option<NodeId>)> = copies
@@ -2833,8 +4257,20 @@ impl Host {
                 self.ask(holder, site, ask);
                 Ok(())
             }
-            RecoveryEffect::CatchUp { .. } | RecoveryEffect::CatchUpBeforeGrant { .. } => {
-                Err(unsupported(self.node, "recovery_catch_up"))
+            RecoveryEffect::CatchUp {
+                from,
+                to,
+                through,
+                credential,
+            }
+            | RecoveryEffect::CatchUpBeforeGrant {
+                from,
+                to,
+                through,
+                credential,
+            } => {
+                self.route_catch_up(site, (*from, *to, *through), *credential);
+                Ok(())
             }
             RecoveryEffect::ProbeDigestAt { .. } => {
                 Err(unsupported(self.node, "recovery_probe_digest"))
@@ -2874,9 +4310,8 @@ impl Host {
     /// Ask `holder` over the peer link (a hold delays it), or answer here when it is us.
     fn ask(&mut self, holder: NodeId, site: Site, ask: PeerAsk) {
         if holder == self.node {
-            if let Some(answer) = self.answer(site.partition, &ask) {
-                self.answer_here(site, answer);
-            }
+            // D10: answered by `deliver` after the step's other effects, peer asks included.
+            self.own_asks.push((site, ask));
             return;
         }
         let msg = Msg::PeerAsk {
@@ -2898,6 +4333,286 @@ impl Host {
         }
     }
 
+    /// F1's catch-up (B-R59: the sim's `catch_up`). The target's node is told to restore its
+    /// dormant receiver first, then the source's node gets the catch-up. Both seeds are the
+    /// plan's configuration and the credential's lineage and revision: F1 minted that
+    /// credential from the fence proof, the same `partitions/{id}` read (A-R173, critic-d7 F4).
+    /// Unroutable is logged and left to F1's own deadline, which ends Blocked.
+    fn route_catch_up(
+        &mut self,
+        site: Site,
+        (from, to, through): (CopyId, CopyId, Seq),
+        credential: FenceCredential,
+    ) {
+        let Some(config) = self
+            .plans
+            .get(&site.partition)
+            .map(|plan| plan.config.clone())
+        else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = site.partition.0,
+                reason = "no_plan",
+                "catch_up_unroutable"
+            );
+            return;
+        };
+        let (Some(source), Some(target)) = (
+            holder_of(&config.members, from),
+            holder_of(&config.members, to),
+        ) else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = site.partition.0,
+                from = from.0,
+                to = to.0,
+                reason = "not_placed",
+                "catch_up_unroutable"
+            );
+            return;
+        };
+        let seed = DormantSeed::new(config, &credential);
+        tracing::info!(
+            node = self.node.0,
+            partition = site.partition.0,
+            from = from.0,
+            to = to.0,
+            through = through.0,
+            holder = source.0,
+            target = target.0,
+            "catch_up_routed"
+        );
+        if target == self.node {
+            self.restore_dormant(site.partition, &seed, false);
+        } else {
+            let restore = Msg::Restore {
+                partition: site.partition,
+                seed: Box::new(seed.clone()),
+            };
+            self.to_peer(target, restore, site.partition);
+        }
+        if source == self.node {
+            self.source_catch_up(self.node, site, (from, to, through), credential, &seed);
+            return;
+        }
+        let msg = Msg::CatchUp {
+            asker: self.node,
+            partition: site.partition,
+            correlation: site.correlation,
+            from,
+            to,
+            through,
+            credential,
+            seed: Box::new(seed),
+        };
+        self.to_peer(source, msg, site.partition);
+    }
+
+    /// `msg` to `node` over the peer link; a link that cannot carry it is logged as
+    /// `catch_up_unroutable{reason: link}`.
+    fn to_peer(&self, node: NodeId, msg: Msg, partition: PartitionId) {
+        if let Err(fault) = self.links.send(self.node, node, msg) {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                to_node = node.0,
+                ?fault,
+                reason = "link",
+                "catch_up_unroutable"
+            );
+        }
+    }
+
+    /// A catch-up this node sources: restore its dormant receiver with the dense ladder the
+    /// cursor needs, remember who asked, then hand R1 `KernelEvent::CatchUp`. A receiver that
+    /// cannot be restored leaves R1 to refuse the catch-up `NotASource`.
+    fn source_catch_up(
+        &mut self,
+        asker: NodeId,
+        site: Site,
+        (from, to, through): (CopyId, CopyId, Seq),
+        credential: FenceCredential,
+        seed: &DormantSeed,
+    ) {
+        self.restore_dormant(site.partition, seed, true);
+        self.catch_ups
+            .insert((site.partition, to), (asker, site.correlation));
+        let kind = KernelEvent::CatchUp {
+            from,
+            to,
+            through,
+            credential,
+        };
+        self.push(site, EventKind::Kernel(kind), true, None);
+    }
+
+    /// Restore R1's dormant receiver for this node's copy of `partition` (A-R173), from the
+    /// engine's lineage at the seed's generation and the seed's epoch, revision and
+    /// configuration. A node already running a live side keeps it. `with_history` also gives
+    /// the receiver its verified ladder, `(0, ROOT)` through its head, once (critic-d7 F2).
+    ///
+    /// Nothing here faults the node (critic-d7 F5): a copy that cannot be restored is logged
+    /// `dormant_restore_refused{reason}` and holds no receiver, so its catch-up is refused and
+    /// F1's deadline ends the recovery with a named `Blocked`.
+    fn restore_dormant(&mut self, partition: PartitionId, seed: &DormantSeed, with_history: bool) {
+        let node = self.node;
+        let held = self.replication.receiver(node, partition);
+        let dormant = held.map(AppendReceiver::is_dormant);
+        if dormant == Some(false)
+            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
+        {
+            return;
+        }
+        if dormant.is_none() {
+            match self.dormant_receiver(partition, seed) {
+                Ok(receiver) => {
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        copy = receiver.copy().0,
+                        generation = receiver.lineage().generation.0,
+                        head = receiver.applied_head().seq.0,
+                        revision = seed.revision.0,
+                        "dormant_restored"
+                    );
+                    self.replication.install_receiver(receiver);
+                    // A new dormant receiver holds no ladder yet, whatever an earlier one held.
+                    self.ladders.remove(&partition);
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        node = node.0,
+                        partition = partition.0,
+                        generation = seed.lineage.generation.0,
+                        reason,
+                        "dormant_restore_refused"
+                    );
+                    return;
+                }
+            }
+        }
+        if with_history && !self.ladders.contains(&partition) {
+            let started = Instant::now();
+            let built = self
+                .dormant_rungs(partition, seed.lineage.generation)
+                .and_then(|rungs| {
+                    self.replication
+                        .restore_history(node, partition, &rungs)
+                        .map(|()| rungs.len())
+                        .map_err(|_| "ladder_refused")
+                });
+            match built {
+                Ok(rungs) => {
+                    self.ladders.insert(partition);
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        rungs,
+                        millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "dormant_ladder_built"
+                    );
+                }
+                Err(reason) => tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    reason,
+                    "dormant_restore_refused"
+                ),
+            }
+        }
+    }
+
+    /// The dormant receiver this node's engine supports for `seed`, or why there is none.
+    fn dormant_receiver(
+        &self,
+        partition: PartitionId,
+        seed: &DormantSeed,
+    ) -> Result<AppendReceiver, &'static str> {
+        let own = seed
+            .config
+            .members
+            .iter()
+            .find(|member| member.node == self.node)
+            .ok_or("not_a_member")?;
+        let generation = seed.lineage.generation;
+        let lineages = self.engine.lineages();
+        if lineages
+            .iter()
+            .any(|(p, g)| *p == partition && *g > generation)
+        {
+            return Err("copy_ahead_of_seed");
+        }
+        if !lineages.contains(&(partition, generation)) {
+            return Err("seed_generation_absent");
+        }
+        let seq = Seq(self.engine.buffered_applied(partition, generation).0);
+        let digest = if seq == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, generation, seq)?.1
+        };
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: seed.config.clone(),
+                own: own.copy,
+                lineage: seed.lineage,
+                head: Head { seq, digest },
+                // Claims nothing durable: the barrier's proofs come from `SyncWalThrough`.
+                durable: DurableSeq(0),
+            },
+            seed.revision,
+        )
+        .map_err(|_| "receiver_refused")
+    }
+
+    /// Every verified digest `(0, ROOT)` through this copy's head of `generation`. A record
+    /// below the lineage's base is read through its parent, as `history_at` does.
+    fn dormant_rungs(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<Vec<(Seq, Digest)>, &'static str> {
+        let head = self.engine.buffered_applied(partition, generation).0;
+        let mut rungs = Vec::with_capacity(usize::try_from(head + 1).unwrap_or(0));
+        rungs.push((Seq::ZERO, Digest::ROOT));
+        for seq in 1..=head {
+            let (_, digest) = self.checked(partition, generation, Seq(seq))?;
+            rungs.push((Seq(seq), digest));
+        }
+        Ok(rungs)
+    }
+
+    /// R1 answered under a catch-up's correlation and runs no source for its copy: it refused
+    /// the catch-up, or its cursor stopped. Forget the asker, as the sim does, so a later
+    /// `CopyCaughtUp` for that copy never reaches a stale F1; the asker's own deadline re-asks.
+    fn forget_refused_catch_ups(&mut self, site: Site, reason: &KernelIgnoredReason) {
+        let (node, partition) = (self.node, site.partition);
+        let refused: Vec<CopyId> = self
+            .catch_ups
+            .iter()
+            .filter(|(&(p, to), &(_, correlation))| {
+                p == partition
+                    && correlation == site.correlation
+                    && self.replication.source(node, partition, to).is_none()
+            })
+            .map(|(&(_, to), _)| to)
+            .collect();
+        for to in refused {
+            let asker = self
+                .catch_ups
+                .remove(&(partition, to))
+                .map(|(asker, _)| asker);
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                to = to.0,
+                asker = asker.map(|asker| asker.0),
+                ?reason,
+                "catch_up_refused"
+            );
+        }
+    }
+
     fn answer_here(&mut self, site: Site, answer: RecoveryEvent) {
         self.push(
             site,
@@ -2915,6 +4630,26 @@ impl Host {
         correlation: CorrelationId,
         ask: &PeerAsk,
     ) {
+        #[cfg(test)]
+        if let PeerAsk::Inventory { .. } = ask {
+            let pause = {
+                let mut pauses = PAUSE_BEFORE_INVENTORY
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = pauses
+                    .iter()
+                    .position(|(dir, _)| self.engine.path().starts_with(dir));
+                at.map(|at| pauses.remove(at).1)
+            };
+            if let Some(pause) = pause {
+                tracing::info!(
+                    node = self.node.0,
+                    millis = pause.as_millis(),
+                    "test_inventory_paused"
+                );
+                std::thread::sleep(pause);
+            }
+        }
         if let PeerAsk::Sync {
             copy,
             generation,
@@ -2969,15 +4704,69 @@ impl Host {
         }
     }
 
-    /// What this copy reports. M9 serves only an empty copy: it reports the plan's anchor at
-    /// the root. A copy holding anything answers `InventoryFailed`: reading a real survivor's
-    /// ladder is M10's (`host_unsupported`), and an invented inventory is never an answer.
+    /// What this copy reports for a plan anchored at `anchor`.
+    ///
+    /// * An anchor at generation 0 (the first open's bootstrap): an empty copy reports the
+    ///   anchor at the root, and a copy holding anything answers `InventoryFailed`, since an
+    ///   invented empty inventory would drop what it holds.
+    /// * An anchor at a later generation (a reopen, M10): the copy reports from its own engine
+    ///   ([`Self::survivor`]): the anchor, its applied head and every stored record digest from
+    ///   the base through the head. Anything it cannot prove from what it stores answers
+    ///   `InventoryFailed`, logged as `inventory_failed{reason}`, never an invented ladder.
+    ///   A copy that missed the anchor's generation while it was silent links it first, when
+    ///   it holds the base exactly ([`Self::inherit_missed_link`], A-R177).
     fn inventory(
-        &self,
+        &mut self,
         partition: PartitionId,
         copy: CopyId,
         anchor: LineageAnchor,
     ) -> RecoveryEvent {
+        if anchor.lineage.generation > Generation(0) {
+            return match self.survivor(partition, copy, anchor) {
+                Ok(inventory) => {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        head = inventory.head.0 .0,
+                        "inventory_reported"
+                    );
+                    RecoveryEvent::InventoryReported(Box::new(inventory))
+                }
+                // C4 (A-R185): an ask that arrives after this copy linked a newer generation at
+                // its landing is late, not a failure of the copy.
+                Err("copy_ahead_of_anchor")
+                    if self
+                        .land_linked
+                        .iter()
+                        .any(|(p, g)| *p == partition && *g > anchor.lineage.generation) =>
+                {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        "inventory_late"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
+                Err(reason) => {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        reason,
+                        "inventory_failed"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
+            };
+        }
         let holds =
             self.engine.lineages().into_iter().any(|(p, g)| {
                 p == partition && (g.0 > 0 || self.engine.buffered_applied(p, g).0 > 0)
@@ -3008,6 +4797,128 @@ impl Host {
         }))
     }
 
+    /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
+    /// `Dispatcher::current_inventory` reports, read from this engine alone.
+    ///
+    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at
+    /// `anchor.base_seq` (its stored link), and the digest it stores at the base is
+    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). A copy holding a newer generation of the
+    /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
+    /// plan is made, never here.
+    fn survivor(
+        &mut self,
+        partition: PartitionId,
+        copy: CopyId,
+        anchor: LineageAnchor,
+    ) -> Result<SurvivorInventory, &'static str> {
+        let generation = anchor.lineage.generation;
+        let lineages = self.engine.lineages();
+        if lineages
+            .iter()
+            .any(|(p, g)| *p == partition && *g > generation)
+        {
+            return Err("copy_ahead_of_anchor");
+        }
+        if !lineages.contains(&(partition, generation)) {
+            let from = self.inherit_missed_link(partition, anchor)?;
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = generation.0,
+                base = anchor.base_seq.0,
+                "inventory_link_inherited"
+            );
+        }
+        let link = self
+            .engine
+            .link(partition, generation)
+            .ok_or("anchor_generation_unlinked")?;
+        if link.base != anchor.base_seq {
+            return Err("base_differs");
+        }
+        let digest_at = |seq: Seq| -> Result<Digest, &'static str> {
+            if seq == Seq::ZERO {
+                return Ok(Digest::ROOT);
+            }
+            self.checked(partition, generation, seq)
+                .map(|(_, digest)| digest)
+        };
+        if digest_at(anchor.base_seq)? != anchor.base_digest {
+            return Err("base_digest_differs");
+        }
+        let head = Seq(self.engine.buffered_applied(partition, generation).0);
+        if head < anchor.base_seq {
+            return Err("head_below_base");
+        }
+        let ladder = (anchor.base_seq.0..=head.0)
+            .map(|seq| digest_at(Seq(seq)).map(|digest| (Seq(seq), digest)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let head_digest = ladder.last().map_or(anchor.base_digest, |(_, d)| *d);
+        Ok(SurvivorInventory {
+            copy,
+            anchor_seen: anchor,
+            head: (head, head_digest),
+            ladder,
+            quarantined: None,
+        })
+    }
+
+    /// A-R177 (critic-f5 option 1): this copy missed the anchor's generation, committed while
+    /// it was silent and never landed here. When it holds its newest generation exactly through
+    /// the anchor's base, with the verified digest there equal to the anchor's, the anchor's
+    /// prefix is its own: it links the anchor's generation onto that one at the base, as a
+    /// landing inherit would have, and then reports as a copy that landed it.
+    ///
+    /// Guards, in this order, before anything is written (C2): no generation above the anchor
+    /// (checked by the caller); the newest held generation is below the anchor's; its head is
+    /// the base exactly, never above (a tail above the base is uncertain data an ask must not
+    /// truncate); its digest at the base is the anchor's. Then only a link (C1): a parent
+    /// already at [`MAX_CHAIN_DEPTH`] levels would need a multi-batch copy inside the discovery
+    /// window, so it is refused. A refusal writes nothing and names its reason.
+    fn inherit_missed_link(
+        &mut self,
+        partition: PartitionId,
+        anchor: LineageAnchor,
+    ) -> Result<Generation, &'static str> {
+        let to = anchor.lineage.generation;
+        let base = anchor.base_seq;
+        let from = self
+            .engine
+            .lineages()
+            .into_iter()
+            .filter(|(p, g)| *p == partition && *g < to)
+            .map(|(_, g)| g)
+            .max()
+            .ok_or("anchor_generation_absent")?;
+        let head = Seq(self.engine.buffered_applied(partition, from).0);
+        if head < base {
+            return Err("missed_generation_held_below_base");
+        }
+        if head > base {
+            return Err("missed_generation_held_past_base");
+        }
+        let digest = if base == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, from, base)?.1
+        };
+        if digest != anchor.base_digest {
+            return Err("missed_generation_base_digest_differs");
+        }
+        if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
+            return Err("missed_generation_link_depth_ceiling");
+        }
+        self.views.remove(&partition);
+        match self.engine.inherit(partition, from, to, base) {
+            // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
+            // generation is held, so `survivor` never calls here. Kept as success (A-R179).
+            Ok(Inherited::Linked | Inherited::AlreadyInherited) => Ok(from),
+            Ok(Inherited::Copied { .. }) => Err("missed_generation_copied"),
+            Err(_) => Err("missed_generation_link_refused"),
+        }
+    }
+
     /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`). `None` is a
     /// withheld answer, logged as `sync_withheld`: F1's own timer reports it.
     fn sync(
@@ -3019,6 +4930,22 @@ impl Host {
         post_commit: bool,
     ) -> Option<RecoveryEvent> {
         let node = self.node.0;
+        if !post_commit {
+            let pause = {
+                let mut pauses = PAUSE_BEFORE_SYNC
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = pauses
+                    .iter()
+                    .position(|(dir, _)| self.engine.path().starts_with(dir));
+                at.map(|at| pauses.remove(at).1)
+            };
+            if let Some(pause) = pause {
+                let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+                tracing::info!(node, millis, "test_sync_paused");
+                std::thread::sleep(pause);
+            }
+        }
         let captured = vec![CapturedPrefix {
             partition,
             generation,
@@ -3088,7 +5015,7 @@ impl Host {
 
     // ------------------------------------------------------------------ clients
 
-    fn client(&mut self, client: Client) -> Result<(), String> {
+    fn client(&mut self, client: Client) -> Result<(), Fault> {
         // One waiter per identity (F-002): a call under an identity whose earlier call still
         // waits is sent once that one is answered, never in its place. A compile waits on
         // nothing, so it never queues. Nor does a status query (F-014): P1 answers it in the
@@ -3147,6 +5074,7 @@ impl Host {
             call,
             reply,
         } = client;
+        let was_resend = matches!(call, ClientCall::Resend { .. });
         let (identity, kind, pending) = match call {
             ClientCall::Put {
                 identity,
@@ -3262,6 +5190,22 @@ impl Host {
                 None,
             ),
         };
+        // Ruling A-R184: no write goes out under a generation not yet marked activated.
+        if let EventKind::Client(ClientEvent::Submit(request)) = &kind {
+            if let Some(error) = self.unactivated(partition) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    request = identity.request.0,
+                    "client_call_refused_unactivated"
+                );
+                let _ = reply.send(Answer::Error {
+                    error,
+                    request: was_resend.then(|| request.clone()),
+                });
+                return Ok(());
+            }
+        }
         // The fence every sent put carries, so a log can show none goes out unfenced.
         let expected_generation = match &kind {
             EventKind::Client(ClientEvent::Submit(request)) => {
@@ -3320,14 +5264,30 @@ impl Host {
     /// Compile writes as one transaction against the step view. The outer error
     /// faults the node (the step view could not be built); the inner one is the caller's: the
     /// first put that does not compile refuses them all, named by its index, never its key.
-    /// `None` is a compile with nothing to write, which is never sent.
+    /// `None` is a compile with nothing to write, which is never sent. A compile that read a
+    /// faulted view faults the node too (A-R164): its conditions were read from a view that was
+    /// not whole.
     fn compile(
         &mut self,
         partition: PartitionId,
         identity: RequestIdentity,
         puts: &[PutOp],
         remaining_millis: u64,
-    ) -> Result<Result<Option<TxnRequest>, ApiError>, String> {
+    ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
+        let compiled = self.compile_unchecked(partition, identity, puts, remaining_millis);
+        if let Some((_, view)) = self.views.get(&partition) {
+            view_whole(view, "compile")?;
+        }
+        compiled
+    }
+
+    fn compile_unchecked(
+        &mut self,
+        partition: PartitionId,
+        identity: RequestIdentity,
+        puts: &[PutOp],
+        remaining_millis: u64,
+    ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
         let generation = self.adopted(partition).generation;
         // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
         // Refused here and never sent (lead ruling on D1, 2026-10-07).
@@ -3336,14 +5296,15 @@ impl Host {
         }
         self.refresh_view(partition, generation)?;
         let Some((_, view)) = self.views.get(&partition) else {
-            return Err("step view missing after refresh".into());
+            return Err(Fault::from("step view missing after refresh".to_owned()));
         };
         // What P1 has published here, as `status` reads it: a publish answers unchanged only
-        // at or below it (C-3).
+        // at or below it (C-3). Read from the kernel, never its whole view: that clones the
+        // status index on every put (A-R174).
         let published = self
             .publication
-            .view(self.node, partition)
-            .map(|view| (view.published.generation, view.published.seq));
+            .kernel(self.node, partition)
+            .map(|kernel| (kernel.published().generation, kernel.published().seq));
         // The first put's group is the request's affinity. A put in another group is refused
         // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
         let affinity = puts.first().map_or(AFFINITY, |put| put.group);
@@ -3439,7 +5400,7 @@ impl Host {
                     mutations.extend(compiled.mutations);
                 }
                 Err(mut refused) => {
-                    log_stored_damage(self.node, &root, &refused, chunk);
+                    log_stored_damage(self.node, &root, &refused, None, chunk);
                     refused.detail = format!("op {index}: {}", refused.detail);
                     return Ok(Err(refused));
                 }
@@ -3543,7 +5504,7 @@ impl Host {
         }
     }
 
-    fn reply(&mut self, partition: PartitionId, reply: &ReplyEffect) -> Result<(), String> {
+    fn reply(&mut self, partition: PartitionId, reply: &ReplyEffect) -> Result<(), Fault> {
         let identity = match reply {
             ReplyEffect::Transaction { identity, .. }
             | ReplyEffect::Status { identity, .. }
@@ -3578,10 +5539,10 @@ impl Host {
             return Ok(());
         }
         if let ReplyEffect::Status { .. } = reply {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "a status answer for request {} with no status query being stepped",
                 identity.request.0
-            ));
+            )));
         }
         let Some(pending) = self.pending.remove(&identity) else {
             tracing::debug!(
@@ -3599,7 +5560,7 @@ impl Host {
             // No request on a refusal: the only product client, the `Db`, sends a put as a
             // `Resend` and already holds what it sent (mutant W3 guards that side).
             (ReplyEffect::Failed { error, .. }, _) => Answer::Error {
-                error: ApiError::from_kernel(error),
+                error: self.refusal(partition, error),
                 request: None,
             },
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
@@ -3633,7 +5594,7 @@ impl Host {
     /// the one after it follows at once. A queued call whose caller has given up is still
     /// sent: its caller holds `UNKNOWN_OUTCOME` or `UNAVAILABLE`, which allow that, and the
     /// kernel de-duplicates a request sent twice.
-    fn release_queued(&mut self, identity: RequestIdentity) -> Result<(), String> {
+    fn release_queued(&mut self, identity: RequestIdentity) -> Result<(), Fault> {
         loop {
             if self.pending.contains_key(&identity) {
                 return Ok(());
@@ -3665,7 +5626,7 @@ impl Host {
         &mut self,
         identity: RequestIdentity,
         handle: Result<SnapshotHandle, ErrorKind>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Fault> {
         tracing::info!(
             node = self.node.0,
             request = identity.request.0,
@@ -3726,9 +5687,9 @@ impl Host {
         value: Option<(u64, Digest)>,
         root: &RootKey,
         look: &Look,
-    ) -> Result<Answer, String> {
+    ) -> Result<Answer, Fault> {
         let Some((_, view)) = self.views.get(&partition) else {
-            return Err("read reply with no step view".into());
+            return Err(Fault::from("read reply with no step view".to_owned()));
         };
         let (generation, at) = (view.generation(), view.at());
         let Some((version, digest)) = value else {
@@ -3745,13 +5706,18 @@ impl Host {
             && stored
                 .as_ref()
                 .is_some_and(|bytes| Digest::of(Domain::ReadValue, &[key, bytes]) == digest);
+        // Unreachable today, kept as defence in depth (A-R164): P1 read these bytes through
+        // this view, and the fault is sticky, so the check after its step fails the node first.
+        view_whole(view, "read reply check")?;
         if !matches {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "read reply v{version} does not match the step view it came from"
-            ));
+            )));
         }
         if matches!(rdb_value::read(view, root), Ok(None)) {
-            return Err("read reply names a value the step view does not decode".into());
+            return Err(Fault::from(
+                "read reply names a value the step view does not decode".to_owned(),
+            ));
         }
         object_answer(self.node, view, root, look, outcome)
     }
@@ -3809,7 +5775,7 @@ impl Host {
         NodeStatus {
             node: self.node,
             boot: self.boot,
-            fault: self.fault.clone(),
+            fault: self.fault.as_ref().map(|fault| fault.detail.clone()),
             holds,
             authority,
             fence: fence_of(self.authority.state()),
@@ -3829,13 +5795,17 @@ impl Host {
             protection: l1
                 .and_then(Protection::mode)
                 .map(|mode| mode_name(mode).to_owned()),
-            admits: l1
-                .and_then(|l1| l1.admission_state(now))
-                .map(|state| state.allow && granted),
+            // A faulted node answers every call with its fault, so it admits nothing (S1-8).
+            admits: l1.and_then(|l1| l1.admission_state(now)).map(|state| {
+                state.allow
+                    && granted
+                    && self.fault.is_none()
+                    && self.unactivated(partition).is_none()
+            }),
             published: self
                 .publication
-                .view(self.node, partition)
-                .map(|view| (view.published.generation, view.published.seq)),
+                .kernel(self.node, partition)
+                .map(|kernel| (kernel.published().generation, kernel.published().seq)),
             in_flight: match self
                 .transaction
                 .kernel(self.node, partition)
@@ -3938,20 +5908,21 @@ fn in_barrier(result: &RecoveryResult, node: NodeId) -> bool {
         .is_some_and(|member| result.barrier.required().contains(&member.copy))
 }
 
-fn unsupported(node: NodeId, kind: &str) -> String {
+fn unsupported(node: NodeId, kind: &str) -> Fault {
     tracing::error!(node = node.0, kind, "host_unsupported");
-    format!("host_unsupported: {kind}")
+    format!("host_unsupported: {kind}").into()
 }
 
-/// Tell a call's waiter, now, that the node faults on `detail`, as `set_fault` tells every
+/// Tell a call's waiter, now, that the node faults on `fault`, as `set_fault` tells every
 /// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
-/// `detail`, for the fault.
-fn fail_waiter(reply: &Sender<Answer>, detail: String) -> String {
+/// `fault`, for the node.
+fn fail_waiter(reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
+    let fault = fault.into();
     let _ = reply.send(Answer::Error {
-        error: ApiError::host(&detail),
+        error: fault.error(),
         request: None,
     });
-    detail
+    fault
 }
 
 /// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
@@ -3965,7 +5936,7 @@ fn compile_error(error: &ValueError) -> ApiError {
         // write and clear. Ahead of `CORRUPT_BLOB`, which also matches a chunk that does not open.
         ValueError::Corrupt(corrupt) if corrupt.is_newer_build() => ApiError::new(
             ErrorKind::IncompatibleVersion,
-            format!("written by a newer build: {corrupt}"),
+            format!("written by a newer build: {corrupt}; open the folder with the newer build"),
         ),
         ValueError::Apply(
             ApplyError::VersionConflict { .. }
@@ -4026,6 +5997,61 @@ fn view_published(
     }
 }
 
+/// ADR-0013: the most bytes of a key a log line shows, as [`key_hex`].
+const KEY_HEX_MAX_BYTES: usize = 32;
+
+/// D9: a key as a log line carries it (ADR-0013): lowercase hex of its first
+/// [`KEY_HEX_MAX_BYTES`] bytes, never its text. The same rule as `config-core`'s and
+/// `config-engine`'s private copies.
+fn key_hex(key: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
+    for byte in key.iter().take(KEY_HEX_MAX_BYTES) {
+        // Writing to a String cannot fail.
+        write!(out, "{byte:02x}").expect("write to String");
+    }
+    out
+}
+
+/// D9: the `key_hex` a damage line names the object by: its id's, or the whole root key's
+/// when the root does not parse, with the parse fault, which names no bytes.
+fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
+    match rdb_value::keys::parse(root.as_bytes()) {
+        Ok(parsed) => (key_hex(&parsed.object_id), None),
+        Err(fault) => (key_hex(root.as_bytes()), Some(fault.to_string())),
+    }
+}
+
+/// D9b: the code a damage line names stored damage by, never its `Display`, which for a map
+/// entry quotes the app's key (`Corrupt::Entry`). Exhaustive on purpose: a new variant is a
+/// compile error here, not a line that quietly falls back to the text.
+const fn damage_code(corrupt: &Corrupt) -> &'static str {
+    match corrupt {
+        Corrupt::Envelope(_) => "envelope",
+        Corrupt::Codec(_) => "codec",
+        Corrupt::VersionWithoutValue => "version_without_value",
+        Corrupt::Key(_) => "key",
+        Corrupt::Root(_) => "root",
+        Corrupt::ListRoot(_) => "list_root",
+        Corrupt::UnknownKeyProfile(_) => "unknown_key_profile",
+        Corrupt::UnknownSub(_) => "unknown_sub",
+        Corrupt::Entry { .. } => "entry",
+        Corrupt::EntryNotDocument { .. } => "entry_not_document",
+        Corrupt::ItemNotDocument { .. } => "item_not_document",
+        Corrupt::ListRecordAtRoot { .. } => "list_record_at_root",
+        Corrupt::SetMemberHasValue { .. } => "set_member_has_value",
+        Corrupt::ElementNewerThanRoot { .. } => "element_newer_than_root",
+        Corrupt::OrphanElement => "orphan_element",
+        Corrupt::CountMismatch { .. } => "count_mismatch",
+        Corrupt::Manifest(_) => "manifest",
+        Corrupt::Chunk { .. } => "chunk",
+        Corrupt::ChunkMissing { .. } => "chunk_missing",
+        Corrupt::Block { .. } => "block",
+        Corrupt::ItemMissing { .. } => "item_missing",
+        Corrupt::ChunkMismatch { .. } => "chunk_mismatch",
+    }
+}
+
 /// One warn line per clear batch compiled (M9 S6): what it deletes and the damage that proved
 /// it. `root` is `deleted` in the batch that empties the object, `guarded` while it is kept,
 /// and `absent` when there is none. No record bytes are logged.
@@ -4046,18 +6072,17 @@ fn log_clear(node: NodeId, identity: RequestIdentity, root: &RootKey, cleared: &
     } else {
         "guarded"
     };
+    let (key_hex, root_unparsed) = object_key_hex(root);
     tracing::warn!(
         node = node.0,
         client = identity.client.0,
         request = identity.request.0,
-        object = %match rdb_value::keys::parse(root.as_bytes()) {
-            Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
-            Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
-        },
+        key_hex = %key_hex,
+        root_unparsed = root_unparsed.as_deref(),
         deletes = compiled.mutations.len(),
         faulting = cleared.faulting,
         root = root_word,
-        damage = %cleared.damage,
+        damage = damage_code(&cleared.damage),
         "clear_compiled"
     );
 }
@@ -4231,6 +6256,25 @@ fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// A letter's kind, for [`Host::slow_step`]: never its contents.
+const fn msg_name(msg: &Msg) -> &'static str {
+    match msg {
+        Msg::Control { .. } => "control",
+        Msg::Fault { .. } => "fault",
+        Msg::Activated { .. } => "activated",
+        Msg::Inject { .. } => "inject",
+        Msg::Frame { .. } => "frame",
+        Msg::PeerAsk { .. } => "peer_ask",
+        Msg::CatchUp { .. } => "catch_up",
+        Msg::Restore { .. } => "restore",
+        Msg::Routed { .. } => "routed",
+        Msg::Landed { .. } => "landed",
+        Msg::Client(_) => "client",
+        Msg::Inspect { .. } => "inspect",
+        Msg::Stop => "stop",
+    }
+}
+
 /// Milliseconds from `at` to `horizon`: positive while it is ahead, 0 at the last tick a view
 /// still admits, negative past it.
 fn margin_ms(horizon: Tick, at: Tick) -> i64 {
@@ -4248,7 +6292,37 @@ fn object_answer(
     root: &RootKey,
     look: &Look,
     outcome: ReadServiceOutcome,
-) -> Result<Answer, String> {
+) -> Result<Answer, Fault> {
+    let answer = object_answer_unchecked(node, view, root, look, outcome);
+    view_whole(view, "read")?;
+    answer
+}
+
+/// A view read that met a storage fault answered `None` or a short page, which is never an
+/// answer (A-R164): checked after every read through a view and before anything the read
+/// produced is sent. A fault fails the node through its `Err` path; what the read produced is
+/// dropped, and every waiter is answered with the error. A `Corrupt` read is stored damage,
+/// `CORRUPT_HISTORY` (A-R178): storage names no blob, so never `CORRUPT_BLOB`.
+fn view_whole(view: &RocksSnapshot, what: &str) -> Result<(), Fault> {
+    view.fault().map_or(Ok(()), |fault| {
+        Err(Fault {
+            damage: (fault == StorageFault::Corrupt).then_some(ErrorKind::CorruptHistory),
+            detail: format!(
+                "{what}: storage read fault {fault:?} in the view of generation {} at seq {}",
+                view.generation().0,
+                view.at().0
+            ),
+        })
+    })
+}
+
+fn object_answer_unchecked(
+    node: NodeId,
+    view: &RocksSnapshot,
+    root: &RootKey,
+    look: &Look,
+    outcome: ReadServiceOutcome,
+) -> Result<Answer, Fault> {
     let (generation, at) = (view.generation(), view.at());
     // A range read's upload, from the manifest it opened, for a damaged chunk's log (A-R132).
     let mut upload = None;
@@ -4295,9 +6369,9 @@ fn object_answer(
     Ok(match seen {
         // P1 found a root record, so the view holds one: its absence here is not an answer (A-4).
         Err(ValueError::Apply(ApplyError::ObjectAbsent)) => {
-            return Err(format!(
+            return Err(Fault::from(format!(
                 "the read view holds no root record for an object P1 answered as present ({look:?})"
-            ));
+            )));
         }
         Ok(seen) => Answer::Read {
             outcome,
@@ -4307,8 +6381,12 @@ fn object_answer(
         },
         Err(error) => {
             let chunk = upload.zip(damaged_chunk(&error));
+            let damage = match &error {
+                ValueError::Corrupt(corrupt) => Some(damage_code(corrupt)),
+                ValueError::Apply(_) => None,
+            };
             let error = compile_error(&error);
-            log_stored_damage(node, root, &error, chunk);
+            log_stored_damage(node, root, &error, damage, chunk);
             Answer::Error {
                 error,
                 request: None,
@@ -4335,32 +6413,42 @@ const fn damaged_chunk(error: &ValueError) -> Option<u32> {
 /// no log of its own. `chunk` adds `upload` (hex) and `index` where the finder knew them: a
 /// chunk that failed its check (A-R132). Damage to the manifest itself names no upload, so the
 /// line leaves both out rather than guess one.
-fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Option<(Upload, u32)>) {
+///
+/// D9b: `damage` is [`damage_code`] where the finder held the `Corrupt` (a read), absent where
+/// only the refusal reached it (a compile). The refusal's detail is never logged: it is the
+/// error's text, and that can quote the app's key.
+fn log_stored_damage(
+    node: NodeId,
+    root: &RootKey,
+    error: &ApiError,
+    damage: Option<&'static str>,
+    chunk: Option<(Upload, u32)>,
+) {
     if !matches!(
         error.kind,
         ErrorKind::CorruptBlob | ErrorKind::CorruptHistory
     ) {
         return;
     }
-    let object = match rdb_value::keys::parse(root.as_bytes()) {
-        Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
-        Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
-    };
+    let (key_hex, root_unparsed) = object_key_hex(root);
+    let root_unparsed = root_unparsed.as_deref();
     match chunk {
         Some((upload, index)) => tracing::warn!(
             node = node.0,
-            %object,
+            %key_hex,
+            root_unparsed,
             kind = %error.name(),
+            damage,
             upload = %format!("{:032x}", u128::from_be_bytes(upload)),
             index,
-            detail = %error.detail,
             "stored_damage"
         ),
         None => tracing::warn!(
             node = node.0,
-            %object,
+            %key_hex,
+            root_unparsed,
             kind = %error.name(),
-            detail = %error.detail,
+            damage,
             "stored_damage"
         ),
     }
@@ -4628,6 +6716,406 @@ mod tests {
         assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
     }
 
+    /// A-R192b: the flush duty syncs only while some lineage is applied past its durable mark.
+    /// Once all are durable through applied, it pushes the same `Flushed` with no fsync: a
+    /// WAL-flush fault armed then stays armed. The next commit makes the duty sync again, and
+    /// the fault fires there. Cut (never skip): the fault fires early. Cut (always skip): the
+    /// first duty leaves seq 1 not durable.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_flush_duty_syncs_only_while_a_lineage_is_applied_past_durable() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let (partition, generation) = (PartitionId(1), Generation(1));
+        let commit = |host: &mut Host, seq: u64| {
+            host.engine
+                .commit(rdb_core::contracts::storage::Batch {
+                    id: rdb_core::contracts::ids::BatchId(seq),
+                    partition,
+                    generation,
+                    seq: Seq(seq),
+                    writes: Vec::new(),
+                })
+                .expect("commit");
+        };
+        let last = |host: &mut Host| {
+            host.queue
+                .pop_back()
+                .map(|queued| queued.event.kind)
+                .expect("the duty pushed an event")
+        };
+        let durable_through = |seq: u64| {
+            EventKind::Storage(StorageEvent::Flushed {
+                ticket: FlushTicket(0),
+                durable: vec![DurablePrefix {
+                    partition,
+                    generation,
+                    through: DurableSeq(seq),
+                }],
+            })
+        };
+        let without_ticket = |kind: EventKind| match kind {
+            EventKind::Storage(StorageEvent::Flushed { durable, .. }) => {
+                EventKind::Storage(StorageEvent::Flushed {
+                    ticket: FlushTicket(0),
+                    durable,
+                })
+            }
+            other => other,
+        };
+
+        commit(&mut host, 1);
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+        // A-R214: that sync wrote the durable mark unsynced, so one more duty syncs it.
+        host.flush_duty().expect("flush");
+        assert!(host.engine.wal_synced_through_latest());
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+
+        host.engine
+            .inject_fault(rdb_storage::InjectedFault::WalFlush);
+        host.flush_duty().expect("flush");
+        assert_eq!(
+            host.engine.armed_fault(),
+            Some(rdb_storage::InjectedFault::WalFlush),
+            "nothing to sync: no fsync"
+        );
+        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
+
+        commit(&mut host, 2);
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.armed_fault(), None, "seq 2 needed a sync");
+        assert!(
+            matches!(
+                last(&mut host),
+                EventKind::Storage(StorageEvent::FlushFailed { .. })
+            ),
+            "the armed fault failed that sync"
+        );
+        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+    }
+
+    /// A-R214: a host over a fresh engine whose one lineage is synced and quiet: a WAL-flush
+    /// fault armed then survives a duty. Every lineage is durable through applied after it.
+    #[cfg(debug_assertions)]
+    fn quiet_host_with_wal_flush_armed(
+        path: &std::path::Path,
+        rt: &tokio::runtime::Runtime,
+    ) -> Host {
+        let mut host = host_over(path, rt);
+        host.engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition: PartitionId(2),
+                generation: Generation(1),
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit");
+        host.flush_duty().expect("flush");
+        host.flush_duty().expect("flush");
+        host.engine
+            .inject_fault(rdb_storage::InjectedFault::WalFlush);
+        host.flush_duty().expect("flush");
+        assert_eq!(
+            host.engine.armed_fault(),
+            Some(rdb_storage::InjectedFault::WalFlush),
+            "a quiet duty does not sync"
+        );
+        host
+    }
+
+    /// A-R214: with every lineage still durable through applied, the next duty syncs anyway,
+    /// and the armed fault fails that sync.
+    #[cfg(debug_assertions)]
+    fn assert_next_duty_syncs(host: &mut Host, what: &str) {
+        let durable_at_applied = host
+            .engine
+            .lineages()
+            .into_iter()
+            .all(|(p, g)| host.engine.durable(p, g).0 == host.engine.buffered_applied(p, g).0);
+        assert!(durable_at_applied, "{what}: no applied mark moved");
+        host.flush_duty().expect("flush");
+        assert_eq!(host.engine.armed_fault(), None, "{what}: the duty synced");
+        assert!(
+            matches!(
+                host.queue.pop_back().map(|queued| queued.event.kind),
+                Some(EventKind::Storage(StorageEvent::FlushFailed { .. }))
+            ),
+            "{what}: the armed fault failed that sync"
+        );
+    }
+
+    /// A-R214 row 1: the retire duty's dedup delete raises no applied mark, so durable ==
+    /// applied alone would skip the next duty and leave the delete in the OS cache. The
+    /// duty syncs it. Cut (durable == applied alone): the fault stays armed, red.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_dedup_delete_alone_still_makes_the_flush_duty_sync() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
+        host.engine
+            .delete_dedup_below(PartitionId(2), Generation(1), &2_u64.to_be_bytes())
+            .expect("dedup delete");
+        assert_next_duty_syncs(&mut host, "a dedup delete");
+    }
+
+    /// Review-s1 F-003 (D10's cap): a mailbox holding more than `MAIL_BEFORE_DUTIES` letters,
+    /// then `Stop`, with the flush duty due. `Host::run` takes exactly that many, runs the due
+    /// duties, and only then reads on to `Stop`, so steady mail cannot starve them. Each letter
+    /// is a stale-boot `Activated`, which logs one line and changes nothing. Cut: the read's
+    /// bound `taken < MAIL_BEFORE_DUTIES` lifted; the run reads every letter and `Stop` before
+    /// any duty, and no flush line is logged, red. Dropping `|| taken == MAIL_BEFORE_DUTIES`
+    /// alone stays green, and rightly: `taken` counts across passes, so the next pass reads
+    /// nothing and the loop ends at the same letter. That clause saves one drain. Unit, under
+    /// a second.
+    #[config_log::retcd_test]
+    fn a_full_mailbox_runs_the_due_duties_after_the_cap_before_reading_on() {
+        const METHOD: &str = "a_full_mailbox_runs_the_due_duties_after_the_cap_before_reading_on";
+        const LETTERS: usize = MAIL_BEFORE_DUTIES + 44;
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition: PartitionId(2),
+                generation: Generation(1),
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit");
+        host.next_flush = host.clock.now();
+        let stale = BootId(host.boot.0 + 1);
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..LETTERS {
+            tx.send(Msg::Activated {
+                boot: stale,
+                partition: PartitionId(2),
+                generation: Generation(1),
+            })
+            .expect("send");
+        }
+        tx.send(Msg::Stop).expect("send");
+        host.run(&rx);
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let letters = lines
+            .iter()
+            .filter(|line| line["@m"] == "control_stale_boot_dropped")
+            .count();
+        assert_eq!(letters, LETTERS, "every letter was read");
+        let flush = lines
+            .iter()
+            .position(|line| line["@m"] == "host_duty" && line["kind"] == "flush")
+            .expect("the flush duty ran before Stop");
+        let before = lines[..flush]
+            .iter()
+            .filter(|line| line["@m"] == "control_stale_boot_dropped")
+            .count();
+        assert_eq!(
+            before, MAIL_BEFORE_DUTIES,
+            "the duty ran right after the cap"
+        );
+    }
+
+    /// PR #60 review F4: a queued event that faults the node ends its turn. The mailbox holds
+    /// `MAIL_BEFORE_DUTIES` letters, then `Stop`, with the flush duty due: first an injected
+    /// timer whose offer faults (`fail_step_view`), then stale-boot letters that change nothing.
+    /// The read stops at the cap with the timer still queued, so the drain after it faults, and
+    /// the flush duty after that drain must not run. Cut: the duties run on whatever the
+    /// drain did, and a `flush` duty line follows the fault, red. Unit, under a second.
+    #[config_log::retcd_test]
+    fn a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn() {
+        const METHOD: &str = "a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn";
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition: PartitionId(2),
+                generation: Generation(1),
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit");
+        host.next_flush = host.clock.now();
+        host.fail_step_view = true;
+        let stale = BootId(host.boot.0 + 1);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Inject {
+            partition: PartitionId(2),
+            correlation: CorrelationId::default(),
+            kind: EventKind::Timer(TimerFired {
+                id: HEALTH_EVAL_TIMER,
+                version: TimerVersion(0),
+                scheduled_at: host.clock.now(),
+            }),
+        })
+        .expect("send");
+        for _ in 1..MAIL_BEFORE_DUTIES {
+            tx.send(Msg::Activated {
+                boot: stale,
+                partition: PartitionId(2),
+                generation: Generation(1),
+            })
+            .expect("send");
+        }
+        tx.send(Msg::Stop).expect("send");
+        host.run(&rx);
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let fault = lines
+            .iter()
+            .position(|line| line["@m"] == "host_fault")
+            .expect("the injected timer faulted the node");
+        let letters = lines[..fault]
+            .iter()
+            .filter(|line| line["@m"] == "control_stale_boot_dropped")
+            .count();
+        assert_eq!(letters, MAIL_BEFORE_DUTIES - 1, "it faulted after the cap");
+        let after: Vec<_> = lines[fault + 1..]
+            .iter()
+            .filter(|line| line["@m"] == "host_duty" || line["@m"] == "host_fault")
+            .collect();
+        assert!(after.is_empty(), "nothing ran after the fault: {after:?}");
+    }
+
+    /// PR #60 review F4: the first fault is the one the node keeps and reports. A later one is
+    /// logged, never kept. Cut: `set_fault` overwrites, and the status names the later one, red.
+    #[test]
+    fn a_second_fault_keeps_the_first() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.set_fault(Fault::from("the first".to_owned()));
+        host.set_fault(Fault::from("the second".to_owned()));
+        assert_eq!(
+            host.status(PartitionId(2)).fault.as_deref(),
+            Some("the first"),
+            "the first fault is kept"
+        );
+    }
+
+    /// PR #60 review F8: the final marks a clean stop writes are a synced write, timed like
+    /// every other duty, so a slow one logs `host_slow_step`. The host restored its marks and
+    /// published seq 6 of generation 1, so the stop has marks to write; that write is held past
+    /// the 250 ms threshold (`step_pause`, inside the write only). The row checks the write ran
+    /// (`host_duty` `final_marks`, the mark on disk) and was logged slow, after it. Cut: the
+    /// `slow_step` call removed, and no such line, red. Unit, about 0.3 s.
+    #[config_log::retcd_test]
+    fn a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow() {
+        const METHOD: &str = "a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow";
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let published = (Generation(1), Seq(6), Tick(HostClock::start().now().0 - 10));
+        {
+            let mut host = host_over(&path, &rt);
+            host.restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            host.published_at
+                .entry(PartitionId(1))
+                .or_default()
+                .push_back(published);
+            host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
+            let (tx, rx) = mpsc::channel();
+            tx.send(Msg::Stop).expect("send stop");
+            host.run(&rx);
+        }
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let wrote = lines
+            .iter()
+            .position(|line| line["@m"] == "host_duty" && line["kind"] == "final_marks")
+            .expect("the clean stop wrote its final marks");
+        let slow: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line["@m"] == "host_slow_step")
+            .map(|(at, line)| (at, line["step"].clone(), line["what"].clone()))
+            .collect();
+        assert_eq!(
+            slow.iter()
+                .map(|(_, step, what)| (step, what))
+                .collect::<Vec<_>>(),
+            [(
+                &serde_json::json!("duty"),
+                &serde_json::json!("final_marks")
+            )],
+            "the slow final write was logged as slow"
+        );
+        assert!(slow[0].0 > wrote, "logged once the write had run");
+        let marks: Vec<Mark> = RocksEngine::open(&path)
+            .expect("open engine")
+            .publish_marks(PartitionId(1))
+            .expect("read marks")
+            .into_iter()
+            .map(|mark| (mark.generation, mark.seq, mark.tick))
+            .collect();
+        assert_eq!(marks, [published], "the final write reached the disk");
+    }
+
+    /// PR #60 review F9: an offer is timed whatever it answers. Here the step view fails
+    /// (`fail_step_view`), so Transaction's offer of an injected timer ends in a host error,
+    /// after a pause past the threshold. Cut: only an offer that delivers is timed, and no
+    /// `Transaction` line, red. Unit, about 0.6 s: Authority's offer is held too.
+    #[config_log::retcd_test]
+    fn a_slow_offer_that_fails_is_logged_as_slow() {
+        const METHOD: &str = "a_slow_offer_that_fails_is_logged_as_slow";
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = host_over(&dir.path().join("node"), &rt);
+        host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
+        host.fail_step_view = true;
+        host.handle(Msg::Inject {
+            partition: PartitionId(2),
+            correlation: CorrelationId::default(),
+            kind: EventKind::Timer(TimerFired {
+                id: HEALTH_EVAL_TIMER,
+                version: TimerVersion(0),
+                scheduled_at: host.clock.now(),
+            }),
+        });
+        host.drain();
+        let fault = host.fault.clone().expect("the offer failed");
+        assert!(fault.detail.contains("injected"), "{fault:?}");
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let slow: Vec<String> = lines
+            .iter()
+            .filter(|line| line["@m"] == "host_slow_step" && line["step"] == "module")
+            .filter_map(|line| line["what"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            slow.iter().any(|what| what.starts_with("Transaction on")),
+            "the failed offer was timed: {slow:?}"
+        );
+    }
+
+    /// A-R214 row 2: an inherit at base 0 (a landing at cutoff 0) writes the link and the
+    /// seal, and leaves both lineages applied and durable at 0. The duty syncs it. Cut
+    /// (durable == applied alone): the fault stays armed, red.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_inherit_at_base_zero_still_makes_the_flush_duty_sync() {
+        let rt = current_thread();
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
+        let inherited = host
+            .engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq::ZERO)
+            .expect("inherit");
+        assert_eq!(inherited, Inherited::Linked);
+        assert_next_duty_syncs(&mut host, "an inherit at base 0");
+    }
+
     /// Defect D2 (2026-10-07, `rdb_dev --hold 1-2,1-3`, walk A10): with both secondaries
     /// unreachable F1 commits `ReadOnly` at cutoff 0, and the partition stayed read-only in
     /// silence. Since the D2 kernel step, F1 pins that rebuild at the commit and, at each
@@ -4830,6 +7318,118 @@ mod tests {
         trio.mem.stop_failing();
         trio.ready();
         assert_eq!(trio.status(0).recovery.as_deref(), Some("Committed"));
+    }
+
+    /// Node 1's `recovery_fact` lines for `BlockPromotion`, as `(effect, terminal)`.
+    fn block_facts(method: &str) -> Vec<(String, Option<bool>)> {
+        logged!(method, "recovery_fact")
+            .into_iter()
+            .filter(|line| line["node"] == 1)
+            .filter_map(|line| {
+                let effect = line["effect"].as_str()?.to_owned();
+                effect
+                    .starts_with("BlockPromotion")
+                    .then(|| (effect, line["terminal"].as_bool()))
+            })
+            .collect()
+    }
+
+    /// BlockPromotion item (lead, 2026-10-23): a block a control-store outage resolves is
+    /// logged `terminal=false`. The activation row's start: F1 commits `ReadOnly` with its
+    /// peers held, the store goes down, and the activation CAS answers `Unavailable`. F1 reports
+    /// `BlockPromotion { reason: ControlUnavailable }` and resolves in `ActivationUnresolved`
+    /// (A-R102), so the block does not last. Cut: `terminal` from the reason and the binding (a
+    /// control outage terminal when unbound, as every `Trio` host is) logs `true` here.
+    /// Integration (~3 s): bootstrap's discovery window, then the activation's own deadline.
+    #[config_log::retcd_test]
+    fn m10_a_block_a_store_outage_resolves_is_logged_not_terminal() {
+        const METHOD: &str = "m10_a_block_a_store_outage_resolves_is_logged_not_terminal";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        trio.until("F1 rebuilding on node 1", |trio| {
+            (trio.status(0).recovery.as_deref() == Some("Rebuilding")).then_some(())
+        });
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.links.heal_all();
+        trio.until("F1 resolving on node 1", |trio| {
+            (trio.status(0).recovery.as_deref() == Some("ActivationUnresolved")).then_some(())
+        });
+
+        let facts = block_facts(METHOD);
+        assert!(!facts.is_empty(), "the outage was reported as a block");
+        for (effect, terminal) in &facts {
+            assert!(
+                effect.starts_with("BlockPromotion { reason: Control"),
+                "only the outage blocked: {facts:?}"
+            );
+            assert_eq!(*terminal, Some(false), "F1 resolves this one: {facts:?}");
+        }
+        trio.mem.stop_failing();
+        trio.ready();
+    }
+
+    /// BlockPromotion item (lead, 2026-10-23): a block that lasts is logged `terminal=true`.
+    /// Node 1 starts with its peers held, and the control store goes down while F1 collects, so
+    /// the recovery CAS answers `Unavailable`. Unbound, as every `Trio` host is, F1 stays
+    /// `Blocked(ControlUnavailable)` until a fresh fence, and no fence comes while the store is
+    /// down. Cut: `terminal` from the reason alone (a control outage never terminal) logs
+    /// `false` here. Integration (~2 s): bootstrap's discovery window.
+    #[config_log::retcd_test]
+    fn m10_a_block_that_lasts_is_logged_terminal() {
+        const METHOD: &str = "m10_a_block_that_lasts_is_logged_terminal";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        trio.until("F1 collecting on node 1", |trio| {
+            matches!(
+                trio.status(0).recovery.as_deref(),
+                Some("Fenced" | "Collecting")
+            )
+            .then_some(())
+        });
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        // `Trio::step` fails a row on a block, which is what this row waits for: step by hand.
+        let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+        let phase = loop {
+            for (host, _, rx) in &mut trio.nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+            if let Some(phase) = trio
+                .status(0)
+                .recovery
+                .filter(|phase| phase.starts_with("Blocked("))
+            {
+                break phase;
+            }
+            assert!(Instant::now() < deadline, "F1 never blocked on node 1");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(phase, "Blocked(ControlUnavailable)");
+
+        assert_eq!(
+            block_facts(METHOD),
+            vec![(
+                "BlockPromotion { reason: ControlUnavailable }".to_owned(),
+                Some(true)
+            )]
+        );
+        trio.mem.stop_failing();
     }
 
     /// Tester gap G2 (2026-10-07, mutant M4): once F1 sends its post-commit sync, the rebuild
@@ -5152,7 +7752,10 @@ mod tests {
     /// A10, end to end (the tester's row (b), mutant M19). Both secondaries are cut off from the
     /// start, so F1 commits `ReadOnly` at cutoff 0 and names both copies stalled. After the heal
     /// the partition activates, and activation clears the stall line. Then two puts publish at
-    /// seq 2 and 3, and L1 stays unpaused past its pause age.
+    /// seq 2 and 3, and L1 stays unpaused past its pause age, except for a pause that a stall of
+    /// this thread explains, which must end with L1 admitting (D16). Cuts (D16): a 600 ms stall
+    /// of the thread fails the old watch and passes this one; with that stall, an L1 that never
+    /// resumes after a pause fails this one.
     ///
     /// Not D4's regression guard: stepped by hand, it passed 20 of 20 with D4 unfixed, where the
     /// threaded walk lost a copy in ~3 of 23. The sim row `m9_d4_00` guards D4.
@@ -5176,23 +7779,48 @@ mod tests {
             None,
             "activation clears the stall line"
         );
+        // D16: this one thread steps all three hosts, so a stall of it leaves the puts undurable
+        // everywhere for as long as it lasts. Past the pause age L1 pauses, as the spec says it
+        // must (600-680 ms under gate load, int fa72544; diag-d16). So a gap of a flush period
+        // or more between looks is a stall; a pause that begins within one pause age of one is
+        // allowed, and the window starts again from the stall. The watch ends only with L1
+        // healthy and admitting, so a pause with no stall, or one that never ends, still fails.
+        let stall = Duration::from_millis(HOST_FLUSH_EVERY_MILLIS);
+        let pause_age = Duration::from_millis(Trio::PAUSE_AGE_MILLIS);
+        let mut last = Instant::now();
         for (request, object, seq) in [(1, b"a", 2), (2, b"b", 3)] {
             match trio.ask(put(request, object, b"v", None)) {
                 Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(seq)),
                 other => panic!("put {request}: {other:?}"),
             }
         }
-        let past_pause = Instant::now() + Duration::from_millis(2 * Trio::PAUSE_AGE_MILLIS);
-        trio.until("twice the pause age, unpaused", |trio| {
+        let mut past_pause = Instant::now() + 2 * pause_age;
+        let mut woke: Option<Instant> = None;
+        let mut held_since: Option<Instant> = None;
+        trio.until("twice the pause age, unpaused and admitting", |trio| {
+            let now = Instant::now();
+            if now.duration_since(last) >= stall {
+                woke = Some(now);
+                past_pause = past_pause.max(now + 2 * pause_age);
+            }
+            last = now;
             let status = trio.status(0);
-            assert_ne!(
+            let held = matches!(
                 status.protection.as_deref(),
-                Some("paused"),
-                "L1 paused after the heal: {status:?}"
+                Some("paused" | "reprotecting")
             );
-            (Instant::now() >= past_pause).then_some(())
+            if held {
+                let began = *held_since.get_or_insert(now);
+                assert!(
+                    woke.and_then(|woke| began.checked_duration_since(woke))
+                        .is_some_and(|since| since < pause_age),
+                    "L1 paused after the heal with no stall of this thread before it: {status:?}"
+                );
+            } else {
+                held_since = None;
+            }
+            (now >= past_pause && !held && status.admits == Some(true)).then_some(())
         });
-        assert_eq!(trio.status(0).admits, Some(true));
     }
 
     /// The tester's row (d), moved onto the pinned stall by the K1 ruling (condition 6), and
@@ -5224,8 +7852,8 @@ mod tests {
             "recovery_rebuild_stalled partition=1 gen=1 mode=DegradedRf2 cutoff=0 \
              required=[0, 1, 2] unproven=[",
             "2] phase=Rebuilding: F1 pinned its rebuild, but these copies have not proved it, so \
-             the partition stays DegradedRf2, and its writes stay paused until the absent copy \
-             returns",
+             the partition stays DegradedRf2, and its writes stay paused until the database is \
+             opened again",
         ] {
             assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
         }
@@ -5246,7 +7874,7 @@ mod tests {
         assert!(
             never.ends_with(
                 "F1 never pinned its rebuild, so the partition stays DegradedRf2, and its writes \
-                 stay paused until the absent copy returns"
+                 stay paused until the database is opened again"
             ),
             "{never}"
         );
@@ -5619,7 +8247,9 @@ mod tests {
     /// M9 serves only an empty copy, so a copy that holds anything must answer
     /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
     /// drops what the copy holds. Two ways to hold something: an anchor past the root, and a
-    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root.
+    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root of the
+    /// bootstrap's generation-0 anchor. M10: a later generation is a reopen's, answered only
+    /// from what the copy stores, so an empty copy asked for one answers `InventoryFailed`.
     #[test]
     fn a_copy_that_holds_anything_never_reports_an_empty_inventory() {
         let dir = config_testkit::fs::temp_dir();
@@ -5637,24 +8267,611 @@ mod tests {
             base_seq: Seq(1),
             ..root
         };
+        let bootstrap = LineageAnchor {
+            lineage: Lineage {
+                generation: Generation(0),
+                owner_epoch: OwnerEpoch(0),
+                ..root.lineage
+            },
+            ..root
+        };
         let report =
-            |trio: &Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
+            |trio: &mut Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
 
         assert!(
-            matches!(report(&trio, root), RecoveryEvent::InventoryReported(_)),
+            matches!(
+                report(&mut trio, bootstrap),
+                RecoveryEvent::InventoryReported(_)
+            ),
             "an empty copy reports the root"
         );
         assert_eq!(
-            report(&trio, past_root),
+            report(
+                &mut trio,
+                LineageAnchor {
+                    base_seq: Seq(1),
+                    ..bootstrap
+                }
+            ),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
             "an anchor past the root"
+        );
+        assert_eq!(
+            report(&mut trio, root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "an empty copy asked for a reopen's generation 1"
         );
         trio.bootstrap();
         trio.ready();
         assert_eq!(
-            report(&trio, root),
+            report(&mut trio, bootstrap),
             RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "a copy holding generation 1"
+            "a copy holding generation 1, asked for the bootstrap's empty anchor"
+        );
+        // M10 (reopen): a copy holding the anchor's generation reports from its engine, and
+        // one whose stored base is not the anchor's answers nothing.
+        assert!(
+            matches!(report(&mut trio, root), RecoveryEvent::InventoryReported(_)),
+            "a copy holding generation 1 at its anchor"
+        );
+        assert_eq!(
+            report(&mut trio, past_root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "a copy whose generation 1 starts elsewhere"
+        );
+    }
+
+    /// A-R177 rows: `n` chained records in `generation` of partition 1, committed as R1 stages
+    /// them (the record, its `History` row, the applied-head `Progress` row). Their digests,
+    /// `[0]` at seq 1.
+    fn write_chain(engine: &mut RocksEngine, generation: Generation, n: u64) -> Vec<Digest> {
+        use rdb_core::contracts::digest::Domain;
+        use rdb_core::contracts::envelope::EnvelopeHeader;
+        use rdb_core::contracts::ids::{BatchId, ClientId, LeaseId, TenantId};
+        use rdb_core::contracts::storage::{Batch, Write};
+        use rdb_core::contracts::txn::Outcome;
+        use rdb_core::contracts::version::ENVELOPE_VERSION;
+        let mut digests: Vec<Digest> = Vec::new();
+        for seq in 1..=n {
+            let mut env = ReplicationEnvelope {
+                header: EnvelopeHeader {
+                    protocol_version: ENVELOPE_VERSION,
+                    partition: PartitionId(1),
+                    generation,
+                    config_version: ConfigVersion(1),
+                    owner_epoch: OwnerEpoch(generation.0),
+                    seq: Seq(seq),
+                    body_len: 0,
+                },
+                lease_id: LeaseId(1),
+                prev_digest: digests.last().copied().unwrap_or(Digest::ROOT),
+                request_identity: RequestIdentity {
+                    tenant: TenantId(1),
+                    client: ClientId(1),
+                    request: RequestId(seq),
+                },
+                request_digest: Digest::of(Domain::Record, &[&seq.to_le_bytes()]),
+                conditions_result: Vec::new(),
+                mutations: vec![Write {
+                    ns: Namespace::User,
+                    key: Bytes::copy_from_slice(&seq.to_be_bytes()),
+                    value: Some(Bytes::from_static(b"v")),
+                }],
+                result: Outcome::Published,
+                record_digest: Digest::ROOT,
+            };
+            env.record_digest = env.compute_record_digest().expect("digest");
+            digests.push(env.record_digest);
+            let mut progress = seq.to_le_bytes().to_vec();
+            progress.extend_from_slice(&env.record_digest.0);
+            let mut writes = env.mutations.clone();
+            writes.push(Write {
+                ns: Namespace::History,
+                key: Bytes::copy_from_slice(&seq.to_be_bytes()),
+                value: Some(env.encode().expect("encode")),
+            });
+            writes.push(Write {
+                ns: Namespace::Progress,
+                key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+                value: Some(Bytes::from(progress)),
+            });
+            engine
+                .commit(Batch {
+                    id: BatchId(seq),
+                    partition: PartitionId(1),
+                    generation,
+                    seq: Seq(seq),
+                    writes,
+                })
+                .expect("commit");
+        }
+        digests
+    }
+
+    /// Node 2's host over the engine at `path`, which a row filled first.
+    fn host_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
+        let engine = RocksEngine::open(path).expect("open engine");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
+        Host::new(NodeId(2), engine, links, control, HostClock::start())
+    }
+
+    /// A reopen's anchor at `generation`, from `base` with `digest` there.
+    fn anchor_at(generation: u64, base: u64, digest: Digest) -> LineageAnchor {
+        LineageAnchor {
+            lineage: Lineage {
+                partition: PartitionId(1),
+                generation: Generation(generation),
+                owner_epoch: OwnerEpoch(generation),
+            },
+            base_seq: Seq(base),
+            base_digest: digest,
+        }
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// A-R177 row 2 (critic-f5 C1-C4): a copy that missed generation 2, written nowhere, holds
+    /// generation 1 exactly through the anchor's base with the anchor's digest there. Its
+    /// inventory links generation 2 onto generation 1 at the base and reports from it.
+    #[test]
+    fn a_copy_that_missed_a_writeless_generation_links_it_at_inventory() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1])) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(2), digests[1]));
+            }
+            other => panic!("expected a report, got {other:?}"),
+        }
+        assert_eq!(
+            host.engine.link(PartitionId(1), Generation(2)),
+            Some(rdb_storage::Link {
+                parent: Generation(1),
+                base: Seq(2),
+                copied: false,
+            })
+        );
+    }
+
+    /// A commit into generation 2 at `(cutoff, digest)`, as node 2 hears it: a trio's
+    /// bootstrap commit, moved on a generation. Its pin names node 2 a secondary.
+    fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.until("node 1 committed", |trio| {
+            trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+        });
+        let mut result = (*trio.nodes[0].0.committed[&PartitionId(1)]).clone();
+        result.new_generation = Generation(2);
+        result.selected.root.generation = Generation(2);
+        result.selected.cutoff_seq = Seq(cutoff);
+        result.selected.cutoff_digest = digest;
+        result.retained_status_map.predecessor_generation = Generation(1);
+        result
+    }
+
+    /// A-R217 rows: node 1's host, the pinned primary of [`landing_at`]'s commit, over the engine
+    /// at `path`, with an open bound, so a landing it links can go on to `activate`.
+    fn primary_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
+        let engine = RocksEngine::open(path).expect("open engine");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
+        let mut host = Host::new(NodeId(1), engine, links, control, HostClock::start());
+        host.instance = Some([7_u8; INSTANCE_LEN]);
+        host
+    }
+
+    /// The newest generation `host` asked the open counter to mark activated for partition 1.
+    fn asked(host: &Host) -> Generation {
+        host.activation
+            .get(&PartitionId(1))
+            .map_or(Generation::default(), |activation| activation.asked)
+    }
+
+    /// Ruling A-R217 (review-s1 F-001), row 1: the path through `inherit`, which `recovered`
+    /// takes on the copy that ran F1 and `land` takes on a barrier copy. The link is synced
+    /// before `activate` may run: with the WAL sync failing, `recovered` faults and nothing
+    /// asks the open counter to mark generation 2. Without the fault the same landing reaches
+    /// `activate`, so the refusal is the sync's doing. Cut: `sync_link` returns before syncing;
+    /// the armed landing is `Ok` and asks for generation 2, red. Unit, under a second.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_link_that_cannot_be_synced_never_reaches_activate_through_inherit() {
+        let rt = current_thread();
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(0),
+        };
+        for armed in [true, false] {
+            let dir = config_testkit::fs::temp_dir();
+            let path = dir.path().join("node");
+            let digests = write_chain(
+                &mut RocksEngine::open(&path).expect("open engine"),
+                Generation(1),
+                2,
+            );
+            let result = landing_at(2, digests[1]);
+            let mut host = primary_over(&path, &rt);
+            if armed {
+                host.engine
+                    .inject_fault(rdb_storage::InjectedFault::WalFlush);
+                let outcome = host.recovered(&result, site);
+                assert!(
+                    outcome
+                        .as_ref()
+                        .is_err_and(|fault| fault.detail.contains("sync the link")),
+                    "a failed link sync faults the node: {outcome:?}"
+                );
+                assert_eq!(asked(&host), Generation::default(), "activate never ran");
+            } else {
+                host.recovered(&result, site).expect("recovered");
+                assert_eq!(asked(&host), Generation(2), "the landing reaches activate");
+            }
+        }
+    }
+
+    /// Ruling A-R217 (review-s1 F-001), row 2: the path through `land_link`, which `land` takes
+    /// on a copy outside the barrier. That link is synced before `activate` may run too. The
+    /// pinned primary lands here outside an empty barrier, so `schedule_acquire` would ask
+    /// for generation 2 next. Cut: the `sync_link` after `land_link` is dropped; the armed
+    /// landing is `Ok` and asks for generation 2, red. Unit, under a second.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_link_that_cannot_be_synced_never_reaches_activate_through_land_link() {
+        let rt = current_thread();
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(0),
+        };
+        for armed in [true, false] {
+            let dir = config_testkit::fs::temp_dir();
+            let path = dir.path().join("node");
+            let digests = write_chain(
+                &mut RocksEngine::open(&path).expect("open engine"),
+                Generation(1),
+                2,
+            );
+            let mut result = landing_at(2, digests[1]);
+            result.barrier = rdb_core::contracts::recovery::RecoveryBarrier::try_new(
+                &[],
+                &BTreeSet::new(),
+                Seq(2),
+                digests[1],
+            )
+            .expect("an empty barrier");
+            assert!(!in_barrier(&result, NodeId(1)), "node 1 is outside it");
+            let mut host = primary_over(&path, &rt);
+            if armed {
+                host.engine
+                    .inject_fault(rdb_storage::InjectedFault::WalFlush);
+                let outcome = host.land(Box::new(result), site, NodeId(3));
+                assert!(
+                    outcome
+                        .as_ref()
+                        .is_err_and(|fault| fault.detail.contains("sync the link")),
+                    "a failed link sync faults the node: {outcome:?}"
+                );
+                assert_eq!(asked(&host), Generation::default(), "activate never ran");
+            } else {
+                host.land(Box::new(result), site, NodeId(3)).expect("land");
+                assert_eq!(
+                    host.engine.link(PartitionId(1), Generation(2)),
+                    Some(rdb_storage::Link {
+                        parent: Generation(1),
+                        base: Seq(2),
+                        copied: false,
+                    }),
+                    "land_link linked generation 2"
+                );
+                assert_eq!(asked(&host), Generation(2), "the landing reaches activate");
+            }
+        }
+    }
+
+    /// Ruling A-R185 (critic-d7fix (c)): a copy that lands a commit outside its barrier while it
+    /// holds its older generation exactly through the cutoff, with the cutoff digest there,
+    /// links the new generation at the cutoff, gets the receiver a barrier copy gets (A-R185a),
+    /// and answers the `CopyCaughtUp` that `land` sends to F1. Cut: the receiver install is
+    /// dropped, and R1 holds none. Unit, about 2.5 s (the trio's bootstrap window).
+    #[config_log::retcd_test]
+    fn a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_up() {
+        const METHOD: &str =
+            "a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_up";
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        let result = landing_at(2, digests[1]);
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let copy = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(2))
+            .expect("node 2 is pinned")
+            .copy;
+        assert_eq!(
+            host.land_link(PartitionId(1), &result),
+            Some(RecoveryEvent::CopyCaughtUp {
+                copy,
+                head: Seq(2),
+                digest: digests[1],
+            })
+        );
+        assert_eq!(
+            host.engine.link(PartitionId(1), Generation(2)),
+            Some(rdb_storage::Link {
+                parent: Generation(1),
+                base: Seq(2),
+                copied: false,
+            })
+        );
+        let receiver = host
+            .replication
+            .receiver(NodeId(2), PartitionId(1))
+            .expect("a receiver at the cutoff");
+        assert_eq!(
+            (receiver.lineage().generation, receiver.applied_head().seq),
+            (Generation(2), Seq(2))
+        );
+        assert_eq!(logged!(METHOD, "land_link_inherited").len(), 1);
+        assert_eq!(logged!(METHOD, "land_receiver_installed").len(), 1);
+    }
+
+    /// Ruling A-R185 rows 3 and 4 (critic-d7fix C2): a copy holding past the cutoff (data an
+    /// ask must not truncate), or holding a different digest at it, links nothing, installs no
+    /// receiver, answers nothing to send, and logs `land_link_refused` with the reason; the
+    /// host does not fault. Unit, about 2.5 s.
+    #[config_log::retcd_test]
+    fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links_nothing() {
+        const METHOD: &str =
+            "a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links_nothing";
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            3,
+        );
+        let past = landing_at(2, digests[1]);
+        let mut off = past.clone();
+        off.selected.cutoff_seq = Seq(3);
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let held = host.engine.lineages();
+        for result in [&past, &off] {
+            assert_eq!(host.land_link(PartitionId(1), result), None);
+            assert_eq!(host.engine.lineages(), held, "nothing linked");
+            assert!(host
+                .replication
+                .receiver(NodeId(2), PartitionId(1))
+                .is_none());
+            assert_eq!(host.fault, None);
+        }
+        let reasons: Vec<_> = logged!(METHOD, "land_link_refused")
+            .into_iter()
+            .map(|line| line["reason"].clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["held_past_base", "base_digest_differs"].map(serde_json::Value::from)
+        );
+    }
+
+    /// review-r185 ADV2 and ADV3: the refusals no row reached, each by name and at its level.
+    /// A copy holding no older generation has nothing to link, which is expected on a first
+    /// landing, so it logs at info. One already holding the new generation, or one the pin
+    /// does not name, logs at warn. None links, installs a receiver or faults the host. Cut
+    /// (every reason at warn): red. Unit.
+    #[config_log::retcd_test]
+    fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
+        const METHOD: &str = "a_landing_with_nothing_to_link_is_refused_by_name_at_its_level";
+        let result = landing_at(0, Digest::ROOT);
+        let mut outside = result.clone();
+        outside
+            .committed
+            .pinned_config
+            .members
+            .retain(|member| member.node != NodeId(2));
+        let rt = current_thread();
+        let empty = config_testkit::fs::temp_dir();
+        let mut fresh = host_over(&empty.path().join("node"), &rt);
+        let ahead = config_testkit::fs::temp_dir();
+        let path = ahead.path().join("node");
+        write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(2),
+            1,
+        );
+        let mut holding = host_over(&path, &rt);
+        let refuses = |host: &mut Host, result: &RecoveryResult| {
+            let held = host.engine.lineages();
+            assert_eq!(host.land_link(PartitionId(1), result), None);
+            assert_eq!(host.engine.lineages(), held, "nothing linked");
+            assert!(host
+                .replication
+                .receiver(NodeId(2), PartitionId(1))
+                .is_none());
+            assert_eq!(host.fault, None);
+        };
+        refuses(&mut fresh, &result);
+        refuses(&mut holding, &result);
+        refuses(&mut fresh, &outside);
+        let refused: Vec<_> = logged!(METHOD, "land_link_refused")
+            .into_iter()
+            .map(|line| (line["reason"].clone(), line["@l"].clone()))
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                ("anchor_generation_absent", "Information"),
+                ("held_at_or_above_generation", "Warning"),
+                ("not_a_member", "Warning"),
+            ]
+            .map(|(reason, level)| (
+                serde_json::Value::from(reason),
+                serde_json::Value::from(level)
+            ))
+        );
+    }
+
+    /// A-R177 rows 3-5 (critic-f5 C2): the guards refuse before anything is written, each by
+    /// name: the digest at the base differs, the copy holds past the base (uncertain data an
+    /// ask must not truncate), or below it.
+    #[test]
+    fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            3,
+        );
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let held = host.engine.lineages();
+        for (anchor, reason) in [
+            (
+                anchor_at(2, 3, digests[1]),
+                "missed_generation_base_digest_differs",
+            ),
+            (
+                anchor_at(2, 2, digests[1]),
+                "missed_generation_held_past_base",
+            ),
+            (
+                anchor_at(2, 4, digests[2]),
+                "missed_generation_held_below_base",
+            ),
+        ] {
+            assert_eq!(
+                host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
+                Err(reason)
+            );
+            assert_eq!(
+                host.inventory(PartitionId(1), CopyId(1), anchor),
+                RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+            );
+            assert_eq!(host.engine.lineages(), held, "{reason}: nothing written");
+        }
+    }
+
+    /// S1-8 D2: each `step_view` line names the depth of the view it built, the levels a read
+    /// through it walks (O(1), never a walk of the lineage). Generation 1 holds its own
+    /// writes, one level; generation 2 inherited onto it reads through two.
+    #[config_log::retcd_test]
+    fn the_step_view_line_names_the_view_depth() {
+        const METHOD: &str = "the_step_view_line_names_the_view_depth";
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 2);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(2))
+            .expect("inherit");
+        drop(engine);
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        for generation in [Generation(1), Generation(2)] {
+            host.refresh_view(PartitionId(1), generation)
+                .expect("step view");
+        }
+        let depths: Vec<_> = logged!(METHOD, "step_view")
+            .into_iter()
+            .map(|line| (line["generation"].clone(), line["depth"].clone()))
+            .collect();
+        assert_eq!(
+            depths,
+            [(1, 1), (2, 2)].map(|(g, d)| (serde_json::json!(g), serde_json::json!(d))),
+            "the step_view lines"
+        );
+    }
+
+    /// A-R177 row 6 (critic-f5 C1): a link onto a parent already at the chain ceiling would be
+    /// a multi-batch flatten inside the discovery window, so it is refused, nothing staged.
+    #[test]
+    fn a_missed_generation_is_not_linked_onto_a_parent_at_the_chain_ceiling() {
+        let ceiling = MAX_CHAIN_DEPTH as u64;
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            let digests = write_chain(&mut engine, Generation(1), 2);
+            for to in 2..=ceiling {
+                assert_eq!(
+                    engine.inherit(PartitionId(1), Generation(to - 1), Generation(to), Seq(2)),
+                    Ok(Inherited::Linked)
+                );
+            }
+            assert_eq!(
+                engine.chain_depth(PartitionId(1), Generation(ceiling)),
+                MAX_CHAIN_DEPTH
+            );
+            digests
+        };
+        let rt = current_thread();
+        let mut host = host_over(&path, &rt);
+        let held = host.engine.lineages();
+        let anchor = anchor_at(ceiling + 1, 2, digests[1]);
+        assert_eq!(
+            host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
+            Err("missed_generation_link_depth_ceiling")
+        );
+        assert_eq!(host.engine.lineages(), held, "nothing staged or linked");
+    }
+
+    /// A-R177 row 8 (critic-f5 C3): the node stops after the link and before its answer. The
+    /// next open's inventory, from the same directory, reports as a copy that landed the
+    /// generation, and the link is unchanged.
+    #[test]
+    fn a_link_made_at_inventory_survives_a_restart_before_the_answer() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            2,
+        );
+        let anchor = anchor_at(2, 2, digests[1]);
+        let rt = current_thread();
+        {
+            let mut host = host_over(&path, &rt);
+            assert!(host.survivor(PartitionId(1), CopyId(1), anchor).is_ok());
+        }
+        let mut host = host_over(&path, &rt);
+        match host.inventory(PartitionId(1), CopyId(1), anchor) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(2), digests[1]));
+            }
+            other => panic!("expected a report after the restart, got {other:?}"),
+        }
+        assert_eq!(
+            host.engine.link(PartitionId(1), Generation(2)),
+            Some(rdb_storage::Link {
+                parent: Generation(1),
+                base: Seq(2),
+                copied: false,
+            })
         );
     }
 
@@ -5883,6 +9100,154 @@ mod tests {
             .collect()
     }
 
+    /// A-R165 item 2: after an `Active` commit the primary's first `Acquire` is queued
+    /// [`ACQUIRE_AFTER_ACTIVE_MILLIS`] out; after any other commit it keeps
+    /// [`ACQUIRE_AFTER_RECOVERED_MILLIS`]. Three nodes with no holds commit `Active`; with node
+    /// 1's links to 2 and 3 held, F1 commits `ReadOnly`. The firing is read off node 1's queue
+    /// in the round the commit lands, before it can fire.
+    /// Integration (~4 s): two discovery windows.
+    #[test]
+    fn the_first_acquire_after_an_active_commit_is_queued_sooner() {
+        let first_acquire = |held: bool| {
+            let dir = config_testkit::fs::temp_dir();
+            let mut trio = Trio::new(dir.path(), Trio::fast);
+            if held {
+                trio.links.hold(NodeId(1), NodeId(2));
+                trio.links.hold(NodeId(1), NodeId(3));
+            }
+            trio.bootstrap();
+            trio.until("F1 committed on node 1", |trio| {
+                trio.status(0).recovered.map(|_| {
+                    let now = trio.clock.now().0;
+                    queued_acquires(&trio.nodes[0].0)
+                        .iter()
+                        .map(|(at, _)| at.0.saturating_sub(now))
+                        .collect::<Vec<_>>()
+                })
+            })
+        };
+        let active = first_acquire(false);
+        let [left] = active.as_slice() else {
+            panic!("one Acquire queued after the Active commit, not {active:?}");
+        };
+        assert!(
+            *left <= ACQUIRE_AFTER_ACTIVE_MILLIS,
+            "Active: due in {left} ms"
+        );
+        let read_only = first_acquire(true);
+        let [left] = read_only.as_slice() else {
+            panic!("one Acquire queued after the ReadOnly commit, not {read_only:?}");
+        };
+        assert!(
+            *left > ACQUIRE_AFTER_ACTIVE_MILLIS && *left <= ACQUIRE_AFTER_RECOVERED_MILLIS,
+            "ReadOnly: due in {left} ms"
+        );
+    }
+
+    /// D7 host wiring (B-R59, the sim's `catch_up`): F1's `CatchUp` on node 1 goes to node 2,
+    /// which holds the source copy; R1 there sends its stored records to node 3 as recovery
+    /// appends, and its `CopyCaughtUp` comes back to node 1, the node that asked. Live receivers
+    /// stand in for the sides a reopen does not have yet (A-R173 rules on those).
+    /// Integration (~3 s): bootstrap's discovery window, then one catch-up.
+    #[config_log::retcd_test]
+    fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
+        use rdb_core::contracts::ids::Revision;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let receivers = |trio: &Trio| {
+            [1usize, 2].map(|i| {
+                let host = &trio.nodes[i].0;
+                host.replication
+                    .receiver(host.node, PartitionId(1))
+                    .map(|receiver| (receiver.lineage(), receiver.applied_head().seq))
+            })
+        };
+        let (lineage, through) = trio.until("nodes 2 and 3 hold node 1's head", |trio| {
+            let head = trio.head()?;
+            match receivers(trio) {
+                [Some((lineage, a)), Some((_, b))] if a.0 == head && b.0 == head && head > 0 => {
+                    Some((lineage, a))
+                }
+                _ => None,
+            }
+        });
+        let credential = FenceCredential {
+            partition: PartitionId(1),
+            prior_generation: lineage.generation,
+            prior_owner_epoch: lineage.owner_epoch,
+            control_revision: Revision(u64::MAX),
+            sender: CopyId(1),
+        };
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(u64::MAX),
+        };
+        let effect = RecoveryEffect::CatchUp {
+            from: CopyId(1),
+            to: CopyId(2),
+            through,
+            credential,
+        };
+        trio.nodes[0]
+            .0
+            .recovery_effect(&effect, site)
+            .expect("routed");
+
+        // Node 1's mail is read here before it is handled, to see the report arrive.
+        let patience = test_patience(Trio::PATIENCE);
+        let deadline = Instant::now() + patience;
+        let reported = loop {
+            let mut reported = None;
+            for (host, _, rx) in &mut trio.nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    if let Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp { copy, head, .. }),
+                        correlation,
+                        ..
+                    } = &msg
+                    {
+                        reported = Some((host.node, *copy, *head, *correlation));
+                    }
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+            if let Some(reported) = reported {
+                break reported;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no CopyCaughtUp reached node 1 within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            reported,
+            (NodeId(1), CopyId(2), through, CorrelationId(u64::MAX)),
+            "node 2's report reaches node 1 under the asking correlation"
+        );
+        assert!(
+            trio.nodes[1].0.catch_ups.is_empty(),
+            "the source forgets the asker once it has reported"
+        );
+        let sent: Vec<_> = config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            "d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked",
+        )
+        .into_iter()
+        .filter(|line| line["@m"] == "recovery_envelopes_sent")
+        .map(|line| (line["node"].clone(), line["to"].clone()))
+        .collect();
+        assert!(
+            sent.contains(&(serde_json::json!(2), serde_json::json!(3))),
+            "node 2 sent recovery appends to node 3: {sent:?}"
+        );
+    }
+
     /// Message 6, round 4 (A-R96 host trigger and status). A node fence queues one `Acquire`
     /// firing at A1's current `Acquire` timer version, one renewal later: the kernel drops a
     /// firing older than that version as stale, and without the firing A1 never polls its grant
@@ -5927,6 +9292,17 @@ mod tests {
             assert_eq!(fired.scheduled_at, *at, "fence {fence}");
             versions.push(current.0);
 
+            // D15: A1 re-arms `Acquire` only when a poll does not acquire. While the store is
+            // down every poll reads `Unavailable` and re-arms, so wait for that before the store
+            // returns. Otherwise a first poll that comes after the old grant expires acquires at
+            // once, and the version stays 0 (seen under load). Versions never fall in a boot,
+            // so the second fence's version is above 0 by construction.
+            if fence == 1 {
+                trio.until("A1 re-armed Acquire during the outage", |trio| {
+                    let host = &trio.nodes[0].0;
+                    (host.authority.timer_version(AuthorityTimer::Acquire) > current).then_some(())
+                });
+            }
             trio.mem.stop_failing();
             trio.until("node 1 holds a grant again", |trio| {
                 (trio.status(0).admits == Some(true)).then_some(())
@@ -6265,7 +9641,10 @@ mod tests {
                 },
             )
             .expect_err("a forged digest faults the node");
-        assert!(fault.contains("does not match the step view"), "{fault}");
+        assert!(
+            fault.detail.contains("does not match the step view"),
+            "{fault:?}"
+        );
         // The waiting read is told the host faulted, at once, not left to time out as "no read
         // answer in 1s" (lead ruling 3, 2026-10-07).
         match answer.try_recv() {
@@ -6274,7 +9653,7 @@ mod tests {
                 request: None,
             }) => {
                 assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
-                assert_eq!(error.detail, format!("host fault: {fault}"));
+                assert_eq!(error.detail, format!("host fault: {}", fault.detail));
             }
             other => panic!("the waiting read is answered with the fault: {other:?}"),
         }
@@ -6312,18 +9691,78 @@ mod tests {
                 reply,
             }));
             let fault = host.fault.clone().expect("the node faulted");
-            assert!(fault.contains("injected"), "{name}: {fault}");
+            assert!(fault.detail.contains("injected"), "{name}: {fault:?}");
             match answered_now(&answer) {
                 Some(Answer::Error {
                     error,
                     request: None,
                 }) => assert_eq!(
                     (error.retry, error.detail),
-                    (RetryRule::NotWired, format!("host fault: {fault}")),
+                    (RetryRule::NotWired, format!("host fault: {}", fault.detail)),
                     "{name}"
                 ),
                 other => panic!("{name}: the caller is told the host faulted: {other:?}"),
             }
+        }
+    }
+
+    /// S1-8, admits at fault: a faulted node answers every call with its fault, so its status
+    /// never says it admits writes, though L1 still allows and A1 still holds its grant.
+    /// Before, `admits` read only L1 and A1 and said `true` beside `fault`.
+    #[test]
+    fn a_faulted_node_does_not_say_it_admits_writes() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let host = &mut trio.nodes[0].0;
+        host.fail_step_view = true;
+        let (reply, _answer) = mpsc::channel();
+        host.handle(Msg::Client(Client {
+            partition: PartitionId(1),
+            call: put(1, b"a", b"1", None),
+            reply,
+        }));
+        let status = trio.status(0);
+        assert!(status.fault.is_some(), "the node faulted: {status:?}");
+        assert_eq!(status.admits, Some(false), "{status:?}");
+    }
+
+    /// A-R178, the pending loop: a put already dispatched, waiting on its copies, when the
+    /// node faults on stored damage, is answered with that damage: `CORRUPT_HISTORY`, retry
+    /// `Quarantine`, its request named, and `no_mutation` false as before, since it was sent.
+    /// Only node 1 steps, so no copy acks and the put stays pending.
+    #[test]
+    fn a_dispatched_put_is_refused_with_the_damage_its_node_faulted_on() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let answer = trio.call(put(1, b"a", b"1", None));
+        let (host, _, rx) = &mut trio.nodes[0];
+        let deadline = Instant::now() + test_patience(Duration::from_secs(5));
+        while host.pending.is_empty() {
+            assert!(Instant::now() < deadline, "the put was never dispatched");
+            while let Ok(msg) = rx.try_recv() {
+                host.handle(msg);
+            }
+            host.drain();
+        }
+        assert!(answer.try_recv().is_err(), "the put is still waiting");
+        host.set_fault(Fault {
+            damage: Some(ErrorKind::CorruptHistory),
+            detail: "a damaged read".to_owned(),
+        });
+        match answer.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: Some(_),
+            }) => assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, false),
+                "{error:?}"
+            ),
+            other => panic!("the pending put is answered with the damage: {other:?}"),
         }
     }
 
@@ -6378,7 +9817,7 @@ mod tests {
                     request: None,
                 }) => assert_eq!(
                     (error.retry, error.detail),
-                    (RetryRule::NotWired, format!("host fault: {fault}")),
+                    (RetryRule::NotWired, format!("host fault: {}", fault.detail)),
                     "{name}"
                 ),
                 other => panic!("{name}: the caller is told the host faulted: {other:?}"),
@@ -7036,6 +10475,574 @@ mod tests {
                 .all(|line| line["node"] == 1 && line["partition"] == 1),
             "nothing trimmed for the idle partition: {trims:?}"
         );
+    }
+
+    /// D6 (ruling A-R172): the trim duty deletes trimmed Dedup rows on disk at most once per a
+    /// quarter of the retention, with the latest floor. Trim ticks every 50 ms and a 400 ms
+    /// retention make a 100 ms period; puts about 40 ms apart give a trim on most ticks. So
+    /// the deletes run, but on fewer ticks than the trims, and node 1's disk keeps fewer
+    /// generation-1 Dedup rows than it wrote. A delete on every trim fails the count.
+    /// Trio (~3 s): a 1.5 s run of puts on real trim ticks.
+    #[config_log::retcd_test]
+    fn the_durable_trim_delete_runs_at_most_once_per_period() {
+        use rdb_core::transaction::dedup::parse_dedup_key;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.trim_every_millis = 50;
+            host.budgets.dedup_retention_millis = 400;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let until = trio.clock.now().plus_millis(1_500);
+        let mut request = 1;
+        let mut landed = 0_usize;
+        while trio.clock.now() < until {
+            match trio.ask(put(request, b"a", b"1", None)) {
+                Answer::Txn { .. } => landed += 1,
+                Answer::Error { error, .. } => {
+                    assert_ne!(
+                        error.kind,
+                        ErrorKind::Overloaded,
+                        "put {request}: {error:?}"
+                    );
+                }
+                other => panic!("put {request}: {other:?}"),
+            }
+            request += 1;
+            let next = trio.clock.now().plus_millis(40);
+            trio.until("40 ms", |trio| (trio.clock.now() >= next).then_some(()));
+        }
+        let owner = &trio.nodes[0].0;
+        let (trims, deletes) = (owner.trims_sent, owner.trim_deletes);
+        assert!(trims >= 4, "trims {trims}, deletes {deletes}");
+        assert!(
+            deletes >= 1 && deletes < trims,
+            "trims {trims}, deletes {deletes}: at most one delete per period"
+        );
+        let view = owner
+            .engine
+            .snapshot(PartitionId(1), Generation(1), STEP_VIEW)
+            .expect("view");
+        let held = view
+            .scan(Namespace::Dedup, &[], usize::MAX)
+            .into_iter()
+            .filter(|(key, _)| {
+                parse_dedup_key(key).is_some_and(|key| key.generation == Generation(1))
+            })
+            .count();
+        assert!(
+            held < landed,
+            "node 1 holds {held} generation-1 Dedup rows of {landed} puts that landed"
+        );
+    }
+
+    /// A-R183 rows: the `(generation, below)` of every `DedupTrim` the host queued.
+    fn dedup_trims_queued(host: &Host) -> Vec<(u64, u64)> {
+        host.queue
+            .iter()
+            .filter_map(|queued| match queued.event.kind {
+                EventKind::Kernel(KernelEvent::DedupTrim { generation, below }) => {
+                    Some((generation.0, below.0))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A-R183 rows: a reopened copy of partition 1 that served generation 1 through seq 7 and
+    /// now serves generation `serving`, linked onto it, with `marks` left by an earlier process.
+    fn reopened_with_marks(path: &std::path::Path, serving: u64, marks: &[Mark]) {
+        let mut engine = RocksEngine::open(path).expect("open engine");
+        if engine.lineages().is_empty() {
+            write_chain(&mut engine, Generation(1), 7);
+        }
+        for to in 2..=serving {
+            if !engine
+                .lineages()
+                .contains(&(PartitionId(1), Generation(to)))
+            {
+                engine
+                    .inherit(PartitionId(1), Generation(to - 1), Generation(to), Seq(7))
+                    .expect("inherit");
+            }
+        }
+        engine
+            .put_publish_marks(PartitionId(1), &publish_marks(marks))
+            .expect("put marks");
+    }
+
+    /// A-R183 row 1, the tail (critic-d6b F1/F3), and A-R193: marks left by an earlier process
+    /// reach seq 5 of generation 1, published two retentions ago. The restore itself trims
+    /// seqs 1-5, before the landing's `Recovered`, with no trim tick, and nothing above: rows 6
+    /// and 7 were never marked, so they wait for the landing plus the retention, as before. The
+    /// floor keeps seq 5's tick read as later by the clock error (C5); restored out of order, the
+    /// trim would stop below seq 4.
+    #[test]
+    fn a_reopen_trims_what_the_marks_cover_at_restore_and_spares_the_tail() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let old = Tick(now.0 - 2 * retention);
+        reopened_with_marks(
+            &path,
+            2,
+            &[
+                (Generation(1), Seq(3), old),
+                (Generation(1), Seq(5), old.plus_millis(10)),
+            ],
+        );
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(2))
+            .expect("restore");
+        let epsilon = Budgets::SPEC_DEFAULTS.clock_error_millis;
+        assert_eq!(
+            dedup_trims_queued(&host),
+            [(1, 6)],
+            "one trim at restore, below seq 6"
+        );
+        assert_eq!(
+            host.trim_floors[&(PartitionId(1), Generation(1))],
+            (Seq(6), old.plus_millis(10 + epsilon)),
+            "the floor is seq 5's tick read as later by the clock error (C5)"
+        );
+        assert!(
+            host.published_at[&PartitionId(1)].is_empty(),
+            "nothing marked is left to age"
+        );
+        host.trim_duty(host.clock.now()).expect("trim");
+        assert_eq!(dedup_trims_queued(&host), [(1, 6)], "the tick adds no trim");
+        assert_eq!(host.trim_deletes, 1, "the floor is deleted on disk too");
+    }
+
+    /// PR #60 review F2: marks of two generations, both a retention old, as several clean
+    /// reopens inside one window leave them. The restore trims both before the landing's
+    /// `Recovered`, a `DedupTrim` and a `StatusTrim` for each, with no trim tick. Before, the
+    /// sweep stopped at the first generation's end, and generation 2's entries counted against
+    /// the dedup cap until later ticks took them one generation each. Cut: `trim_aged` takes
+    /// one generation per sweep, and only generation 1 is queued.
+    #[test]
+    fn a_reopen_trims_the_aged_marks_of_every_generation_at_restore() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let old = Tick(now.0 - 2 * retention);
+        reopened_with_marks(
+            &path,
+            3,
+            &[
+                (Generation(1), Seq(5), old),
+                (Generation(2), Seq(9), old.plus_millis(10)),
+            ],
+        );
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(3))
+            .expect("restore");
+        assert_eq!(
+            dedup_trims_queued(&host),
+            [(1, 6), (2, 10)],
+            "both generations trimmed at restore"
+        );
+        let status_trims: Vec<(u64, u64)> = host
+            .queue
+            .iter()
+            .filter_map(|queued| match queued.event.kind {
+                EventKind::Kernel(KernelEvent::StatusTrim { generation, below }) => {
+                    Some((generation.0, below.0))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(status_trims, [(1, 6), (2, 10)], "and both status floors");
+        assert!(
+            host.published_at[&PartitionId(1)].is_empty(),
+            "nothing aged is left"
+        );
+    }
+
+    /// A-R183 row 2: a store with no marks (a crash before the first write of marks, or data
+    /// from an older build) restores nothing, and the first trim takes nothing.
+    #[test]
+    fn a_reopen_with_no_marks_trims_nothing_on_its_first_tick() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(2))
+            .expect("restore");
+        host.trim_duty(host.clock.now()).expect("trim");
+        assert_eq!(dedup_trims_queued(&host), [], "nothing trimmed");
+    }
+
+    /// A-R183 row 3, the daily restart (critic-d6b F2): a middle process restores generation
+    /// 1's marks, publishes nothing, writes its marks and quits before they age. The next
+    /// reopen still holds them and, once they age, trims generation 1 at once. A process that
+    /// wrote only what it published itself would erase them, and generation 1 would wait for
+    /// a landing plus the retention after every restart.
+    #[test]
+    fn publish_marks_outlive_a_process_that_published_nothing() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let period = trim_delete_period(retention);
+        let young = Tick(now.0 - retention / 2);
+        reopened_with_marks(&path, 2, &[(Generation(1), Seq(5), young)]);
+        {
+            let mut middle = host_over(&path, &rt);
+            // A trim tick before the landing writes nothing: no marks were read yet.
+            middle.trim_duty(now).expect("a tick before the landing");
+            middle
+                .restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            middle.trim_duty(now).expect("trim");
+            middle
+                .trim_duty(now.plus_millis(period + 1_000))
+                .expect("a mark write");
+            assert_eq!(
+                dedup_trims_queued(&middle),
+                [],
+                "not aged in the middle process"
+            );
+        }
+        RocksEngine::open(&path)
+            .expect("open engine")
+            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(7))
+            .expect("inherit");
+        let mut next = host_over(&path, &rt);
+        next.restore_marks(PartitionId(1), Generation(3))
+            .expect("restore");
+        next.trim_duty(young.plus_millis(retention + 1_000))
+            .expect("trim");
+        assert_eq!(
+            dedup_trims_queued(&next),
+            [(1, 6)],
+            "generation 1 trimmed at once"
+        );
+    }
+
+    /// A-R186: a clean stop writes the publish marks at once, inside the mark period. The host
+    /// restored its marks (none), then published seqs 6 and 7 of generation 1. Its stop through
+    /// `run` leaves both on disk, ticks verbatim (C1), with no trim tick in between. Without the
+    /// final write the disk keeps the empty set and a reopen ages them from its landing.
+    #[test]
+    fn a_clean_stop_writes_the_publish_marks_at_once() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let now = HostClock::start().now();
+        let published = [
+            (Generation(1), Seq(6), Tick(now.0 - 20)),
+            (Generation(1), Seq(7), Tick(now.0 - 10)),
+        ];
+        {
+            let mut host = host_over(&path, &rt);
+            host.restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            host.published_at
+                .entry(PartitionId(1))
+                .or_default()
+                .extend(published);
+            let (tx, rx) = mpsc::channel();
+            tx.send(Msg::Stop).expect("send stop");
+            host.run(&rx);
+        }
+        let marks: Vec<Mark> = RocksEngine::open(&path)
+            .expect("open engine")
+            .publish_marks(PartitionId(1))
+            .expect("read marks")
+            .into_iter()
+            .map(|mark| (mark.generation, mark.seq, mark.tick))
+            .collect();
+        assert_eq!(marks, published, "the stop wrote both marks verbatim");
+    }
+
+    /// A-R183, lead k205: rows trimmed in memory but not yet deleted on disk keep their mark. A
+    /// process trims generation 1 below 6 and quits inside the delete period, so seqs 1-5 are
+    /// still on disk. The next reopen trims them on its first tick, from their publish, not a
+    /// retention after its landing. Marks taken from the in-memory queue alone dropped them.
+    #[test]
+    fn rows_trimmed_but_not_yet_deleted_keep_their_mark_across_a_reopen() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
+        let period = trim_delete_period(retention);
+        let old = Tick(now.0 - 2 * retention);
+        reopened_with_marks(&path, 2, &[(Generation(1), Seq(5), old)]);
+        {
+            let mut first = host_over(&path, &rt);
+            first
+                .restore_marks(PartitionId(1), Generation(2))
+                .expect("restore");
+            // The last delete ran just now, so this process quits before the next one.
+            first
+                .trim_deleted_at
+                .insert(PartitionId(1), now.plus_millis(1_000));
+            first.trim_duty(now).expect("trim");
+            first
+                .trim_duty(now.plus_millis(period + 500))
+                .expect("a mark write");
+            assert_eq!(dedup_trims_queued(&first), [(1, 6)], "trimmed in memory");
+            assert_eq!(first.trim_deletes, 0, "seqs 1-5 are still on disk");
+        }
+        RocksEngine::open(&path)
+            .expect("open engine")
+            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(7))
+            .expect("inherit");
+        let mut next = host_over(&path, &rt);
+        next.restore_marks(PartitionId(1), Generation(3))
+            .expect("restore");
+        next.trim_duty(next.clock.now()).expect("trim");
+        assert_eq!(
+            dedup_trims_queued(&next),
+            [(1, 6)],
+            "generation 1 trimmed on the first tick"
+        );
+    }
+
+    /// A-R183 row 4 (critic-d6b C3): a mark of a lineage the engine does not hold, or of a
+    /// generation not below the one served, is not restored, and the node does not fault. A
+    /// restored mark of generation 1 here would send a durable delete for a lineage the engine
+    /// does not hold, which faults the node.
+    #[test]
+    fn publish_marks_of_a_lineage_not_held_or_not_older_are_not_restored() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        let now = HostClock::start().now();
+        let old = Tick(now.0 - 2 * Budgets::SPEC_DEFAULTS.dedup_retention_millis);
+        {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            write_chain(&mut engine, Generation(2), 2);
+            engine
+                .put_publish_marks(
+                    PartitionId(1),
+                    &publish_marks(&[
+                        (Generation(1), Seq(5), old),
+                        (Generation(2), Seq(1), old),
+                        (Generation(3), Seq(1), old),
+                    ]),
+                )
+                .expect("put marks");
+        }
+        let mut host = host_over(&path, &rt);
+        host.restore_marks(PartitionId(1), Generation(2))
+            .expect("restore");
+        host.trim_duty(host.clock.now())
+            .expect("no mark restored, so no delete to fault on");
+        assert_eq!(dedup_trims_queued(&host), [], "nothing trimmed");
+    }
+
+    /// critic-d6b C6: floors of two generations of one partition trimmed inside one delete
+    /// period are both deleted on disk when the period ends. Keyed by partition alone, the
+    /// newer floor overwrote the older, and the older generation's rows stayed on disk.
+    #[test]
+    fn two_generations_trimmed_in_one_delete_period_are_both_deleted() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        let mut host = host_over(&path, &rt);
+        let now = host.clock.now();
+        let retention = host.budgets.dedup_retention_millis;
+        let old = Tick(now.0 - 2 * retention);
+        host.published_at.insert(
+            PartitionId(1),
+            VecDeque::from([(Generation(1), Seq(3), old), (Generation(2), Seq(9), old)]),
+        );
+        host.trim_deleted_at.insert(PartitionId(1), now);
+        host.trim_duty(now).expect("trim generation 1");
+        host.trim_duty(now).expect("trim generation 2");
+        assert_eq!(dedup_trims_queued(&host), [(1, 4), (2, 10)]);
+        assert_eq!(host.trim_deletes, 0, "inside the period");
+        host.trim_duty(now.plus_millis(trim_delete_period(retention)))
+            .expect("the period ends");
+        assert_eq!(host.trim_deletes, 2, "both floors deleted");
+    }
+
+    /// A-R183 row 5 (critic-d6b candidate 3): an `OVERLOADED` from a full dedup index says when
+    /// the trim duty can first free room: not before the first retire due or the oldest publish
+    /// one retention on, at the trim tick that runs it. Kind and retry rule stay the kernel's.
+    /// Trio (~2 s): a cap of 2 and a 5-minute retention, so nothing frees while it runs.
+    #[config_log::retcd_test]
+    fn a_dedup_cap_overload_says_when_the_cap_can_first_free() {
+        const RETENTION: u64 = 300_000;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = RETENTION;
+            host.transaction = Transaction::with_limits(Limits {
+                dedup_cap: 2,
+                ..Limits::default()
+            });
+        });
+        trio.bootstrap();
+        trio.ready();
+        for (request, key) in [(1, b"a"), (2, b"b")] {
+            match trio.ask(put(request, key, b"1", None)) {
+                Answer::Txn { .. } => {}
+                other => panic!("put {request}: {other:?}"),
+            }
+        }
+        let error = match trio.ask(put(3, b"c", b"1", None)) {
+            Answer::Error { error, .. } => error,
+            other => panic!("put 3 on a full cap: {other:?}"),
+        };
+        let answered = trio.clock.now();
+        assert_eq!(
+            (error.kind, error.retry),
+            (ErrorKind::Overloaded, RetryRule::BoundedJitter),
+            "{error:?}"
+        );
+        let owner = &trio.nodes[0].0;
+        let due = owner
+            .retire_due
+            .values()
+            .copied()
+            .chain(
+                owner
+                    .published_at
+                    .get(&PartitionId(1))
+                    .and_then(VecDeque::front)
+                    .map(|&(_, _, at)| at.plus_millis(RETENTION)),
+            )
+            .min()
+            .expect("a free is scheduled");
+        let after = error.retry_after().expect("a not-before hint");
+        assert!(
+            answered.plus_millis(u64::try_from(after.as_millis()).expect("millis")) >= due,
+            "the hint {after:?} names a time before the earliest free {due:?}"
+        );
+        assert!(
+            after <= Duration::from_millis(RETENTION + owner.trim_every_millis),
+            "the hint {after:?} is past one retention and a trim tick"
+        );
+        assert!(error.detail.contains("not before ~"), "{error:?}");
+    }
+
+    /// A-R187 (A-R209): a full dedup cap that nothing scheduled frees gives no hint, never an
+    /// invented one. Node 1 holds two scheduled frees that free nothing T1 holds. One is real:
+    /// the bootstrap's publish at seq 1, which carries no request, so T1 retained nothing for
+    /// it. The other is a retire due for the generation node 1 serves, below which no generation
+    /// holds a row. Before A-R187 each was named as the hint. Cut either half of the rule and
+    /// the hint comes back.
+    ///
+    /// Constructed: T1's two entries are real puts, and their own buckets are taken out by hand.
+    /// That stands in for entries no bucket covers (a condition failure T1 retains, A-R108),
+    /// which this Trio cannot retain at the cap without a publish; the retire due is set by
+    /// hand too. Trio (~1 s), a 5-minute retention.
+    #[config_log::retcd_test]
+    fn a_full_dedup_cap_that_nothing_scheduled_frees_gives_no_hint() {
+        const RETENTION: u64 = 300_000;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = RETENTION;
+            host.transaction = Transaction::with_limits(Limits {
+                dedup_cap: 2,
+                ..Limits::default()
+            });
+        });
+        trio.bootstrap();
+        trio.ready();
+        for (request, key) in [(1, b"a"), (2, b"b")] {
+            match trio.ask(put(request, key, b"1", None)) {
+                Answer::Txn { .. } => {}
+                other => panic!("put {request}: {other:?}"),
+            }
+        }
+        let owner = &mut trio.nodes[0].0;
+        let kernel = owner
+            .transaction
+            .kernel(owner.node, PartitionId(1))
+            .expect("node 1 serves partition 1");
+        assert_eq!(kernel.dedup().len(), 2, "the cap is full");
+        let served = kernel.lineage().generation;
+        let published = owner
+            .published_at
+            .get_mut(&PartitionId(1))
+            .expect("the puts published");
+        published.retain(|&(_, seq, _)| seq == Seq(1));
+        assert_eq!(
+            published
+                .iter()
+                .map(|&(g, seq, _)| (g, seq))
+                .collect::<Vec<_>>(),
+            [(served, Seq(1))],
+            "the bootstrap's publish is left"
+        );
+        let now = owner.clock.now();
+        owner
+            .retire_due
+            .insert((PartitionId(1), served), now.plus_millis(2_000));
+
+        let error = match trio.ask(put(3, b"c", b"1", None)) {
+            Answer::Error { error, .. } => error,
+            other => panic!("put 3 on a full cap: {other:?}"),
+        };
+        assert_eq!(
+            (error.kind, error.retry),
+            (ErrorKind::Overloaded, RetryRule::BoundedJitter),
+            "{error:?}"
+        );
+        assert_eq!(error.retry_after(), None, "{error:?}");
+        assert!(!error.detail.contains("not before"), "{error:?}");
+    }
+
+    /// A-R183 with A-R164: publish marks that do not decode fault the restore, so the landing
+    /// faults the node. They are never read as "no marks", which would hide the damage.
+    #[test]
+    fn undecodable_publish_marks_fault_the_restore() {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let rt = current_thread();
+        reopened_with_marks(&path, 2, &[]);
+        {
+            let raw = rocksdb::DB::open_cf(
+                &rocksdb::Options::default(),
+                &path,
+                rdb_storage::keys::COLUMN_FAMILIES,
+            )
+            .expect("raw open");
+            let cf = raw.cf_handle(rdb_storage::keys::CF_METADATA).expect("cf");
+            let mut key = b"publish".to_vec();
+            key.extend_from_slice(&1_u32.to_be_bytes());
+            raw.put_cf(cf, &key, [1, 2, 3]).expect("raw put");
+        }
+        let mut host = host_over(&path, &rt);
+        let fault = host
+            .restore_marks(PartitionId(1), Generation(2))
+            .expect_err("a fault, not an empty list");
+        assert_eq!(fault.detail, "publish marks of p1: Corrupt", "{fault:?}");
+    }
+
+    /// A-R183 C2: the marks of a long queue are at most [`PUBLISH_MARKS`] spread along it, plus
+    /// the newest entry of each generation, in order.
+    #[test]
+    fn publish_marks_sample_the_queue_and_keep_each_generations_newest() {
+        let mut published: VecDeque<(Generation, Seq, Tick)> = (1..=1_000)
+            .map(|seq| (Generation(1), Seq(seq), Tick(seq)))
+            .collect();
+        published.extend((1_001..=1_003).map(|seq| (Generation(2), Seq(seq), Tick(seq))));
+        let marks = sample_marks(&published);
+        assert!(marks.len() <= PUBLISH_MARKS + 2, "{} marks", marks.len());
+        assert!(marks.len() >= PUBLISH_MARKS / 2, "{} marks", marks.len());
+        assert!(marks.contains(&(Generation(1), Seq(1_000), Tick(1_000))));
+        assert_eq!(
+            marks.last(),
+            Some(&(Generation(2), Seq(1_003), Tick(1_003)))
+        );
+        assert!(marks.windows(2).all(|pair| pair[0] < pair[1]), "in order");
+        assert_eq!(sample_marks(&VecDeque::new()), []);
     }
 
     /// M9 S3-5c, guard 1: a write ages from its publication, never from its commit. Node 1
@@ -8385,7 +12392,8 @@ mod tests {
         };
         assert_eq!(trio.sent(damage), Ok(3));
 
-        let named = "op 0: written by a newer build: map entry \"b\": unknown codec version 0x02";
+        let named = "op 0: written by a newer build: map entry \"b\": unknown codec version 0x02; \
+                     open the folder with the newer build";
         for (request, ops) in [
             (
                 3,
@@ -8470,7 +12478,7 @@ mod tests {
                 ErrorKind::IncompatibleVersion,
                 format!(
                     "op 0: written by a newer build: map entry \"{ENTRY}\": unknown codec \
-                     version 0x02"
+                     version 0x02; open the folder with the newer build"
                 ),
             ),
             (
@@ -8694,7 +12702,7 @@ mod tests {
                     line["root"].clone(),
                     line["deletes"].clone(),
                     line["faulting"].clone(),
-                    line["object"].clone(),
+                    line["key_hex"].clone(),
                 )
             })
             .collect();
@@ -8704,7 +12712,7 @@ mod tests {
                 root.into(),
                 deletes.into(),
                 faulting.into(),
-                "o".into(),
+                "6f".into(),
             )
         };
         assert_eq!(
@@ -8716,6 +12724,120 @@ mod tests {
             ],
             "{lines:?}"
         );
+    }
+
+    /// D9 (ADR-0013): the damage lines name the object by `key_hex`, its id's first 32 bytes
+    /// as lowercase hex, and never by its text. `stored_damage`, with and without a chunk, and
+    /// `clear_compiled` for the tester's `zqa` and for a 40-byte id cut to 32 bytes.
+    /// Unit (~10 ms): the two log functions called by hand.
+    #[config_log::retcd_test]
+    fn d9_damage_lines_carry_the_object_as_key_hex_capped_at_32_bytes() {
+        const METHOD: &str = "d9_damage_lines_carry_the_object_as_key_hex_capped_at_32_bytes";
+        let long = [b'z'; 40];
+        let error = ApiError::new(ErrorKind::CorruptHistory, "damaged".to_owned());
+        for (request, object) in [(1, &b"zqa"[..]), (2, &long[..])] {
+            let root = root_key(TenantId(1), AFFINITY, object);
+            log_stored_damage(NodeId(1), &root, &error, None, None);
+            log_stored_damage(NodeId(1), &root, &error, None, Some(([7; 16], 2)));
+            let cleared = Cleared {
+                compiled: Compiled {
+                    mutations: vec![Mutation::Delete {
+                        key: root.to_bytes(),
+                        expected_version: Some(3),
+                    }],
+                    conditions: Vec::new(),
+                },
+                damage: Corrupt::VersionWithoutValue,
+                faulting: 1,
+            };
+            log_clear(NodeId(1), identity(request), &root, &cleared);
+        }
+
+        let short = "7a7161".to_owned();
+        let capped = "7a".repeat(32);
+        for (message, want) in [
+            ("stored_damage", vec![&short, &short, &capped, &capped]),
+            ("clear_compiled", vec![&short, &capped]),
+        ] {
+            let lines = logged!(METHOD, message);
+            let named: Vec<_> = lines.iter().map(|line| line["key_hex"].clone()).collect();
+            let want: Vec<serde_json::Value> =
+                want.into_iter().map(|hex| hex.as_str().into()).collect();
+            assert_eq!(named, want, "{message}: {lines:?}");
+            for line in &lines {
+                let text = line.to_string();
+                assert!(
+                    line.get("object").is_none() && line.get("root_unparsed").is_none(),
+                    "{message} names the object only by key_hex: {text}"
+                );
+                assert!(
+                    !text.contains("zqa") && !text.contains("zzzz"),
+                    "{message} carries the object's text: {text}"
+                );
+            }
+        }
+    }
+
+    /// D9b: the damage lines name the damage by a code, never by the error's text. A map
+    /// entry's damage quotes the app's key in its `Display` ("map entry \"zqk-secret\": ..."),
+    /// so the refusal's detail is left out of `stored_damage`, and `clear_compiled` logs
+    /// `damage_code`. The damage is built by hand: no stored record carries it to these sites
+    /// today, so the row pins the sites, whatever text a refusal carries.
+    /// Unit (~10 ms): the two log functions called by hand.
+    #[config_log::retcd_test]
+    fn d9b_damage_lines_log_a_code_and_never_the_error_text() {
+        const METHOD: &str = "d9b_damage_lines_log_a_code_and_never_the_error_text";
+        let entry = Corrupt::Entry {
+            key: Value::Text("zqk-secret".to_owned()),
+            error: rdb_value::envelope::EnvelopeError::UnknownKind(0),
+        };
+        let text = entry.to_string();
+        assert!(
+            text.contains("zqk-secret"),
+            "the fixture quotes the key: {text}"
+        );
+        let root = root_key(TenantId(1), AFFINITY, b"m");
+        let refused = ApiError::new(ErrorKind::CorruptHistory, text);
+        log_stored_damage(NodeId(1), &root, &refused, None, None);
+        log_stored_damage(NodeId(1), &root, &refused, Some(damage_code(&entry)), None);
+        log_stored_damage(
+            NodeId(1),
+            &root,
+            &refused,
+            Some(damage_code(&entry)),
+            Some(([7; 16], 2)),
+        );
+        let cleared = Cleared {
+            compiled: Compiled {
+                mutations: vec![Mutation::Delete {
+                    key: root.to_bytes(),
+                    expected_version: Some(3),
+                }],
+                conditions: Vec::new(),
+            },
+            damage: entry,
+            faulting: 1,
+        };
+        log_clear(NodeId(1), identity(1), &root, &cleared);
+
+        let stored = logged!(METHOD, "stored_damage");
+        let codes: Vec<_> = stored.iter().map(|line| line["damage"].clone()).collect();
+        assert_eq!(
+            codes,
+            [serde_json::Value::Null, "entry".into(), "entry".into()],
+            "{stored:?}"
+        );
+        let clear = logged!(METHOD, "clear_compiled");
+        assert_eq!(clear.len(), 1, "{clear:?}");
+        assert_eq!(clear[0]["damage"], "entry", "{clear:?}");
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        for line in &lines {
+            let text = line.to_string();
+            assert!(
+                !text.contains("zqk") && line.get("detail").is_none(),
+                "a log line carries the error's text: {text}"
+            );
+        }
     }
 
     /// M9 S6 review Q-1: "nothing to clear" is answered only for a view P1 has published in the
@@ -8881,5 +13003,66 @@ mod tests {
             ),
             "once the repair is published the map is not damaged"
         );
+    }
+    /// Ruling A-R184, the write gate: the lead asked that a second recovery in one open go
+    /// through the gate too, so a write is refused, and nothing is sent, while the primary has
+    /// not heard that the open counter marks its adopted generation activated, even with a grant
+    /// held. `admits` says false meanwhile, so `wait_ready` waits for the mark. Here the mark
+    /// is taken back by hand, which is what a second recovery's commit leaves until its own mark
+    /// lands. Cut: `unactivated` answers `None`, and the put publishes. Trio, about 1 s.
+    #[test]
+    fn a_write_under_a_generation_not_marked_activated_is_refused_and_sends_nothing() {
+        let dir = config_testkit::fs::temp_dir();
+        let instance = [7_u8; INSTANCE_LEN];
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.instance = Some(instance);
+        });
+        trio.rt
+            .block_on(crate::admin::count_open(
+                &*trio.store,
+                &instance,
+                true,
+                crate::admin::COUNT_WITHIN,
+            ))
+            .expect("the open counter");
+        trio.bootstrap();
+        trio.ready();
+        let add = |n| Change::Set(vec![ElemOp::Add(int(n))]);
+        assert_eq!(
+            trio.write(compile_change(1, b"s", add(1), Some(Expected::Absent))),
+            Ok(2),
+            "a write once the mark is heard"
+        );
+        let marked = trio.nodes[0]
+            .0
+            .activation
+            .get_mut(&PartitionId(1))
+            .expect("node 1 asked for a mark");
+        assert_eq!(marked.marked, Generation(1), "{marked:?}");
+        marked.marked = Generation(0);
+        assert!(
+            trio.status(0).authority.starts_with("held"),
+            "{:?}",
+            trio.status(0)
+        );
+        assert_eq!(trio.status(0).admits, Some(false), "{:?}", trio.status(0));
+        // review-r184 A1: the refusal reads as one sentence, no run of spaces from a wrap.
+        let refusal = trio.nodes[0]
+            .0
+            .unactivated(PartitionId(1))
+            .expect("the refusal");
+        assert_eq!(
+            refusal.detail,
+            "generation 1 of partition 1 on node 1 is not yet marked activated in the open \
+             counter; nothing was sent"
+        );
+        let head = trio.head();
+        assert_eq!(
+            trio.write(compile_change(2, b"s", add(2), None)),
+            Err(Refused::ByKernel(ErrorKind::Unavailable)),
+            "refused before it is sent"
+        );
+        assert_eq!(trio.head(), head, "nothing was sent");
     }
 }

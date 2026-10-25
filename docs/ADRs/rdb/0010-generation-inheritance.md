@@ -41,6 +41,16 @@ and the full-copy fallback (scope ruling 2026-10-02).
      but adoption and `History` (`seq ≤ base`) work as in decision 7.
    - The late bytes stay in `g-1`, quarantined and never read by `g`.
    - It is code, not format. It can later shrink to "copy only the keys the suffix touched".
+   - **Amended 2026-10-22 (lead ruling A-R166): the flatten at the ceiling.** An inherit with no late
+     write normally links (decision 3). It copies instead, by this decision's full copy, when the parent
+     already reads through `MAX_CHAIN_DEPTH` = 32 levels. The child gets the parent's merged view:
+     values only, tombstones dropped, versions kept. Its link is flagged `copied`, so it starts again
+     at depth 1, and no read walks more than 32 levels. Measured on the dev host: one-time cost 40 ms
+     at 1k keys, 356 ms at 10k, 3.05 s at 100k (`snapshot_bench --flatten-keys`, `crates/rdb-storage`
+     README). Residuals:
+     - Parents are kept, so disk grows by one full copy every 32 reopens until M11's GC (O4).
+     - The `History` chain still grows one level per reopen: `History` falls through for
+       `seq ≤ base` as in decision 5.
 7. **How an inheriting node reports `g`.** After `inherit`, `RocksEngine` reports `parent(g) = g-1`,
    `base(g) = base`, `applied(g) = base`, `durable(g)` unchanged until a sync, `history_at(g, s ≤ base)`
    from the parent, and `lineages()` lists `g`. This matches `MemoryEngine::parent` and `base`.
@@ -56,6 +66,25 @@ and the full-copy fallback (scope ruling 2026-10-02).
      (`inherit_lineage_conflict`); this copy holds less than `base` (`inherit_behind_cutoff`); a full
      copy that `History` cannot rebuild as of `base` (`inherit_history_missing`).
    - A crash mid full copy leaves keys in `g` and no lineage record. A re-run clears `g`'s prefix and copies again.
+   - **Amended 2026-10-22 (M10, lead ruling A-R177; critic-f5 C1–C5): a second caller, the
+     inventory.** Until now only landing called `inherit`, after F1 committed the root. A reopen's
+     inventory now calls it too, for a copy that missed a generation which wrote nothing: the copy's
+     newest held generation `Gs` is older than the anchor generation `G` that `partitions/1` names.
+     The anchor is committed history, read from the fenced record, so "only after rDB commits the
+     new root" still holds. These are checked in this order, and nothing is written unless all hold:
+     - no held generation is newer than `G`, and `Gs` is the newest held, below `G`;
+     - `applied(Gs)` equals the anchor's `base` exactly. A tail above `base` is uncertain data,
+       and an inventory does not truncate it;
+     - the verified digest at `base` equals the anchor's `base_digest` (`ROOT` at seq 0);
+     - the inherit links, never copies: the parent reads through fewer than `MAX_CHAIN_DEPTH`
+       levels. A full copy is multi-batch staging inside the discovery window, and a crash
+       mid-copy would leave a child that selection reads as unlinked.
+
+     Otherwise the inventory fails by name and writes nothing. It is the same atomic batch, with
+     the same side effects as landing. A repeat is the no-op success above, so an F1 retry or a
+     crash after the link answers normally. It is logged `inventory_link_inherited{from, to, base}`.
+     A copy **below** `base` in its own generation is not covered by this caller (critic-f5's
+     residual).
 9. **Spec sentence amended.** §7.2: "Revalidate at IO dispatch and isolate physical effects in an
    epoch/generation namespace." New reading: the namespace isolates **writes**; a read of `g` also sees
    older generations' keys at `base`. §4.1 is unchanged.

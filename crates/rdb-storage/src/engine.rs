@@ -23,23 +23,28 @@
 //! read-only and does not flush.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, DurablePrefix, Namespace, StorageFault};
 use rdb_core::replication::append::PROGRESS_KEY;
+use rdb_core::transaction::dedup::parse_dedup_value;
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, IteratorMode, Options, WriteBatch,
-    WriteOptions, DB,
+    ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction, IteratorMode, Options,
+    WriteBatch, WriteOptions, DB,
 };
 
 use rdb_core::contracts::trace::Version;
 
 use crate::keys::{
-    self, decode_copying, decode_key, decode_mark, encode_key, frame, ns_byte, ns_from_byte,
-    private_key, tombstone, unframe, Frame, Link, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
-    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY,
+    self, decode_copying, decode_key, decode_mark, decode_publish_marks, decode_publish_marks_key,
+    encode_key, encode_publish_marks, frame, ns_byte, ns_from_byte, private_key, publish_marks_key,
+    tombstone, unframe, Frame, Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
+    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, PARENT_KEY,
+    PRIVATE_NS, SEALED_KEY,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -115,6 +120,29 @@ pub enum OpenError {
     },
 }
 
+/// Why [`RocksEngine::bind_instance`] refused. Nothing was written in either case.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BindError {
+    /// The copy is already bound to another instance id. A copy is never rebound.
+    #[error(
+        "copy is bound to instance {}, refusing to bind {}",
+        hex(found),
+        hex(wanted)
+    )]
+    OtherInstance {
+        /// The id the copy holds.
+        found: [u8; INSTANCE_LEN],
+        /// The id the caller asked to bind.
+        wanted: [u8; INSTANCE_LEN],
+    },
+    /// RocksDB refused the synced write; the copy stays unbound.
+    #[error("instance marker write failed: {detail}")]
+    WriteFailed {
+        /// RocksDB's message.
+        detail: String,
+    },
+}
+
 /// One lineage's engine-private records as the engine holds them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Marks {
@@ -133,12 +161,31 @@ pub(crate) struct Marks {
 /// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). The write-order mutex is `&mut self`:
 /// a capture and its sync cannot interleave with a commit. When M9 adds IO workers it becomes a
 /// real `Mutex`.
+///
+/// A [`crate::RocksSnapshot`] shares the database (M10 decision 2): dropping the engine closes
+/// RocksDB and releases its `LOCK` and its directory claim only once every view taken from it
+/// has been dropped too.
 pub struct RocksEngine {
-    pub(crate) db: DB,
+    /// Shared with every live [`crate::RocksSnapshot`], which pins a RocksDB snapshot on it.
+    pub(crate) db: Arc<DB>,
     path: PathBuf,
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
+    /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
+    instance: Option<[u8; INSTANCE_LEN]>,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
+    /// The lock on the directory's [`CLAIM_FILE`] (lead ruling A-R168); `None` on a read-only
+    /// open. Every view holds a clone, so the claim outlives the last handle on `db`.
+    pub(crate) claim: Option<Arc<File>>,
+    /// A-R214: RocksDB's latest sequence number when the WAL was last known synced through
+    /// it: read just before a `flush_wal(true)` that succeeded, or just after a synced write.
+    /// `None` until then, so a fresh open counts as unsynced. A write after it, synced or not,
+    /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`].
+    synced_seq: Option<u64>,
+    /// Debug builds: the options a writable open used, kept for their WAL-sync counter
+    /// ([`Self::wal_syncs`]); `None` on a read-only open.
+    #[cfg(debug_assertions)]
+    options: Option<Options>,
 }
 
 /// A storage fault the engine reports at the next matching call instead of calling RocksDB, so
@@ -160,6 +207,10 @@ pub enum InjectedFault {
     /// before it have landed, the switch has not (rows #15, #19). Not reached by a linked
     /// switch or a copy with no keys.
     CopyBatch,
+    /// The next synced metadata put ([`RocksEngine::bind_instance`],
+    /// [`RocksEngine::put_publish_marks`]): nothing is written and nothing counts as synced
+    /// (review-s1 F-008). Not reached by a bind of the id the copy already holds.
+    SyncedPut,
 }
 
 impl InjectedFault {
@@ -173,6 +224,7 @@ impl InjectedFault {
             Self::MarkWrite => "mark-write",
             Self::Switch => "switch",
             Self::CopyBatch => "copy-batch",
+            Self::SyncedPut => "synced-put",
         }
     }
 }
@@ -182,6 +234,7 @@ impl std::fmt::Debug for RocksEngine {
         f.debug_struct("RocksEngine")
             .field("path", &self.path)
             .field("lineages", &self.lineages)
+            .field("instance", &self.instance.map(|id| hex(&id)))
             .finish_non_exhaustive()
     }
 }
@@ -201,6 +254,31 @@ impl RocksEngine {
     #[must_use]
     pub const fn armed_fault(&self) -> Option<InjectedFault> {
         self.injected
+    }
+
+    /// Debug builds only: how many times RocksDB has synced this engine's WAL since it opened,
+    /// by its own count (`rocksdb.wal.synced`). A synced write adds one; an unsynced write adds
+    /// none (review-s1 F-008). Zero on a read-only open.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn wal_syncs(&self) -> u64 {
+        self.options.as_ref().map_or(0, |options| {
+            options.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced)
+        })
+    }
+
+    /// The one synced write of a metadata key (review-s1 F-008): a put with `sync` set, and
+    /// only once it returns `Ok` does [`Self::wal_synced_through_latest`] count it, so the
+    /// flush duty may skip its next fsync. Fault point [`InjectedFault::SyncedPut`].
+    fn put_metadata_synced(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.fire(InjectedFault::SyncedPut)?;
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .put_cf_opt(self.cf(CF_METADATA), key, value, &opts)
+            .map_err(|e| e.to_string())?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        Ok(())
     }
 
     /// `Err` once, if [`Self::inject_fault`] armed `at`. The `fault_injected` line is
@@ -223,16 +301,13 @@ impl RocksEngine {
     ///
     /// [`OpenError::NoDatabase`] when `path` holds no database, else as [`Self::open`].
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        let path = path.as_ref();
-        if !path.join("CURRENT").exists() {
-            return Err(refused(OpenError::NoDatabase {
-                path: path.to_path_buf(),
-            }));
-        }
-        Self::open(path)
+        Self::open_inner(path.as_ref().to_path_buf(), true).map_err(refused)
     }
 
     /// Open, or create, the engine at `path`.
+    ///
+    /// Takes the directory's claim first (lead ruling A-R168): an OS lock on its `CLAIM` file,
+    /// held for the engine's life and released by the OS on exit or crash.
     ///
     /// Refuses a directory whose column families are not exactly [`COLUMN_FAMILIES`], whose
     /// format marker is missing or not [`FORMAT_VERSION`], or in which any lineage has
@@ -242,20 +317,33 @@ impl RocksEngine {
     ///
     /// An [`OpenError`] naming the refusal.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf()).map_err(refused)
+        Self::open_inner(path.as_ref().to_path_buf(), false).map_err(refused)
     }
 
-    fn open_inner(path: PathBuf) -> Result<Self, OpenError> {
+    /// The claim comes first, before any read of the directory (lead ruling A-R168). Without it
+    /// a racing loser's read-only checks met the winner's `LOG`, or a copy it had not finished
+    /// creating, and the loser was told `Backend` instead of `Locked`. RocksDB's `LOCK` stays as
+    /// the second line.
+    fn open_inner(path: PathBuf, must_exist: bool) -> Result<Self, OpenError> {
+        if must_exist && !path.is_dir() {
+            return Err(OpenError::NoDatabase { path });
+        }
+        let claim = claim(&path)?;
         let existed = path.join("CURRENT").exists();
+        if must_exist && !existed {
+            return Err(OpenError::NoDatabase { path });
+        }
         if existed {
             verify_column_families(&path)?;
             // S1-P1: decide every refusal on a read-only open, which writes no file. A writable
             // open replays, flushes and rotates before the marker can be read.
             read_only(&path)?;
         }
-        let db = DB::open_cf_descriptors(&db_options(!existed), &path, descriptors())
+        let options = db_options(!existed);
+        let db = DB::open_cf_descriptors(&options, &path, descriptors())
             .map_err(|e| backend(&path, &e))?;
         let created = ensure_format(&db, &path, existed)?;
+        let instance = read_instance(&db, &path)?;
         let lineages = restore_lineages(&db, &path)?;
         for (&(partition, generation), marks) in &lineages {
             tracing::info!(
@@ -277,13 +365,19 @@ impl RocksEngine {
             format_version = FORMAT_VERSION,
             created,
             lineages = lineages.len(),
+            instance_hex = instance.map(|id| hex(&id)),
             "storage_open"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
+            instance,
             injected: None,
+            claim: Some(Arc::new(claim)),
+            synced_seq: None,
+            #[cfg(debug_assertions)]
+            options: Some(options),
         })
     }
 
@@ -305,19 +399,36 @@ impl RocksEngine {
             Err(OpenError::NoDatabase { path: path.clone() })
         };
         let (db, lineages) = opened.map_err(refused)?;
+        let instance = read_instance(&db, &path).map_err(refused)?;
         tracing::info!(
             target: LOG_TARGET,
             path = %path.display(),
             format_version = FORMAT_VERSION,
             lineages = lineages.len(),
+            instance_hex = instance.map(|id| hex(&id)),
             "storage_open_read_only"
         );
         Ok(Self {
-            db,
+            db: Arc::new(db),
             path,
             lineages,
+            instance,
             injected: None,
+            claim: None,
+            synced_seq: None,
+            #[cfg(debug_assertions)]
+            options: None,
         })
+    }
+
+    /// A-R214: whether every write so far is synced: no write, synced or not, since the last
+    /// `flush_wal(true)` that succeeded or the last synced write. `false` on a fresh open. A
+    /// caller that finds every durable mark at its applied mark still syncs when this is
+    /// `false`, because an unsynced write that raises no applied mark (a dedup delete, an
+    /// inherit at base 0, a durable-mark write) lives only in the OS cache until a sync.
+    #[must_use]
+    pub fn wal_synced_through_latest(&self) -> bool {
+        self.synced_seq == Some(self.db.latest_sequence_number())
     }
 
     /// The directory this engine is open on.
@@ -330,6 +441,114 @@ impl RocksEngine {
     #[must_use]
     pub fn lineages(&self) -> Vec<(PartitionId, Generation)> {
         self.lineages.keys().copied().collect()
+    }
+
+    /// The instance id this copy is bound to (M10, arch R3b), or `None` when it is unbound.
+    /// Read at open; a marker of the wrong length was refused there.
+    #[must_use]
+    pub const fn instance(&self) -> Option<[u8; INSTANCE_LEN]> {
+        self.instance
+    }
+
+    /// Bind this copy to instance `id`, with a synced write, before this returns `Ok`.
+    ///
+    /// Binding the id the copy already holds is a no-op that writes nothing, so an open that
+    /// died part way through binding its copies can bind them all again (arch R3b fresh step 2).
+    /// Never rebinds: a copy bound to another id is refused, and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// [`BindError::OtherInstance`] when the copy is bound to another id;
+    /// [`BindError::WriteFailed`] when RocksDB refuses the write (the copy stays unbound).
+    pub fn bind_instance(&mut self, id: [u8; INSTANCE_LEN]) -> Result<(), BindError> {
+        match self.instance {
+            Some(found) if found == id => return Ok(()),
+            Some(found) => {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    found_hex = hex(&found),
+                    wanted_hex = hex(&id),
+                    "instance_bind_refused"
+                );
+                return Err(BindError::OtherInstance { found, wanted: id });
+            }
+            None => {}
+        }
+        if let Err(detail) = self.put_metadata_synced(INSTANCE_KEY, &id) {
+            tracing::error!(target: LOG_TARGET, error = %detail, "instance_bind_failed");
+            return Err(BindError::WriteFailed { detail });
+        }
+        self.instance = Some(id);
+        tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
+        Ok(())
+    }
+
+    /// Replace `partition`'s publish marks with `marks`, with a synced write, before this
+    /// returns `Ok` (M10 S1-6, lead ruling A-R183). Stored as given, in the order given; an
+    /// empty list is stored as one. The key lives outside every namespace, so no read, seed or
+    /// retire scan of a lineage ever meets it, and it needs no lineage.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] when RocksDB refuses the write; the marks held before stay.
+    pub fn put_publish_marks(
+        &mut self,
+        partition: PartitionId,
+        marks: &[PublishMark],
+    ) -> Result<(), StorageFault> {
+        let written =
+            self.put_metadata_synced(&publish_marks_key(partition), &encode_publish_marks(marks));
+        if let Err(e) = written {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                error = %e,
+                "publish_marks_write_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        tracing::debug!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            marks = marks.len(),
+            newest = ?marks.last().map(|m| (m.generation.0, m.seq.0, m.tick.0)),
+            "publish_marks_written"
+        );
+        Ok(())
+    }
+
+    /// `partition`'s publish marks, as [`Self::put_publish_marks`] last stored them; empty when
+    /// none were ever stored, as on a copy an older build wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when the read fails or the stored value is not a whole number
+    /// of marks. Never an empty list in their place: a fault is not "no marks".
+    pub fn publish_marks(&self, partition: PartitionId) -> Result<Vec<PublishMark>, StorageFault> {
+        let raw = self
+            .db
+            .get_cf(self.cf(CF_METADATA), publish_marks_key(partition))
+            .map_err(|e| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    error = %e,
+                    "publish_marks_read_failed"
+                );
+                StorageFault::Corrupt
+            })?;
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        decode_publish_marks(&raw).ok_or_else(|| {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                len = raw.len(),
+                "publish_marks_undecodable"
+            );
+            StorageFault::Corrupt
+        })
     }
 
     /// Apply a batch atomically and advance `buffered_applied`. **Buffered, not durable.**
@@ -443,6 +662,8 @@ impl RocksEngine {
         &mut self,
         captured: Vec<CapturedPrefix>,
     ) -> Result<Vec<DurablePrefix>, StorageFault> {
+        // A-R214: read before the sync, so a write racing it can only cost one more sync.
+        let latest = self.db.latest_sequence_number();
         let synced = self
             .fire(InjectedFault::WalFlush)
             .and_then(|()| self.db.flush_wal(true).map_err(|e| e.to_string()));
@@ -450,6 +671,7 @@ impl RocksEngine {
             tracing::error!(target: LOG_TARGET, error = %e, "wal_sync_failed");
             return Err(StorageFault::FlushFailed);
         }
+        self.synced_seq = Some(latest);
         let mut next = self.lineages.clone();
         let mut marks_write = WriteBatch::default();
         let mut durable = Vec::with_capacity(captured.len());
@@ -543,6 +765,173 @@ impl RocksEngine {
             );
         }
         Ok(durable)
+    }
+
+    /// Delete every Dedup row `(partition, generation)` reads whose key sorts below `end`, at
+    /// every level its reads walk ([`Self::levels`]): one range delete per level, in one
+    /// `WriteBatch`. Other namespaces, and levels behind a copied link, are not touched. Views
+    /// taken before the call still see the rows.
+    ///
+    /// For retiring the dedup rows of older generations (defect D6, draft of ruling A-R170): a
+    /// `dedup_key` leads with its generation big-endian, so `end = (h + 1).to_be_bytes()` is
+    /// every row of generations `<= h`. Storage reads no key layout; the caller picks `end`.
+    ///
+    /// Local cleanup, not a replicated write: no `applied` mark moves and nothing is added to
+    /// `History`. Unsynced, as [`Self::commit`] is; after a host crash the rows may be back, and
+    /// deleting again is the cure.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] for a lineage the engine does not hold, or when RocksDB
+    /// refuses the write; nothing is deleted.
+    pub fn delete_dedup_below(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        end: &[u8],
+    ) -> Result<(), StorageFault> {
+        if !self.lineages.contains_key(&(partition, generation)) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                "dedup_delete_unknown_lineage"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let levels = self.levels(partition, generation);
+        let cf = self.cf(keys::cf_for(Namespace::Dedup));
+        let mut write = WriteBatch::default();
+        for level in &levels {
+            write.delete_range_cf(
+                cf,
+                encode_key(partition, *level, Namespace::Dedup, &[]),
+                encode_key(partition, *level, Namespace::Dedup, end),
+            );
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(false);
+        opts.disable_wal(false);
+        if let Err(e) = self.db.write_opt(write, &opts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                error = %e,
+                "dedup_delete_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        tracing::info!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            levels = levels.len(),
+            end_hex = %hex(end),
+            "dedup_delete_below"
+        );
+        Ok(())
+    }
+
+    /// Durably delete what `DedupTrim{generation, below}` drops from T1's memory: the Dedup
+    /// rows stored at lineage `(partition, generation)`'s own level whose key leads with
+    /// `generation` and whose value's seq (`parse_dedup_value`) is below `below`. That is
+    /// `DedupIndex::trim`'s predicate, so a reseed after a restart loads no row T1 trimmed
+    /// (defect D6, lead ruling A-R170 D). Returns how many rows it deleted.
+    ///
+    /// Only lineage `generation` writes keys that lead with `generation`, so a plain delete is
+    /// exact: no parent level holds such a key. Any node that applies the trim may call it,
+    /// owner or secondary. Local cleanup, not a replicated write: no `applied` mark moves and
+    /// nothing is added to `History`. The write is synced before this returns, so it survives
+    /// a host crash; one fsync per trim, and the host trims at most once a second.
+    ///
+    /// It reads every row of `generation` at that level once; the host keeps them at about the
+    /// dedup cap.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] for a lineage the engine does not hold, or when RocksDB
+    /// refuses the write. [`StorageFault::Corrupt`] when a read fails or a value does not decode
+    /// as a dedup value. Either way nothing is deleted.
+    pub fn delete_dedup_trimmed(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        below: Seq,
+    ) -> Result<usize, StorageFault> {
+        if !self.lineages.contains_key(&(partition, generation)) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                "dedup_trim_unknown_lineage"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let cf = self.cf(keys::cf_for(Namespace::Dedup));
+        let prefix = encode_key(
+            partition,
+            generation,
+            Namespace::Dedup,
+            &generation.0.to_be_bytes(),
+        );
+        let mut write = WriteBatch::default();
+        let (mut scanned, mut deleted) = (0_usize, 0_usize);
+        for item in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (raw, value) = item.map_err(|e| {
+                tracing::error!(target: LOG_TARGET, error = %e, "dedup_trim_read_failed");
+                StorageFault::Corrupt
+            })?;
+            if !raw.starts_with(&prefix) {
+                break;
+            }
+            scanned += 1;
+            let seq = match unframe(&value) {
+                Some(Frame::Value(_, bytes)) => parse_dedup_value(bytes).map(|v| v.seq),
+                // T1 never deletes a Dedup row, but a tombstone holds nothing to seed.
+                Some(Frame::Tombstone(_)) => continue,
+                None => None,
+            };
+            let Some(seq) = seq else {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    generation = generation.0,
+                    key_hex = %hex(raw.get(keys::PREFIX_LEN..).unwrap_or_default()),
+                    "dedup_trim_value_undecodable"
+                );
+                return Err(StorageFault::Corrupt);
+            };
+            if seq < below {
+                write.delete_cf(cf, &raw);
+                deleted += 1;
+            }
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        if let Err(e) = self.db.write_opt(write, &opts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                error = %e,
+                "dedup_trim_delete_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        tracing::info!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            below = below.0,
+            scanned,
+            deleted,
+            "dedup_trim_deleted"
+        );
+        Ok(deleted)
     }
 
     /// The highest sequence applied to state, not necessarily synced.
@@ -737,6 +1126,22 @@ impl std::fmt::Display for RawRecord {
                     );
                 return write!(f, "format_marker={format}");
             }
+            if self.key.as_ref() == INSTANCE_KEY {
+                return write!(f, "instance_marker={}", hex(&self.value));
+            }
+            if let Some(partition) = decode_publish_marks_key(&self.key) {
+                let marks = decode_publish_marks(&self.value).map_or_else(
+                    || format!("<undecodable {}>", hex(&self.value)),
+                    |marks| {
+                        let shown: Vec<String> = marks
+                            .iter()
+                            .map(|m| format!("{}:{}@{}", m.generation.0, m.seq.0, m.tick.0))
+                            .collect();
+                        format!("[{}]", shown.join(" "))
+                    },
+                );
+                return write!(f, "publish_marks p={} {marks}", partition.0);
+            }
             return write!(
                 f,
                 "unknown key={} value={}",
@@ -841,6 +1246,13 @@ fn db_options(create: bool) -> Options {
     opts.set_manual_wal_flush(false);
     opts.set_enable_pipelined_write(false);
     opts.set_unordered_write(false);
+    // Review-s1 F-008: debug builds count WAL syncs ([`RocksEngine::wal_syncs`]), so a row can
+    // see that a synced write synced. Tickers only, the cheapest level that keeps them.
+    #[cfg(debug_assertions)]
+    {
+        opts.enable_statistics();
+        opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptHistogramOrTimers);
+    }
     opts
 }
 
@@ -878,9 +1290,32 @@ fn read_only(path: &Path) -> Result<(DB, Lineages), OpenError> {
     let db = DB::open_cf_for_read_only(&db_options(false), path, COLUMN_FAMILIES, false)
         .map_err(|e| backend(path, &e))?;
     check_format(&db, path, true)?;
+    read_instance(&db, path)?;
     let lineages = restore_lineages(&db, path)?;
     check_marks(&lineages)?;
     Ok((db, lineages))
+}
+
+/// The instance marker, `None` when absent. A marker that is not [`INSTANCE_LEN`] bytes is a
+/// corrupt record: refused at open, never read as unbound.
+fn read_instance(db: &DB, path: &Path) -> Result<Option<[u8; INSTANCE_LEN]>, OpenError> {
+    let meta = handle(db, path, CF_METADATA)?;
+    let Some(raw) = db
+        .get_cf(meta, INSTANCE_KEY)
+        .map_err(|e| backend(path, &e))?
+    else {
+        return Ok(None);
+    };
+    <[u8; INSTANCE_LEN]>::try_from(raw.as_slice())
+        .map(Some)
+        .map_err(|_| OpenError::CorruptRecord {
+            path: path.to_path_buf(),
+            key_hex: hex(INSTANCE_KEY),
+            problem: format!(
+                "the instance marker is {} bytes, not {INSTANCE_LEN}",
+                raw.len()
+            ),
+        })
 }
 
 /// Refuse a lineage with `durable > applied`.
@@ -964,20 +1399,42 @@ fn restore_lineages(
     let mut lineages: BTreeMap<(PartitionId, Generation), Marks> = BTreeMap::new();
     for item in db.iterator_cf(meta, IteratorMode::Start) {
         let (key, value) = item.map_err(|e| backend(path, &e))?;
-        let Some((partition, generation, ns, name)) = decode_key(&key) else {
-            continue;
-        };
         let corrupt = |problem: &str| OpenError::CorruptRecord {
             path: path.to_path_buf(),
             key_hex: hex(&key),
             problem: problem.to_string(),
         };
+        let Some((partition, generation, ns, name)) = decode_key(&key) else {
+            // Shorter than a lineage prefix: only the engine-wide keys this build defines may be
+            // here. Any other is refused by name, as an unknown private record is (A-R164,
+            // lead ruling A-R184), never skipped.
+            if key.as_ref() == FORMAT_KEY
+                || key.as_ref() == INSTANCE_KEY
+                || decode_publish_marks_key(&key).is_some()
+            {
+                continue;
+            }
+            return Err(corrupt(
+                "a metadata key shorter than a lineage prefix that this build does not define",
+            ));
+        };
         // Format 1 holds no Meta key: commit refuses Meta writes (critic F1(a)).
         if ns == ns_byte(Namespace::Meta) {
             return Err(corrupt("a Meta key, which format 1 never stores"));
         }
-        if ns != PRIVATE_NS {
+        // Progress is the one namespace `cf_for` puts in this family. Any other ns byte is a key
+        // no format-1 writer produces, such as an engine record with a garbled ns byte: refused
+        // by name, never skipped, so a lost record never reads as absent (A-R164, critic-rollfwd
+        // A3).
+        if ns == ns_byte(Namespace::Progress) {
             continue;
+        }
+        if ns != PRIVATE_NS {
+            return Err(corrupt(&format!(
+                "a metadata key with namespace byte {ns:#04x}, which this build never writes \
+                 there; this copy cannot be opened: restore it from a backup of this directory, \
+                 then open it again"
+            )));
         }
         // Each shape names its own fault (S1-P9): a length first, then what the bytes say.
         let sized = |record: &str, want: usize| {
@@ -1074,6 +1531,36 @@ fn handle<'a>(db: &'a DB, path: &Path, name: &str) -> Result<&'a ColumnFamily, O
         path: path.to_path_buf(),
         detail: format!("column family {name} has no handle after open"),
     })
+}
+
+/// The file in a node directory whose OS lock is that directory's claim (lead ruling A-R168).
+/// Never deleted: the OS releases the lock when the holder closes it, exits or crashes, so a
+/// file left behind is not a stale claim.
+pub(crate) const CLAIM_FILE: &str = "CLAIM";
+
+/// Take the claim on `path`, creating the directory and [`CLAIM_FILE`] if missing.
+/// `Locked` when another open, in this process or another, holds it.
+fn claim(path: &Path) -> Result<File, OpenError> {
+    let failed = |what: &str, e: std::io::Error| OpenError::Backend {
+        path: path.to_path_buf(),
+        detail: format!("{what} {CLAIM_FILE}: {e}"),
+    };
+    std::fs::create_dir_all(path).map_err(|e| failed("create the directory for", e))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.join(CLAIM_FILE))
+        .map_err(|e| failed("open", e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(OpenError::Locked {
+            path: path.to_path_buf(),
+            detail: format!("{CLAIM_FILE} is held by another open"),
+        }),
+        Err(TryLockError::Error(e)) => Err(failed("lock", e)),
+    }
 }
 
 /// Classify a RocksDB failure. `Locked` only for the IO errors RocksDB raises on the `LOCK`

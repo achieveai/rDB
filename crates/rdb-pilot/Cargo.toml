@@ -1,0 +1,26 @@
+[package]
+name = "rdb-pilot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+publish = false
+description = "pilot_kv: a small app that keeps its data in rDB, written the way docs/rdb/embed.md says an outside crate does it"
+
+# Every dependency is a plain path or version, never `workspace = true`, so a copy of this crate
+# outside the checkout needs only its paths rewritten (docs/rdb/embed.md, arch-m10 R3c, C-22).
+[dependencies]
+# The database.
+rdb-api = { path = "../rdb-api" }
+# `ConfigStore`, the trait the rEtcd client is passed to `Db::open` as.
+config-core = { path = "../config-core" }
+# The rEtcd gRPC client: rDB's control store.
+config-client = { path = "../config-client" }
+# JSONL logs, so a run can be read with DuckDB. Optional for an app; the pilot keeps them.
+config-log = { path = "../config-log" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tracing = "0.1"
+
+[[bin]]
+name = "pilot_kv"
+path = "src/main.rs"

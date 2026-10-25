@@ -219,6 +219,10 @@ On the deadline:
   have been used → extend by another window;
 - otherwise → record the remaining sources as unavailable too, and close.
 
+**Amendment (2026-10-23, lead ruling A-R165):** the window also closes before its deadline, on the
+answer that leaves every queried copy verified or ineligible, unless a copy failed; nothing that can
+still arrive then changes the selection, and the 2,000 ms budget itself is unchanged.
+
 The extension cap is new and necessary: without it, a source that advertises a longer prefix and
 dribbles one record per window satisfies "progress observed" forever while never arriving, holding
 recovery open indefinitely. Total discovery is bounded at 2,000 + 3 × 2,000 = 8,000 ms. When the cap
@@ -298,6 +302,15 @@ already held now changes only the mode:
 The transaction and lag modules are unchanged. Rows: `m9_d3_00` (sim) and `m9_d3_01`..`m9_d3_08`;
 for the kept view, `a_re_emit_while_the_start_record_is_pending_keeps_the_previous_view` in
 `rdb-api`'s host tests.
+
+**Amended 2026-10-22 (lead ruling A-R197, M10; amends K-B-02, B-R47a and B-R67f for this case
+only).** The tracker still rebuilt every other copy at zero and moved its anchor to the head, so the
+activation re-emit reported qualification `Lost` and lag protection paused writes for its hold
+(M10 D12). A re-emit that restates the generation served now keeps each copy's progress, its
+`received` clamped to its applied head, and the anchor; only the proved floors are restated from
+the new barrier. All five guards must hold: the tracker is not retired; the same generation; the
+cutoff equals its base; the same root; and the pin equals its only predicate. If any fails, the
+rebuild is as before. Rows: `m10_r197_c1`..`c4` in `rdb-core`'s `replication_tracker`.
 
 `RecoveryBarrier` still cannot be built from a sequence number — only from `DurableProof` values,
 which only the storage seam mints (ADR-0005 §4). Spec §8.1's "buffered complete entries from a live
@@ -383,6 +396,22 @@ The recovery CAS cannot be resolved this way: `PartitionRecord` binds no run id 
 bytes cannot be told from a peer's identical decision (ruling F-g). That needs a run id in
 `partitions/{id}`, owed to M10 and tracked as achieveai/rDB#45.
 
+**Amended 2026-10-22 (M10, lead ruling A-R185; critic-d7fix C5): landing is a third `inherit`
+caller.** A copy that answers the discovery window late is left out of the barrier. Before this,
+it landed the new generation without a link, nothing pinned the rebuild, and a `DegradedRf2`
+partition stayed write-paused until the next open, with all three copies healthy. Now, when such a
+copy lands the new generation for the first time, the host links that generation to the copy's
+newest held generation at the selected cutoff. It uses the missed-link guards of §8's A-R177 note
+(ADR-rdb-0010 decision 8): no generation above the new one, head exactly at the cutoff, the digest
+there equal, and a parent below the depth ceiling. The link happens before the copy reports
+`Recovered`. A refused guard writes nothing and sends nothing, and the partition keeps today's
+stall. After the link, the host sends F1 `CopyCaughtUp` at the cutoff and its digest. That
+**zero-record catch-up by link counts as a live catch-up at the cutoff**, so the rebuild pins
+through `CopyCaughtUp` in its existing `Committed` arm, then syncs every required copy, runs the activation CAS and goes
+`Active`. Each (partition, generation) gets at most one link and one `CopyCaughtUp`. No fence, no
+new generation and no timer. Still owed to slice 2: a late copy holding past or below the cutoff,
+and a lost `CopyCaughtUp`, which is not re-sent.
+
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
 | Eligible regulars | Mode | Rules |
@@ -400,6 +429,18 @@ activation proves only the empty prefix, not that the third copy holds what the 
 writes while a copy is unheard, counting it as infinitely behind (B-R38), not because of the
 proof. Work that lets writes resume while a copy is silent (M10 PC17) must not reopen this.
 Rows: `m9_k1_00`, `m9_k1_02` and `m9_k1_03` (sim); `m9_d2_05` and `m9_k1_01` (unit).
+
+**Amended 2026-10-22 (M10, lead ruling A-R177; critic-f5 C5): a new `inherit` caller, the
+inventory.** A reopened copy may have missed a generation that wrote nothing: its newest generation
+is older than the anchor generation the fenced `partitions/{id}` names, and it holds that older
+generation exactly through the anchor's `base`, with the digest the anchor names there. Its
+inventory now links it to the anchor generation (ADR-rdb-0010 decision 8, amended the same day).
+That happens for a committed anchor only, as a link only, and before the copy reports. The copy then
+reports as an anchor-generation copy at `base`, which every later step already handles. Anything
+else (a tail above `base`, a different digest, a parent at the depth ceiling) fails the inventory by
+name and writes nothing. This changes no row of the table above, and it does not reopen the K1
+amendment: a copy that is unheard, or that holds less than `base` in its own generation, still
+pauses writes (B-R38).
 
 The mode is **derived, never configured**. rDB has no equivalent of
 `unclean.leader.election.enable` and must not acquire one: the Kafka toggle is a single boolean that

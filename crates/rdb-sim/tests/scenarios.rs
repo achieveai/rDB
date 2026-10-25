@@ -324,11 +324,11 @@ fn m7v_86_runner_stops_at_max_events_and_ends_at_an_event_boundary() {
 
     // A cut inside a transaction leaves the oracle Unavailable, never Violated (review VC-T1).
     // The F1/R1 case above never submits, so the cut has to come from a case that does: F1/T1's
-    // first Submit is the pop at tick `A1_P1_SUBMIT_AT`, and measured over caps 850..1000 on
-    // this build, cap 950 is the first to hold it. Caps 950..954 hold T1's dispatch with no A1
-    // answer and no reply; from 955 A1 has answered. The structural asserts below fail loudly if
-    // the case moves, rather than letting the cut drift out of the transaction. The trace shows
-    // the transaction only as T1's dispatch: this case emits no `ClientSubmit` or
+    // first Submit is the pop at tick `A1_P1_SUBMIT_AT`, and the cap that holds it is
+    // [`M7V_86_CUT_INSIDE_FIRST_SUBMIT`], derived below it. Caps 396..400 hold T1's dispatch with
+    // no A1 answer and no reply; from 401 A1 has answered. The structural asserts below fail
+    // loudly if the case moves, rather than letting the cut drift out of the transaction. The
+    // trace shows the transaction only as T1's dispatch: this case emits no `ClientSubmit` or
     // `AdmissionDecision` line.
     let mut scenario = cases::case_f1_t1_digest_across_recovery();
     scenario.budget.max_events = M7V_86_CUT_INSIDE_FIRST_SUBMIT;
@@ -399,7 +399,27 @@ fn assert_cut_verdicts(cut: &str, run: &ScenarioRun) {
 
 /// M7V-86's cut for `case_f1_t1_digest_across_recovery`: the first pop cap that holds its first
 /// Submit, which lands no A1 decision and no reply before the budget stops the run.
-const M7V_86_CUT_INSIDE_FIRST_SUBMIT: u32 = 950;
+///
+/// Derived by phase and pop kind from the runner's Debug `runner pop` line on 2026-10-23 at int
+/// f5b3306 (ruling A-R201). L1 on B pauses at the close (2_003) and, since A-R197, resumes once at
+/// the host's second round (2_103): the first resume of a generation skips the hold (A-R165(2)),
+/// and R1's keepalive stops with it.
+///
+/// ```text
+///   before the close                                                     5
+///   [2_003, 2_103): R1's walk, F1's rebuild and activation              72
+///   [2_103, 7_303): resumed, 52 host rounds                            318
+///     host flushes 52 x 3 = 156; L1's 50 ms timer 104, +3 at the resume;
+///     A1's acquisition at 2_503 and 9 renewals, x 4 = 40;
+///     the resume round's one-off 13 (R1's last keepalive timer 1, its frames and
+///     the copies' first durable ACKs 7, PeerProgress 3, DurableAdvanced 1,
+///     SetAdmission 1); one more R1 timer and F1's last deadline 2
+///   the Submit, the first pop at 7_303                                   1
+///                                                                      396
+/// ```
+///
+/// Before A-R197 the keepalive ran for the whole 5 s hold and the cap was 950.
+const M7V_86_CUT_INSIDE_FIRST_SUBMIT: u32 = 5 + 72 + 318 + 1;
 
 // ------------------------------------------------------------------------------------------
 // M7V-45, M7V-46 — the fixture is the reproducer
@@ -648,11 +668,13 @@ fn oracle_half(run: &ScenarioRun) -> Vec<(Invariant, Verdict)> {
 /// (M7B-137). F1 then re-emits `Recovered` with `mode: Active` and the same loss record
 /// (T-B-03). The same split M7B-104 took at B-R58b.
 ///
-/// L1 stays `Paused` after this, so R1's B-R60 keepalive runs to the deadline by design. Ruling
-/// B-R65 bounds its rate, not its time: the budget is a function of the deadline
-/// ([`cases::f1_r1_max_events`]), and every full window after the pause holds at most
-/// [`cases::f1_r1_window_bound`] pops: the steady rate, plus the host's first round in the one
-/// window that holds it (ruling V-R31). Asserted before the stop reason.
+/// **The rate half** (ruling A-R201), in one line: L1 on B pauses at the close and resumes once,
+/// in the host's first flush round, never pausing again, and every full window after the pause
+/// holds at most its phase's rate — the keepalive's while paused, the host's and A1's once
+/// resumed — plus the first round, once, in the one window that holds it (rulings B-R65, V-R31).
+/// The admissions are asserted exactly: before A-R197 the `Active` re-emit kept L1 paused for
+/// good, and that was defect D12. The budget is a function of the deadline
+/// ([`cases::f1_r1_max_events`]). Asserted before the stop reason.
 ///
 /// **Oracle half**: the trace opens with the 9-line capability preamble, the oracle finds
 /// nothing, and every verdict whose package is unwired is `Unavailable{Capability(p)}`.
@@ -674,15 +696,37 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
     let trace = &run.trace;
     tracing::info!(
         stop = ?run.report.stop,
+        popped = run.report.events_consumed,
         events = trace.events.len(),
         fingerprint = scenario_run::fingerprint(trace),
         census = ?scenario_run::census(trace),
         "m7v_47 f1/r1 run"
     );
-    // The steady rate after the pause, checked before the budget (ruling B-R65): L1 stays
-    // `Paused` for good here, so R1's keepalive (B-R60) runs to the deadline by design, and what
-    // is bounded is its rate. A keepalive that speeds up fails here by name, not as a budget
-    // overrun. One pop is six `ModuleDispatch` lines, so a pop is counted by its Authority offer.
+    // L1 on B pauses at the close and resumes once, in the host's first round (ruling A-R201).
+    // A later pause would be the `Active` re-emit pausing L1 again (D12), which keeps R1's
+    // keepalive running to the deadline; an earlier resume would be a barrier made durable by
+    // something other than the host's flush.
+    let first_host_round = lowered
+        .as_ref()
+        .ok()
+        .and_then(|plan| plan.flushes.iter().map(|(at, _)| at.0).min());
+    assert_eq!(
+        first_host_round,
+        Some(cases::F1_R1_FIRST_HOST_ROUND_AT),
+        "the host's first round is at the latest cutoff F1 can choose"
+    );
+    assert_eq!(
+        scenario_run::admissions(trace, cases::B_NODE),
+        vec![
+            (cases::F1_R1_PAUSED_AT, false),
+            (cases::F1_R1_FIRST_HOST_ROUND_AT, true)
+        ],
+        "L1 on B pauses at the close and resumes once, in the host's first round"
+    );
+    // The rate after the pause, checked before the budget (ruling B-R65): what is bounded is the
+    // rate of each phase, not its time. A keepalive that speeds up, or one still running after
+    // the resume, fails here by name, not as a budget overrun. One pop is six `ModuleDispatch`
+    // lines, so a pop is counted by its Authority offer.
     let pops_at: BTreeMap<u64, u64> = trace
         .events
         .iter()
@@ -713,22 +757,20 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
             (start, pops)
         })
         .collect();
-    tracing::info!(?windows, last_tick, "m7v_47 f1/r1 steady pops per window");
+    tracing::info!(?windows, last_tick, "m7v_47 f1/r1 pops per window");
     assert!(
-        !windows.is_empty(),
-        "at least one full window after the pause is checked"
+        windows
+            .iter()
+            .any(|(start, _)| start + cases::F1_R1_RATE_WINDOW <= cases::F1_R1_FIRST_HOST_ROUND_AT),
+        "a full paused window is checked: {windows:?}"
     );
     // The host's first flush round is a one-off (ruling V-R31). It is counted in the one checked
     // window that holds it and in no other, so it never loosens a window it is not in.
-    let first_host_round = lowered
-        .as_ref()
-        .ok()
-        .and_then(|plan| plan.flushes.iter().map(|(at, _)| at.0).min());
     let one_off: u64 = windows
         .iter()
         .map(|(start, _)| {
             cases::f1_r1_window_bound(*start, first_host_round)
-                - cases::F1_R1_STEADY_POPS_PER_WINDOW
+                - cases::f1_r1_window_rate(*start, first_host_round)
         })
         .sum();
     assert_eq!(
@@ -736,47 +778,38 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
         cases::F1_R1_FIRST_HOST_ROUND_POPS,
         "the first host round ({first_host_round:?}) is counted once, in a checked window"
     );
-    // The one-off's **value**, measured from this run and not from the constant (tester P1):
-    // B's pops over the first host round minus B's over the round after it. The two rounds
-    // differ only in what the first durable prefix sets off, so their difference is the term.
-    let first = first_host_round.expect("the lowered plan has a host flush round");
+    // The one-off's **value**, measured from this run and not from the constant (tester P1): the
+    // pops of all three nodes over the first host round minus theirs over the round after it.
+    // The two rounds differ only in what the first durable prefix sets off, so their difference
+    // is the term. All three, not B alone (A-R201): C and A get R1's last keepalive frame in the
+    // first round and none in the next.
+    let first = cases::F1_R1_FIRST_HOST_ROUND_AT;
     let round = scenario_run::HOST_FLUSH_EVERY_MILLIS;
-    let b_pops_in = |from: u64| {
-        trace
-            .events
-            .iter()
-            .filter(|event| {
-                event.node == cases::B_NODE
-                    && (from..from + round).contains(&event.logical_tick)
-                    && matches!(
-                        event.kind,
-                        TraceKind::ModuleDispatch {
-                            module: ModuleName::Authority,
-                            ..
-                        }
-                    )
-            })
-            .count() as u64
+    let pops_in = |from: u64| {
+        pops_at
+            .range(from..from + round)
+            .map(|(_, pops)| pops)
+            .sum::<u64>()
     };
-    let (first_round, next_round) = (b_pops_in(first), b_pops_in(first + round));
+    let (first_round, next_round) = (pops_in(first), pops_in(first + round));
     tracing::info!(
         first,
         first_round,
         next_round,
-        "m7v_47 f1/r1 B pops by host round"
+        "m7v_47 f1/r1 pops by host round"
     );
     assert_eq!(
         first_round.checked_sub(next_round),
         Some(cases::F1_R1_FIRST_HOST_ROUND_POPS),
-        "B pops {first_round} in the first host round [{first}, +{round}) and {next_round} in \
-         the next: F1_R1_FIRST_HOST_ROUND_POPS is not what the first round adds"
+        "{first_round} pops in the first host round [{first}, +{round}) and {next_round} in the \
+         next: F1_R1_FIRST_HOST_ROUND_POPS is not what the first round adds"
     );
     for (start, pops) in &windows {
         let bound = cases::f1_r1_window_bound(*start, first_host_round);
         assert!(
             *pops <= bound,
-            "the B-R60 keepalive's rate grew (ruling B-R65): {pops} pops in [{start}, +{}), \
-             measured at most {bound}",
+            "a cadence's rate grew (ruling B-R65): {pops} pops in [{start}, +{}), derived at \
+             most {bound}",
             cases::F1_R1_RATE_WINDOW,
         );
     }
@@ -969,6 +1002,9 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
 /// decision, because A1's `Fence` precedes its `Answer`.
 ///
 /// **Kernel half**, read from the trace:
+/// - L1 on B starts paused at the cutoff and resumes once at [`cases::A1_P1_RESUMES_AT`], the first host
+///   flush that finds the barrier durable, with no hold (A-R165(2)). It does not pause again
+///   before the submit.
 /// - On the write's correlation, A1 decides `Dispatch` and `Publication` `Valid` in generation 2,
 ///   and B publishes seq 11 there.
 /// - After that publish, the `RecoveredFact` that creates generation 3 is recorded.
@@ -1023,6 +1059,28 @@ fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_runs_through_the_r
             if deadline.0 == cases::A1_P1_MAX_TICKS),
         "the case runs to its deadline inside its event budget: {:?}",
         run.report.stop
+    );
+
+    // L1 on B: paused from the cutoff, resumed once at the first host flush that finds the barrier
+    // durable, with no hold (A-R165(2)), and not paused again before the write is submitted.
+    let admitted = scenario_run::admissions(&run.trace, cases::B_NODE);
+    tracing::info!(?admitted, "a1p1 admissions");
+    assert_eq!(
+        admitted.get(..2),
+        Some(
+            &[
+                (cases::PLAN_AT + 1 + 2_000, false),
+                (cases::A1_P1_RESUMES_AT, true)
+            ][..]
+        ),
+        "L1 on B starts paused at the cutoff and resumes at A1_P1_RESUMES_AT: {admitted:?}"
+    );
+    assert!(
+        !admitted
+            .iter()
+            .any(|(at, allow)| !allow
+                && (cases::A1_P1_RESUMES_AT..=cases::A1_P1_SUBMIT_AT).contains(at)),
+        "L1 on B stays resumed through the submit: {admitted:?}"
     );
 
     // Kernel half.

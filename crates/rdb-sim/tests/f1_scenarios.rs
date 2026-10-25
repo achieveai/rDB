@@ -1104,5 +1104,19 @@ fn m7b_136_two_survivor_synchronization_converges_on_the_selected_prefix() {
         ),
         (Seq(B_HEAD_136), history.digest(B_HEAD_136))
     );
+    // A-R213: B and C hold live receivers, so routing the catch-up restores neither, and builds
+    // no ladder over B's.
+    let dormant: Vec<serde_json::Value> = config_testkit::logs::lines_for_current_test(
+        "f1_scenarios",
+        "m7b_136_two_survivor_synchronization_converges_on_the_selected_prefix",
+    )
+    .into_iter()
+    .filter(|line| {
+        line["@m"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("dormant_"))
+    })
+    .collect();
+    assert!(dormant.is_empty(), "live receivers are kept: {dormant:?}");
     oracle_is_clean(&trace);
 }

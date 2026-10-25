@@ -281,7 +281,15 @@ pub fn error_from_status(status: &Status) -> ConfigError {
         // safe resubmit: `config_client::classify` checks the marker before it gets here, and
         // applying this arm to an unmarked status would be exactly the duplicate-write bug the
         // marker exists to prevent.
-        _ => ConfigError::Unavailable { reason: detail },
+        //
+        // The message is the server's `Display`, which already begins "unavailable: "; the
+        // reason drops it, so the client's own `Display` does not say it twice (A-R208).
+        _ => ConfigError::Unavailable {
+            reason: match detail.strip_prefix("unavailable: ") {
+                Some(reason) => reason.to_owned(),
+                None => detail,
+            },
+        },
     }
 }
 

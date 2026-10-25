@@ -13,7 +13,8 @@
 //! only [`Db::status`] with the same id settles it, and only inside the dedup retention window;
 //! a definitive answer to a later resend covers that resend alone.
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,6 +22,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::ConfigStore;
+use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
@@ -30,6 +33,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
+use rdb_storage::RocksEngine;
 use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
 use rdb_value::value::Value;
@@ -110,6 +114,10 @@ pub struct ApiError {
     pub no_mutation: bool,
     /// Detail, for the log and the operator.
     pub detail: String,
+    /// The soonest a retry can be admitted, when the host knows it (M10 S1-6, critic-d6b
+    /// candidate 3): a lower bound, "not before", never a promise that it will be. `None` when
+    /// nothing is known. Set it with [`Self::with_retry_after`], which also says it in `detail`.
+    pub retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -154,6 +162,7 @@ impl ApiError {
             retry,
             no_mutation,
             detail: detail.into(),
+            retry_after: None,
         }
     }
 
@@ -165,6 +174,7 @@ impl ApiError {
             retry: error.retry_rule(),
             no_mutation: error.proves_no_mutation(),
             detail: error.to_string(),
+            retry_after: None,
         }
     }
 
@@ -188,6 +198,7 @@ impl ApiError {
                 "no generation adopted yet for partition {} on node {}; nothing was sent",
                 partition.0, node.0
             ),
+            retry_after: None,
         }
     }
 
@@ -199,7 +210,25 @@ impl ApiError {
             retry: RetryRule::NotWired,
             no_mutation: false,
             detail: format!("host fault: {detail}"),
+            retry_after: None,
         }
+    }
+
+    /// This error with a "not before" hint: a retry is not admitted sooner than `after` from
+    /// now. Sets [`Self::retry_after`] and ends `detail` with `; not before ~Ns`, the seconds
+    /// rounded up so the text never names a time earlier than the hint.
+    #[must_use]
+    pub fn with_retry_after(mut self, after: Duration) -> Self {
+        let seconds = after.as_millis().div_ceil(1_000);
+        self.detail = format!("{}; not before ~{seconds}s", self.detail);
+        self.retry_after = Some(after);
+        self
+    }
+
+    /// The soonest a retry can be admitted, when the host knows it.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
     }
 
     /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
@@ -252,13 +281,25 @@ pub struct DbConfig {
     pub hold: Vec<(NodeId, NodeId)>,
     /// Call timeouts.
     pub timeouts: Timeouts,
-    /// T1's dedup cap: retained answers allowed before a new write is `OVERLOADED`. `None` is
-    /// the spec's [`RETENTION_CAP_ENTRIES`]; a value above it is refused at open, since P1's
-    /// status index holds no more than that. A dev budget, to reach a full index by hand.
+    /// T1's dedup cap: retained answers allowed per partition before a new write is
+    /// `OVERLOADED`. `None` is the spec's [`RETENTION_CAP_ENTRIES`] (65,536); a value above it
+    /// is refused at open, since P1's status index holds no more than that.
+    ///
+    /// The cap and [`Self::dedup_retention`] together set the write rate a partition sustains:
+    /// about `cap / retention`. At the default cap that is 0.76 writes/s at 24 h, 18/s at 1 h
+    /// and 109/s at 10 min. A burst may use the whole cap at once; once it is full, a new write
+    /// is `OVERLOADED` until trimming frees entries. Each retained entry costs about 1.8 KB of
+    /// memory (measured on a debug build).
     pub dedup_cap: Option<usize>,
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
-    /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
+    /// ([`Budgets::dedup_retention_millis`]). A supported app option (ruling A-R181): a shorter
+    /// window frees the cap sooner, so a partition sustains more writes (see
+    /// [`Self::dedup_cap`] for the rates).
+    ///
+    /// The cost of a shorter window: a resend or a status query made after it can no longer be
+    /// settled (spec §5.3).
+    ///
     /// A `CONDITION_FAILED` answer is kept as long, counted from when it was given, since nothing
     /// need publish after it (ruling A-R108).
     /// A retry of a trimmed request is no longer recognised: it is submitted afresh (spec §5.3).
@@ -274,9 +315,9 @@ impl DbConfig {
     /// # Errors
     ///
     /// [`OpenError::DedupCap`] when [`Self::dedup_cap`] is above [`RETENTION_CAP_ENTRIES`];
-    /// it is also logged as `dedup_cap_refused`.
+    /// it is also logged as `db_open_refused` with `kind=DedupCap`, as every refused open is.
     pub fn check(&self) -> Result<(), OpenError> {
-        limits(self.dedup_cap).map(|_| ())
+        limits(self.dedup_cap).map(|_| ()).map_err(open_refused)
     }
 }
 
@@ -361,19 +402,75 @@ impl std::fmt::Display for PutError {
 /// Why [`Db::open`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
-    /// `nodes/` already exists: it holds node data, or another open has claimed it. Nothing was
-    /// started and nothing was removed.
-    #[error("{0} already exists: it holds node data or another open has claimed it; M9 opens only a directory without one")]
-    NotEmpty(PathBuf),
-    /// A node did not start.
-    #[error("node start: {0}")]
-    Node(String),
-    /// The bootstrap was refused.
+    /// Another open, in this process or another, holds this copy's lock. Nothing was started and
+    /// nothing was removed. The text names the next step (tester S1-8 walk, 066ab6e).
+    #[error(
+        "{0} is in use by another open. Close that open, or stop the process that holds it, then \
+         open this directory again"
+    )]
+    InUse(PathBuf),
+    /// A copy is missing or holds no database while another copy holds data. Nothing was started
+    /// and nothing was removed. This build does not rebuild a copy (slice 2's S2-4 will).
+    #[error(
+        "{0} is missing or empty while another copy holds data; this directory cannot be opened. \
+         Restore that copy from a backup of this directory, then open it again"
+    )]
+    CopyMissing(PathBuf),
+    /// The copies hold data but name no rDB instance: an M9 directory, which this build does not
+    /// open. Nothing was started and nothing was removed. The text names the next step (tester
+    /// S1-8 walk, 066ab6e); no tool migrates M9 data, so it offers none.
+    #[error(
+        "{0} holds data but names no rDB instance (an M9 directory); this build does not open it. \
+         Open it with the M9 build that wrote it, or start a new database in an empty folder: \
+         this build does not migrate M9 data"
+    )]
+    Unbound(PathBuf),
+    /// The copies and the control store do not belong together: the copies name different
+    /// instances, or the store's `partitions/1` or open counter does not name this one.
+    #[error("this directory and the control store do not belong together: {0}")]
+    Mismatch(String),
+    /// No copy holds the generation `partitions/1` names, and it cannot be rolled forward. Either
+    /// another folder, or a newer backup of this one, holds that generation, or a commit of it
+    /// landed and the process stopped before it was used. The refusal changes no data, and the
+    /// copies keep every acknowledged write they hold (lead ruling A-R184).
+    #[error(
+        "no copy holds generation {generation} that partitions/1 names: {detail}. This open \
+         changed no data, and the acknowledged writes these copies hold are intact: do not \
+         delete this directory. If another folder, or a newer backup of this one, holds \
+         generation {generation}, open that folder or restore those copies here"
+    )]
+    Stale {
+        /// The record's generation.
+        generation: u64,
+        /// Why it is not rolled forward.
+        detail: String,
+    },
+    /// The open counter refused for good: it counted the most opens, or holds a value this
+    /// build does not write (M10, arch R3b). A store failure while counting is `Control`.
     #[error(transparent)]
+    Counter(#[from] admin::CounterError),
+    /// The control store failed, or did not answer, a read or a count the open needs. Nothing was
+    /// changed for good. When the store was unreachable, or failed a count, the text ends with
+    /// the step to open again.
+    #[error("control store: {0}")]
+    Control(String),
+    /// A node did not start: a copy's storage refused to open (a newer format, a corrupt
+    /// record, a disk error), or binding or linking a copy failed. Nothing was removed. The text
+    /// ends with the step (review-s1 F-006).
+    #[error(
+        "node start: {0}. Nothing was removed. If this names a newer format, open the folder \
+         with the build that wrote it; if it names a disk or permission error, fix that, then \
+         open again; otherwise, or if it repeats, stop and report it with this message"
+    )]
+    Node(String),
+    /// The bootstrap of a new folder was refused. Nothing was served yet, and the next open
+    /// reads what the store holds then (review-s1 F-006).
+    #[error("{0}. Check that rEtcd is running and reachable, then open the folder again")]
     Bootstrap(#[from] admin::BootstrapError),
     /// [`DbConfig::dedup_cap`] is above the cap P1's status index holds. Nothing was started.
     #[error(
-        "dedup_cap {asked} is above the most P1's status index holds ({max}); nothing was started"
+        "dedup_cap {asked} is above the most P1's status index holds ({max}); nothing was \
+         started. Set DbConfig::dedup_cap to at most {max}, or leave it unset for the default"
     )]
     DedupCap {
         /// The cap asked for.
@@ -381,8 +478,11 @@ pub enum OpenError {
         /// The largest allowed, [`RETENTION_CAP_ENTRIES`].
         max: usize,
     },
-    /// The filesystem refused.
-    #[error("{0}")]
+    /// The filesystem refused (review-s1 F-006).
+    #[error(
+        "the filesystem refused: {0}. Check that the folder's path is right and that this \
+         process may write there, then open again"
+    )]
     Io(#[from] std::io::Error),
 }
 
@@ -407,6 +507,158 @@ pub struct Db {
     /// removes it after the nodes have stopped, whether the open failed or was cancelled
     /// (F-001, F-003). `None` once the open succeeds, so a served `Db` never removes its data.
     unwind: Option<PathBuf>,
+    /// What this open is: its boots and its heal.
+    opened: Opened,
+}
+
+/// What one open of a directory is (M10, arch R3b).
+#[derive(Debug)]
+struct Opened {
+    /// The boot every node started at: `((N - 1) << 16) + 1` for the directory's N-th open.
+    base_boot: BootId,
+    /// How the reopen's heal stands. `NotNeeded` for a fresh open.
+    heal: Arc<Mutex<HealState>>,
+    /// The heal's task, aborted at shutdown.
+    heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Node 1's recovery as the latest look at it found it, when stuck for this open
+    /// (A-R200). Every refusal reads this instead of asking node 1 again.
+    stuck: Mutex<Option<ReadyError>>,
+}
+
+impl Default for Opened {
+    fn default() -> Self {
+        Self {
+            base_boot: host::BOOT,
+            heal: Arc::new(Mutex::new(HealState::NotNeeded)),
+            heal_task: None,
+            stuck: Mutex::new(None),
+        }
+    }
+}
+
+/// How a reopen's heal stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealState {
+    /// A fresh open: there was nothing to heal.
+    NotNeeded,
+    /// Clearing old grants and proving the takeover.
+    Running,
+    /// Node 1 has its plan and fence.
+    Handed(admin::Healed),
+    /// It stopped; the open will not become ready.
+    Failed(admin::HealError),
+}
+
+/// Why [`Db::wait_ready`] returned without node 1 admitting writes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReadyError {
+    /// The reopen's heal failed.
+    #[error("the reopen's heal failed: {0}")]
+    Heal(admin::HealError),
+    /// Node 1 did not admit writes in time.
+    #[error("node 1 did not admit writes within {within_ms} ms; recovery phase {phase}")]
+    TimedOut {
+        /// The bound asked for.
+        within_ms: u128,
+        /// Node 1's last recovery phase, in words.
+        phase: String,
+    },
+    /// Node 1 restarted, or its restart failed: it does not rejoin in this open (#42), so it
+    /// will not admit writes again whatever the wait (A-R188).
+    #[error("{note}; {step}", step = REOPEN_STEP)]
+    Stopped {
+        /// [`Db::restart_note`].
+        note: String,
+    },
+    /// Node 1's recovery ended `Blocked` before it took writes. It does not try again in this
+    /// open (ruling F-a), so no wait helps (A-R196). A new open usually gets past it; one that
+    /// is blocked again is not a slow host, so the text says to stop then (review-s1 F-007).
+    #[error(
+        "the open's recovery stopped before node 1 took writes ({reason}), and it does not try \
+         again in this open. If the last open of this folder stopped the same way, stop and \
+         report it with this message; otherwise shut this Db down and open the folder again"
+    )]
+    Blocked {
+        /// The block's reason, as node 1's recovery phase names it.
+        reason: String,
+    },
+    /// Node 1's recovery found copies whose histories diverged and quarantined them. That is
+    /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
+    /// wait nor a reopen helps (A-R196(2a)).
+    ///
+    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator removes the
+    /// diverged copies from membership and fences again. This build has no command for that, so
+    /// the text does not tell the reader to do it (A-R196(2b)); node 1's `recovery_fact` log
+    /// line names the copies.
+    #[error(
+        "the open's recovery found copies whose histories disagree, so node 1 takes no writes; \
+         the acknowledged data is kept. Opening the folder again will not help, and do not \
+         delete the folder: this build has no repair command yet (removing a copy from \
+         membership comes in a later build)"
+    )]
+    Quarantined,
+    /// Node 1 faulted, before or after it took writes. A faulted node takes no writes again in
+    /// this open, so no wait helps (PR #60 review F3). The text carries the fault as node 1
+    /// recorded it.
+    #[error(
+        "node 1 stopped on a fault, and it takes no writes in this open: \
+         {fault}. Shut this Db down and open the folder again, once; if that open stops the \
+         same way, stop and report it with this message, and do not delete the folder"
+    )]
+    Faulted {
+        /// Node 1's fault, as its status records it.
+        fault: String,
+    },
+}
+
+/// The next step once node 1 has restarted: nothing it served comes back in this open
+/// (M10 A-R188). Rides on [`ReadyError::Stopped`] and on every put or get refusal after it.
+const REOPEN_STEP: &str = "nothing is served again in this open: to read or write again, shut \
+                           this Db down and open the folder again";
+
+/// Node 1's recovery when nothing in this open moves it on: `Blocked` (ruling F-a, A-R196) or
+/// `Quarantined` (A-R196(2a)), read from the phase as the host spells it. [`Db::wait_ready`]
+/// and every refusal read it here, so the two never disagree (A-R200).
+fn stuck_recovery(owner: &NodeStatus) -> Option<ReadyError> {
+    let phase = owner.recovery.as_deref()?;
+    if let Some(reason) = phase
+        .strip_prefix("Blocked(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return Some(ReadyError::Blocked {
+            reason: reason.to_owned(),
+        });
+    }
+    (phase == "Quarantined").then_some(ReadyError::Quarantined)
+}
+
+/// The largest restart count one open gives a node, so it never reaches the next open's boots.
+const MAX_RESTARTS: u64 = 65_534;
+
+/// The boot every node of a directory's `n`-th open starts at (arch R3b).
+const fn base_boot(n: u64) -> BootId {
+    BootId(((n - 1) << 16) + 1)
+}
+
+/// The request id floor of a directory's `n`-th open: its ids are above it (arch R3b).
+const fn request_floor(n: u64) -> u64 {
+    (n - 1) << 40
+}
+
+/// The top bit of a request id: set on every id an app chooses, never on one a `Db` draws
+/// itself, so the two never name the same write (ruling A-R195, D11).
+const APP_REQUEST_BIT: u64 = 1 << 63;
+
+/// The request id an app sends under with [`Db::put_as`], [`Db::txn_as`] or [`Db::write_as`]:
+/// its own number `n` with the top bit set. A `Db` numbers its own writes below 2^63, so an id
+/// built here never names one of them. `None` when `n` is 2^63 or more.
+#[must_use]
+pub const fn app_request_id(n: u64) -> Option<RequestId> {
+    if n < APP_REQUEST_BIT {
+        Some(RequestId(n | APP_REQUEST_BIT))
+    } else {
+        None
+    }
 }
 
 impl std::fmt::Debug for Db {
@@ -430,29 +682,38 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Db {
-    /// Start three nodes on `config.dir` against `store`, then bootstrap partition 1.
+    /// Open `config.dir` against `store`: start three nodes on it and serve partition 1.
     ///
-    /// Returns once the bootstrap's events are queued, not when the partition is ready: watch
-    /// [`Self::node_status`] for that.
+    /// A directory with no copies is a **fresh** open: it names a new rDB instance, binds it
+    /// into all three copies, counts the open in `rdb/instances/{instance}`, and bootstraps
+    /// partition 1. A directory whose copies hold data is a **reopen**: it checks that the copies
+    /// and `store` belong together, counts the open, starts the nodes at this open's boots, and
+    /// heals partition 1 in the background (M10, arch R3a, R3b). Returns once the bootstrap's
+    /// events are queued or the heal has started, not when the partition is ready: call
+    /// [`Self::wait_ready`].
+    ///
+    /// `rt` must belong to a runtime that keeps running until [`Self::shutdown`] returns:
+    /// control calls, watches and the reopen's heal run as tasks on it, also while a caller
+    /// blocks in [`Self::wait_ready`], [`Self::put`] or [`Self::get`]. A multi-thread runtime
+    /// does. A current-thread runtime runs its tasks only inside its own `block_on`, so once
+    /// that returns they stop (PR #60 review F5).
     ///
     /// # Errors
     ///
-    /// [`OpenError`]. [`OpenError::NotEmpty`] when `config.dir` already has a `nodes/`: this
-    /// open claims the directory by creating it, so of two opens racing on one directory one
-    /// is refused, starts nothing, and removes nothing. Once claimed, when a node fails to
-    /// start, the bootstrap fails, or the returned future is dropped unfinished, every node
-    /// started has stopped and `nodes/` is removed, so the same open can run again.
+    /// [`OpenError`]. Every check runs before a node starts, and a refused check removes
+    /// nothing: [`OpenError::InUse`] when another open holds a copy's lock,
+    /// [`OpenError::CopyMissing`], [`OpenError::Unbound`] for an M9 directory,
+    /// [`OpenError::Mismatch`] when the copies and `store` do not belong together, and
+    /// [`OpenError::Stale`] when no copy holds the generation `partitions/1` names. An open that
+    /// created `nodes/` and then fails, or whose future is dropped unfinished, stops every node
+    /// it started and removes `nodes/`, so the same open can run again.
     ///
-    /// The bootstrap refuses a `partitions/1` that has a history
-    /// ([`admin::BootstrapError::AlreadyExists`]). An untouched record this bootstrap would
-    /// write is adopted instead, so an open whose create committed but whose reply was lost
-    /// can be run again against the same store. A store error is
-    /// [`admin::BootstrapError::Control`]; the next open adopts the record if it was written.
-    ///
-    /// S0 supports one `Db` per control store. Every `Db` starts nodes 1-3 at [`host::BOOT`], so
-    /// a second `Db` on the same store is refused with [`admin::BootstrapError::AlreadyExists`]
-    /// or, if it opens before the first has committed generation 1, opens but never becomes
-    /// ready.
+    /// A fresh open against a store whose `partitions/1` belongs to another database is
+    /// [`OpenError::Mismatch`], in words that name both databases and what to do (tester D1).
+    /// An untouched generation-0 record is adopted instead, so an open whose create committed
+    /// but whose reply was lost can be run again against the same store;
+    /// [`admin::BootstrapError::AlreadyExists`] is left for a record that changes between that
+    /// check and the bootstrap.
     pub async fn open(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
@@ -468,7 +729,7 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
-        let limits = limits(config.dedup_cap)?;
+        let limits = limits(config.dedup_cap).map_err(open_refused)?;
         let budgets = Budgets {
             dedup_retention_millis: config
                 .dedup_retention
@@ -491,58 +752,125 @@ impl Db {
             config,
             store,
             rt,
-            move |node, dir, links, control, clock| {
-                host::spawn_with(
-                    node,
-                    dir,
-                    links,
-                    control,
-                    clock,
-                    budgets,
-                    limits,
-                    host::BOOT,
-                )
+            budgets,
+            move |node, engine, links, control, clock, boot| {
+                host::spawn_on(node, engine, links, control, clock, budgets, limits, boot)
             },
         )
-        .await?;
+        .await
+        .map_err(open_refused)?;
         db.respawn = Some(respawn);
         Ok(db)
     }
 
     /// [`Self::open_with`] with `spawn` starting each node, so a crate test can fail one.
+    /// `budgets` are the ones the heal judges grants with.
     async fn open_spawning(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
         rt: Handle,
+        budgets: Budgets,
         spawn: impl Fn(
             NodeId,
-            PathBuf,
+            RocksEngine,
             Arc<Links>,
             Arc<ControlAdapter>,
             HostClock,
+            BootId,
         ) -> Result<NodeHandle, String>,
     ) -> Result<Self, OpenError> {
-        // F-001: creating `nodes/` is the claim, and it is atomic, so of two opens racing on one
-        // directory exactly one gets it. The other is refused before it starts a node, and
-        // removes nothing.
         std::fs::create_dir_all(&config.dir)?;
         let nodes_dir = config.dir.join("nodes");
-        if let Err(error) = std::fs::create_dir(&nodes_dir) {
-            return Err(match error.kind() {
-                std::io::ErrorKind::AlreadyExists => OpenError::NotEmpty(nodes_dir),
-                _ => OpenError::Io(error),
-            });
-        }
+        let created = match std::fs::create_dir(&nodes_dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(OpenError::Io(error)),
+        };
+        // Opening the engines takes their `LOCK`s, so of two opens racing on one directory one
+        // is refused `InUse` here (F-001). Only an open that created `nodes/` and holds node 1's
+        // `LOCK` may remove it.
+        let engines = match open_engines(&nodes_dir) {
+            Ok(engines) => engines,
+            Err((error, held_owner)) => {
+                if created && held_owner {
+                    remove_claim(&nodes_dir);
+                }
+                return Err(error);
+            }
+        };
+        // Until `db` takes them over, an open that fails or is dropped while it waits on the
+        // control store closes the engines and removes the `nodes/` it created.
+        let mut claim = Claim {
+            engines,
+            created: created.then(|| nodes_dir.clone()),
+        };
+        let found = Self::check(&mut claim.engines, &store).await?;
+        let refused = |error| counter_refused(&found.instance, error);
+        let n = match &found.roll {
+            None => admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
+                .await
+                .map_err(refused)?,
+            // Ruling A-R184: count at exactly the revision the decision read, so a host that
+            // activated the generation since then makes this open Stale, then link the copies.
+            Some(roll) => {
+                let n = admin::count_open_at(
+                    &*store,
+                    &found.instance,
+                    roll.count,
+                    roll.revision,
+                    admin::COUNT_WITHIN,
+                )
+                .await
+                .map_err(|error| match error {
+                    moved @ admin::CounterError::Moved { .. } => OpenError::Stale {
+                        generation: roll.to.0,
+                        detail: format!("not rolled forward: {moved}"),
+                    },
+                    other => refused(other),
+                })?;
+                for node in &roll.copies {
+                    claim
+                        .engines
+                        .get_mut(node)
+                        .ok_or_else(|| OpenError::Node(format!("node {}: no engine", node.0)))?
+                        .inherit(PARTITION, roll.from, roll.to, roll.base)
+                        .map_err(|error| {
+                            OpenError::Node(format!("node {}: roll forward: {error}", node.0))
+                        })?;
+                }
+                tracing::info!(
+                    generation = roll.to.0,
+                    from = roll.from.0,
+                    base = roll.base.0,
+                    copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    n,
+                    "db_open_rolled_forward"
+                );
+                n
+            }
+        };
+        let engines = std::mem::take(&mut claim.engines);
+        let unwind = claim.created.take();
+        drop(claim);
+        let boot = base_boot(n);
+        tracing::info!(
+            instance_hex = %admin::instance_hex(&found.instance),
+            fresh = found.fresh,
+            n,
+            boot = boot.0,
+            request_floor = request_floor(n),
+            "db_open_found"
+        );
         let clock = HostClock::start();
         let links = Links::new();
-        let control = ControlAdapter::new(Arc::clone(&store), rt, Arc::clone(&links));
+        let control = ControlAdapter::new(Arc::clone(&store), rt.clone(), Arc::clone(&links));
         for (a, b) in &config.hold {
             links.hold(*a, *b);
         }
-        // Built before any node starts and armed with the claim, so an open that fails below, or
-        // is dropped while it waits, drops it: its `Drop` stops and joins the nodes started so
-        // far, shuts the control adapter down, then removes `nodes/` (F-004, F-005, F-003). So
-        // the same open can run again.
+        // Built before any node starts and armed with the claim when this open made it, so an
+        // open that fails below, or is dropped while it waits, drops it: its `Drop` stops and
+        // joins the nodes started so far, shuts the control adapter down, then removes `nodes/`
+        // (F-004, F-005, F-003). So the same open can run again.
         let mut db = Self {
             nodes: Mutex::new(Vec::with_capacity(3)),
             respawn: None,
@@ -550,46 +878,299 @@ impl Db {
             control,
             clock,
             timeouts: config.timeouts,
-            next_request: AtomicU64::new(1),
+            next_request: AtomicU64::new(request_floor(n) + 1),
             ready_seen: AtomicBool::new(false),
-            unwind: Some(nodes_dir.clone()),
+            unwind,
+            opened: Opened {
+                base_boot: boot,
+                ..Opened::default()
+            },
         };
-        db.start(&nodes_dir, &store, spawn).await?;
+        let mut failed = None;
+        for (node, engine) in engines {
+            match spawn(
+                node,
+                engine,
+                Arc::clone(&db.links),
+                Arc::clone(&db.control),
+                db.clock,
+                boot,
+            ) {
+                Ok(handle) => lock(&db.nodes).push(handle),
+                Err(detail) => {
+                    failed = Some(detail);
+                    break;
+                }
+            }
+        }
+        // The engines not started were dropped with the loop, before `db` can unwind.
+        if let Some(detail) = failed {
+            return Err(OpenError::Node(detail));
+        }
+        if found.fresh {
+            admin::bootstrap_at(&store, db.clock.now(), boot, |msg| db.send_to(OWNER, msg)).await?;
+        } else {
+            db.start_heal(&store, &rt, budgets, boot)?;
+        }
         db.unwind = None;
         Ok(db)
     }
 
-    /// Start the three nodes under `nodes_dir`, then bootstrap partition 1 through node 1.
-    async fn start(
-        &mut self,
-        nodes_dir: &std::path::Path,
+    /// The reopen checks of arch R3b, all before anything is counted or started: one instance in
+    /// every copy, bound now on a fresh directory; and on a directory with data, a
+    /// `partitions/1` and counter of that instance, and a copy that holds the generation the
+    /// record names.
+    async fn check(
+        engines: &mut BTreeMap<NodeId, RocksEngine>,
         store: &Arc<dyn ConfigStore>,
-        spawn: impl Fn(
-            NodeId,
-            PathBuf,
-            Arc<Links>,
-            Arc<ControlAdapter>,
-            HostClock,
-        ) -> Result<NodeHandle, String>,
+    ) -> Result<Found, OpenError> {
+        let bound: BTreeSet<[u8; INSTANCE_LEN]> =
+            engines.values().filter_map(RocksEngine::instance).collect();
+        if bound.len() > 1 {
+            let named: Vec<String> = bound.iter().map(admin::instance_hex).collect();
+            return Err(OpenError::Mismatch(format!(
+                "the copies name different instances: {}",
+                named.join(", ")
+            )));
+        }
+        let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
+        if holds_data {
+            if let Some((node, _)) = engines.iter().find(|(_, e)| e.instance().is_none()) {
+                return Err(OpenError::Unbound(PathBuf::from(format!(
+                    "nodes/{}",
+                    node.0
+                ))));
+            }
+        }
+        let instance = bound
+            .first()
+            .copied()
+            .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
+        for (node, engine) in engines.iter_mut() {
+            engine
+                .bind_instance(instance)
+                .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+        }
+        let read = store
+            .get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            })
+            .await
+            .map_err(|error| {
+                // Nothing was written, so opening again is safe; say so when the store was
+                // simply not reachable (M10 D14). `config-client` names each endpoint it tried.
+                // One step fits both an rEtcd nobody reached and one that answered without a
+                // leader because most of its nodes are down (A-R210).
+                let step = match error {
+                    config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
+                    _ => "",
+                };
+                OpenError::Control(format!("get partitions/1: {error}{step}"))
+            })?;
+        let root = read
+            .record
+            .as_ref()
+            .and_then(|found| Some((PartitionRecord::decode(&found.value)?, found)))
+            .map(|(record, found)| (record, PartitionRoot::decode(&found.value)));
+        let fresh = Found {
+            instance,
+            fresh: true,
+            roll: None,
+        };
+        let untouched = read
+            .record
+            .as_ref()
+            .is_some_and(|found| found.create_revision == found.mod_revision);
+        let (record, root) = match (holds_data, root) {
+            // Nothing written yet: the bootstrap creates `partitions/1`, or adopts an untouched
+            // generation-0 one, its own whose reply was lost.
+            (false, None) => return Ok(fresh),
+            (false, Some((record, None))) if untouched && record.generation == Generation(0) => {
+                return Ok(fresh)
+            }
+            // Another database's history (tester D1).
+            (false, Some((_, None))) => {
+                return Err(OpenError::Mismatch(another_database(
+                    &instance,
+                    "an older database that names no instance",
+                )))
+            }
+            (false, Some((_, Some(root)))) if root.instance != instance => {
+                return Err(OpenError::Mismatch(another_database(
+                    &instance,
+                    &format!("instance {}", admin::instance_hex(&root.instance)),
+                )))
+            }
+            (true, None) => {
+                return Err(OpenError::Mismatch(
+                    "the copies hold data, but the store has no partitions/1".to_owned(),
+                ))
+            }
+            (true, Some((_, None))) => {
+                return Err(OpenError::Mismatch(
+                    "the copies hold data, but partitions/1 names no instance".to_owned(),
+                ))
+            }
+            (_, Some((record, Some(root)))) => (record, root),
+        };
+        if root.instance != instance {
+            return Err(OpenError::Mismatch(format!(
+                "the copies name instance {}, partitions/1 names {}",
+                admin::instance_hex(&instance),
+                admin::instance_hex(&root.instance)
+            )));
+        }
+        // PR #60 review F1: a copy staged into the generation and never switched in does not
+        // hold it, so it does not stop the roll-forward that resumes it.
+        let holds = engines
+            .values()
+            .any(|engine| serves(engine, record.generation));
+        if !holds {
+            // Ruling A-R184: roll forward only what the open counter proves no host activated.
+            let (count, revision) = admin::read_count(&**store, &instance)
+                .await
+                .map_err(|error| counter_refused(&instance, error))?;
+            return match roll_forward_copies(engines, record.generation, &root, count) {
+                Ok(copies) => Ok(Found {
+                    instance,
+                    fresh: false,
+                    roll: Some(Roll {
+                        count,
+                        revision,
+                        from: root.predecessor_generation,
+                        to: record.generation,
+                        base: root.predecessor_cutoff,
+                        copies,
+                    }),
+                }),
+                Err(why) => Err(OpenError::Stale {
+                    generation: record.generation.0,
+                    detail: format!(
+                        "partitions/1 is {:?} at generation {}, the copies hold {:?}; {why}",
+                        root.mode,
+                        record.generation.0,
+                        engines
+                            .values()
+                            .flat_map(RocksEngine::lineages)
+                            .map(|(_, generation)| generation.0)
+                            .collect::<BTreeSet<_>>()
+                    ),
+                }),
+            };
+        }
+        Ok(Found {
+            instance,
+            fresh: false,
+            roll: None,
+        })
+    }
+
+    /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
+    /// once every node has started on its open engine (A-R165): a copy queried before it is up
+    /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
+    /// logs how many had started.
+    fn start_heal(
+        &mut self,
+        store: &Arc<dyn ConfigStore>,
+        rt: &Handle,
+        budgets: Budgets,
+        boot: BootId,
     ) -> Result<(), OpenError> {
-        for n in 1..=3u32 {
-            let node = NodeId(n);
-            let dir = nodes_dir.join(n.to_string());
-            let handle = spawn(
-                node,
-                dir,
-                Arc::clone(&self.links),
-                Arc::clone(&self.control),
-                self.clock,
-            )
-            .map_err(OpenError::Node)?;
-            lock(&self.nodes).push(handle);
-        }
-        if !lock(&self.nodes).iter().any(|handle| handle.node == OWNER) {
-            return Err(OpenError::Node("no owner node".into()));
-        }
-        admin::bootstrap(store, self.clock.now(), |msg| self.send_to(OWNER, msg)).await?;
+        let (owner, started) = {
+            let nodes = lock(&self.nodes);
+            let owner = nodes
+                .iter()
+                .find(|handle| handle.node == OWNER)
+                .map(NodeHandle::sender);
+            (owner, nodes.len())
+        };
+        let owner = owner.ok_or_else(|| OpenError::Node("no owner node".into()))?;
+        tracing::info!(nodes_started = started, boot = boot.0, "db_heal_started");
+        let ctx = admin::HealCtx {
+            store: Arc::clone(store),
+            boot,
+            budgets,
+            clock: self.clock,
+            owner,
+            within: heal_within(&budgets),
+        };
+        let state = Arc::clone(&self.opened.heal);
+        *lock(&state) = HealState::Running;
+        self.opened.heal_task = Some(rt.spawn(async move {
+            let ended = admin::heal(ctx).await;
+            if let Err(error) = &ended {
+                tracing::error!(%error, "heal_failed");
+            }
+            *lock(&state) = match ended {
+                Ok(healed) => HealState::Handed(healed),
+                Err(error) => HealState::Failed(error),
+            };
+        }));
         Ok(())
+    }
+
+    /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at
+    /// node 1 itself each time, never at what an earlier look saw. Once node 1 has restarted,
+    /// or its restart failed, answers at once: it does not rejoin in this open (#42). So does a
+    /// recovery that ended `Blocked`: only a fresh fence leaves that phase, and an open sends
+    /// one fence only (ruling F-a, A-R196). So does a quarantined one, which nothing in an open
+    /// leaves (A-R196(2a)). So does a node 1 that has faulted, before or after ready: a faulted
+    /// node takes no writes again in this open (PR #60 review F3).
+    ///
+    /// # Errors
+    ///
+    /// [`ReadyError`]: [`ReadyError::Stopped`] after node 1's restart, and
+    /// [`ReadyError::Blocked`] once its recovery is blocked, whose texts say to shut this `Db`
+    /// down and open the folder again (A-R188, A-R196). [`ReadyError::Quarantined`] once its
+    /// recovery is quarantined, whose text says a reopen will not help (A-R196(2a), A-R196(2b)).
+    /// [`ReadyError::Faulted`] once node 1 has faulted, whose text carries the fault.
+    pub fn wait_ready(&self, within: Duration) -> Result<(), ReadyError> {
+        let deadline = std::time::Instant::now() + within;
+        let mut phase = String::from("unknown");
+        loop {
+            if let HealState::Failed(error) = &*lock(&self.opened.heal) {
+                return Err(ReadyError::Heal(error.clone()));
+            }
+            if let Some(note) = self.restart_note().filter(|_| self.owner_restarted()) {
+                return Err(ReadyError::Stopped { note });
+            }
+            if let Some(owner) = self.inspect(OWNER) {
+                if owner.admits == Some(true) {
+                    self.ready_seen.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                match stuck_recovery(&owner) {
+                    Some(ReadyError::Blocked { reason }) => {
+                        tracing::warn!(reason, "ready_blocked");
+                        return Err(ReadyError::Blocked { reason });
+                    }
+                    Some(stuck) => {
+                        tracing::warn!("ready_quarantined");
+                        return Err(stuck);
+                    }
+                    None => {}
+                }
+                // PR #60 review F3: a faulted node takes no writes again in this open.
+                if let Some(fault) = owner.fault {
+                    tracing::warn!(fault, "ready_faulted");
+                    return Err(ReadyError::Faulted { fault });
+                }
+                phase = owner.recovery.unwrap_or_else(|| "none".to_owned());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ReadyError::TimedOut {
+                    within_ms: within.as_millis(),
+                    phase,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// How the reopen's heal stands now.
+    #[must_use]
+    pub fn heal_state(&self) -> HealState {
+        lock(&self.opened.heal).clone()
     }
 
     /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
@@ -609,6 +1190,30 @@ impl Db {
             client: CLIENT,
             request: RequestId(self.next_request.fetch_add(1, Ordering::Relaxed)),
         }
+    }
+
+    /// The identity an `_as` call sends under, or its refusal when `request` is not an app's id
+    /// (A-R195): below 2^63 it could name a write this `Db` numbered itself. Nothing is sent.
+    /// The refusal goes through [`Self::retried`], so it never claims `no_mutation`: an id
+    /// sent by a build from before A-R195 may still be applied.
+    fn app_identity(&self, request: RequestId) -> Result<RequestIdentity, PutError> {
+        if request.0 & APP_REQUEST_BIT == 0 {
+            let refused = PutError {
+                error: ApiError::invalid(format!(
+                    "request id {} is in the range this Db numbers its own writes from, so it \
+                     could name another write; nothing was sent: build the id with \
+                     rdb_api::app_request_id(n)",
+                    request.0
+                )),
+                request: None,
+            };
+            return self.retried(request, Err(refused));
+        }
+        Ok(RequestIdentity {
+            tenant: TENANT,
+            client: CLIENT,
+            request,
+        })
     }
 
     fn call(&self, call: ClientCall, wait: Duration) -> Option<Answer> {
@@ -652,8 +1257,8 @@ impl Db {
         self.put_identified(self.identity(), object, value, if_version)
     }
 
-    /// [`Self::put`] under request id `request`, which this client may have used already. A
-    /// fresh compile, so a changed payload under a used id meets the dedup rules
+    /// [`Self::put`] under the app's request id `request`, which this client may have used
+    /// already. A fresh compile, so a changed payload under a used id meets the dedup rules
     /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
     /// own.
     ///
@@ -663,6 +1268,9 @@ impl Db {
     /// already be applied, and the compile refuses (a stale condition, an oversized value)
     /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
     /// that this call sent nothing; ask [`Self::status`] what became of `request`.
+    ///
+    /// First, before anything is compiled or sent, `INVALID_ARGUMENT` when `request` is below
+    /// 2^63, where this `Db` numbers its own writes: build it with [`app_request_id`] (A-R195).
     pub fn put_as(
         &self,
         request: RequestId,
@@ -670,11 +1278,7 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
-        let identity = RequestIdentity {
-            tenant: TENANT,
-            client: CLIENT,
-            request,
-        };
+        let identity = self.app_identity(request)?;
         self.retried(
             request,
             self.put_identified(identity, object, value, if_version),
@@ -722,7 +1326,47 @@ impl Db {
                 request: None,
             });
         }
-        let identity = self.identity();
+        self.txn_identified(self.identity(), puts, deadline)
+    }
+
+    /// [`Self::txn`] under the app's request id `request`, which this client may have used
+    /// already, so an app can keep the id before it sends and ask [`Self::status`] after a
+    /// crash (A-R194). A fresh compile, so a changed payload under a used id meets the dedup
+    /// rules (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this
+    /// `Db`'s own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::txn`], except that no answer claims `no_mutation` (D-S0-1). `request` may
+    /// already be applied, and the compile refuses (a stale condition, an oversized value)
+    /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
+    /// that this call sent nothing; ask [`Self::status`] what became of `request`.
+    ///
+    /// First, before anything is compiled or sent, `INVALID_ARGUMENT` when `request` is below
+    /// 2^63, where this `Db` numbers its own writes: build it with [`app_request_id`] (A-R195).
+    pub fn txn_as(
+        &self,
+        request: RequestId,
+        puts: &[TxnPut<'_>],
+        deadline: Duration,
+    ) -> Result<PutOk, PutError> {
+        let identity = self.app_identity(request)?;
+        let answer = match deadline_refusal(deadline) {
+            Some(error) => Err(PutError {
+                error,
+                request: None,
+            }),
+            None => self.txn_identified(identity, puts, deadline),
+        };
+        self.retried(request, answer)
+    }
+
+    fn txn_identified(
+        &self,
+        identity: RequestIdentity,
+        puts: &[TxnPut<'_>],
+        deadline: Duration,
+    ) -> Result<PutOk, PutError> {
         // Counted before any value is copied (M9 S5).
         if puts.len() > MAX_OPS {
             return Err(PutError {
@@ -820,18 +1464,54 @@ impl Db {
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
+        self.write_identified(self.identity(), object, change, expect)
+    }
+
+    /// [`Self::write`] under the app's request id `request`, which this client may have used
+    /// already, so an app can keep the id before it sends and ask [`Self::status`] after a
+    /// crash (A-R194). A fresh compile, so a changed payload under a used id meets the dedup
+    /// rules (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this
+    /// `Db`'s own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`], except that no answer claims `no_mutation` (D-S0-1). `request` may
+    /// already be applied, and the compile refuses (a stale condition, an oversized value)
+    /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
+    /// that this call sent nothing; ask [`Self::status`] what became of `request`. Likewise
+    /// `Ok(None)`: the change compiled to nothing here, which says nothing about an earlier
+    /// send under `request`.
+    ///
+    /// First, before anything is compiled or sent, `INVALID_ARGUMENT` when `request` is below
+    /// 2^63, where this `Db` numbers its own writes: build it with [`app_request_id`] (A-R195).
+    pub fn write_as(
+        &self,
+        request: RequestId,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
+        let identity = self.app_identity(request)?;
+        self.retried(
+            request,
+            self.write_identified(identity, object, change, expect),
+        )
+    }
+
+    fn write_identified(
+        &self,
+        identity: RequestIdentity,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
         let put = PutOp {
             group: GROUP,
             object: Bytes::copy_from_slice(object),
             change,
             expect,
         };
-        self.compile_and_send(
-            self.identity(),
-            vec![put],
-            self.timeouts.put,
-            self.timeouts.put,
-        )
+        self.compile_and_send(identity, vec![put], self.timeouts.put, self.timeouts.put)
     }
 
     /// Compile `puts` under `identity` with kernel deadline `deadline`, waiting
@@ -861,8 +1541,8 @@ impl Db {
             remaining_millis: millis(deadline),
         };
         // Every answer here sent nothing: the compile refused, or never answered (Q3, M9 S6).
-        // `put_as` takes this back to `false` through `Self::retried`: its request id may have
-        // applied on an earlier send.
+        // `put_as`, `txn_as` and `write_as` take this back to `false` through `Self::retried`:
+        // their request id may have applied on an earlier send.
         let refused = |mut error: ApiError| {
             error.no_mutation = true;
             Err(PutError {
@@ -978,7 +1658,7 @@ impl Db {
             self.ready_seen.store(true, Ordering::Relaxed);
         }
         answered.map_err(|PutError { error, request }| PutError {
-            error: self.explained(error),
+            error: self.explained(reconcile_step(error, request.as_deref())),
             request,
         })
     }
@@ -1162,18 +1842,16 @@ impl Db {
             .any(|handle| handle.node == node && handle.start_failed)
     }
 
-    /// Why writes stopped for good, once a node of this `Db` has restarted or failed to restart;
-    /// `None` while every node runs its first boot. Names each restarted node and its boot, and
-    /// says when the restart failed and the node stays stopped (F-013), in one short clause,
-    /// because it rides on every refused answer (tester walk 5): a restarted copy does not
-    /// rejoin before M10 (achieveai/rDB#42), so writes do not resume, and this `Db`'s data and
-    /// control store cannot be opened again (`NotEmpty`, `AlreadyExists`), so writing again
-    /// takes a new `Db` on new ones (M9 S2b, D2).
+    /// Which nodes of this `Db` have restarted or failed to restart; `None` while every node runs
+    /// its first boot. Names each restarted node and its boot, and says when the restart failed
+    /// and the node stays stopped (F-013), in one short clause, because it rides on every refused
+    /// answer (tester walk 5). A restarted copy does not rejoin in this open (achieveai/rDB#42):
+    /// it takes part again once the folder is opened again (M10 A-R188).
     #[must_use]
     pub fn restart_note(&self) -> Option<String> {
         let restarted: Vec<String> = lock(&self.nodes)
             .iter()
-            .filter(|handle| handle.boot != host::BOOT)
+            .filter(|handle| handle.boot != self.opened.base_boot)
             .map(|handle| {
                 let (node, boot) = (handle.node.0, handle.boot.0);
                 let who = if handle.node == OWNER {
@@ -1190,7 +1868,7 @@ impl Db {
             .collect();
         (!restarted.is_empty()).then(|| {
             format!(
-                "{}; a restarted node stays out until M10 (#42)",
+                "{}; a restarted node stays out until the folder is opened again (#42)",
                 restarted.join(", ")
             )
         })
@@ -1199,25 +1877,63 @@ impl Db {
     /// `error` with [`Self::restart_note`] appended to its detail, for the kinds a restart
     /// leaves every later call with: `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME`, and
     /// `NOT_PRIMARY`, whose `RefreshRoute` would otherwise send the caller looking for a primary
-    /// that no node becomes again in M9 (tester W3-D1). The kind, retry rule and mutation proof
-    /// are unchanged.
+    /// that no node becomes again in this open (tester W3-D1). Once node 1 has restarted, the
+    /// next step follows: shut this `Db` down and open the folder again (A-R188). The kind,
+    /// retry rule and mutation proof are unchanged.
+    ///
+    /// An `UNAVAILABLE` answered while node 1's recovery is stuck for this open, `Blocked` or
+    /// `Quarantined`, also names that state and the one step that helps, as the latest look at
+    /// node 1 found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
+    /// proof stay; it only cannot succeed in this open.
     fn explained(&self, mut error: ApiError) -> ApiError {
-        let Some(note) = self.restart_note() else {
+        if error.kind == ErrorKind::Unavailable {
+            if let Some(step) = self.stuck_step() {
+                error.detail = format!("{}; {step}", error.detail);
+            }
+        }
+        let Some(mut note) = self.restart_note() else {
             return error;
         };
+        if self.owner_restarted() {
+            note = format!("{note}; {REOPEN_STEP}");
+        }
         match error.kind {
             ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome => {
                 error.detail = format!("{}; {note}", error.detail);
             }
             ErrorKind::NotPrimary => {
                 error.detail = format!(
-                    "{}; no node becomes primary again in M9: {note}",
+                    "{}; no node becomes primary again in this open: {note}",
                     error.detail
                 );
             }
             _ => {}
         }
         error
+    }
+
+    /// What a refusal adds while node 1's recovery is stuck for this open (A-R200), or `None`.
+    /// It reads what the latest look at node 1 found ([`Self::wait_ready`], [`Self::node_status`])
+    /// and sends nothing: `Blocked` and `Quarantined` are final within an open, so a look that
+    /// found either still holds. A refusal before any look carries no step.
+    fn stuck_step(&self) -> Option<String> {
+        let stuck = lock(&self.opened.stuck).clone();
+        match stuck? {
+            ReadyError::Blocked { reason } => Some(format!(
+                "node 1 is blocked for this open ({reason}); retrying will not help: shut this \
+                 Db down and open the folder again"
+            )),
+            stuck => Some(stuck.to_string()),
+        }
+    }
+
+    /// Whether node 1 has restarted, or its restart failed: it then holds nothing and does not
+    /// rejoin in this open (#42), so nothing it served comes back until the folder is opened
+    /// again.
+    fn owner_restarted(&self) -> bool {
+        lock(&self.nodes)
+            .iter()
+            .any(|handle| handle.node == OWNER && handle.boot != self.opened.base_boot)
     }
 
     /// Whether node 1 admits writes or has been seen to; looks once when it has not.
@@ -1246,7 +1962,11 @@ impl Db {
             },
         )
         .ok()?;
-        answer.recv_timeout(self.timeouts.read).ok()
+        let status = answer.recv_timeout(self.timeouts.read).ok()?;
+        if node == OWNER {
+            *lock(&self.opened.stuck) = stuck_recovery(&status);
+        }
+        Some(status)
     }
 
     /// A resend's or retry's answer under `request`: whatever refused it, the request may have
@@ -1256,11 +1976,7 @@ impl Db {
     /// ([`Self::status_will_show`]): F1 refuses a retry of a finished write paused too (Message
     /// 7, P2), but a request refused at admission was never queued, and nothing resolves it
     /// (Msg 8, W6-D1). A new put's refusal does not come through here.
-    fn retried(
-        &self,
-        request: RequestId,
-        answer: Result<PutOk, PutError>,
-    ) -> Result<PutOk, PutError> {
+    fn retried<T>(&self, request: RequestId, answer: Result<T, PutError>) -> Result<T, PutError> {
         answer.map_err(|mut refused| {
             refused.error.no_mutation = false;
             if refused.error.kind == ErrorKind::ProtectionPaused && self.status_will_show(request) {
@@ -1289,6 +2005,11 @@ impl Db {
             self.status(request, None),
             Ok(TxnStatus::Resolved(_) | TxnStatus::Unresolved { .. })
         )
+    }
+
+    /// The clock every node of this `Db` runs on.
+    pub(crate) const fn clock(&self) -> HostClock {
+        self.clock
     }
 
     /// The budgets every node runs with, or `None` in a `Db` a crate test builds by hand.
@@ -1322,7 +2043,62 @@ impl Db {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         }
+    }
+
+    /// Day-1 spike (M10 W1): start the three nodes again on the `nodes/` an earlier open left,
+    /// at `boot`, with no bootstrap. Crate tests only; the real reopen is `Db::open`.
+    #[cfg(test)]
+    pub(crate) fn spike_reopen(
+        config: &DbConfig,
+        store: Arc<dyn ConfigStore>,
+        rt: Handle,
+        budgets: Budgets,
+        boot: BootId,
+    ) -> Result<Self, OpenError> {
+        let nodes_dir = config.dir.join("nodes");
+        let limits = limits(config.dedup_cap)?;
+        let clock = HostClock::start();
+        let links = Links::new();
+        let control = ControlAdapter::new(store, rt, Arc::clone(&links));
+        let db = Self {
+            nodes: Mutex::new(Vec::with_capacity(3)),
+            respawn: Some(Respawn {
+                nodes_dir: nodes_dir.clone(),
+                budgets,
+                limits,
+            }),
+            links,
+            control,
+            clock,
+            timeouts: config.timeouts,
+            next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+        };
+        for n in 1..=3u32 {
+            let handle = host::spawn_with(
+                NodeId(n),
+                nodes_dir.join(n.to_string()),
+                Arc::clone(&db.links),
+                Arc::clone(&db.control),
+                db.clock,
+                budgets,
+                limits,
+                boot,
+            )
+            .map_err(OpenError::Node)?;
+            lock(&db.nodes).push(handle);
+        }
+        Ok(db)
+    }
+
+    /// Send `msg` to node 1. Crate tests only (the spike's heal).
+    #[cfg(test)]
+    pub(crate) fn send_owner(&self, msg: Msg) -> Result<(), NodeStopped> {
+        self.send_to(OWNER, msg)
     }
 
     /// Stop `node`'s process and start it again on the same data at its boot plus one, as a
@@ -1374,6 +2150,7 @@ impl Db {
                      a write); restart a node only once it is ready",
                     node.0
                 ),
+                retry_after: None,
             });
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
@@ -1385,6 +2162,14 @@ impl Db {
             )));
         };
         let old_boot = handle.boot;
+        // One open never reaches the next open's boots (arch R3b).
+        if old_boot.0 - self.opened.base_boot.0 >= MAX_RESTARTS {
+            return Err(ApiError::invalid(format!(
+                "node {} not restarted: it has restarted {MAX_RESTARTS} times, the most one open \
+                 allows; reopen the directory",
+                node.0
+            )));
+        }
         let boot = BootId(old_boot.0 + 1);
         handle.stop();
         self.control.forget_node(node, old_boot);
@@ -1428,6 +2213,9 @@ impl Db {
 
     /// Stop every node and every control call. The control store stays the caller's.
     pub fn shutdown(&mut self) {
+        if let Some(task) = self.opened.heal_task.take() {
+            task.abort();
+        }
         for handle in self
             .nodes
             .get_mut()
@@ -1497,6 +2285,26 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
     })
 }
 
+/// `error` with the action a `GENERATION_CHANGED` refusal of `sent` asks for (M10 A-R189): the
+/// request may have applied under the generation it was sent under, so the caller looks it up
+/// with [`Db::status`] rather than sending it again as a new request. Any other error, or one
+/// with no request in hand, is returned as it is.
+fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
+    let Some(sent) = sent.filter(|_| error.kind == ErrorKind::GenerationChanged) else {
+        return error;
+    };
+    let under = sent.expected_generation.map_or_else(
+        || "with no expected generation".to_owned(),
+        |generation| format!("under generation {}", generation.0),
+    );
+    error.detail = format!(
+        "{}; request {} was sent {under}; look it up with Db::status to see whether it applied; \
+         do not resend it as a new request",
+        error.detail, sent.identity.request.0
+    );
+    error
+}
+
 /// A read P1 refused with `kind`, with the retry rule and mutation proof the kernel's own table
 /// gives that kind, as a put's refusal has (F-011). The `RdbError` here only carries the kind
 /// to that table: its fields are placeholders, so its message never reaches the detail.
@@ -1541,6 +2349,296 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         retry: kernel.retry_rule(),
         no_mutation: kernel.proves_no_mutation(),
         detail: "the read was refused".to_owned(),
+        retry_after: None,
+    }
+}
+
+/// What [`Db::check`] found: the instance the copies name now, and whether nothing was written
+/// under it yet.
+#[derive(Debug, Clone)]
+struct Found {
+    instance: [u8; INSTANCE_LEN],
+    fresh: bool,
+    /// Set when no copy holds the record's generation and it may be rolled forward (A-R184).
+    roll: Option<Roll>,
+}
+
+/// A reopen's roll-forward, decided by [`Db::check`] (ruling A-R184): count the open at exactly
+/// the counter revision the decision read, then link `to` onto `from` at `base` on `copies`.
+#[derive(Debug, Clone)]
+struct Roll {
+    count: admin::Count,
+    revision: u64,
+    from: Generation,
+    to: Generation,
+    base: Seq,
+    copies: Vec<NodeId>,
+}
+
+/// Whether `engine` holds `generation` of partition 1 as a generation it can serve. A full copy
+/// staged into it and never switched in, its `copying` record still there, is not that
+/// generation, only the start of one: its keys are partial and it has no link (PR #60 review
+/// F1). Counted as held, it stopped the roll-forward that resumes it, and no open succeeded.
+fn serves(engine: &RocksEngine, generation: Generation) -> bool {
+    engine.lineages().contains(&(PARTITION, generation))
+        && engine.staging(PARTITION, generation).is_none()
+}
+
+/// Ruling A-R184 (arch R3b check 4, critic-rollfwd F2): the copies a reopen may roll forward to
+/// `generation`, which no copy holds. Only when the open counter proves no host ever activated
+/// `generation`, so it never admitted a write, and only onto copies that hold the predecessor
+/// generation through its cutoff with the record's base digest there, verified from the record
+/// itself. Otherwise why not. Each copy's verdict is logged as `db_open_roll_forward_copy`.
+fn roll_forward_copies(
+    engines: &BTreeMap<NodeId, RocksEngine>,
+    generation: Generation,
+    root: &PartitionRoot,
+    count: admin::Count,
+) -> Result<Vec<NodeId>, String> {
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::envelope::ReplicationEnvelope;
+    if count.activated == admin::ACTIVATED_UNKNOWN {
+        return Err(
+            "the open counter predates activation marks, so it may have admitted \
+                    writes"
+                .to_owned(),
+        );
+    }
+    if count.may_have_admitted(generation) {
+        return Err(format!(
+            "the open counter marks generation {} activated, so it may have admitted writes",
+            count.activated.0
+        ));
+    }
+    // critic-rollfwd A1: a root naming boot 0 was never written by an owner.
+    if root.owner_boot == BootId(0) {
+        return Err("partitions/1 names owner boot 0".to_owned());
+    }
+    let (from, cutoff) = (root.predecessor_generation, root.predecessor_cutoff);
+    if from >= generation || root.base_seq != cutoff {
+        return Err(format!(
+            "partitions/1's root does not start at generation {} seq {}",
+            from.0, cutoff.0
+        ));
+    }
+    // A copy that holds a generation after `from` saw the database move on from it, so this
+    // root is not the one that generation's successor was built on: nothing to roll forward.
+    // Except `generation` itself staged from this root's base and never switched in (PR #60
+    // review F1): a flatten cut short there. The roll-forward's inherit re-runs it.
+    let resumable = |engine: &RocksEngine, held: Generation| {
+        held == generation && engine.staging(PARTITION, held) == Some((from, cutoff))
+    };
+    if let Some(newer) = engines
+        .values()
+        .flat_map(|engine| {
+            engine
+                .lineages()
+                .into_iter()
+                .filter(move |&(partition, held)| {
+                    partition == PARTITION && held > from && !resumable(engine, held)
+                })
+        })
+        .map(|(_, held)| held)
+        .max()
+    {
+        return Err(format!(
+            "a copy holds generation {}, after generation {} that partitions/1's root starts at",
+            newer.0, from.0
+        ));
+    }
+    let holds_base = |engine: &RocksEngine| -> Result<(), &'static str> {
+        if !engine.lineages().contains(&(PARTITION, from)) {
+            return Err("predecessor_absent");
+        }
+        if engine.buffered_applied(PARTITION, from).0 < cutoff.0 {
+            return Err("predecessor_below_cutoff");
+        }
+        let digest = if cutoff == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            let (bytes, _) = engine
+                .history_at(PARTITION, from, cutoff)
+                .map_err(|_| "history_read_failed")?
+                .ok_or("no_record_at_cutoff")?;
+            let envelope = ReplicationEnvelope::decode(&bytes).map_err(|_| "undecodable")?;
+            if envelope.header.seq != cutoff {
+                return Err("wrong_seq");
+            }
+            if envelope.compute_record_digest().ok() != Some(envelope.record_digest) {
+                return Err("digest_mismatch");
+            }
+            envelope.record_digest
+        };
+        if digest != root.base_digest {
+            return Err("base_digest_differs");
+        }
+        Ok(())
+    };
+    let mut copies = Vec::new();
+    for (node, engine) in engines {
+        let verdict = holds_base(engine);
+        tracing::info!(
+            node = node.0,
+            generation = generation.0,
+            from = from.0,
+            cutoff = cutoff.0,
+            verdict = verdict.err().unwrap_or("holds_base"),
+            "db_open_roll_forward_copy"
+        );
+        if verdict.is_ok() {
+            copies.push(*node);
+        }
+    }
+    if copies.is_empty() {
+        return Err(format!(
+            "no copy holds generation {} through seq {} with the record's base digest",
+            from.0, cutoff.0
+        ));
+    }
+    Ok(copies)
+}
+
+/// Log a refused open as `db_open_refused`, with its kind and its text, and hand it back. An
+/// open reads no app object, so the text holds paths, generations and instance ids, never key
+/// or value text.
+fn open_refused(error: OpenError) -> OpenError {
+    let kind = match &error {
+        OpenError::InUse(_) => "InUse",
+        OpenError::CopyMissing(_) => "CopyMissing",
+        OpenError::Unbound(_) => "Unbound",
+        OpenError::Mismatch(_) => "Mismatch",
+        OpenError::Stale { .. } => "Stale",
+        OpenError::Counter(_) => "Counter",
+        OpenError::Control(_) => "Control",
+        OpenError::Node(_) => "Node",
+        OpenError::Bootstrap(_) => "Bootstrap",
+        OpenError::DedupCap { .. } => "DedupCap",
+        OpenError::Io(_) => "Io",
+    };
+    tracing::warn!(kind, error = %error, "db_open_refused");
+    error
+}
+
+/// The words for a new folder against a store that serves another database (tester D1): both
+/// databases, and what to do instead.
+fn another_database(ours: &[u8; INSTANCE_LEN], theirs: &str) -> String {
+    format!(
+        "this control store already holds another database ({theirs}); this folder is instance {}. \
+         To use that database, open its original folder; for a new database, start a separate \
+         rEtcd",
+        admin::instance_hex(ours)
+    )
+}
+
+/// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
+const RETCD_STEP: &str = ". Check that rEtcd is running and reachable from this process, and \
+                          that a majority of its nodes is up, then open again";
+
+/// The open counter's refusal, as the open reports it. `Absent` is a store that is not this
+/// folder's. `Control`, a store that failed or did not answer, is the same passing failure as
+/// the open's read of `partitions/1`, with the same step (ruling A-R218, review-s1 F-002):
+/// a lost count reply can waste a number but never hands one out twice, and a roll-forward
+/// links nothing before its count lands, so opening again is safe. Only `Exhausted` and
+/// `Unreadable` stay `Counter`; a roll-forward's `Moved` is its caller's.
+fn counter_refused(instance: &[u8; INSTANCE_LEN], error: admin::CounterError) -> OpenError {
+    match error {
+        admin::CounterError::Absent { key } => OpenError::Mismatch(format!(
+            "the copies name instance {}, but {key} is absent",
+            admin::instance_hex(instance)
+        )),
+        admin::CounterError::Control(detail) => {
+            OpenError::Control(format!("open counter: {detail}{RETCD_STEP}"))
+        }
+        other => OpenError::Counter(other),
+    }
+}
+
+/// How long the heal may wait for old grants to clear: a whole grant, its clock error and
+/// dispatch margin, and 10 s of slack for the store.
+fn heal_within(budgets: &Budgets) -> Duration {
+    Duration::from_millis(
+        budgets
+            .grant_millis
+            .saturating_add(budgets.clock_error_millis)
+            .saturating_add(budgets.dispatch_margin_millis)
+            .saturating_add(10_000),
+    )
+}
+
+/// Open the three copies under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
+/// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
+/// missing copy is created only while no copy holds data. On error, says whether node 1's
+/// `LOCK` was held, which is what lets a claim be removed; every engine is closed by then.
+fn open_engines(nodes_dir: &Path) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
+    let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
+        rdb_storage::OpenError::Locked { .. } => OpenError::InUse(dir.to_path_buf()),
+        rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(dir.to_path_buf()),
+        other => OpenError::Node(format!("open {}: {other}", dir.display())),
+    };
+    let mut engines = BTreeMap::new();
+    let mut missing = Vec::new();
+    for n in 1..=3u32 {
+        let dir = nodes_dir.join(n.to_string());
+        if !dir.join("CURRENT").exists() {
+            missing.push((NodeId(n), dir));
+            continue;
+        }
+        match RocksEngine::open_existing(&dir) {
+            Ok(engine) => {
+                engines.insert(NodeId(n), engine);
+            }
+            Err(error) => {
+                let held = engines.contains_key(&OWNER);
+                return Err((refused(&dir, error), held));
+            }
+        }
+    }
+    if let Some((_, dir)) = missing.first() {
+        if engines.values().any(|engine| !engine.lineages().is_empty()) {
+            let held = engines.contains_key(&OWNER);
+            return Err((OpenError::CopyMissing(dir.clone()), held));
+        }
+    }
+    for (node, dir) in missing {
+        match RocksEngine::open(&dir) {
+            Ok(engine) => {
+                engines.insert(node, engine);
+            }
+            Err(error) => {
+                let held = engines.contains_key(&OWNER);
+                return Err((refused(&dir, error), held));
+            }
+        }
+    }
+    Ok(engines)
+}
+
+/// An open's engines and the `nodes/` it created, between opening the engines and handing them
+/// to the nodes. Dropped, it closes every engine first, releasing their `LOCK`s, then removes
+/// `nodes/` when this open created it.
+struct Claim {
+    engines: BTreeMap<NodeId, RocksEngine>,
+    created: Option<PathBuf>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.engines.clear();
+        if let Some(dir) = self.created.take() {
+            remove_claim(&dir);
+        }
+    }
+}
+
+/// Remove a `nodes/` this open created, once every engine in it is closed.
+fn remove_claim(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => tracing::info!(dir = %dir.display(), "open_unwound"),
+        Err(error) => tracing::error!(
+            dir = %dir.display(),
+            error = %error,
+            "open_unwind_remove_failed"
+        ),
     }
 }
 
@@ -1549,11 +2647,8 @@ fn limits(dedup_cap: Option<usize>) -> Result<Limits, OpenError> {
     let mut limits = Limits::default();
     if let Some(asked) = dedup_cap {
         if asked > RETENTION_CAP_ENTRIES {
-            tracing::error!(
-                dedup_cap = asked,
-                max = RETENTION_CAP_ENTRIES,
-                "dedup_cap_refused"
-            );
+            // Logged by the caller, as `db_open_refused` (`open_refused`): one event name for
+            // every refused open (lead ruling, tester S1-8 walk on 066ab6e).
             return Err(OpenError::DedupCap {
                 asked,
                 max: RETENTION_CAP_ENTRIES,
@@ -1783,13 +2878,21 @@ fn millis(duration: Duration) -> u64 {
 }
 
 #[cfg(test)]
+mod reopen_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_store::{Script, Scripted};
 
     /// Wait until node 1 admits writes, failing at once if any node is stuck in discovery.
     fn admits(db: &Db, phase: &str) {
-        let patience = crate::host::test_patience(Duration::from_secs(5));
+        admits_within(db, phase, Duration::from_secs(5));
+    }
+
+    /// [`admits`] with its own patience, scaled the same way.
+    fn admits_within(db: &Db, phase: &str, patience: Duration) {
+        let patience = crate::host::test_patience(patience);
         let deadline = std::time::Instant::now() + patience;
         while db.node_status().first().and_then(|node| node.admits) != Some(true) {
             for node in db.node_status() {
@@ -1799,6 +2902,27 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "{phase}: node 1 does not admit writes within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Wait until node 1 has published `seq` and holds nothing applied unpublished (D13).
+    ///
+    /// Not [`admits`]: that is L1 and A1 only, and stays true while T1 is still frozen on an
+    /// unpublished txn and refuses new writes `PROTECTION_PAUSED`. `Msg::Inspect` is answered
+    /// between drains, so once `published` shows `seq`, the publish's thaw has run too.
+    fn publishes(db: &Db, seq: Seq, phase: &str) {
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while !db.node_status().first().is_some_and(|node| {
+            node.published.map(|(_, at)| at) == Some(seq) && node.in_flight.is_none()
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase}: node 1 has not published {seq:?} with nothing in flight within \
+                 {patience:?}: {:?}",
+                db.node_status().first()
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1883,6 +3007,9 @@ mod tests {
 
         db.links().heal_all();
         admits(&db, "after the heal");
+        // D13: `admits` can be true while T1 still holds request 2 unpublished; wait for
+        // the publish too, so the resend never meets that freeze.
+        publishes(&db, Seq(3), "after the heal");
         let resent = db.resend(*request).expect("resend after the heal");
         assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
         let read = db.get(b"a").expect("get a");
@@ -1968,6 +3095,9 @@ mod tests {
 
         db.links().heal_all();
         admits(&db, "after the heal");
+        // D13: `admits` can be true while T1 still holds request 2 unpublished; wait for
+        // the publish too, so the resend never meets that freeze.
+        publishes(&db, Seq(3), "after the heal");
         let resent = db.resend(*request).expect("resend after the heal");
         assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
         let read = db.get(b"a").expect("get a");
@@ -2005,6 +3135,7 @@ mod tests {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
 
         let refused = db
@@ -2090,7 +3221,7 @@ mod tests {
 
         db.links().hold(NodeId(1), NodeId(2));
         db.links().hold(NodeId(1), NodeId(3));
-        let id = RequestId(100);
+        let id = app_request_id(100).expect("below 2^63");
         let putter = {
             let db = Arc::clone(&db);
             std::thread::spawn(move || db.put_as(id, b"a", b"2", None))
@@ -2113,7 +3244,7 @@ mod tests {
         match asker.join().expect("asker").expect("the status query") {
             TxnStatus::Resolved(result) => assert_eq!(result.seq, Seq(3)),
             TxnStatus::Unknown => {}
-            other => panic!("status of request 100: {other:?}"),
+            other => panic!("status of request {}: {other:?}", id.0),
         }
         let changed = changer
             .join()
@@ -2202,6 +3333,7 @@ mod tests {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
 
         let started = std::time::Instant::now();
@@ -2242,10 +3374,15 @@ mod tests {
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
-            timeouts: Timeouts::default(),
+            // The answerer is a thread: under a loaded gate it can take over a second to run.
+            timeouts: Timeouts {
+                read: crate::host::test_patience(Duration::from_secs(1)),
+                ..Timeouts::default()
+            },
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
         let cases = [
             (ErrorKind::ProtectionPaused, RetryRule::RetryAfterRecovery),
@@ -2285,34 +3422,28 @@ mod tests {
         db.shutdown();
     }
 
-    /// M9 opens only a directory without a `nodes/`: node data already there is refused before
-    /// any node starts, and left as it was, so a second open never bootstraps over a first
-    /// one's history.
+    /// M10 arch R3b (replaces M9's `NotEmpty` row, whose contract M10 retires): a `nodes/` an
+    /// earlier open left with no database in it, killed before its first engine opened, is
+    /// opened fresh again, not refused.
+    /// Integration (~2 s): real node threads and RocksDB; waits for generation 1.
     #[test]
-    fn open_refuses_a_directory_that_already_holds_node_data() {
+    fn an_open_over_copies_that_hold_no_database_opens_fresh() {
         let dir = config_testkit::fs::temp_dir();
         std::fs::create_dir_all(dir.path().join("nodes").join("1")).expect("node dir");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let config = DbConfig {
-            dir: dir.path().to_path_buf(),
-            hold: Vec::new(),
-            timeouts: Timeouts::default(),
-            dedup_cap: None,
-            dedup_retention: None,
-        };
-        match rt.block_on(Db::open(config, store, rt.handle().clone())) {
-            Err(OpenError::NotEmpty(path)) => assert_eq!(path, dir.path().join("nodes")),
-            Err(other) => panic!("open over node data: {other}"),
-            Ok(_) => panic!("open over node data succeeded"),
-        }
-        assert!(
-            dir.path().join("nodes").join("1").exists(),
-            "the refusal removed nothing"
-        );
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("an empty nodes/1 opens fresh");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("ready");
+        assert_eq!(db.heal_state(), HealState::NotNeeded);
+        db.shutdown();
     }
 
     /// F-004, F-005: an open that fails part-way leaves nothing running and nothing on disk, so
@@ -2329,19 +3460,19 @@ mod tests {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let fail_node_2 = |node: NodeId, dir, links, control, clock| {
+        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot| {
             if node == NodeId(2) {
                 return Err("node 2: injected".to_owned());
             }
-            host::spawn_with(
+            host::spawn_on(
                 node,
-                dir,
+                engine,
                 links,
                 control,
                 clock,
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
-                host::BOOT,
+                boot,
             )
         };
 
@@ -2349,6 +3480,7 @@ mod tests {
             config(dir.path()),
             Arc::clone(&store),
             rt.handle().clone(),
+            Budgets::SPEC_DEFAULTS,
             fail_node_2,
         ));
         match failed {
@@ -2377,9 +3509,10 @@ mod tests {
             Arc::clone(&store),
             rt.handle().clone(),
         )) {
-            Err(OpenError::Bootstrap(admin::BootstrapError::AlreadyExists { .. })) => {}
-            Err(other) => panic!("(b) the bootstrap is refused, not: {other}"),
-            Ok(_) => panic!("(b) the bootstrap is refused: partitions/1 exists"),
+            // Tester D1: another database's partitions/1 is a mismatch, not a bootstrap race.
+            Err(OpenError::Mismatch(_)) => {}
+            Err(other) => panic!("(b) the open is refused as another database's, not: {other}"),
+            Ok(_) => panic!("(b) the open is refused: partitions/1 is another database's"),
         }
         assert!(
             !second.path().join("nodes").exists(),
@@ -2392,7 +3525,8 @@ mod tests {
     /// start waits until the other has reached its own node-1 start or returned, so neither
     /// starts a node before both are past the claim. The winner's node-3 start then waits until
     /// the loser has returned, so the loser runs to its end while the winner's nodes are live.
-    /// Exactly one wins. The loser is refused `NotEmpty` and removes nothing: every node's
+    /// Exactly one wins. The loser is refused `InUse` at a copy's `LOCK` (M10 arch R3b; M9 refused
+    /// it `NotEmpty` at `nodes/`) and removes nothing: every node's
     /// `CURRENT` file is still there, and the winner serves a put and a get.
     /// Integration (~3 s): real node threads and RocksDB; the winner waits for generation 1.
     #[test]
@@ -2431,22 +3565,22 @@ mod tests {
                 let race = Arc::clone(&race);
                 std::thread::spawn(move || {
                     let other = 1 - me;
-                    let spawn = |node: NodeId, dir, links, control, clock| {
+                    let spawn = |node: NodeId, engine, links, control, clock, boot| {
                         if node == NodeId(1) {
                             race.mark(me, |state| state.0 = true);
                             race.wait("the other opener reaches node 1 or returns", other, |s| {
                                 s.0 || s.1
                             });
                         }
-                        let started = host::spawn_with(
+                        let started = host::spawn_on(
                             node,
-                            dir,
+                            engine,
                             links,
                             control,
                             clock,
                             fast(),
                             Limits::default(),
-                            host::BOOT,
+                            boot,
                         )?;
                         if node == NodeId(3) {
                             race.wait("the loser returns while these nodes run", other, |s| s.1);
@@ -2457,6 +3591,7 @@ mod tests {
                         config(&path),
                         store,
                         handle.clone(),
+                        fast(),
                         spawn,
                     ));
                     race.mark(me, |state| state.1 = true);
@@ -2470,7 +3605,11 @@ mod tests {
             .partition(Result::is_ok);
         assert_eq!((won.len(), lost.len()), (1, 1), "{won:?} {lost:?}");
         match lost.pop() {
-            Some(Err(OpenError::NotEmpty(path))) => assert_eq!(path, dir.path().join("nodes")),
+            Some(Err(OpenError::InUse(path))) => assert!(
+                path.starts_with(dir.path().join("nodes")),
+                "{}",
+                path.display()
+            ),
             other => panic!("the loser is refused at the claim, not: {other:?}"),
         }
         let mut db = won.pop().expect("one winner").expect("the winner's Db");
@@ -2504,8 +3643,11 @@ mod tests {
         let cases = [
             (
                 "(a) applied",
+                // M10: the open reads partitions/1 and its counter, and puts the counter, first.
                 Script {
+                    pass_puts: 1,
                     lose_put_replies: 1,
+                    pass_gets: 2,
                     fail_gets: 1,
                     ..Script::default()
                 },
@@ -2514,6 +3656,7 @@ mod tests {
             (
                 "(c) never applied",
                 Script {
+                    pass_puts: 1,
                     drop_puts: 1,
                     ..Script::default()
                 },
@@ -2562,37 +3705,49 @@ mod tests {
     /// removed; on Windows the removal is also the proof of the join, as above. Once the store
     /// lets puts through, the same open on the same directory and store succeeds. That open's
     /// claim was disarmed: dropping its `Db` leaves its node data.
-    /// Integration (~0.5 s): real node threads and RocksDB, no partition traffic.
+    /// M10: the open counter's put comes first, before any node starts, and an open dropped
+    /// while it waits there removes `nodes/` too, with the engines it opened closed first.
+    /// Integration (~1 s): real node threads and RocksDB, no partition traffic.
     #[test]
     fn an_open_dropped_while_its_bootstrap_put_waits_stops_its_nodes_and_removes_nodes() {
-        let dir = config_testkit::fs::temp_dir();
-        let nodes = dir.path().join("nodes");
         let rt = runtime();
-        let scripted = Arc::new(Scripted::gated());
-        let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
-        let opened = rt.block_on(async {
-            tokio::select! {
-                opened = Db::open(config(dir.path()), Arc::clone(&store), rt.handle().clone()) => {
-                    Some(opened)
+        // (case, puts let through before the one the open is dropped at)
+        for (case, ahead) in [("the counter put", 0), ("the bootstrap put", 1)] {
+            let dir = config_testkit::fs::temp_dir();
+            let nodes = dir.path().join("nodes");
+            let scripted = Arc::new(match ahead {
+                0 => Scripted::gated(),
+                pass_gate => Scripted::gated_with(Script {
+                    pass_gate,
+                    ..Script::default()
+                }),
+            });
+            let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+            let opened = rt.block_on(async {
+                tokio::select! {
+                    opened = Db::open(config(dir.path()), Arc::clone(&store), rt.handle().clone()) => {
+                        Some(opened)
+                    }
+                    () = scripted.put_arrived.notified() => None,
                 }
-                () = scripted.put_arrived.notified() => None,
-            }
-        });
-        assert!(opened.is_none(), "the open was dropped: {opened:?}");
-        assert!(
-            !nodes.exists(),
-            "the dropped open removed nodes/ and its nodes released their locks"
-        );
+            });
+            assert!(opened.is_none(), "{case}: the open was dropped: {opened:?}");
+            assert!(
+                !nodes.exists(),
+                "{case}: the dropped open removed nodes/ and released every lock"
+            );
 
-        scripted.release();
-        let db = rt
-            .block_on(Db::open(config(dir.path()), store, rt.handle().clone()))
-            .expect("the same open on the same directory succeeds");
-        drop(db);
-        assert!(
-            nodes.join("1").join("CURRENT").exists(),
-            "an open that succeeded never removes its node data"
-        );
+            // A permit returns to the gate after each put, so one lets every later put through.
+            scripted.release();
+            let db = rt
+                .block_on(Db::open(config(dir.path()), store, rt.handle().clone()))
+                .unwrap_or_else(|error| panic!("{case}: the same open succeeds: {error}"));
+            drop(db);
+            assert!(
+                nodes.join("1").join("CURRENT").exists(),
+                "{case}: an open that succeeded never removes its node data"
+            );
+        }
     }
 
     /// Open a `Db` on three real node threads with [`fast`] budgets and wait until it admits.
@@ -2839,7 +3994,9 @@ mod tests {
         let second = paused.request.expect("a kernel refusal keeps its request");
 
         db.links().heal_all();
-        admits(&db, "after the heal");
+        // D13: wait for the publish this row is named after, not for `admits`, which is true
+        // through the whole hold.
+        publishes(&db, Seq(3), "after the heal");
         let first = db.resend(*first).expect("the first publishes");
         assert_eq!((first.request, first.seq), (RequestId(2), Seq(3)));
         let second = db.resend(*second).expect("3b: admitted after the publish");
@@ -2864,7 +4021,7 @@ mod tests {
             "the host's expiry answers a resend, not the put timeout: {unknown:?}"
         );
         db.links().heal_all();
-        admits(&db, "after the second heal");
+        publishes(&db, Seq(5), "after the second heal");
         assert_eq!(
             db.resend(late).expect("published after the heal").seq,
             Seq(5)
@@ -2954,7 +4111,11 @@ mod tests {
                 "resend_within",
                 db.resend_within((*request).clone(), Duration::from_secs(2)),
             ),
-            ("put_as", db.put_as(id, b"b", b"2", None)),
+            // `put_as` takes an app's id (A-R195): one never admitted, as the new txn's was.
+            (
+                "put_as",
+                db.put_as(app_request_id(id.0).expect("below 2^63"), b"b", b"2", None),
+            ),
         ] {
             let refused = refused.expect_err(how);
             assert_eq!(
@@ -3062,7 +4223,7 @@ mod tests {
     /// first send and cannot on its resend.
     ///
     /// D-S0-1, the same flaw on `put_as`: it recompiles under a caller-chosen id, and the
-    /// compile refuses before the dedup index is asked. Under applied request 1, a stale
+    /// compile refuses before the dedup index is asked. Under an applied request, a stale
     /// condition answered `CONDITION_FAILED no_mutation=true`, and so did an oversized value.
     /// Integration (~3 s): three node threads; most of it is the open and readiness, which
     /// no `Db` row can skip.
@@ -3141,17 +4302,21 @@ mod tests {
             "a resend cannot know: {again:?}"
         );
 
-        // D-S0-1: `put_as` under applied request 1 (a=1 at seq 2; a is now at version 3).
+        // D-S0-1: `put_as` under an applied app request (A-R195: an app's ids are its own;
+        // a is at version 3).
+        let app = app_request_id(1).expect("below 2^63");
+        db.put_as(app, b"d", b"1", None)
+            .expect("put d=1 under the app's id");
         let stale = db
-            .put_as(put.request, b"a", b"1", Some(2))
+            .put_as(app, b"a", b"1", Some(2))
             .expect_err("a is at version 3");
         assert_eq!(stale.error.kind, ErrorKind::ConditionFailed, "{stale:?}");
         assert!(
             !stale.error.no_mutation,
-            "request 1 is applied at seq 2; the answer must not claim no mutation: {stale:?}"
+            "the app's request is applied; the answer must not claim no mutation: {stale:?}"
         );
         let oversized = db
-            .put_as(put.request, b"a", &vec![b'z'; 1_048_536], None)
+            .put_as(app, b"a", &vec![b'z'; 1_048_536], None)
             .expect_err("past the envelope");
         assert_eq!(
             oversized.error.kind,
@@ -3196,6 +4361,7 @@ mod tests {
             next_request: AtomicU64::new(1),
             ready_seen: AtomicBool::new(false),
             unwind: None,
+            opened: Opened::default(),
         };
         (db, mailbox, rt)
     }
@@ -3239,14 +4405,19 @@ mod tests {
         let note = db.restart_note().expect("the owner restarted");
         assert_eq!(
             note,
-            "the owner, node 1, restarted (now boot 2); a restarted node stays out until M10 (#42)"
+            "the owner, node 1, restarted (now boot 2); a restarted node stays out until the folder \
+             is opened again (#42)"
         );
         for kind in kinds {
             let plain = ApiError::new(kind, "d");
             let explained = db.explained(plain.clone());
             let detail = match kind {
-                ProtectionPaused | Unavailable | UnknownOutcome => format!("d; {note}"),
-                NotPrimary => format!("d; no node becomes primary again in M9: {note}"),
+                ProtectionPaused | Unavailable | UnknownOutcome => {
+                    format!("d; {note}; {REOPEN_STEP}")
+                }
+                NotPrimary => {
+                    format!("d; no node becomes primary again in this open: {note}; {REOPEN_STEP}")
+                }
                 _ => "d".to_owned(),
             };
             assert_eq!(
@@ -3260,7 +4431,8 @@ mod tests {
         let put = db.put(b"a", b"1", None).expect_err("nor the compile").error;
         for (call, error) in [("get", get), ("status", status), ("put", put)] {
             assert!(
-                error.kind == Unavailable && error.detail.ends_with(&note),
+                error.kind == Unavailable
+                    && error.detail.ends_with(&format!("{note}; {REOPEN_STEP}")),
                 "{call}: {error:?}"
             );
         }
@@ -3487,10 +4659,25 @@ mod tests {
         );
         let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
-            .filter(|line| line["@m"] == "dedup_cap_refused")
+            .filter(|line| line["@m"] == "db_open_refused")
             .collect();
+        // One event name for every refused open (lead ruling, tester S1-8 walk on 066ab6e).
         assert_eq!(lines.len(), 1, "one refusal line: {lines:?}");
-        assert_eq!(lines[0]["dedup_cap"], RETENTION_CAP_ENTRIES + 1);
+        assert_eq!(
+            (&lines[0]["@l"], &lines[0]["kind"], &lines[0]["error"]),
+            (
+                &serde_json::json!("Warning"),
+                &serde_json::json!("DedupCap"),
+                &serde_json::json!(format!(
+                    "dedup_cap {} is above the most P1's status index holds ({}); nothing was \
+                     started. Set DbConfig::dedup_cap to at most {}, or leave it unset for the \
+                     default",
+                    RETENTION_CAP_ENTRIES + 1,
+                    RETENTION_CAP_ENTRIES,
+                    RETENTION_CAP_ENTRIES
+                ))
+            )
+        );
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
             dedup_retention: None,
@@ -3844,8 +5031,9 @@ mod tests {
     fn m9_s5_put_as_refuses_an_object_id_over_1024_bytes_before_it_is_sent() {
         let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
         let long = vec![b'k'; MAX_OBJECT_ID + 1];
+        let id = app_request_id(77).expect("below 2^63");
         let refused = db
-            .put_as(RequestId(77), &long, b"v", None)
+            .put_as(id, &long, b"v", None)
             .expect_err("over the limit");
         assert_eq!(
             (
@@ -3859,7 +5047,11 @@ mod tests {
                 ErrorKind::InvalidArgument,
                 RetryRule::Definitive,
                 false,
-                "op 0: object id 1025 bytes, over the 1024-byte limit; request 77 not sent",
+                format!(
+                    "op 0: object id 1025 bytes, over the 1024-byte limit; request {} not sent",
+                    id.0
+                )
+                .as_str(),
                 true
             ),
         );
@@ -3867,17 +5059,412 @@ mod tests {
 
         let edge = vec![0_u8; MAX_OBJECT_ID];
         let at = db
-            .put_as(RequestId(77), &edge, b"v", None)
+            .put_as(id, &edge, b"v", None)
             .expect_err("nothing answers");
         assert_eq!(at.error.kind, ErrorKind::Unavailable, "{at:?}");
         match reached(&mailbox) {
             ClientCall::Compile { identity, puts, .. } => assert_eq!(
                 (identity.request, puts[0].object.len()),
-                (RequestId(77), MAX_OBJECT_ID)
+                (id, MAX_OBJECT_ID)
             ),
             other => panic!("the put at the limit is compiled: {other:?}"),
         }
         db.shutdown();
+    }
+
+    /// Ruling A-R195 (D11): `put_as`, `txn_as` and `write_as` refuse an id below 2^63, where
+    /// this `Db` numbers its own writes, before anything is compiled or sent: the owner hears
+    /// nothing. The refusal is `INVALID_ARGUMENT` with no request, its next step naming
+    /// `app_request_id`, and it does not claim `no_mutation` (D-S0-1). `app_request_id` builds
+    /// ids from 2^63 up and has none for 2^63 or more. Cut: the `_as` check is dropped, and the
+    /// owner hears a compile. Unit (~10 ms): no node thread.
+    #[test]
+    fn m10_r195_an_as_call_under_an_id_below_2_63_is_refused_and_nothing_is_sent() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let put = TxnPut {
+            group: GROUP,
+            object: b"a",
+            value: b"1",
+            if_version: None,
+        };
+        for id in [RequestId(5), RequestId((1 << 63) - 1)] {
+            for (how, refused) in [
+                ("put_as", db.put_as(id, b"a", b"1", None)),
+                ("txn_as", db.txn_as(id, &[put], Duration::from_secs(1))),
+                (
+                    "write_as",
+                    db.write_as(id, b"a", byte_doc(b"1"), None)
+                        .map(|ok| ok.expect("never answered")),
+                ),
+            ] {
+                let refused = refused.expect_err(how);
+                assert_eq!(
+                    (
+                        refused.error.kind,
+                        refused.error.no_mutation,
+                        refused.request.is_none()
+                    ),
+                    (ErrorKind::InvalidArgument, false, true),
+                    "{how} {}: {refused:?}",
+                    id.0
+                );
+                assert_eq!(
+                    refused.error.detail,
+                    format!(
+                        "request id {} is in the range this Db numbers its own writes from, so \
+                         it could name another write; nothing was sent: build the id with \
+                         rdb_api::app_request_id(n)",
+                        id.0
+                    ),
+                    "{how}"
+                );
+                assert!(
+                    mailbox.try_recv().is_err(),
+                    "{how}: nothing reached the owner"
+                );
+            }
+        }
+        assert_eq!(app_request_id(5), Some(RequestId((1 << 63) | 5)));
+        assert_eq!(app_request_id((1 << 63) - 1), Some(RequestId(u64::MAX)));
+        assert_eq!(app_request_id(1 << 63), None);
+        db.shutdown();
+    }
+
+    /// Ruling A-R196 (D10 part 2): node 1's recovery ended `Blocked` (here `BarrierIncomplete`,
+    /// final in an open by ruling F-a), so `wait_ready` answers at once, well inside 1 s of a
+    /// 90 s bound, with `Blocked` naming the reason and saying to open the folder again. Node 1
+    /// is a stub that answers every look with that phase, spelled as the host spells it. Cut:
+    /// `wait_ready` does not stop on `Blocked`, and it polls out its bound to `TimedOut`. Cut
+    /// (D17): it sleeps 1.5 s before answering, and the time fails.
+    /// Unit (~50 ms): no node thread.
+    #[test]
+    fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_blocked() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let blocked = format!(
+            "{:?}",
+            rdb_core::recovery::RecoveryPhase::Blocked(
+                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                    missing: vec![
+                        rdb_core::contracts::membership::CopyId(1),
+                        rdb_core::contracts::membership::CopyId(2),
+                    ],
+                }
+            )
+        );
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: Some(blocked),
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        // D17: timed from the first look node 1 answered in time, as the quarantined row below
+        // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
+        let answered = Arc::new(Mutex::new(None::<std::time::Instant>));
+        let node_1 = {
+            let answered = Arc::clone(&answered);
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        let at = std::time::Instant::now();
+                        if reply.send(status.clone()).is_ok() {
+                            lock(&answered).get_or_insert(at);
+                        }
+                    }
+                }
+            })
+        };
+
+        let answer = db.wait_ready(Duration::from_secs(3));
+        let returned = std::time::Instant::now();
+        assert_eq!(
+            answer,
+            Err(ReadyError::Blocked {
+                reason: "BarrierIncomplete { missing: [CopyId(1), CopyId(2)] }".to_owned()
+            })
+        );
+        assert_eq!(
+            answer.expect_err("blocked").to_string(),
+            "the open's recovery stopped before node 1 took writes (BarrierIncomplete { missing: \
+             [CopyId(1), CopyId(2)] }), and it does not try again in this open. If the last open \
+             of this folder stopped the same way, stop and report it with this message; \
+             otherwise shut this Db down and open the folder again"
+        );
+        drop(db);
+        node_1.join().expect("the stub");
+        let first = (*lock(&answered)).expect("node 1 answered a look in time");
+        let took = returned.saturating_duration_since(first);
+        assert!(
+            took < Duration::from_secs(1),
+            "answered {took:?} after node 1's first answer"
+        );
+    }
+
+    /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
+    /// open leaves, so `wait_ready` answers at once with `Quarantined`, whose text says the data
+    /// is kept and that neither a reopen nor a repair command helps yet (A-R196(2b)). Node 1 is a
+    /// stub that answers every look with that phase, spelled as the host spells it. Cut: `wait_ready` does not stop on `Quarantined`,
+    /// and it polls out its bound to `TimedOut`. Cut (D17): it sleeps 1.5 s before answering,
+    /// and the time fails.
+    /// Unit (~50 ms): no node thread.
+    #[test]
+    fn m10_d10_wait_ready_answers_at_once_when_the_recovery_is_quarantined() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let status = NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: Some(format!(
+                "{:?}",
+                rdb_core::recovery::RecoveryPhase::Quarantined
+            )),
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(false),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+        };
+        // D17: "at once" is timed from the first look node 1 answered in time, not from the
+        // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
+        // so a stub the host did not schedule for 2.2 s failed this row under gate load
+        // (int f5b3306) with `wait_ready` doing nothing wrong. The time is taken before the send,
+        // so it is never after `wait_ready` sees the reply.
+        let answered = Arc::new(Mutex::new(None::<std::time::Instant>));
+        let node_1 = {
+            let answered = Arc::clone(&answered);
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        let at = std::time::Instant::now();
+                        if reply.send(status.clone()).is_ok() {
+                            lock(&answered).get_or_insert(at);
+                        }
+                    }
+                }
+            })
+        };
+
+        let answer = db.wait_ready(Duration::from_secs(3));
+        let returned = std::time::Instant::now();
+        assert_eq!(answer, Err(ReadyError::Quarantined));
+        assert_eq!(
+            answer.expect_err("quarantined").to_string(),
+            "the open's recovery found copies whose histories disagree, so node 1 takes no \
+             writes; the acknowledged data is kept. Opening the folder again will not help, and \
+             do not delete the folder: this build has no repair command yet (removing a copy \
+             from membership comes in a later build)"
+        );
+        drop(db);
+        node_1.join().expect("the stub");
+        let first = (*lock(&answered)).expect("node 1 answered a look in time");
+        let took = returned.saturating_duration_since(first);
+        assert!(
+            took < Duration::from_secs(1),
+            "answered {took:?} after node 1's first answer"
+        );
+    }
+
+    /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
+    /// `UNAVAILABLE` keep their kind, retry rule and proof, and their detail adds the state and
+    /// the one step that helps: the reopen step for `Blocked`, the A-R196(2b) text for
+    /// `Quarantined`. A healthy node 1's refusal is unchanged. Node 1 is a stub that answers
+    /// every look with the phase and holds every call unanswered, so each call times out. The
+    /// row looks once with `wait_ready` first, as an app does after an open.
+    /// Cut: `explained` adds nothing, and the stuck cases equal the healthy one.
+    /// Unit (~2 s): no node thread.
+    #[test]
+    fn m10_r200_a_stuck_recovery_names_its_state_and_step_on_each_refusal() {
+        let refusals = |recovery: Option<String>| {
+            let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(200));
+            db.timeouts.read = Duration::from_millis(200);
+            let status = NodeStatus {
+                node: OWNER,
+                boot: host::BOOT,
+                fault: None,
+                holds: None,
+                authority: "held(grant 1)".to_owned(),
+                fence: None,
+                fence_polling: false,
+                replace_stopped: false,
+                recovery,
+                recovered: None,
+                role: "primary",
+                protection: None,
+                admits: Some(false),
+                published: None,
+                in_flight: None,
+                waits_on: None,
+                stalled: None,
+                reload_pending: None,
+            };
+            let node_1 = std::thread::spawn(move || {
+                // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
+                let mut held = Vec::new();
+                while let Ok(msg) = mailbox.recv() {
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            let _ = reply.send(status.clone());
+                        }
+                        other => held.push(other),
+                    }
+                }
+            });
+            // The look the app makes after an open; the refusals read what it found.
+            let _ = db.wait_ready(Duration::from_millis(50));
+            let put = db
+                .put(b"a", b"1", None)
+                .expect_err("nothing answers the compile")
+                .error;
+            let get = db.get(b"a").expect_err("nothing answers the read");
+            drop(db);
+            node_1.join().expect("the stub");
+            (put, get)
+        };
+        let (healthy_put, healthy_get) = refusals(None);
+        for refused in [&healthy_put, &healthy_get] {
+            assert_eq!(
+                (refused.kind, refused.retry),
+                (ErrorKind::Unavailable, RetryRule::BoundedJitter),
+                "{refused:?}"
+            );
+        }
+        assert!(healthy_put.no_mutation, "a compile sends nothing");
+
+        let blocked = format!(
+            "{:?}",
+            rdb_core::recovery::RecoveryPhase::Blocked(
+                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                    missing: vec![rdb_core::contracts::membership::CopyId(1)],
+                }
+            )
+        );
+        let quarantined = format!("{:?}", rdb_core::recovery::RecoveryPhase::Quarantined);
+        let cases = [
+            (
+                blocked,
+                "node 1 is blocked for this open (BarrierIncomplete { missing: [CopyId(1)] }); \
+                 retrying will not help: shut this Db down and open the folder again"
+                    .to_owned(),
+            ),
+            (quarantined, ReadyError::Quarantined.to_string()),
+        ];
+        for (phase, step) in cases {
+            let (put, get) = refusals(Some(phase.clone()));
+            for (stuck, healthy) in [(&put, &healthy_put), (&get, &healthy_get)] {
+                assert_eq!(
+                    (stuck.kind, stuck.retry, stuck.no_mutation),
+                    (healthy.kind, healthy.retry, healthy.no_mutation),
+                    "{phase}: kind, retry and proof stay: {stuck:?}"
+                );
+                assert_eq!(
+                    stuck.detail,
+                    format!("{}; {step}", healthy.detail),
+                    "{phase}"
+                );
+            }
+        }
+    }
+
+    /// M10 D14: the open's control read finds the store unreachable. The error says to check
+    /// that rEtcd is running and to open again, and opening the same folder again with the
+    /// store back does succeed, so the step it names is one this build can run. Cut: drop the
+    /// step from the text, and the first assertion fails.
+    /// Integration (~3 s): real node threads and RocksDB on the second open.
+    #[test]
+    fn m10_d14_an_open_whose_control_read_is_unavailable_says_to_check_retcd_and_open_again() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_gets: 1,
+            ..Script::default()
+        }));
+        let error = match rt.block_on(Db::open(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+        )) {
+            Err(error @ OpenError::Control(_)) => error,
+            Err(other) => panic!("the open fails with Control, not: {other}"),
+            Ok(_) => panic!("the open fails while the store is unreachable"),
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("control store: get partitions/1: ")
+                && text.ends_with(
+                    ". Check that rEtcd is running and reachable from this process, and that a \
+                     majority of its nodes is up, then open again"
+                ),
+            "{text}"
+        );
+
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("opening the same folder again, with the store back, succeeds");
+        admits(&db, "after the second open");
+        db.shutdown();
+    }
+
+    /// A-R210: rEtcd answered, but with no leader, because most of its nodes are down (the
+    /// tester's control-follower run, as `config-client` reports it after A-R208). The open's
+    /// error keeps that answer, and its step also says to bring a majority of the nodes up.
+    /// Cut: the D14 step without the majority clause, and this row and the D14 row fail.
+    /// Unit (~1 s): `MemStore` failing every call.
+    #[test]
+    fn m10_r210_an_open_whose_control_store_has_no_leader_says_to_bring_a_majority_up() {
+        const ANSWER: &str = "leader unknown (answered by 127.0.0.1:18922; could not reach: \
+                              cannot connect to 127.0.0.1:18902: transport error; cannot connect \
+                              to 127.0.0.1:18912: transport error)";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let store = config_testkit::MemStore::new();
+        store.failing_with(config_core::ConfigError::Unavailable {
+            reason: ANSWER.to_owned(),
+        });
+        let error = match rt.block_on(Db::open(
+            config(dir.path()),
+            Arc::new(store),
+            rt.handle().clone(),
+        )) {
+            Err(error @ OpenError::Control(_)) => error,
+            Err(other) => panic!("the open fails with Control, not: {other}"),
+            Ok(_) => panic!("the open fails while rEtcd has no leader"),
+        };
+        let text = error.to_string();
+        assert_eq!(
+            text,
+            format!(
+                "control store: get partitions/1: unavailable: {ANSWER}. Check that rEtcd is \
+                 running and reachable from this process, and that a majority of its nodes is \
+                 up, then open again"
+            )
+        );
     }
 
     /// M9 S5-2 (G3, G4). A change of any op-carrying kind with 256 ops, and a txn of 256 puts,
@@ -4199,5 +5786,2475 @@ mod tests {
         let nothing = db.write(b"missing", Change::Clear, None);
         assert!(matches!(nothing, Ok(None)), "{nothing:?}");
         db.shutdown();
+    }
+
+    /// What the spike saw.
+    #[derive(Debug)]
+    struct SpikeSeen {
+        /// The revision the grant delete landed at.
+        deleted: rdb_core::contracts::ids::Revision,
+        /// The store revision the `partitions/1` read was served at.
+        read_revision: rdb_core::contracts::ids::Revision,
+        /// `partitions/1`'s `mod_revision` from that read.
+        partition_revision: rdb_core::contracts::ids::Revision,
+        /// The fence's `control_revision`.
+        control_revision: rdb_core::contracts::ids::Revision,
+    }
+
+    /// Tester D1 (lead ruling on D1): a new folder opened against a control store that already
+    /// serves another folder is refused `Mismatch`, in words an app author can act on: both
+    /// instance ids, "this control store already holds another database", and what to do.
+    /// Nothing is left behind: the new folder's `nodes/` is removed.
+    /// Integration (~2 s): folder A must commit generation 1 first.
+    #[config_log::retcd_test]
+    fn m10_d1_a_new_folder_on_a_store_that_serves_another_is_refused_in_plain_words() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let a = config_testkit::fs::temp_dir();
+        let mut first = rt
+            .block_on(Db::open_with(
+                config(a.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("folder A opens");
+        admits(&first, "folder A");
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        let theirs = PartitionRoot::decode(&found.value)
+            .expect("layout 3")
+            .instance;
+
+        let b = config_testkit::fs::temp_dir();
+        let refused = rt.block_on(Db::open_with(
+            config(b.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ));
+        let error = match refused {
+            Err(error) => error,
+            Ok(_) => panic!("folder B opened on a store that serves folder A"),
+        };
+        let text = error.to_string();
+        tracing::info!(?error, %text, "d1_refusal");
+        assert!(matches!(error, OpenError::Mismatch(_)), "{error:?}");
+        assert!(
+            text.contains("this control store already holds another database"),
+            "{text}"
+        );
+        assert!(text.contains(&admin::instance_hex(&theirs)), "{text}");
+        assert!(
+            text.contains("open its original folder") && text.contains("a separate rEtcd"),
+            "{text}"
+        );
+        assert!(!b.path().join("nodes").exists(), "folder B left nothing");
+        first.shutdown();
+    }
+
+    /// A-R164: a value whose stored frame does not decode, read by the app after a reopen, is
+    /// an error and stops the node. Never `None`, never a panic. The view's get answers `None`
+    /// and records the fault; the host's check after the step turns that into the node's fault,
+    /// which answers the waiter.
+    /// Integration (~30 s): two opens, each reopen waits out the last run's grant.
+    #[config_log::retcd_test]
+    fn m10_a_frame_corrupt_value_read_by_the_app_is_an_error_never_absent() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get(b"c07")));
+        match read {
+            Ok(Err(error)) => names_the_fault(&error),
+            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R164, the compile checkpoint: a put whose condition reads a corrupt value is refused
+    /// with the node's fault, never with a conflict decided on a value read as absent. The
+    /// compile answers its caller itself, before anything reaches a T1 step, so only the check
+    /// after the compile sees the fault.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_a_put_whose_condition_reads_a_corrupt_value_is_refused_with_the_fault() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        let put = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.put(b"c07", b"again", Some(2))
+        }));
+        match put {
+            Ok(Err(refused)) => names_the_fault(&refused.error),
+            Ok(Ok(put)) => panic!("a condition read from a corrupt value is no answer: {put:?}"),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R164, the previous-view checkpoint: `get_previous` of a corrupt value reads it through
+    /// the view P1 kept, which no T1 or P1 step reads, so only the check in the object read
+    /// sees the fault. A put of another object first makes a kept view exist.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_a_previous_view_read_of_a_corrupt_value_is_an_error_never_absent() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        db.put(b"z", b"other", None)
+            .expect("a put of another object");
+        let read =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.get_previous(b"c07")));
+        match read {
+            Ok(Err(error)) => names_the_fault(&error),
+            Ok(Ok(found)) => panic!("a corrupt value is an error, never {:?}", found.value),
+            Err(_) => panic!("a corrupt value is an error, never a panic"),
+        }
+        db.shutdown();
+    }
+
+    /// A-R178 (S1-8): a node that faulted on a corrupt read refuses as stored damage, not as
+    /// a host fault. The put whose condition read the corrupt value, and a later put of another
+    /// object to the faulted node, both answer `CORRUPT_HISTORY` with retry `Quarantine`, and
+    /// with `no_mutation` as a compile refusal sets it today: nothing was sent.
+    /// Integration (~30 s): as the frame row.
+    #[config_log::retcd_test]
+    fn m10_s1_8_a_corrupt_read_faults_the_node_and_its_puts_answer_quarantine() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = reopened_over_a_corrupt_value(&rt, dir.path());
+        for (what, key, expected) in [
+            (
+                "the put whose condition read it",
+                b"c07".as_slice(),
+                Some(2),
+            ),
+            ("a later put to the faulted node", b"z".as_slice(), None),
+        ] {
+            let refused = match db.put(key, b"again", expected) {
+                Err(refused) => refused.error,
+                Ok(put) => panic!("{what}: a faulted node answers no put: {put:?}"),
+            };
+            assert_eq!(
+                (refused.kind, refused.retry, refused.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, true),
+                "{what}: {refused:?}"
+            );
+            names_the_fault(&refused);
+        }
+        db.shutdown();
+    }
+
+    fn names_the_fault(error: &ApiError) {
+        assert!(
+            error.detail.contains("storage read fault"),
+            "the error names the fault: {error:?}"
+        );
+    }
+
+    /// The A-R164 rows' folder: `c07=hello` written in generation 1, then every user value of
+    /// generation 1, in every copy, cut to 3 bytes (shorter than a frame), then reopened and
+    /// ready.
+    fn reopened_over_a_corrupt_value(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> Db {
+        use rdb_core::contracts::storage::Namespace;
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "first open");
+        db.put(b"c07", b"hello", None).expect("put");
+        db.shutdown();
+        drop(db);
+
+        let prefix = rdb_storage::keys::encode_key(PARTITION, Generation(1), Namespace::User, &[]);
+        let mut corrupted = 0;
+        for n in 1..=3 {
+            let path = dir.join("nodes").join(n.to_string());
+            let raw = rocksdb::DB::open_cf(
+                &rocksdb::Options::default(),
+                &path,
+                rdb_storage::keys::COLUMN_FAMILIES,
+            )
+            .expect("raw open");
+            let cf = raw
+                .cf_handle(rdb_storage::keys::cf_for(Namespace::User))
+                .expect("cf");
+            let keys: Vec<Box<[u8]>> = raw
+                .prefix_iterator_cf(cf, &prefix)
+                .map(|item| item.expect("raw read").0)
+                .take_while(|key| key.starts_with(&prefix))
+                .collect();
+            for key in keys {
+                raw.put_cf(cf, &key, [0, 0, 0]).expect("raw put");
+                corrupted += 1;
+            }
+        }
+        assert!(
+            corrupted >= 3,
+            "the value is stored in every copy: {corrupted}"
+        );
+
+        let db = open();
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the reopen is ready");
+        db
+    }
+
+    /// A-R165 item 3 (critic B2): a reopen starts its heal only after all three nodes have
+    /// started on their open engines, so recovery never queries a copy that is not up yet.
+    /// Integration (~2 s): one open until it admits writes, then one reopen; its heal is not
+    /// waited for.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_heals_only_after_every_node_has_started() {
+        const METHOD: &str = "m10_a_reopen_heals_only_after_every_node_has_started";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.shutdown();
+        drop(db);
+        let mut db = open();
+        db.shutdown();
+        let started: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_heal_started")
+            .map(|line| line["nodes_started"].clone())
+            .collect();
+        assert_eq!(
+            started,
+            vec![serde_json::json!(3)],
+            "one heal, after all three nodes"
+        );
+    }
+
+    /// M10 S1-1: an app reopens its folder and reads back every acknowledged write, twice in a
+    /// row, and a folder that was opened and closed empty reopens empty. Each reopen heals
+    /// (`HealState::Handed`), becomes ready through `wait_ready`, and takes writes again. D3
+    /// (k141): an app that reopens and only reads, four times running, still becomes ready.
+    /// Integration (~30 s today): four reopens, each waiting out the last run's grant on
+    /// wall-clock time and a full discovery window. Re-timed after the A-R165 timers land.
+    #[config_log::retcd_test]
+    fn m10_s1_1_a_reopen_reads_back_every_acknowledged_write() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let written: &[(&[u8], &[u8])] = &[(b"a", b"hello"), (b"b", b"world")];
+        // (case, writes, reopens, whether each reopen writes before it closes)
+        for (case, writes, reopens, writes_again) in [
+            ("empty", &[][..], 2, true),
+            ("written", written, 2, true),
+            ("read-only reopens", written, 4, false),
+        ] {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let dir = config_testkit::fs::temp_dir();
+            let open = || {
+                rt.block_on(Db::open_with(
+                    config(dir.path()),
+                    Arc::clone(&store),
+                    rt.handle().clone(),
+                    fast(),
+                ))
+            };
+            let mut db = open().unwrap_or_else(|e| panic!("{case}: the first open: {e}"));
+            admits(&db, case);
+            for (key, value) in writes {
+                db.put(key, value, None)
+                    .unwrap_or_else(|e| panic!("{case}: put: {e}"));
+            }
+            db.shutdown();
+            drop(db);
+
+            for round in 1..=reopens {
+                let mut db = open().unwrap_or_else(|e| panic!("{case}: reopen {round}: {e}"));
+                db.wait_ready(patience)
+                    .unwrap_or_else(|e| panic!("{case}: reopen {round} ready: {e}"));
+                assert!(
+                    matches!(db.heal_state(), HealState::Handed(_)),
+                    "{case}: reopen {round} healed: {:?}",
+                    db.heal_state()
+                );
+                for (key, value) in writes {
+                    let read = db.get(key).expect("get");
+                    assert_eq!(
+                        read.value.map(|(_, bytes)| bytes),
+                        Some(Bytes::copy_from_slice(value)),
+                        "{case}: reopen {round} reads back an acknowledged write"
+                    );
+                }
+                if writes.is_empty() {
+                    assert_eq!(
+                        db.get(b"a").expect("get").value,
+                        None,
+                        "{case}: reopen {round} of an empty folder is empty"
+                    );
+                }
+                if writes_again {
+                    db.put(b"after", b"x", None)
+                        .unwrap_or_else(|e| panic!("{case}: reopen {round} takes writes: {e}"));
+                }
+                db.shutdown();
+            }
+        }
+    }
+
+    /// D7 (tester s1-4/onecopy): one copy lagging at a clean quit must not brick the folder. The
+    /// link 1-2 is held for the last two puts, so node 2 stops at the first write while nodes 1
+    /// and 3 hold all three. The reopen selects the longer prefix and must catch node 2 up, then
+    /// become ready and read every acknowledged write back.
+    /// Integration (~5 s): one open, one reopen with a full discovery window.
+    #[config_log::retcd_test]
+    fn m10_d7_a_reopen_catches_up_a_copy_that_lagged_at_the_quit() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let written: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(written[0].0, written[0].1, None).expect("put a");
+        db.links().hold(NodeId(1), NodeId(2));
+        for (key, value) in &written[1..] {
+            db.put(key, value, None).expect("put while 1-2 is held");
+        }
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        db.wait_ready(patience)
+            .unwrap_or_else(|e| panic!("the reopen catches node 2 up and is ready: {e}"));
+        for (key, value) in written {
+            let read = db.get(key).expect("get");
+            assert_eq!(
+                read.value.map(|(_, bytes)| bytes),
+                Some(Bytes::copy_from_slice(value)),
+                "the reopen reads back an acknowledged write"
+            );
+        }
+        db.shutdown();
+    }
+
+    /// A-R177 (critic-f5 option 1, row 1): a copy that missed a writeless generation. The first
+    /// reopen holds node 2's links, so generation 2 commits on nodes 1 and 3 alone, `DegradedRf2`,
+    /// and node 2 keeps generation 1. B-R38 pauses writes while a copy is unheard, so generation 2
+    /// never admits: that is pinned here, not assumed. Neither reopen writes. The second reopen
+    /// heals case A; node 2's inventory finds generation 2 absent, holds generation 1 exactly
+    /// through its base with the same digest, and links generation 2 onto it. Generation 3 then
+    /// commits with every copy, fully protected, admits writes and reads the write back. Never a
+    /// host fault, never a failed heal.
+    /// Integration (~10 s): three opens, two discovery windows.
+    #[config_log::retcd_test]
+    fn m10_d7_a_copy_that_missed_a_writeless_generation_links_it_and_the_reopen_admits() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = |hold: Vec<(NodeId, NodeId)>| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    hold,
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        // Node 1's status once `done` holds for it. Any fault or failed heal fails the row.
+        let settle = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| -> NodeStatus {
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                if let HealState::Failed(error) = db.heal_state() {
+                    panic!("{what}: the heal failed: {error}");
+                }
+                for node in db.node_status() {
+                    assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
+                }
+                let owner = db.node_status().into_iter().next().expect("node 1");
+                if done(&owner) {
+                    return owner;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: not settled within {patience:?}: {owner:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let mut db = open(Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        // Settled once it committed and holds a grant, so the next open heals case A.
+        let mut db = open(vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))]);
+        let first = settle(&db, "the reopen without node 2", &|owner| {
+            owner.recovered.is_some() && owner.authority.starts_with("held(")
+        });
+        assert_eq!(first.recovered, Some(Generation(2)), "{first:?}");
+        assert_eq!(
+            first.admits,
+            Some(false),
+            "B-R38: generation 2 pauses writes while node 2 is unheard"
+        );
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(Vec::new());
+        let second = settle(&db, "the reopen with node 2 behind", &|owner| {
+            owner.admits == Some(true)
+        });
+        assert!(
+            matches!(
+                db.heal_state(),
+                HealState::Handed(admin::Healed {
+                    cleared: admin::GrantCleared::Deleted(_),
+                    ..
+                })
+            ),
+            "the second reopen heals case A: the first reopen held a grant"
+        );
+        assert_eq!(second.recovered, Some(Generation(3)), "{second:?}");
+        assert_eq!(
+            (second.recovery.as_deref(), second.stalled.as_deref()),
+            (Some("Committed"), None),
+            "generation 3 committed fully protected, nothing stalled"
+        );
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(
+            read.value.map(|(_, bytes)| bytes),
+            Some(Bytes::from_static(b"1")),
+            "the second reopen reads the write back"
+        );
+        db.shutdown();
+    }
+
+    // ---- A-R185: a copy outside the barrier links the new generation at its landing ----
+
+    /// Open `dir` on `store` with [`fast`] budgets and the peer links in `hold` held.
+    fn open_held(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+        hold: Vec<(NodeId, NodeId)>,
+    ) -> Db {
+        rt.block_on(Db::open_with(
+            DbConfig {
+                hold,
+                ..config(dir)
+            },
+            Arc::clone(store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("open")
+    }
+
+    /// The first two opens of the D7 shape: a=1 lands on every copy, then a reopen with node
+    /// 2's links held commits generation 2 on nodes 1 and 3 alone and holds a grant, so the
+    /// next open heals case A. Node 2 lands generation 2 from the control watch and links it at
+    /// the cutoff (A-R185), but its `CopyCaughtUp` waits on the held link and is lost at the
+    /// shutdown, so generation 2 never activates.
+    fn d7_node_2_behind(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+    ) {
+        let mut db = open_held(rt, dir, store, Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+        let mut db = open_held(
+            rt,
+            dir,
+            store,
+            vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))],
+        );
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let owner = db.node_status().into_iter().next().expect("node 1");
+            if owner.recovered == Some(Generation(2)) && owner.authority.starts_with("held(") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation 2 never committed and held: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+    }
+
+    /// Generation 3 is committed fully protected (F1 `Committed`, the mode `Active`), not a
+    /// generation 4, with nothing stalled; node 1 admits within patience; a=1 reads back; b=2
+    /// lands; and every copy then holds the same applied seq, durable. No fault, no failed heal.
+    ///
+    /// Ordered (ruling A-R197, critic D12 A3): b=2 is put only after node 1 logged generation 3
+    /// `recovered mode=Active`, so a put that lands between the first resume and the activation
+    /// re-emit cannot pass it. After the put, node 1 has logged no `set_admission allow=false`
+    /// since that line: the re-emit did not pause lag protection.
+    fn d7_active_at_3(db: &Db, method: &str, case: &str) {
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            if let HealState::Failed(error) = db.heal_state() {
+                panic!("{case}: the heal failed: {error}");
+            }
+            let nodes = db.node_status();
+            for node in &nodes {
+                assert_eq!(node.fault, None, "{case}: node {} faulted", node.node.0);
+            }
+            let owner = nodes.first().expect("node 1");
+            if owner.recovery.as_deref() == Some("Committed")
+                && owner.recovered == Some(Generation(3))
+                && owner.admits == Some(true)
+            {
+                assert_eq!(owner.stalled, None, "{case}: {owner:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: generation 3 is not mode Active and admitting within {patience:?}: \
+                 {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(
+            read.value.map(|(_, bytes)| bytes),
+            Some(Bytes::from_static(b"1")),
+            "{case}: a=1 reads back"
+        );
+        let activated = |lines: &[serde_json::Value]| {
+            lines.iter().position(|line| {
+                line["@m"] == "recovered"
+                    && line["node"] == 1
+                    && line["generation"] == 3
+                    && line["mode"] == "Active"
+            })
+        };
+        while activated(&config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            method,
+        ))
+        .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: node 1 never logged generation 3 recovered mode=Active"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let put = db
+            .put(b"b", b"2", None)
+            .unwrap_or_else(|e| panic!("{case}: put b=2 after the activation re-emit: {e}"));
+        loop {
+            let holds: Vec<_> = db
+                .node_status()
+                .into_iter()
+                .map(|node| node.holds.map(|h| (h.generation, h.applied, h.durable)))
+                .collect();
+            if holds.len() == 3
+                && holds
+                    .iter()
+                    .all(|h| *h == Some((Generation(3), put.seq.0, put.seq.0)))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: not every copy holds b=2 durably at generation 3: {holds:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+        let active = activated(&lines).expect("logged above");
+        let paused: Vec<_> = lines[active..]
+            .iter()
+            .filter(|line| {
+                line["@m"] == "set_admission" && line["node"] == 1 && line["allow"] == false
+            })
+            .collect();
+        assert!(
+            paused.is_empty(),
+            "{case}: lag protection paused after the activation re-emit: {paused:?}"
+        );
+    }
+
+    /// Node 2's lines, in order, among `inventory_reported` for generation 2, its first
+    /// `recovered_landed` for generation 3, and `land_link_inherited` to generation 3.
+    fn node_2_landing(method: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["node"] == 2)
+            .filter(|line| {
+                (line["@m"] == "inventory_reported" && line["generation"] == 2)
+                    || (line["@m"] == "recovered_landed"
+                        && line["generation"] == 3
+                        && line["first"] == true)
+                    || (line["@m"] == "land_link_inherited" && line["to"] == 3)
+            })
+            .collect()
+    }
+
+    /// Critic-d7fix follow-up M1: F1 logged generation 3 `recovered mode=Active`, and once F1
+    /// pinned node 2 (its post-commit `sync_proven` for generation 3) node 1 never logged node 2
+    /// as not advancing: the receiver installed at the landing took the appends.
+    fn node_2_followed_after_the_pin(method: &str) {
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+        assert!(
+            lines.iter().any(|line| line["@m"] == "recovered"
+                && line["generation"] == 3
+                && line["mode"] == "Active"),
+            "F1 activated generation 3"
+        );
+        let pinned = lines
+            .iter()
+            .position(|line| {
+                line["@m"] == "sync_proven"
+                    && line["node"] == 2
+                    && line["generation"] == 3
+                    && line["post_commit"] == true
+            })
+            .expect("F1 pinned node 2 and it proved the cutoff");
+        let stuck: Vec<_> = lines[pinned..]
+            .iter()
+            .filter(|line| line["@m"] == "replication_copy_not_advancing" && line["copy_node"] == 2)
+            .collect();
+        assert!(stuck.is_empty(), "node 2 follows after the pin: {stuck:?}");
+    }
+
+    /// Ruling A-R185 row 1 (critic-d7fix (c), answer-first): node 2 answers the third open's
+    /// inventory ask only after F1's discovery window closed (its thread sleeps past it), so
+    /// generation 3 commits without it, `DegradedRf2`. Its mailbox is FIFO, so it answers the ask
+    /// first, linking generation 2 (A-R177), then lands generation 3 outside the barrier and
+    /// links it at the cutoff, and reports `CopyCaughtUp`; F1 pins it, syncs every copy and
+    /// activates. Cut: the `CopyCaughtUp` send is dropped, and generation 3 never goes Active.
+    /// Integration (~12 s): three opens, a 4 s pause.
+    #[config_log::retcd_test]
+    fn m10_d7_a_copy_that_answers_after_the_window_links_at_landing_and_the_reopen_is_active() {
+        const METHOD: &str =
+            "m10_d7_a_copy_that_answers_after_the_window_links_at_landing_and_the_reopen_is_active";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        d7_node_2_behind(&rt, dir.path(), &store);
+
+        let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+        crate::host::pause_before_inventory(
+            &dir.path().join("nodes").join("2"),
+            Duration::from_millis(2 * window),
+        );
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        d7_active_at_3(&db, METHOD, "answer-first");
+        db.shutdown();
+        node_2_followed_after_the_pin(METHOD);
+
+        let order: Vec<_> = node_2_landing(METHOD)
+            .iter()
+            .map(|line| {
+                let mut said = line["@m"].as_str().unwrap_or_default().to_owned();
+                if said == "recovered_landed" {
+                    said = format!("{said} in_barrier={}", line["in_barrier"]);
+                }
+                if said == "land_link_inherited" {
+                    said = format!("{said} {}->{}", line["from"], line["to"]);
+                }
+                said
+            })
+            .collect();
+        assert_eq!(
+            order.first().map(String::as_str),
+            Some("inventory_reported"),
+            "{order:?}"
+        );
+        assert_eq!(
+            order[1..],
+            [
+                "recovered_landed in_barrier=false".to_owned(),
+                "land_link_inherited 2->3".to_owned()
+            ],
+            "node 2 answers late, then lands outside the barrier and links: {order:?}"
+        );
+    }
+
+    /// Ruling A-R185 row 2 (critic-d7fix (c), land-first): the third open holds link 1-2, so
+    /// node 2 never hears the inventory ask, and lands generation 3 from the control watch
+    /// outside the barrier. It holds generation 2 through the cutoff exactly (linked at its
+    /// landing in the reopen before), so it links generation 3 onto generation 2 there. Its
+    /// `CopyCaughtUp` is buffered until the heal; then F1 pins it and activates, and the late
+    /// ask is logged `inventory_late`, not `inventory_failed`. Cut: as row 1.
+    /// Integration (~12 s): three opens, a held link.
+    #[config_log::retcd_test]
+    fn m10_d7_a_copy_that_lands_before_it_is_asked_links_at_landing_and_the_reopen_is_active() {
+        const METHOD: &str =
+            "m10_d7_a_copy_that_lands_before_it_is_asked_links_at_landing_and_the_reopen_is_active";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        d7_node_2_behind(&rt, dir.path(), &store);
+
+        let mut db = open_held(&rt, dir.path(), &store, vec![(NodeId(1), NodeId(2))]);
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let landed = node_2_landing(METHOD)
+                .iter()
+                .any(|line| line["@m"] == "recovered_landed" && line["in_barrier"] == false);
+            if landed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 never landed generation 3 outside the barrier"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        db.links().heal(NodeId(1), NodeId(2));
+        d7_active_at_3(&db, METHOD, "land-first");
+        db.shutdown();
+        node_2_followed_after_the_pin(METHOD);
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let linked: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "land_link_inherited")
+            .map(|line| {
+                (
+                    line["node"].clone(),
+                    line["from"].clone(),
+                    line["to"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            [
+                (2.into(), 1.into(), 2.into()),
+                (2.into(), 2.into(), 3.into())
+            ],
+            "node 2 links once per landing outside the barrier: 1->2, then 2->3"
+        );
+        let failed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "inventory_failed")
+            .collect();
+        assert!(failed.is_empty(), "a late ask is not a failure: {failed:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["@m"] == "inventory_late" && line["node"] == 2),
+            "the ask held by the link reaches node 2 after the heal and is logged late"
+        );
+    }
+
+    /// Ruling A-R185 row 7 (the tester's o1-o4 walk, the variant seen at 0cab613): the third
+    /// open holds link 1-2, so node 2 lands generation 3 outside the barrier and links it; while
+    /// its `CopyCaughtUp` waits on the held link, node 1's grant renewals are dropped until the
+    /// grant expires (`fenced(Expired)`), and then node 1 acquires a new grant. After the heal
+    /// generation 3 activates and is writable; a fourth open is writable too, with no missed
+    /// link to make (`inventory_link_inherited`) and nothing stalled. Cut: as row 1.
+    /// Integration (~20 s): four opens, a held link, an expired grant.
+    #[config_log::retcd_test]
+    fn m10_d7_a_grant_that_expires_while_a_copy_waits_on_its_link_still_activates_and_reopens() {
+        const METHOD: &str =
+            "m10_d7_a_grant_that_expires_while_a_copy_waits_on_its_link_still_activates_and_reopens";
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        d7_node_2_behind(&rt, dir.path(), &store);
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let until = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| {
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                let owner = db.node_status().into_iter().next().expect("node 1");
+                if done(&owner) {
+                    return owner;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: not within {patience:?}: {owner:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let mut db = open_held(&rt, dir.path(), &store, vec![(NodeId(1), NodeId(2))]);
+        let deadline = std::time::Instant::now() + patience;
+        while !node_2_landing(METHOD)
+            .iter()
+            .any(|line| line["@m"] == "land_link_inherited")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 never linked generation 3 at its landing"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let held = until(&db, "node 1 holds a grant under generation 3", &|owner| {
+            owner.recovered == Some(Generation(3)) && owner.authority.starts_with("held(")
+        });
+        scripted.rescript(Script {
+            only_prefix: Some(ControlKey::Grant(OWNER).encode().into_bytes()),
+            drop_puts: u32::MAX,
+            ..Script::default()
+        });
+        until(&db, "the grant expires", &|owner| {
+            owner.fence == Some(rdb_core::contracts::authority::DenyReason::Expired)
+        });
+        scripted.rescript(Script::default());
+        until(&db, "node 1 acquires a new grant", &|owner| {
+            owner.authority.starts_with("held(") && owner.authority != held.authority
+        });
+        db.links().heal(NodeId(1), NodeId(2));
+        d7_active_at_3(&db, METHOD, "after the grant came back and the heal");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        let fourth = until(&db, "the fourth open admits", &|owner| {
+            owner.admits == Some(true)
+        });
+        assert_eq!(fourth.stalled, None, "{fourth:?}");
+        for (key, value) in [(&b"a"[..], &b"1"[..]), (b"b", b"2")] {
+            let read = db.get(key).expect("get");
+            assert_eq!(
+                read.value.map(|(_, bytes)| bytes),
+                Some(Bytes::copy_from_slice(value)),
+                "the fourth open reads back every acknowledged write"
+            );
+        }
+        db.put(b"c", b"3", None)
+            .expect("the fourth open is writable");
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let fourth_open = lines
+            .iter()
+            .rposition(|line| line["@m"] == "db_open")
+            .expect("the fourth open");
+        let missed: Vec<_> = lines[fourth_open..]
+            .iter()
+            .filter(|line| {
+                line["@m"] == "inventory_link_inherited" || line["@m"] == "recovery_rebuild_stalled"
+            })
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "no missed link, nothing stalled: {missed:?}"
+        );
+    }
+
+    /// A-R177 row 9 (critic-f5 residual): a copy below the base in its own generation. Node 2
+    /// misses `b` while 1-2 is held, so it stops at seq 1 of generation 1 while nodes 1 and 3
+    /// hold 2; the next reopen runs without node 2 and commits generation 2 at base 2. The
+    /// reopen after that cannot link generation 2 for node 2 (its head is below the base), and
+    /// a cross-generation catch-up does not exist yet: it is owed to slice 2. This row guards
+    /// slice 1's bar until then (A-R179): no host fault, and the stall is named
+    /// (`NodeStatus::stalled`, the `recovery_rebuild_stalled` line). It waits for that line, not
+    /// a fixed time.
+    /// Integration (~20 s): the stall only shows after three real opens and the rebuild watch.
+    #[config_log::retcd_test]
+    fn m10_d7_below_the_base_a_copy_has_no_fault_and_its_stall_is_named() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = |hold: Vec<(NodeId, NodeId)>| {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    hold,
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let settle = |db: &Db, what: &str, done: &dyn Fn(&NodeStatus) -> bool| -> NodeStatus {
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                if let HealState::Failed(error) = db.heal_state() {
+                    panic!("{what}: the heal failed: {error}");
+                }
+                for node in db.node_status() {
+                    assert_eq!(node.fault, None, "{what}: node {} faulted", node.node.0);
+                }
+                let owner = db.node_status().into_iter().next().expect("node 1");
+                if done(&owner) {
+                    return owner;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: not settled within {patience:?}: {owner:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let mut db = open(Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.put(b"b", b"2", None).expect("put b while 1-2 is held");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(vec![(NodeId(1), NodeId(2)), (NodeId(2), NodeId(3))]);
+        let first = settle(&db, "the reopen without node 2", &|owner| {
+            owner.recovered.is_some() && owner.authority.starts_with("held(")
+        });
+        assert_eq!(first.recovered, Some(Generation(2)), "{first:?}");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open(Vec::new());
+        let stalled = settle(&db, "the reopen with node 2 below the base", &|owner| {
+            owner.stalled.is_some()
+        });
+        let line = stalled.stalled.clone().unwrap_or_default();
+        assert!(
+            line.starts_with("recovery_rebuild_stalled") && line.contains("gen=3"),
+            "the stall names generation 3's rebuild: {line}"
+        );
+        db.shutdown();
+    }
+
+    /// A-R174: a put's compile reads only P1's published position, so its cost does not grow
+    /// with the status index. Generation 1 gets one more record on every copy, written straight
+    /// to disk, whose batch holds 50,000 dedup rows; the reopen seeds them into node 1's status
+    /// index (M7A-194). Then 100 compiles take under 1 s in all (times the deadline scale). A
+    /// compile that copies P1's whole view copies that index each time: 7.6 s for the 100 in a
+    /// debug build, against 19 ms reading the kernel's position (2026-10-23). The bar sits
+    /// between the two, far from both: a 50 ms bar failed at 285 ms on a loaded gate. A count of
+    /// clones would be exact, but the clone is inside rdb-core's `Publication::view`.
+    /// Integration (~5 s): two real opens, and the seed needs a recovery to land.
+    #[config_log::retcd_test]
+    fn a_compile_beside_a_50k_status_index_does_not_copy_it() {
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::envelope::ReplicationEnvelope;
+        use rdb_core::contracts::ids::BatchId;
+        use rdb_core::contracts::storage::{Batch, Namespace, Write};
+        use rdb_core::transaction::dedup::{dedup_key, dedup_value};
+        const SEEDED: u64 = 50_000;
+        const FIRST: u64 = 1_000_000;
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        for n in 1..=3 {
+            let mut engine =
+                RocksEngine::open(dir.path().join("nodes").join(n.to_string())).expect("engine");
+            let head = Seq(engine.buffered_applied(PARTITION, Generation(1)).0);
+            let (bytes, _) = engine
+                .history_at(PARTITION, Generation(1), head)
+                .expect("read")
+                .expect("the head record");
+            let last = ReplicationEnvelope::decode(&bytes).expect("decode");
+            let seq = Seq(head.0 + 1);
+            let mut env = last.clone();
+            env.header.seq = seq;
+            env.prev_digest = last.record_digest;
+            env.request_identity.request = RequestId(FIRST - 1);
+            env.mutations = Vec::new();
+            env.record_digest = env.compute_record_digest().expect("digest");
+            let mut progress = seq.0.to_le_bytes().to_vec();
+            progress.extend_from_slice(&env.record_digest.0);
+            let mut writes: Vec<Write> = (FIRST..FIRST + SEEDED)
+                .map(|request| Write {
+                    ns: Namespace::Dedup,
+                    key: dedup_key(
+                        Generation(1),
+                        GROUP,
+                        RequestIdentity {
+                            tenant: TENANT,
+                            client: CLIENT,
+                            request: RequestId(request),
+                        },
+                    ),
+                    value: Some(dedup_value(Digest::ROOT, seq, env.header.owner_epoch)),
+                })
+                .collect();
+            writes.push(Write {
+                ns: Namespace::History,
+                key: Bytes::copy_from_slice(&seq.0.to_be_bytes()),
+                value: Some(env.encode().expect("encode")),
+            });
+            writes.push(Write {
+                ns: Namespace::Progress,
+                key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+                value: Some(Bytes::from(progress)),
+            });
+            engine
+                .commit(Batch {
+                    id: BatchId(seq.0),
+                    partition: PARTITION,
+                    generation: Generation(1),
+                    seq,
+                    writes,
+                })
+                .expect("commit");
+        }
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + patience;
+        for request in [FIRST, FIRST + SEEDED - 1] {
+            loop {
+                match db.status(RequestId(request), Some(Generation(1))) {
+                    Ok(TxnStatus::Resolved(result))
+                        if result.outcome == Outcome::RecoveredApplied =>
+                    {
+                        break
+                    }
+                    other => assert!(
+                        std::time::Instant::now() < deadline,
+                        "request {request} not seeded within {patience:?}: {other:?}"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let compile = |request: u64| ClientCall::Compile {
+            identity: RequestIdentity {
+                tenant: TENANT,
+                client: CLIENT,
+                request: RequestId(request),
+            },
+            puts: vec![PutOp {
+                group: GROUP,
+                object: Bytes::from_static(b"a"),
+                change: byte_doc(b"2"),
+                expect: None,
+            }],
+            remaining_millis: 5_000,
+        };
+        let wait = Duration::from_secs(5);
+        match db.call(compile(1), wait) {
+            Some(Answer::Compiled(_)) => {}
+            other => panic!("the warm-up compile: {other:?}"),
+        }
+        let bar = crate::host::test_patience(Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        for request in 2..=101 {
+            match db.call(compile(request), wait) {
+                Some(Answer::Compiled(_)) => {}
+                other => panic!("compile {request}: {other:?}"),
+            }
+        }
+        let took = started.elapsed();
+        tracing::info!(
+            took_micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+            "a_r174_compiles"
+        );
+        assert!(took < bar, "100 compiles took {took:?}, over {bar:?}");
+        db.shutdown();
+    }
+
+    /// D6 (A-R170 rows): the generations of node `n`'s Dedup rows, read from its newest held
+    /// lineage of partition 1 after the `Db` has shut down. A `dedup_key` leads with its
+    /// generation, so one seek per generation finds them.
+    fn dedup_generations(dir: &std::path::Path, n: u32) -> (Generation, Vec<u64>) {
+        use rdb_core::contracts::storage::{Namespace, SnapshotRead};
+        let engine = RocksEngine::open(dir.join("nodes").join(n.to_string())).expect("open engine");
+        let newest = engine
+            .lineages()
+            .into_iter()
+            .filter(|(partition, _)| *partition == PARTITION)
+            .map(|(_, generation)| generation)
+            .max()
+            .expect("a held lineage");
+        let view = engine
+            .snapshot(PARTITION, newest, crate::host::STEP_VIEW)
+            .expect("view");
+        let mut found = Vec::new();
+        let mut from = 0_u64.to_be_bytes().to_vec();
+        while let Some((key, _)) = view.scan(Namespace::Dedup, &from, 1).into_iter().next() {
+            let head: [u8; 8] = key[..8].try_into().expect("a dedup key leads with 8 bytes");
+            let generation = u64::from_be_bytes(head);
+            found.push(generation);
+            from = (generation + 1).to_be_bytes().to_vec();
+        }
+        assert_eq!(view.fault(), None, "node {n}: the scan met a fault");
+        (newest, found)
+    }
+
+    /// D6, the tester's walk (A-R170 A + B): a full dedup cap frees up after a reopen once one
+    /// retention has passed, on every copy. Cap 2, retention 300 ms: two puts fill the cap. The
+    /// reopen seeds both, so a put is OVERLOADED until node 1 retires generation 1, one
+    /// retention after it landed generation 2; then a put lands. A second reopen with no wait
+    /// writes at once: generation 1's rows are gone from disk, not only from memory. Every copy
+    /// retires them, secondaries too (F3): no node still holds a generation-1 row.
+    /// Integration (~6 s): three opens, and the retirement waits a real retention.
+    #[config_log::retcd_test]
+    fn m10_d6_a_full_dedup_cap_frees_up_after_a_reopen_once_retention_passes() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(2),
+                    dedup_retention: Some(Duration::from_millis(300)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.put(b"b", b"1", None).expect("put b");
+        let refused = db.put(b"c", b"1", None).expect_err("a full cap");
+        assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            match db.put(b"c", b"1", None) {
+                Ok(_) => break,
+                Err(refused) => assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation 1's two entries were not retired within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Every copy retires one retention after it landed generation 2.
+        std::thread::sleep(Duration::from_millis(
+            crate::host::HOST_TRIM_EVERY_MILLIS + 500,
+        ));
+        db.shutdown();
+        drop(db);
+        for n in 1..=3 {
+            let (newest, found) = dedup_generations(dir.path(), n);
+            assert!(
+                !found.contains(&1),
+                "node {n} still holds generation 1's rows at generation {newest:?}: {found:?}"
+            );
+        }
+
+        let mut db = open();
+        admits(&db, "the second reopen");
+        db.put(b"d", b"1", None)
+            .expect("generation 1's rows are gone from disk, so the cap has room at once");
+        db.shutdown();
+    }
+
+    /// A-R186 and A-R193, the tester's clean quit: a quit right after the puts that fill the
+    /// cap still leaves their publish marks, and a reopen trims what they cover before it
+    /// admits. Cap 2, retention 4 s: puts a and b fill it and the process quits at once, inside
+    /// the mark period. Two retentions later the first two puts after the reopen admits both
+    /// land, with no OVERLOADED and no wait for a trim tick. Node 1's final mark comes back on
+    /// the reopen at the same generation and seq, its tick plus the clock error only (C1), and
+    /// its restore trims generation 1 through it. Without the final write nothing marks a or
+    /// b; without the trim at restore the first put waits up to a trim tick.
+    /// Integration (~11 s): two opens with two real retentions between them.
+    #[config_log::retcd_test]
+    fn m10_a_clean_quit_at_the_cap_reopens_writable_at_once() {
+        const METHOD: &str = "m10_a_clean_quit_at_the_cap_reopens_writable_at_once";
+        let retention = Duration::from_secs(4);
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(2),
+                    dedup_retention: Some(retention),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.put(b"b", b"1", None).expect("put b");
+        let published = std::time::Instant::now();
+        let refused = db.put(b"c", b"1", None).expect_err("a full cap");
+        assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}");
+        db.shutdown();
+        drop(db);
+        std::thread::sleep(
+            (published + 2 * retention).saturating_duration_since(std::time::Instant::now()),
+        );
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        // A-R193: the restore trimmed a and b before admitting, so both free slots are there
+        // at once, with no OVERLOADED and no wait for a trim tick.
+        db.put(b"c", b"1", None)
+            .expect("the first put after the reopen lands at once");
+        db.put(b"d", b"1", None)
+            .expect("the second put after the reopen lands at once");
+        db.shutdown();
+        drop(db);
+
+        // `newest` is `Some((generation, seq, tick))`.
+        let newest = |line: &serde_json::Value| -> Vec<u64> {
+            line["newest"]
+                .as_str()
+                .unwrap_or_default()
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.parse().expect("a number"))
+                .collect()
+        };
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let node_1 = |line: &&serde_json::Value| line["node"] == 1 && line["partition"] == 1;
+        let written = lines
+            .iter()
+            .filter(node_1)
+            .filter(|line| line["@m"] == "host_duty" && line["kind"] == "final_marks")
+            .map(newest)
+            .next()
+            .expect("node 1 wrote its final marks at the first quit");
+        let restored = lines
+            .iter()
+            .filter(node_1)
+            .filter(|line| line["@m"] == "publish_marks_restored")
+            .map(newest)
+            .next_back()
+            .expect("node 1 restored marks at the reopen");
+        let epsilon = fast().clock_error_millis;
+        assert_eq!(
+            written[0], 1,
+            "the final mark is generation 1's: {written:?}"
+        );
+        assert_eq!(
+            restored,
+            [written[0], written[1], written[2] + epsilon],
+            "the reopen restores the final mark verbatim, plus the clock error"
+        );
+        let pre_trims: Vec<_> = lines
+            .iter()
+            .filter(node_1)
+            .filter(|line| line["@m"] == "host_duty" && line["kind"] == "pre_trim")
+            .map(|line| (line["generation"].clone(), line["below"].clone()))
+            .collect();
+        assert_eq!(
+            pre_trims,
+            [(serde_json::json!(1), serde_json::json!(written[1] + 1))],
+            "node 1 trimmed generation 1 through the final mark at the restore"
+        );
+    }
+
+    /// A-R187, the tester's m8g20 walk (k210): a client that waits out the cap's not-before hint
+    /// is not refused again for the same reason with a later hint. Cap 2, retention 3 s. Puts a
+    /// and b fill the cap and the process quits cleanly, so final marks cover them (A-R186). The
+    /// reopen comes once they aged, so its restore trims generation 1 before it admits (A-R193),
+    /// and the retire it schedules one retention after the landing frees nothing. Puts c and
+    /// d, a second after the reopen admits, fill the cap again, and put e is `OVERLOADED`.
+    /// Before A-R187 its hint named that empty retire: e waited as told and was refused again
+    /// with a later hint. Now the hint names c's publish one retention on, and e lands after it.
+    /// Integration (~9 s): two opens and two real retentions.
+    #[config_log::retcd_test]
+    fn m10_r187_a_client_that_waits_out_the_cap_hint_is_not_refused_again() {
+        let retention = Duration::from_secs(3);
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(2),
+                    dedup_retention: Some(retention),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.put(b"b", b"1", None).expect("put b");
+        let published = std::time::Instant::now();
+        db.shutdown();
+        drop(db);
+        let aged = published + retention + Duration::from_millis(fast().clock_error_millis + 500);
+        std::thread::sleep(aged.saturating_duration_since(std::time::Instant::now()));
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        // Generation 2's publishes come well after its landing, so its empty retire is due
+        // first: that is the hint the old rule named.
+        std::thread::sleep(Duration::from_secs(1));
+        db.put(b"c", b"1", None)
+            .expect("the restore trimmed generation 1, so the cap has room");
+        db.put(b"d", b"1", None).expect("put d");
+        let refused = db.put(b"e", b"1", None).expect_err("c and d fill the cap");
+        assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}");
+        let hint = refused
+            .error
+            .retry_after()
+            .expect("c's publish frees room, so there is a hint");
+        std::thread::sleep(hint + crate::host::test_patience(Duration::from_millis(300)));
+        if let Err(again) = db.put(b"e", b"1", None) {
+            panic!(
+                "waited out the hint {hint:?} and was refused again, now not before {:?}: \
+                 {again:?}",
+                again.error.retry_after()
+            );
+        }
+        db.shutdown();
+    }
+
+    /// A-R215: a reopen whose primary copy lags its peers serves every acked write. Node 1's
+    /// WAL is cut back to its length before b and c, as a power loss that took node 1's unsynced
+    /// tail would leave it (the s0 torn-WAL rows cut the same way); nodes 2 and 3 keep them. F1
+    /// selects copy 1's longer prefix, and placement names copy 0 alone primary-eligible, so node
+    /// 1 still leads: it catches up before its grant, owns `partitions/1`, adopts the
+    /// generation, and a..c read back and d lands. Before the fix the leader was the prefix
+    /// source, node 2 owned the record, node 1 held the grant, and the open served nothing.
+    /// Integration (~4 s): two real opens with a cut WAL between them.
+    #[config_log::retcd_test]
+    fn m10_r215_a_reopen_whose_primary_copy_lags_its_peers_serves_every_acked_write() {
+        const METHOD: &str =
+            "m10_r215_a_reopen_whose_primary_copy_lags_its_peers_serves_every_acked_write";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let node_1 = dir.path().join("nodes").join("1");
+        let newest_wal = || {
+            std::fs::read_dir(&node_1)
+                .expect("list node 1")
+                .map(|entry| entry.expect("dir entry").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+                .max()
+                .expect("node 1 has a WAL")
+        };
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the first open");
+        let a = db.put(b"a", b"1", None).expect("put a");
+        publishes(&db, a.seq, "after a");
+        let wal = newest_wal();
+        let cut = std::fs::metadata(&wal).expect("WAL size").len();
+        db.put(b"b", b"1", None).expect("put b");
+        db.put(b"c", b"1", None).expect("put c");
+        db.shutdown();
+        drop(db);
+        assert_eq!(newest_wal(), wal, "node 1 wrote one WAL");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .expect("open node 1's WAL")
+            .set_len(cut)
+            .expect("cut node 1's WAL");
+
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the reopen");
+        db.put(b"d", b"1", None).expect("put d");
+        for key in [&b"a"[..], b"b", b"c", b"d"] {
+            let read = db.get(key).unwrap_or_else(|e| panic!("get {key:?}: {e:?}"));
+            assert_eq!(
+                read.value.map(|(_, value)| value),
+                Some(Bytes::from_static(b"1")),
+                "{key:?} reads back"
+            );
+        }
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1")
+            .record
+            .expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("decodes");
+        assert_eq!(
+            record.owner,
+            NodeId(1),
+            "the pinned primary owns the record"
+        );
+        db.shutdown();
+
+        // The cut took: node 1 reported a shorter prefix than its peers, so F1's source was not
+        // copy 0.
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let heads: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "inventory_reported")
+            .map(|line| (line["copy"].as_u64(), line["head"].as_u64()))
+            .collect();
+        let head = |copy| {
+            heads
+                .iter()
+                .rev()
+                .find(|(c, _)| *c == Some(copy))
+                .and_then(|(_, head)| *head)
+        };
+        assert!(
+            head(0) < head(1) && head(1) == head(2),
+            "copy 0 lags copies 1 and 2 at the reopen: {heads:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line["@m"] == "recovery_fact"
+                && line["effect"]
+                    .as_str()
+                    .is_some_and(|effect| effect.contains("source: CopyId(1)"))),
+            "F1 selected copy 1's prefix"
+        );
+    }
+
+    /// D18 (A-R206): a stall of node 1's run loop alone, past L1's pause age, with its own copy
+    /// durable and the peers' acks waiting in its mailbox, does not pause writes. The loop drains
+    /// the mail it took before it runs the due duties, so the peers' `DurableAdvanced` reaches L1
+    /// before the overdue health eval. Node 1 sleeps 1 s (the pause age is 400 ms) at the top of
+    /// a loop once its copy is durable past the primary's floor. Cut: `run_due` before that
+    /// drain, and L1 pauses on stale progress. Integration (~3 s): one open, puts until the stall
+    /// fires, then twice the pause age.
+    #[config_log::retcd_test]
+    fn m10_d18_a_stall_of_node_1_alone_does_not_pause_writes_its_peers_made_durable() {
+        const METHOD: &str =
+            "m10_d18_a_stall_of_node_1_alone_does_not_pause_writes_its_peers_made_durable";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the open");
+        let node_1 = dir.path().join("nodes").join("1");
+        let pause_age = Duration::from_millis(fast().pause_age_millis);
+        let stall = Duration::from_millis(1_000);
+        crate::host::stall_loop_once(&node_1, Seq(2), stall);
+        // The stall waits for node 1's own fsync to beat the peers' acks, which a put need not
+        // give; each put is another chance.
+        for i in 0..40u32 {
+            if !crate::host::stall_loop_armed(&node_1) {
+                break;
+            }
+            db.put(format!("k{i}").as_bytes(), b"v", None)
+                .expect("a put before the stall");
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        assert!(
+            !crate::host::stall_loop_armed(&node_1),
+            "node 1's own copy never got ahead of the floor"
+        );
+        // The window the pause would fall in; the log, read below, is what is judged.
+        std::thread::sleep(stall + 2 * pause_age);
+        admits(&db, "after the stall");
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let stalled = lines
+            .iter()
+            .position(|line| line["@m"] == "test_loop_stalled" && line["node"] == 1)
+            .expect("node 1's loop stalled");
+        let paused: Vec<_> = lines[stalled..]
+            .iter()
+            .filter(|line| {
+                line["@m"] == "set_admission" && line["node"] == 1 && line["allow"] == false
+            })
+            .collect();
+        assert!(
+            paused.is_empty(),
+            "node 1 paused on progress its mailbox held: {:?} then {paused:?}",
+            lines[stalled]
+        );
+    }
+
+    /// D10 (A-R196(1)): a reopen whose owner syncs slowly still completes its barrier. Node 1's
+    /// own barrier sync sleeps a second past the discovery window, as a slow fsync under load
+    /// did. Its asks to nodes 2 and 3 leave before its own sync, and the run loop reads their
+    /// answers before it judges the overdue deadline, so F1 commits and a reads back. Either
+    /// half alone fails it `BarrierIncomplete`: asks sent after the sleep are answered after the
+    /// deadline, and answers queued during the sleep are read after it.
+    /// Integration (~5 s): two opens, a 3 s sleep.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_whose_owner_syncs_slowly_still_completes_its_barrier() {
+        const METHOD: &str = "m10_a_reopen_whose_owner_syncs_slowly_still_completes_its_barrier";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits(&db, "the first open");
+        db.put(b"a", b"1", None).expect("put a");
+        db.shutdown();
+        drop(db);
+
+        let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+        crate::host::pause_before_sync(
+            &dir.path().join("nodes").join("1"),
+            Duration::from_millis(window + 1_000),
+        );
+        let mut db = open_held(&rt, dir.path(), &store, Vec::new());
+        admits_within(&db, "the reopen", Duration::from_secs(15));
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(
+            read.value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"1"))
+        );
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["@m"] == "test_sync_paused" && line["node"] == 1),
+            "node 1's own barrier sync slept"
+        );
+        // A-R192a: the sleep is inside a module step, and the host names that step.
+        let slow: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "host_slow_step" && line["node"] == 1)
+            .collect();
+        assert!(
+            slow.iter()
+                .any(|line| line["step"] == "module"
+                    && line["millis"].as_u64() >= Some(window + 1_000)),
+            "node 1 logged the slow module step that held its sync: {slow:?}"
+        );
+        // The reopen's barrier is the last three pre-commit proofs: node 1's comes last, after
+        // the peers it asked first.
+        let proven: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "sync_proven" && line["post_commit"] == false)
+            .map(|line| line["node"].as_u64().unwrap_or_default())
+            .collect();
+        let barrier = &proven[proven.len().saturating_sub(3)..];
+        assert_eq!(barrier.len(), 3, "three barrier proofs: {proven:?}");
+        assert_eq!(barrier[2], 1, "node 1 proved its own copy last: {proven:?}");
+        let blocked: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                line["@m"] == "recovery_fact"
+                    && line["effect"]
+                        .as_str()
+                        .is_some_and(|effect| effect.starts_with("BlockPromotion"))
+            })
+            .collect();
+        assert!(blocked.is_empty(), "the barrier completed: {blocked:?}");
+    }
+
+    /// D6, critic-d6 F1 (A-R170 D): writes spread over more than the retention fill the cap
+    /// several times over, and a reopen writes at once. Cap 5, retention 300 ms, seven puts
+    /// 800 ms apart: at most two are retained at a time, so each passes. The trim duty deletes
+    /// what it trims on disk too, so the reopen seeds at most the last few, not all seven.
+    /// Without that delete the seed holds seven entries against a cap of five, and the put is
+    /// OVERLOADED until one retention after the reopen.
+    /// Integration (~8 s): seven puts across real trim ticks, then two opens.
+    #[config_log::retcd_test]
+    fn m10_d6_writes_over_more_than_the_retention_reopen_writable_at_once() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let open = || {
+            rt.block_on(Db::open_with(
+                DbConfig {
+                    dedup_cap: Some(5),
+                    dedup_retention: Some(Duration::from_millis(300)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open")
+        };
+        // A put lands, or fails at once if it is OVERLOADED. A host-load refusal such as a
+        // lapsed grant's LEASE_EXPIRED is retried; CONDITION_FAILED means an earlier try landed.
+        let land = |db: &Db, key: &[u8], what: &str| {
+            let patience = crate::host::test_patience(Duration::from_secs(5));
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                match db.put(key, b"1", None) {
+                    Ok(_) => return,
+                    Err(refused) => match refused.error.name().as_str() {
+                        "OVERLOADED" => panic!("{what}: {refused:?}"),
+                        "CONDITION_FAILED" => return,
+                        _ => assert!(
+                            std::time::Instant::now() < deadline,
+                            "{what}: not landed within {patience:?}: {refused:?}"
+                        ),
+                    },
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let mut db = open();
+        admits(&db, "the first open");
+        for n in 0..7_u8 {
+            if n > 0 {
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            land(&db, &[b'k', b'0' + n], &format!("put {n}"));
+        }
+        db.shutdown();
+        drop(db);
+
+        let mut db = open();
+        admits(&db, "the reopen");
+        land(
+            &db,
+            b"after",
+            "the reopen seeds only what the last trims had not deleted",
+        );
+        db.shutdown();
+    }
+
+    /// M10 W1 day-1 spike (ruling A-R163): bootstrap, write, stop, start the same `nodes/` again
+    /// at boot 2, clear `grants/1` by its exact revision once it is proven expired, read
+    /// `partitions/1` after the delete's reply, hand node 1 a second recovery's `Plan` and an
+    /// `ExpiryProven` fence naming that record's revision, and read the write back from
+    /// generation 2.
+    /// Integration (~5 s): a grant must be proven expired on wall-clock time.
+    #[config_log::retcd_test]
+    fn m10_spike_partition_revision() {
+        use config_core::GetRequest;
+        use rdb_core::authority::grant::GrantRecord;
+        use rdb_core::authority::partition::PartitionRecord;
+        use rdb_core::contracts::authority::{
+            AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
+        };
+        use rdb_core::contracts::control::ControlKey;
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::event::{EventKind, KernelEvent};
+        use rdb_core::contracts::ids::{ConfigVersion, CorrelationId, ReplicaRole, Revision};
+        use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+        use rdb_core::contracts::recovery::{
+            Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan,
+        };
+        use rdb_core::contracts::time::Tick;
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = fast();
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+                budgets,
+            ))
+            .expect("first open");
+        admits(&db, "first open");
+        let put = db.put(b"a", b"hello", None).expect("put a=hello");
+        tracing::info!(seq = put.seq.0, generation = put.generation.0, "spike_put");
+        db.shutdown();
+        drop(db);
+
+        let boot = BootId(2);
+        let db = Db::spike_reopen(
+            &config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            budgets,
+            boot,
+        )
+        .expect("reopen");
+        let read = |key: ControlKey| {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from(key.encode()),
+            }))
+            .expect("get")
+        };
+        let held = read(ControlKey::Grant(OWNER)).record.expect("grants/1");
+        let held = GrantRecord::decode(&held.value).expect("decodes");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deleted = loop {
+            match rt.block_on(admin::clear_grant(&db, &*store, OWNER)) {
+                Ok(admin::Clearance::Cleared(revision)) => break revision,
+                Ok(admin::Clearance::Refused { .. }) => {
+                    assert!(std::time::Instant::now() < deadline, "never cleared");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                other => panic!("clear grants/1: {other:?}"),
+            }
+        };
+        // Read only after the delete's reply (A-R163).
+        let after = read(ControlKey::Partition(PARTITION));
+        let found = after.record.expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("decodes");
+        let now = db.now();
+        let sample = HostClock::control_time(now, &budgets);
+        let seen = SpikeSeen {
+            deleted,
+            read_revision: Revision(after.read_revision),
+            partition_revision: Revision(found.mod_revision),
+            control_revision: Revision(found.mod_revision),
+        };
+        tracing::info!(
+            ?record,
+            ?held,
+            deleted = seen.deleted.0,
+            read_revision = seen.read_revision.0,
+            control_revision = seen.control_revision.0,
+            "spike_cleared"
+        );
+
+        let lineage = Lineage {
+            partition: PARTITION,
+            generation: record.generation,
+            owner_epoch: record.owner_epoch,
+        };
+        let version = ConfigVersion(record.config_version.0 + 1);
+        let members: Vec<Member> = (1..=3u8)
+            .map(|n| Member {
+                copy: CopyId(n - 1),
+                node: NodeId(u32::from(n)),
+                boot,
+                role: if n == 1 {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::RegularSecondary
+                },
+            })
+            .collect();
+        let config = PartitionConfig::new(PARTITION, version, members);
+        let plan = RecoveryPlan {
+            anchor: LineageAnchor {
+                lineage,
+                base_seq: Seq::ZERO,
+                base_digest: Digest::ROOT,
+            },
+            candidates: config
+                .members
+                .iter()
+                .map(|member| Candidate {
+                    copy: member.copy,
+                    primary_eligible: true,
+                    healthy: true,
+                    within_capacity: true,
+                    has_valid_grant: true,
+                })
+                .collect(),
+            rebuild_required: config.members.iter().map(|member| member.copy).collect(),
+            authority_view: AuthorityView {
+                lineage,
+                grant_id: held.grant,
+                boot_id: boot,
+                authority_generation: held.authority_generation,
+                config_version: version,
+                authority_seq: 1,
+                valid_through_tick: Tick(u64::MAX),
+                past_horizon: DenyReason::NoGrant,
+            },
+            retention_millis: 1_000,
+            config,
+        };
+        let fence = FencingProof {
+            partition: PARTITION,
+            prior_generation: record.generation,
+            prior_owner_epoch: record.owner_epoch,
+            prior_grant_id: held.grant,
+            prior_boot_id: held.boot,
+            revocation: Revocation::ExpiryProven {
+                frozen_expiry_utc_ms: held.expiry_utc_ms,
+                authority_utc_ms: i64::try_from(sample.estimate.0).expect("utc ms"),
+                authority_tick: now,
+                epsilon_ms: u32::try_from(budgets.clock_error_millis).expect("eps"),
+                delta_ms: u32::try_from(budgets.dispatch_margin_millis).expect("delta"),
+            },
+            control_revision: seen.control_revision,
+            decision_tick: now,
+        };
+        for event in [
+            RecoveryEvent::Plan(Box::new(plan)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ] {
+            db.send_owner(Msg::Inject {
+                partition: PARTITION,
+                correlation: CorrelationId(2),
+                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+            })
+            .expect("node 1 runs");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut phase = None;
+        let owner = loop {
+            let owner = db
+                .node_status()
+                .into_iter()
+                .find(|s| s.node == OWNER)
+                .expect("node 1 status");
+            if owner.recovery != phase {
+                tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
+                phase.clone_from(&owner.recovery);
+            }
+            if owner.admits == Some(true) {
+                break owner;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 never admitted; last phase {phase:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let got = db.get(b"a").expect("get a");
+        tracing::info!(?got, ?seen, "spike_result");
+
+        // The proof names partitions/1's revision, read after the delete landed.
+        assert!(seen.read_revision >= seen.deleted, "{seen:?}");
+        assert_eq!(seen.control_revision, seen.partition_revision, "{seen:?}");
+        // Generation 2 is committed (F1's recovery CAS on partitions/1 is conditioned on exactly
+        // that revision) and active (node 1 admits writes only after the activation CAS).
+        assert_eq!(owner.recovered, Some(Generation(2)), "{owner:?}");
+        let now_record = read(ControlKey::Partition(PARTITION))
+            .record
+            .expect("partitions/1");
+        assert!(Revision(now_record.mod_revision) > seen.partition_revision);
+        let now_record = PartitionRecord::decode(&now_record.value).expect("decodes");
+        assert_eq!(now_record.generation, Generation(2), "{now_record:?}");
+        let fresh = db.put(b"b", b"world", None).expect("put at generation 2");
+        assert_eq!(fresh.generation, Generation(2));
+        // The acknowledged write reads back.
+        assert_eq!(got.generation, Generation(2), "{got:?}");
+        assert_eq!(
+            got.value.as_ref().map(|(_, v)| v.as_ref()),
+            Some(&b"hello"[..]),
+            "{got:?}"
+        );
+    }
+
+    // ---- A-R184: a reopen rolls forward only a generation no host activated ----
+
+    /// The generation `partitions/1` names in `store` now, `None` when there is no record.
+    fn stored_generation(
+        rt: &tokio::runtime::Runtime,
+        store: &Arc<dyn ConfigStore>,
+    ) -> Option<u64> {
+        let read = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1");
+        read.record
+            .and_then(|found| PartitionRecord::decode(&found.value))
+            .map(|record| record.generation.0)
+    }
+
+    /// Open `dir` on `store` with [`fast`] budgets.
+    fn open_fast(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+    ) -> Result<Db, OpenError> {
+        rt.block_on(Db::open_with(
+            config(dir),
+            Arc::clone(store),
+            rt.handle().clone(),
+            fast(),
+        ))
+    }
+
+    /// A fresh open of `dir` that writes a=1 and quits.
+    fn wrote_a_and_quit(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+    ) {
+        let mut db = open_fast(rt, dir, store).expect("the fresh open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the fresh open is ready");
+        db.put(b"a", b"1", None).expect("put a=1");
+        db.shutdown();
+    }
+
+    /// The reopen is ready, a=1 reads back, and b=2 lands.
+    fn ready_and_reads_back(db: &Db, case: &str) {
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .unwrap_or_else(|error| panic!("{case}: not ready: {error:?}"));
+        let got = db
+            .get(b"a")
+            .unwrap_or_else(|error| panic!("{case}: get a: {error:?}"));
+        assert_eq!(
+            got.value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"1")),
+            "{case}: a=1 reads back"
+        );
+        db.put(b"b", b"2", None)
+            .unwrap_or_else(|error| panic!("{case}: put b: {error:?}"));
+    }
+
+    /// Wait until `partitions/1` names `generation`.
+    fn until_stored(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, generation: u64) {
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        while stored_generation(rt, store) != Some(generation) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "partitions/1 never named generation {generation} within {patience:?}: {:?}",
+                stored_generation(rt, store)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The `db_open_rolled_forward` lines this row logged.
+    fn rolled_forward(method: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open_rolled_forward")
+            .collect()
+    }
+
+    /// Ruling A-R184 (critic-rollfwd row 1, S1-5): a process that dies right after the reopen's
+    /// recovery commits, before any node links the new generation or marks it activated, leaves
+    /// `partitions/1` at a generation no copy holds. The next open rolls it forward onto the
+    /// copies that hold its base, logs `db_open_rolled_forward`, and reads back. The hook faults
+    /// node 1 instead of aborting, so the row goes on in one process. Cut: the open refuses
+    /// every roll-forward (`roll_forward_copies` answers `Err`), and the last open is `Stale`.
+    /// Integration (~10 s): a fresh open, a reopen cut short at its commit, a rolled-forward
+    /// open until ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_after_a_process_died_right_after_its_commit_rolls_forward_and_reads_back() {
+        const METHOD: &str =
+            "m10_a_reopen_after_a_process_died_right_after_its_commit_rolls_forward_and_reads_back";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen cut short");
+        until_stored(&rt, &store, 2);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open that rolls forward");
+        let rolled = rolled_forward(METHOD);
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert_eq!(
+            (&rolled[0]["generation"], &rolled[0]["from"]),
+            (&serde_json::json!(2), &serde_json::json!(1)),
+            "{rolled:?}"
+        );
+        ready_and_reads_back(&db, "after the roll-forward");
+        db.shutdown();
+    }
+
+    /// Ruling A-R218 (review-s1 F-002): a reopen whose read of the open counter fails once,
+    /// as in an rEtcd leader change, is `Control` with the step to open again, never the
+    /// `Counter` refusal an app must treat as final. The roll-forward's read is the one with no
+    /// retry, so the row cuts a reopen short at its commit (as the row above) to reach it. Then
+    /// opening the same folder again, with the store back, rolls forward and reads back: the
+    /// step is one this build can run. Cut: `counter_refused` maps `Control` to `Counter`, and
+    /// the first match fails. Integration (~12 s): a fresh open, a reopen cut short, a refused
+    /// open, a rolled-forward open until ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_whose_counter_read_fails_once_says_open_again_and_opens_again() {
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen cut short");
+        until_stored(&rt, &store, 2);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+
+        // The open's first read, `partitions/1`, passes; its second, the counter, fails.
+        scripted.rescript(Script {
+            pass_gets: 1,
+            fail_gets: 1,
+            ..Script::default()
+        });
+        let error = match open_fast(&rt, dir.path(), &store) {
+            Err(error @ OpenError::Control(_)) => error,
+            Err(other) => panic!("the open fails with Control, not: {other:?}"),
+            Ok(_) => panic!("the open fails while the counter read fails"),
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("control store: open counter: get ") && text.ends_with(RETCD_STEP),
+            "{text}"
+        );
+
+        scripted.rescript(Script::default());
+        let mut db = open_fast(&rt, dir.path(), &store).expect("opening again rolls forward");
+        ready_and_reads_back(&db, "after opening again");
+        db.shutdown();
+    }
+
+    /// Ruling A-R184 (critic-rollfwd row 2, #45): a reopen whose recovery CAS landed but kept
+    /// answering "unknown", and that quit with F1 still `ProposalUnresolved`, never activated
+    /// the generation it wrote. The next open rolls it forward and reads back. Cut as the row
+    /// above. Integration (~10 s): a fresh open, a reopen until `ProposalUnresolved`, a
+    /// rolled-forward open until ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_that_quit_with_its_commit_unresolved_rolls_forward_and_reads_back() {
+        const METHOD: &str =
+            "m10_a_reopen_that_quit_with_its_commit_unresolved_rolls_forward_and_reads_back";
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        scripted.rescript(Script {
+            only_prefix: Some(ControlKey::Partition(PARTITION).encode().into_bytes()),
+            lose_put_replies: u32::MAX,
+            ..Script::default()
+        });
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        until_stored(&rt, &store, 2);
+        let patience = crate::host::test_patience(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let owner = db.node_status().into_iter().next().expect("node 1");
+            if owner.recovery.as_deref() == Some("ProposalUnresolved") {
+                assert_eq!(owner.recovered, None, "never committed here: {owner:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "F1 never reached ProposalUnresolved: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        db.shutdown();
+        drop(db);
+        scripted.rescript(Script::default());
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open that rolls forward");
+        assert_eq!(rolled_forward(METHOD).len(), 1);
+        ready_and_reads_back(&db, "after the roll-forward");
+        db.shutdown();
+    }
+
+    /// `partitions/1` in `store` now: the record, its root and its revision.
+    fn stored_root(
+        rt: &tokio::runtime::Runtime,
+        store: &Arc<dyn ConfigStore>,
+    ) -> (PartitionRecord, PartitionRoot, u64) {
+        let found = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1")
+            .record
+            .expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("a record");
+        let root = PartitionRoot::decode(&found.value).expect("a root");
+        (record, root, found.mod_revision)
+    }
+
+    /// The record digest `engine` holds at `seq` of `generation`; `Digest::ROOT` at seq 0.
+    fn digest_at(
+        engine: &RocksEngine,
+        generation: Generation,
+        seq: Seq,
+    ) -> rdb_core::contracts::digest::Digest {
+        if seq == Seq::ZERO {
+            return rdb_core::contracts::digest::Digest::ROOT;
+        }
+        let (bytes, _) = engine
+            .history_at(PARTITION, generation, seq)
+            .expect("read history")
+            .expect("a record at the seq");
+        rdb_core::contracts::envelope::ReplicationEnvelope::decode(&bytes)
+            .expect("an envelope")
+            .record_digest
+    }
+
+    /// PR #60 review F1: a reopen whose history is 32 levels deep copies the merged data into
+    /// the new generation in batches, the `copying` marker first and the switch last. A process
+    /// that dies between the two, before node 1 tells the other copies, leaves node 1 holding
+    /// only a staged copy of the generation `partitions/1` names. A staged copy is not that
+    /// generation, so the next open rolls it forward from the verified predecessor on every
+    /// copy, node 1's included (a re-run clears the staged keys and copies again), and reads
+    /// back. Before, the staged copy counted as held: nothing rolled forward, node 1 reported
+    /// it unlinked, nodes 2 and 3 refused a 33rd level, and every open failed the same way.
+    ///
+    /// The 32 levels are built offline, since a real reopen per level would take ~45 s: each
+    /// copy links generations 3..=31 at generation 2's head, and `partitions/1` moves to 31
+    /// with the same root. The crash is a switch fault on node 1's engine, offline, after the
+    /// reopen's commit stopped node 1 (`AfterCommit::Fault`). Cut: `check` counts a staged
+    /// generation as held, and the last open is never ready. Integration (~8 s): four opens.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_after_a_flatten_cut_short_before_its_switch_rolls_forward_and_reads_back() {
+        const METHOD: &str =
+            "m10_a_reopen_after_a_flatten_cut_short_before_its_switch_rolls_forward_and_reads_back";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let nodes = dir.path().join("nodes");
+        wrote_a_and_quit(&rt, dir.path(), &store);
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen to generation 2");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("generation 2 is ready");
+        db.shutdown();
+        drop(db);
+
+        // Generations 3..=31, linked on every copy at generation 2's head: with 0..=2, 32 levels.
+        let (record, root, revision) = stored_root(&rt, &store);
+        assert_eq!(record.generation, Generation(2), "{record:?}");
+        let mut head = None;
+        for n in 1..=3u32 {
+            let mut engine =
+                RocksEngine::open_existing(nodes.join(n.to_string())).expect("open a copy");
+            let applied = Seq(engine.buffered_applied(PARTITION, Generation(2)).0);
+            assert!(head.is_none_or(|head| head == applied), "copies differ");
+            head = Some(applied);
+            for to in 3..=31 {
+                engine
+                    .inherit(PARTITION, Generation(to - 1), Generation(to), applied)
+                    .expect("link a level");
+            }
+            assert_eq!(engine.chain_depth(PARTITION, Generation(31)), 32);
+        }
+        let head = head.expect("three copies");
+        let digest = {
+            let engine = RocksEngine::open_existing(nodes.join("1")).expect("node 1");
+            digest_at(&engine, Generation(31), head)
+        };
+        let moved = PartitionRoot {
+            base_seq: head,
+            base_digest: digest,
+            predecessor_generation: Generation(30),
+            predecessor_cutoff: head,
+            ..root
+        };
+        let record = PartitionRecord {
+            generation: Generation(31),
+            ..record
+        };
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: record.encode_with(&moved),
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        }))
+        .expect("move partitions/1 to generation 31");
+
+        // The reopen commits generation 32, and node 1 stops before it links it.
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen cut short");
+        until_stored(&rt, &store, 32);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+
+        // Node 1 flattens generation 32 and dies before the switch: only the staged copy.
+        let (_, root, _) = stored_root(&rt, &store);
+        let base = root.predecessor_cutoff;
+        assert_eq!(root.predecessor_generation, Generation(31), "{root:?}");
+        {
+            let mut engine = RocksEngine::open_existing(nodes.join("1")).expect("node 1");
+            engine.inject_fault(rdb_storage::InjectedFault::Switch);
+            let cut = engine.inherit(PARTITION, Generation(31), Generation(32), base);
+            assert!(
+                matches!(cut, Err(rdb_storage::InheritError::Storage(_))),
+                "{cut:?}"
+            );
+            assert_eq!(
+                engine.staging(PARTITION, Generation(32)),
+                Some((Generation(31), base))
+            );
+            assert_eq!(engine.link(PARTITION, Generation(32)), None);
+        }
+        for n in 2..=3u32 {
+            let engine =
+                RocksEngine::open_existing(nodes.join(n.to_string())).expect("open a copy");
+            assert!(
+                !engine.lineages().contains(&(PARTITION, Generation(32))),
+                "node {n} never heard of generation 32"
+            );
+        }
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open after the cut flatten");
+        let rolled = rolled_forward(METHOD);
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert_eq!(
+            (&rolled[0]["generation"], &rolled[0]["from"]),
+            (&serde_json::json!(32), &serde_json::json!(31)),
+            "{rolled:?}"
+        );
+        ready_and_reads_back(&db, "after the cut flatten");
+        db.shutdown();
+    }
+
+    /// Ruling A-R184 (critic-rollfwd row 3, F2): once a host marked a generation activated, it
+    /// may have admitted writes there, so an open whose copies are older is `Stale` and names
+    /// the mark, never rolled forward over them. Here node 1 is restarted and its grant cleared,
+    /// so no grant protects b, and the copies are put back to a backup taken before b. Cut:
+    /// `Count::may_have_admitted` answers false, the open rolls forward, and b is lost.
+    /// Integration (~15 s): a fresh open, a reopen that writes b, a restart and a cleared grant,
+    /// a refused open.
+    #[config_log::retcd_test]
+    fn m10_an_older_copy_of_an_activated_generation_is_stale_never_rolled_forward() {
+        const METHOD: &str =
+            "m10_an_older_copy_of_an_activated_generation_is_stale_never_rolled_forward";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+        let backup = config_testkit::fs::temp_dir();
+        copy_tree(&dir.path().join("nodes"), &backup.path().join("nodes"));
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the reopen is ready");
+        db.put(b"b", b"2", None).expect("put b=2 at generation 2");
+        db.restart_node(OWNER).expect("restart node 1");
+        let patience = crate::host::test_patience(Duration::from_secs(15));
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            match rt.block_on(admin::clear_grant(&db, &*store, OWNER)) {
+                Ok(admin::Clearance::Cleared(_)) => break,
+                Ok(admin::Clearance::Refused { .. }) => {
+                    assert!(std::time::Instant::now() < deadline, "never cleared");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                other => panic!("clear grants/1: {other:?}"),
+            }
+        }
+        db.shutdown();
+        drop(db);
+        std::fs::remove_dir_all(dir.path().join("nodes")).expect("remove nodes/");
+        copy_tree(&backup.path().join("nodes"), &dir.path().join("nodes"));
+
+        let refused = match open_fast(&rt, dir.path(), &store) {
+            Err(error @ OpenError::Stale { .. }) => error,
+            other => panic!(
+                "an older copy of an activated generation: {:?}",
+                other.map(|_| "Db")
+            ),
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("the open counter marks generation 2 activated"),
+            "{refused}"
+        );
+        assert!(rolled_forward(METHOD).is_empty());
+    }
+
+    /// Copy the directory tree `from` to `to`.
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("create");
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy");
+            }
+        }
+    }
+
+    /// PR #60 review round 2: `wait_ready` answers `Faulted` for any fault on node 1, one after
+    /// it took writes too, so the text claims nothing about when the node stopped. Pins the
+    /// whole text. Cut: the round-1 text ("stopped on a fault before it took writes"), red.
+    /// Unit.
+    #[test]
+    fn the_faulted_text_says_no_writes_in_this_open_and_not_when_it_stopped() {
+        let error = ReadyError::Faulted {
+            fault: "storage write fault".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "node 1 stopped on a fault, and it takes no writes in this open: storage write \
+             fault. Shut this Db down and open the folder again, once; if that open stops the \
+             same way, stop and report it with this message, and do not delete the folder"
+        );
+    }
+
+    /// PR #60 review F3: a node that faulted takes no writes again in this open, so once node 1
+    /// has faulted `wait_ready` answers at once, `Faulted`, with the fault in its text. Before,
+    /// it waited out `within` and answered `TimedOut`, naming only a recovery phase, and the
+    /// cause was in the log alone. Here the reopen's commit faults node 1
+    /// (`AfterCommit::Fault`). Cut: `wait_ready` does not read node 1's fault, and the row waits
+    /// out the whole bound. Integration (~5 s): a fresh open, a reopen that faults.
+    #[config_log::retcd_test]
+    fn m10_wait_ready_answers_a_fault_of_node_1_at_once_and_names_it() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        let within = crate::host::test_patience(Duration::from_secs(20));
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(within);
+        let took = started.elapsed();
+        crate::host::set_after_commit(dir.path(), None);
+        let Err(error @ ReadyError::Faulted { .. }) = answer else {
+            panic!("node 1 faulted, so wait_ready says so: {answer:?}");
+        };
+        assert!(took < within / 2, "answered at once, not after {took:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains("after-commit hook: generation 2 committed and not linked"),
+            "the text carries the fault: {text}"
+        );
+        assert!(
+            text.contains("open the folder again"),
+            "and the step: {text}"
+        );
+        db.shutdown();
+    }
+
+    /// Ruling A-R184: a node acquires under a generation, and admits writes, only once the open
+    /// counter marks it activated. While the mark's CAS keeps answering "unknown" without
+    /// applying, node 1 holds no grant and admits nothing; once the store answers, it acquires
+    /// and the reopen is ready. Cut: the first acquire does not wait on the mark, and node 1
+    /// holds a grant while unmarked. Integration (~8 s): a fresh open, a reopen held ~2 s past
+    /// its commit, then ready.
+    #[config_log::retcd_test]
+    fn m10_a_reopen_acquires_only_once_the_open_counter_marks_its_generation() {
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let dir = config_testkit::fs::temp_dir();
+        wrote_a_and_quit(&rt, dir.path(), &store);
+
+        // The open's own count passes; every activation mark after it is dropped.
+        scripted.rescript(Script {
+            only_prefix: Some(b"rdb/instances/".to_vec()),
+            pass_puts: 1,
+            drop_puts: u32::MAX,
+            ..Script::default()
+        });
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        until_stored(&rt, &store, 2);
+        let held_until = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < held_until {
+            let owner = db.node_status().into_iter().next().expect("node 1");
+            assert!(
+                owner.authority == "unheld" && owner.admits != Some(true),
+                "node 1 acquired or admits before the mark: {owner:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        scripted.rescript(Script::default());
+        ready_and_reads_back(&db, "once the mark lands");
+        db.shutdown();
+    }
+
+    /// Ruling A-R184: the roll-forward's count is a CAS at exactly the revision its decision
+    /// read. Another open counted since then: `Moved`, so that open is `Stale`. A lost reply
+    /// whose bytes landed: counted. Cut: `count_open_at` takes a moved counter as counted.
+    /// Unit (~0.1 s): a `MemStore` and a scripted one.
+    #[test]
+    fn a_roll_forward_count_at_a_moved_revision_is_refused_and_a_lost_reply_is_settled() {
+        let rt = runtime();
+        let instance = [9_u8; INSTANCE_LEN];
+        let store = config_testkit::MemStore::new();
+        rt.block_on(admin::count_open(
+            &store,
+            &instance,
+            true,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("counted");
+        let (read, revision) = rt
+            .block_on(admin::read_count(&store, &instance))
+            .expect("read");
+        rt.block_on(admin::count_open(
+            &store,
+            &instance,
+            false,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("another open counted");
+        match rt.block_on(admin::count_open_at(
+            &store,
+            &instance,
+            read,
+            revision,
+            admin::COUNT_WITHIN,
+        )) {
+            Err(admin::CounterError::Moved { .. }) => {}
+            other => panic!("a moved counter: {other:?}"),
+        }
+
+        let lossy = Scripted::new(Script::default());
+        rt.block_on(admin::count_open(
+            &lossy,
+            &instance,
+            true,
+            admin::COUNT_WITHIN,
+        ))
+        .expect("counted");
+        let (read, revision) = rt
+            .block_on(admin::read_count(&lossy, &instance))
+            .expect("read");
+        lossy.rescript(Script {
+            lose_put_replies: 1,
+            ..Script::default()
+        });
+        let n = rt
+            .block_on(admin::count_open_at(
+                &lossy,
+                &instance,
+                read,
+                revision,
+                admin::COUNT_WITHIN,
+            ))
+            .expect("its own bytes landed");
+        assert_eq!(n, read.n + 1);
     }
 }

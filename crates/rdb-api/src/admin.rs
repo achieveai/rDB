@@ -23,23 +23,26 @@
 //! record a restarted node's old process left behind, through rdb-core's three guards.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::{
     ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, MutationOutcome, PutRequest,
 };
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::partition::{
+    PartitionLifecycle, PartitionRecord, PartitionRoot, INSTANCE_LEN,
+};
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
 };
 use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
-use rdb_core::contracts::event::{EventKind, KernelEvent};
+use rdb_core::contracts::event::{Budgets, EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, ConfigVersion, CorrelationId, Generation, GrantId, NodeId, OwnerEpoch,
-    PartitionId, ReplicaRole, Revision, Seq,
+    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, Generation, GrantId, NodeId,
+    OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
@@ -100,6 +103,61 @@ pub fn members() -> Vec<Member> {
         .collect()
 }
 
+/// The rf3 member set of [`members`], every node at `boot`: the boot one open starts all three
+/// nodes at (M10, arch R3b).
+#[must_use]
+pub fn members_at(boot: BootId) -> Vec<Member> {
+    members()
+        .into_iter()
+        .map(|member| Member { boot, ..member })
+        .collect()
+}
+
+/// A recovery plan for partition 1 from `anchor`: rf3 at `version`, every node at `boot`, every
+/// copy a candidate and in `rebuild_required`, node 1 primary with `grant` at `generation`.
+///
+/// Only the pinned primary is `primary_eligible` (ruling A-R215). The host acquires, tracks and
+/// adopts on that copy alone, so F1 must lead with it even when another copy holds the longer
+/// prefix: the leader then catches up before its grant. Every copy eligible let `select_leader`
+/// name the prefix source, which owned the record while node 1 held the grant, and the open
+/// served nothing.
+fn recovery_plan(
+    anchor: LineageAnchor,
+    version: ConfigVersion,
+    boot: BootId,
+    grant: GrantId,
+    generation: AuthorityGeneration,
+) -> RecoveryPlan {
+    let config = PartitionConfig::new(PARTITION, version, members_at(boot));
+    RecoveryPlan {
+        anchor,
+        candidates: config
+            .members
+            .iter()
+            .map(|member| Candidate {
+                copy: member.copy,
+                primary_eligible: member.role == ReplicaRole::Primary,
+                healthy: true,
+                within_capacity: true,
+                has_valid_grant: true,
+            })
+            .collect(),
+        rebuild_required: config.members.iter().map(|member| member.copy).collect(),
+        authority_view: AuthorityView {
+            lineage: anchor.lineage,
+            grant_id: grant,
+            boot_id: boot,
+            authority_generation: generation,
+            config_version: version,
+            authority_seq: 1,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon: DenyReason::NoGrant,
+        },
+        retention_millis: RETENTION_MILLIS,
+        config,
+    }
+}
+
 /// Write `partitions/1`, then start F1 on node 1 through `send`.
 ///
 /// # Errors
@@ -109,6 +167,20 @@ pub fn members() -> Vec<Member> {
 pub async fn bootstrap(
     store: &Arc<dyn ConfigStore>,
     now: Tick,
+    send: impl Fn(Msg) -> Result<(), NodeStopped>,
+) -> Result<Revision, BootstrapError> {
+    bootstrap_at(store, now, BOOT, send).await
+}
+
+/// [`bootstrap`] with every node at `boot`, the boot this open started them at (M10, arch R3b).
+///
+/// # Errors
+///
+/// As [`bootstrap`].
+pub async fn bootstrap_at(
+    store: &Arc<dyn ConfigStore>,
+    now: Tick,
+    boot: BootId,
     send: impl Fn(Msg) -> Result<(), NodeStopped>,
 ) -> Result<Revision, BootstrapError> {
     let record = PartitionRecord {
@@ -151,40 +223,19 @@ pub async fn bootstrap(
         base_seq: Seq::ZERO,
         base_digest: Digest::ROOT,
     };
-    let config = PartitionConfig::new(PARTITION, CONFIG_VERSION, members());
-    let plan = RecoveryPlan {
+    let plan = recovery_plan(
         anchor,
-        candidates: config
-            .members
-            .iter()
-            .map(|member| Candidate {
-                copy: member.copy,
-                primary_eligible: true,
-                healthy: true,
-                within_capacity: true,
-                has_valid_grant: true,
-            })
-            .collect(),
-        rebuild_required: config.members.iter().map(|member| member.copy).collect(),
-        authority_view: AuthorityView {
-            lineage,
-            grant_id: GrantId(1),
-            boot_id: BOOT,
-            authority_generation: AuthorityGeneration(1),
-            config_version: CONFIG_VERSION,
-            authority_seq: 1,
-            valid_through_tick: Tick(u64::MAX),
-            past_horizon: DenyReason::NoGrant,
-        },
-        retention_millis: RETENTION_MILLIS,
-        config,
-    };
+        CONFIG_VERSION,
+        boot,
+        GrantId(1),
+        AuthorityGeneration(1),
+    );
     let fence = FencingProof {
         partition: PARTITION,
         prior_generation: Generation(0),
         prior_owner_epoch: OwnerEpoch(0),
         prior_grant_id: GrantId(1),
-        prior_boot_id: BOOT,
+        prior_boot_id: boot,
         revocation: Revocation::DurableDrain {
             ack_revision: revision,
         },
@@ -235,6 +286,809 @@ async fn adopt(
     }
     tracing::info!(key = %key, revision = found.mod_revision, "bootstrap_partition_record_adopted");
     Ok(Revision(found.mod_revision))
+}
+
+/// The most opens one data directory may have (arch R3b): `N <= 2^23`, so a boot and a
+/// request id derived from N never wrap, and every id a `Db` numbers its own writes with
+/// (`(N - 1) << 40` and up) stays below 2^63, out of the range an app's ids take
+/// (`app_request_id`, ruling A-R195).
+pub const MAX_OPENS: u64 = 1 << 23;
+
+/// The version byte of an open counter's value. Layout 2 (ruling A-R184): N, then the newest
+/// generation of partition 1 a host marked activated, each a little-endian u64. A build from
+/// before A-R184 reads layout 2 as `Unreadable`, never as a count.
+const COUNTER_LAYOUT: u8 = 2;
+
+/// Layout 1, written before A-R184: N alone. Read with the activated generation unknown.
+const COUNTER_LAYOUT_N_ONLY: u8 = 1;
+
+/// The activated generation a layout-1 counter leaves unknown: no generation is ever rolled
+/// forward on it, and the next activation replaces it.
+pub const ACTIVATED_UNKNOWN: Generation = Generation(u64::MAX);
+
+/// An open counter's value (arch R3b, rulings A-R160 and A-R184).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Count {
+    /// How many opens were counted: N.
+    pub n: u64,
+    /// The newest generation of partition 1 a host marked activated before its first acquire
+    /// under it ([`activate`]): `Generation(0)` before any, [`ACTIVATED_UNKNOWN`] on a layout-1
+    /// value.
+    pub activated: Generation,
+}
+
+impl Count {
+    /// Whether `generation` may have admitted a write: always, unless the marker proves that no
+    /// host ever activated it.
+    #[must_use]
+    pub fn may_have_admitted(self, generation: Generation) -> bool {
+        self.activated == ACTIVATED_UNKNOWN || self.activated >= generation
+    }
+}
+
+/// How long [`count_open`] keeps reading and CASing before it gives up.
+pub(crate) const COUNT_WITHIN: Duration = Duration::from_secs(10);
+
+/// An instance id as 32 lowercase hex digits: how logs and keys name it.
+#[must_use]
+pub fn instance_hex(instance: &[u8; INSTANCE_LEN]) -> String {
+    instance.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The key of `instance`'s open counter (M10, arch R3b, ruling A-R160).
+#[must_use]
+pub fn instance_key(instance: &[u8; INSTANCE_LEN]) -> String {
+    format!("rdb/instances/{}", instance_hex(instance))
+}
+
+fn encode_count(count: Count) -> Bytes {
+    let mut out = Vec::with_capacity(17);
+    out.push(COUNTER_LAYOUT);
+    out.extend_from_slice(&count.n.to_le_bytes());
+    out.extend_from_slice(&count.activated.0.to_le_bytes());
+    Bytes::from(out)
+}
+
+fn decode_count(body: &[u8]) -> Option<Count> {
+    match body {
+        [COUNTER_LAYOUT, rest @ ..] if rest.len() == 16 => Some(Count {
+            n: u64::from_le_bytes(rest[..8].try_into().ok()?),
+            activated: Generation(u64::from_le_bytes(rest[8..].try_into().ok()?)),
+        }),
+        [COUNTER_LAYOUT_N_ONLY, rest @ ..] => Some(Count {
+            n: u64::from_le_bytes(rest.try_into().ok()?),
+            activated: ACTIVATED_UNKNOWN,
+        }),
+        _ => None,
+    }
+}
+
+/// Why [`count_open`] did not count an open.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CounterError {
+    /// The copies name an instance whose counter the store does not hold: the store is not the
+    /// one this directory was opened against.
+    #[error("{key} is absent: this directory was not opened against this control store")]
+    Absent {
+        /// The counter's key.
+        key: String,
+    },
+    /// The directory has been opened [`MAX_OPENS`] times.
+    #[error("{key} has counted {MAX_OPENS} opens, the most one directory may have")]
+    Exhausted {
+        /// The counter's key.
+        key: String,
+    },
+    /// The counter's value is not one this build writes.
+    #[error("{key} at revision {revision} is not an open counter")]
+    Unreadable {
+        /// The counter's key.
+        key: String,
+        /// Where it was read.
+        revision: u64,
+    },
+    /// A roll-forward's count found the counter moved from the revision its decision read
+    /// ([`count_open_at`]): another open counted in between, so the decision no longer holds.
+    #[error("{key} moved from revision {read} that the roll-forward decision read")]
+    Moved {
+        /// The counter's key.
+        key: String,
+        /// The revision the decision read.
+        read: u64,
+    },
+    /// The store refused, or did not settle the count within [`COUNT_WITHIN`].
+    #[error("control store: {0}")]
+    Control(String),
+}
+
+/// Count one more open of `instance` and return its number N (arch R3b): N = 1 by a create-only
+/// write when `fresh` finds no counter, otherwise N + 1 by a CAS at the revision just read. A
+/// conflict or a lost reply reads again and CASes again, so a lost reply can waste a number but
+/// never hand one out twice. A transient store error waits 50 ms and tries again; all of it is
+/// bounded by `within`. Logged as `open_counted{instance_hex, n, revision}` and each retry as
+/// `open_count_retry{instance_hex, error}`.
+///
+/// # Errors
+///
+/// [`CounterError`].
+pub async fn count_open(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    fresh: bool,
+    within: Duration,
+) -> Result<u64, CounterError> {
+    let key = instance_key(instance);
+    let hex = instance_hex(instance);
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = String::from("nothing answered");
+    while tokio::time::Instant::now() < deadline {
+        let read = match store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => read,
+            Err(error) if crate::control::transient(&error) => {
+                last = error.to_string();
+                tracing::warn!(instance_hex = %hex, error = %error, "open_count_retry");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(error) => return Err(CounterError::Control(format!("get {key}: {error}"))),
+        };
+        let (next, expected) = match read.record {
+            None if fresh => (
+                Count {
+                    n: 1,
+                    activated: Generation(0),
+                },
+                0,
+            ),
+            None => return Err(CounterError::Absent { key }),
+            Some(found) => {
+                let count = decode_count(&found.value).ok_or_else(|| CounterError::Unreadable {
+                    key: key.clone(),
+                    revision: found.mod_revision,
+                })?;
+                if count.n >= MAX_OPENS {
+                    return Err(CounterError::Exhausted { key });
+                }
+                (
+                    Count {
+                        n: count.n + 1,
+                        ..count
+                    },
+                    found.mod_revision,
+                )
+            }
+        };
+        let written = store
+            .put(PutRequest {
+                key: Bytes::from(key.clone()),
+                value: encode_count(next),
+                expected_mod_revision: Some(expected),
+                dedup: None,
+            })
+            .await;
+        match written {
+            Ok(response) if response.outcome == MutationOutcome::Applied => {
+                tracing::info!(
+                    instance_hex = %hex,
+                    n = next.n,
+                    activated = next.activated.0,
+                    revision = response.revision,
+                    "open_counted"
+                );
+                return Ok(next.n);
+            }
+            Ok(_) => last = format!("CAS at {expected} was not applied"),
+            Err(error)
+                if matches!(
+                    error,
+                    ConfigError::Conflict { .. } | ConfigError::DeadlineExceededUnknownOutcome
+                ) || crate::control::transient(&error) =>
+            {
+                last = error.to_string();
+            }
+            Err(error) => return Err(CounterError::Control(format!("put {key}: {error}"))),
+        }
+        tracing::warn!(instance_hex = %hex, error = %last, "open_count_retry");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(CounterError::Control(format!(
+        "{key} was not counted within {} ms; last: {last}",
+        within.as_millis()
+    )))
+}
+
+/// `instance`'s open counter and the revision it was read at, for a reopen's roll-forward
+/// decision (ruling A-R184). One read, no retry, as the reopen's read of `partitions/1`.
+///
+/// # Errors
+///
+/// [`CounterError::Absent`], [`CounterError::Unreadable`], or [`CounterError::Control`] when the
+/// read fails.
+pub async fn read_count(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+) -> Result<(Count, u64), CounterError> {
+    let key = instance_key(instance);
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| CounterError::Control(format!("get {key}: {error}")))?;
+    let found = read
+        .record
+        .ok_or_else(|| CounterError::Absent { key: key.clone() })?;
+    let count = decode_count(&found.value).ok_or(CounterError::Unreadable {
+        key,
+        revision: found.mod_revision,
+    })?;
+    Ok((count, found.mod_revision))
+}
+
+/// Count one more open of `instance` on a roll-forward (ruling A-R184, k199): a CAS from `read`
+/// at exactly the `revision` the decision read it at, never from a newer value. A conflict means
+/// another open counted since, so the decision no longer holds: [`CounterError::Moved`]. A lost
+/// reply reads again: the counter still at `revision` sends the same CAS again, this CAS's own
+/// bytes there count as applied, and anything else is [`CounterError::Moved`]. Bounded by
+/// `within`. Logged as `open_counted{instance_hex, n, activated, revision, rolled_forward}`.
+///
+/// # Errors
+///
+/// [`CounterError::Moved`], [`CounterError::Exhausted`], or [`CounterError::Control`] when the
+/// store refuses or does not settle within `within`.
+pub async fn count_open_at(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    read: Count,
+    revision: u64,
+    within: Duration,
+) -> Result<u64, CounterError> {
+    let key = instance_key(instance);
+    let hex = instance_hex(instance);
+    if read.n >= MAX_OPENS {
+        return Err(CounterError::Exhausted { key });
+    }
+    let next = Count {
+        n: read.n + 1,
+        ..read
+    };
+    let counted = |at: u64| {
+        tracing::info!(
+            instance_hex = %hex,
+            n = next.n,
+            activated = next.activated.0,
+            revision = at,
+            rolled_forward = true,
+            "open_counted"
+        );
+        Ok(next.n)
+    };
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = String::from("nothing answered");
+    let mut send = true;
+    while tokio::time::Instant::now() < deadline {
+        if send {
+            let written = store
+                .put(PutRequest {
+                    key: Bytes::from(key.clone()),
+                    value: encode_count(next),
+                    expected_mod_revision: Some(revision),
+                    dedup: None,
+                })
+                .await;
+            match written {
+                Ok(response) if response.outcome == MutationOutcome::Applied => {
+                    return counted(response.revision)
+                }
+                Ok(_) | Err(ConfigError::Conflict { .. }) => {
+                    return Err(CounterError::Moved {
+                        key,
+                        read: revision,
+                    })
+                }
+                Err(error)
+                    if matches!(error, ConfigError::DeadlineExceededUnknownOutcome)
+                        || crate::control::transient(&error) =>
+                {
+                    last = error.to_string();
+                }
+                Err(error) => return Err(CounterError::Control(format!("put {key}: {error}"))),
+            }
+        }
+        tracing::warn!(instance_hex = %hex, error = %last, "open_count_retry");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => match read.record {
+                Some(found) if found.mod_revision == revision => send = true,
+                Some(found) if decode_count(&found.value) == Some(next) => {
+                    return counted(found.mod_revision)
+                }
+                _ => {
+                    return Err(CounterError::Moved {
+                        key,
+                        read: revision,
+                    })
+                }
+            },
+            Err(error) if crate::control::transient(&error) => {
+                last = error.to_string();
+                send = false;
+            }
+            Err(error) => return Err(CounterError::Control(format!("get {key}: {error}"))),
+        }
+    }
+    Err(CounterError::Control(format!(
+        "{key} was not counted within {} ms; last: {last}",
+        within.as_millis()
+    )))
+}
+
+/// Mark `generation` of partition 1 activated in `instance`'s open counter (ruling A-R184,
+/// critic-rollfwd F2). A host calls it before its first acquire under `generation` and acquires
+/// only once it returns, so a generation the counter does not name never admitted a write. It
+/// reads the counter and CASes `activated = generation`, keeping N, at the revision read. A
+/// conflict, a lost reply or a store error reads again, so it returns only once the counter names
+/// `generation` or newer, and it never gives up on its own: the node's acquire waits on it, and
+/// a node that stops abandons it. Logged as `open_activated{instance_hex, n, generation,
+/// revision}`, each retry as `open_activate_retry{instance_hex, generation, error}`.
+///
+/// # Errors
+///
+/// [`CounterError::Absent`] or [`CounterError::Unreadable`]: no read again changes them.
+pub async fn activate(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    generation: Generation,
+) -> Result<Count, CounterError> {
+    let key = instance_key(instance);
+    let hex = instance_hex(instance);
+    let activated = |count: Count, revision: u64| {
+        tracing::info!(
+            instance_hex = %hex,
+            n = count.n,
+            generation = generation.0,
+            activated = count.activated.0,
+            revision,
+            "open_activated"
+        );
+        Ok(count)
+    };
+    let mut wait = Duration::from_millis(50);
+    loop {
+        let error = match store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => {
+                let Some(found) = read.record else {
+                    return Err(CounterError::Absent { key });
+                };
+                let count = decode_count(&found.value).ok_or_else(|| CounterError::Unreadable {
+                    key: key.clone(),
+                    revision: found.mod_revision,
+                })?;
+                if count.activated != ACTIVATED_UNKNOWN && count.activated >= generation {
+                    return activated(count, found.mod_revision);
+                }
+                let next = Count {
+                    activated: generation,
+                    ..count
+                };
+                let written = store
+                    .put(PutRequest {
+                        key: Bytes::from(key.clone()),
+                        value: encode_count(next),
+                        expected_mod_revision: Some(found.mod_revision),
+                        dedup: None,
+                    })
+                    .await;
+                match written {
+                    Ok(response) if response.outcome == MutationOutcome::Applied => {
+                        return activated(next, response.revision)
+                    }
+                    Ok(_) => format!("CAS at {} was not applied", found.mod_revision),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!(
+            instance_hex = %hex,
+            generation = generation.0,
+            error = %error,
+            "open_activate_retry"
+        );
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// What a reopen's heal proved and handed node 1 (M10, arch R3a, ruling A-R163).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Healed {
+    /// How node 1's old grant was found gone: deleted by this heal (case A), or absent (case B).
+    pub cleared: GrantCleared,
+    /// The store revision `partitions/1` was then read at: never below [`Self::cleared`]'s.
+    pub read_revision: Revision,
+    /// The fence's `control_revision`: `partitions/1`'s `mod_revision` from that read.
+    pub control_revision: Revision,
+}
+
+/// How a reopen's heal found node 1's old grant gone (M10, arch R3a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantCleared {
+    /// Case A: the heal deleted it, at this revision ([`Revocation::ExpiryProven`]).
+    Deleted(Revision),
+    /// Case B: a read at this store revision found it absent ([`Revocation::NoGrantHeld`]).
+    Absent(Revision),
+}
+
+impl GrantCleared {
+    /// The revision `partitions/1` must be read at or after.
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        match self {
+            Self::Deleted(revision) | Self::Absent(revision) => revision,
+        }
+    }
+}
+
+/// Why a reopen's heal did not hand node 1 a fence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HealError {
+    /// A grant was still not clearable when the heal's time ran out.
+    #[error(
+        "the last run's grant for node {node} (grants/{node}) was still held after {secs} \
+         seconds of trying: {last}",
+        secs = seconds_in_words(*.within_ms)
+    )]
+    NotCleared {
+        /// The node.
+        node: u32,
+        /// The heal's bound.
+        within_ms: u128,
+        /// Why the last answer kept the grant, and the next step, in words (A-R191b).
+        last: String,
+    },
+    /// The `partitions/1` read was served before the grant delete it must follow.
+    #[error("partitions/1 was read at revision {read}, before the grant delete at {deleted}")]
+    ReadBeforeDelete {
+        /// The read's store revision.
+        read: u64,
+        /// The delete's revision.
+        deleted: u64,
+    },
+    /// The `partitions/1` read was served before the read that found `grants/1` absent.
+    #[error(
+        "partitions/1 was read at revision {read}, before grants/1 was read absent at {absent}"
+    )]
+    ReadBeforeAbsence {
+        /// The read's store revision.
+        read: u64,
+        /// The absent read's store revision.
+        absent: u64,
+    },
+    /// `partitions/1` is not a layout-3 record.
+    #[error("partitions/1: {0}")]
+    Record(String),
+    /// The store refused.
+    #[error("control store: {0}")]
+    Control(String),
+    /// Node 1's thread is gone.
+    #[error("node {} stopped before the heal reached it", OWNER.0)]
+    NodeStopped,
+}
+
+/// What a reopen's heal runs with: it runs as a task, after `Db::open` has returned.
+pub(crate) struct HealCtx {
+    pub(crate) store: Arc<dyn ConfigStore>,
+    /// The boot this open started every node at.
+    pub(crate) boot: BootId,
+    pub(crate) budgets: Budgets,
+    pub(crate) clock: HostClock,
+    /// Node 1's mailbox.
+    pub(crate) owner: std::sync::mpsc::Sender<Msg>,
+    /// How long clearing the old grants may take.
+    pub(crate) within: Duration,
+}
+
+/// The correlation a heal's two events carry.
+const HEAL: CorrelationId = CorrelationId(2);
+
+/// Heal partition 1 after a reopen (M10, arch R3a, rulings A-R159, A-R163): clear the three old
+/// grants, node 1's first; only after node 1's grant is known gone, read `partitions/1`; then
+/// hand node 1's F1 a `Plan` from the record's root at config version + 1 with this open's
+/// boots, and a takeover authorization whose `control_revision` is the record's `mod_revision`.
+/// The same proof `bootstrap` and the simulator's `reinspect_now` already use: a CAS at that
+/// revision lands only if nothing wrote `partitions/1` after the read.
+///
+/// Node 1's grant is gone one of two ways:
+/// - **Case A**, deleted by this heal under `clear_verdict`'s guards:
+///   [`Revocation::ExpiryProven`] from the record it judged, `prior_grant_id` that record's
+///   grant. A record holding `GrantId(0)` is refused before the delete: A1 never issues 0.
+/// - **Case B**, read absent (an earlier heal deleted it and its process died before an
+///   acquire): [`Revocation::NoGrantHeld`] at that read's revision, `prior_grant_id`
+///   `GrantId(0)` ("none held").
+///
+/// Either way `prior_boot_id` is the record's `owner_boot`, the owner the F1 commit pinned,
+/// never 0 (R3a; R5 row 8).
+///
+/// Logged as `heal_takeover_authorized{variant, control_revision, prior_boot, prior_grant,
+/// grant_delete_revision | absent_revision, read_revision}`.
+///
+/// # Errors
+///
+/// [`HealError`]. Nothing is sent to node 1 unless every step held.
+pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
+    let deadline = tokio::time::Instant::now() + ctx.within;
+    let gone = clear_until(&ctx, OWNER, deadline).await?;
+    for node in [NodeId(2), NodeId(3)] {
+        clear_until(&ctx, node, deadline).await?;
+    }
+    // Only now, after node 1's delete was acknowledged or its absence read (A-R163).
+    let read = ctx
+        .store
+        .get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        })
+        .await
+        .map_err(|error| HealError::Control(format!("get partitions/1: {error}")))?;
+    let cleared = match &gone {
+        Gone::Deleted(revision, _) => GrantCleared::Deleted(*revision),
+        Gone::Absent(revision) => GrantCleared::Absent(*revision),
+    };
+    if Revision(read.read_revision) < cleared.revision() {
+        return Err(match cleared {
+            GrantCleared::Deleted(deleted) => HealError::ReadBeforeDelete {
+                read: read.read_revision,
+                deleted: deleted.0,
+            },
+            GrantCleared::Absent(absent) => HealError::ReadBeforeAbsence {
+                read: read.read_revision,
+                absent: absent.0,
+            },
+        });
+    }
+    let found = read
+        .record
+        .ok_or_else(|| HealError::Record("absent".to_owned()))?;
+    let (Some(record), Some(root)) = (
+        PartitionRecord::decode(&found.value),
+        PartitionRoot::decode(&found.value),
+    ) else {
+        return Err(HealError::Record(format!(
+            "the record at revision {} carries no root (layout 3)",
+            found.mod_revision
+        )));
+    };
+    let healed = Healed {
+        cleared,
+        read_revision: Revision(read.read_revision),
+        control_revision: Revision(found.mod_revision),
+    };
+    // R3a, both cases: the prior boot is the owner the F1 commit pinned (R5 row 8: never 0).
+    if root.owner_boot == BootId(0) {
+        return Err(HealError::Record(format!(
+            "the record at revision {} names owner boot 0",
+            found.mod_revision
+        )));
+    }
+    let prior_boot = root.owner_boot;
+    let now = ctx.clock.now();
+    // The plan's view: case A carries the old grant, as before; case B has none, so it takes
+    // bootstrap's. A1 replaces the view at its first acquire either way.
+    let (prior_grant, view_grant, view_generation, revocation) = match &gone {
+        Gone::Deleted(_, held) => {
+            let sample = HostClock::control_time(now, &ctx.budgets);
+            let revocation = Revocation::ExpiryProven {
+                frozen_expiry_utc_ms: held.expiry_utc_ms,
+                authority_utc_ms: i64::try_from(sample.estimate.0).unwrap_or(i64::MAX),
+                authority_tick: now,
+                epsilon_ms: u32::try_from(ctx.budgets.clock_error_millis).unwrap_or(u32::MAX),
+                delta_ms: u32::try_from(ctx.budgets.dispatch_margin_millis).unwrap_or(u32::MAX),
+            };
+            let held = *held;
+            (
+                held.grant,
+                held.grant,
+                held.authority_generation,
+                revocation,
+            )
+        }
+        Gone::Absent(absent_revision) => {
+            let revocation = Revocation::NoGrantHeld {
+                absent_revision: *absent_revision,
+            };
+            (GrantId(0), GrantId(1), AuthorityGeneration(1), revocation)
+        }
+    };
+    let lineage = Lineage {
+        partition: PARTITION,
+        generation: record.generation,
+        owner_epoch: record.owner_epoch,
+    };
+    let anchor = LineageAnchor {
+        lineage,
+        base_seq: root.base_seq,
+        base_digest: root.base_digest,
+    };
+    let version = ConfigVersion(record.config_version.0 + 1);
+    let plan = recovery_plan(anchor, version, ctx.boot, view_grant, view_generation);
+    let fence = FencingProof {
+        partition: PARTITION,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: prior_grant,
+        prior_boot_id: prior_boot,
+        revocation,
+        control_revision: healed.control_revision,
+        decision_tick: now,
+    };
+    match cleared {
+        GrantCleared::Deleted(deleted) => tracing::info!(
+            variant = "ExpiryProven",
+            control_revision = healed.control_revision.0,
+            prior_boot = prior_boot.0,
+            prior_grant = prior_grant.0,
+            grant_delete_revision = deleted.0,
+            read_revision = read.read_revision,
+            "heal_takeover_authorized"
+        ),
+        GrantCleared::Absent(absent) => tracing::info!(
+            variant = "NoGrantHeld",
+            control_revision = healed.control_revision.0,
+            prior_boot = prior_boot.0,
+            prior_grant = prior_grant.0,
+            absent_revision = absent.0,
+            read_revision = read.read_revision,
+            "heal_takeover_authorized"
+        ),
+    }
+    for event in [
+        RecoveryEvent::Plan(Box::new(plan)),
+        RecoveryEvent::FenceProven(Box::new(fence)),
+    ] {
+        ctx.owner
+            .send(Msg::Inject {
+                partition: PARTITION,
+                correlation: HEAL,
+                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+            })
+            .map_err(|_| HealError::NodeStopped)?;
+    }
+    Ok(healed)
+}
+
+/// How [`clear_until`] found a node's grant gone.
+enum Gone {
+    /// Deleted at this revision; the record it judged.
+    Deleted(Revision, GrantRecord),
+    /// Read absent at this store revision.
+    Absent(Revision),
+}
+
+/// Run [`judge`] for `node` until it answers `Cleared` or `Absent`, or `deadline` passes. A
+/// guard that still holds is waited out until about when it says it will stop holding.
+async fn clear_until(
+    ctx: &HealCtx,
+    node: NodeId,
+    deadline: tokio::time::Instant,
+) -> Result<Gone, HealError> {
+    let mut last = format!("the control store did not answer; {STORE_STEP}");
+    while tokio::time::Instant::now() < deadline {
+        match judge(&*ctx.store, node, ctx.boot, &ctx.budgets, ctx.clock).await {
+            Ok((Clearance::Cleared(revision), Some(record), _)) => {
+                return Ok(Gone::Deleted(revision, record));
+            }
+            Ok((Clearance::Absent, None, read)) => return Ok(Gone::Absent(read)),
+            Ok((clearance, ..)) => last = kept_in_words(clearance, node, ctx.clock.now()),
+            // A lost delete reply is read again next time round, as `clear_grant` advises.
+            Err(error)
+                if error.retry == RetryRule::BoundedJitter
+                    || error.kind == ErrorKind::UnknownOutcome =>
+            {
+                last = format!("the control store answered: {}; {STORE_STEP}", error.detail);
+            }
+            Err(error) => return Err(HealError::Control(error.detail)),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(HealError::NotCleared {
+        node: node.0,
+        within_ms: ctx.within.as_millis(),
+        last,
+    })
+}
+
+/// The next step when another process may still hold the grant (A-R191b, tester w3a03).
+const OTHER_OPEN_STEP: &str = "another open may hold this folder's data, for example a live \
+                               copy of this folder: shut it down, then open again";
+
+/// The next step when the control store did not settle an answer.
+const STORE_STEP: &str = "open again once the control store answers";
+
+/// Why `clearance` kept `grants/{node}` in place, with the next step, in words for
+/// [`HealError::NotCleared`] (A-R191b). `now` is the heal's clock, so a guard's until-time reads
+/// as a time of day and a distance from now.
+fn kept_in_words(clearance: Clearance, node: NodeId, now: Tick) -> String {
+    match clearance {
+        Clearance::Refused {
+            refusal: ClearRefusal::NotProvenExpired,
+            until_utc_ms,
+        } => {
+            let left = i128::from(until_utc_ms) - i128::from(now.0);
+            let when = if left > 0 {
+                format!(
+                    "about {} seconds from now",
+                    seconds_in_words(left.unsigned_abs())
+                )
+            } else {
+                "which has just passed".to_owned()
+            };
+            format!(
+                "it may still be in use until {} UTC ({when}), and later if its holder keeps \
+                 renewing it; {OTHER_OPEN_STEP}",
+                clock_in_words(until_utc_ms)
+            )
+        }
+        Clearance::Refused {
+            refusal: ClearRefusal::Frozen,
+            ..
+        } => "it is frozen for a takeover that has not finished, so another open may be taking \
+              over this folder's data: let it finish or shut it down, then open again"
+            .to_owned(),
+        Clearance::Refused {
+            refusal: ClearRefusal::PartitionInTransfer(partition),
+            ..
+        } => format!(
+            "partition {} names node {} as its owner and is not serving yet: let that move \
+             finish, then open again",
+            partition.0, node.0
+        ),
+        Clearance::Current => format!(
+            "it names the boot this open runs node {} at, so another open of this folder's data \
+             may be running now, for example a live copy of this folder: shut it down, then open \
+             again",
+            node.0
+        ),
+        Clearance::Conflict => format!(
+            "it changed while it was being cleared, so something still renews it; \
+             {OTHER_OPEN_STEP}"
+        ),
+        Clearance::Absent | Clearance::Cleared(_) => {
+            format!(
+                "the control store gave an answer that does not fit ({clearance:?}); {STORE_STEP}"
+            )
+        }
+    }
+}
+
+/// Milliseconds as seconds with at most one decimal: 13200 is "13.2", 30000 is "30".
+fn seconds_in_words(ms: u128) -> String {
+    let tenths = ms / 100;
+    if tenths.is_multiple_of(10) {
+        (tenths / 10).to_string()
+    } else {
+        format!("{}.{}", tenths / 10, tenths % 10)
+    }
+}
+
+/// UTC milliseconds as a time of day, `HH:MM:SS`.
+fn clock_in_words(utc_ms: i64) -> String {
+    let secs = utc_ms.div_euclid(1000).rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 /// What [`clear_grant`] did with `grants/{node}`. The simulator's service answers the same way
@@ -319,6 +1173,22 @@ async fn judge_and_clear(
     let budgets = db.budgets().ok_or_else(|| {
         ApiError::invalid("this Db was built without budgets, so it cannot judge a grant")
     })?;
+    judge(store, node, boot, &budgets, db.clock())
+        .await
+        .map(|(clearance, ..)| clearance)
+}
+
+/// [`clear_grant`] for `node` running at `boot`, judged with `budgets` on `clock`, without a
+/// `Db`: the reopen's heal runs it from a task (M10, arch R3c). Also returns the record it
+/// judged, when there was one, and the store revision of the read that found it or its absence.
+async fn judge(
+    store: &dyn ConfigStore,
+    node: NodeId,
+    boot: BootId,
+    budgets: &Budgets,
+    clock: HostClock,
+) -> Result<(Clearance, Option<GrantRecord>, Revision), ApiError> {
+    let budgets = *budgets;
     let key = ControlKey::Grant(node).encode();
     let read = store
         .get(GetRequest {
@@ -326,14 +1196,16 @@ async fn judge_and_clear(
         })
         .await
         .map_err(|error| store_failed(&format!("get {key}"), &error, true))?;
+    let read_revision = Revision(read.read_revision);
     let Some(found) = read.record else {
         tracing::info!(
             node = node.0,
             boot = boot.0,
+            read_revision = read_revision.0,
             verdict = ?Clearance::Absent,
             "grant_clear"
         );
-        return Ok(Clearance::Absent);
+        return Ok((Clearance::Absent, None, read_revision));
     };
     let record = GrantRecord::decode(&found.value).ok_or_else(|| {
         unreadable(format!(
@@ -341,8 +1213,22 @@ async fn judge_and_clear(
             found.mod_revision
         ))
     })?;
+    // R3a; M10 arch R5 row 9: A1's one minting site counts from 1, so a record holding 0 was
+    // not written by A1. Refused before anything is deleted; a heal's proof carrying it would
+    // read as `NoGrantHeld`'s "none held".
+    if record.grant == GrantId(0) {
+        tracing::warn!(
+            node = node.0,
+            revision = found.mod_revision,
+            "grant_clear_grant_0_refused"
+        );
+        return Err(unreadable(format!(
+            "{key} at revision {} holds grant 0, which no grant issuer writes",
+            found.mod_revision
+        )));
+    }
     let partitions = list_partitions(store).await?;
-    let now = db.now();
+    let now = clock.now();
     let sample = HostClock::control_time(now, &budgets);
     let verdict = clear_verdict(node, &record, boot, sample, now, &budgets, || {
         Ok::<_, std::convert::Infallible>(partitions)
@@ -373,7 +1259,7 @@ async fn judge_and_clear(
         verdict = ?clearance,
         "grant_clear"
     );
-    Ok(clearance)
+    Ok((clearance, Some(record), read_revision))
 }
 
 /// The whole `partitions/` family, or an error: a failed or truncated list is never read as a
@@ -484,6 +1370,7 @@ fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError 
         retry,
         no_mutation,
         detail: format!("control store: {detail}; {tail}"),
+        retry_after: None,
     }
 }
 
@@ -901,5 +1788,453 @@ mod tests {
             2,
             "(c) the failure sent nothing"
         );
+    }
+
+    // ---- case B: the heal with no grant held (M10 arch R3a, rulings A-R159, A-R163, A-R171) ----
+
+    /// The boot the reopen in these rows runs at: open 2's first (arch R3b).
+    const OPEN_2: BootId = BootId((1 << 16) + 1);
+
+    /// `partitions/1` as a layout-3 record at generation 3, owner epoch 3, whose owner boot is
+    /// `owner_boot`. Returns the revision it was written at.
+    fn rooted(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, owner_boot: BootId) -> u64 {
+        let record = PartitionRecord {
+            generation: Generation(3),
+            owner_epoch: OwnerEpoch(3),
+            ..record(3)
+        };
+        let root = PartitionRoot {
+            mode: rdb_core::authority::partition::RecordMode::Active,
+            owner_boot,
+            base_seq: Seq(7),
+            base_digest: Digest::ROOT,
+            predecessor_generation: Generation(2),
+            predecessor_cutoff: Seq(7),
+            instance: [7; INSTANCE_LEN],
+            run: Revision(1),
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: record.encode_with(&root),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put partitions/1")
+        .revision
+    }
+
+    /// Run one heal over `store` and return its answer and every message node 1 received.
+    fn heal_once(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+    ) -> (Result<Healed, HealError>, Vec<Msg>) {
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            store,
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_millis(500),
+        };
+        let healed = rt.block_on(heal(ctx));
+        (healed, mailbox.try_iter().collect())
+    }
+
+    /// The `FencingProof` a heal sent node 1, if it sent one.
+    fn fence_sent(sent: &[Msg]) -> Option<FencingProof> {
+        sent.iter().find_map(|msg| match msg {
+            Msg::Inject {
+                kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(fence))),
+                ..
+            } => Some((**fence).clone()),
+            _ => None,
+        })
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+    }
+
+    /// Case B (R3a; R5 rows 6 and 8): every `grants/{n}` absent and a layout-3 `partitions/1`.
+    /// The heal hands node 1 a `Plan`, then a `NoGrantHeld` takeover authorization whose
+    /// `absent_revision` is the read that found `grants/1` absent, whose `control_revision` is
+    /// `partitions/1`'s `mod_revision` read at or after it (A-R163), with `prior_grant_id` 0
+    /// ("none held") and `prior_boot_id` the record's `owner_boot`. Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_reopen_with_no_grant_held_hands_node_1_a_no_grant_held_takeover() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let written = rooted(&*store, &rt, BootId(5));
+        // A later write elsewhere, so the absent read's revision is past the record's.
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from_static(b"unrelated"),
+            value: Bytes::from_static(b"x"),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("put an unrelated key");
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        let healed = healed.expect("case B heals");
+        assert_eq!(sent.len(), 2, "a Plan, then the proof");
+        assert!(matches!(
+            &sent[0],
+            Msg::Inject {
+                kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(_))),
+                ..
+            }
+        ));
+        let fence = fence_sent(&sent).expect("a takeover authorization");
+        let Revocation::NoGrantHeld { absent_revision } = fence.revocation else {
+            panic!("expected NoGrantHeld: {fence:?}");
+        };
+        assert!(absent_revision.0 > written, "{fence:?}");
+        assert_eq!(
+            fence.control_revision,
+            Revision(written),
+            "partitions/1's mod_revision"
+        );
+        assert_eq!(fence.prior_grant_id, GrantId(0));
+        assert_eq!(fence.prior_boot_id, BootId(5));
+        assert_eq!(fence.prior_generation, Generation(3));
+        assert_eq!(fence.prior_owner_epoch, OwnerEpoch(3));
+        assert_eq!(healed.control_revision, fence.control_revision);
+        assert!(healed.read_revision >= absent_revision, "{healed:?}");
+    }
+
+    /// R5 row 8 for case B: a record whose `owner_boot` is 0 cannot name the prior process, so
+    /// the heal refuses it and sends nothing. Unit (~10 ms).
+    #[test]
+    fn a_no_grant_heal_over_owner_boot_0_is_refused_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(0));
+        let (healed, sent) = heal_once(store, &rt);
+        assert!(matches!(healed, Err(HealError::Record(_))), "{healed:?}");
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// Case B over a layout-2 `partitions/1`: no root, so no anchor and no owner boot. Refused,
+    /// and nothing sent. Unit (~10 ms).
+    #[test]
+    fn a_no_grant_heal_over_a_record_with_no_root_is_refused_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        put(&store, &rt, record(3).encode(), 0);
+        let (healed, sent) = heal_once(store, &rt);
+        assert!(matches!(healed, Err(HealError::Record(_))), "{healed:?}");
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// When [`old_grant`]'s record expired: long past, and not 0, so a proof that carried a
+    /// constant 0 in place of the record's expiry would not match it.
+    const OLD_EXPIRY_UTC_MS: i64 = 1_000;
+
+    /// `grants/1` as a dead open's boot-1 process left it holding `grant`: long expired and not
+    /// frozen, so case A's guards clear it. Returns the revision it was written at.
+    fn old_grant(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, grant: GrantId) -> u64 {
+        let old = GrantRecord {
+            grant,
+            node: OWNER,
+            boot: BOOT,
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: OLD_EXPIRY_UTC_MS,
+            frozen: false,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            value: old.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/1")
+        .revision
+    }
+
+    /// Case A (R3a, A-R175): the heal deletes a dead open's expired grant and hands node 1 an
+    /// `ExpiryProven` takeover. `prior_grant_id` is the record's grant; `prior_boot_id` is
+    /// `partitions/1`'s `owner_boot`, which the F1 commit pinned, not the grant's own boot. The
+    /// proof's frozen expiry is the deleted record's expiry (A-R207, tester cut r6d).
+    /// Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_reopen_over_an_expired_grant_hands_node_1_an_expiry_proven_takeover_naming_the_owner_boot()
+    {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let written = rooted(&*store, &rt, BootId(5));
+        let granted = old_grant(&*store, &rt, GrantId(4));
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        let healed = healed.expect("case A heals");
+        assert!(
+            matches!(healed.cleared, GrantCleared::Deleted(deleted) if deleted.0 > granted),
+            "{healed:?}"
+        );
+        let fence = fence_sent(&sent).expect("a FenceProven was sent");
+        let Revocation::ExpiryProven {
+            frozen_expiry_utc_ms,
+            ..
+        } = fence.revocation
+        else {
+            panic!("expected ExpiryProven: {fence:?}");
+        };
+        assert_eq!(
+            frozen_expiry_utc_ms, OLD_EXPIRY_UTC_MS,
+            "the deleted record's expiry: {fence:?}"
+        );
+        assert_eq!(fence.prior_grant_id, GrantId(4));
+        assert_eq!(
+            fence.prior_boot_id,
+            BootId(5),
+            "partitions/1's owner_boot, not the grant's boot {}",
+            BOOT.0
+        );
+        assert_eq!(fence.control_revision, Revision(written));
+        assert_eq!(grant_revision(&*store, &rt), None, "the old grant is gone");
+    }
+
+    /// Case A (R3a; R5 row 9; A-R175): A1 never issues `GrantId(0)`, and a proof carrying it
+    /// would read as case B's "none held". A record holding it is refused before anything is
+    /// deleted: the heal fails naming it, `grants/1` stays at its revision, and node 1 is sent
+    /// nothing. Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_heal_over_a_grant_record_holding_grant_0_is_refused_and_deletes_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let written = old_grant(&*store, &rt, GrantId(0));
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        match &healed {
+            Err(HealError::Control(detail)) => assert!(detail.contains("grant 0"), "{detail}"),
+            other => panic!("expected a refusal naming grant 0: {other:?}"),
+        }
+        assert_eq!(
+            grant_revision(&*store, &rt),
+            Some(written),
+            "nothing deleted"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// Case A over a `grants/1` that does not decode (A-R207, tester cut r10a, heal side): the
+    /// record is there but unreadable, which is not "no grant held". The heal refuses it naming
+    /// the record, `grants/1` stays, and node 1 is sent no `Plan` or anything else.
+    /// Unit (~10 ms): `MemStore`.
+    #[test]
+    fn a_heal_over_a_grant_record_that_does_not_decode_is_refused_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        put_at(
+            &*store,
+            &rt,
+            ControlKey::Grant(OWNER),
+            Bytes::from_static(b"not a grant record"),
+        );
+        let written = grant_revision(&*store, &rt).expect("grants/1 written");
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        match &healed {
+            Err(HealError::Control(detail)) => {
+                assert!(detail.contains("is not a grant record"), "{detail}");
+            }
+            other => panic!("expected a refusal naming the unreadable grant: {other:?}"),
+        }
+        assert_eq!(
+            grant_revision(&*store, &rt),
+            Some(written),
+            "nothing deleted"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// A `partitions/` family holding one record this build cannot decode is not a complete
+    /// list, since that record could be a partition in transfer (A-R207, tester cut r10c). With
+    /// an undecodable `partitions/2` beside an expired `grants/1`, `clear_grant` answers
+    /// unreadable (`NotWired`, nothing deleted) and the heal refuses and sends nothing; in both,
+    /// `grants/1` stays at its revision. Unit (~20 ms): `MemStore`.
+    #[test]
+    fn an_undecodable_partitions_record_makes_clear_and_heal_delete_nothing() {
+        let rt = runtime();
+        let damaged = || Bytes::from_static(b"not a partition record");
+
+        let store = config_testkit::MemStore::new();
+        let (db, _mailbox, written) = restarted_owner(&store, &rt);
+        put_at(
+            &store,
+            &rt,
+            ControlKey::Partition(PartitionId(2)),
+            damaged(),
+        );
+        let refused = rt
+            .block_on(clear_grant(&db, &store, OWNER))
+            .expect_err("an unreadable partitions/2 is refused");
+        assert_eq!(
+            (refused.kind, refused.retry, refused.no_mutation),
+            (ErrorKind::Unavailable, RetryRule::NotWired, true),
+            "{refused:?}"
+        );
+        assert!(
+            refused.detail.contains("partitions/2")
+                && refused.detail.contains("is not a partition record")
+                && refused.detail.ends_with("nothing deleted"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            grant_revision(&store, &rt),
+            Some(written),
+            "clear: grants/1"
+        );
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let written = old_grant(&*store, &rt, GrantId(4));
+        put_at(
+            &*store,
+            &rt,
+            ControlKey::Partition(PartitionId(2)),
+            damaged(),
+        );
+        let (healed, sent) = heal_once(Arc::clone(&store), &rt);
+        match &healed {
+            Err(HealError::Control(detail)) => {
+                assert!(detail.contains("is not a partition record"), "{detail}");
+            }
+            other => panic!("expected a refusal naming the unreadable partition: {other:?}"),
+        }
+        assert_eq!(
+            grant_revision(&*store, &rt),
+            Some(written),
+            "heal: grants/1"
+        );
+        assert!(sent.is_empty(), "heal: {} messages sent", sent.len());
+    }
+
+    /// A control store whose `partitions/1` reads answer from the snapshot [`Self::freeze`]
+    /// took: a lagging read, older than anything written after it. Everything else is the
+    /// `MemStore` underneath. Written out by hand because `async-trait` is not a dependency of
+    /// this crate.
+    struct StalePartition {
+        inner: config_testkit::MemStore,
+        stale: std::sync::Mutex<Option<config_core::GetResponse>>,
+    }
+
+    type Reply<'a, T> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConfigError>> + Send + 'a>>;
+
+    impl StalePartition {
+        fn new() -> Self {
+            Self {
+                inner: config_testkit::MemStore::new(),
+                stale: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn freeze(&self, rt: &tokio::runtime::Runtime) {
+            let read = rt
+                .block_on(self.inner.get(GetRequest {
+                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                }))
+                .expect("get partitions/1");
+            *self.stale.lock().expect("stale") = Some(read);
+        }
+    }
+
+    impl ConfigStore for StalePartition {
+        fn get<'a, 'b>(&'a self, request: GetRequest) -> Reply<'b, config_core::GetResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            let stale = self.stale.lock().expect("stale").clone();
+            match stale {
+                Some(read)
+                    if request.key == ControlKey::Partition(PARTITION).encode().as_bytes() =>
+                {
+                    Box::pin(std::future::ready(Ok(read)))
+                }
+                _ => self.inner.get(request),
+            }
+        }
+
+        fn list<'a, 'b>(&'a self, request: ListRequest) -> Reply<'b, config_core::ListResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.list(request)
+        }
+
+        fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.put(request)
+        }
+
+        fn delete<'a, 'b>(
+            &'a self,
+            request: DeleteRequest,
+        ) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.delete(request)
+        }
+
+        fn capabilities(&self) -> config_core::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn watch<'a, 'b>(
+            &'a self,
+            request: config_core::WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.watch(request)
+        }
+    }
+
+    /// A-R163's read-before guards (A-R175): a `partitions/1` read served below the revision of
+    /// the grant delete (case A) or of the read that found the grant absent (case B) is a
+    /// lagging answer, so the heal refuses it and sends node 1 nothing. Unit (~20 ms):
+    /// `MemStore` behind [`StalePartition`].
+    #[test]
+    fn a_partitions_read_older_than_the_grant_is_gone_is_refused_and_sends_nothing() {
+        let rt = runtime();
+
+        let store = Arc::new(StalePartition::new());
+        rooted(&store.inner, &rt, BootId(5));
+        store.freeze(&rt);
+        old_grant(&store.inner, &rt, GrantId(4));
+        let (healed, sent) = heal_once(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        assert!(
+            matches!(healed, Err(HealError::ReadBeforeDelete { read, deleted }) if read < deleted),
+            "case A: {healed:?}"
+        );
+        assert!(sent.is_empty(), "case A: {} messages sent", sent.len());
+
+        let store = Arc::new(StalePartition::new());
+        rooted(&store.inner, &rt, BootId(5));
+        store.freeze(&rt);
+        rt.block_on(store.inner.put(PutRequest {
+            key: Bytes::from_static(b"unrelated"),
+            value: Bytes::from_static(b"x"),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("put unrelated");
+        let (healed, sent) = heal_once(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        assert!(
+            matches!(healed, Err(HealError::ReadBeforeAbsence { read, absent }) if read < absent),
+            "case B: {healed:?}"
+        );
+        assert!(sent.is_empty(), "case B: {} messages sent", sent.len());
     }
 }

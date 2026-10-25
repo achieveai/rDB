@@ -1686,7 +1686,11 @@ fn m7v_114_a_down_node_is_not_stepped_and_what_reaches_it_is_dropped() {
 /// at the first storage effect after 3 000, so the restart step was never reached.
 #[retcd_test]
 fn crash_a_run_goes_on_through_a_crash_and_a_restart_step_brings_the_node_back() {
+    use rdb_core::contracts::event::ClientEvent;
+    use rdb_core::contracts::ids::{AffinityId, ClientId, RequestId, RequestIdentity, TenantId};
     use rdb_core::contracts::trace::{BoundaryId, FaultKind};
+    use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
+    use rdb_core::contracts::version::API_VERSION;
     use rdb_sim::harness::run::{FaultTag, ScenarioStep, StepAction};
     support::preamble();
     const CRASH_AT: Tick = Tick(3_000);
@@ -1714,6 +1718,36 @@ fn crash_a_run_goes_on_through_a_crash_and_a_restart_step_brings_the_node_back()
         ),
         on_node(RESTART_AT, StepAction::Restart(REBOOT), None),
     ];
+    // The crash is taken at node 1's next storage effect, so the run must give it one. A client
+    // write on the recovered partition does. Before ruling A-R165 the resume hold's keepalive did
+    // by accident: R1 re-sends the head every 100 ms while L1 rejects, and partition 1 stayed in
+    // its 5 s hold until about 7 100. The first resume now skips that hold, partition 1 is
+    // healthy from 2 103 and idle, nothing touched storage before the restart step, and the step
+    // was refused `Config { field: "restart" }` because the node was never down.
+    plan.seed.push(seed(
+        CRASH_AT.0,
+        NODE,
+        BOOT,
+        RECOVERED,
+        EventKind::Client(ClientEvent::Submit(TxnRequest {
+            api_version: API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                // The spine's history wrote as client 1; a new client cannot reuse its ids.
+                client: ClientId(2),
+                request: RequestId(1),
+            },
+            affinity: AffinityId(1),
+            expected_generation: None,
+            remaining_millis: 1_000,
+            conditions: Vec::new(),
+            mutations: vec![Mutation::Put {
+                key: scoped_key(TenantId(1), AffinityId(1), b"k"),
+                value: Bytes::from_static(b"v"),
+                expected_version: None,
+            }],
+        })),
+    ));
     plan.limits = RunLimits {
         max_events: LONG_RUN_EVENTS,
         deadline: SECOND_DEADLINE,

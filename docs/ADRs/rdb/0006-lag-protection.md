@@ -363,6 +363,29 @@ durable barrier still gates `Paused → Reprotecting`.
 after catching up would no longer block resume, and a dead replica would flap the partition
 between a 5 s resume and a 2 s pause.
 
+## Amendment 2026-10-23: a new generation's first resume skips the hold (lead rulings A-R165, A-R167)
+
+**The cost.** Every open of an embedded database starts a new generation, and L1 starts it
+`Paused` (§4). The 5 s hold then ran before the first write, every time. Measured on the dev host
+with `pilot_kv`: 5034 ms of a 7694 ms open-to-ready was this hold. Nothing was at risk during it:
+recovery had just made every pinned copy durable through the cutoff.
+
+**Decision (A-R165).** The generation's first `Reprotecting → Healthy` skips the hold. Everything
+else still applies to it:
+
+- It still starts `Paused`, still needs the exact barrier durable on every predicate, a qualifying
+  secondary, and `replication_lag < 250 ms` at the evaluation that resumes.
+- Any later pause in the same generation (a `Lost` edge, an exposure pause, a demotion) clears
+  the exemption, and that resume holds the full 5 s as before.
+- Rejected: starting `Healthy`, and a `DbConfig` knob for the hold.
+
+**What it exposed (A-R167).** With the hold gone, the simulator's INV-LAG oracle caught a resume
+at barrier 0 before any copy had reported. L1 counted a predicate it had never heard from as
+durable through 0, and the hold had been hiding that. Now a copy counts as durable through `b`
+only once it reported `durable_through ≥ b` in this generation. A copy that never reported is
+durable through nothing, barrier 0 included. The host does send that report at open: `pilot_kv`
+reaches ready in 2759 ms with both rulings.
+
 ## Verification
 
 | Claim | How it is proven |
@@ -372,11 +395,11 @@ between a 5 s resume and a 2 s pause.
 | No success without a qualifying secondary | Kill every regular secondary at t=0: admission rejects on the `QualificationChanged` edge, not at 2 s and not on the next eval; P1 independently refuses to publish — **V8** |
 | Resume reads liveness, not exposure | Reach `Reprotecting` with an empty unsafe queue, then stall a required copy's progress: the 5 s hold restarts instead of completing |
 | A peer never heard from blocks resume | Reach `Reprotecting` with one peer absent from `peer_progress`: `replication_lag` is infinite, `stalest_copy` names it, no `HealthEval` resumes; deliver `PeerProgress` for it at least every 250 ms and resume follows 5 s after the first (a single `PeerProgress` does not resume: lag passes 250 ms and the hold restarts — corrected 2026-09-26) |
-| A paused partition resumes with no writes (amendment 2026-09-26) | Recovered RF3 partition, all survivors live, no client writes: R1's keepalive draws ACKs, `PeerProgress` arrives every ≤ 100 ms per peer, and `SetAdmission(Allow)` lands by fence + barrier + 5 s + margin; a Submit then is not refused `PROTECTION_PAUSED`. Near-miss: one peer silent ⇒ never resumes. The keepalive stops on `Allow` |
+| A paused partition resumes with no writes (amendment 2026-09-26) | Recovered RF3 partition, all survivors live, no client writes: R1's keepalive draws ACKs, `PeerProgress` arrives every ≤ 100 ms per peer, and `SetAdmission(Allow)` lands by fence + barrier + margin (+ 5 s on any resume but the generation's first, amendment 2026-10-23); a Submit then is not refused `PROTECTION_PAUSED`. Near-miss: one peer silent ⇒ never resumes. The keepalive stops on `Allow` |
 | Self is not in the lag domain | Primary sends no ACK to itself; with both peers reporting, `Reprotecting` completes — the earlier definition over a set containing self never did |
 | A lost copy leaves the lag domain | `CopyLost { C, Diverged }` during `Reprotecting` with the floor intact: the hold continues over the remaining peers and completes; `lost_copies` exports `[C]`. The trace carries the same set by node, `ProtectionState.lost_copy_set`, and INV-LAG clause (a) does not require a lost copy at the barrier (amended 2026-10-07, M9 S0 ruling item 5; `m9_f2_b`, `m9_f2_00`) |
 | A dropped `Lost` edge is caught outside L1 | Verification's dispatcher mutation drops the routed `QualificationChanged { Lost }`; the oracle reports an `Admitted` after the loss; no L1 row claims to catch this |
-| The module starts closed | Fresh instance at `Recovered`: `Paused`, `SetAdmission(Reject)` at construction, no admission before the first `Gained` and the durable barrier; then `Reprotecting` and the 5 s hold as usual |
+| The module starts closed | Fresh instance at `Recovered`: `Paused`, `SetAdmission(Reject)` at construction, no admission before the first `Gained` and the durable barrier, reported by every pinned copy (A-R167); then `Reprotecting`, and `Healthy` with no hold on this first resume (A-R165) |
 | A block reads as a block | `BlockPartition` with no prior `Lost` (predicate already false, or before the first `Gained`): the module is `Paused`, `reason == DIVERGENCE_REQUIRES_OPERATOR`, and no later `HealthEval` or `Gained` resumes it |
 | A membership change does not unblock | `BlockPartition`, then a config change adding a regular copy that ACKs at head: `Gained` arrives, every predicate is durable through the barrier, and the module still stays `Paused` with admission unchanged |
 | The primary counts as a required copy | Stall the primary's flush with both secondaries healthy: `unsafe_age` rises and the partition pauses |

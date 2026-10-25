@@ -3080,6 +3080,11 @@ fn expired_work_is_cancelled_at_storage_dispatch() {
 /// requests queued behind it are answered at once, as a fence answers them. Nothing of theirs
 /// was written, so `PROTECTION_PAUSED` is a definitive non-admission. Before, they waited
 /// unanswered until A1's `Fence` arrived, and T1 emits no `FenceRequest` to make it come.
+///
+/// M10 D4 (lead ruling A-R180): each answer's mutation proof. The queued requests' paused
+/// refusals prove they wrote nothing; the dispatched request's batch may have landed, so its
+/// `UNKNOWN_OUTCOME` proves nothing. Answering the dispatched request paused would claim a proof
+/// for a batch that may have applied.
 #[retcd_test]
 fn a_failed_batch_answers_the_queue_behind_it() {
     let mut h = H::live();
@@ -3098,6 +3103,16 @@ fn a_failed_batch_answers_the_queue_behind_it() {
             (3, ErrorKind::ProtectionPaused)
         ]
     );
+    let proofs: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Reply(ReplyEffect::Failed { identity, error }) => {
+                Some((identity.request.0, error.proves_no_mutation()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(proofs, vec![(1, false), (2, true), (3, true)]);
     assert_eq!(h.k().queue_len(), 0);
 }
 
@@ -4223,6 +4238,19 @@ fn m7a_71_deny_error_mapping_total_and_checkpoint_sensitive() {
     );
 }
 
+/// M10 D4 (lead ruling A-R180): `PROTECTION_PAUSED` proves its submission wrote nothing only
+/// because no deny reason maps to it after apply. After apply every reason's error proves
+/// nothing and none is paused, so the proof can never cover a batch that may have landed.
+#[retcd_test]
+fn no_deny_reason_after_apply_is_paused_or_proves_no_mutation() {
+    let at = deny_at();
+    for reason in EVERY_DENY_REASON {
+        let error = deny_error(reason, Boundary::PostApply, &at);
+        assert_ne!(error.kind(), ErrorKind::ProtectionPaused, "{reason:?}");
+        assert!(!error.proves_no_mutation(), "{reason:?}: {error:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Retention across two generations (plan §4.4)
 // ---------------------------------------------------------------------------------------------
@@ -5343,6 +5371,60 @@ fn dedup_older_answers_the_newest_older_generation_holding_that_identity() {
     index.retire(Generation(5));
     assert_eq!(older(&index, 7, AffinityId(0), zero), Some((3, 30)));
     assert_eq!(older(&index, 7, AFF, identity(2)), None);
+}
+
+/// A-R209 (for the cap retry hint, A-R187): `holds_through(g, s)` is whether a trim of `g` below
+/// `s + 1` would drop an entry. It counts only `g` itself, counts `s` and not `s + 1`, and a
+/// generation with no entries, or one trimmed or retired away, holds nothing. The zero identity
+/// sits at a generation's first key and `u64::MAX` is the last generation, where a range bound
+/// would slip.
+#[retcd_test]
+fn dedup_holds_through_counts_only_its_generation_up_to_and_including_the_seq() {
+    let zero = RequestIdentity {
+        tenant: TenantId(0),
+        client: ClientId(0),
+        request: RequestId(0),
+    };
+    let mut index = DedupIndex::default();
+    // g4 holds seqs 40 and 45; its neighbours hold lower seqs that must not count for g4.
+    index.insert(Generation(3), AFF, identity(1), retained_at(1));
+    index.insert(Generation(4), AffinityId(0), zero, retained_at(45));
+    index.insert(Generation(4), AFF, identity(2), retained_at(40));
+    index.insert(Generation(5), AffinityId(0), zero, retained_at(2));
+    index.insert(Generation(u64::MAX), AFF, identity(3), retained_at(7));
+
+    let holds = |index: &DedupIndex, g: u64, s: u64| index.holds_through(Generation(g), Seq(s));
+    // Seq 40 is through + 1 here, and g3's seq 1 and g5's seq 2 are both below 39.
+    assert!(
+        !holds(&index, 4, 39),
+        "seq == through + 1 does not count, nor do g3's and g5's lower seqs"
+    );
+    assert!(holds(&index, 4, 40), "seq == through counts");
+    assert!(holds(&index, 4, 45), "the first key of g4 is in g4");
+    assert!(holds(&index, 4, u64::MAX));
+    assert!(
+        !holds(&index, 6, u64::MAX),
+        "an empty generation holds nothing"
+    );
+    assert!(
+        !holds(&index, 0, u64::MAX),
+        "an empty generation holds nothing"
+    );
+    assert!(holds(&index, 3, 1));
+    assert!(holds(&index, 5, 2));
+    assert!(holds(&index, u64::MAX, 7), "the last generation");
+    assert!(!holds(&index, u64::MAX, 6));
+
+    // A trim below 41 drops seq 40 and keeps 45; a retire drops the rest.
+    index.trim(Generation(4), Seq(41));
+    assert!(!holds(&index, 4, 44), "trimmed");
+    assert!(holds(&index, 4, 45));
+    index.retire(Generation(4));
+    assert!(!holds(&index, 4, u64::MAX), "retired");
+    assert!(
+        holds(&index, 3, 1) && holds(&index, 5, 2),
+        "neighbours untouched"
+    );
 }
 
 /// M7A-178 (plan §8.1, lead ledger L-R177gf; the reask livelock inv-publish-path found). An A1
