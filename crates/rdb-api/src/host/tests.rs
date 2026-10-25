@@ -2530,7 +2530,7 @@ fn a_reply_the_waiting_call_cannot_take_answers_it_with_the_host_fault() {
                 },
             )
         } else {
-            host.previous_answer(identity(n), Ok(SnapshotHandle(7)))
+            host.previous_answer(PartitionId(1), identity(n), Ok(SnapshotHandle(7)))
         }
         .expect_err(name);
         match answered_now(&answer) {

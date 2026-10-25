@@ -1999,8 +1999,12 @@ async fn cas(
 ///   nothing commits. The promote then fails "did not commit"; promoting again pins its real
 ///   boot. `promote` re-reads the boot after the expiry wait, so a handshake that comes late
 ///   is taken in that same run.
-/// - When the member starts again, the owner's `repair_duty` of the `ReadOnly` commit probes
-///   it as a pinned regular secondary and re-plans it at the boot its link reports.
+/// - When the member starts again, it is re-planned at the boot its link reports, by one of two
+///   paths. Usually the owner sees `peer_booted` (its route still held the member's old boot)
+///   and `rejoin_if_stale` revokes and re-plans, since the live boot is newer than `0`; seen on
+///   the A-R401 F2 walk, `ReadOnly` gen 3 to `DegradedRf2` gen 4. When no `PeerBooted` comes (the
+///   route never held a boot), the owner's `repair_duty` of the `ReadOnly` commit is the
+///   fallback: it probes the member as a pinned regular secondary and the drain re-pins it.
 pub(crate) const UNLINKED_BOOT: BootId = BootId(0);
 
 /// The members kept, each at its boot; `to` becomes the primary and a `Shadow` stays one. Polls

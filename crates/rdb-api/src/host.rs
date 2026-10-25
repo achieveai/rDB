@@ -4131,7 +4131,7 @@ impl Host {
             KernelEffect::Publication(effect) => {
                 return match effect {
                     PublicationEffect::Snapshot { identity, handle } => {
-                        self.previous_answer(*identity, *handle)
+                        self.previous_answer(site.partition, *identity, *handle)
                     }
                     PublicationEffect::Status(_)
                     | PublicationEffect::Mode { .. }
@@ -8011,8 +8011,10 @@ impl Host {
 
     /// P1's answer to a `ReadPrevious`: the kept view it handed out, read for the asked object,
     /// or why there is none. A handle storage never bound is a host fault.
+    /// `partition` is the site whose P1 answered, so `recovery_mode` reads that partition.
     fn previous_answer(
         &mut self,
+        partition: PartitionId,
         identity: RequestIdentity,
         handle: Result<SnapshotHandle, ErrorKind>,
     ) -> Result<(), Fault> {
@@ -8062,7 +8064,7 @@ impl Host {
                     ReadServiceOutcome::Served,
                 )
                 .map_err(|detail| fail_waiter(&pending.reply, detail))?
-                .in_mode(self.recovery_mode(crate::admin::PARTITION))
+                .in_mode(self.recovery_mode(partition))
             }
         };
         let _ = pending.reply.send(answer);
