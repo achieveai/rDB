@@ -2,6 +2,7 @@
 # Run rDB as three real processes with one command (M10 S2, W4): `lr`.
 #
 #   scripts/local-rdb.sh up [--release] [--base-port P] [--root DIR] [--timeout-sec N]
+#   scripts/local-rdb.sh up --resume                              [--run DIR]
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
 #   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
 #   scripts/local-rdb.sh suspend N | resume N                     [--run DIR]
@@ -14,7 +15,8 @@
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
 # database once in one process (rdb_node --form, ruling A-R231), then starts rdb_node 1, 2 and 3,
 # each holding only its own copy, and waits for each to say ready. Ctrl-C or a failed step brings
-# everything it started back down.
+# everything it started back down. `up --resume` starts a run that is down again (its rEtcd,
+# then nodes 1-3) with its ports and binary paths; nothing is formed anew.
 #
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
 # it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
@@ -64,6 +66,7 @@ ROOT="${RDB_LR_ROOT:-C:/rdb_test_data/lr}"
 RUN=""
 TIMEOUT_SEC=90
 WIPE=0
+RESUME=0
 ARG=""
 FAULT_NODE=1
 DROP=""
@@ -76,6 +79,9 @@ while [ $# -gt 0 ]; do
         --run) RUN="$2"; shift 2 ;;
         --timeout-sec) TIMEOUT_SEC="$2"; shift 2 ;;
         --wipe) WIPE=1; shift ;;
+        --resume)
+            [ "$COMMAND" = up ] || { echo "lr: --resume goes with 'up' only" >&2; exit 2; }
+            RESUME=1; shift ;;
         --node) FAULT_NODE="$2"; shift 2 ;;
         --drop) DROP="$2"; shift 2 ;;
         --release)
@@ -92,7 +98,7 @@ while [ $# -gt 0 ]; do
 done
 
 usage() {
-    sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -379,13 +385,36 @@ run_basis() {
 }
 
 up() {
-    local lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 43)) p sha stamp
+    local lo hi p sha stamp n role fix="pick another --base-port"
+    if [ "$RESUME" = 1 ]; then
+        pick_run
+        # A run still up says so before the port checks below, which would otherwise blame
+        # the base port: a resume cannot change it, run.env sets it (critic-w5g A1).
+        for n in 1 2 3; do
+            node_alive "$n" && die "node $n of $RUN still runs: the run is up; 'lr down' first"
+        done
+        for role in $(awk '$1 ~ /^retcd-/ { print $1 }' "$RUN/pids" 2>/dev/null); do
+            os_pid_is "$(pid_of "$role")" config-server \
+                && die "rEtcd ($role) of $RUN still runs: the run is up; 'lr down' first"
+        done
+        fix="stop what holds it: this run's ports are fixed in $RUN/run.env"
+    fi
+    lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 43))
     for p in 27021 27031; do
         [ "$p" -lt "$lo" ] || [ "$p" -gt "$hi" ] || die "ports $lo-$hi hold $p (mongod on this host); pick another --base-port"
     done
     for p in $(seq "$lo" "$hi"); do
-        port_free "$p" || die "port $p is already in use; pick another --base-port (lr uses $lo-$hi)"
+        port_free "$p" || die "port $p is already in use; $fix (lr uses $lo-$hi)"
     done
+    if [ "$RESUME" = 1 ]; then
+        # The run kept its rEtcd data and its copies across `down`: start them again, from
+        # the binary paths in run.env (a later `up` may have rebuilt them in place). Nothing
+        # is formed or made anew.
+        echo "$RUN" > "$ROOT/current"
+        start_retcd
+        start_all
+        return
+    fi
     build
     sha="$(run_basis)"
     stamp="$(date -u +%H%M%S)"
@@ -403,6 +432,11 @@ PILOT_BIN=$PILOT_BIN
 EOF
     : > "$RUN/pids"
     echo "$RUN" > "$ROOT/current"
+    start_retcd
+    form_and_start
+}
+
+start_retcd() { # rEtcd of $RUN, with the trap that takes the run down if `up` stops short
     # An EXIT trap, not ERR: ERR does not fire inside functions or on die's exit.
     UP_DONE=0
     trap 'rc=$?; if [ "$UP_DONE" = 0 ]; then echo "lr: up failed or interrupted (exit $rc); bringing the run down" >&2; down || true; fi' EXIT
@@ -416,6 +450,9 @@ EOF
         [ -f "$f" ] && record_pid "retcd-$(basename "$(dirname "$f")")" "$(sed -n 1p "$f" | tr -d '\r ')"
     done
     say "rEtcd up at $CONTROL"
+}
+
+form_and_start() {
     "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --apps pilot,pilot-a,pilot-b,admin >/dev/null
     "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs-other" --apps pilot >/dev/null
     say "certificates in $RUN/certs (a second CA in $RUN/certs-other)"
@@ -423,6 +460,10 @@ EOF
         --ready-secs "$TIMEOUT_SEC" >"$RUN/out/form.out" 2>"$RUN/out/form.err" \
         || { cat "$RUN/out/form.err" >&2; false; }
     say "$(cat "$RUN/out/form.out")"
+    start_all
+}
+
+start_all() { # nodes 1-3, then the wait for each: the tail of `up` and `up --resume`
     local n
     for n in 1 2 3; do start_node "$n"; done
     local ok=1

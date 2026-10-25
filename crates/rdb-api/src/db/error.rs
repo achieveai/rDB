@@ -137,6 +137,27 @@ impl ApiError {
         }
     }
 
+    /// A call to the owner that runs in another process, sent, whose answer never came back:
+    /// the link dropped while it waited, as when that process is stopped (`lr down`, tester tc1
+    /// D1, A-R357). Not a host fault: a retry helps once the node is back. The call was sent,
+    /// so a write may have applied.
+    #[must_use]
+    pub fn owner_lost(node: NodeId) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: false,
+            detail: format!(
+                "node {}, the owner, went out of reach while this call waited for its answer (its \
+                 process may have stopped); a write sent here may have applied: once it is \
+                 back, send the same request again with `Db::resend`, or ask `Db::status`; \
+                 never send it under a new request id",
+                node.0
+            ),
+            retry_after: None,
+        }
+    }
+
     /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
     #[must_use]
     pub fn host(detail: &str) -> Self {
@@ -260,7 +281,8 @@ const fn step_for(kind: ErrorKind, retry: RetryRule) -> &'static str {
         }
         ErrorKind::IncompatibleVersion => "open the folder with the newer build that wrote it",
         ErrorKind::StatusExpired => {
-            "the answer is no longer kept: read the object to see whether the write is there"
+            "the answer is no longer kept: read the object to see its value, and write again only \
+             if that value is not the one you want"
         }
         ErrorKind::DivergenceRequiresOperator => {
             "an operator must act: keep this Db's log and report this message; retrying will \

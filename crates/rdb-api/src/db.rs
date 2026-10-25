@@ -59,8 +59,12 @@ const OWNER: NodeId = admin::OWNER;
 /// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
 const TENANT: TenantId = TenantId(1);
 
-/// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads.
-const GROUP: AffinityId = AffinityId(1);
+/// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads. A [`TxnPut`] names it
+/// as its `group` to write where `put` and `get` do.
+pub const DEFAULT_GROUP: AffinityId = AffinityId(1);
+
+/// [`DEFAULT_GROUP`], under its name inside this module.
+const GROUP: AffinityId = DEFAULT_GROUP;
 
 /// The longest deadline [`Db::txn`] and [`Db::resend_within`] accept: the caller's maximum in
 /// `docs/rdb/developer-handoff.md`, ExecuteTxn row. Those two refuse a longer one before
@@ -206,8 +210,9 @@ pub struct DbConfig {
     ///   `Db`, so per partition (A5); the ninth evicts the oldest, which is logged
     ///   `ack_floor_pin_evicted` and from then on answers `STATUS_EXPIRED`.
     /// - A request this `Db` resends after a later write was answered may find its own answer
-    ///   dropped: it answers `STATUS_EXPIRED` with nothing applied. Submit it as new. This holds
-    ///   while an earlier write is still kept (above), and for a request that was answered `Ok`:
+    ///   dropped: it answers `STATUS_EXPIRED`. That resend applies nothing, but an earlier send
+    ///   may have: read the object to see its value. This holds while an earlier write is still kept (above), and for a request that
+    ///   was answered `Ok`:
     ///   it is never applied twice (A-R274). After a restart of the owner, a kept write that never
     ///   applied answers `STATUS_EXPIRED` too.
     /// - Ids an app chose ([`Db::put_as`], [`Db::txn_as`], [`Db::write_as`]) get no relief:
@@ -1678,7 +1683,10 @@ impl Db {
             // The node dropped the call's waiter unanswered: not a timeout, so not the
             // timeout's outcome either (F-001).
             Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
-                error: ApiError::host("the owner dropped the call unanswered"),
+                error: unanswered(
+                    lock(&self.nodes).iter().any(|handle| handle.node == owner),
+                    owner,
+                ),
                 request: None,
             }),
         }
@@ -2082,7 +2090,9 @@ impl Db {
     /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
     ///
     /// With [`DbConfig::ack_floor`] on, a refused request resent after a later write answers
-    /// `STATUS_EXPIRED`, with nothing applied: submit it as new (spec §5.3). A request answered
+    /// `STATUS_EXPIRED`. That resend applies nothing, but an earlier send may have: read the
+    /// object to see its value (spec §5.3 and §8.1, A-R357). Its detail says whether this open
+    /// was answered for it, or an earlier open of the same client. A request answered
     /// `UNKNOWN_OUTCOME` is the exception: its answer is kept, so its resend still replays it.
     /// Every other request below the floor, answered `Ok` or refused, stays covered while that
     /// request is unsettled, so a resend never applies one twice (A-R274).
@@ -2171,8 +2181,13 @@ impl Db {
         ) {
             self.settled(identity);
         }
+        let here = lock(&self.ack_floor).numbered_here(identity.0);
         answered.map_err(|PutError { error, request }| PutError {
-            error: self.explained(reconcile_step(error, request.as_deref())),
+            error: self.explained(expired_case(
+                reconcile_step(error, request.as_deref()),
+                identity,
+                here,
+            )),
             request,
         })
     }
@@ -3022,6 +3037,41 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
          look it up with Db::status to see whether an earlier send applied it, and do not \
          resend it as a new request",
         error.detail, sent.identity.request.0
+    );
+    error
+}
+
+/// The refusal for a call `owner` dropped unanswered (F-001). A node of this process that drops
+/// one is a host fault. One in another process went out of reach, most often because its
+/// process stopped (`lr down`): `UNAVAILABLE`, wait and retry, never "report this" (tc1 D1).
+fn unanswered(local: bool, owner: NodeId) -> ApiError {
+    if local {
+        ApiError::host("the owner dropped the call unanswered")
+    } else {
+        ApiError::owner_lost(owner)
+    }
+}
+
+/// `error` with which case a resend's `STATUS_EXPIRED` of `request` is (A-R357). The kernel
+/// answers it only for an id under its open's ack floor whose answer was dropped, so either the
+/// app was answered for it, or it stayed unsettled past the 8 pins or the dedup retention.
+/// `here`: this open numbered it, so this `Db` is the one that was answered. Any other error is
+/// returned as it is.
+fn expired_case(mut error: ApiError, request: RequestId, here: bool) -> ApiError {
+    if error.kind != ErrorKind::StatusExpired {
+        return error;
+    }
+    let case = if here {
+        "it is below this open's ack floor: this app received an answer for it, or it was one \
+         of more than 8 unsettled writes (`ack_floor_pin_evicted`), or the owner restarted or \
+         the dedup retention passed while it was unsettled"
+    } else {
+        "an earlier open of this client received an answer for it, or it stayed unsettled past \
+         the dedup retention"
+    };
+    error.detail = format!(
+        "{}; request {}: {case}; this resend applied nothing, an earlier send may have",
+        error.detail, request.0
     );
     error
 }
@@ -5379,8 +5429,9 @@ mod tests {
     /// queued, so a retry of it must not promise that `status` will show its outcome: status
     /// stays `Unknown` for good. A retry of the published put keeps the promise, since status
     /// shows it (review F-023). Since A-R256(2) node 1 re-plans after the restart and writes
-    /// resume once node 3 syncs, so the published put is made at the re-planned generation and
-    /// node 3's link is then held to bring the pause, and the refusals still name the restart.
+    /// resume once node 3 syncs, so node 3's link is held once the re-plan includes it, and the
+    /// published put is made under that hold at the re-planned generation: it stays unsafe and
+    /// brings the pause (A-R371), and the refusals still name the restart.
     /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
     #[test]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
@@ -5421,28 +5472,29 @@ mod tests {
         }
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
         let deadline = std::time::Instant::now() + patience;
-        let first = loop {
+        // A-R371 (W9 load runs, 2 of 85 red, "L1 pauses: not within 15s"): L1 pauses only on
+        // the age of its oldest unsafe record. The put used to land first and the hold come
+        // after, so when node 3 synced it in between, nothing was unsafe and L1 stayed healthy.
+        // Hold first, so the put is published by node 2 and stays unsafe until node 3 has it.
+        loop {
             let owner = owner_status(&db, "node 1 re-planning");
-            if owner.recovered > before && owner.admits == Some(true) {
-                if let Ok(put) = db.put(b"a", b"2", None) {
-                    break put;
-                }
+            let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
+            let replanned = owner.recovered > before && owner.admits == Some(true);
+            // A re-plan that dropped node 3 leaves the hold below nothing to pause: say so.
+            if replanned && node_3.as_ref().and_then(|n| n.recovered) == owner.recovered {
+                break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "no put landed after node 1's re-plan within {patience:?}: {owner:?}"
+                "node 1 never re-planned with node 3 within {patience:?}: owner {owner:?}, \
+                 node 3 {node_3:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
-        };
-        // A re-plan that dropped node 3 leaves the hold below nothing to pause: say so now.
-        let owner = owner_status(&db, "node 1 after the re-plan");
-        let node_3 = db.node_status().into_iter().find(|n| n.node == NodeId(3));
-        assert_eq!(
-            node_3.as_ref().and_then(|n| n.recovered),
-            owner.recovered,
-            "node 3 is not in node 1's re-plan (dropped?): owner {owner:?}, node 3 {node_3:?}"
-        );
+        }
         db.links().hold(OWNER, NodeId(3));
+        let first = db
+            .put(b"a", b"2", None)
+            .expect("node 2 publishes a put node 3 cannot hold");
         owner_when(&db, "L1 pauses", patience, &|node| {
             node.admits == Some(false)
         });
@@ -10422,7 +10474,7 @@ mod tests {
     /// applied: an id above the pin stays covered (A-R274). The txn, resent,
     /// replays its answer, since a pin keeps it, and that settles the pin; its status still
     /// answers. With no pin left, one more put raises the floor past the paused put, which,
-    /// resent, answers `STATUS_EXPIRED` and applies nothing (submit it as new); its status, asked
+    /// resent, answers `STATUS_EXPIRED` and applies nothing (read the object); its status, asked
     /// with its generation, is `Expired`.
     /// Integration (~2 s): three node threads, a real pause and a heal.
     #[config_log::retcd_test]

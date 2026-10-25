@@ -20,8 +20,9 @@ Run every `lr` command from the checkout.
 Where things go:
 
 - Binaries: `$CARGO_TARGET_DIR/debug` (default `./target/debug`). Every `up` builds them first,
-  so a run never uses a stale binary. The first build takes several minutes; after that, cargo
-  skips what has not changed. `LR_BUILD=0` skips the build and uses the binaries as they are.
+  so a run never uses a stale binary. The first build takes several minutes (452 s on the dev
+  host, 2026-10-24), on top of your app's own first build: they build into different target
+  folders. After that, cargo skips what has not changed. `LR_BUILD=0` skips the build and uses the binaries as they are.
 - Each `up` makes a new **run folder** under `C:/rdb_test_data/lr` (or `$RDB_LR_ROOT`, or
   `--root DIR`). Its name is `<commit>-<base port>-<time>`. `<root>/current` names the last one.
 - In the run folder:
@@ -59,7 +60,8 @@ works as written. `--run DIR` picks another run.
 | `restart N` | `stop N`, then `start N`, with the same wait for ready. |
 | `kill N` | Kills node N at once, like a crash. Prints `lr: node N killed (pid ...)`. |
 | `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. |
-| `down` | Stops the nodes and rEtcd. The run folder stays, so you can read its logs. |
+| `down` | Stops the nodes and rEtcd. The run folder stays, with its data and logs. |
+| `up --resume` | Starts the last run again after a `down`: its rEtcd, then nodes 1, 2 and 3, with its own ports and binary paths (a later `up` rebuilds those binaries in place). The data written before `down` is still there. A run that is still up is refused: "the run is up; 'lr down' first". Plain `up` always makes a **new**, empty run. |
 | `clean` | `down`, then deletes the run folder, **its logs included**: copy what you need first. Prints `lr: removed <run folder>`. |
 
 `scripts/local-rdb.sh` with no verb lists every verb, including the fault verbs.
@@ -133,7 +135,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             None,
         )?
     };
-    rt.block_on(net.wait_up(&nodes, Duration::from_secs(30)))?;
+    // Wait for the links. Two of three is enough to start: `wait_ready` below says whether
+    // the owner takes writes.
+    if let Err(down) = rt.block_on(net.wait_up(&nodes, Duration::from_secs(10))) {
+        eprintln!("starting without: {down}");
+    }
 
     let config = DbConfig {
         ack_floor: true,
@@ -171,7 +177,11 @@ Everything else is the same `Db` you would embed.
   `lr env` prints all three as `CONTROL`, `PEERS` and `RUN`.
 - With `local` empty, nothing is written to `dir` today. Give it a folder of the app's own
   anyway; here it is in the run folder, so `clean` removes it with the run.
-- Use one `ClientId` per app process. Two processes with one id can send the same request id.
+- Give each app process its own `ClientId`; it keeps their writes apart in the logs. It is not
+  needed for safety: two processes, even on one `dir` with one `ClientId`, never send the same
+  request id. Each `Db::open` counts once in rEtcd, and each open numbers its requests from its
+  own base (row `m10_r357_two_app_processes_on_one_dir_with_one_client_never_share_an_id`).
+  That is also why no folder lock is taken here.
 
 Run it from your crate's folder in Git Bash, with `<checkout>` as in `embed.md`:
 
@@ -184,6 +194,37 @@ vars="$(<checkout>/scripts/local-rdb.sh env)" && eval "$vars" &&
   `eval "$(... env)"` hides that and leaves the three values empty.
 - It prints `read back hello at version N`. Run it again and `N` goes up. Once built, a run
   takes about 2 seconds.
+- `N` counts every write to the partition, not writes to `greeting`. On a new run the first
+  `hello` reads version 2: the partition already holds one entry that rDB writes itself.
+- **Two of three nodes are enough to start.** With node 3 killed, the app printed
+  `starting without: node 3: not reachable ...`, then `ready after 10065 ms`, and wrote and
+  read `hello`. Those 10 s are the `wait_up` limit in the sample: lower it if you start often
+  with a node down. With node 1 (the owner) down, `wait_ready` times out and names node 1.
+
+### What embed.md sections 5 and 6 mean for this app
+
+[`embed.md`](embed.md) sections 5 and 6 are written for a process that holds the copies. This
+app holds none, so:
+
+- **An app restart is not a reopen.** The nodes keep running: no new generation, no repair.
+  `heal_state()` is always `NotNeeded`, and `wait_ready` only waits for the owner to take writes.
+- **A saved request, resent after the app restarts,** answers its own answer again, or
+  `STATUS_EXPIRED` if its answer was dropped. It answers `GENERATION_CHANGED` only when a node
+  restarted meanwhile: `lr restart 2` moved the generation from 4 to 5 in the walk below. The
+  `did_it_land` in embed.md section 5 handles all three. Follow its rule on what to save.
+- **No `InUse`.** Nothing is locked, and two app processes may run at once (the `ClientId`
+  bullet above).
+- **Each open still counts once in rEtcd**, so the open counter's limit (`OpenError::Counter`,
+  2^23 opens, `admin::MAX_OPENS`) covers app opens too.
+- **The refusals an app open can see:** `Control` (rEtcd not reachable), `Counter`, and
+  `Config` (no `links`, or a database not formed yet: "form the database first (lr up)").
+  Folder errors (`Mismatch`, `Stale`, `CopyMissing`, `Node`) belong to the node processes:
+  `lr status` and the node's console show them. `ReadyError::TimedOut` names the owner when it
+  does not take writes in time.
+- **Reopen costs and ceilings** (embed.md section 7) apply to a node process restart, not to the
+  app.
+- **What a write sees while the database pauses** is in embed.md, "When writes pause". Every
+  refusal there is retryable; none needs the app to reopen.
 
 When you are done, from the checkout. `clean` deletes the logs too, so read them first if you
 need them (section 4):
@@ -224,9 +265,24 @@ worth reading.
 
 ## 5. Known limits today
 
-<!-- update-when: W6's restart rejoin lands (M10 S2); rewrite the restart bullet below. -->
-- **A restarted node does not rejoin yet.** `lr restart N` on a secondary exits 1 with
-  `rdb_node not-ready ... BarrierIncomplete`, and reads and writes stay refused (`LEASE_EXPIRED`).
-  A restarted owner stays out too (#42). Avoid `stop` and `restart` on a run you still need
-  (`kill` then `promote` works). To recover, start a new run (`clean`, then `up`); its data is
-  lost.
+- **A restarted node rejoins.** `lr restart N` exits 0 once the node prints `rdb_node ready`.
+  Measured in one walk on the dev host (`--base-port 18500`), with an app writing all the
+  time:
+
+  | Step | `lr` took | Writes refused for |
+  |---|---|---|
+  | `kill 3`, left down 60 s, then `start 3` | `start`: 1.6 s | 15.4 s, then writes resumed with node 3 still down |
+  | `restart 2` | 12.0 s (stop, then start) | 8.6 s |
+  | `restart 1`, the owner | 5.2 s | 3.6 s |
+  | `down`, then `up --resume` | 52 s | until `up --resume`; the data was all there |
+
+  Every acknowledged write read back (0 missing). The refusals the app saw, and what to do with
+  each, are in embed.md, "When writes pause". A write sent to the owner as it stops answers
+  `UNAVAILABLE (node 1, the owner, went out of reach while this call waited ...)`: resend that
+  same request once it is back. A read with the owner down is refused after 1 s
+  (`Timeouts::read`): `UNAVAILABLE (node 1, the owner, is not reachable ...; nothing was sent)`.
+- **`lr down` stops writes until `up --resume`.** An app open across it gets the `UNAVAILABLE`
+  lines above for every write and read. The walk did not keep an app open across
+  `up --resume`; restart the app after it to be sure.
+- **A restart can move the generation** (4 to 5 after `restart 2`), so a resend of a request
+  sent before it answers `GENERATION_CHANGED`. `did_it_land` handles that.

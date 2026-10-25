@@ -158,6 +158,86 @@ fn run() -> Result<(), Box<dyn Error>> {
   those figures as a promise.
 - Call `shutdown` before you exit. A killed process is safe too: see section 5.
 
+### A transaction and a map
+
+`txn` writes several objects at once: all of them land, or none. `write` with `Change::Map`
+changes a map's entries; `read` with `Look::Members` reads them a page at a time. Both functions
+take the `db` from the sample above. `rdb_api::db::DEFAULT_GROUP` is the group `put` and `get`
+use; name it in every `TxnPut`.
+
+```rust
+use rdb_api::db::DEFAULT_GROUP;
+use rdb_api::{Change, Db, ElemOp, Look, Seen, TxnPut, Value};
+use std::error::Error;
+use std::time::Duration;
+
+/// Two objects in one transaction: both are written, or neither. `if_version: Some(v)` writes
+/// only while the object is still at version `v`; a change since then refuses the whole
+/// transaction with `CONDITION_FAILED`, nothing written.
+fn transfer(db: &Db) -> Result<(), Box<dyn Error>> {
+    let seen = db.get(b"acct-a")?.value.map(|(version, _)| version);
+    let ok = db
+        .txn(
+            &[
+                TxnPut {
+                    group: DEFAULT_GROUP, // where `put` and `get` work
+                    object: b"acct-a",
+                    value: b"90",
+                    if_version: seen,
+                },
+                TxnPut {
+                    group: DEFAULT_GROUP,
+                    object: b"acct-b",
+                    value: b"10",
+                    if_version: None, // write over whatever is there, or create it
+                },
+            ],
+            Duration::from_secs(5), // the deadline; at most 30 s
+        )
+        .map_err(|refused| refused.error)?;
+    println!("both written at {:?}", ok.seq);
+    Ok(())
+}
+
+/// A map: put two entries in one write, then read every entry, 100 at a time.
+fn profile(db: &Db) -> Result<Vec<(Value, Value)>, Box<dyn Error>> {
+    let text = |s: &str| Value::Text(s.to_owned());
+    db.write(
+        b"profile",
+        Change::Map(vec![
+            ElemOp::Put(text("name"), text("ada")),
+            ElemOp::Put(text("lang"), text("rust")),
+        ]),
+        None,
+    )
+    .map_err(|refused| refused.error)?;
+    let mut entries = Vec::new();
+    let mut after = None; // start from the first entry
+    loop {
+        let read = db.read(b"profile", Look::Members { after, limit: 100 })?;
+        let Seen::Members(page) = read.seen else {
+            return Err(format!("profile is not a map: {:?}", read.seen).into());
+        };
+        let full = page.members.len() == 100;
+        after = page.members.last().map(|last| last.key.clone());
+        for member in page.members {
+            entries.extend(member.value.map(|value| (member.key, value)));
+        }
+        if !full {
+            return Ok(entries);
+        }
+    }
+}
+```
+
+- `transfer` refuses with `CONDITION_FAILED` when `acct-a` changed after the `get`. Read again
+  and decide; nothing was written.
+- One transaction holds at most `rdb_api::MAX_OPS` puts, all in one group.
+- A map key or value is any `Value`; here, text. `Look::Members` lists them in key order.
+- Sets work the same way with `Change::Set` and `ElemOp::Add` / `ElemOp::Remove`.
+- This code is compiled and run by the rows in `crates/rdb-api/src/db/reopen_tests.rs`
+  (`guide_sample`), so it matches this release.
+
 ## 5. Reopening your folder
 
 Open the same folder against the same rEtcd with the same `Db::open` call. There is nothing
@@ -185,16 +265,10 @@ extra to do, after a clean `shutdown` or after the process was killed.
 - Each open counts as one "reopen" of the folder's history. See the ceilings in section 7 for
   what that costs over many reopens.
 
-### After a reopen: did my write land?
+### After a restart: did my write land?
 
 To ask later, you need something saved before the process stopped. There are two ways.
 
-- **Save the request after its answer.** It is in `ok.sent` on success, or `refused.request` on
-  `UNKNOWN_OUTCOME`. Both hold it boxed: pass `*ok.sent` to `did_it_land` below. A
-  `TxnRequest` serializes with `serde_json` (in the `Cargo.toml` of section 2). Write it to a
-  file, and sync the file (`File::sync_data`) before you rely on it. This does not cover a kill
-  before the answer: `put` builds its request inside `Db`, so there is nothing to save until it
-  returns.
 - **Save the id before the send.** For a write you must be able to settle after a kill, choose
   its request id yourself. Build it with `rdb_api::app_request_id(n)` from your own number `n`
   (it returns `None` when `n` is 2^63 or more). Save the id, synced, then send with
@@ -204,14 +278,36 @@ To ask later, you need something saved before the process stopped. There are two
   `INVALID_ARGUMENT` and send nothing. A send refused before it went out, and `write_as`'s
   `Ok(None)` (the change came to nothing), say nothing about an earlier send under that id:
   ask `status`.
+- **Save a request whose answer was not definitive, and only that.** That is any refusal with
+  `no_mutation` false that hands the request back in `refused.request`, boxed: save
+  `*request`. `UNKNOWN_OUTCOME` is the common one; `UNAVAILABLE` "went out of reach while this
+  call waited" is another. A `TxnRequest`
+  serializes with `serde_json` (in the `Cargo.toml` of section 2). Write it to a file and sync
+  it (`File::sync_data`). **Delete it on any definitive answer**: `Ok`, or a refusal with
+  `no_mutation` true. Never save a request after `Ok`: the ack floor (below) drops its answer
+  once a later write is answered, and then asking can only say "read the object". So after a
+  restart only unanswered requests remain. The owner keeps their answers too, with three
+  limits: at most 8 unsettled writes per open, not across a restart of the owner, and not past
+  the dedup retention. Past those, asking answers "read the object".
+  A `put` builds its request inside `Db`, so a kill before any answer leaves nothing to save:
+  use the first way for writes that must survive that.
 
 With neither, a kill before any answer leaves nothing to ask about. Read the data with `get`.
 
+**What a resend answers after the app restarts** depends on where the copies run:
+
+| Mode | An app restart is | A saved request, resent, answers |
+|---|---|---|
+| Embedded (this page: `local` lists the nodes) | a reopen, so a new generation | `GENERATION_CHANGED`, with nothing applied by that send. Then ask `status` |
+| Three processes ([`local-cluster.md`](local-cluster.md): `local` empty) | a new open in the **same** generation | its own answer, replayed (`Ok`); or `Ok` because it applied now, if it never reached the owner; or `STATUS_EXPIRED` if its answer was dropped. `GENERATION_CHANGED` only if a node process restarted meanwhile |
+
+`did_it_land` below handles both. Rows
+`m10_r357_the_guide_s_did_it_land_answers_an_embedded_app_after_its_reopen` (embedded) and
+`m10_r357_the_guide_s_did_it_land_answers_an_app_restarted_over_the_links` (three processes) in
+`crates/rdb-api/src/db/reopen_tests.rs` run it.
+
 Then ask:
 
-- **A resend answers `GENERATION_CHANGED`.** The reopen started a new generation (one chapter of
-  the folder's history), and a request from an older one is never replayed or run again. That
-  send changed nothing. Look the request up with `status`; do not resend it as a new request.
 - **Ask `db.status(id, generation)`.** `Resolved` means it landed. Its `outcome` is
   `RecoveredApplied` when the answer comes from history kept across the reopen.
 - **The second argument is the generation the request was sent under**: the request's
@@ -219,11 +315,19 @@ Then ask:
   as after `put_saved`. A request that landed still answers `Resolved`. Only the not-landed
   answers differ: without it, a record from an older generation that is gone answers `Unknown`
   instead of `Expired`.
-- **`Unknown` or `Expired` is not proof that it did not land.** `Expired` means the record is
-  older than the dedup retention (`DbConfig::dedup_retention`, 24 h by default). Ask only after
-  `wait_ready` returns `Ok`. After that, do not keep asking: decide with `get`, or give up and
-  report it. A request of the current open still in flight can answer `Unknown` until it
-  publishes. Ask again a few times within a few seconds at most. Never poll `status` forever.
+- **`Unknown`, `Expired` and `STATUS_EXPIRED` are never proof that it did not land** (spec
+  §8.1). `STATUS_EXPIRED` and `Expired` mean the answer was dropped. That happens when the app
+  was answered for it earlier, when it was one of more than 8 unsettled writes of one open,
+  when the owner restarted while it was unsettled, or when it is older than the dedup retention
+  (`DbConfig::dedup_retention`, 24 h by default). The refusal's text says whose floor it is
+  below: "below this open's ack floor", or "an earlier open of this client received an answer
+  for it, or it stayed unsettled past the dedup retention". Either way, read the object: its
+  value is the answer. Never send
+  it as a new write on that refusal alone.
+- **Ask only after `wait_ready` returns `Ok`.** After that, do not keep asking: decide with
+  `get`, or give up and report it. A request of the current open still in flight can answer
+  `Unknown` until it publishes. Ask again a few times within a few seconds at most. Never poll
+  `status` forever.
 
 `crates/rdb-pilot/examples/did_it_land.rs` holds this code and is built with the workspace.
 
@@ -253,23 +357,44 @@ fn put_saved(
         .map_err(|refused| refused.error)?)
 }
 
-/// `true`: request `id` landed. `false`: not known, which is not proof that it did not land.
-/// `sent_in`: the generation it was sent under, when you know it.
-fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<bool, ApiError> {
-    Ok(matches!(db.status(id, sent_in)?, TxnStatus::Resolved(_)))
+/// What became of a saved request, and what the app does next.
+#[derive(Debug, PartialEq, Eq)]
+enum Landed {
+    /// It landed. Delete the saved copy.
+    Yes,
+    /// An answer for it came earlier, or it is too old to settle. Not proof either way: read
+    /// the object to see its value, then delete the saved copy.
+    ReadTheObject,
+    /// Not known yet, which is not proof that it did not land: ask again in a few seconds, or
+    /// read the object. Never send it as a new write.
+    NotKnown,
 }
 
-/// The same question for a request saved after its answer: `*ok.sent`, or `refused.request`'s.
-fn did_it_land(db: &Db, saved: TxnRequest) -> Result<bool, ApiError> {
+/// What became of request `id`. `sent_in`: the generation it was sent under, when you know it.
+fn landed(db: &Db, id: RequestId, sent_in: Option<Generation>) -> Result<Landed, ApiError> {
+    Ok(match db.status(id, sent_in)? {
+        TxnStatus::Resolved(_) => Landed::Yes,
+        TxnStatus::Expired => Landed::ReadTheObject,
+        TxnStatus::Unknown | TxnStatus::Unresolved { .. } => Landed::NotKnown,
+    })
+}
+
+/// The same question for a request saved because its answer was not definitive:
+/// `refused.request` of an `UNKNOWN_OUTCOME`. `Err`: this resend was refused for another
+/// reason (`UNAVAILABLE`, say); its text says when to ask again.
+fn did_it_land(db: &Db, saved: TxnRequest) -> Result<Landed, ApiError> {
     let (id, sent_in) = (saved.identity.request, saved.expected_generation);
-    match db.resend(saved) {
-        Ok(_) => return Ok(true), // same generation: applied now, or its answer replayed
-        Err(refused) if refused.error.kind != ErrorKind::GenerationChanged => {
-            return Err(refused.error)
-        }
-        Err(_) => {} // after a reopen: this send applied nothing; ask what the first one did
+    let refused = match db.resend(saved) {
+        Ok(_) => return Ok(Landed::Yes), // applied now, or its answer replayed
+        Err(refused) => refused.error,
+    };
+    match refused.kind {
+        // Its answer was dropped: answered earlier, or too old. This resend applied nothing.
+        ErrorKind::StatusExpired => Ok(Landed::ReadTheObject),
+        // An embedded folder was reopened: this send applied nothing; ask about the first one.
+        ErrorKind::GenerationChanged => landed(db, id, sent_in),
+        _ => Err(refused),
     }
-    landed(db, id, sent_in)
 }
 ```
 
@@ -311,11 +436,12 @@ floor), so the table above no longer limits it.
 
 - **It keeps up to 8 writes whose outcome is unknown**, so `status` or a resend can still
   settle them. The ninth drops the oldest, which then answers `STATUS_EXPIRED`.
-- **A dropped answer answers `STATUS_EXPIRED`** on a resend, with nothing applied: submit the
-  write as new. `status` with its generation says `Expired`; with none, `Unknown`.
+- **A dropped answer answers `STATUS_EXPIRED`** on a resend; that resend applies nothing. It is
+  never proof that the write did not run: read the object to see its value. `status` with its
+  generation says `Expired`; with none, `Unknown`.
 - **A write is never applied twice.** A resend of a write that was answered, even `Ok`, answers
   `STATUS_EXPIRED` once its answer was dropped. After the owner restarts, a kept write that never
-  applied answers `STATUS_EXPIRED` too: submit it as new.
+  applied answers `STATUS_EXPIRED` too: read the object.
 - **Ids you choose (`put_as`, `txn_as`, `write_as`) get no relief.** The table above applies.
 - **A cap below 3 is refused at open.** The floor and the newest answer would fill it.
 - `ack_floor: false` keeps every answer for the retention, as before.
@@ -323,11 +449,51 @@ floor), so the table above no longer limits it.
 ### When writes pause
 
 Writes can pause without any error in your code. Most pauses end by themselves, and none
-loses data.
-A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, say).
+loses data. A write made meanwhile is refused.
+
+**What happened to the write is in `refused.error.no_mutation`, not in the refusal's name.**
+
+- **`no_mutation` true:** this send wrote nothing, and no earlier send exists: a first send of
+  a new write. Retry it as the step says.
+- **`no_mutation` false:** an earlier send of this request may have applied. This is always the
+  case for a resend, whatever the refusal. Send the **same** request again with
+  `db.resend(..)` (the request is in `refused.request`), or ask `db.status(..)`. Never send it
+  as a new write under a new id: it could apply twice.
+
+What each refusal means, and when to retry:
+
+| Refusal | Why | When to retry |
+|---|---|---|
+| `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
+| `LEASE_EXPIRED` | The owner's permission to write ran out. | After `db.wait_ready(..)`. |
+| `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
+| `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
+| `UNAVAILABLE`, "went out of reach while this call waited" | The owner's process stopped mid-call. | Once it is back. |
+| `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
+
+`did_it_land` above does the "ask" part. Keep resending the same request and it lands once the
+pause ends.
+
+Measured with three processes on the dev host (local-cluster.md section 5 has the walk), an
+app writing all the time:
+
+| Event | Writes refused for | Refusals seen, in order |
+|---|---|---|
+| A secondary killed and left down for 60 s | 15.4 s, then writes resumed **with the copy still down** | `PROTECTION_PAUSED`, `LEASE_EXPIRED`, `PROTECTION_PAUSED` |
+| A secondary restarted (`lr restart 2`) | 8.6 s | `UNKNOWN_OUTCOME`, `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED` |
+| The owner restarted (`lr restart 1`) | 3.6 s | `UNAVAILABLE` (went out of reach), `PROTECTION_PAUSED` |
+
+Every acknowledged write read back afterwards (28,734, 6,217 and 13,644 of them, 0 missing).
+One run each, on a busy host: treat the times as rough.
 
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
-  new writes until that copy catches up. Then they resume.
+  new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
+  walk, 15 s after the kill, while the copy stayed down.
+- **A restarted copy waits about 5 s before it counts again.** Once it has caught up, it must
+  stay within 250 ms of the owner for 5 s in a row before writes resume (`resume_hold_millis`
+  and `resume_lag_millis`). Falling behind again restarts the 5 s. That wait is most of the
+  3.6 to 8.6 s restart pauses above; opening the node's store takes only 37 to 55 ms. The
+  first resume after an open skips the wait. An app cannot change these times in this release.
 - **The exception: a copy cut off across two or more reopens with no writes in between.** That
   copy stays behind, and writes stay paused:
   - A plain reopen does not help, even with every link up. Reads still work.
@@ -346,6 +512,11 @@ A `put` made meanwhile is refused with a retryable error (`PROTECTION_PAUSED`, s
   process, on one machine. Each node process then opens its own `nodes/<n>` in that shared
   folder. Forming a new database over the network is not supported yet. A node process started
   on a folder that was never formed is refused with "form the database first (lr up)".
+- **A copy missed while the database is first formed never joins.** This happens when a node's
+  report misses the first discovery window, for example when the host stalls during `lr up`.
+  The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
+  one more copy and the partition becomes read-only. A copy wiped after forming is not
+  affected: it rejoins through the heal.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
@@ -407,7 +578,7 @@ does not help; the "what to do" column does.
 | `OpenError::Stale` | The folder is an old copy: the rEtcd records a newer generation than any copy here holds | Do not delete this directory: its acknowledged writes are intact. Open the folder, or restore the backup, that holds the generation the message names |
 | `OpenError::Unbound` | The folder was made before M10 (M9's `rdb_dev --keep`) and never bound to an rEtcd | Start a new folder; M9 dev data is not migrated |
 | `OpenError::CopyMissing` | One of the folder's `nodes/<n>` directories is missing or empty while another holds data | Restore that directory from where it came from |
-| `OpenError::Counter` | The folder's open counter is used up (2^24 opens), or holds a value this build does not write | Used up (the message says "the most one directory may have"): start a new folder. A value this build does not write (the message says "is not an open counter"): do not delete the folder, its acknowledged writes are intact; stop and report it with the message |
+| `OpenError::Counter` | The folder's open counter is used up (2^23 opens, `admin::MAX_OPENS`), or holds a value this build does not write | Used up (the message says "the most one directory may have"): start a new folder. A value this build does not write (the message says "is not an open counter"): do not delete the folder, its acknowledged writes are intact; stop and report it with the message |
 
 A `Stale` whose message says "the open counter marks generation N activated" means a later
 open already served that generation, so this copy cannot catch up to it. A crash during the
