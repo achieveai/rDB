@@ -387,6 +387,8 @@ pub enum Msg {
         boot: BootId,
         /// The partition.
         partition: PartitionId,
+        /// The node fence the read was begun under ([`Host`]'s `owner_fence`).
+        fence: u64,
         /// The owner the record names.
         owner: Option<NodeId>,
     },
@@ -1830,9 +1832,9 @@ struct Host {
     /// read it after its last node fence; absent until that read answers. Read only while A1 is
     /// fenced, to refuse a client `NOT_PRIMARY` naming that owner instead of `LEASE_EXPIRED`.
     owner_after_fence: BTreeMap<PartitionId, Option<NodeId>>,
-    /// The partitions whose after-fence owner read is still retrying: a second fence meanwhile
-    /// starts no second read.
-    owner_reads: BTreeSet<PartitionId>,
+    /// How many node fences this node has had: each one's owner reads carry it, so a read
+    /// begun under an earlier fence, answering late, is dropped (critic-d3 A3).
+    owner_fence: u64,
     /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
     blamed: BTreeMap<PartitionId, Blame>,
     /// How many of A1's next `DrainProof`s this host loses, as if A1 never answered. Crate
@@ -1982,7 +1984,7 @@ impl Host {
             left_out: BTreeMap::new(),
             revocation_persisted: None,
             owner_after_fence: BTreeMap::new(),
-            owner_reads: BTreeSet::new(),
+            owner_fence: 0,
             blamed: BTreeMap::new(),
             #[cfg(test)]
             drain_proofs_to_lose: 0,
@@ -2293,17 +2295,31 @@ impl Host {
                 Ok(())
             }
             Msg::OwnerLearned {
-                partition, owner, ..
+                partition,
+                fence,
+                owner,
+                ..
             } => {
-                tracing::info!(
-                    node = self.node.0,
-                    partition = partition.0,
-                    owner = owner.map(|owner| owner.0),
-                    fenced = fence_of(self.authority.state()).is_some(),
-                    "host_owner_learned"
-                );
-                self.owner_reads.remove(&partition);
-                self.owner_after_fence.insert(partition, owner);
+                // A read begun under an earlier fence, or answering after A1 left Fenced, says
+                // nothing about this fence (critic-d3 A3).
+                if fence != self.owner_fence || fence_of(self.authority.state()).is_none() {
+                    tracing::debug!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        fence,
+                        current = self.owner_fence,
+                        "host_owner_learned_stale"
+                    );
+                } else {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        owner = owner.map(|owner| owner.0),
+                        fence,
+                        "host_owner_learned"
+                    );
+                    self.owner_after_fence.insert(partition, owner);
+                }
                 Ok(())
             }
             Msg::Inject {
@@ -3611,6 +3627,16 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
+        // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
+        // history; a later fence of either scope must not reuse it.
+        if fence_of(self.authority.state()).is_none() && !self.owner_after_fence.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                forgot = self.owner_after_fence.len(),
+                "host_owner_forgotten"
+            );
+            self.owner_after_fence.clear();
+        }
     }
 
     /// `txn_dispatch`: T1 hands `batch` to storage. The binding tick is `decided_at`, when A1
@@ -4168,7 +4194,8 @@ impl Host {
                 if *scope == FenceScope::Node {
                     self.schedule_acquire_after_fence(site);
                     // A-R399: what each fenced partition's record names now, for the
-                    // refusals alone; a new fence forgets the last answer and reads again. Every
+                    // refusals alone; a new fence forgets the last answer and reads again, and
+                    // a read begun under an earlier fence is dropped when it answers. Every
                     // served partition, not the fence's own site alone: A1 may site a node fence
                     // at partition 0, which no T1 or P1 serves, and the fan-out leaves the site
                     // out.
@@ -4178,12 +4205,17 @@ impl Host {
                     {
                         fenced.push(site.partition);
                     }
+                    fenced.sort_unstable();
+                    fenced.dedup();
+                    self.owner_fence += 1;
                     for partition in fenced {
                         self.owner_after_fence.remove(&partition);
-                        if self.owner_reads.insert(partition) {
-                            self.control
-                                .read_owner_after_fence(self.node, self.boot, partition);
-                        }
+                        self.control.read_owner_after_fence(
+                            self.node,
+                            self.boot,
+                            partition,
+                            self.owner_fence,
+                        );
                     }
                 }
             }
@@ -8050,8 +8082,8 @@ impl Host {
                 ));
             }
         };
-        // The caller stopped waiting, at its own deadline, before the answer came: the answer is
         let answer = self.redirect(partition, answer);
+        // The caller stopped waiting, at its own deadline, before the answer came: the answer is
         // lost here. A write's caller then holds `UNKNOWN_OUTCOME`, which `status` settles.
         if pending.reply.send(answer).is_err() {
             tracing::info!(

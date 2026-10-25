@@ -5817,14 +5817,16 @@ fn m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_
     }
 }
 
-/// A-R399 condition (3): reading the owner never admits a write. After the read, node 1 stays
-/// fenced and not admitting, and every put for half a second is refused with nothing
-/// mutated; its engine holds nothing past what it held at the fence.
+/// A-R399 condition (3), as far as a row can show it: after the read, node 1 stays fenced and
+/// not admitting, and every put for half a second is refused with nothing mutated; its engine
+/// holds nothing past what it held at the fence. What it does not show (critic-d3 A5): that
+/// the read cannot re-arm A1. The grant is frozen, so a re-arm could not admit here anyway;
+/// that half rests on the code (`Msg::OwnerLearned` sends A1 no event).
 /// Cut: `redirect` sets `no_mutation = false` on its `NOT_PRIMARY`: put 10 is refused claiming
 /// it may have mutated, red. (The row above goes red too.)
 /// Integration (~3.5 s): as the row above, then half a second of puts.
 #[config_log::retcd_test]
-fn m10_s2_a_fenced_owner_never_admits_a_put_after_it_reads_the_owner() {
+fn m10_s2_a_fenced_owner_refuses_every_put_with_no_mutation_after_it_reads_the_owner() {
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, _) = cut_owner_promoted_away(dir.path());
     let before = trio.status(0);
@@ -5863,7 +5865,8 @@ fn m10_s2_a_fenced_owner_never_admits_a_put_after_it_reads_the_owner() {
 ///
 /// The positive control first: node 1's own refusal is rewritten, so the setup is live.
 /// Cuts, one at a time: drop `!expired`; drop `&& error.no_mutation`; drop the fenced check;
-/// drop the owner check. Each turns its case into `NOT_PRIMARY`, red.
+/// drop the owner check. Each turns its case into `NOT_PRIMARY`, red. And the read path
+/// (critic-d3 A4): the `Read` arm never matches: the rejected read stays `LEASE_EXPIRED`, red.
 /// Integration (~3 s): `cut_owner_promoted_away`, then direct calls.
 #[config_log::retcd_test]
 fn m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing() {
@@ -5889,7 +5892,14 @@ fn m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing() {
             format!("{:?} no_mutation={}", error.kind, error.no_mutation)
         }
         Answer::Unchanged => "Unchanged".to_owned(),
+        Answer::Read { outcome, .. } => format!("Read {outcome:?}"),
         other => format!("{other:?}"),
+    };
+    let read = |outcome: ReadServiceOutcome| Answer::Read {
+        outcome,
+        seen: Seen::Absent,
+        generation: Generation(1),
+        at: Seq(0),
     };
     let p1 = PartitionId(1);
 
@@ -5921,6 +5931,22 @@ fn m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing() {
         "no_mutation: may have mutated"
     );
 
+    // The read path (critic-d3 A4): P1's `LEASE_EXPIRED` rejection is rewritten, as a put's is;
+    // a served read is an answer, never a refusal, and is left alone.
+    let rewritten = trio.nodes[0].0.redirect(
+        p1,
+        read(ReadServiceOutcome::Rejected(ErrorKind::LeaseExpired)),
+    );
+    assert_eq!(
+        shape(&rewritten),
+        "NotPrimary no_mutation=true",
+        "read: rejected"
+    );
+    let kept = trio.nodes[0]
+        .0
+        .redirect(p1, read(ReadServiceOutcome::Served));
+    assert_eq!(shape(&kept), "Read Served", "read: served");
+
     // The fenced check: node 2 holds its grant, so a learned owner changes nothing there.
     assert!(trio.status(1).fence.is_none(), "node 2 is not fenced");
     trio.nodes[1]
@@ -5948,5 +5974,50 @@ fn m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing() {
         shape(&kept),
         "LeaseExpired no_mutation=true",
         "owner check: itself"
+    );
+}
+
+/// critic-d3 A3: a learned owner belongs to one fence. An answer to a read begun under an
+/// earlier fence is dropped, and once A1 holds a grant again (a view while not fenced) the
+/// learned owners are forgotten, so a later fence of either scope never reuses them.
+/// Cuts: the handler takes any `fence`: the stale answer replaces node 2's owner, red;
+/// `report_view` keeps the map: node 2's entry survives its view, red.
+/// Integration (~3 s): `cut_owner_promoted_away`, then direct calls.
+#[config_log::retcd_test]
+fn m10_s2_a_learned_owner_is_forgotten_once_a1_leaves_the_fence_it_was_learned_under() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = cut_owner_promoted_away(dir.path());
+    let p1 = PartitionId(1);
+    let host = &mut trio.nodes[0].0;
+    let current = host.owner_fence;
+    assert!(current >= 1, "node 1 counted its fence");
+    let stale = Msg::OwnerLearned {
+        boot: host.boot,
+        partition: p1,
+        fence: current - 1,
+        owner: Some(NodeId(3)),
+    };
+    host.handle(stale);
+    assert_eq!(
+        host.owner_after_fence.get(&p1),
+        Some(&Some(NodeId(2))),
+        "a read from an earlier fence changes nothing"
+    );
+
+    // Node 2 is not fenced: a view it reports forgets what a fence once taught it. Node 2
+    // serves no partition, so it is handed the view node 1 reported before its fence; only
+    // node 2's own A1 state decides.
+    let view = *host
+        .authority_views
+        .get(&p1)
+        .expect("node 1 reported a view before its fence");
+    assert!(trio.status(1).fence.is_none(), "node 2 is not fenced");
+    let host = &mut trio.nodes[1].0;
+    host.owner_after_fence.insert(p1, Some(NodeId(3)));
+    host.report_view(&view);
+    assert!(
+        host.owner_after_fence.is_empty(),
+        "held again: {:?}",
+        host.owner_after_fence
     );
 }

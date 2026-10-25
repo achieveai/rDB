@@ -231,11 +231,18 @@ impl ControlAdapter {
 
     /// A-R399 (tester-final D3): after a node fence, read who `partitions/{partition}` names as
     /// owner, for the host's refusals only. Retries at [`retry_backoff`] of the attempt while
-    /// the store does not answer (the node may still be cut from rEtcd), and stops at the first
+    /// the store does not answer (a [`transient`] error: the node may still be cut from rEtcd);
+    /// any other error is logged once as a warning and answers `None`. Stops at the first
     /// answer: [`Msg::OwnerLearned`] with the owner, or `None` when the record is absent or does
     /// not decode. It never posts a control event, so A1 never hears it. Tracked with the
     /// node's calls, so a restart abandons it.
-    pub fn read_owner_after_fence(&self, node: NodeId, boot: BootId, partition: PartitionId) {
+    pub fn read_owner_after_fence(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        fence: u64,
+    ) {
         let store = Arc::clone(&self.store);
         let links = Arc::clone(&self.links);
         let task = self.rt.spawn(
@@ -257,6 +264,18 @@ impl ControlAdapter {
                                 .map(|record| record.owner)
                             });
                         }
+                        // critic-d3 A1: an error retrying cannot cure is said once, and the
+                        // host keeps refusing `LEASE_EXPIRED`.
+                        Err(error) if !transient(&error) => {
+                            tracing::warn!(
+                                node = node.0,
+                                partition = partition.0,
+                                attempt,
+                                %error,
+                                "host_owner_read_failed"
+                            );
+                            break None;
+                        }
                         Err(error) => {
                             attempt = attempt.saturating_add(1);
                             tracing::debug!(
@@ -273,6 +292,7 @@ impl ControlAdapter {
                 let msg = Msg::OwnerLearned {
                     boot,
                     partition,
+                    fence,
                     owner,
                 };
                 if links.post(node, msg).is_err() {
