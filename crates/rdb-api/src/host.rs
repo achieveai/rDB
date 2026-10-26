@@ -2091,6 +2091,9 @@ struct Host {
     /// M11 T4: per partition, the shadow a move pinned and since when this owner has had no
     /// link to it ([`Self::shadow_give_up_duty`]).
     shadow_unreachable: BTreeMap<PartitionId, (NodeId, Tick)>,
+    /// M11 T10: per partition, the promote re-plan (its generation and `since`) whose move
+    /// target this owner told F1 was lost ([`Self::move_target_lost_duty`]); told once a plan.
+    target_lost_told: BTreeMap<PartitionId, (Generation, Tick)>,
     /// M11 T7: partitions whose revocation was asked while A1 held no grant. A1 records such a
     /// revocation but answers no `DrainProof` (it has no view to supersede), so
     /// [`Self::retry_blocked_rejoin`] asks it again as soon as A1 holds one, instead of after
@@ -2252,6 +2255,7 @@ impl Host {
             boot_seen_while_planned: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             shadow_unreachable: BTreeMap::new(),
+            target_lost_told: BTreeMap::new(),
             revoke_unheld: BTreeSet::new(),
             blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
@@ -5607,6 +5611,7 @@ impl Host {
             self.repair_duty(partition, now);
             self.shadow_duty(partition);
             self.shadow_give_up_duty(partition, now);
+            self.move_target_lost_duty(partition);
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
@@ -6380,6 +6385,68 @@ impl Host {
         }
         self.blamed.remove(&partition);
         self.revoke(partition, epoch, Some(node), None);
+    }
+
+    /// M11 T10 (ruling A-R454): a move's promote whose target this owner has no link to while
+    /// F1 waits on it before commit (`Synchronizing` or `Barrier`). F1 is told the target's
+    /// copy is lost (`CopyLost`, to F1 alone), so it blocks on it at once rather than retrying
+    /// the barrier for 2+4+8 discovery windows, and [`Self::move_blocked`] gives the move up
+    /// with the source kept. Told once per plan; logged `move_target_lost`.
+    fn move_target_lost_duty(&mut self, partition: PartitionId) {
+        let Some(Rejoin::Planned { generation, replan }) = self.rejoins.get(&partition).copied()
+        else {
+            self.target_lost_told.remove(&partition);
+            return;
+        };
+        let plan = (generation, replan.since);
+        if !replan.promote || self.target_lost_told.get(&partition) == Some(&plan) {
+            return;
+        }
+        let Some(to) = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.abandoned.is_none() && replan.rejoiner == Some(mv.to))
+            .map(|mv| mv.to)
+        else {
+            return;
+        };
+        let waiting = matches!(
+            self.recoveries.get(&partition).map(Recovery::phase),
+            Some(RecoveryPhase::Synchronizing | RecoveryPhase::Barrier)
+        );
+        if !waiting || self.linked(to) {
+            return;
+        }
+        let pinned = self.committed.get(&partition).and_then(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.node == to)
+                .map(|member| member.copy)
+        });
+        let Some(copy) = pinned.or(move_copy_id(to)) else {
+            return;
+        };
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            to = to.0,
+            copy = copy.0,
+            waited_ms = HostClock::millis_until(replan.since, self.clock.now()),
+            "move_target_lost"
+        );
+        self.target_lost_told.insert(partition, plan);
+        self.push(
+            Site {
+                partition,
+                correlation: REJOIN,
+            },
+            EventKind::Kernel(KernelEvent::CopyLost { copy }),
+            false,
+            Some(ModuleName::Recovery),
+        );
     }
 
     /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a

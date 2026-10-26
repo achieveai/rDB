@@ -3638,6 +3638,70 @@ fn m11_t11_a_restart_re_add_pins_only_the_free_slots() {
     }
 }
 
+/// M11 defect T10 (tester walk, ruling A-R454): the target of a move died while the promote's
+/// barrier waited on it, and F1 retried the barrier for 2+4+8 s of discovery windows before the
+/// move was given up: 14 s of refused writes. Now the owner tells F1 at once that a move target
+/// it has no link to is lost, the barrier blocks on it, and the move is given up with node 3
+/// kept. The commit without node 4 lands within the drop clock and one discovery window of the
+/// loss, as a lost ordinary member's would, and a put lands.
+/// Cut: no `move_target_lost_duty` in `drop_duty`, red (the barrier's retries outlast the bound).
+/// Integration (~4 s): bootstrap's window, the join, the promote, the give-up re-plan.
+#[config_log::retcd_test]
+fn m11_t10_a_move_target_lost_in_the_promote_barrier_is_given_up_at_once() {
+    const METHOD: &str = "m11_t10_a_move_target_lost_in_the_promote_barrier_is_given_up_at_once";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 starts the promote of node 4", |trio| {
+        assert_ne!(
+            pinned_role(trio, 4),
+            Some(ReplicaRole::RegularSecondary),
+            "the promote committed before the row could cut node 4"
+        );
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.promote && replan.rejoiner == Some(NodeId(4))
+        )
+        .then_some(())
+    });
+    for other in [1, 2, 3] {
+        trio.links.hold(NodeId(other), NodeId(4));
+    }
+    let lost = trio.clock.now();
+    let (_, _, members) = trio.until("node 1 left node 4 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&4))
+    });
+    let took = trio.clock.now().0 - lost.0;
+    tracing::info!(took_ms = took, "m11_t10_left_out");
+    assert_eq!(members, vec![1, 2, 3], "node 3 keeps its copy");
+    assert_eq!(pinned_role(&trio, 3), Some(ReplicaRole::RegularSecondary));
+    let window = trio.nodes[0].0.budgets.discovery_window_millis;
+    assert!(
+        took < DROP_AFTER_MILLIS + window,
+        "node 4 was left out {took} ms after it was lost, past the drop clock and a window"
+    );
+    assert!(
+        logged!(METHOD, "barrier_retry").is_empty(),
+        "the barrier was retried for a target with no link"
+    );
+    trio.ready();
+    match trio.ask(put(20)) {
+        Answer::Txn { .. } => {}
+        other => panic!("a put after the move was given up: {other:?}"),
+    }
+    match trio.ask(move_call(21, 3, 4)) {
+        Answer::Error { error, .. } => assert!(
+            error.detail.contains("given up") && error.detail.contains("node 3 keeps its copy"),
+            "{error:?}"
+        ),
+        other => panic!("move 3 4 after the give-up: {other:?}"),
+    }
+}
+
 /// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
 /// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
 /// left-out member, and the partition pinned the moved-off copy again on its own. The move's
