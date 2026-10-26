@@ -2283,7 +2283,7 @@ async fn freeze(
     }
 }
 
-mod rebuild;
+pub(crate) mod rebuild;
 
 #[cfg(test)]
 mod tests {
