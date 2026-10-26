@@ -2529,6 +2529,107 @@ fn m11_t6_a_reopen_pins_the_members_the_record_names_not_nodes_1_to_3() {
     );
 }
 
+/// The role `partitions/1` pins `node` as, if it pins it.
+fn pinned_role(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    node: u32,
+) -> Option<rdb_core::contracts::ids::ReplicaRole> {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record?;
+    rdb_core::authority::partition::RecordMember::decode_all(&read.value)?
+        .into_iter()
+        .find(|member| member.node.0 == node)
+        .map(|member| member.role)
+}
+
+/// M11 defect T7 (tester walk, scenario 6): after `admin promote` with a move's shadow pinned,
+/// writes stayed refused about 10 s more. The new owner promoted the shadow as soon as it had
+/// recovered, before its A1 held a grant; A1 records a revocation persisted then but answers no
+/// `DrainProof`, so the promote's re-plan waited for the revocation's retry. Here node 4's
+/// frames to node 1 are lost, so `move 3 4` pins it as a shadow that never catches up there.
+/// Node 1 stops and node 2 is promoted: node 2 promotes the shadow, and the record pins node 4
+/// regular well inside the retry's 10 s.
+/// Integration (~8 s): a fresh open, the move's re-plan, the promote's grant wait, the shadow's.
+#[config_log::retcd_test]
+fn m11_t7_a_shadow_left_by_a_promote_is_promoted_without_the_revoke_retry() {
+    use rdb_core::contracts::ids::ReplicaRole;
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let links = Arc::new(Links::default());
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the open of nodes 1 to 3");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let mut spare = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(4)],
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 4's process");
+    put_through_pauses(&db, b"before", b"1", "a put before the move");
+
+    // Node 1 never hears node 4, so node 4 stays a shadow node 1 cannot promote.
+    links.drop_direction(NodeId(4), NodeId(1));
+    let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4");
+    assert!(!answer.done, "{answer:?}");
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + patience;
+    while pinned_role(&rt, &store, 4) != Some(ReplicaRole::Shadow) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 4 not pinned as a shadow within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    lock(&db.nodes)
+        .iter_mut()
+        .find(|handle| handle.node == OWNER)
+        .expect("node 1 runs here")
+        .stop();
+    let promoted = db.promote(NodeId(2), None).expect("promote 2");
+    assert_eq!(promoted.dropped, OWNER, "{promoted:?}");
+    let at = std::time::Instant::now();
+    // Under the revoke retry's 10 s even at the gate's deadline scale of 3.
+    let bound = crate::host::test_patience(Duration::from_millis(2_500));
+    while pinned_role(&rt, &store, 4) != Some(ReplicaRole::RegularSecondary) {
+        assert!(
+            at.elapsed() < bound,
+            "node 4 still not regular {bound:?} after the promote: {:?}",
+            pinned_role(&rt, &store, 4)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    tracing::info!(
+        waited_ms = at.elapsed().as_millis(),
+        "m11_t7_shadow_regular_after_promote"
+    );
+    put_through_pauses(&db, b"after", b"2", "a put after the promote");
+    db.shutdown();
+    spare.shutdown();
+}
+
 /// A-R328: an empty copy already bound to another database's instance does not join this one.
 /// The open is refused `Mismatch` and the copy keeps its own binding. Integration (~1 s): one
 /// fresh open until ready, one refused node-process open.

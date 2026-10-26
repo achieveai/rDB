@@ -2091,6 +2091,11 @@ struct Host {
     /// M11 T4: per partition, the shadow a move pinned and since when this owner has had no
     /// link to it ([`Self::shadow_give_up_duty`]).
     shadow_unreachable: BTreeMap<PartitionId, (NodeId, Tick)>,
+    /// M11 T7: partitions whose revocation was asked while A1 held no grant. A1 records such a
+    /// revocation but answers no `DrainProof` (it has no view to supersede), so
+    /// [`Self::retry_blocked_rejoin`] asks it again as soon as A1 holds one, instead of after
+    /// `peer_drop_after_millis`.
+    revoke_unheld: BTreeSet<PartitionId>,
     /// Per partition, the planned re-plan F1 was first seen `Blocked` on by a drop check, and
     /// when: (generation, the plan's `since`, seen at). `blocked_ms` of `rejoin_replan_on_boot`,
     /// which is `None` when no drop check saw the block before the re-plan.
@@ -2247,6 +2252,7 @@ impl Host {
             boot_seen_while_planned: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             shadow_unreachable: BTreeMap::new(),
+            revoke_unheld: BTreeSet::new(),
             blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
@@ -5335,6 +5341,17 @@ impl Host {
     fn start_revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, replan: Replan) {
         self.rejoins
             .insert(partition, Rejoin::Revoking { epoch, replan });
+        if self.authority.state().is_held() {
+            self.revoke_unheld.remove(&partition);
+        } else {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                epoch = epoch.0,
+                "revoke_asked_unheld"
+            );
+            self.revoke_unheld.insert(partition);
+        }
         let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
         self.push(
             Site {
@@ -6724,6 +6741,19 @@ impl Host {
             Some(Rejoin::Planned { generation, replan }) => (generation, replan),
             Some(Rejoin::Revoking { epoch, replan }) => {
                 let waited_ms = HostClock::millis_until(replan.since, now);
+                // T7: asked before A1 held a grant, so no proof is coming; ask again now that
+                // it holds one. `since` stays, so the pause counts from the first ask.
+                if self.authority.state().is_held() && self.revoke_unheld.contains(&partition) {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        epoch = epoch.0,
+                        waited_ms,
+                        "rejoin_revoke_reasked_held"
+                    );
+                    self.start_revoke(partition, epoch, replan);
+                    return;
+                }
                 if waited_ms >= self.peer_drop_after_millis {
                     tracing::warn!(
                         node = self.node.0,
