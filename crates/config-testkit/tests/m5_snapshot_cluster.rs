@@ -870,9 +870,20 @@ fn log_count(method: &str, needles: &[&str]) -> usize {
 
 /// A formed 3-node Rocks cluster whose node 1 holds its `nth` export, seeded with a few keys.
 /// Node 1 is the node the #30 rows build on; it need not lead.
+///
+/// The write budget is scaled. A trigger gives OpenRaft's core half its `write_timeout` to hear
+/// the held build finish, and spends the rest on its two tries. That half must cover the row
+/// seeing the trigger's log line, releasing the build, and the core hearing it. With the
+/// testkit's unscaled 2 s it is 1 s, and under 6 parallel copies of this binary the trigger
+/// answered that no build started (b30_a 30 of 150 runs, b30_c 5 of 150, 2026-10-26). One poll
+/// of this row's log alone took up to 4.6 s there, because it flushes the process's log writer.
 async fn held_cluster(nth: u64) -> (Arc<Cluster>, Arc<HoldAfterExport>) {
     let hold = HoldAfterExport::new(nth);
-    let mut builder = Cluster::builder().nodes(3).storage(StorageKind::ROCKS);
+    let write_budget = TestTimers::DEFAULT.multiple(4);
+    let mut builder = Cluster::builder()
+        .nodes(3)
+        .storage(StorageKind::ROCKS)
+        .timeouts(write_budget, write_budget);
     for i in 1..=3u64 {
         let faults: Arc<dyn config_storage::FaultInjector> = if i == 1 {
             hold.clone()
