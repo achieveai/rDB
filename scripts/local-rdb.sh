@@ -51,10 +51,10 @@
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
 # config-server. Every `up` builds them first (cargo skips what is fresh); `LR_BUILD=0` skips the
-# build and uses them as they are. `promote` builds rdb_dev only when it is missing, or with
-# `LR_BUILD=1`. `up --release` uses and builds them under .../release instead, cargo's own
-# folder, so a debug and a release binary are never mixed up. The run records its binaries in
-# run.env, so `start`, `restart` and every other verb use the profile the run was started
+# build and uses them as they are. `promote` builds rdb_dev first too, so it never runs a stale
+# one against newer nodes (bug bash #64); `LR_BUILD=0` skips that build too. `up --release` uses
+# and builds them under .../release instead, cargo's own folder, so a debug and a release binary
+# are never mixed up. The run records its binaries in run.env, so `start`, `restart` and every other verb use the profile the run was started
 # with; `--release` is refused on any verb but `up`.
 
 set -euo pipefail
@@ -521,6 +521,15 @@ clean() {
     say "removed $RUN"
 }
 
+last_line() { # n state: a running node's last stdout line; a stopped one's is from its last run
+    local line
+    line="$(tail -n1 "$RUN/out/node-$1.out" 2>/dev/null || true)"
+    case "$2" in
+        running*) printf '%s' "${line:--}" ;;
+        *) printf '%s' "${line:+(last run: $line)}" ;;
+    esac
+}
+
 status() {
     local n os state
     echo "run      $RUN"
@@ -529,7 +538,7 @@ status() {
         os="$(pid_of "node-$n")"
         if os_pid_is "$os" rdb_node; then state="running pid $os"; else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
-            "$(tail -n1 "$RUN/out/node-$n.out" 2>/dev/null || echo '-')" \
+            "$(last_line "$n" "$state")" \
             "$(tr '\n' ';' 2>/dev/null < "$RUN/faults/node-$n.txt" || echo none)"
     done
     "$REPO/scripts/local-cluster.sh" status --dir "$RUN/ctl" 2>/dev/null || true
@@ -544,7 +553,7 @@ promote() {
     local dev line release=""
     [ "$PROFILE" = release ] && release=--release
     dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
-    if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$dev" ]; then
+    if [ "${LR_BUILD:-1}" != 0 ] || [ ! -f "$dev" ]; then
         say "building rdb_dev into $TARGET/$PROFILE"
         # shellcheck disable=SC2086
         (cd "$REPO" && cargo build $release -p rdb-api --example rdb_dev) >&2
