@@ -436,7 +436,7 @@ impl WalSync {
         // file's entry survives a power cut. On Linux that is a real step; RocksDB's Windows
         // env makes it a no-op (`WinDirectory::Fsync` returns OK), and Windows cannot open a
         // directory as a `File`. So sync it wherever the OS can (A-R373).
-        // Never executed on this host; the first Linux gate owes a row.
+        // Never executed on this host; the first Linux gate owes a row (achieveai/rDB#71).
         if cfg!(unix) {
             std::fs::File::open(&self.dir)
                 .and_then(|dir| dir.sync_all())

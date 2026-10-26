@@ -649,8 +649,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   node it promotes checks the fence it is sent against those records and refuses one that is
   not true. The plan sent with the fence, which names the members, is not checked. So while a
   promote is stalled with partition 1 fencing, any app holding the link cert can finish it with
-  members of its choosing. That is a known gap. **The dropped node is added back automatically when it starts
-  again, or at the next reopen heal; membership is fixed at three nodes.**
+  members of its choosing. That is a known gap (issue #70). **The dropped node is added back
+  automatically when it starts again, or at the next reopen heal; membership is fixed at three
+  nodes.**
   - **After every node restarts, a promote can be refused.** If the owner's copy is lost too,
     `promote` answers `Unconfigured` ("node N holds no configuration since its restart"). The
     member list is kept in memory only. To recover, bring back the owner's node or restore its
