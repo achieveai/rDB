@@ -8476,10 +8476,12 @@ mod tests {
     /// `NotASource` from the retired receiver, F1 waited its 14 s out and dropped node 1 again,
     /// writes refused all that while. Now node 2 restores a dormant receiver to source it: no
     /// catch-up is refused, no re-plan is abandoned, and node 1 is promoted back. Node 1
-    /// restarts with its link to node 2 held until puts land, so the promote needs that
-    /// catch-up and the row never passes without one (#43: unforced, under load, 20 restarts
-    /// gave none). Cut: the source restore keeps a retired receiver (before the fix):
-    /// `catch_up_refused`, red. Cut: no hold: no catch-up, red.
+    /// restarts with its link to node 2 held until puts land, so it is behind at the heal (#43:
+    /// unforced, under load, 20 restarts gave no catch-up). After the heal it catches up by the
+    /// routed catch-up from node 2, or first through node 2's shadow cursor; the row asserts the
+    /// outcome, not the route (lead ruling, PR #73; the cursor route failed it 1 in 11): node 1
+    /// is promoted back, holds node 2's head, and writes go on. Cut: the source restore keeps a
+    /// retired receiver (before the fix): `catch_up_refused`, red.
     /// Integration (~10-60 s): the promote waits node 1's grant out, then each re-add and promote.
     #[config_log::retcd_test]
     fn m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on() {
@@ -8517,7 +8519,7 @@ mod tests {
         }
         let stop = std::sync::atomic::AtomicBool::new(false);
         let landed = std::sync::atomic::AtomicU64::new(0);
-        let cycle = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             let _stop = StopOnDrop(&stop);
             scope.spawn(|| {
                 let mut sent = 0;
@@ -8542,7 +8544,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             db.links().heal(OWNER, NodeId(2));
-            let cycle = loop {
+            loop {
                 let lines = lines();
                 let cycle = lines[before..].to_vec();
                 let settled = cycle
@@ -8557,27 +8559,51 @@ mod tests {
                         })
                     });
                 if settled {
-                    break cycle;
+                    break;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
                     "node 2 did not promote node 1 back within {patience:?}"
                 );
                 std::thread::sleep(Duration::from_millis(50));
-            };
-            cycle
+            }
+            // Writes go on after the re-add: more puts land once node 1 is promoted back.
+            let promoted_at = landed.load(std::sync::atomic::Ordering::Relaxed);
+            while landed.load(std::sync::atomic::Ordering::Relaxed) < promoted_at + 3 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writes stopped after node 1 was promoted back, within {patience:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         });
-        let routed = cycle
-            .iter()
-            .filter(|line| line["@m"] == "catch_up_routed" && line["node"] == 2)
-            .count();
-        let lines = lines();
-        let refused: Vec<_> = lines
-            .iter()
+        // Node 1 caught up, by either route: it holds node 2's generation through node 2's
+        // head. Read after the writer stopped, so the head stands still.
+        let holds = |node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .and_then(|status| status.holds)
+        };
+        let head = holds(NodeId(2)).expect("node 2 holds");
+        loop {
+            let held = holds(OWNER);
+            if held.is_some_and(|held| {
+                held.generation >= head.generation && held.durable >= head.applied
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 holds {held:?}, not node 2's {head:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let refused: Vec<_> = lines()
+            .into_iter()
             .filter(|line| line["@m"] == "catch_up_refused" || line["@m"] == "rejoin_abandoned")
             .collect();
         assert!(refused.is_empty(), "{refused:?}");
-        assert_eq!(routed, 1, "no restart needed a catch-up from node 2");
         db.shutdown();
     }
 
