@@ -71,6 +71,8 @@ pub(crate) struct Rebuilt {
     pub(crate) boot: BootId,
     /// Where N's old folder went, when it was wiped.
     pub(crate) aside: Option<std::path::PathBuf>,
+    /// Why writes were not admitted again within the rebuild's wait, or `None` once they were.
+    pub(crate) writes_wait: Option<String>,
 }
 
 impl Rebuilt {
@@ -79,13 +81,17 @@ impl Rebuilt {
         let kept: Vec<String> = self.kept.iter().map(|node| node.0.to_string()).collect();
         format!(
             "rebuilt: node {} (mode {}) is pinned regular again at boot {}; generation {} left \
-             it out and kept node{} {}; {}",
+             it out and kept node{} {}; {}; {}",
             self.node.0,
             self.mode.letter(),
             self.boot.0,
             self.generation.0,
             if kept.len() == 1 { "" } else { "s" },
             kept.join(" and "),
+            self.writes_wait.as_ref().map_or_else(
+                || "writes are admitted again".to_owned(),
+                |why| format!("writes are not admitted yet ({why}); `wait ready` waits")
+            ),
             self.aside.as_ref().map_or_else(
                 || "its folder was kept, not wiped".to_owned(),
                 |to| format!("its old folder was moved aside to {}", to.display())

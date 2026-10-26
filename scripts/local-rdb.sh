@@ -557,7 +557,7 @@ rebuild() {
             start_node "$n" stopped; await_ready "$n" || not_ready "$n"
             die "rebuild $n refused; its folder is left in place and it runs on it again"
         fi
-        aside="$RUN/db/aside/node-$n-$(date +%Y%m%d-%H%M%S)"
+        aside="$RUN/db/aside/node-$n-$(date -u +%Y%m%dT%H%M%SZ)"
         if ! { mkdir -p "$RUN/db/aside" && mv "$RUN/db/nodes/$n" "$aside"; }; then
             start_node "$n" stopped; await_ready "$n" || not_ready "$n"
             die "node $n's folder could not be moved aside to $aside; the folder is left in place and it runs on it again"

@@ -3095,17 +3095,15 @@ impl Db {
                 drop_boot = aside.boot.0,
                 "node_wipe_refused_boot"
             );
-            return Err(ApiError {
-                kind: ErrorKind::Unavailable,
-                retry: RetryRule::NotWired,
-                no_mutation: true,
-                detail: format!(
+            return Err(rebuild_error(
+                RetryRule::NotWired,
+                true,
+                format!(
                     "node {} not wiped: it runs boot {}, not boot {} the drop named; it restarted \
                      since, and may be counted again. Nothing was stopped or moved",
                     node.0, old_boot.0, aside.boot.0
                 ),
-                retry_after: None,
-            });
+            ));
         }
         let boot = match &respawn.boots {
             // A node process's boots come from its folder, so they stay fresh across processes
@@ -3169,10 +3167,16 @@ impl Db {
                 }
                 match unmoved {
                     None => Ok(boot),
-                    Some(detail) => Err(ApiError::host(&format!(
-                        "node {} restarted at boot {} on its own folder, not wiped: {detail}",
-                        node.0, boot.0
-                    ))),
+                    // A fence refusal, not a host fault (bb walk paper cut): the detail names
+                    // why, and the node runs on its own folder again.
+                    Some(detail) => Err(rebuild_error(
+                        RetryRule::NotWired,
+                        false,
+                        format!(
+                            "node {} restarted at boot {} on its own folder, not wiped: {detail}",
+                            node.0, boot.0
+                        ),
+                    )),
                 }
             }
             Err(detail) => {
@@ -3356,8 +3360,9 @@ impl Db {
                 "process",
                 format!(
                     "node {} is still pinned; under --nodes the owner cannot be asked to drop it: \
-                     stop it (`lr stop {}`), wait for the owner to drop it (about 10 s out), then \
-                     rebuild it; nothing was done",
+                     stop it (`lr stop {}`), then send one write: the owner drops a stopped copy \
+                     about 10 s after a write finds it gone, and with no writes it stays pinned; \
+                     then rebuild it; nothing was done",
                     node.0, node.0
                 ),
             );
@@ -3417,17 +3422,15 @@ impl Db {
             Ok(Ok(ready)) => ready,
             Ok(Err(refusal)) => return Err(refused(refusal)),
             Err(_) => {
-                return Err(ApiError {
-                    kind: ErrorKind::Unavailable,
-                    retry: RetryRule::NotWired,
-                    no_mutation: false,
-                    detail: format!(
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
                         "node {} (the owner) did not answer the rebuild of node {} in time; it \
                          may still drop it. Node {} was not wiped: restart it to re-add it",
                         owner.0, node.0, node.0
                     ),
-                    retry_after: None,
-                })
+                ))
             }
         };
         let wipe = wipe || ready.mode == admin::rebuild::RebuildMode::Quarantined;
@@ -3439,28 +3442,40 @@ impl Db {
                 to: aside_path(&respawn.nodes_dir, node, boot),
             }),
             (true, None) => {
-                return Err(ApiError::host(&format!(
-                    "node {} has no boot here, so its wipe cannot be fenced; it was left out at \
-                     generation {} and not wiped: restart node {} to re-add it",
-                    node.0, ready.generation.0, node.0
-                )))
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "node {} has no boot here, so its wipe cannot be fenced; it was left out \
+                         at generation {} and not wiped: restart node {} to re-add it",
+                        node.0, ready.generation.0, node.0
+                    ),
+                ))
             }
         };
         let moved = aside.as_ref().map(|aside| aside.to.clone());
         // A1 (critic-65): once the folder has moved, every later error says where it is.
         let named = |mut error: ApiError| {
             if let Some(to) = moved.as_ref().filter(|to| to.exists()) {
+                // Before the tail that ends a rebuild error, so it still ends the detail.
+                let tail = format!("; {}", error::REBUILD_STEP);
+                let head = error.detail.strip_suffix(&tail).map(str::to_owned);
                 error.detail = format!(
-                    "{}; node {}'s old folder is kept at {}",
-                    error.detail,
+                    "{}; node {}'s old folder is kept at {}{}",
+                    head.as_deref().unwrap_or(&error.detail),
                     node.0,
-                    to.display()
+                    to.display(),
+                    if head.is_some() { tail.as_str() } else { "" }
                 );
             }
             error
         };
         let boot = self.restart_node_with(node, aside).map_err(named)?;
         self.await_regular(node, within).map_err(named)?;
+        // Pinned regular is not yet admitting: the owner's L1 resumes writes a moment later
+        // (bb walk: ~50 ms). Wait for that, so the next write is not refused right after
+        // "rebuilt"; when it does not come, the line says why instead.
+        let writes_wait = self.wait_ready(within).err().map(|error| error.to_string());
         let rebuilt = admin::rebuild::Rebuilt {
             node,
             mode: ready.mode,
@@ -3468,6 +3483,7 @@ impl Db {
             kept: ready.kept,
             boot,
             aside: moved,
+            writes_wait,
         };
         tracing::info!(
             node = node.0,
@@ -3499,18 +3515,16 @@ impl Db {
                     within_ms = within.as_millis(),
                     "db_rebuild_not_regular"
                 );
-                return Err(ApiError {
-                    kind: ErrorKind::Unavailable,
-                    retry: RetryRule::NotWired,
-                    no_mutation: false,
-                    detail: format!(
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
                         "node {} restarted but is not pinned regular again within {} s; it may \
                          still be catching up as a shadow: `nodes` shows when it is back",
                         node.0,
                         within.as_secs()
                     ),
-                    retry_after: None,
-                });
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -3964,19 +3978,34 @@ pub(crate) struct Aside {
 }
 
 /// A rebuild guard's refusal as the caller sees it: `INVALID_ARGUMENT` for a node that holds no
-/// copy or owns the partition (G1, G2), else `UNAVAILABLE`; nothing was done either way.
+/// copy or owns the partition (G1, G2), else `UNAVAILABLE`; nothing was done either way. A
+/// refusal on the cluster's state (a re-plan running, a copy still pinned, a quarantine) can
+/// pass once that changes, so it is `RetryAfterRecovery`; only "process" (this process cannot
+/// run it) is `NotWired`. Each ends with [`error::REBUILD_STEP`], since its detail names the
+/// step.
 fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
     tracing::warn!(guard = refused.guard, detail = %refused.detail, "db_rebuild_refused");
     if matches!(refused.guard, "G1" | "G2") {
         ApiError::invalid(refused.to_string())
     } else {
-        ApiError {
-            kind: ErrorKind::Unavailable,
-            retry: RetryRule::NotWired,
-            no_mutation: true,
-            detail: refused.to_string(),
-            retry_after: None,
-        }
+        let retry = if refused.guard == "process" {
+            RetryRule::NotWired
+        } else {
+            RetryRule::RetryAfterRecovery
+        };
+        rebuild_error(retry, true, refused.to_string())
+    }
+}
+
+/// An `UNAVAILABLE` from `admin rebuild` whose `detail` names its own step: it ends with
+/// [`error::REBUILD_STEP`], so no generic step is added after it.
+fn rebuild_error(retry: RetryRule, no_mutation: bool, detail: String) -> ApiError {
+    ApiError {
+        kind: ErrorKind::Unavailable,
+        retry,
+        no_mutation,
+        detail: format!("{detail}; {}", error::REBUILD_STEP),
+        retry_after: None,
     }
 }
 

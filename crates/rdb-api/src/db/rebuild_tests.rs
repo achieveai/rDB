@@ -124,6 +124,11 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
             )),
         "{line}"
     );
+    // Bug bash #65 paper cut: "rebuilt" used to return before writes were admitted again.
+    assert!(
+        rebuilt.writes_wait.is_none() && line.contains("writes are admitted again"),
+        "{line}"
+    );
     assert!(
         aside.join("CURRENT").exists(),
         "G7: {} holds 3's old copy",
@@ -212,6 +217,13 @@ fn b3_a_stale_wipe_is_refused_and_leaves_the_folder_in_place() {
         refused.detail.contains("pins node 3 again"),
         "{}",
         refused.detail
+    );
+    // Bug bash #65 paper cut: the refusal ends with its own step, not the generic NotWired
+    // "retrying will not help" that contradicted it.
+    assert!(
+        refused.next_step().is_none() && !refused.explain().contains("retrying will not help"),
+        "{}",
+        refused.explain()
     );
     assert!(!to.exists(), "nothing moved aside");
     assert!(folder.join("CURRENT").exists(), "3's folder is in place");
