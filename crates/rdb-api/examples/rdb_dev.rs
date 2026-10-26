@@ -4397,10 +4397,10 @@ fn set_lifecycle(
     rewrite(rt, cluster, &key, |body| {
         let mut record = PartitionRecord::decode(body)?;
         record.lifecycle = lifecycle;
-        // A rooted body (layout 3) stays rooted: `encode` alone writes layout 2 and drops the
-        // `PartitionRoot` the open wrote (review F-004).
-        let bytes = PartitionRoot::decode(body)
-            .map_or_else(|| record.encode(), |root| record.encode_with(&root));
+        // The body keeps its layout, its root and its members: `encode` alone writes layout 2
+        // and drops the `PartitionRoot` the open wrote (review F-004), and `encode_with` drops
+        // the members a layout-4 body pins (bug bash #64, A-R426 M1).
+        let bytes = record.encode_over(body, None)?;
         Some((bytes, format!("{:?}", record.lifecycle)))
     })
 }

@@ -1917,6 +1917,12 @@ struct Host {
     /// Per partition, the `Inspect` probes the last repair check sent to the members it would
     /// repair for, and when (A-R350): a repair runs only for a member that answered one.
     repair_probes: BTreeMap<PartitionId, (Tick, Vec<RepairProbe>)>,
+    /// The copies F1 named in `RebuildStalled` during the step being run, per partition.
+    stall_step: BTreeMap<PartitionId, BTreeSet<CopyId>>,
+    /// Per partition, the copies F1's latest `RebuildStalled` step named, with the watched
+    /// generation they are for: replaced at each step that names any (A-R426 M8). Unlike
+    /// [`RebuildWatch::unproven`], a copy that has since proved is no longer in it.
+    latest_stall: BTreeMap<PartitionId, (Generation, BTreeSet<CopyId>)>,
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
@@ -2061,6 +2067,8 @@ impl Host {
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
+            stall_step: BTreeMap::new(),
+            latest_stall: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
             restart_shadow: true,
@@ -2393,6 +2401,25 @@ impl Host {
                         fence,
                         current = self.owner_fence,
                         "host_owner_learned_stale"
+                    );
+                } else if owner == Some(self.node) {
+                    // #66: a promote freezes this node's grant before it names the new owner,
+                    // so the read at the fence names this node. Read again while the same fence
+                    // holds; a later fence or a regained grant drops the answer above and ends
+                    // it. Debug: it repeats for as long as the fence lasts.
+                    tracing::debug!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        fence,
+                        "host_owner_still_self"
+                    );
+                    self.owner_after_fence.insert(partition, owner);
+                    self.control.read_owner_after_fence(
+                        self.node,
+                        self.boot,
+                        partition,
+                        fence,
+                        crate::control::OWNER_REREAD_AFTER,
                     );
                 } else {
                     tracing::info!(
@@ -4407,6 +4434,7 @@ impl Host {
                             self.boot,
                             partition,
                             self.owner_fence,
+                            std::time::Duration::ZERO,
                         );
                     }
                 }
@@ -5120,8 +5148,10 @@ impl Host {
     /// a reason that passes (a late inventory), and a bound with no retry would then keep the
     /// partition read-only for good. A movement or a commit that is not `ReadOnly` starts the
     /// wait again from the first. A held repair is logged once per wait,
-    /// `membership_repair_held`. Nothing runs while F1's rebuild is pinned, which F1's own
-    /// deadline bounds.
+    /// `membership_repair_held`. While F1's rebuild is pinned nothing runs until F1's deadline
+    /// reports a stall, and then only when no copy that latest stall named answers (A-R383,
+    /// A-R426 M8): at cutoff 0 the pin is set on every commit, so a dead copy would otherwise
+    /// hold a `ReadOnly` partition for good.
     ///
     /// Answered (A-R350). Once the hold has passed, a check sends each linked member an
     /// `Inspect` and the next check reads the answers: an answer must arrive within one check.
@@ -5136,12 +5166,21 @@ impl Host {
             self.repaired.remove(&partition);
         }
         let outside = self.read_only_outside(partition);
-        if outside.is_empty()
-            || self
-                .rebuilds
-                .get(&partition)
-                .is_some_and(|watch| watch.pinned)
-        {
+        // A-R383 as ruled by critic-bb (A-R426 M8): while F1's rebuild is pinned and F1 has
+        // reported no stall for it, nothing repairs and nothing is probed
+        // ([`rebuild_holds_repair`] with no answers).
+        let pinned = self
+            .rebuilds
+            .get(&partition)
+            .filter(|watch| watch.pinned)
+            .map(|watch| watch.generation);
+        let members: Vec<Member> = self
+            .committed
+            .get(&partition)
+            .map(|committed| committed.committed.pinned_config.members.clone())
+            .unwrap_or_default();
+        let latest = self.latest_stall.get(&partition);
+        if outside.is_empty() || rebuild_holds_repair(pinned, latest, &[], &members) {
             self.repair_since.remove(&partition);
             self.repair_probes.remove(&partition);
             return;
@@ -5233,6 +5272,21 @@ impl Host {
                 "membership_repair_probed"
             );
             self.repair_probes.insert(partition, (now, probes));
+            return;
+        }
+        if rebuild_holds_repair(
+            pinned,
+            self.latest_stall.get(&partition),
+            &answered,
+            &members,
+        ) {
+            tracing::debug!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                answered = ?answered.iter().map(|node| node.0).collect::<Vec<_>>(),
+                "membership_repair_waits_on_rebuild"
+            );
             return;
         }
         self.repair_since.remove(&partition);
@@ -5393,9 +5447,15 @@ impl Host {
         if self.rejoins.contains_key(&partition) {
             return None;
         }
-        let owner = self
-            .committed
-            .get(&partition)?
+        let committed = self.committed.get(&partition)?;
+        // A-R381 (critic-w9r "Q read-only drop"): no drop clock while the commit is `ReadOnly`.
+        // Every regular copy is outside its barrier there, so a blame picks a copy close to
+        // arbitrarily, the healthy one included, and the mode refuses every write anyway. The
+        // repair ([`Self::repair_duty`]) ends it; the clock runs again from `DegradedRf2`.
+        if committed.mode == PartitionMode::ReadOnly {
+            return None;
+        }
+        let owner = committed
             .committed
             .pinned_config
             .members
@@ -5781,11 +5841,18 @@ impl Host {
         if watch.unproven.insert(copy) {
             watch.unreported = true;
         }
+        self.stall_step.entry(partition).or_default().insert(copy);
     }
 
     /// PC15: F1 names every unproven copy at one deadline, in one step, so the stall line is
     /// written after the step with all of them, once, instead of once per copy.
     fn report_unproven(&mut self) {
+        for (partition, copies) in std::mem::take(&mut self.stall_step) {
+            if let Some(watch) = self.rebuilds.get(&partition) {
+                self.latest_stall
+                    .insert(partition, (watch.generation, copies));
+            }
+        }
         let due: Vec<PartitionId> = self
             .rebuilds
             .iter()
@@ -5982,28 +6049,18 @@ impl Host {
         let cutoff = result.selected.cutoff_seq;
         let digest = result.selected.cutoff_digest;
         let node = self.node.0;
-        // A copy that holds no older generation has nothing to link: expected, so info, not
-        // warn (review-r185 ADV3). Every other reason is a copy that cannot catch up here.
+        // Every reason is a copy that cannot catch up here, so warn. A copy holding no lineage
+        // of the partition links as an empty one (#69, `land_at`), so review-r185 ADV3's
+        // info-level `anchor_generation_absent` no longer reaches this.
         let refused = |reason: &str| {
-            if reason == "anchor_generation_absent" {
-                tracing::info!(
-                    node,
-                    partition = partition.0,
-                    generation = generation.0,
-                    cutoff = cutoff.0,
-                    reason,
-                    "land_link_refused"
-                );
-            } else {
-                tracing::warn!(
-                    node,
-                    partition = partition.0,
-                    generation = generation.0,
-                    cutoff = cutoff.0,
-                    reason,
-                    "land_link_refused"
-                );
-            }
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                generation = generation.0,
+                cutoff = cutoff.0,
+                reason,
+                "land_link_refused"
+            );
             Ok(None)
         };
         let Some(copy) = result
@@ -7638,14 +7695,40 @@ impl Host {
     ) -> Result<(Generation, Seq, Digest), &'static str> {
         let to = anchor.lineage.generation;
         let base = anchor.base_seq;
-        let from = self
+        let held: Vec<Generation> = self
             .engine
             .lineages()
             .into_iter()
-            .filter(|(p, g)| *p == partition && *g < to)
+            .filter(|(p, _)| *p == partition)
             .map(|(_, g)| g)
-            .max()
-            .ok_or("anchor_generation_absent")?;
+            .collect();
+        // #69 (critic-w9 "A-R383 re-plan" option (c)): a copy missed at formation holds no
+        // lineage of the partition at all, so it holds no generation 0 to link from. It links
+        // as head 0 at the root from generation 0, as the bootstrap's own inherit does and as
+        // `inventory_reported_empty` reports it: arm 2 at base 0, arm 3 above it, where R1
+        // catches it up from seq 1. Empty is (critic-bb M9, A-R426): no lineage of the partition
+        // at any generation, which also rules out a staged copy (the engine keeps `staging` on
+        // the lineage's marks), and no publish marks stored for it. A copy holding either is
+        // refused. The instance guard is `Db::check`'s `another_database` refusal at open
+        // (A-R424, critic-bb A2): this engine is bound to the instance the node serves before
+        // the host starts, and `bind_instance` never rebinds.
+        let from = match held.iter().filter(|g| **g < to).max() {
+            Some(from) => *from,
+            None if held.is_empty() => {
+                let marks = self
+                    .engine
+                    .publish_marks(partition)
+                    .map_err(|_| "publish_marks_unreadable")?;
+                if !marks.is_empty() {
+                    return Err("publish_marks_held");
+                }
+                if let (Some(served), Some(bound)) = (self.instance, self.engine.instance()) {
+                    debug_assert_eq!(served, bound, "an empty copy of another instance");
+                }
+                Generation(0)
+            }
+            None => return Err("anchor_generation_absent"),
+        };
         let head = Seq(self.engine.buffered_applied(partition, from).0);
         if head > base {
             return Err("held_past_base");
@@ -8815,6 +8898,32 @@ fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
         .filter(|member| member.role == ReplicaRole::RegularSecondary)
         .map(|member| member.node)
         .collect()
+}
+
+/// A-R383 as critic-bb rules it (A-R426 M8): whether F1's pinned rebuild of generation `pinned`
+/// holds a `ReadOnly` commit's repair back. Not pinned: never. Pinned with no stall F1 reported
+/// for that generation (`latest`, the copies its latest `RebuildStalled` step named): always,
+/// the rebuild may still finish. Pinned and stalled: while a node in `answered` holds one of
+/// the stalled copies, since an answering copy can still prove the point. A stalled copy that
+/// does not answer (dead, half-open) holds nothing: at cutoff 0 the pin is set on every commit,
+/// so it would otherwise keep the partition `ReadOnly` for good.
+fn rebuild_holds_repair(
+    pinned: Option<Generation>,
+    latest: Option<&(Generation, BTreeSet<CopyId>)>,
+    answered: &[NodeId],
+    members: &[Member],
+) -> bool {
+    let Some(generation) = pinned else {
+        return false;
+    };
+    let Some((_, stalled)) = latest.filter(|(at, _)| *at == generation) else {
+        return true;
+    };
+    answered.iter().any(|node| {
+        members
+            .iter()
+            .any(|member| member.node == *node && stalled.contains(&member.copy))
+    })
 }
 
 /// Whether a rebuild check that found F1 unpinned stays quiet. K1 ruling, condition 6: a

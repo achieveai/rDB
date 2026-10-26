@@ -34,7 +34,9 @@ pub enum ControlKey {
     /// version, mode.
     Grant(NodeId),
     /// `partitions/{id}` — range, owner, owner epoch, generation, membership and config version,
-    /// lineage root, lifecycle state.
+    /// lineage root, lifecycle state. Layout 4 also pins the members as `(copy, node, role)`, no
+    /// boots (`authority::partition::RecordMember`, bug bash #64): a promote reads them there,
+    /// and a build that knows only layouts 2 and 3 reads such a record as undecodable.
     Partition(PartitionId),
     /// `routes/{range}` — versioned route root or manifest pointer; the atomic cutover key.
     Route(RangeId),

@@ -278,7 +278,9 @@ pub struct PutOk {
     pub seq: Seq,
     /// `Published`, or `RecoveredApplied` for an answer from retained history.
     pub outcome: Outcome,
-    /// What was true when the reply was sent.
+    /// The v1 success class (spec §5.1). For `Published`, what was true when the reply was
+    /// sent. For `RecoveredApplied`, not a live copy count: the partition's mode says how many
+    /// copies hold it (bug bash #68-A3, A-R426).
     pub durability: Durability,
     /// The request as sent, so the caller can [`Db::resend`] it.
     pub sent: Box<TxnRequest>,
@@ -1143,6 +1145,14 @@ impl Db {
                     other => refused(other),
                 })?;
                 for node in &roll.copies {
+                    // #62: a crash part way through the roll-forward, in one process.
+                    #[cfg(test)]
+                    if roll_stops_before(&config.dir, *node) {
+                        return Err(OpenError::Node(format!(
+                            "test hook: roll forward stopped before node {}",
+                            node.0
+                        )));
+                    }
                     claim
                         .engines
                         .get_mut(node)
@@ -2855,7 +2865,8 @@ impl Db {
     /// the partition already, or is `drop`. `UNAVAILABLE`, nothing changed, from a `Db` a crate
     /// test built by hand, which has no control store. `UNAVAILABLE`, nothing changed, when
     /// `to` does not answer within the read timeout, holds no configuration since its restart
-    /// (a stated limit: retrying will not help), or holds one older than `partitions/1`'s.
+    /// (retrying will not help), or holds one older than `partitions/1`'s; the last two do not
+    /// apply when `partitions/1` pins its members (layout 4, bug bash #64).
     /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
     /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
     /// it again picks up where it stopped.
@@ -2871,10 +2882,18 @@ impl Db {
                 .to_owned(),
                 retry_after: None,
             })?;
-        // The roles come from `to`'s own pinned configuration, read before anything is
-        // written (review-s2 F-004, A-R412).
-        let (members, members_version) =
-            admin::promote_members(to, self.look(to).ok(), self.timeouts.read)?;
+        // The roles come from `partitions/1` when it pins them (layout 4), else from `to`'s own
+        // pinned configuration, read before anything is written (review-s2 F-004, A-R412). A
+        // refused look is the answer only for a layout-3 record (bug bash #64, A-R431).
+        let (members, members_version, refused) =
+            match admin::promote_members(to, self.look(to).ok(), self.timeouts.read) {
+                Ok((members, version)) => (members, version, None),
+                Err(refused) => (
+                    Vec::new(),
+                    rdb_core::contracts::ids::ConfigVersion(0),
+                    Some(refused),
+                ),
+            };
         let (senders, boots): (
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
@@ -2916,7 +2935,7 @@ impl Db {
         let (done, answer) = mpsc::channel();
         rt.spawn(async move {
             // The caller may have given up; then nobody needs the answer.
-            let _ = done.send(admin::promote(ctx).await);
+            let _ = done.send(admin::promote_looked(ctx, refused).await);
         });
         let promoted = match answer.recv_timeout(within + Duration::from_secs(5)) {
             Ok(Ok(promoted)) => promoted,
@@ -3879,6 +3898,26 @@ fn send_wait(deadline: Duration) -> Duration {
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Test-only (#62): open directories whose next roll-forward stops before it links the named
+/// node's copy, as a process that crashed part way through the loop would. Used once.
+#[cfg(test)]
+static ROLL_STOP: Mutex<Vec<(PathBuf, NodeId)>> = Mutex::new(Vec::new());
+
+/// Test-only: the next roll-forward of the open of `dir` stops before node `node`'s copy.
+#[cfg(test)]
+fn stop_roll_before(dir: &Path, node: NodeId) {
+    lock(&ROLL_STOP).push((dir.to_path_buf(), node));
+}
+
+/// Whether the roll-forward of the open of `dir` stops here; a hit disarms the hook.
+#[cfg(test)]
+fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
+    let mut stops = lock(&ROLL_STOP);
+    let before = stops.len();
+    stops.retain(|(at, stop)| !(at == dir && *stop == node));
+    stops.len() != before
 }
 
 #[cfg(test)]
@@ -7554,7 +7593,8 @@ mod tests {
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
-    /// it. A put then lands on node 2 at the new generation, and the write made before reads
+    /// it; within about a second of the promote that refusal is `NOT_PRIMARY` naming node 2
+    /// (#66). A put then lands on node 2 at the new generation, and the write made before reads
     /// back there. Node 1's refusal proves it wrote nothing and its held head stays (review-s2
     /// F-012); a resend there never claims `no_mutation` and, redirected, says only that this
     /// send wrote nothing (F-014). A fault of node 2, the owner now, is named as node 2's
@@ -7562,6 +7602,8 @@ mod tests {
     /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
     /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2. Redirect's
     /// text back to "nothing was sent", or `Faulted` with no owner ("node 1 stopped"): red.
+    /// #66: the `OwnerLearned` arm stops at the first answer: node 1 still answers
+    /// `LEASE_EXPIRED` a second after the promote, red.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -7610,22 +7652,38 @@ mod tests {
                 .map(|held| (held.generation, held.applied))
         };
         let held = head(&db);
-        db.route.owner.store(OWNER.0, Ordering::Relaxed);
-        let old = db.put(b"c", b"3", None);
-        db.route.owner.store(2, Ordering::Relaxed);
-        let old = old.expect_err("node 1 took a put after the promote");
-        assert!(
-            matches!(
-                old.error.kind,
-                ErrorKind::NotPrimary | ErrorKind::LeaseExpired
-            ) && old.error.no_mutation,
-            "node 1 refused at admission, writing nothing: {old:?}"
-        );
+        // #66: node 1 was fenced by the freeze before `partitions/1` moved, so its read at the
+        // fence named itself. It reads again every 250 ms while it does, so within about a
+        // second of the promote it refuses `NOT_PRIMARY` naming node 2. Until then it may
+        // still refuse `LEASE_EXPIRED`; every refusal writes nothing.
+        let within = crate::host::test_patience(Duration::from_secs(1));
+        let promoted_at = std::time::Instant::now();
+        let old = loop {
+            db.route.owner.store(OWNER.0, Ordering::Relaxed);
+            let old = db.put(b"c", b"3", None);
+            db.route.owner.store(2, Ordering::Relaxed);
+            let old = old.expect_err("node 1 took a put after the promote");
+            assert!(
+                matches!(
+                    old.error.kind,
+                    ErrorKind::NotPrimary | ErrorKind::LeaseExpired
+                ) && old.error.no_mutation,
+                "node 1 refused at admission, writing nothing: {old:?}"
+            );
+            if old.error.kind == ErrorKind::NotPrimary {
+                break old;
+            }
+            assert!(
+                promoted_at.elapsed() < within,
+                "node 1 still answers LEASE_EXPIRED {within:?} after the promote: {old:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(old.error.detail.contains("names node 2"), "{old:?}");
 
         // review-s2 F-014: a resend to node 1 may have applied on an earlier send, so its
-        // answer never claims `no_mutation`, and its text never says nothing was sent. Node 1
-        // was fenced by the freeze before `partitions/1` moved, so it still answers
-        // `LEASE_EXPIRED` here; the redirect's own text is pinned in host/tests.rs
+        // answer never claims `no_mutation`, and its text never says nothing was sent. The
+        // redirect's own text is pinned in host/tests.rs
         // (`m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner`).
         let request = old.request.expect("a refused put keeps its request");
         db.route.owner.store(OWNER.0, Ordering::Relaxed);
@@ -11013,6 +11071,106 @@ mod tests {
         );
         ready_and_reads_back(&db, "after the cut flatten");
         db.shutdown();
+    }
+
+    /// Generation 2 committed and its process died before linking it (`AfterCommit::Fault`);
+    /// then the open that rolls it forward stopped after `k` of the 3 copies (#62). Returns
+    /// with `k` copies at generation 2 and the rest at generation 1.
+    fn rolled_forward_part_way(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+        k: u32,
+    ) {
+        wrote_a_and_quit(rt, dir, store);
+        crate::host::set_after_commit(dir, Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(rt, dir, store).expect("the reopen cut short");
+        until_stored(rt, store, 2);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir, None);
+        stop_roll_before(dir, NodeId(k + 1));
+        match open_fast(rt, dir, store) {
+            Err(OpenError::Node(text)) if text.starts_with("test hook") => {}
+            other => panic!(
+                "k={k}: the roll-forward stops part way, not {:?}",
+                other.map(|_| "Db")
+            ),
+        }
+        for n in 1..=3u32 {
+            let engine = RocksEngine::open_existing(dir.join("nodes").join(n.to_string()))
+                .expect("open a copy");
+            assert_eq!(
+                engine.lineages().contains(&(PARTITION, Generation(2))),
+                n <= k,
+                "k={k}: node {n}"
+            );
+        }
+    }
+
+    /// #62 (A-R426): a process crashed part way through an open's roll-forward, after k of the
+    /// 3 copies were linked to generation 2. The next open finishes it: a copy serves the
+    /// record's generation, so `check` takes the heal path (no second roll-forward), F1 commits
+    /// mode `Active` (the issue predicted `ReadOnly`), a=1 reads back, a put lands, and every
+    /// copy holds the generation N this open commits. For k = 1 and k = 2. Cut: `check` counts the generation held only
+    /// when every copy serves it; the mix goes to `roll_forward_copies`, which refuses it
+    /// `Stale` ("a copy holds generation 2"), red.
+    /// Integration (~4 s per k): a fresh open, a reopen cut at its commit, a roll-forward cut
+    /// part way, an open until ready.
+    #[config_log::retcd_test]
+    fn m10_bb_62_an_open_after_a_roll_forward_cut_part_way_finishes_it_and_writes() {
+        const METHOD: &str =
+            "m10_bb_62_an_open_after_a_roll_forward_cut_part_way_finishes_it_and_writes";
+        let rt = runtime();
+        for k in 1..=2u32 {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let dir = config_testkit::fs::temp_dir();
+            rolled_forward_part_way(&rt, dir.path(), &store, k);
+            let mut db = open_fast(&rt, dir.path(), &store)
+                .unwrap_or_else(|error| panic!("k={k}: the open: {error}"));
+            // A copy serves generation 2, so `check` heals instead of rolling forward again.
+            assert!(rolled_forward(METHOD).is_empty(), "k={k}");
+            ready_and_reads_back(&db, &format!("k={k}"));
+            let owner = owner_status(&db, &format!("k={k}"));
+            assert_eq!(
+                owner.recovery.as_deref(),
+                Some("Committed"),
+                "k={k}: {owner:?}"
+            );
+            let n = owner.recovered.expect("node 1 recovered a generation");
+            // The issue predicted `ReadOnly`; F1 commits this open's generation `Active`.
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+            let last = lines
+                .iter()
+                .rev()
+                .find(|line| line["@m"] == "recovered")
+                .expect("a recovered line");
+            assert_eq!(
+                (last["generation"].as_u64(), last["mode"].as_str()),
+                (Some(n.0), Some("Active")),
+                "k={k}: {last}"
+            );
+            // Every copy ends at generation N.
+            let patience = crate::host::test_patience(Duration::from_secs(10));
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                let held: Vec<_> = db
+                    .node_status()
+                    .into_iter()
+                    .map(|status| (status.node, status.holds.map(|held| held.generation)))
+                    .collect();
+                if held.len() == 3 && held.iter().all(|(_, at)| *at == Some(n)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "k={k}: not every copy at generation {} within {patience:?}: {held:?}",
+                    n.0
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            db.shutdown();
+        }
     }
 
     /// Ruling A-R184 (critic-rollfwd row 3, F2): once a host marked a generation activated, it

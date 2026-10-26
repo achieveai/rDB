@@ -287,7 +287,9 @@ pub enum ConditionOutcome {
 /// buffered application".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Durability {
-    /// Applied on the primary and buffered/applied on at least one regular secondary.
+    /// Applied on the primary and buffered/applied on at least one regular secondary: the v1
+    /// success class (spec §5.1). For `RecoveredApplied`, not a live copy count; the partition's
+    /// mode says how many copies hold it.
     BufferedOnTwo,
     /// Additionally confirmed by an fsync boundary on every required regular copy. Reported by
     /// status, never the precondition for a client reply.

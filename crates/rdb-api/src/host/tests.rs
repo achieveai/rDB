@@ -6047,6 +6047,100 @@ fn m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_
     }
 }
 
+/// #66: an owner that still reaches rEtcd is promoted away. The promote freezes `grants/1`, so
+/// node 1 fences at its next renewal and its read at the fence names node 1: the promote
+/// names node 2 only after it has waited the grant out. Node 1 refuses a put `LEASE_EXPIRED`
+/// then. Once `partitions/1` names node 2, node 1 learns it within about a second
+/// (`OWNER_REREAD_AFTER`, 250 ms) and refuses the next put `NOT_PRIMARY` naming node 2,
+/// mutating nothing.
+/// Cut: the `OwnerLearned` arm stops at the first answer (no read again while it names this
+/// node): node 1 never learns node 2, red after `Trio::PATIENCE`.
+/// Integration (~3 s): bootstrap's discovery window, a fence on a 600 ms grant, the re-reads.
+#[config_log::retcd_test]
+fn bb_66_an_owner_promoted_away_while_it_reaches_control_redirects_within_a_second() {
+    use config_core::{ConfigStore as _, GetRequest, MutationOutcome, PutRequest};
+    use rdb_core::authority::grant::GrantRecord;
+    use rdb_core::authority::partition::{PartitionRecord, PartitionRoot};
+    use rdb_core::contracts::control::ControlKey;
+
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), |host| {
+        Trio::fast(host);
+        host.budgets.grant_millis = 600;
+        host.budgets.renew_millis = 100;
+    });
+    trio.bootstrap();
+    trio.ready();
+    let read = |trio: &Trio, key: &Bytes| {
+        trio.rt
+            .block_on(trio.mem.get(GetRequest { key: key.clone() }))
+            .expect("get")
+            .record
+            .expect("the record exists")
+    };
+    let write = |trio: &Trio, key: Bytes, value: Bytes, revision| {
+        let put = trio
+            .rt
+            .block_on(trio.mem.put(PutRequest {
+                key,
+                value,
+                expected_mod_revision: Some(revision),
+                dedup: None,
+            }))
+            .expect("the promote's put");
+        assert_eq!(put.outcome, MutationOutcome::Applied);
+    };
+
+    // The promote's freeze: node 1 still reaches rEtcd, so its next renewal is refused.
+    let grants = Bytes::from(ControlKey::Grant(NodeId(1)).encode());
+    let found = read(&trio, &grants);
+    let mut grant = GrantRecord::decode(&found.value).expect("a grant record");
+    grant.frozen = true;
+    write(&trio, grants, grant.encode(), found.mod_revision);
+    trio.until("node 1 fenced and read itself as owner", |trio| {
+        let host = &trio.nodes[0].0;
+        (fence_of(host.authority.state()).is_some()
+            && host.owner_after_fence.get(&PartitionId(1)) == Some(&Some(NodeId(1))))
+        .then_some(())
+    });
+    match trio.ask(put(1, b"a", b"1", None)) {
+        Answer::Error { error, .. } => assert_eq!(
+            (error.kind, error.no_mutation),
+            (ErrorKind::LeaseExpired, true),
+            "before partitions/1 moves: {error:?}"
+        ),
+        other => panic!("a put while fenced: {other:?}"),
+    }
+
+    // The promote names node 2, as F1's commit does once the grant is waited out.
+    let partitions = Bytes::from(ControlKey::Partition(PartitionId(1)).encode());
+    let owned = read(&trio, &partitions);
+    let mut record = PartitionRecord::decode(&owned.value).expect("a partition record");
+    record.owner = NodeId(2);
+    let value = PartitionRoot::decode(&owned.value)
+        .map_or_else(|| record.encode(), |root| record.encode_with(&root));
+    write(&trio, partitions, value, owned.mod_revision);
+    let moved = Instant::now();
+    trio.until("node 1 read node 2 as owner", |trio| {
+        (trio.nodes[0].0.owner_after_fence.get(&PartitionId(1)) == Some(&Some(NodeId(2))))
+            .then_some(())
+    });
+    let took = moved.elapsed();
+    let within = test_patience(Duration::from_secs(1));
+    assert!(took <= within, "node 1 learned node 2 after {took:?}");
+    match trio.ask(put(2, b"a", b"2", None)) {
+        Answer::Error { error, .. } => {
+            assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::NotPrimary, RetryRule::RefreshRoute, true),
+                "{error:?}"
+            );
+            assert!(error.detail.contains("names node 2"), "{error:?}");
+        }
+        other => panic!("a put after the owner moved: {other:?}"),
+    }
+}
+
 /// A-R399 condition (3), as far as a row can show it: after the read, node 1 stays fenced and
 /// not admitting, and every put for half a second is refused with nothing mutated; its engine
 /// holds nothing past what it held at the fence. What it does not show (critic-d3 A5): that

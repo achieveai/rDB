@@ -1406,7 +1406,7 @@ cited it. Marker moved below after this re-read, not before it.
 
 **Re-read (2026-10-24, dev-w16, ninth event), basis moves tree `fdc5423` → tree `ee28792`.** `ee28792` is the contracts tree of the commit that adds this entry (M10 slice 2, branch `m10-s2-w5`, lead rulings A-R401 F4 and A-R402, critic-d4 Q3; ADR-rdb-0004 §5 and spec §5.4 amended the same day). `git diff --stat fdc5423 ee28792` touches one file, `errors.rs` (+7). One behaviour changes: `RdbError::proves_no_mutation` now also returns `true` for `RecoveryReadOnly`, whose retry rule stays `RetryAfterRecovery`. Its one producer, `admission::freeze_error` of `FreezeCause::RecoveryReadOnly`, answers only before apply. No type, variant or field changes, and no other error's proof changes. **Declarations that moved:** in `errors.rs`, `proves_no_mutation` moves +6 to `:419` (was `:413`), and `capability` (`:437`) and `unavailable` (`:446`) move +7; `Capability`, `RetryRule`, `ErrorKind`, `RdbError`, `kind` and `retry_rule` keep their lines. Re-read against this plan's §15 table: no row pins the `RecoveryReadOnly` proof (the read-only rows pin the mode and the refusal, not `no_mutation`), so no row changes here. The new row is `a_recovery_read_only_refusal_proves_no_mutation` in `crates/rdb-core/tests/transaction_t1.rs`. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
-<!-- drift-basis: ee287928016170be716a9ab0e17dccb52597091f -->
+<!-- drift-basis: 0778f5312f5e7051b3d09c398cf8b013d8101318 -->
 
 **Foundation asks still open after this round: none.** Rows 1 and 21 were the last two, and both
 landed at `6893442` — in foundation's *first* code round, the same round that received them.
