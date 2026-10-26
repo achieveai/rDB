@@ -257,6 +257,12 @@ impl ClientBackend for NodeBackend {
     fn record_authn_rejection(&self, reason: config_engine::AuthnRejectReason) {
         self.node.record_authn_rejection(reason);
     }
+
+    /// This node's history, so a watch cursor from another one is refused (#37).
+    fn watch_history(&self) -> Option<(config_core::ClusterId, config_core::RecoveryEpoch)> {
+        let identity = self.node.identity();
+        Some((identity.cluster_id, identity.recovery_epoch))
+    }
 }
 
 /// How long the admin-plane `Backup` RPC waits for the snapshot it triggered to be published.
