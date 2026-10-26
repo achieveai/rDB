@@ -1624,6 +1624,91 @@ mod tests {
         assert_eq!(node.lock().unwrap().triggers, 2);
     }
 
+    /// #68 finding: under back-to-back builds from other triggers, each wait of a backup ends
+    /// at the backup's deadline with an error that names the step that ran out.
+    #[tokio::test]
+    async fn backup_wait_is_bounded_and_names_the_step_that_timed_out() {
+        // Far past the 50 ms deadline: a wait that ignores the deadline fails here, not hangs.
+        const BOUND: Duration = Duration::from_secs(5);
+        let deadline = || tokio::time::Instant::now() + Duration::from_millis(50);
+        let reason = |e: config_engine::AdminError| match e {
+            config_engine::AdminError::Unavailable { reason } => reason,
+            other => panic!("expected Unavailable, got {other:?}"),
+        };
+        let started = || {
+            std::future::ready(Ok(config_engine::SnapshotTriggered::Started {
+                snapshot_id: None,
+                last_log_id: None,
+            }))
+        };
+        let busy = || std::future::ready(Ok(config_engine::SnapshotTriggered::AlreadyInProgress));
+
+        // One build after another is always running: the backup never gets to trigger.
+        let triggers = std::sync::atomic::AtomicU32::new(0);
+        let err = tokio::time::timeout(
+            BOUND,
+            await_fresh_snapshot(
+                || {
+                    triggers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    started()
+                },
+                || 1,
+                || Some("old"),
+                |id: &&str| id.to_string(),
+                deadline(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the backup's own deadline ends the wait")
+        .expect_err("a build that never ends cannot be waited on for ever");
+        assert!(
+            reason(err).starts_with("a snapshot build already running did not finish"),
+            "the error names the in-flight wait"
+        );
+        assert_eq!(triggers.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Another trigger's build starts between each look and each trigger.
+        let err = tokio::time::timeout(
+            BOUND,
+            await_fresh_snapshot(
+                busy,
+                || 0,
+                || Some("old"),
+                |id: &&str| id.to_string(),
+                deadline(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the backup's own deadline ends the wait")
+        .expect_err("a trigger that never starts a build gives up");
+        assert!(
+            reason(err).starts_with("no snapshot build could be started"),
+            "the error names the trigger step"
+        );
+
+        // The backup's own build started but never publishes.
+        let err = tokio::time::timeout(
+            BOUND,
+            await_fresh_snapshot(
+                started,
+                || 0,
+                || Some("old"),
+                |id: &&str| id.to_string(),
+                deadline(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the backup's own deadline ends the wait")
+        .expect_err("a build that never publishes gives up");
+        assert!(
+            reason(err).starts_with("no snapshot was published"),
+            "the error names the publish wait"
+        );
+    }
+
     /// M6-87, the `--capabilities` half: the schema triple is an added *top-level* key.
     ///
     /// Asserted on the serialized shape rather than the struct because `#[serde(flatten)]` is
