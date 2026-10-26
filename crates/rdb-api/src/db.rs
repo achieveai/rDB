@@ -8507,9 +8507,18 @@ mod tests {
         let before = lines().len();
         db.links().hold(OWNER, NodeId(2));
         db.restart_node(OWNER).expect("restart node 1");
+        /// Sets the writer's `stop` when dropped, so a failed assertion in the scope below ends
+        /// the writer instead of leaving the scope waiting on it for ever (Revobot #73 finding 5).
+        struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let stop = std::sync::atomic::AtomicBool::new(false);
         let landed = std::sync::atomic::AtomicU64::new(0);
         let cycle = std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&stop);
             scope.spawn(|| {
                 let mut sent = 0;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -8556,7 +8565,6 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(50));
             };
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
             cycle
         });
         let routed = cycle
