@@ -3314,3 +3314,32 @@ fn m10_bb_67_b8_at_its_old_timing_drops_on_the_unreachable_clock() {
     let unreachable_ms = planned[0]["unreachable_ms"].as_str().unwrap_or_default();
     assert!(unreachable_ms.starts_with("Some("), "{planned:?}");
 }
+
+/// M11 defect D1 (dev walk, 2026-10-26): `admin move 4 3` onto node 3, which an earlier move
+/// left out, pinned node 3 twice. A left-out target is the restart re-add's rejoiner too, so
+/// `drained` pinned it once as the re-add's shadow and once as the move's, and the plan held
+/// two members for one node. Here node 3 is dropped, node 1 is given a move onto it, and node
+/// 3 restarts: the re-add's re-plan runs with the move held. The commit pins node 3 once.
+/// Integration (~4 s): b1's drop, the re-add's re-plan.
+#[config_log::retcd_test]
+fn m11_d1_a_move_onto_a_left_out_node_pins_it_once() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.nodes[0].0.moves.insert(
+        PartitionId(1),
+        CopyMove {
+            from: NodeId(2),
+            to: NodeId(3),
+            abandoned: None,
+        },
+    );
+    trio.links.heal_all();
+    restart(&mut trio, dir.path(), 3);
+    let (_, _, members) = trio.until("node 1 pinned node 3 again", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.contains(&3))
+    });
+    assert_eq!(members, vec![1, 2, 3], "node 3 pinned once");
+}

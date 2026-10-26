@@ -732,6 +732,16 @@ pub enum ClientCall {
         /// The generation the caller believes it ran in.
         generation: Option<Generation>,
     },
+    /// M11: move the copy on node `from` to node `to`, or say where that move stands
+    /// ([`Answer::Moved`]). Only the pinned primary takes it; asking again resumes a move.
+    Move {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The member that gives its copy up.
+        from: NodeId,
+        /// The node that takes it, first as a shadow.
+        to: NodeId,
+    },
 }
 
 /// One write of a [`ClientCall::Compile`]: apply `change` to `object` in affinity group
@@ -953,6 +963,8 @@ pub enum Answer {
     Unchanged,
     /// A status query was answered.
     Status(TxnStatus),
+    /// Where a [`ClientCall::Move`] stands.
+    Moved(MoveAnswer),
     /// The call failed.
     Error {
         /// Why.
@@ -961,6 +973,16 @@ pub enum Answer {
         /// [`ClientCall::Resend`] caller already holds what it sent.
         request: Option<TxnRequest>,
     },
+}
+
+/// Where a copy move stands (M11): `done` once the target is pinned regular and the source is
+/// out. `line` is the operator's line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveAnswer {
+    /// The move has committed.
+    pub done: bool,
+    /// What to print.
+    pub line: String,
 }
 
 impl Answer {
@@ -1251,6 +1273,17 @@ struct Replan {
     promote: bool,
     /// When the revocation was asked.
     since: Tick,
+}
+
+/// M11: a copy move the owner was asked for, from its ask to the commit that pins `to`
+/// regular without `from`. Kept in memory only: once `to` is pinned as a shadow, asking again
+/// resumes it (D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyMove {
+    from: NodeId,
+    to: NodeId,
+    /// Set when the move was given up; the next ask answers it once and clears the entry.
+    abandoned: Option<String>,
 }
 
 /// #65: an `admin rebuild` the owner answers once the commit that leaves `node` out lands.
@@ -1995,6 +2028,8 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// M11: per partition, the copy move this owner runs ([`Host::move_step`]).
+    moves: BTreeMap<PartitionId, CopyMove>,
     /// #65: per partition, the divergence evidence F1's last `Quarantine` reported, for
     /// `admin rebuild`'s G6. Kept until a rebuild replaces the quarantined F1.
     quarantines: BTreeMap<PartitionId, rdb_core::contracts::recovery::DivergenceEvidence>,
@@ -2187,6 +2222,7 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
+            moves: BTreeMap::new(),
             quarantines: BTreeMap::new(),
             rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
@@ -5408,7 +5444,12 @@ impl Host {
                 ..*left
             })
         });
-        if let Some(member) = readded {
+        // M11 D1: a left-out target is the re-add above too; it is pinned once, as that.
+        let joining = readded
+            .is_none()
+            .then(|| self.move_shadow(partition, replan, &pinned.members))
+            .flatten();
+        for member in readded.into_iter().chain(joining) {
             members.push(member);
             members.sort_by_key(|member| member.copy);
         }
@@ -5461,6 +5502,7 @@ impl Host {
             dropped = ?replan.drop.map(|node| node.0),
             rejoiner = ?replan.rejoiner.map(|node| node.0),
             readded = ?readded.map(|member| member.node.0),
+            joining = ?joining.map(|member| member.node.0),
             shadowed = ?shadowed.map(|node| node.0),
             "rejoin_plan"
         );
@@ -5496,7 +5538,7 @@ impl Host {
         }
         let Some(Rejoin::Planned {
             generation: planned,
-            ..
+            replan,
         }) = self.rejoins.get(&partition).copied()
         else {
             return;
@@ -5505,6 +5547,8 @@ impl Host {
             return;
         }
         self.rejoins.remove(&partition);
+        let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
+        self.move_committed(partition, generation, waited_ms);
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -5849,6 +5893,354 @@ impl Host {
             .collect()
     }
 
+    /// M11 thin slice: move the copy on `from` to `to`, or say where that move stands. Only the
+    /// pinned primary takes it. The move is two re-plans through the restart machinery: the
+    /// first pins `to` as a shadow (R1 catches it up off the stream, from seq 1), and once it
+    /// reaches the cutoff [`Self::shadow_duty`] pins it regular and leaves `from` out in one
+    /// commit. Membership changes only by those commits. Asking again resumes: the intent is
+    /// in memory, and once `to` is pinned as a shadow the pin itself says what is moving (D2).
+    /// Every refusal changes nothing and names the next step.
+    fn move_step(
+        &mut self,
+        partition: PartitionId,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<MoveAnswer, ApiError> {
+        let step = crate::db::error::MOVE_STEP;
+        let refuse = |detail: String| Err(ApiError::invalid(format!("{detail}; {step}")));
+        let wait = |detail: String| {
+            let mut error = ApiError::new(ErrorKind::Unavailable, format!("{detail}; {step}"));
+            error.no_mutation = true;
+            Err(error)
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return wait(format!(
+                "node {} has committed no generation of partition {} yet: run the move again \
+                 once it serves",
+                self.node.0, partition.0
+            ));
+        };
+        let members = committed.committed.pinned_config.members.clone();
+        let generation = committed.new_generation;
+        let mode = committed.mode.clone();
+        let epoch = committed.selected.root.owner_epoch;
+        let owner = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| member.node);
+        if owner != Some(self.node) {
+            let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+                partition,
+                hint: owner,
+            });
+            error.no_mutation = true;
+            return Err(error);
+        }
+        if from == to {
+            return refuse(format!(
+                "node {} is both the source and the target: name two different nodes",
+                from.0
+            ));
+        }
+        if from == self.node {
+            // D3: the owner's copy moves only after the ownership does.
+            return refuse(format!(
+                "node {} owns partition {}: move the ownership first with `admin promote <other \
+                 node> --drop {}`, then move its copy",
+                from.0, partition.0, from.0
+            ));
+        }
+        let role = |node: NodeId| {
+            members
+                .iter()
+                .find(|member| member.node == node)
+                .map(|member| member.role)
+        };
+        let mut asked = self.moves.get(&partition).cloned();
+        if asked
+            .as_ref()
+            .is_some_and(|mv| mv.abandoned.is_some() && (mv.from, mv.to) != (from, to))
+        {
+            self.moves.remove(&partition);
+            asked = None;
+        }
+        let ours = asked
+            .as_ref()
+            .is_some_and(|mv| (mv.from, mv.to) == (from, to));
+        if let Some(why) = asked
+            .as_ref()
+            .filter(|_| ours)
+            .and_then(|mv| mv.abandoned.clone())
+        {
+            self.moves.remove(&partition);
+            return wait(why);
+        }
+        match (role(from), role(to)) {
+            (None, Some(ReplicaRole::RegularSecondary)) => {
+                if ours {
+                    self.moves.remove(&partition);
+                }
+                return Ok(MoveAnswer {
+                    done: true,
+                    line: format!(
+                        "moved: node {} regular at generation {}; node {} left out",
+                        to.0, generation.0, from.0
+                    ),
+                });
+            }
+            (_, Some(ReplicaRole::Primary)) => {
+                return refuse(format!(
+                    "node {} already holds partition {}'s copy as its owner: name a node with \
+                     no copy as the target",
+                    to.0, partition.0
+                ));
+            }
+            (_, Some(ReplicaRole::RegularSecondary)) => {
+                return refuse(format!(
+                    "node {} already holds a regular copy of partition {}: name a node with no \
+                     copy as the target",
+                    to.0, partition.0
+                ));
+            }
+            (None, _) => {
+                return refuse(format!(
+                    "node {} holds no copy of partition {} (members: {}): name a member as the \
+                     source",
+                    from.0,
+                    partition.0,
+                    member_list(&members)
+                ));
+            }
+            (Some(ReplicaRole::Shadow), _) => {
+                return refuse(format!(
+                    "node {} is a shadow of partition {}, not a regular copy: wait until it is \
+                     regular, then move it",
+                    from.0, partition.0
+                ));
+            }
+            _ => {}
+        }
+        let shadow = role(to) == Some(ReplicaRole::Shadow);
+        let progress = |replanning: bool| {
+            let line = match (shadow, replanning) {
+                (false, _) => format!("moving: node {} joining as a shadow", to.0),
+                (true, false) => format!("moving: node {} catching up as a shadow", to.0),
+                (true, true) => format!(
+                    "moving: node {} caught up; pinning it regular and leaving node {} out",
+                    to.0, from.0
+                ),
+            };
+            Ok(MoveAnswer { done: false, line })
+        };
+        if self.rejoins.contains_key(&partition) {
+            if ours {
+                return progress(true);
+            }
+            return wait(format!(
+                "a re-plan of partition {} is running: run the move again once it commits",
+                partition.0
+            ));
+        }
+        if let Some(other) = asked.filter(|_| !ours) {
+            return wait(format!(
+                "the move of node {} to node {} is still running: run `admin move {} {}` to \
+                 follow it, then this one",
+                other.from.0, other.to.0, other.from.0, other.to.0
+            ));
+        }
+        if let Some(other) = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Shadow && member.node != to)
+        {
+            return wait(format!(
+                "node {} is pinned as a shadow of partition {} and still catching up: run the \
+                 move again once it is regular",
+                other.node.0, partition.0
+            ));
+        }
+        if !self.linked(to) || self.links.boot_of(to).is_none() {
+            return wait(format!(
+                "node {} is not reachable from node {} (the owner): start it (`lr start {}`), or \
+                 name a node that runs, and run the move again",
+                to.0, self.node.0, to.0
+            ));
+        }
+        let regular = members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        let rf = crate::admin::members().len();
+        if mode != PartitionMode::Active || regular != rf {
+            return wait(format!(
+                "partition {} serves {mode:?} with {regular} regular copies (members: {}): a move \
+                 needs all {rf} serving; run it again once they are",
+                partition.0,
+                member_list(&members)
+            ));
+        }
+        let taken = move_copy_id(to)
+            .is_none_or(|copy| !shadow && members.iter().any(|member| member.copy == copy));
+        if taken {
+            return refuse(format!(
+                "node {}'s copy id is taken in partition {} (members: {}): name another node",
+                to.0,
+                partition.0,
+                member_list(&members)
+            ));
+        }
+        self.moves.insert(
+            partition,
+            CopyMove {
+                from,
+                to,
+                abandoned: None,
+            },
+        );
+        if shadow {
+            // Resumed (D2): the pin names the shadow; shadow_duty promotes it once caught up.
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                from = from.0,
+                to = to.0,
+                "move_resumed"
+            );
+            return progress(false);
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            from = from.0,
+            to = to.0,
+            "move_started"
+        );
+        let replan = Replan {
+            drop: None,
+            rejoiner: Some(to),
+            promote: false,
+            since: self.clock.now(),
+        };
+        self.start_revoke(partition, epoch, replan);
+        progress(false)
+    }
+
+    /// M11: the shadow a move pins, when `replan` is that move's first re-plan: `to` is the
+    /// rejoiner, not pinned, and this owner holds the move. It joins at its live boot under
+    /// [`move_copy_id`]; R1 feeds it off the stream and F1's barrier skips it.
+    fn move_shadow(
+        &self,
+        partition: PartitionId,
+        replan: Replan,
+        pinned: &[Member],
+    ) -> Option<Member> {
+        let mv = self.moves.get(&partition)?;
+        if replan.promote
+            || mv.abandoned.is_some()
+            || replan.rejoiner != Some(mv.to)
+            || pinned.iter().any(|member| member.node == mv.to)
+        {
+            return None;
+        }
+        let copy = move_copy_id(mv.to)?;
+        if pinned.iter().any(|member| member.copy == copy) {
+            return None;
+        }
+        Some(Member {
+            copy,
+            node: mv.to,
+            boot: self.links.boot_of(mv.to)?,
+            role: ReplicaRole::Shadow,
+        })
+    }
+
+    /// M11: a commit that ends one of a move's re-plans, `waited_ms` after its revocation was
+    /// asked: the pause writes saw. Clears the move once `to` is regular and `from` is out.
+    fn move_committed(&mut self, partition: PartitionId, generation: Generation, waited_ms: u64) {
+        let Some(mv) = self.moves.get(&partition).cloned() else {
+            return;
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let role = |node: NodeId| {
+            members
+                .iter()
+                .find(|member| member.node == node)
+                .map(|member| member.role)
+        };
+        let phase = match (role(mv.from), role(mv.to)) {
+            (None, Some(ReplicaRole::RegularSecondary)) => "moved",
+            (_, Some(ReplicaRole::Shadow)) => "shadow_pinned",
+            _ => "other",
+        };
+        if phase == "moved" {
+            self.moves.remove(&partition);
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            from = mv.from.0,
+            to = mv.to.0,
+            phase,
+            waited_ms,
+            "move_committed"
+        );
+    }
+
+    /// M11 (critic M1): F1 blocked a move's re-plan on the target's copy. The move is given up
+    /// and the commit's members are planned again without the target, so the source keeps its
+    /// copy: the target, if already pinned as a shadow, is left out. `true` when it was.
+    fn move_blocked(
+        &mut self,
+        partition: PartitionId,
+        replan: Replan,
+        reason: &BlockReason,
+        members: &[Member],
+        epoch: OwnerEpoch,
+    ) -> bool {
+        let Some(mv) = self.moves.get(&partition).cloned() else {
+            return false;
+        };
+        if mv.abandoned.is_some() || replan.rejoiner != Some(mv.to) {
+            return false;
+        }
+        let pinned = members.iter().find(|member| member.node == mv.to);
+        let Some(copy) = pinned.map(|member| member.copy).or(move_copy_id(mv.to)) else {
+            return false;
+        };
+        if named_by_block(reason, Some(copy)) != Some(copy) {
+            return false;
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            from = mv.from.0,
+            to = mv.to.0,
+            waited_ms = HostClock::millis_until(replan.since, self.clock.now()),
+            reason = ?reason,
+            "move_abandoned"
+        );
+        let why = format!(
+            "the move of node {} to node {} was given up: recovery could not reach node {}'s \
+             copy ({reason:?}); node {} keeps its copy. Check node {} and run the move again",
+            mv.from.0, mv.to.0, mv.to.0, mv.from.0, mv.to.0
+        );
+        self.moves.insert(
+            partition,
+            CopyMove {
+                abandoned: Some(why),
+                ..mv
+            },
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, pinned.map(|member| member.node), None);
+        true
+    }
+
     /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
     /// drop left out and a restart re-added, [`Self::readd_candidate`]) has applied up to the
     /// commit's cutoff, as this primary's tracker last admitted it, the owner re-plans with it
@@ -5876,6 +6268,23 @@ impl Host {
         if !owner {
             return;
         }
+        // M11: a shadow pinned beside all rf3 regular copies is a move's target. It is promoted
+        // only for the move this owner holds, and the promote leaves the source out; with no
+        // move held (this owner restarted or was promoted since), it waits for `admin move`
+        // to be asked again (D2).
+        let regular = members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        let moving = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.to == shadow.node && mv.abandoned.is_none())
+            .map(|mv| mv.from);
+        if moving.is_none() && regular >= crate::admin::members().len() {
+            return;
+        }
+        let drop = moving.filter(|from| members.iter().any(|member| member.node == *from));
         let Some(primary) = self.replication.primary(self.node, partition) else {
             return;
         };
@@ -5896,10 +6305,11 @@ impl Host {
             copy = shadow.copy.0,
             acked,
             cutoff = cutoff.0,
+            dropped = ?drop.map(|node| node.0),
             "shadow_promote"
         );
         let replan = Replan {
-            drop: None,
+            drop,
             rejoiner: Some(shadow.node),
             promote: true,
             since: self.clock.now(),
@@ -6090,8 +6500,12 @@ impl Host {
         let Some(committed) = self.committed.get(&partition) else {
             return;
         };
-        let members = &committed.committed.pinned_config.members;
+        let members = committed.committed.pinned_config.members.clone();
+        let members = &members;
         let epoch = committed.selected.root.owner_epoch;
+        if self.move_blocked(partition, replan, reason, members, epoch) {
+            return;
+        }
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         // A-R329: a re-add F1 blocks on is given up, and the commit's members are planned
         // again. The member stays left out at the boot it was planned at, so only another
@@ -8749,7 +9163,9 @@ impl Host {
         // nothing, so it never queues. Nor does a status query (F-014): P1 answers it in the
         // step that takes it, and it is how a caller resolves a put that may never be answered.
         let identity = match &client.call {
-            ClientCall::Compile { .. } | ClientCall::Status { .. } => None,
+            ClientCall::Compile { .. } | ClientCall::Status { .. } | ClientCall::Move { .. } => {
+                None
+            }
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
             | ClientCall::GetPrevious { identity, .. } => Some(*identity),
@@ -8882,6 +9298,18 @@ impl Host {
                 EventKind::Client(ClientEvent::Submit(request.clone())),
                 Some(PendingKind::Txn(request)),
             ),
+            // M11: answered in this step; it waits on nothing.
+            ClientCall::Move { from, to, .. } => {
+                let answer = match self.move_step(partition, from, to) {
+                    Ok(moved) => Answer::Moved(moved),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
             ClientCall::Get {
                 identity,
                 object,
@@ -9711,6 +10139,24 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
 /// The regular secondaries among `members`: the copies outside a `ReadOnly` commit's barrier
 /// that M3's repair re-plans. A shadow is never one: L1 never counts it, and
 /// [`Host::shadow_duty`] promotes it.
+/// M11: the copy id a move pins node `node` under, as `admin::members` numbers nodes 1 to 3:
+/// node n holds copy n - 1. `None` for node 0 or past `u8`.
+fn move_copy_id(node: NodeId) -> Option<CopyId> {
+    node.0
+        .checked_sub(1)
+        .and_then(|copy| u8::try_from(copy).ok())
+        .map(CopyId)
+}
+
+/// `members` as `node role` words, for a refusal.
+fn member_list(members: &[Member]) -> String {
+    members
+        .iter()
+        .map(|member| format!("{} {:?}", member.node.0, member.role))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
     members
         .iter()

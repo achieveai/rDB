@@ -3345,6 +3345,60 @@ impl Db {
         ))
     }
 
+    /// M11: ask the owner to move partition 1's copy on node `from` to node `to`, or say where
+    /// that move stands. Asking again resumes it and answers `done` once `to` is pinned
+    /// regular and `from` is left out. The answer comes at once; the move runs on the owner.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal, which changed nothing and names the next step (`INVALID_ARGUMENT`
+    /// for a move that cannot be made as asked, `UNAVAILABLE` for one to run again later);
+    /// `NOT_PRIMARY` when the node asked is not the owner; `UNAVAILABLE` when no answer came in
+    /// the read timeout.
+    pub fn move_copy(&self, from: NodeId, to: NodeId) -> Result<host::MoveAnswer, ApiError> {
+        match self.call(
+            ClientCall::Move {
+                identity: self.identity(),
+                from,
+                to,
+            },
+            self.timeouts.read,
+        ) {
+            Some(Answer::Moved(moved)) => Ok(moved),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a move was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no answer to the move in {:?}", self.timeouts.read),
+            )),
+        }
+    }
+
+    /// M11: the owner this `Db` routes to, and the members its commit pins, as it answers its
+    /// status look.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` when the owner cannot be reached or does not answer in the read timeout.
+    pub fn pinned_members(
+        &self,
+    ) -> Result<(NodeId, Vec<rdb_core::contracts::membership::Member>), ApiError> {
+        let owner = self.route.owner();
+        self.look(owner)
+            .map(|status| (owner, status.pinned))
+            .map_err(|_| {
+                ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {} (the owner) did not answer its status look",
+                        owner.0
+                    ),
+                )
+            })
+    }
+
     /// The guards an app with no node of its own can check against the owner's status: `node`
     /// holds a copy (G1), is not the owner (G2), the owner is not quarantined (mode C needs the
     /// owner's process) and already leaves `node` out (mode A). Returns the owner and the
@@ -4374,7 +4428,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         ClientCall::Put { .. }
         | ClientCall::Compile { .. }
         | ClientCall::Resend { .. }
-        | ClientCall::Status { .. } => return None,
+        | ClientCall::Status { .. }
+        | ClientCall::Move { .. } => return None,
     };
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {

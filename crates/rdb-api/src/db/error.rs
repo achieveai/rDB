@@ -38,6 +38,9 @@ const RUN_AGAIN: &str = "run it again to read where it stands";
 /// contradict (bb walk paper cut).
 pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this says";
 
+/// The tail every `admin move` refusal ends with (M11): its detail names the step.
+pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
+
 /// The tail of [`super::ReadyError::Quarantined`]'s text, which a refusal carries while the
 /// owner's recovery is quarantined ([`super::Db::explained`]). It already says what to do, which
 /// a "wait a few seconds and try again" step would contradict (review-s2 F-003).
@@ -255,6 +258,7 @@ impl ApiError {
         if reopen
             || self.detail.ends_with(RUN_AGAIN)
             || self.detail.ends_with(REBUILD_STEP)
+            || self.detail.ends_with(MOVE_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
         {

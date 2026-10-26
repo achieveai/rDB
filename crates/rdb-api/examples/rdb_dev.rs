@@ -229,7 +229,19 @@
 //!                                         until the first `ready`
 //! admin status                            read-only: the partitions/ and grants/ records
 //!                                         through this Db's store, as `control` prints them,
-//!                                         then each `--nodes` link's `link node=N ..` line
+//!                                         and the members line (M11): `members 1=owner
+//!                                         2=regular 4=shadow; not pinned 3 (as node 1 pins
+//!                                         them)`, then each `--nodes` link's `link node=N ..`
+//!                                         line
+//! admin move <from> <to>                  M11: move partition 1's copy from node <from> to
+//!                                         node <to> (a spare, `lr up --nodes K`): <to> joins
+//!                                         as a shadow, catches up from seq 1, then one
+//!                                         commit pins it regular and leaves <from> out.
+//!                                         Prints `moving: ..` lines until `moved: node <to>
+//!                                         regular at generation G; node <from> left out`.
+//!                                         Asking again resumes, or says `already moved`.
+//!                                         The owner's copy is refused (promote first); a
+//!                                         refusal prints `err admin move ..`, exits 1
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
 //!                                         and it may go: `absent`, `current` (the running
 //!                                         process's own), `cleared rev=R`, `conflict`, or
@@ -1986,8 +1998,11 @@ fn repl<'scope, 'env>(
                 bad |= !answer_all(&admin_status_lines(rt, db, store));
                 Ok(())
             }
+            ["admin", "move", from, to] => parse_any_node(from).and_then(|from| {
+                parse_any_node(to).map(|to| bad |= !move_lines(db, from, to, &say))
+            }),
             ["admin", ..] => Err(format!(
-                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
                  clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
@@ -2112,6 +2127,101 @@ fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
         ));
     }
     Ok((to, drop))
+}
+
+/// `admin move`'s usage (M11).
+const MOVE_USAGE: &str =
+    "admin move <from> <to>: move partition 1's copy from node <from> to node <to> (1 to 8)";
+
+/// How long `admin move` follows a move before it hands back; a move resumes when asked again.
+const MOVE_FOLLOW: Duration = Duration::from_secs(120);
+
+/// `admin move <from> <to>` (M11): ask the owner, then ask again about every 500 ms, saying
+/// each new line, until the move is done, refused, or [`MOVE_FOLLOW`] passes. A `NOT_PRIMARY`
+/// answer is asked again: the `Db` has read the new owner. `true` when the move is done.
+fn move_lines(db: &Db, from: NodeId, to: NodeId, say: &dyn Fn(&str)) -> bool {
+    let started = Instant::now();
+    let mut last = String::new();
+    let mut first = true;
+    loop {
+        match db.move_copy(from, to) {
+            Ok(moved) => {
+                let line = if moved.done && first {
+                    format!("already {}", moved.line)
+                } else {
+                    moved.line
+                };
+                if line != last {
+                    tracing::info!(from = from.0, to = to.0, done = moved.done, line = %line, "repl_move");
+                    say(&line);
+                    last = line;
+                }
+                if moved.done {
+                    return true;
+                }
+            }
+            Err(error)
+                if error.kind == rdb_api::ErrorKind::NotPrimary
+                    && started.elapsed() < MOVE_FOLLOW =>
+            {
+                tracing::info!(from = from.0, to = to.0, error = %error, "repl_move_reroute");
+            }
+            Err(error) => {
+                tracing::warn!(from = from.0, to = to.0, error = %error, "repl_move_refused");
+                say(&format!("err admin move {} {}: {error}", from.0, to.0));
+                return false;
+            }
+        }
+        first = false;
+        if started.elapsed() >= MOVE_FOLLOW {
+            say(&format!(
+                "err admin move {} {}: not done after {:?}; it keeps running on the owner: run \
+                 `admin move {} {}` again to follow it",
+                from.0, to.0, MOVE_FOLLOW, from.0, to.0
+            ));
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// `admin status`'s members line (M11): each node the owner's commit pins, with its role, then
+/// each node this process knows of that it does not pin: a spare or a copy left out.
+fn members_line(db: &Db) -> String {
+    let (owner, pinned) = match db.pinned_members() {
+        Ok(found) => found,
+        Err(error) => return format!("members: unknown: {error}"),
+    };
+    let known: Vec<NodeId> = match db.links().net() {
+        Some(net) => net.states().keys().copied().collect(),
+        None => vec![NodeId(1), NodeId(2), NodeId(3)],
+    };
+    let roles = pinned
+        .iter()
+        .map(|member| {
+            let role = match member.role {
+                rdb_core::contracts::ids::ReplicaRole::Primary => "owner",
+                rdb_core::contracts::ids::ReplicaRole::RegularSecondary => "regular",
+                rdb_core::contracts::ids::ReplicaRole::Shadow => "shadow",
+            };
+            format!("{}={role}", member.node.0)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let out = known
+        .iter()
+        .filter(|node| !pinned.iter().any(|member| member.node == **node))
+        .map(|node| node.0.to_string())
+        .collect::<Vec<_>>();
+    let out = if out.is_empty() {
+        "none".to_owned()
+    } else {
+        out.join(" ")
+    };
+    format!(
+        "members {roles}; not pinned {out} (as node {} pins them)",
+        owner.0
+    )
 }
 
 /// `admin rebuild`'s usage (#65).
@@ -4501,6 +4611,7 @@ fn admin_status_lines(
     store: &dyn ConfigStore,
 ) -> Vec<String> {
     let mut lines = record_lines(rt, store, "admin status");
+    lines.push(members_line(db));
     match db.links().net() {
         Some(net) => lines.extend(link_lines(&net.states())),
         None => lines.push("links: the three nodes run in this process".to_owned()),
