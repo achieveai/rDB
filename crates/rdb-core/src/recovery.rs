@@ -572,7 +572,14 @@ impl Recovery {
             copies: queried.iter().copied().collect(),
         });
         self.arm(deadline, emit);
-        let collect = Collecting::new(proof.clone(), queried, deadline);
+        let shadows: BTreeSet<CopyId> = plan
+            .config
+            .members
+            .iter()
+            .filter(|m| m.role == ReplicaRole::Shadow)
+            .map(|m| m.copy)
+            .collect();
+        let collect = Collecting::new(proof.clone(), queried, shadows, deadline);
         Some(Phase::Collecting(Box::new(Run { plan, collect })))
     }
 
@@ -610,7 +617,11 @@ impl Recovery {
                     }
                 }
             },
-            Input::Recovery(RecoveryEvent::InventoryFailed { copy }) => collect.failed(*copy, emit),
+            Input::Recovery(RecoveryEvent::InventoryFailed { copy }) => {
+                if collect.failed(*copy, emit) && collect.close_if_all_answered(emit) {
+                    return self.decide(ctx, run, emit);
+                }
+            }
             Input::Recovery(RecoveryEvent::TransferProgress {
                 copy,
                 advertised_seq,

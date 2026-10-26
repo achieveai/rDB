@@ -815,6 +815,39 @@ fn the_last_answer_closes_the_window_unless_a_copy_failed() {
     );
 }
 
+/// M11 M2 (ruling A-R451): a copy the plan pins as `Shadow` that fails never holds the window.
+/// A move's empty target answers `InventoryFailed`, and holding the window for it paused
+/// writes for the whole 2 s. Whichever arrives last, the shadow's failure or the last regular's
+/// report, closes the window at once. The same copy pinned regular still holds it (A-R165).
+/// Cut: drop the shadow exemption in `Collecting::close_if_all_answered`, red (no close).
+#[retcd_test]
+fn m11_q3_a_failed_shadow_never_holds_the_window() {
+    let shadow = [member(D, ReplicaRole::Shadow)];
+    let mut first = fenced(&shadow);
+    first.rec(10, RecoveryEvent::InventoryFailed { copy: D });
+    first.report(11, inv(A, 20));
+    first.report(12, inv(B, 20));
+    let close = first.report(13, inv(C, 20));
+    assert_eq!(close.first(), Some(&r(RecoveryEffect::CloseWindow)), "{close:?}");
+    assert!(has_selected(&close), "{close:?}");
+
+    let mut last = fenced(&shadow);
+    for (at, copy) in [(10, A), (11, B), (12, C)] {
+        last.report(at, inv(copy, 20));
+    }
+    assert_eq!(last.phase(), RecoveryPhase::Collecting, "the shadow is still asked");
+    let close = last.rec(13, RecoveryEvent::InventoryFailed { copy: D });
+    assert!(close.contains(&r(RecoveryEffect::CloseWindow)), "{close:?}");
+    assert!(has_selected(&close), "{close:?}");
+
+    let mut regular = fenced(&[member(D, ReplicaRole::RegularSecondary)]);
+    regular.rec(10, RecoveryEvent::InventoryFailed { copy: D });
+    for (at, copy) in [(11, A), (12, B), (13, C)] {
+        regular.report(at, inv(copy, 20));
+    }
+    assert_eq!(regular.phase(), RecoveryPhase::Collecting, "a failed regular holds it");
+}
+
 /// Scaffolds M7B-88/89: a stale-lineage or quarantined survivor is recorded, never selected, and
 /// its later reports are refused.
 #[retcd_test]

@@ -131,6 +131,12 @@ impl Trio {
 
     /// Three hosts on `dir`, each tuned by `tune`, not yet bootstrapped.
     pub(super) fn new(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> Self {
+        Self::with_nodes(dir, tune, 3)
+    }
+
+    /// [`Self::new`] with hosts 1..=`count`. Bootstrap pins nodes 1 to 3; a host past them is
+    /// a spare that holds no copy until a move pins it (M11, A-R450).
+    pub(super) fn with_nodes(dir: &std::path::Path, tune: impl Fn(&mut Host), count: u32) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -142,7 +148,7 @@ impl Trio {
         let control =
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
         let clock = HostClock::capped(Self::CLOCK_STEP_CAP_MILLIS);
-        let nodes = (1..=3u32)
+        let nodes = (1..=count)
             .map(|n| {
                 let engine = RocksEngine::open(dir.join(n.to_string())).expect("open engine");
                 let (tx, rx) = mpsc::channel();

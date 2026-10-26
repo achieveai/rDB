@@ -3367,6 +3367,95 @@ fn m11_t1_a_move_that_never_ran_is_not_already_moved() {
     }
 }
 
+/// Four hosts, bootstrapped with nodes 1 to 3 and admitting; node 4 is a spare.
+fn started_four(dir: &std::path::Path) -> Trio {
+    let mut trio = Trio::with_nodes(dir, tuned, 4);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    let (_, _, members) = commit_of(&trio).expect("bootstrap committed");
+    assert_eq!(members, vec![1, 2, 3]);
+    trio
+}
+
+/// The role node 1's last commit pins `node` as, if any.
+fn pinned_role(trio: &Trio, node: u32) -> Option<ReplicaRole> {
+    trio.nodes[0]
+        .0
+        .committed
+        .get(&PartitionId(1))
+        .and_then(|result| {
+            result
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.node == NodeId(node))
+                .map(|member| member.role)
+        })
+}
+
+fn move_call(request: u64, from: u32, to: u32) -> ClientCall {
+    ClientCall::Move {
+        identity: identity(request),
+        from: NodeId(from),
+        to: NodeId(to),
+    }
+}
+
+/// M11 M2 (tester walk, critic M2; ruling A-R451): a move onto an empty node paused writes for
+/// 2.0-2.9 s. The empty target answers F1's inventory `InventoryFailed` (it holds nothing to
+/// prove), and a failed copy held the window to its 2 s deadline. A pinned shadow's failure no
+/// longer holds it: the re-plan that pins node 4 as a shadow commits in under 0.5 s of host
+/// time, and the move then ends with node 4 regular and node 3 out.
+/// Integration (~3 s): bootstrap's window, the two re-plans, node 4's catch-up.
+#[config_log::retcd_test]
+fn m11_q3_a_move_onto_an_empty_node_pins_its_shadow_in_under_half_a_second() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let asked = trio.clock.now();
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    let pinned = trio.clock.now();
+    let waited = pinned.0 - asked.0;
+    tracing::info!(waited_ms = waited, "m11_q3_shadow_pinned");
+    assert!(waited < 500, "the shadow was pinned {waited} ms after the ask");
+    let mut request = 2;
+    let (_, _, members) = trio.until("node 4 regular and node 3 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&3))
+    });
+    assert_eq!(members, vec![1, 2, 4]);
+    assert_eq!(pinned_role(&trio, 4), Some(ReplicaRole::RegularSecondary));
+    match trio.ask(move_call(request, 3, 4)) {
+        Answer::Moved(answer) => assert!(answer.done, "{answer:?}"),
+        other => panic!("move 3 4 again: {other:?}"),
+    }
+    // Writes go on with node 4 counted. Around the promote a few are refused, changing nothing.
+    let landed_at = loop {
+        request += 1;
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => break trio.clock.now(),
+            // The promote's commit lands under it: `Db` reconciles and asks again.
+            Answer::Error { error, .. }
+                if error.no_mutation
+                    && matches!(error.name().as_str(), "PROTECTION_PAUSED" | "GENERATION_CHANGED") =>
+            {
+                pass(&mut trio, 20);
+                assert!(
+                    trio.clock.now().0 - pinned.0 < 10_000,
+                    "writes still paused 10 s after the shadow was pinned"
+                );
+            }
+            other => panic!("a put after the move: {other:?}"),
+        }
+    };
+    tracing::info!(after_pin_ms = landed_at.0 - pinned.0, "m11_q3_put_landed");
+}
+
 /// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
 /// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
 /// left-out member, and the partition pinned the moved-off copy again on its own. The move's
