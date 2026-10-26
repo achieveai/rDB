@@ -273,6 +273,68 @@ const BACKUP_BUILD_DEADLINE: Duration = Duration::from_secs(300);
 /// it is waiting on and large enough to cost nothing.
 const BACKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Wait for a snapshot that a build **started after this call** published, and return it.
+///
+/// `trigger` asks for a build, `in_flight` says how many builds are running, and `current`
+/// reads the published snapshot. Every wait is bounded by `deadline`.
+///
+/// A trigger that answers `AlreadyInProgress` started nothing: a build that began before this
+/// call is still running. Taking the next snapshot that build publishes would ship state
+/// captured before the call, without writes the caller saw acknowledged. So this waits until
+/// no build is running, reads the published id, and triggers again. Only after a `Started`
+/// does a change of id count, and it can then only come from a build that started after the
+/// running ones ended (#68 finding, ruling A-R440). Comparing ids rather than indexes is what
+/// makes an idle cluster work: a build at an unchanged last_log_id still gets a fresh id
+/// (ADR-0022), so two backups of a quiet cluster give two fresh exports rather than a hang.
+async fn await_fresh_snapshot<M, Fut>(
+    mut trigger: impl FnMut() -> Fut,
+    in_flight: impl Fn() -> u64,
+    current: impl Fn() -> Option<M>,
+    id_of: impl Fn(&M) -> String,
+    deadline: tokio::time::Instant,
+    poll: Duration,
+) -> Result<M, config_engine::AdminError>
+where
+    Fut: std::future::Future<
+        Output = Result<config_engine::SnapshotTriggered, config_engine::AdminError>,
+    >,
+{
+    let timed_out = |what: &str| config_engine::AdminError::Unavailable {
+        reason: format!(
+            "{what} within {}s of the backup request",
+            BACKUP_BUILD_DEADLINE.as_secs()
+        ),
+    };
+    let before = loop {
+        while in_flight() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timed_out("a snapshot build already running did not finish"));
+            }
+            tokio::time::sleep(poll).await;
+        }
+        let before = current().map(|m| id_of(&m));
+        match trigger().await? {
+            config_engine::SnapshotTriggered::Started { .. } => break before,
+            config_engine::SnapshotTriggered::AlreadyInProgress => {
+                tracing::info!("backup_trigger_found_a_build_running");
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(timed_out("no snapshot build could be started"));
+                }
+                tokio::time::sleep(poll).await;
+            }
+        }
+    };
+    loop {
+        match current() {
+            Some(meta) if Some(id_of(&meta)) != before => return Ok(meta),
+            _ if tokio::time::Instant::now() >= deadline => {
+                return Err(timed_out("no snapshot was published"))
+            }
+            _ => tokio::time::sleep(poll).await,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl config_grpc::AdminBackend for NodeBackend {
     /// Forward the admin plane's allowlist refusals to the node's counter (C5B-15), so
@@ -367,29 +429,15 @@ impl config_grpc::AdminBackend for NodeBackend {
             trust_key: None,
         };
 
-        // Trigger, then wait for a *newer* snapshot than the one that was current when the
-        // call arrived. Comparing ids rather than indexes is what makes an idle cluster work:
-        // a build at an unchanged last_log_id still gets a fresh id (ADR-0022), so an operator
-        // taking two backups of a quiet cluster gets two fresh exports rather than a hang.
-        let capture = async {
-            let before = store.snapshot_meta().map(|m| m.snapshot_id);
-            self.node.trigger_snapshot().await?;
-            let deadline = tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE;
-            loop {
-                match store.snapshot_meta() {
-                    Some(meta) if Some(&meta.snapshot_id) != before.as_ref() => break Ok(meta),
-                    _ if tokio::time::Instant::now() >= deadline => {
-                        break Err(config_engine::AdminError::Unavailable {
-                            reason: format!(
-                                "no snapshot was published within {}s of the trigger",
-                                BACKUP_BUILD_DEADLINE.as_secs()
-                            ),
-                        })
-                    }
-                    _ => tokio::time::sleep(BACKUP_POLL_INTERVAL).await,
-                }
-            }
-        };
+        // A snapshot built after this call arrived ([`await_fresh_snapshot`]).
+        let capture = await_fresh_snapshot(
+            || self.node.trigger_snapshot(),
+            || self.storage.snapshot_builds_in_flight(),
+            || store.snapshot_meta(),
+            |m| m.snapshot_id.clone(),
+            tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE,
+            BACKUP_POLL_INTERVAL,
+        );
         // M6-33: the policy version the artifact names. Sampled before the trigger and again
         // after publication, by `PolicyLoader::version_across`: it is `Some` only when no
         // adoption landed in between, so the version named was in force for the whole
@@ -1493,6 +1541,88 @@ async fn shutdown(running: Running) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the scripted node in [`backup_never_ships_a_build_started_before_the_call`] holds.
+    struct Scripted {
+        triggers: u32,
+        in_flight: u64,
+        /// A build from before the call is running; it publishes when the node next looks.
+        old_build_running: bool,
+        current: &'static str,
+        /// Published at the next read of the current snapshot.
+        next: Option<&'static str>,
+    }
+
+    impl Scripted {
+        /// The build from before the call publishes `old`, if it is still running.
+        fn old_build_publishes(&mut self) {
+            if self.old_build_running {
+                self.old_build_running = false;
+                self.in_flight = 0;
+                self.current = "old";
+            }
+        }
+    }
+
+    /// #68 finding (ruling A-R440): a backup ships a snapshot from a build that started after
+    /// the request, never one that was already running.
+    ///
+    /// The first trigger answers `AlreadyInProgress`: a build from before the call is running.
+    /// It publishes `old` while the backup waits, just before the second trigger starts a
+    /// build that publishes `fresh`. A backup that took the next new id would ship `old`, which
+    /// can miss writes acknowledged before the request. It must return `fresh`.
+    #[tokio::test]
+    async fn backup_never_ships_a_build_started_before_the_call() {
+        let node = std::sync::Mutex::new(Scripted {
+            triggers: 0,
+            in_flight: 0,
+            old_build_running: false,
+            current: "before",
+            next: None,
+        });
+        let got = await_fresh_snapshot(
+            || {
+                let mut n = node.lock().unwrap();
+                n.triggers += 1;
+                let answer = if n.triggers == 1 {
+                    n.in_flight = 1;
+                    n.old_build_running = true;
+                    config_engine::SnapshotTriggered::AlreadyInProgress
+                } else {
+                    // The build from before the call ends here, so this one starts; it
+                    // publishes `fresh` only after `old` has been seen.
+                    n.old_build_publishes();
+                    n.next = Some("fresh");
+                    config_engine::SnapshotTriggered::Started {
+                        snapshot_id: None,
+                        last_log_id: None,
+                    }
+                };
+                std::future::ready(Ok(answer))
+            },
+            || {
+                let mut n = node.lock().unwrap();
+                let running = n.in_flight;
+                n.old_build_publishes();
+                running
+            },
+            || {
+                let mut n = node.lock().unwrap();
+                let seen = n.current;
+                if let Some(next) = n.next.take() {
+                    n.current = next;
+                }
+                Some(seen)
+            },
+            |id: &&str| id.to_string(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("a fresh snapshot is published");
+        assert_eq!(got, "fresh", "the backup ships the build it started");
+        assert_eq!(node.lock().unwrap().triggers, 2);
+    }
 
     /// M6-87, the `--capabilities` half: the schema triple is an added *top-level* key.
     ///
