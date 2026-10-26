@@ -4024,12 +4024,26 @@ fn m10_s2_r447_a_rerun_with_another_drop_fences_at_its_own_revision_and_commits_
         (NodeId(2), NodeId(3)),
         "{promoted:?}"
     );
+    // A-R448: the answer names the commit's revision, after this run's own `Fencing` write,
+    // which keyed the newest stored plan.
+    let plans = rt
+        .block_on(store.list(config_core::ListRequest {
+            prefix: Bytes::from_static(b"operations/"),
+            max_items: 0,
+            max_bytes: 0,
+        }))
+        .expect("list the stored plans")
+        .records;
+    let newest = plans.last().expect("the re-run's stored plan");
     assert!(
-        promoted.control_revision.0 > first,
-        "its own revision: {promoted:?}"
+        plans.len() == 2 && promoted.control_revision.0 > newest.mod_revision,
+        "the commit is after the re-run's own plan: {promoted:?}, {} plans",
+        plans.len()
     );
     assert_eq!(
-        kept(stored_plan_at(&rt, &store, promoted.control_revision.0)),
+        kept(Some(
+            admin::decode_promote_plan(&newest.value).expect("a stored plan")
+        )),
         [1, 2]
     );
     assert_eq!(kept(stored_plan_at(&rt, &store, first)), [2, 3], "kept");

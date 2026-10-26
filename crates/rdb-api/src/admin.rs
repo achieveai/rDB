@@ -1574,8 +1574,8 @@ pub struct Promoted {
     /// The prior owner's grant, now frozen: the one it held, or `GrantId(0)` ("none held")
     /// when it held none and the promote created a frozen record in its place (PR #41).
     pub frozen_grant: GrantId,
-    /// The fence's `control_revision`: `partitions/1`'s `mod_revision` after the promote wrote
-    /// it `Fencing`.
+    /// `partitions/1`'s `mod_revision` at the commit this answer reports, never the
+    /// `Fencing` revision of a run that did not commit (A-R448).
     pub control_revision: Revision,
 }
 
@@ -1657,6 +1657,19 @@ pub enum PromoteError {
     /// `partitions/1` or the owner's grant record is not one this build reads.
     #[error("{0}")]
     Record(String),
+    /// Another promote committed instead of this one (A-R448): it fenced over this run after
+    /// this run had sent its plan, and F1 committed its plan. A promote did happen.
+    #[error(
+        "another promote committed instead: node {who} dropped, generation {generation}; run \
+         status before promoting again",
+        who = names_in_words(.dropped)
+    )]
+    Superseded {
+        /// The nodes the committed configuration leaves out.
+        dropped: Vec<u32>,
+        /// The generation it committed.
+        generation: u64,
+    },
     /// The new owner's node could not be sent the plan.
     #[error(
         "node {node} could not be sent the new plan; partition 1 takes no writes until a promote \
@@ -1687,10 +1700,10 @@ impl PromoteError {
 
 impl From<PromoteError> for ApiError {
     /// A-R256: a refused argument is `INVALID_ARGUMENT`; anything else `UNAVAILABLE`. Each of
-    /// those texts but `Record`'s and `Unconfigured`'s ends "promote again", and promoting again
+    /// those texts but `Record`'s, `Unconfigured`'s and `Superseded`'s ends "promote again", and promoting again
     /// picks up where this one stopped, so its retry rule is `BoundedJitter`: the step says to
     /// try again and agrees with the text. A record this build cannot read, or a `to` with no configuration since its
-    /// restart, is `NotWired`: retrying will not help.
+    /// restart, or another promote's commit (`Superseded`), is `NotWired`: retrying will not help.
     fn from(error: PromoteError) -> Self {
         let no_mutation = error.no_mutation();
         let retry = match &error {
@@ -1698,7 +1711,9 @@ impl From<PromoteError> for ApiError {
             | PromoteError::NotAMember { .. }
             | PromoteError::AlreadyOwner { .. }
             | PromoteError::DropIsTarget => return Self::invalid(error.to_string()),
-            PromoteError::Record(_) | PromoteError::Unconfigured { .. } => RetryRule::NotWired,
+            PromoteError::Record(_)
+            | PromoteError::Unconfigured { .. }
+            | PromoteError::Superseded { .. } => RetryRule::NotWired,
             PromoteError::PeersUnknown { .. }
             | PromoteError::StaleMembers { .. }
             | PromoteError::Unreachable { .. }
@@ -1806,7 +1821,10 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
 ///    `ExpiryProven` and whose `control_revision` is `R`. F1's commit is a CAS there. The node
 ///    commits only the stored plan, never the one sent (A-R447, issue #70); the plan is sent
 ///    too only so a node logs it arriving.
-/// 7. Wait until `partitions/1` names `to` as owner at a newer generation.
+/// 7. Wait until `partitions/1` names `to` as owner at a newer generation, pinning the
+///    members of this run's plan (A-R448). Another set there is another promote's commit:
+///    [`PromoteError::Superseded`]. A record that pins none (layout 3) is taken as today and
+///    logged `promote_outcome_unproven`. The answer names the commit's revision.
 ///
 /// Running it again after it stopped picks up from the record and grant it left. Logged as
 /// `promote_*` lines.
@@ -2015,6 +2033,9 @@ pub(crate) async fn promote_looked(
         AuthorityGeneration(1),
     );
     store_plan(&*ctx.store, fenced_at, &plan).await?;
+    // What F1 pins in `partitions/1` when it commits this plan (A-R448): step 7 answers Ok only
+    // for a commit that carries it.
+    let own: Vec<NodeId> = sorted_nodes(&RecordMember::pinned(&plan.config));
     let fence = FencingProof {
         partition: PARTITION,
         prior_generation: record.generation,
@@ -2043,13 +2064,42 @@ pub(crate) async fn promote_looked(
         .map_err(|_| PromoteError::Unreachable { node: ctx.to.0 })?;
     }
 
-    // 7. The commit.
+    // 7. The commit, and that it is this run's (A-R448): another promote that fenced over this
+    // one after it sent may be the one F1 committed.
     loop {
-        let (now, ..) = read_partition(&*ctx.store).await?;
+        let (now, _, pinned, committed_at, _) = read_partition(&*ctx.store).await?;
         if now.owner == ctx.to && now.generation > record.generation {
+            match pinned.as_deref().map(sorted_nodes) {
+                Some(committed) if committed != own => {
+                    let dropped: Vec<u32> = written
+                        .iter()
+                        .map(|member| member.node.0)
+                        .filter(|node| !committed.contains(&NodeId(*node)))
+                        .collect();
+                    tracing::warn!(
+                        owner = ctx.to.0,
+                        generation = now.generation.0,
+                        revision = committed_at,
+                        committed = ?committed.iter().map(|node| node.0).collect::<Vec<_>>(),
+                        own = ?own.iter().map(|node| node.0).collect::<Vec<_>>(),
+                        "promote_superseded"
+                    );
+                    return Err(PromoteError::Superseded {
+                        dropped,
+                        generation: now.generation.0,
+                    });
+                }
+                Some(_) => {}
+                None => tracing::warn!(
+                    owner = ctx.to.0,
+                    generation = now.generation.0,
+                    "promote_outcome_unproven"
+                ),
+            }
             tracing::info!(
                 owner = ctx.to.0,
                 generation = now.generation.0,
+                revision = committed_at,
                 "promote_committed"
             );
             return Ok(Promoted {
@@ -2058,7 +2108,7 @@ pub(crate) async fn promote_looked(
                 dropped,
                 generation: now.generation,
                 frozen_grant: frozen.grant,
-                control_revision: Revision(control_revision),
+                control_revision: Revision(committed_at),
             });
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2271,6 +2321,13 @@ async fn store_plan(
             "{key} is absent after a create that was not reported applied; promote again"
         ))),
     }
+}
+
+/// The nodes `members` names, in order.
+fn sorted_nodes(members: &[RecordMember]) -> Vec<NodeId> {
+    let mut nodes: Vec<NodeId> = members.iter().map(|member| member.node).collect();
+    nodes.sort_unstable();
+    nodes
 }
 
 /// The boot a promote pins a kept member at when no link to it came up (D4, A-R398): `0`,
@@ -4061,77 +4118,351 @@ mod tests {
         );
     }
 
-    /// A-R447 step 6: another promote fences `partitions/1` again while this one waits out the
-    /// grant. The record's bytes are the same, but its revision is not this run's, so this run
-    /// refuses and sends nothing: the newer run owns the fence.
-    /// Cut: the revision check removed: this run sends its fence at the other run's revision,
-    /// red.
-    /// The other run waits for this run's own `Fencing` write (a revision past the rooted one)
-    /// and only then CASes over it, so the order is a condition, not a sleep. Node 1's grant
-    /// stays live for a scaled second, which keeps this run in its expiry wait meanwhile.
-    /// Unit (~1 s at scale 1): `MemStore`.
+    /// A-R447 step 6: another promote fences `partitions/1` again between this run's `Fencing`
+    /// write and its step 6. The record's bytes are the same, but its revision is not this run's,
+    /// so this run refuses and sends nothing: the newer run owns the fence.
+    /// The order is built, not timed (Revobot r4): every put after this run's `Fencing` CAS
+    /// parks at the store's gate, so its freeze (step 4) waits there while the row CASes over
+    /// `partitions/1` underneath, then goes on. Node 1's grant is long expired, so no clock
+    /// decides anything.
+    /// Cut: the revision check removed: this run stores and sends its plan at the other run's
+    /// revision, red.
+    /// Unit (<100 ms): `Scripted::gated_with`.
     #[test]
     fn m10_s2_r447_a_promote_fenced_over_by_another_run_refuses_and_sends_nothing() {
         let rt = runtime();
-        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let rooted_at = rooted(&*store, &rt, BootId(5));
-        let window = crate::host::test_patience(Duration::from_secs(1));
-        let live = GrantRecord {
-            grant: GrantId(4),
-            node: OWNER,
-            boot: BootId(5),
-            authority_generation: AuthorityGeneration(0),
-            expiry_utc_ms: i64::try_from(HostClock::start().now().0).expect("fits")
-                + i64::try_from(window.as_millis()).expect("fits"),
-            frozen: false,
-        };
-        rt.block_on(store.put(PutRequest {
-            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
-            value: live.encode(),
-            expected_mod_revision: Some(0),
-            dedup: None,
-        }))
-        .expect("put grants/1");
-        let other = Arc::clone(&store);
-        let rerun = std::thread::spawn(move || {
+        let gated = Arc::new(Scripted::gated_with(Script {
+            pass_gate: 1,
+            ..Script::default()
+        }));
+        let mem = gated.mem();
+        let rooted_at = rooted(mem, &rt, BootId(5));
+        put_grant(mem, &rt, expired_grant());
+        let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+        let promoter = std::thread::spawn(move || {
             let rt = runtime();
-            let read = || async {
-                let found = other
-                    .get(GetRequest {
-                        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-                    })
-                    .await
-                    .expect("get")
-                    .record
-                    .expect("partitions/1");
-                let fencing = PartitionRecord::decode(&found.value)
-                    .is_some_and(|record| record.lifecycle == PartitionLifecycle::Fencing);
-                (fencing && found.mod_revision > rooted_at).then_some(found)
-            };
-            let found = rt
-                .block_on(config_testkit::poll::poll_until_async(
-                    crate::host::test_patience(Duration::from_secs(2)),
-                    Duration::from_millis(5),
-                    read,
-                ))
-                .expect("this run's own Fencing write");
-            put(&other, &rt, found.value, found.mod_revision);
+            promote_once(
+                &store,
+                &rt,
+                NodeId(2),
+                None,
+                members(),
+                all_known(),
+                crate::host::test_patience(Duration::from_secs(2)),
+            )
         });
-        let (answer, sent) = promote_once(
-            &store,
-            &rt,
-            NodeId(2),
-            None,
-            members(),
-            all_known(),
-            window + crate::host::test_patience(Duration::from_secs(2)),
+        rt.block_on(async {
+            tokio::time::timeout(
+                crate::host::test_patience(Duration::from_secs(2)),
+                gated.put_arrived.notified(),
+            )
+            .await
+        })
+        .expect("this run's freeze parks at the gate");
+        let found = partition_now(mem, &rt);
+        assert!(
+            found.mod_revision > rooted_at
+                && PartitionRecord::decode(&found.value)
+                    .is_some_and(|record| record.lifecycle == PartitionLifecycle::Fencing),
+            "this run's own Fencing write is in: revision {}",
+            found.mod_revision
         );
-        rerun.join().expect("the other run's CAS");
+        let over = rt
+            .block_on(mem.put(PutRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                value: found.value,
+                expected_mod_revision: Some(found.mod_revision),
+                dedup: None,
+            }))
+            .expect("the other run's CAS");
+        assert_eq!(over.outcome, MutationOutcome::Applied);
+        gated.rescript(Script {
+            pass_gate: u32::MAX,
+            ..Script::default()
+        });
+        gated.release();
+        let (answer, sent) = promoter.join().expect("the promote");
         let refused = answer.expect_err("fenced over").to_string();
         assert!(
             refused.contains("another promote is running; promote again"),
             "{refused}"
         );
         assert!(sent.is_empty(), "sent {sent:?}");
+    }
+
+    /// Node 1's grant, never frozen and long expired: a promote freezes it and proves its expiry
+    /// at once.
+    fn expired_grant() -> GrantRecord {
+        GrantRecord {
+            grant: GrantId(4),
+            node: OWNER,
+            boot: BootId(5),
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: i64::try_from(HostClock::start().now().0).expect("fits") - 60_000,
+            frozen: false,
+        }
+    }
+
+    fn put_grant(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, grant: GrantRecord) {
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            value: grant.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/1");
+    }
+
+    /// A promote's answer and what it sent, as [`promote_once`] returns them.
+    type Ran = (Result<Promoted, PromoteError>, Vec<(NodeId, Msg)>);
+
+    /// One promote on its own thread. The receiver hears once it has sent its fence.
+    fn promote_started(
+        store: &Arc<dyn ConfigStore>,
+        to: NodeId,
+        drop: Option<NodeId>,
+    ) -> (std::thread::JoinHandle<Ran>, std::sync::mpsc::Receiver<()>) {
+        let (fenced, heard) = std::sync::mpsc::channel();
+        let fenced = std::sync::Mutex::new(fenced);
+        let sent: Sent = Arc::default();
+        let log = Arc::clone(&sent);
+        let ctx = PromoteCtx {
+            store: Arc::clone(store),
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            to,
+            drop,
+            within: crate::host::test_patience(Duration::from_secs(3)),
+            members: members(),
+            members_version: CONFIG_VERSION,
+            member_boot: all_known(),
+            send: Arc::new(move |node, msg| {
+                let fence = matches!(
+                    msg,
+                    Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::FenceProven(_)),
+                        ..
+                    }
+                );
+                log.lock().expect("log").push((node, msg));
+                if fence {
+                    fenced
+                        .lock()
+                        .expect("fenced")
+                        .send(())
+                        .expect("the row listens");
+                }
+                Ok(())
+            }),
+        };
+        let run = std::thread::spawn(move || {
+            let answer = runtime().block_on(promote(ctx));
+            let sent = std::mem::take(&mut *sent.lock().expect("sent"));
+            (answer, sent)
+        });
+        (run, heard)
+    }
+
+    /// What F1 writes when it commits a promote to node 2: `partitions/1` owned by node 2 at the
+    /// next generation, pinning the members of the plan stored at `revision`, as layout 4, by a
+    /// CAS at `revision` (`recovery::commit::Cas`). The commit's revision, or `None` when the
+    /// CAS did not apply. `layout_3` writes it pinning no members, as a build before A-R426 would.
+    fn commit_at(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+        revision: Revision,
+        layout_3: bool,
+    ) -> Option<u64> {
+        let plan = stored_plan_at(store, rt, revision).expect("the fence's stored plan");
+        let found = partition_now(store, rt);
+        let root = PartitionRoot::decode(&found.value).expect("root");
+        let record = PartitionRecord::decode(&found.value).expect("record");
+        let committed = PartitionRecord {
+            owner: NodeId(2),
+            generation: Generation(record.generation.0 + 1),
+            owner_epoch: OwnerEpoch(record.owner_epoch.0 + 1),
+            lifecycle: PartitionLifecycle::Serving,
+            ..record
+        };
+        let response = rt
+            .block_on(store.put(PutRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                value: if layout_3 {
+                    committed.encode_with(&root)
+                } else {
+                    committed.encode_with_members(&root, &RecordMember::pinned(&plan.config))
+                },
+                expected_mod_revision: Some(revision.0),
+                dedup: None,
+            }))
+            .expect("put");
+        (response.outcome == MutationOutcome::Applied).then_some(response.revision)
+    }
+
+    /// Two promotes to node 2 overlap, the earlier sent first. The later fences over it after
+    /// the earlier has sent, and F1 commits the later fence: the earlier's commit CAS fails.
+    /// Answers both runs' answers, earlier first, and the commit's revision.
+    fn overlapped_after_send(
+        rt: &tokio::runtime::Runtime,
+        earlier_drop: Option<NodeId>,
+        later_drop: Option<NodeId>,
+    ) -> (
+        Result<Promoted, PromoteError>,
+        Result<Promoted, PromoteError>,
+        u64,
+    ) {
+        let patience = crate::host::test_patience(Duration::from_secs(2));
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, rt, BootId(5));
+        put_grant(&*store, rt, expired_grant());
+        let (earlier, earlier_fenced) = promote_started(&store, NodeId(2), earlier_drop);
+        earlier_fenced
+            .recv_timeout(patience)
+            .expect("the earlier run sends its fence");
+        let earlier_at = partition_now(&*store, rt).mod_revision;
+        let (later, later_fenced) = promote_started(&store, NodeId(2), later_drop);
+        later_fenced
+            .recv_timeout(patience)
+            .expect("the later run sends its fence");
+        let later_at = partition_now(&*store, rt).mod_revision;
+        assert!(later_at > earlier_at, "the later run fenced over");
+        assert_eq!(
+            commit_at(&*store, rt, Revision(earlier_at), false),
+            None,
+            "the earlier fence is stale"
+        );
+        let committed =
+            commit_at(&*store, rt, Revision(later_at), false).expect("F1 commits the later");
+        let (earlier, _) = earlier.join().expect("the earlier run");
+        let (later, _) = later.join().expect("the later run");
+        (earlier, later, committed)
+    }
+
+    /// Revobot r4, ruling A-R448 (step 7): two promotes to node 2 overlap. Each answers only for
+    /// the commit it sees, and only Ok when that commit pins its own plan's members.
+    /// (1) The later run (drop 3) fences over the earlier (drop 1) before the earlier reaches
+    /// step 6: the earlier is refused "another promote is running" and sends nothing; the later
+    /// answers Ok, dropped 3, at the commit's revision.
+    /// (2) The later run fences over after the earlier has sent, and F1 commits the later one.
+    /// The earlier answers "another promote committed instead", naming node 3, and does not
+    /// claim no mutation. The later answers Ok, dropped 3.
+    /// (3) As (2), both dropping node 1: the commit carries both runs' members, so both answer
+    /// Ok, each with the commit's generation and revision, never its own fence's.
+    /// (4) A commit pinning no members (layout 3) is taken as before, Ok.
+    /// Cut: the member comparison dropped, (2) red.
+    /// Unit (<1 s): `MemStore`, `Scripted::gated_with`, a stand-in for F1's commit CAS.
+    #[test]
+    fn m10_s2_r448_overlapping_promotes_each_answer_only_for_their_own_commit() {
+        let rt = runtime();
+        let patience = crate::host::test_patience(Duration::from_secs(2));
+
+        // (1)
+        let gated = Arc::new(Scripted::gated_with(Script {
+            pass_gate: 1,
+            ..Script::default()
+        }));
+        let mem = gated.mem();
+        rooted(mem, &rt, BootId(5));
+        put_grant(mem, &rt, expired_grant());
+        let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+        let (earlier, _) = promote_started(&store, NodeId(2), None);
+        rt.block_on(async { tokio::time::timeout(patience, gated.put_arrived.notified()).await })
+            .expect("the earlier run's freeze parks at the gate");
+        let earlier_at = partition_now(mem, &rt).mod_revision;
+        gated.rescript(Script {
+            pass_gate: u32::MAX,
+            ..Script::default()
+        });
+        let (later, later_fenced) = promote_started(&store, NodeId(2), Some(NodeId(3)));
+        later_fenced
+            .recv_timeout(patience)
+            .expect("the later run sends its fence");
+        gated.release();
+        let (refused, sent) = earlier.join().expect("the earlier run");
+        let refused = refused.expect_err("fenced over").to_string();
+        assert!(
+            refused.contains("another promote is running"),
+            "(1) {refused}"
+        );
+        assert!(sent.is_empty(), "(1) the earlier run sent {sent:?}");
+        let later_at = partition_now(mem, &rt).mod_revision;
+        assert!(later_at > earlier_at, "(1) the later run fenced over");
+        let committed = commit_at(mem, &rt, Revision(later_at), false).expect("(1) F1 commits");
+        let (answer, _) = later.join().expect("the later run");
+        let done = answer.expect("(1) the later run commits");
+        assert_eq!(
+            (done.control_revision, done.dropped, done.generation),
+            (Revision(committed), NodeId(3), Generation(4)),
+            "(1) the later run answers for its own commit"
+        );
+
+        // (2)
+        let (earlier, later, committed) = overlapped_after_send(&rt, None, Some(NodeId(3)));
+        let superseded = earlier.expect_err("(2) the earlier run's plan did not commit");
+        assert_eq!(
+            superseded,
+            PromoteError::Superseded {
+                dropped: vec![3],
+                generation: 4
+            },
+            "(2) {superseded}"
+        );
+        assert_eq!(
+            superseded.to_string(),
+            "another promote committed instead: node 3 dropped, generation 4; run status before \
+             promoting again",
+            "(2)"
+        );
+        assert!(!superseded.no_mutation(), "(2) a promote did happen");
+        let answered = ApiError::from(superseded.clone());
+        assert_eq!(
+            (answered.retry, answered.no_mutation),
+            (RetryRule::NotWired, false),
+            "(2) promoting again blindly will not help: {answered:?}"
+        );
+        let done = later.expect("(2) the later run commits");
+        assert_eq!(
+            (done.control_revision, done.dropped, done.generation),
+            (Revision(committed), NodeId(3), Generation(4)),
+            "(2) the later run answers for its own commit"
+        );
+
+        // (3)
+        let (earlier, later, committed) = overlapped_after_send(&rt, None, None);
+        for (run, answer) in [("earlier", earlier), ("later", later)] {
+            let done = answer.unwrap_or_else(|error| panic!("(3) the {run} run: {error}"));
+            assert_eq!(
+                (done.control_revision, done.dropped, done.generation),
+                (Revision(committed), NodeId(1), Generation(4)),
+                "(3) the {run} run names the commit"
+            );
+        }
+
+        // (4) A commit that pins no members (layout 3) cannot be told apart: taken as today, and
+        // logged `promote_outcome_unproven`.
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        put_grant(&*store, &rt, expired_grant());
+        let (run, fenced) = promote_started(&store, NodeId(2), Some(NodeId(3)));
+        fenced
+            .recv_timeout(patience)
+            .expect("(4) the run sends its fence");
+        let fenced_at = partition_now(&*store, &rt).mod_revision;
+        let committed = commit_at(&*store, &rt, Revision(fenced_at), true).expect("(4) F1 commits");
+        let done = run.join().expect("the run").0.expect("(4) taken as today");
+        assert_eq!(
+            (done.control_revision, done.dropped, done.generation),
+            (Revision(committed), NodeId(3), Generation(4)),
+            "(4)"
+        );
+    }
+
+    fn partition_now(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime) -> config_core::Record {
+        rt.block_on(store.get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        }))
+        .expect("get")
+        .record
+        .expect("partitions/1")
     }
 }

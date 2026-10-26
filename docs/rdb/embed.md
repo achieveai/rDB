@@ -657,7 +657,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   promoter has stored its plan, any node that can read rEtcd can finish that same stored plan,
   on a node and at a time the sender picks. That is harmless: it is the promoter's own plan.
   - **Wait for `promote` to answer before running it again.** A rerun while the earlier run is
-    still committing (up to about 15 s) cancels that run's commit. This costs time, not safety.
+    still committing (up to about 15 s) can cancel that run's commit. This costs time, not
+    safety. The earlier run then answers "another promote committed instead", naming the node
+    the other run dropped: run status before promoting again.
   - **Upgrade every node before you use `promote`.** A node built before issue #70 still
     trusts a plan sent to it directly.
   - **The dropped node is added back automatically when it starts again, or at the next
