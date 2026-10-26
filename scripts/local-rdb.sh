@@ -424,13 +424,15 @@ up() {
     RUN="$ROOT/$sha-$BASE_PORT-$stamp"
     mkdir -p "$RUN"/{out,stop,faults,logs}
     CONTROL="$(control_endpoints)"
+    # pick_run sources this file, so the paths are shell-quoted: a target dir with a space
+    # in it broke every later verb (PR #63 review).
     cat > "$RUN/run.env" <<EOF
 BASE_PORT=$BASE_PORT
 CONTROL=$CONTROL
 SHA=$sha
 PROFILE=$PROFILE
-NODE_BIN=$NODE_BIN
-PILOT_BIN=$PILOT_BIN
+NODE_BIN=$(printf '%q' "$NODE_BIN")
+PILOT_BIN=$(printf '%q' "$PILOT_BIN")
 EOF
     : > "$RUN/pids"
     echo "$RUN" > "$ROOT/current"
