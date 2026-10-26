@@ -6393,7 +6393,10 @@ impl Host {
         else {
             return;
         };
-        if !owner {
+        // T8: a shadow this owner has no link to is not promoted, however far it got: the
+        // promote would leave the source out for a copy that may be gone. A move's shadow is
+        // given up past the drop clock instead ([`Self::shadow_give_up_duty`]).
+        if !owner || !self.linked(shadow.node) {
             return;
         }
         // M11: a shadow pinned beside all rf3 regular copies is a move's target. It is promoted

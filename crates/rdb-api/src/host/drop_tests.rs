@@ -3518,6 +3518,60 @@ fn m11_t4_a_move_whose_target_is_unreachable_past_the_drop_clock_is_given_up() {
     }
 }
 
+/// M11 defect T8 (tester walk): the owner promoted a caught-up shadow whose link was already
+/// down. The promote left the healthy source out, writes paused on the dead target until the
+/// drop clock dropped it, and only two copies were left. Now a shadow the owner has no link to
+/// is not promoted: node 4 catches up, its links go, and the move is given up past the drop
+/// clock with node 3 kept, as in T4.
+/// Integration (~4 s): bootstrap's window, the join, the drop clock, the give-up re-plan.
+#[config_log::retcd_test]
+fn m11_t8_a_caught_up_shadow_with_no_link_is_not_promoted() {
+    const METHOD: &str = "m11_t8_a_caught_up_shadow_with_no_link_is_not_promoted";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 4 a shadow at the cutoff, not yet promoted", |trio| {
+        let host = &trio.nodes[0].0;
+        let committed = host.committed.get(&PartitionId(1))?;
+        let shadow = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(4) && member.role == ReplicaRole::Shadow)?;
+        assert!(
+            !matches!(
+                host.rejoins.get(&PartitionId(1)),
+                Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                    if replan.promote
+            ),
+            "promoted in the step node 4 caught up: the row cannot cut its links first"
+        );
+        let acked = host
+            .replication
+            .primary(NodeId(1), PartitionId(1))?
+            .tracker()
+            .peer(shadow.copy)
+            .map_or(0, |peer| peer.progress.buffered_applied.0);
+        (acked >= committed.selected.cutoff_seq.0).then_some(())
+    });
+    for other in [1, 2, 3] {
+        trio.links.hold(NodeId(other), NodeId(4));
+    }
+    let (_, _, members) = trio.until("node 1 left node 4 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&4))
+    });
+    assert_eq!(members, vec![1, 2, 3], "node 3 keeps its copy");
+    assert_eq!(pinned_role(&trio, 3), Some(ReplicaRole::RegularSecondary));
+    assert!(
+        logged!(METHOD, "shadow_promote").is_empty(),
+        "a shadow with no link was promoted"
+    );
+}
+
 /// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
 /// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
 /// left-out member, and the partition pinned the moved-off copy again on its own. The move's
