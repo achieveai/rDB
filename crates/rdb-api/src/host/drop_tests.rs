@@ -3423,7 +3423,10 @@ fn m11_q3_a_move_onto_an_empty_node_pins_its_shadow_in_under_half_a_second() {
     let pinned = trio.clock.now();
     let waited = pinned.0 - asked.0;
     tracing::info!(waited_ms = waited, "m11_q3_shadow_pinned");
-    assert!(waited < 500, "the shadow was pinned {waited} ms after the ask");
+    assert!(
+        waited < 500,
+        "the shadow was pinned {waited} ms after the ask"
+    );
     let mut request = 2;
     let (_, _, members) = trio.until("node 4 regular and node 3 out", |trio| {
         commit_of(trio).filter(|(_, _, members)| !members.contains(&3))
@@ -3442,7 +3445,10 @@ fn m11_q3_a_move_onto_an_empty_node_pins_its_shadow_in_under_half_a_second() {
             // The promote's commit lands under it: `Db` reconciles and asks again.
             Answer::Error { error, .. }
                 if error.no_mutation
-                    && matches!(error.name().as_str(), "PROTECTION_PAUSED" | "GENERATION_CHANGED") =>
+                    && matches!(
+                        error.name().as_str(),
+                        "PROTECTION_PAUSED" | "GENERATION_CHANGED"
+                    ) =>
             {
                 pass(&mut trio, 20);
                 assert!(

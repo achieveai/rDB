@@ -828,14 +828,22 @@ fn m11_q3_a_failed_shadow_never_holds_the_window() {
     first.report(11, inv(A, 20));
     first.report(12, inv(B, 20));
     let close = first.report(13, inv(C, 20));
-    assert_eq!(close.first(), Some(&r(RecoveryEffect::CloseWindow)), "{close:?}");
+    assert_eq!(
+        close.first(),
+        Some(&r(RecoveryEffect::CloseWindow)),
+        "{close:?}"
+    );
     assert!(has_selected(&close), "{close:?}");
 
     let mut last = fenced(&shadow);
     for (at, copy) in [(10, A), (11, B), (12, C)] {
         last.report(at, inv(copy, 20));
     }
-    assert_eq!(last.phase(), RecoveryPhase::Collecting, "the shadow is still asked");
+    assert_eq!(
+        last.phase(),
+        RecoveryPhase::Collecting,
+        "the shadow is still asked"
+    );
     let close = last.rec(13, RecoveryEvent::InventoryFailed { copy: D });
     assert!(close.contains(&r(RecoveryEffect::CloseWindow)), "{close:?}");
     assert!(has_selected(&close), "{close:?}");
@@ -845,7 +853,11 @@ fn m11_q3_a_failed_shadow_never_holds_the_window() {
     for (at, copy) in [(11, A), (12, B), (13, C)] {
         regular.report(at, inv(copy, 20));
     }
-    assert_eq!(regular.phase(), RecoveryPhase::Collecting, "a failed regular holds it");
+    assert_eq!(
+        regular.phase(),
+        RecoveryPhase::Collecting,
+        "a failed regular holds it"
+    );
 }
 
 /// Scaffolds M7B-88/89: a stale-lineage or quarantined survivor is recorded, never selected, and

@@ -299,13 +299,10 @@ impl Collecting {
     /// is withdrawn, and `CloseWindow` is the last effect this pushes, as on a deadline's close.
     pub(crate) fn close_if_all_answered(&mut self, emit: &mut Emit<'_>) -> bool {
         let answered = matches!(self.window, Window::Open { .. })
-            && !self
-                .lost
-                .values()
-                .any(|outcome| match outcome {
-                    InventoryOutcome::Failed { copy, .. } => !self.shadows.contains(copy),
-                    _ => false,
-                })
+            && !self.lost.values().any(|outcome| match outcome {
+                InventoryOutcome::Failed { copy, .. } => !self.shadows.contains(copy),
+                _ => false,
+            })
             && self
                 .queried
                 .iter()
