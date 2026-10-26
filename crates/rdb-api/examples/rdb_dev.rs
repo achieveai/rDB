@@ -2012,7 +2012,11 @@ fn promote_line(db: &Db, to: NodeId, drop: Option<NodeId>) -> Result<String, Str
             Ok(promoted_line(&promoted))
         }
         Err(error) => {
-            tracing::warn!(error = %error, "repl_promote_refused");
+            tracing::warn!(
+                error = %error,
+                no_mutation = error.no_mutation,
+                "repl_promote_refused"
+            );
             Err(format!("err admin promote: {error}"))
         }
     }

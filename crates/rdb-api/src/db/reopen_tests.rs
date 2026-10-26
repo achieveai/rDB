@@ -2516,6 +2516,18 @@ fn m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_takes_the_members_
         (NodeId(2), NodeId(1), NodeId(1)),
         "{promoted:?}"
     );
+    // Bug bash #64 leftover: the look the record overrides is not logged as a warning.
+    let warned: Vec<_> = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_takes_the_members_from_the_record",
+    )
+    .into_iter()
+    .filter(|line| line["@m"] == "promote_members_unknown" && line["@l"] != "Debug")
+    .collect();
+    assert!(
+        warned.is_empty(),
+        "a promote that succeeds warns nothing: {warned:?}"
+    );
     let after = stored().expect("the new owner's commit wrote layout 4 too");
     assert_eq!(
         after.iter().map(|m| m.node.0).collect::<Vec<_>>(),
@@ -2541,6 +2553,11 @@ fn m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_takes_the_members_
             Err(refused) => panic!("a put after the promote: {refused:?}"),
         }
     }
+    // Bug bash #64 leftover: the node process that waited for node 1 since its open sees node 2
+    // own the partition now, so its ready wait ends instead of asking node 1 forever.
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(5)))
+        .expect("nodes 2 and 3 are ready once node 2 owns the partition");
     app.shutdown();
     nodes.shutdown();
 }
@@ -3397,6 +3414,17 @@ fn m10_s2_a_promote_that_could_not_reach_node_2_finishes_when_run_again_and_rede
         "{refused:?}"
     );
     assert_eq!(partition_owner(&rt, &store), (crate::admin::OWNER, before));
+    // Bug bash #64 leftover: the refusal's log line says nothing changed.
+    let failed: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "db_promote_failed")
+        .map(|line| line["no_mutation"].as_bool())
+        .collect();
+    assert_eq!(
+        failed,
+        [Some(true)],
+        "one db_promote_failed with no_mutation=true"
+    );
 
     assert_eq!(
         nodes.restart_node(NodeId(2)).expect("node 2 runs again"),

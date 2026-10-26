@@ -21,6 +21,7 @@
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
 # it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
 # each node; when it does not, they print its last not-ready line and exit 1, leaving it running.
+# When that line says no link reaches the owner, they also print the `promote` that ends the wait.
 # Any other verb is refused with the list of verbs, exit 2.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
@@ -269,16 +270,32 @@ await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an ex
     line="$(settled_line "$out")"
     if [ -n "$line" ]; then
         say "node $n: $line"
-        case "$line" in "rdb_node ready"*) return 0 ;; *) return 1 ;; esac
+        case "$line" in "rdb_node ready"*) return 0 ;; esac
+        promote_hint "$n" "$line"
+        return 1
     fi
     tail -n 5 "$RUN/out/node-$n.err" >&2 || true
     line="$(grep "^rdb_node not-ready" "$out" 2>/dev/null | tail -n1 || true)"
     if os_pid_is "$os" rdb_node; then
         say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
+        promote_hint "$n" "$line"
     else
         say "node $n: exited before it was ready${line:+; last: $line} (see $RUN/out/node-$n.err)"
     fi
     return 1
+}
+
+promote_hint() { # n line: a node that gave up waiting for an owner no link reaches names the
+    # promote that ends the wait (bug bash #64): the lowest running node but the lost one.
+    local n="$1" gone k
+    gone="$(printf '%s' "$2" | sed -n 's/.*node \([0-9]\) is not reachable from this process.*/\1/p')"
+    { [ -n "$gone" ] && [ "$gone" != "$n" ]; } || return 0
+    for k in 1 2 3; do
+        if [ "$k" != "$gone" ] && node_alive "$k"; then
+            say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
+            return 0
+        fi
+    done
 }
 
 not_ready() { # n: `start`/`restart` end here when await_ready did not see ready (A-R287 item 4)

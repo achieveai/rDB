@@ -1581,6 +1581,10 @@ impl Db {
             if looked == Err(Unlooked::NoLink) {
                 // What is known now: the owner is not reachable, whatever an earlier look saw.
                 NO_LINK.clone_into(&mut phase);
+                // A promote may have moved the partition away from it (bug bash #64): read the
+                // owner again, at most once per `OWNER_REREAD_GAP`, so the next look asks the
+                // owner `partitions/1` names now.
+                self.refresh_owner();
             }
             if let Ok(owner) = looked {
                 if owner.admits == Some(true) {
@@ -2940,7 +2944,12 @@ impl Db {
         let promoted = match answer.recv_timeout(within + Duration::from_secs(5)) {
             Ok(Ok(promoted)) => promoted,
             Ok(Err(error)) => {
-                tracing::warn!(to = to.0, %error, "db_promote_failed");
+                tracing::warn!(
+                    to = to.0,
+                    %error,
+                    no_mutation = error.no_mutation(),
+                    "db_promote_failed"
+                );
                 return Err(error.into());
             }
             Err(_) => {

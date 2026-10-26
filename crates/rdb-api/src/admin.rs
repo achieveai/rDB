@@ -1769,7 +1769,9 @@ pub(crate) fn promote_members(
             within_ms: within.as_millis(),
         },
     };
-    tracing::warn!(to = to.0, %error, "promote_members_unknown");
+    // Debug, not a warning: a layout-4 `partitions/1` may still plan the promote, and then the
+    // promote succeeds. `promote_looked` warns when it refuses on this look (bug bash #64).
+    tracing::debug!(to = to.0, %error, "promote_members_unknown");
     Err(error)
 }
 
@@ -1825,7 +1827,13 @@ pub(crate) async fn promote_looked(
         // `to` did not answer at all: it is refused before anything is written whatever the
         // record pins, so no owner is fenced toward a node that is not there (A-R412).
         (_, Some(refused @ PromoteError::PeersUnknown { .. })) | (None, Some(refused)) => {
-            return Err(refused)
+            tracing::warn!(
+                to = ctx.to.0,
+                error = %refused,
+                no_mutation = refused.no_mutation(),
+                "promote_members_unknown"
+            );
+            return Err(refused);
         }
         (Some(stored), _) => (
             stored
