@@ -6155,6 +6155,19 @@ impl Host {
             .filter(|member| member.role != ReplicaRole::Shadow)
             .count();
         let rf = crate::admin::members().len();
+        if regular < rf && members.len() < rf {
+            // A-R456: a copy is missing and a slot is free; the way back is a rebuild onto a
+            // spare, which `to` is.
+            return wait(format!(
+                "partition {} serves {mode:?} with {regular} regular copies (members: {}): a move \
+                 needs all {rf} serving. A copy is missing: run `admin rebuild {}` to pin node {} \
+                 in the free slot, then run the move again",
+                partition.0,
+                member_list(&members),
+                to.0,
+                to.0
+            ));
+        }
         if mode != PartitionMode::Active || regular != rf {
             return wait(format!(
                 "partition {} serves {mode:?} with {regular} regular copies (members: {}): a move \
@@ -6993,9 +7006,10 @@ impl Host {
         reply: RebuildReply,
     ) {
         use crate::admin::rebuild::{decide, kept, Asked, Ready, RebuildMode, Refused};
+        let me = self.node;
         let refuse = |reply: &RebuildReply, refused: Refused| {
             tracing::warn!(
-                node = self.node.0,
+                node = me.0,
                 partition = partition.0,
                 rebuild = node.0,
                 guard = refused.guard,
@@ -7041,7 +7055,16 @@ impl Host {
             .recoveries
             .get(&partition)
             .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined));
-        let known: Vec<NodeId> = crate::admin::members().iter().map(|m| m.node).collect();
+        let mut known: Vec<NodeId> = crate::admin::members().iter().map(|m| m.node).collect();
+        // A-R456 (T12): a spare, configured and not pinned, is a node a rebuild may pin. This
+        // owner counts one configured when it holds a link to it at a boot.
+        let pinned = members.iter().any(|member| member.node == node);
+        let spare = !pinned
+            && (1..=crate::db::MAX_NODES).contains(&node.0)
+            && self.links.boot_of(node).is_some();
+        if spare && !known.contains(&node) {
+            known.push(node);
+        }
         let asked = Asked {
             node,
             owner: self.node,
@@ -7076,6 +7099,17 @@ impl Host {
             "rebuild_asked"
         );
         if mode == RebuildMode::NotPinned {
+            let left = self
+                .left_out
+                .get(&partition)
+                .is_some_and(|left| left.iter().any(|member| member.node == node));
+            if !left {
+                let pinned_now = members.to_vec();
+                if let Err(refused) = self.rebuild_spare(partition, node, &pinned_now) {
+                    return refuse(&reply, refused);
+                }
+            }
+            let members = &self.committed[&partition].committed.pinned_config.members;
             reply.send(Ok(Ready {
                 mode,
                 generation,
@@ -7120,6 +7154,64 @@ impl Host {
         );
         self.blamed.remove(&partition);
         self.revoke(partition, epoch, Some(node), None);
+    }
+
+    /// M11 A-R456 (T12): `admin rebuild node` onto a spare, a node no commit pins and no drop
+    /// left out, is the way back from two copies. With a free slot (fewer members than rf3,
+    /// shadows counted, A-R455) and its copy id free, `node` is noted as left out at its live
+    /// boot, so once it restarts the re-add pins it as a shadow through the same commit CAS
+    /// (A-R450), and [`Self::shadow_duty`] promotes it. Refused, with nothing noted, otherwise.
+    fn rebuild_spare(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        members: &[Member],
+    ) -> Result<(), crate::admin::rebuild::Refused> {
+        let rf = crate::admin::members().len();
+        let list = member_list(members);
+        if members.len() >= rf {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "partition {} has no free slot for node {} (members: {list}): a rebuild                      onto a spare fills a missing copy; to replace a copy, run `admin move                      <source> {}`",
+                    partition.0, node.0, node.0
+                ),
+            });
+        }
+        let copy = move_copy_id(node).filter(|copy| !members.iter().any(|m| m.copy == *copy));
+        let Some(copy) = copy else {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "node {}'s copy id is taken in partition {} (members: {list}): name another                      spare",
+                    node.0, partition.0
+                ),
+            });
+        };
+        let Some(boot) = self.links.boot_of(node) else {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "node {} is not reachable from node {} (the owner): start it, then rebuild                      it",
+                    node.0, self.node.0
+                ),
+            });
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            spare = node.0,
+            copy = copy.0,
+            boot = boot.0,
+            "rebuild_spare_noted"
+        );
+        self.left_out.entry(partition).or_default().push(Member {
+            copy,
+            node,
+            boot,
+            role: ReplicaRole::RegularSecondary,
+        });
+        Ok(())
     }
 
     /// #65: answer each `admin rebuild` waiting on a re-plan without its node: G5 once a newer

@@ -3749,6 +3749,60 @@ fn m11_t10_a_move_target_lost_in_the_promote_barrier_is_given_up_at_once() {
     }
 }
 
+/// M11 T12 (ruling A-R456): the way back from two copies is `admin rebuild` onto a spare. Node 3
+/// dies and is dropped, so the commit pins nodes 1 and 2. `move 2 4` is refused and names
+/// `admin rebuild 4`; the rebuild of spare node 4 is answered at once (mode A), and once node 4
+/// restarts the owner pins it as a shadow and then regular: nodes 1, 2 and 4, and a put lands.
+/// Cut: `rebuild_asked` notes no spare (`rebuild_spare` not called), red (node 4 never pinned).
+/// Integration (~5 s): b1's drop, the re-add's re-plan, the catch-up, the promote.
+#[config_log::retcd_test]
+fn m11_t12_a_rebuild_onto_a_spare_fills_the_free_slot() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    kill(&trio, 3, &[1, 2, 4]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    match trio.ask(move_call(5_000, 2, 4)) {
+        Answer::Error { error, .. } => assert!(
+            error.detail.contains("admin rebuild 4") && !error.detail.contains("  "),
+            "{error:?}"
+        ),
+        other => panic!("move 2 4 with a copy missing: {other:?}"),
+    }
+    let (tx, rx) = mpsc::channel();
+    trio.nodes[0].0.rebuild_asked(
+        PartitionId(1),
+        NodeId(4),
+        Duration::from_secs(10),
+        RebuildReply(tx),
+    );
+    match rx.try_recv() {
+        Ok(Ok(ready)) => assert_eq!(
+            ready.mode,
+            crate::admin::rebuild::RebuildMode::NotPinned,
+            "{ready:?}"
+        ),
+        other => panic!("rebuild 4 onto a spare: {other:?}"),
+    }
+    restart(&mut trio, dir.path(), 4);
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    let (_, _, members) = trio.until("node 4 regular", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::RegularSecondary))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert_eq!(members, vec![1, 2, 4]);
+    trio.ready();
+    match trio.ask(put(5_001)) {
+        Answer::Txn { .. } => {}
+        other => panic!("a put with node 4 regular: {other:?}"),
+    }
+}
+
 /// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
 /// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
 /// left-out member, and the partition pinned the moved-off copy again on its own. The move's
