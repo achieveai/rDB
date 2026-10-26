@@ -2109,15 +2109,15 @@ fn not_built(words: &[&str]) -> Option<&'static str> {
 }
 
 /// `admin promote`'s usage (A-R245).
-const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are 1, 2 or 3; without \
+const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are nodes 1 to 8; without \
                              --drop the prior owner is dropped";
 
 /// `admin promote N [--drop M]`'s words after `promote`: the node to own partition 1, and the
 /// node to drop, `None` for `Db::promote`'s default, the prior owner. A node cannot be both.
 fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
     let (to, drop) = match rest {
-        [to] => (parse_node(to)?, None),
-        [to, "--drop", drop] => (parse_node(to)?, Some(parse_node(drop)?)),
+        [to] => (parse_any_node(to)?, None),
+        [to, "--drop", drop] => (parse_any_node(to)?, Some(parse_any_node(drop)?)),
         _ => return Err(PROMOTE_USAGE.to_owned()),
     };
     if drop == Some(to) {
@@ -7854,10 +7854,8 @@ mod tests {
                 "--cert-dir is read only with --nodes",
             ),
             (vec!["--app", "ops"], "--app is read only with --nodes"),
-            (
-                vec!["--nodes", "4=a:1"],
-                "--nodes: \"4\": a node is 1, 2 or 3",
-            ),
+            // M11 WS A: a run with spares links nodes 1 to 8.
+            (vec!["--nodes", "9=a:1"], "--nodes: \"9\": a node is 1 to 8"),
             (
                 vec!["--nodes", "1:a"],
                 "--nodes: \"1:a\" is not N=host:port",
@@ -7950,7 +7948,13 @@ mod tests {
                 "node 2 cannot be promoted and dropped at once; {PROMOTE_USAGE}"
             ))
         );
-        for bad in ["", "4", "2 --drop", "2 3", "2 --drop 3 x"] {
+        // M11 T5 (tester walk): after a move a member can be node 4 to 8; a promote of one was
+        // refused "a node is 1, 2 or 3", so losing the owner left no way to serve.
+        assert_eq!(
+            parse_promote(&words("5 --drop 1")),
+            Ok((NodeId(5), Some(NodeId(1))))
+        );
+        for bad in ["", "9", "2 --drop 9", "2 --drop", "2 3", "2 --drop 3 x"] {
             assert!(parse_promote(&words(bad)).is_err(), "{bad:?}");
         }
         let promoted = admin::Promoted {
