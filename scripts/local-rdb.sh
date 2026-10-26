@@ -10,6 +10,7 @@
 #   scripts/local-rdb.sh drop-request N [--node M] | drop-reply N [--node M]   [--run DIR]
 #   scripts/local-rdb.sh cut-control N | uncut-control N          [--run DIR]
 #   scripts/local-rdb.sh promote N [--drop M]                     [--run DIR]
+#   scripts/local-rdb.sh rebuild N [--wipe]                       [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
@@ -98,7 +99,7 @@ while [ $# -gt 0 ]; do
 done
 
 usage() {
-    sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -523,8 +524,8 @@ status() {
 # The surviving rdb_node processes take the new plan from their control watch. rdb_dev's own
 # answer and exit code are passed through. rdb_dev is built in the run's profile (run.env), so
 # an `up --release` run promotes with a release rdb_dev too (A-R295).
-promote() {
-    local dev line release=""
+admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its exit code is ours
+    local dev line="$1" release=""
     [ "$PROFILE" = release ] && release=--release
     dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
     if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$dev" ]; then
@@ -534,10 +535,43 @@ promote() {
         dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
     fi
     [ -f "$dev" ] || die "rdb_dev not found at $dev after building"
-    line="admin promote $ARG${DROP:+ --drop $DROP}"
     say "$line (rdb_dev: $dev)"
     printf '%s\nquit\n' "$line" | "$dev" --dir "$RUN/admin" --log-dir "$RUN/logs/admin" \
         --control "$CONTROL" --nodes "$(peers)" --cert-dir "$RUN/certs" --app admin
+}
+
+promote() { admin_line "admin promote $ARG${DROP:+ --drop $DROP}"; }
+
+node_boot() { # n: the boot node n's last start printed (`rdb_node listening ... boot=B`)
+    sed -n 's/^rdb_node listening .* boot=\([0-9][0-9]*\).*/\1/p' "$RUN/out/node-$1.out" 2>/dev/null | head -n1
+}
+
+# bb #65 over processes: only mode A (node N already left out by the owner) runs here, since
+# dropping N needs the owner's own process. rdb_dev checks the guards against the owner first.
+# With --wipe, N is stopped first; rdb_dev then checks the fence against the owner's record,
+# read after N is down: the record leaves N out and N has not restarted since the check (its boot
+# before the stop equals its boot after). Only then is N's folder moved aside, never deleted.
+# A refused fence starts N again on its own folder and exits 1.
+rebuild() {
+    local n="$ARG" before after aside
+    before="$(node_boot "$n")"
+    [ -n "$before" ] || die "node $n has printed no boot in $RUN/out/node-$n.out; start it first"
+    if [ "$WIPE" != 1 ]; then
+        admin_line "admin rebuild $n" || die "rebuild $n refused; node $n was not touched"
+        stop_node "$n"; start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+        return 0
+    fi
+    stop_node "$n"
+    after="$(node_boot "$n")"
+    if ! admin_line "admin rebuild $n --wipe --boot $before --last ${after:-0}"; then
+        start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+        die "rebuild $n refused; its folder is left in place and it runs on it again"
+    fi
+    aside="$RUN/db/aside/node-$n-boot-$before-$(date +%s)"
+    mkdir -p "$RUN/db/aside"
+    mv "$RUN/db/nodes/$n" "$aside"
+    say "node $n's old folder moved aside to $aside"
+    start_node "$n" stopped; await_ready "$n" || not_ready "$n"
 }
 
 case "$COMMAND" in
@@ -576,6 +610,7 @@ case "$COMMAND" in
             [ "$DROP" != "$ARG" ] || die "promote $ARG cannot also drop $ARG"
         fi
         promote ;;
+    rebuild) pick_run; check_node_arg "$ARG"; rebuild ;;
     "") usage ;;
     *) echo "lr: unknown verb '$COMMAND'; the verbs are:" >&2; usage ;;
 esac

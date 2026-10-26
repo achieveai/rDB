@@ -367,8 +367,11 @@
 //!                                         folder. Refused, nothing done, for the owner
 //!                                         (promote first), a re-plan running, a partition
 //!                                         on two copies, or a quarantine whose evidence
-//!                                         does not name n. In process only; `lr rebuild n`
-//!                                         for node processes
+//!                                         does not name n. Under `--nodes` it only checks
+//!                                         that n is already left out; `lr rebuild n
+//!                                         [--wipe]` then stops n, has the fence checked
+//!                                         (`--boot B --last L`), moves the folder aside
+//!                                         and starts n
 //! admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
@@ -1701,7 +1704,7 @@ fn repl<'scope, 'env>(
             ["put", "--as", ..] => Err("put --as <n> <object> <value> [--if-version N]".to_owned()),
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
                 Ok(if_version) => {
-                    let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
+                    let answer = put_adopted(db, object.as_bytes(), value.as_bytes(), if_version);
                     let kind = Kind::Put {
                         object: object.as_bytes().to_vec(),
                         if_version,
@@ -1727,7 +1730,7 @@ fn repl<'scope, 'env>(
                 let (object, value) = ((*object).to_owned(), (*value).to_owned());
                 say(&format!("bg {object}: queued"));
                 scope.spawn(move || {
-                    let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
+                    let answer = put_adopted(db, object.as_bytes(), value.as_bytes(), if_version);
                     if answer.is_err() {
                         bg_failed.store(true, Ordering::Relaxed);
                     }
@@ -1870,14 +1873,20 @@ fn repl<'scope, 'env>(
                     }
                 })
             }
-            ["admin", "rebuild", rest @ ..] => parse_rebuild(rest).map(|(node, wipe)| {
-                say(&format!(
-                    "rebuild: node {} comes out of partition 1 and back{}; this waits for the \
-                     owner to drop it and take it back",
-                    node.0,
-                    if wipe { ", wiped" } else { "" }
-                ));
-                match db.rebuild(node, wipe) {
+            ["admin", "rebuild", rest @ ..] => parse_rebuild(rest).map(|(node, ask)| {
+                let answer = match ask {
+                    RebuildAsk::Here { wipe } => {
+                        say(&format!(
+                            "rebuild: node {} comes out of partition 1 and back{}; this waits \
+                             for the owner to drop it and take it back",
+                            node.0,
+                            if wipe { ", wiped" } else { "" }
+                        ));
+                        db.rebuild(node, wipe)
+                    }
+                    RebuildAsk::Fence { boot, last } => db.rebuild_fence(node, boot, last),
+                };
+                match answer {
                     Ok(line) => say(&line),
                     Err(error) => {
                         tracing::warn!(node = node.0, error = %error, "repl_rebuild_refused");
@@ -2019,18 +2028,32 @@ fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
 }
 
 /// `admin rebuild`'s usage (#65).
-const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe]: n is 1, 2 or 3, not the owner";
+const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--boot B --last L]]: n is 1, 2 or 3, not the owner; `lr rebuild n --wipe` adds the boots";
 
-/// `admin rebuild N [--wipe]`'s words after `rebuild`: the node, and whether to wipe it.
-fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, bool), String> {
+/// What `admin rebuild` was asked: in this process, or the fence `lr rebuild N --wipe` checks
+/// once it has stopped N (`--boot` before the stop, `--last` after it).
+#[derive(Debug, PartialEq, Eq)]
+enum RebuildAsk {
+    Here { wipe: bool },
+    Fence { boot: u64, last: u64 },
+}
+
+/// `admin rebuild N [--wipe [--boot B --last L]]`'s words after `rebuild`.
+fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, RebuildAsk), String> {
+    let node = |n: &str| parse_node(n).map_err(|e| format!("{e}; {REBUILD_USAGE}"));
+    let boot = |b: &str| {
+        b.parse::<u64>()
+            .map_err(|_| format!("'{b}' is not a boot; {REBUILD_USAGE}"))
+    };
     match rest {
-        [node] => Ok((
-            parse_node(node).map_err(|e| format!("{e}; {REBUILD_USAGE}"))?,
-            false,
-        )),
-        [node, "--wipe"] => Ok((
-            parse_node(node).map_err(|e| format!("{e}; {REBUILD_USAGE}"))?,
-            true,
+        [n] => Ok((node(n)?, RebuildAsk::Here { wipe: false })),
+        [n, "--wipe"] => Ok((node(n)?, RebuildAsk::Here { wipe: true })),
+        [n, "--wipe", "--boot", b, "--last", l] => Ok((
+            node(n)?,
+            RebuildAsk::Fence {
+                boot: boot(b)?,
+                last: boot(l)?,
+            },
         )),
         _ => Err(REBUILD_USAGE.to_owned()),
     }
@@ -3931,7 +3954,7 @@ fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) -> bool {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             });
         let started = Instant::now();
-        let answer = db.put(object.as_bytes(), i.to_string().as_bytes(), None);
+        let answer = put_adopted(db, object.as_bytes(), i.to_string().as_bytes(), None);
         let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = answer
             .as_ref()
@@ -3996,6 +4019,41 @@ fn bg_note(db: &Db, label: &str, answer: &Result<rdb_api::PutOk, PutError>) {
         if let Some(note) = waits_note(db) {
             say(&format!("{label}: {note}"));
         }
+    }
+}
+
+/// How long a put refused with "no generation adopted yet" is sent again (bb #65 paper cut).
+const NOT_ADOPTED_PATIENCE: Duration = Duration::from_secs(3);
+
+/// `db.put`, sent again for up to [`NOT_ADOPTED_PATIENCE`] while the answer is "no generation
+/// adopted yet". Right after a promote the new owner adopts its generation a moment after it
+/// answers, and that refusal is `no_mutation` (nothing was sent), so sending it again is safe.
+/// Any other answer, and the last refusal after the patience, is returned as it came.
+fn put_adopted(
+    db: &Db,
+    object: &[u8],
+    value: &[u8],
+    if_version: Option<u64>,
+) -> Result<rdb_api::PutOk, PutError> {
+    let started = Instant::now();
+    let mut tries = 1_u32;
+    loop {
+        let answer = db.put(object, value, if_version);
+        let not_adopted = answer.as_ref().err().is_some_and(|refused| {
+            refused.error.no_mutation
+                && refused
+                    .error
+                    .detail
+                    .starts_with("no generation adopted yet")
+        });
+        if !not_adopted || started.elapsed() >= NOT_ADOPTED_PATIENCE {
+            if tries > 1 {
+                tracing::info!(tries, ok = answer.is_ok(), "repl_put_not_adopted_retried");
+            }
+            return answer;
+        }
+        tries += 1;
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -7521,6 +7579,38 @@ mod tests {
             promoted_line(&promoted),
             "promoted: node 2 owns partition 1 at generation 3 (was node 1); node 3 dropped"
         );
+    }
+
+    /// bb #65: `admin rebuild N [--wipe]` runs in process; `lr rebuild N --wipe` adds the boots
+    /// before and after its stop, and only with both is it the fence check. Cut: accept
+    /// `--boot` without `--last` and the `3 --wipe --boot 7` line goes red. Unit.
+    #[test]
+    fn admin_rebuild_reads_its_node_and_the_fence_boots() {
+        fn words(line: &str) -> Vec<&str> {
+            line.split_whitespace().collect()
+        }
+        assert_eq!(
+            parse_rebuild(&words("3")),
+            Ok((NodeId(3), RebuildAsk::Here { wipe: false }))
+        );
+        assert_eq!(
+            parse_rebuild(&words("3 --wipe")),
+            Ok((NodeId(3), RebuildAsk::Here { wipe: true }))
+        );
+        assert_eq!(
+            parse_rebuild(&words("3 --wipe --boot 7 --last 7")),
+            Ok((NodeId(3), RebuildAsk::Fence { boot: 7, last: 7 }))
+        );
+        for bad in [
+            "",
+            "4",
+            "3 --boot 7 --last 7",
+            "3 --wipe --boot 7",
+            "3 --wipe --boot x --last 7",
+            "3 --wipe x",
+        ] {
+            assert!(parse_rebuild(&words(bad)).is_err(), "{bad:?}");
+        }
     }
 
     /// A-R245: `admin status` lists both prefixes through the store it is given, the Db's own,

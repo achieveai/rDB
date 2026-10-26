@@ -6984,7 +6984,7 @@ impl Host {
             | RecoveryEffect::Quarantine(_) => {
                 // #65: kept for `admin rebuild`'s G6 only; the arm does what it did.
                 if let RecoveryEffect::Quarantine(evidence) = effect {
-                    self.quarantines.insert(site.partition, evidence.clone());
+                    self.quarantines.insert(site.partition, *evidence);
                 }
                 tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
                 Ok(())

@@ -75,7 +75,10 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
     let db = ready(&rt, dir.path(), &store);
     let patience = crate::host::test_patience(Duration::from_secs(20));
     for i in 0..5 {
-        assert!(put_acked(&db, &format!("pre{i}"), patience).is_some(), "pre{i}");
+        assert!(
+            put_acked(&db, &format!("pre{i}"), patience).is_some(),
+            "pre{i}"
+        );
     }
     let stop = AtomicBool::new(false);
     let (rebuilt, acked, longest) = std::thread::scope(|scope| {
@@ -101,15 +104,25 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
     let rebuilt = rebuilt.expect("the rebuild");
     tracing::info!(line = %rebuilt.line(), acked = acked.len(), longest_ms = longest.as_millis(), "b3_rebuilt");
     assert_eq!(rebuilt.mode, admin::rebuild::RebuildMode::Pinned);
-    assert!(rebuilt.kept.contains(&NodeId(1)) && rebuilt.kept.contains(&NodeId(2)), "{rebuilt:?}");
+    assert!(
+        rebuilt.kept.contains(&NodeId(1)) && rebuilt.kept.contains(&NodeId(2)),
+        "{rebuilt:?}"
+    );
     assert!(!acked.is_empty(), "writes went on during the rebuild");
     assert!(
         longest < crate::host::test_patience(Duration::from_secs(15)),
         "the longest wait for an ack was {longest:?}"
     );
     let aside = rebuilt.aside.clone().expect("wiped");
-    assert!(aside.join("CURRENT").exists(), "G7: {} holds 3's old copy", aside.display());
-    assert!(dir.path().join("nodes").join("3").join("CURRENT").exists(), "3 runs again");
+    assert!(
+        aside.join("CURRENT").exists(),
+        "G7: {} holds 3's old copy",
+        aside.display()
+    );
+    assert!(
+        dir.path().join("nodes").join("3").join("CURRENT").exists(),
+        "3 runs again"
+    );
     let owner = db.inspect(NodeId(1)).expect("the owner answers");
     assert!(
         owner
@@ -143,7 +156,11 @@ fn b3_rebuild_of_the_owner_is_refused_and_names_promote() {
     let refused = db.rebuild_with(NodeId(1), true).expect_err("the owner");
     assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused:?}");
     assert!(refused.no_mutation);
-    assert!(refused.detail.contains("admin promote"), "{}", refused.detail);
+    assert!(
+        refused.detail.contains("admin promote"),
+        "{}",
+        refused.detail
+    );
     assert_eq!(db.boot_of(NodeId(1)), boot, "nothing restarted");
 }
 
@@ -181,8 +198,16 @@ fn b3_a_stale_wipe_is_refused_and_leaves_the_folder_in_place() {
     let refused = db
         .restart_node_with(NodeId(3), Some(pinned))
         .expect_err("the record still pins 3");
-    assert!(refused.detail.contains("pins node 3 again"), "{}", refused.detail);
+    assert!(
+        refused.detail.contains("pins node 3 again"),
+        "{}",
+        refused.detail
+    );
     assert!(!to.exists(), "nothing moved aside");
     assert!(folder.join("CURRENT").exists(), "3's folder is in place");
-    assert_ne!(db.boot_of(NodeId(3)), Some(boot), "3 restarted on its own folder");
+    assert_ne!(
+        db.boot_of(NodeId(3)),
+        Some(boot),
+        "3 restarted on its own folder"
+    );
 }
