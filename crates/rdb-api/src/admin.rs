@@ -2171,11 +2171,16 @@ async fn store_plan(
         }
         Ok(_) | Err(ConfigError::Conflict { .. } | ConfigError::DeadlineExceededUnknownOutcome) => {
         }
-        Err(error) => {
+        Err(error @ ConfigError::PermissionDenied { .. }) => {
             return Err(PromoteError::Control(format!(
                 "create {key}: {error}; partition 1 is fencing and takes no writes until a \
                  promote finishes. A promote needs rEtcd write access to operations/ as well as \
                  partitions/ and grants/: grant it, then promote again"
+            )))
+        }
+        Err(error) => {
+            return Err(PromoteError::Control(format!(
+                "could not store the plan at {key}: {error}; promote again"
             )))
         }
     }
@@ -3896,9 +3901,10 @@ mod tests {
     /// sent nothing. (a) The create never applied and the read-back finds nothing. (b) The key
     /// already holds another plan. (c) The promoter may not write `operations/` (critic-63 A4):
     /// partition 1 is already fencing and frozen, so the text says so and names the access.
+    /// (d) Any other create error, such as `Unavailable`, says only to promote again.
     /// Cuts: absent on read-back carries on, red; another plan adopted, red; the text loses
-    /// `operations/`, red.
-    /// Unit (~3 s): three 600 ms promotes over `Scripted`/`MemStore`.
+    /// `operations/`, red; every create error given the access text, red (d).
+    /// Unit (~3 s): four 600 ms promotes over `Scripted`/`MemStore`.
     #[test]
     fn m10_s2_r447_a_plan_that_did_not_land_or_is_not_this_runs_refuses_and_sends_nothing() {
         let rt = runtime();
@@ -3968,6 +3974,24 @@ mod tests {
             refused.contains("partition 1 is fencing and takes no writes")
                 && refused.contains("rEtcd write access to operations/"),
             "(c) {refused}"
+        );
+
+        // (d) Any other create error is not an access problem: the text says only to promote
+        // again (review-63b A1).
+        let unavailable: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_put_with: Some(ConfigError::Unavailable {
+                reason: "no quorum".to_owned(),
+            }),
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*unavailable, &rt, BootId(5));
+        let refused = run(unavailable);
+        assert!(
+            refused.contains("could not store the plan at operations/")
+                && refused.contains("promote again")
+                && !refused.contains("write access"),
+            "(d) {refused}"
         );
     }
 

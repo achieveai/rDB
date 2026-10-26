@@ -646,14 +646,18 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
   can promote too. A node commits a promote only with the plan the promoter stored in rEtcd
-  (`operations/<revision>`), and only on a fence its own reads of `partitions/1` and the old
-  owner's grant prove true. So running `promote`, or finishing a stopped one, needs rEtcd write
-  access to `partitions/`, `grants/` and `operations/`; an rDB link certificate alone is not
-  enough. An app with the link certificate still chooses which node it sends the fence to; that
-  node then runs the stored plan, so it cannot change the members or the owner the promoter
-  chose. **The dropped node is added back
-  automatically when it starts again, or at the next reopen heal; membership is fixed at three
-  nodes.**
+  (`operations/<tag + revision>`, where the revision is the promote's own `Fencing` write), and
+  only on a fence its own reads of `partitions/1` and the old owner's grant prove true.
+  Starting a promote needs rEtcd write access to `partitions/`, `grants/` and `operations/`.
+  An app holding only an rDB link certificate cannot choose or change a promote's plan. Once a
+  promoter has stored its plan, any node that can read rEtcd can finish that same stored plan,
+  on a node and at a time the sender picks. That is harmless: it is the promoter's own plan.
+  - **Wait for `promote` to answer before running it again.** A rerun while the earlier run is
+    still committing (up to about 15 s) cancels that run's commit. This costs time, not safety.
+  - **Upgrade every node before you use `promote`.** A node built before issue #70 still
+    trusts a plan sent to it directly.
+  - **The dropped node is added back automatically when it starts again, or at the next
+    reopen heal; membership is fixed at three nodes.**
   - **After every node restarts, a promote can be refused.** If the owner's copy is lost too,
     `promote` answers `Unconfigured` ("node N holds no configuration since its restart"). The
     member list is kept in memory only. To recover, bring back the owner's node or restore its
