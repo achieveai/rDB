@@ -3488,7 +3488,8 @@ fn m11_t4_a_move_whose_target_is_unreachable_past_the_drop_clock_is_given_up() {
             assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
             assert!(
                 error.detail.contains("pinned as this move's shadow")
-                    && error.detail.contains("given up"),
+                    && error.detail.contains("given up")
+                    && !error.detail.contains("  "),
                 "{error:?}"
             );
         }
@@ -3503,7 +3504,9 @@ fn m11_t4_a_move_whose_target_is_unreachable_past_the_drop_clock_is_given_up() {
         Answer::Error { error, .. } => {
             assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
             assert!(
-                error.detail.contains("given up") && error.detail.contains("unreachable"),
+                error.detail.contains("given up")
+                    && error.detail.contains("unreachable")
+                    && !error.detail.contains("  "),
                 "{error:?}"
             );
         }

@@ -6091,13 +6091,10 @@ impl Host {
         if role(to) == Some(ReplicaRole::Shadow) && !self.linked(to) {
             // T4: the pin stays, so the move goes on by itself once the target is back.
             return wait(format!(
-                "node {} is pinned as this move's shadow but is not reachable from node {} (the                  owner): start it (`lr start {}`) and the move goes on; unreachable for {} ms                  in all, the move is given up, node {} is left out and node {} keeps its copy",
-                to.0,
-                self.node.0,
-                to.0,
-                self.peer_drop_after_millis,
-                to.0,
-                from.0
+                "node {} is pinned as this move's shadow but is not reachable from node {} (the \
+                 owner): start it (`lr start {}`) and the move goes on; unreachable for {} ms \
+                 in all, the move is given up, node {} is left out and node {} keeps its copy",
+                to.0, self.node.0, to.0, self.peer_drop_after_millis, to.0, from.0
             ));
         }
         if !self.linked(to) || self.links.boot_of(to).is_none() {
@@ -6354,7 +6351,9 @@ impl Host {
         );
         if let Some(mv) = held {
             let why = format!(
-                "the move of node {} to node {} was given up: node {} was unreachable from node                  {} (the owner) for {waited_ms} ms; node {} keeps its copy. Start node {} and                  run the move again",
+                "the move of node {} to node {} was given up: node {} was unreachable from node \
+                 {} (the owner) for {waited_ms} ms; node {} keeps its copy. Start node {} and \
+                 run the move again",
                 mv.from.0, mv.to.0, mv.to.0, self.node.0, mv.from.0, mv.to.0
             );
             self.moves.insert(

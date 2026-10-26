@@ -2744,6 +2744,104 @@ fn m11_t7_a_shadow_left_by_a_promote_is_promoted_without_the_revoke_retry() {
     spare.shutdown();
 }
 
+/// M11 ruling A-R452 (D2): a move's intent is the shadow the commit pins, so it survives the
+/// owner's restart. Node 4's frames to node 1 are lost, so `move 3 4` leaves node 4 pinned as a
+/// shadow; then every node restarts. The restarted owner holds no move and does not promote the
+/// shadow on its own (members stay nodes 1 to 3 regular, node 4 shadow); `move 3 4` asked again
+/// resumes the pinned move and ends it: nodes 1, 2 and 4, and the writes read back.
+/// Cut: `move_step` refuses a pinned-shadow target as `already` running, red.
+/// Integration (~8 s): a fresh open, the move's first re-plan, a reopen, the promote.
+#[config_log::retcd_test]
+fn m11_q4_a_move_resumes_after_the_owner_restarts_with_its_shadow_pinned() {
+    use rdb_core::contracts::ids::ReplicaRole;
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let opened = |rt: &tokio::runtime::Runtime, fresh: bool| {
+        let links = Arc::new(Links::default());
+        let db = rt
+            .block_on(Db::open_with(
+                DbConfig {
+                    links: Some(Arc::clone(&links)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("the open of nodes 1 to 3");
+        let ready = |db: &Db| {
+            db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+                .expect("ready");
+        };
+        if fresh {
+            ready(&db);
+        }
+        let spare = rt
+            .block_on(Db::open_with(
+                DbConfig {
+                    local: vec![NodeId(4)],
+                    links: Some(Arc::clone(&links)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("node 4's process");
+        if !fresh {
+            ready(&db);
+        }
+        (db, spare, links)
+    };
+    let (mut db, mut spare, links) = opened(&rt, true);
+    put_through_pauses(&db, b"before", b"1", "a put before the move");
+    links.drop_direction(NodeId(4), NodeId(1));
+    let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4");
+    assert!(!answer.done, "{answer:?}");
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + patience;
+    while pinned_role(&rt, &store, 4) != Some(ReplicaRole::Shadow) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 4 not pinned as a shadow within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    db.shutdown();
+    spare.shutdown();
+
+    let (db, _spare, _links) = opened(&rt, false);
+    put_through_pauses(&db, b"after", b"2", "a put after the restart");
+    assert_eq!(
+        pinned_role(&rt, &store, 4),
+        Some(ReplicaRole::Shadow),
+        "the restarted owner kept the move's shadow and did not promote it unasked"
+    );
+    assert_eq!(
+        pinned_role(&rt, &store, 3),
+        Some(ReplicaRole::RegularSecondary)
+    );
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    loop {
+        let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4 again");
+        if answer.done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the move did not resume: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        pinned_nodes(&rt, &store),
+        Some(vec![1, 2, 4]),
+        "the resumed move"
+    );
+    assert!(db.get(b"before").is_ok() && db.get(b"after").is_ok());
+}
+
 /// A-R328: an empty copy already bound to another database's instance does not join this one.
 /// The open is refused `Mismatch` and the copy keeps its own binding. Integration (~1 s): one
 /// fresh open until ready, one refused node-process open.
