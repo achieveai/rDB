@@ -2023,3 +2023,333 @@ async fn f001_a_waiting_build_ends_when_the_install_fails() {
         assert!(dst.snapshot_meta().is_none(), "nothing was published");
     }
 }
+
+// --- #68: C5-06 rename window, A-2 superseded prune, Q-R1 install clock -----------------------
+
+/// Seed `s` with puts `from..=to` on top of what it holds.
+async fn seed_range(s: &RocksStore, from: u64, to: u64) {
+    for i in from..=to {
+        let entry = put(1, i, &format!("/m5/{i}"), &format!("v{i}"));
+        s.log_store()
+            .blocking_append(vec![entry.clone()])
+            .await
+            .expect("append");
+        s.state_machine().apply(vec![entry]).await.expect("apply");
+    }
+}
+
+/// [`transfer`] for bytes already read, so the source's file may be gone by now.
+async fn install_bytes(
+    dst: &RocksStore,
+    meta: &SnapshotMeta<RaftNodeId, RaftNode>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let mut sm = dst.state_machine();
+    let mut file = sm
+        .begin_receiving_snapshot()
+        .await
+        .map_err(|e| e.to_string())?;
+    file.write_all(bytes).await.expect("write received bytes");
+    sm.install_snapshot(meta, file)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// #68 C5-06: a local build that publishes and prunes while an install sits between renaming
+/// its file into `snapshots/` and writing its marker must not prune that file.
+///
+/// The received file was built on the leader, so it sorts older than the local build, and with
+/// `retain_snapshots = 1` it is the first to go. Before the fix the install set its in-memory
+/// mirror only after the marker, so prune saw nothing to spare; the install then wrote a marker
+/// naming a deleted file and failed, poisoning the store. The row waits until the build is done
+/// with its checkpoint (published, or refused because an install is in flight) before letting
+/// the install go on.
+#[retcd_test]
+async fn c5_06_a_build_inside_the_rename_window_never_prunes_the_installing_file() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let meta = build(&src).await.expect("source build succeeds");
+        let expected_hash = src.reader().state_hash();
+
+        let race = InstallRace::new(Some(Boundary::BeforeInstallMarker), None, false);
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
+        dst.configure_snapshots(&SnapshotConfig {
+            retain_snapshots: 1,
+            ..SnapshotConfig::DEFAULT
+        });
+        seed(&dst, 9).await;
+
+        let installing = {
+            let (src, dst, meta) = (src.clone(), dst.clone(), meta.clone());
+            tokio::spawn(async move { transfer(&src, &dst, &meta, |_| {}).await })
+        };
+        race.reached(false).await;
+        let building = {
+            let dst = dst.clone();
+            tokio::spawn(async move { build(&dst).await })
+        };
+        race.reached(true).await;
+        let deadline = std::time::Instant::now() + RACE_PATIENCE;
+        while build_view_exists(dst_dir.path()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        race.release_all();
+        let installed = installing.await.expect("the install task joins");
+        let built = building.await.expect("the build task joins");
+
+        installed.expect("the install finds the file it renamed in");
+        assert!(
+            !dst.is_poisoned(),
+            "the install did not fail mid-replacement"
+        );
+        built.expect("the build publishes once the install has committed");
+        assert_eq!(dst.reader().state_hash(), expected_hash);
+    }
+}
+
+/// Holds the first snapshot capture open, and removes `victim` (when set) at the first
+/// [`FaultInjector::after_snapshot_export`], as a prune would between the publish check and the
+/// open (#68 A-2).
+struct PruneBeforeOpen {
+    capture_seen: AtomicU64,
+    capture: Handshake,
+    victim: Mutex<Option<std::path::PathBuf>>,
+    removed: AtomicU64,
+}
+
+impl FaultInjector for PruneBeforeOpen {
+    fn before(&self, _boundary: Boundary) -> FaultAction {
+        FaultAction::Proceed
+    }
+
+    fn during_snapshot_capture(&self) {
+        if self.capture_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.capture.arrive(true);
+        }
+    }
+
+    fn after_snapshot_export(&self) {
+        if let Some(victim) = self.victim.lock().unwrap().take() {
+            std::fs::remove_file(&victim).expect("the current snapshot's file exists");
+            self.removed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Wait on the store-side half of `handshake` from a blocking thread.
+async fn wait_reached<T: Send + Sync + 'static>(owner: Arc<T>, pick: fn(&T) -> &Handshake) {
+    tokio::task::spawn_blocking(move || {
+        pick(&owner)
+            .reached_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(RACE_PATIENCE)
+            .expect("the operation reaches its hook")
+    })
+    .await
+    .expect("wait task joins");
+}
+
+/// #68 A-2: a build whose view an install superseded hands OpenRaft the current snapshot. If
+/// that file is pruned between the publish check and the open, the build captures again rather
+/// than failing: an `Err` from `build_snapshot` is fatal to the node, and nothing here failed.
+#[retcd_test]
+async fn a2_a_superseded_build_whose_file_was_pruned_captures_again() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let meta = build(&src).await.expect("source build succeeds");
+
+        let hook = Arc::new(PruneBeforeOpen {
+            capture_seen: AtomicU64::new(0),
+            capture: Handshake::new(),
+            victim: Mutex::new(None),
+            removed: AtomicU64::new(0),
+        });
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), hook.clone());
+        seed(&dst, 3).await;
+
+        let building = {
+            let dst = dst.clone();
+            tokio::spawn(async move { build(&dst).await })
+        };
+        wait_reached(hook.clone(), |h| &h.capture).await;
+
+        // The checkpoint holds index 3. Install index 6 while it is held, so the build's view is
+        // superseded, and arm the prune of the installed file.
+        let installed = transfer(&src, &dst, &meta, |_| {}).await;
+        *hook.victim.lock().unwrap() = Some(snap_path(&dst, &meta));
+        hook.capture.release();
+        let built = building.await.expect("the build task joins");
+        installed.expect("the install succeeds");
+
+        assert_eq!(
+            hook.removed.load(Ordering::SeqCst),
+            1,
+            "the superseded snapshot's file was removed before the open"
+        );
+        let built = built.expect("a pruned superseded file costs a capture, not the node");
+        assert_eq!(
+            built.last_log_id, meta.last_log_id,
+            "the new capture covers the installed state"
+        );
+        assert_eq!(
+            dst.snapshot_meta().map(|m| m.snapshot_id),
+            Some(built.snapshot_id),
+            "the build published its own file"
+        );
+    }
+}
+
+/// Parks each of the first two crossings of [`Boundary::AfterInstallDropCf`] (two installs)
+/// and holds the second snapshot capture, each on its own handshake (Q-R1).
+struct TwoInstalls {
+    boundary_seen: AtomicU64,
+    capture_seen: AtomicU64,
+    first: Handshake,
+    second: Handshake,
+    capture: Handshake,
+}
+
+impl FaultInjector for TwoInstalls {
+    fn before(&self, boundary: Boundary) -> FaultAction {
+        if boundary == Boundary::AfterInstallDropCf {
+            match self.boundary_seen.fetch_add(1, Ordering::SeqCst) {
+                0 => self.first.arrive(true),
+                1 => self.second.arrive(true),
+                _ => {}
+            }
+        }
+        FaultAction::Proceed
+    }
+
+    fn during_snapshot_capture(&self) {
+        if self.capture_seen.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.capture.arrive(true);
+        }
+    }
+}
+
+/// Q-R1: a build's patience for an install restarts when a **new** install begins.
+///
+/// The patience is shortened to 1.5 s. The build waits on install 1 for 1 s, then, after one
+/// fresh capture, on install 2 for another 1 s. Neither wait reaches the patience, but the two
+/// together pass it. Before the fix the clock counted from the build's start, so the patience ran
+/// out during install 2 and the build spent an attempt; with every attempt spent it returns the
+/// error OpenRaft turns into a fatal one. The row requires that **no** attempt is spent: whether
+/// a clock that is still wrong spends all three depends on how long a capture takes. The holds
+/// are real time because the patience is a clock: this row takes about 2 s by design.
+#[retcd_test]
+async fn q_r1_the_install_patience_restarts_for_each_new_install() {
+    const PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(1000);
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let first = build(&src).await.expect("first source build");
+        let first_bytes = std::fs::read(snap_path(&src, &first)).unwrap();
+        seed_range(&src, 7, 9).await;
+        let second = build(&src).await.expect("second source build");
+        let second_bytes = std::fs::read(snap_path(&src, &second)).unwrap();
+        let expected_hash = src.reader().state_hash();
+
+        let race = Arc::new(TwoInstalls {
+            boundary_seen: AtomicU64::new(0),
+            capture_seen: AtomicU64::new(0),
+            first: Handshake::new(),
+            second: Handshake::new(),
+            capture: Handshake::new(),
+        });
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
+        dst.set_install_patience(PATIENCE);
+        seed(&dst, 3).await;
+
+        let install_one = {
+            let (dst, meta) = (dst.clone(), first.clone());
+            tokio::spawn(async move { install_bytes(&dst, &meta, &first_bytes).await })
+        };
+        wait_reached(race.clone(), |r| &r.first).await;
+        let building = {
+            let dst = dst.clone();
+            tokio::spawn(async move { build(&dst).await })
+        };
+        tokio::time::sleep(HOLD).await;
+        race.first.release();
+        install_one
+            .await
+            .expect("install 1 joins")
+            .expect("install 1 commits");
+
+        // The build captures again; hold that capture until install 2 is parked mid-install, so
+        // the capture's publish meets install 2 in flight.
+        wait_reached(race.clone(), |r| &r.capture).await;
+        let install_two = {
+            let (dst, meta) = (dst.clone(), second.clone());
+            tokio::spawn(async move { install_bytes(&dst, &meta, &second_bytes).await })
+        };
+        wait_reached(race.clone(), |r| &r.second).await;
+        race.capture.release();
+        tokio::time::sleep(HOLD).await;
+        race.second.release();
+        install_two
+            .await
+            .expect("install 2 joins")
+            .expect("install 2 commits");
+
+        let built = building.await.expect("the build task joins");
+        assert_eq!(
+            dst.metrics().snapshot_build_retries,
+            0,
+            "no install was waited on for the patience, so no attempt was spent"
+        );
+        let built = built
+            .expect("each install was waited on for less than the patience, so the build succeeds");
+        assert_eq!(built.last_log_id, second.last_log_id);
+        assert_eq!(dst.reader().state_hash(), expected_hash);
+    }
+}
+
+/// #68 C5-06, the abort half: the mirror now goes up before the rename, so an install that
+/// fails after that point must take it down again. Left up, it names an install that will never
+/// commit, and every later build waits on it until the patience runs out and then fails, which
+/// OpenRaft treats as fatal. The install here fails at its marker, after the rename.
+#[retcd_test]
+async fn c5_06b_an_install_that_fails_after_the_rename_leaves_no_install_behind() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let meta = build(&src).await.expect("source build succeeds");
+
+        let dst = open_as(
+            dst_dir.path(),
+            identity_for(7, 2),
+            FailAt::new(Boundary::BeforeInstallMarker, FaultAction::Fail),
+        );
+        // Short, so a build that waits on a dead install fails in well under a second.
+        dst.set_install_patience(std::time::Duration::from_millis(300));
+        seed(&dst, 3).await;
+
+        transfer(&src, &dst, &meta, |_| {})
+            .await
+            .expect_err("the install fails at its marker");
+        assert!(!dst.is_poisoned(), "a Fail at the marker does not poison");
+
+        let built = build(&dst)
+            .await
+            .expect("no install is in flight after the failed one, so the build publishes");
+        assert_eq!(
+            dst.snapshot_meta().map(|m| m.snapshot_id),
+            Some(built.snapshot_id)
+        );
+    }
+}

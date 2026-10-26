@@ -533,6 +533,9 @@ struct RocksShared {
     purge_refusals: AtomicU64,
     /// How many published `.snap` files to keep, from [`SnapshotConfig::retain_snapshots`].
     retain_snapshots: AtomicUsize,
+    /// How long one build waits for a single snapshot install to commit, in milliseconds
+    /// ([`INSTALL_PATIENCE`] unless a test shortens it with [`RocksStore::set_install_patience`]).
+    install_patience_ms: AtomicU64,
     /// The `.recv.tmp` a `begin_receiving_snapshot` opened and no `install_snapshot` has yet
     /// resolved.
     ///
@@ -1297,6 +1300,7 @@ impl RocksStore {
                 purge_deferrals: AtomicU64::new(0),
                 purge_refusals: AtomicU64::new(0),
                 retain_snapshots: AtomicUsize::new(SnapshotConfig::DEFAULT.retain_snapshots),
+                install_patience_ms: AtomicU64::new(INSTALL_PATIENCE.as_millis() as u64),
                 recv: Mutex::new(None),
                 pending_purge: Mutex::new(None),
                 log: Mutex::new(LogMeta {
@@ -1482,6 +1486,15 @@ impl RocksStore {
         self.shared
             .retain_snapshots
             .store(config.retain_snapshots.max(1), Ordering::SeqCst);
+    }
+
+    /// Shorten how long a build waits for one snapshot install to commit. A test knob (Q-R1):
+    /// production keeps [`INSTALL_PATIENCE`] (300 s), which no row can wait out.
+    pub fn set_install_patience(&self, patience: std::time::Duration) {
+        self.shared.install_patience_ms.store(
+            u64::try_from(patience.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
     }
 
     /// The current snapshot's OpenRaft metadata, or `None` if this node has never published one.
@@ -3332,42 +3345,55 @@ const BUILD_ATTEMPTS: u32 = 3;
 /// How often a build that captured mid-install checks whether the install has committed.
 const INSTALL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// How long one build waits, in total, for installs to commit before a mid-install view counts
-/// as a failed attempt. An install that fails mid-replacement poisons the store, which ends the
-/// wait at once (the next capture fails at its guard); this limit is for an install that never
+/// How long a build waits for **one** install to commit before a mid-install view counts as a
+/// failed attempt. An install that fails mid-replacement poisons the store, which ends the wait
+/// at once (the next capture fails at its guard); this limit is for an install that never
 /// finishes and never fails, so a build cannot wait for ever on a stuck node.
 ///
-/// When it expires: that wait returns an error, which spends one of [`BUILD_ATTEMPTS`]. Every
-/// later mid-install view in the same build fails its attempt at once (one poll, no further
-/// wait). Once all attempts are spent the build returns `Err`, which OpenRaft turns into a
-/// fatal error for the node. Nothing is published in any of those attempts. No row covers it:
-/// it needs a 300 s wait.
+/// The clock is per install (Q-R1). It starts when the build first meets an install and
+/// restarts when the install in flight is a different one, so a node that receives one install
+/// after another never fails a build that only waited a short while on each.
+///
+/// When it expires: that wait returns an error, which spends one of [`BUILD_ATTEMPTS`]. A later
+/// mid-install view of the **same** install fails its attempt after one poll, with no further
+/// wait. Once all attempts are spent the build returns `Err`, which OpenRaft turns into a fatal
+/// error for the node. Nothing is published in any of those attempts. Tests shorten it with
+/// [`RocksStore::set_install_patience`].
 const INSTALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Wait until no snapshot install is in progress (F-001), polling the in-memory mirror of the
-/// marker. The mirror is set right after the marker is durable and cleared with the final
-/// batch's state, so "clear" means the next checkpoint holds either the old state or the whole
-/// new one. One poll interval always passes first: a checkpoint can catch the durable marker
-/// just before the mirror is set.
+/// Wait until the install `waiting_on` is no longer in progress (F-001), polling the in-memory
+/// mirror of the marker. The mirror is set before the install renames its file in (C5-06), so
+/// before the marker is durable, and cleared with the final batch's state, so "clear" means the
+/// next checkpoint holds either the old state or the whole new one. A mirror that names another
+/// install also ends the wait: the caller captures again and starts that install's clock
+/// (Q-R1). One poll interval always passes first, so a build never spins on the mirror.
 #[allow(clippy::result_large_err)]
 async fn wait_for_install(
     shared: &Arc<RocksShared>,
-    started: std::time::Instant,
+    since: std::time::Instant,
+    waiting_on: Option<String>,
 ) -> Result<(), StorageError<RaftNodeId>> {
     loop {
         tokio::time::sleep(INSTALL_POLL).await;
         // A poisoned store fails the next capture at its guard, which is the error to report.
-        if shared.is_poisoned() || shared.sm().install_in_progress.is_none() {
+        if shared.is_poisoned() {
             return Ok(());
         }
-        if started.elapsed() >= INSTALL_PATIENCE {
+        match shared.sm().install_in_progress.as_ref() {
+            None => return Ok(()),
+            Some(m) if waiting_on.as_deref() != Some(m.snapshot_id.as_str()) => return Ok(()),
+            Some(_) => {}
+        }
+        let patience =
+            std::time::Duration::from_millis(shared.install_patience_ms.load(Ordering::SeqCst));
+        if since.elapsed() >= patience {
             return Err(io_error(
                 ErrorSubject::Snapshot(None),
                 ErrorVerb::Read,
                 format!(
-                    "a snapshot install has been in progress for over {} s; \
+                    "a snapshot install has been in progress for over {} ms; \
                      the build view would be a mid-install image",
-                    INSTALL_PATIENCE.as_secs()
+                    patience.as_millis()
                 ),
             ));
         }
@@ -3477,6 +3503,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RocksSnapshotBuilder {
         let started = std::time::Instant::now();
         let mut last_err = None;
         let mut attempt = 0;
+        // The install this build last waited on, and since when (Q-R1).
+        let mut waited_on: Option<(String, std::time::Instant)> = None;
         while attempt < BUILD_ATTEMPTS {
             // A fresh view per attempt: a failed export removes its checkpoint.
             let result = self
@@ -3512,12 +3540,39 @@ impl RaftSnapshotBuilder<TypeConfig> for RocksSnapshotBuilder {
                         duration_ms = elapsed,
                         "snapshot_build_superseded"
                     );
-                    return self.open_built(current, elapsed).await;
+                    match self.open_built(current, elapsed).await {
+                        Ok(built) => return Ok(built),
+                        // A-2: the current snapshot's file went between the publish check and
+                        // this open, as a prune removes it once a newer one is current. Nothing
+                        // failed, so no attempt is spent: capture again, which covers the newer
+                        // state. Not a loop: a fresh view is never older than the current
+                        // snapshot it was captured over.
+                        Err(e) => {
+                            tracing::info!(detail = %e, "snapshot_build_superseded_file_gone");
+                            continue;
+                        }
+                    }
                 }
                 // F-001: an install is in flight. Not a failure, so no attempt is spent: wait
                 // for the install to commit, then capture again.
                 Ok(Exported::InstallInFlight) => {
-                    match wait_for_install(&self.shared, started).await {
+                    // Q-R1: the patience is per install. It restarts when the install in flight
+                    // is a different one from the install this build last waited on, and keeps
+                    // running for the same one, so a stuck install still ends the build.
+                    let installing = self
+                        .shared
+                        .sm()
+                        .install_in_progress
+                        .as_ref()
+                        .map(|m| m.snapshot_id.clone());
+                    let since = match (&waited_on, &installing) {
+                        (Some((id, since)), Some(now)) if id == now => *since,
+                        _ => std::time::Instant::now(),
+                    };
+                    if let Some(id) = installing.clone() {
+                        waited_on = Some((id, since));
+                    }
+                    match wait_for_install(&self.shared, since, installing).await {
                         Ok(()) => continue,
                         Err(e) => e,
                     }
@@ -3771,13 +3826,13 @@ fn export_into_file(
     );
     {
         // F-001: check and publish under one hold of the state-machine lock. An install sets
-        // its in-memory marker under this lock (after the durable marker, before it clears
-        // anything) and clears it, with the new `current_snapshot`, under this lock after its
-        // final batch. So with no marker seen here, an install has either committed (and the
-        // newer check sees it) or not yet set its marker, which it cannot do until this write is
-        // done; its final batch then replaces this one. Held for one small synced write, as
-        // `apply` holds it for its batch — never for the checkpoint, which stays outside the
-        // lock (A-R279).
+        // its in-memory marker under this lock (before its rename and durable marker, so before
+        // it clears anything) and clears it, with the new `current_snapshot`, under this lock
+        // after its final batch. So with no marker seen here, an install has either committed
+        // (and the newer check sees it) or not yet set its marker, which it cannot do until this
+        // write is done; its final batch then replaces this one. Held for one small synced
+        // write, as `apply` holds it for its batch — never for the checkpoint, which stays
+        // outside the lock (A-R279).
         let mut sm = s.sm();
         if let Some(blocked) = publish_blocker(&sm, view.last_applied) {
             let in_use = [
@@ -3814,11 +3869,6 @@ fn export_into_file(
 /// marker's file is retained until the install commits.
 fn prune_snapshots(s: &RocksShared, current_id: &str) {
     let keep = s.retain_snapshots.load(Ordering::SeqCst).max(1);
-    let in_progress = s
-        .sm()
-        .install_in_progress
-        .as_ref()
-        .map(|m| m.snapshot_id.clone());
     let listed = match snapshot::list_snapshots(&s.path) {
         Ok(listed) => listed,
         Err(e) => {
@@ -3826,8 +3876,22 @@ fn prune_snapshots(s: &RocksShared, current_id: &str) {
             return;
         }
     };
+    // Read after the listing, not before (C5-06). An install sets the mirror before it renames
+    // its file in, so a file this listing saw was named in the mirror by then — or, if that
+    // install has since committed, is the current snapshot.
+    let spared: Vec<String> = {
+        let sm = s.sm();
+        [
+            sm.current_snapshot.as_ref(),
+            sm.install_in_progress.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|m| m.snapshot_id.clone())
+        .collect()
+    };
     for (id, path) in listed.into_iter().skip(keep) {
-        if id == current_id || in_progress.as_deref() == Some(id.as_str()) {
+        if id == current_id || spared.contains(&id) {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -4213,8 +4277,11 @@ fn install_received(
     // Any failure from here on abandons the transfer: the slot is released, the partial file
     // goes, and so does the deferred purge it was going to justify (ruling M5-R11 — dropped,
     // never executed). `path` is whatever the transfer currently occupies, which is the
-    // received file before the rename and the published one after it.
+    // received file before the rename and the published one after it. The in-memory marker
+    // mirror is set before the rename (C5-06), so it is cleared here too; nothing else can have
+    // set it, because a store whose earlier install failed is poisoned and stops at the guard.
     let abort = |s: &RocksShared, path: &Path| {
+        s.sm().install_in_progress = None;
         *s.recv() = None;
         let _ = std::fs::remove_file(path);
         *s.pending_purge() = None;
@@ -4241,6 +4308,21 @@ fn install_received(
     }
 
     let final_path = snapshot::snap_path(&s.path, &header.snapshot_id);
+    let stored = StoredSnapshot {
+        snapshot_id: header.snapshot_id.clone(),
+        last_log_id: header.last_log_id,
+        membership: header.membership.clone(),
+        file_name: format!("{}.{}", header.snapshot_id, snapshot::SNAP_EXT),
+        size_bytes: std::fs::metadata(&recv_path).map_or(0, |m| m.len()),
+        created_unix_ms: header.created_unix_ms,
+    };
+    // C5-06: the mirror goes up **before** the file appears under `snapshots/`. Retention reads
+    // it to spare the install's file, and a build reads it to stay out of an install's way;
+    // set after the rename, it left a window in which a local build published and pruned the
+    // file this install was about to name in its marker. Only the in-memory mirror moves: a
+    // durable marker before the rename would, after a crash, name a file that was never
+    // renamed in, and the next open would refuse the store.
+    s.sm().install_in_progress = Some(stored.clone());
     if let Err(e) = std::fs::rename(&recv_path, &final_path) {
         abort(s, &recv_path);
         return Err(io_error(
@@ -4250,15 +4332,6 @@ fn install_received(
         ));
     }
     fsync_dir(&s.snapshot_dir());
-
-    let stored = StoredSnapshot {
-        snapshot_id: header.snapshot_id.clone(),
-        last_log_id: header.last_log_id,
-        membership: header.membership.clone(),
-        file_name: format!("{}.{}", header.snapshot_id, snapshot::SNAP_EXT),
-        size_bytes: std::fs::metadata(&final_path).map_or(0, |m| m.len()),
-        created_unix_ms: header.created_unix_ms,
-    };
 
     // Failing here is still "nothing was destroyed", so it aborts like every other check
     // above it rather than leaving a claimed slot and an orphaned published file behind.
@@ -4287,9 +4360,9 @@ fn install_received(
         abort(s, &final_path);
         return Err(e);
     }
-    s.sm().install_in_progress = Some(stored.clone());
     // The marker is durable, so it — not the slot — is now the activity evidence a concurrent
     // purge needs, and the received file has already been renamed into its published name.
+    // The mirror has been up since before the rename.
     *s.recv() = None;
 
     let pending = s.pending_purge().take();

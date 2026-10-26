@@ -338,6 +338,14 @@ all, from a situation in which nothing had actually been lost. `prune_snapshots`
 exempts `install_in_progress.snapshot_id` as well as the current snapshot. Row:
 `m5_15a_prune_never_removes_the_in_progress_install_file`.
 
+The exemption reads the in-memory mirror of the marker, so the mirror goes up **before** the
+install renames its file into `snapshots/` (#68). Set after the rename, it left a window in
+which a local build published, pruned the incoming file, and the install then wrote a marker
+naming a missing file. Only the mirror moves: a durable marker before the rename would, after a
+crash, name a file that was never renamed in. An install that aborts before its marker clears
+the mirror. Prune reads the mirror after it lists the directory, so every file it saw was
+already named there. Row: `c5_06_a_build_inside_the_rename_window_never_prunes_the_installing_file`.
+
 **8. Both kinds of partial file are swept at open (C5-13).** `.recv.tmp` is an incoming
 transfer that will never be installed; `.tmp` is an export that died before its rename, so it
 was never a publication. Neither is ever served and neither is visible to `list_snapshots`,
@@ -453,11 +461,19 @@ The offline backup export (`snapshot::export_snapshot`) refuses a directory that
 marker; opening the store once redoes the install. Rows: `f001_*` in
 `config-storage/tests/m5_snapshot.rs`.
 
-Limit (review-s2 Q-R1, A-R418): the build's wait for an install, `INSTALL_PATIENCE` (300 s),
-counts from the build's start, not from each `InstallInFlight`. So an export plus an install
-that together take about 300 s spend every build attempt at once, and the node stops with a
-fatal error. It needs a restart; no data is lost. rEtcd's state today is far below the size
-such a build needs. Restarting the clock at each `InstallInFlight` is a follow-up.
+Patience (review-s2 Q-R1, A-R418, fixed in #68): the build waits for **one** install for at
+most `INSTALL_PATIENCE` (300 s). The clock starts when the build first meets that install and
+restarts when a different install is in flight, so a node receiving one install after another
+never fails a build that waited a short while on each. The clock keeps running for the same
+install, so a stuck install still ends the build: every attempt is spent, and OpenRaft stops
+the node with a fatal error. It needs a restart; no data is lost. Tests shorten the patience
+with `RocksStore::set_install_patience`. Row:
+`q_r1_the_install_patience_restarts_for_each_new_install`.
+
+A superseded build hands OpenRaft the current snapshot. If a prune removed that file between
+the publish check and the open, the build captures again and spends no attempt (#68 A-2): an
+`Err` here is fatal to the node, and nothing failed. Row:
+`a2_a_superseded_build_whose_file_was_pruned_captures_again`.
 
 Store open also sets RocksDB `max_background_jobs = 16` (4 flush threads instead of 1, shared by
 every store in the process). With both changes `m5_snapshot_cluster` passed 20 of 20 runs under
