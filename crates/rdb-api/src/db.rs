@@ -4219,6 +4219,9 @@ fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
 mod reopen_tests;
 
 #[cfg(test)]
+mod rebuild_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_store::{Script, Scripted};
