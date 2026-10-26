@@ -2739,6 +2739,21 @@ fn m11_t7_a_shadow_left_by_a_promote_is_promoted_without_the_revoke_retry() {
         waited_ms = at.elapsed().as_millis(),
         "m11_t7_shadow_regular_after_promote"
     );
+    // The new owner adopts its generation after the commit lands; a put sent before that is
+    // refused "no generation adopted yet" and changes nothing (2 of 7 runs).
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+    while !db
+        .node_status()
+        .iter()
+        .any(|status| status.node == NodeId(2) && status.admits == Some(true))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2 does not admit writes after the promote: {:?}",
+            db.node_status()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     put_through_pauses(&db, b"after", b"2", "a put after the promote");
     db.shutdown();
     spare.shutdown();
