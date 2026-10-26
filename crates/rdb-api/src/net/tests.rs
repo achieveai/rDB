@@ -30,8 +30,8 @@ use super::wire::{self, Frame, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 use super::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
 use crate::db::ApiError;
 use crate::host::{
-    Answer, Change, Client, ClientCall, DormantSeed, Holding, ListEdit, Look, Msg, NodeStatus,
-    PeerAsk, PutOp, Seen,
+    Answer, Change, Client, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg,
+    NodeStatus, PeerAsk, PutOp, Seen,
 };
 use crate::transport::Links;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
@@ -260,6 +260,11 @@ fn calls() -> Vec<ClientCall> {
         identity: identity(4, 33),
         node: NodeId(4),
     });
+    calls.push(ClientCall::Move {
+        identity: identity(4, 34),
+        from: NodeId(3),
+        to: NodeId(4),
+    });
     calls
 }
 
@@ -351,6 +356,14 @@ fn answers() -> Vec<Answer> {
         Answer::Unchanged,
         Answer::Status(zero()),
         Answer::Rebuilt("rebuild: node 4 is a spare".to_owned()),
+        Answer::Moved(MoveAnswer {
+            done: true,
+            line: "already moved: node 3 to node 4".to_owned(),
+        }),
+        Answer::Moved(MoveAnswer {
+            done: false,
+            line: "moving".to_owned(),
+        }),
         Answer::Error {
             error,
             request: Some(zero()),
@@ -540,6 +553,15 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         };
         assert_eq!(format!("{:?}", back.land()), before);
     }
+    // Critic A1: M11's answers go last, so a pre-M11 answer keeps its encoded index (postcard
+    // writes the variant index first).
+    let index = |answer: &WireAnswer| postcard::to_stdvec(answer).expect("encodes")[0];
+    assert_eq!(index(&WireAnswer::Unchanged), 3);
+    let error = WireAnswer::carry(&Answer::Error {
+        error: ApiError::host("x"),
+        request: None,
+    });
+    assert_eq!(index(&error), 5);
 
     let status = status();
     let bytes = wire::encode(&Frame::Reply {

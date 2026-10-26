@@ -1536,16 +1536,17 @@ pub enum WireAnswer {
     Compiled(TxnRequest),
     Unchanged,
     Status(TxnStatus),
+    Error {
+        error: WireApiError,
+        request: Option<TxnRequest>,
+    },
+    // M11 (A-R449): added last, so the variants above keep their encoded index.
     Moved {
         done: bool,
         line: String,
     },
     Rebuilt {
         line: String,
-    },
-    Error {
-        error: WireApiError,
-        request: Option<TxnRequest>,
     },
 }
 
