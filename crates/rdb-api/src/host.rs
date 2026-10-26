@@ -6078,13 +6078,6 @@ impl Host {
                     to.0, partition.0, from.0, self.node.0
                 ));
             }
-            (_, Some(ReplicaRole::RegularSecondary)) => {
-                return refuse(format!(
-                    "node {} already holds a regular copy of partition {}: name a node with no \
-                     copy as the target",
-                    to.0, partition.0
-                ));
-            }
             (Some(ReplicaRole::Shadow), _) => {
                 return refuse(format!(
                     "node {} is a shadow of partition {}, not a regular copy: wait until it is \
