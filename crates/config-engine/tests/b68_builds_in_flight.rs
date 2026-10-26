@@ -21,7 +21,7 @@ use config_engine::StorageHandle;
 use config_storage::{
     Boundary, FaultAction, FaultInjector, NoFaults, RaftNode, RaftNodeId, RocksStore, TypeConfig,
 };
-use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine};
+use openraft::storage::{RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, SnapshotMeta};
 use tokio::io::AsyncWriteExt;
 use tracing::Span;
