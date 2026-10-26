@@ -2862,8 +2862,16 @@ fn m11_q4_a_move_resumes_after_the_owner_restarts_with_its_shadow_pinned() {
         Some(vec![1, 2, 4]),
         "the resumed move"
     );
-    assert_eq!(read_bytes(&db, b"before"), Some(b"1".to_vec()), "before the move");
-    assert_eq!(read_bytes(&db, b"after"), Some(b"2".to_vec()), "after the restart");
+    assert_eq!(
+        read_bytes(&db, b"before"),
+        Some(b"1".to_vec()),
+        "before the move"
+    );
+    assert_eq!(
+        read_bytes(&db, b"after"),
+        Some(b"2".to_vec()),
+        "after the restart"
+    );
 }
 
 /// A-R328: an empty copy already bound to another database's instance does not join this one.
