@@ -2028,11 +2028,10 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
-    /// M11: per partition, the copy move this owner runs ([`Host::move_step`]).
+    /// M11: per partition, the copy move this owner was asked for and has not yet answered
+    /// done ([`Host::move_step`]). Only the ask: where the move stands is read from the
+    /// commit's pinned members each time (D2, A-R452).
     moves: BTreeMap<PartitionId, CopyMove>,
-    /// M11 T1: per partition, the last move that committed here, `(from, to)`. Only it is
-    /// answered `already moved`; in memory, so a restarted owner refuses it instead.
-    moved: BTreeMap<PartitionId, (NodeId, NodeId)>,
     /// #65: per partition, the divergence evidence F1's last `Quarantine` reported, for
     /// `admin rebuild`'s G6. Kept until a rebuild replaces the quarantined F1.
     quarantines: BTreeMap<PartitionId, rdb_core::contracts::recovery::DivergenceEvidence>,
@@ -2226,7 +2225,6 @@ impl Host {
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
             moves: BTreeMap::new(),
-            moved: BTreeMap::new(),
             quarantines: BTreeMap::new(),
             rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
@@ -5961,9 +5959,14 @@ impl Host {
                 .map(|member| member.role)
         };
         let mut asked = self.moves.get(&partition).cloned();
+        // Another ask that was given up, or whose move the commit shows done, is over.
+        let over = |mv: &CopyMove| {
+            mv.abandoned.is_some()
+                || (role(mv.from).is_none() && role(mv.to) == Some(ReplicaRole::RegularSecondary))
+        };
         if asked
             .as_ref()
-            .is_some_and(|mv| mv.abandoned.is_some() && (mv.from, mv.to) != (from, to))
+            .is_some_and(|mv| over(mv) && (mv.from, mv.to) != (from, to))
         {
             self.moves.remove(&partition);
             asked = None;
@@ -5979,12 +5982,11 @@ impl Host {
             self.moves.remove(&partition);
             return wait(why);
         }
-        let committed_here = self.moved.get(&partition) == Some(&(from, to));
         match (role(from), role(to)) {
-            (None, Some(ReplicaRole::RegularSecondary)) if committed_here => {
-                if ours {
-                    self.moves.remove(&partition);
-                }
+            // A-R452: `moved` answers the ask this owner ran. The record cannot tell a source a
+            // move left out from one that never held a copy (T1), so any other ask is refused.
+            (None, Some(ReplicaRole::RegularSecondary)) if ours => {
+                self.moves.remove(&partition);
                 return Ok(MoveAnswer {
                     done: true,
                     line: format!(
@@ -5993,11 +5995,11 @@ impl Host {
                     ),
                 });
             }
-            // T1: a source with no copy is refused unless this exact move committed here.
+            // T1: a source with no copy is refused unless this owner ran that move.
             (None, _) => {
                 return refuse(format!(
-                    "node {} holds no copy of partition {} (members: {}): name a member as the \
-                     source",
+                    "node {} holds no copy of partition {} (members: {}): run `admin status` to \
+                     see whether a move already took it, or name a member as the source",
                     from.0,
                     partition.0,
                     member_list(&members)
@@ -6162,7 +6164,8 @@ impl Host {
     }
 
     /// M11: a commit that ends one of a move's re-plans, `waited_ms` after its revocation was
-    /// asked: the pause writes saw. Clears the move once `to` is regular and `from` is out.
+    /// asked: the pause writes saw. Once `to` is regular and `from` is out, `from` is no longer
+    /// a left-out member (T3); the ask is answered `moved` by the next `move_step`.
     fn move_committed(&mut self, partition: PartitionId, generation: Generation, waited_ms: u64) {
         let Some(mv) = self.moves.get(&partition).cloned() else {
             return;
@@ -6183,8 +6186,11 @@ impl Host {
             _ => "other",
         };
         if phase == "moved" {
-            self.moves.remove(&partition);
-            self.moved.insert(partition, (mv.from, mv.to));
+            // T3 (critic M4): the copy moved away; the source is a spare now, not a member a
+            // drop left out, so its restart re-adds nothing.
+            if let Some(left) = self.left_out.get_mut(&partition) {
+                left.retain(|member| member.node != mv.from);
+            }
         }
         tracing::info!(
             node = self.node.0,

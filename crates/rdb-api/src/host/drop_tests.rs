@@ -3366,3 +3366,47 @@ fn m11_t1_a_move_that_never_ran_is_not_already_moved() {
         other => panic!("a move from a node with no copy: {other:?}"),
     }
 }
+
+/// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
+/// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
+/// left-out member, and the partition pinned the moved-off copy again on its own. The move's
+/// commit now forgets the source, so a restart re-adds nothing. Here the drop of node 3 is
+/// the commit of a move from node 3 (node 2 regular, node 3 out); node 3 then restarts while
+/// the commit pins two regular copies, and stays out.
+/// Integration (~6 s): b1's drop, then b15's re-add window with nothing re-added.
+#[config_log::retcd_test]
+fn m11_t3_a_moved_off_source_is_not_added_back_by_its_restart() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    trio.until("node 1 decided to drop node 3", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.drop == Some(NodeId(3))
+        )
+        .then_some(())
+    });
+    trio.nodes[0].0.moves.insert(
+        PartitionId(1),
+        CopyMove {
+            from: NodeId(3),
+            to: NodeId(2),
+            abandoned: None,
+        },
+    );
+    dropped_three(&mut trio, before);
+    trio.links.heal_all();
+    restart(&mut trio, dir.path(), 3);
+    pass(&mut trio, 3_000);
+    let (_, _, members) = commit_of(&trio).expect("a commit");
+    assert_eq!(members, vec![1, 2], "the moved-off source was pinned again");
+    assert!(
+        trio.nodes[0].0.left_out[&PartitionId(1)]
+            .iter()
+            .all(|member| member.node != NodeId(3)),
+        "node 3 is still left out: {:?}",
+        trio.nodes[0].0.left_out
+    );
+}
