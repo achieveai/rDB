@@ -5999,7 +5999,7 @@ impl Host {
             self.moves.remove(&partition);
             asked = None;
         }
-        let ours = asked
+        let mut ours = asked
             .as_ref()
             .is_some_and(|mv| (mv.from, mv.to) == (from, to));
         if let Some(why) = asked
@@ -6008,7 +6008,24 @@ impl Host {
             .and_then(|mv| mv.abandoned.clone())
         {
             self.moves.remove(&partition);
-            return wait(why);
+            // T9: once the give-up has committed and the target is reachable again, the re-run
+            // starts the move afresh instead of repeating why the last one was given up.
+            let back = role(to).is_none()
+                && !self.rejoins.contains_key(&partition)
+                && self.linked(to)
+                && self.links.boot_of(to).is_some();
+            if !back {
+                return wait(why);
+            }
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = to.0,
+                "move_given_up_cleared"
+            );
+            asked = None;
+            ours = false;
         }
         match (role(from), role(to)) {
             // A-R452: `moved` answers the ask this owner ran. The record cannot tell a source a

@@ -3521,6 +3521,46 @@ fn m11_t4_a_move_whose_target_is_unreachable_past_the_drop_clock_is_given_up() {
     }
 }
 
+/// M11 defect T9 (tester walk): a move given up while its target was down was answered once more
+/// with the stale give-up text after the target came back, and only the run after that started
+/// it. Now a re-run once the target is reachable again and the give-up has committed starts the
+/// move afresh, and it ends with node 4 regular and node 3 out.
+/// Integration (~5 s): T4's give-up, then a whole move.
+#[config_log::retcd_test]
+fn m11_t9_a_re_run_after_the_target_is_back_starts_afresh() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    for other in [1, 2, 3] {
+        trio.links.hold(NodeId(other), NodeId(4));
+    }
+    trio.until("node 1 left node 4 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&4))
+    });
+    trio.until("the give-up re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.links.heal_all();
+    trio.until("node 1 links node 4 again", |trio| {
+        trio.nodes[0].0.linked(NodeId(4)).then_some(())
+    });
+    trio.ready();
+    match trio.ask(move_call(2, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4 once node 4 is back: {other:?}"),
+    }
+    let (_, _, members) = trio.until("node 4 regular and node 3 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&3))
+    });
+    assert_eq!(members, vec![1, 2, 4]);
+}
+
 /// M11 defect T8 (tester walk): the owner promoted a caught-up shadow whose link was already
 /// down. The promote left the healthy source out, writes paused on the dead target until the
 /// drop clock dropped it, and only two copies were left. Now a shadow the owner has no link to
