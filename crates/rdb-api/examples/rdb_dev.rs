@@ -436,6 +436,14 @@
 //! then, logged as `control_store_rebind`.
 //!
 //! The JSONL log goes to `<log-dir>/rdb_dev.jsonl`; its path is printed to stderr as `log=`.
+//!
+//! `rdb_dev admin plan <inventory.json> [--max-moves K]` (M11, model only) starts nothing and
+//! talks to no cluster. It reads an inventory file (nodes, and where each partition's copies and
+//! primary are; format in `docs/rdb/local-cluster.md`), plans at most K steps (no limit without
+//! the flag), prints one `rdb_dev admin move <from> <to> --partition P [--primary]` line per
+//! step with its reason, then `after:` with the skews and one `residual:` line per claim left
+//! unmet. Nothing is applied. A file that does not read, or an inventory that does not add up,
+//! prints `rdb_dev admin plan: ..` to stderr and exits 2.
 
 #[path = "support/hostile_store.rs"]
 mod hostile_store;
@@ -727,8 +735,97 @@ fn parse_pair(text: &str) -> Result<(NodeId, NodeId), String> {
     Ok((a, b))
 }
 
+/// `admin plan <file> [--max-moves K]`: reads an inventory, prints the plan, applies nothing.
+/// Runs before any argument parsing, log or cluster: it reads one file and writes stdout.
+fn admin_plan(rest: &[String]) -> ExitCode {
+    use rdb_core::placement;
+    const USAGE: &str = "usage: rdb_dev admin plan <inventory.json> [--max-moves K]";
+    let fail = |message: String| {
+        eprintln!("rdb_dev admin plan: {message}");
+        ExitCode::from(2)
+    };
+    let mut file = None;
+    let mut max_moves = None;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--max-moves" => match words.next().map(|k| k.parse::<usize>()) {
+                Some(Ok(k)) => max_moves = Some(k),
+                _ => return fail(format!("--max-moves takes a whole number; {USAGE}")),
+            },
+            other if other.starts_with("--") || file.is_some() => {
+                return fail(format!("unexpected {other:?}; {USAGE}"));
+            }
+            other => file = Some(other.to_owned()),
+        }
+    }
+    let Some(file) = file else {
+        return fail(format!("no inventory file; {USAGE}"));
+    };
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) => return fail(format!("{file}: {e}")),
+    };
+    let inventory: placement::Inventory = match serde_json::from_str(&text) {
+        Ok(inventory) => inventory,
+        Err(e) => return fail(format!("{file}: not an inventory: {e}")),
+    };
+    let plan = match placement::plan(&inventory, max_moves.unwrap_or(usize::MAX)) {
+        Ok(plan) => plan,
+        Err(e) => return fail(format!("{file}: {e}")),
+    };
+    println!(
+        "plan: {} nodes, {} partitions, max moves {}; model only, nothing is applied",
+        inventory.nodes.len(),
+        inventory.partitions.len(),
+        max_moves.map_or_else(|| "none".to_owned(), |k| k.to_string())
+    );
+    println!(
+        "before: copy skew {}, primary skew {}",
+        placement::copy_skew(&inventory),
+        placement::primary_skew(&inventory)
+    );
+    for step in &plan.steps {
+        println!("{}", step.line());
+    }
+    println!(
+        "after: {} moves, copy skew {}, primary skew {}",
+        plan.steps.len(),
+        placement::copy_skew(&plan.after),
+        placement::primary_skew(&plan.after)
+    );
+    let counts = |counts: std::collections::BTreeMap<u32, usize>| {
+        counts
+            .iter()
+            .map(|(node, count)| format!("{node}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    println!(
+        "after: copies per node {}",
+        counts(placement::copy_counts(&plan.after))
+    );
+    println!(
+        "after: primaries per node {}",
+        counts(placement::primary_counts(&plan.after))
+    );
+    for residual in &plan.residuals {
+        println!("residual: {}", residual.describe());
+    }
+    if plan.residuals.is_empty() {
+        println!("residual: none");
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
-    let args = match parse(std::env::args().skip(1)) {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if let [admin, plan, rest @ ..] = raw.as_slice() {
+        if admin == "admin" && plan == "plan" {
+            return admin_plan(rest);
+        }
+    }
+    let args = match parse(raw.into_iter()) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("rdb_dev: {message}");
