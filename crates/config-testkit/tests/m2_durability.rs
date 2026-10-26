@@ -221,9 +221,7 @@ async fn m2_04_revision_monotonic_across_restart() {
 
         expected += 1;
         let leader_now = cluster.leader().await;
-        let resp = cluster
-            .client(leader_now)
-            .put(put_req(&format!("/m2/04/after{i}"), "v"))
+        let resp = put_following_the_leader(&cluster, leader_now, &format!("/m2/04/after{i}"))
             .await
             .unwrap_or_else(|e| panic!("put after restarting {id}: {e}"));
         assert_eq!(
@@ -251,6 +249,62 @@ async fn m2_04_revision_monotonic_across_restart() {
         sentinel_after.mod_revision, sentinel_before.mod_revision,
         "an untouched key's mod_revision moved"
     );
+
+    cluster.shutdown().await;
+}
+
+/// M2-04's put after each restart, sent to `first` and followed to whichever node leads after a
+/// `NotLeader` (#43).
+///
+/// Under host load the leader lost its term between `cluster.leader()` and the put: a RocksDB
+/// write stall of 2.9 s on node 1 (lead gate run 571ba84d, `teams/m9/m4w-dev.md`), and the put
+/// answered "not leader". `NotLeader` is refused before anything is proposed, so the revision
+/// the row then checks is still the next one; any other error still fails the row.
+async fn put_following_the_leader(
+    cluster: &Cluster,
+    first: NodeId,
+    key: &str,
+) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+    cluster
+        .retry_on_not_leader(first, cluster.deadline(20), |node| {
+            let client = cluster.client(node);
+            let request = put_req(key, "v");
+            async move { client.put(request).await }
+        })
+        .await
+}
+
+/// #43's forced repro for M2-04: leadership moves after the row picked its leader, as the
+/// RocksDB stall made it do under load. The old leader is isolated until a successor leads,
+/// then healed until it steps down, so it answers `NotLeader`. M2-04's put still lands, at
+/// the next revision.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m2_04_probe_a_put_sent_to_a_stale_leader_follows_the_move() {
+    let cluster = Cluster::start(3, StorageKind::ROCKS).await;
+    let stale = cluster.leader().await;
+    put_n(&*cluster.client(stale), 3, "/m2/04p/k").await;
+
+    cluster.isolate(stale);
+    cluster
+        .wait_for(
+            "a leader other than the isolated one",
+            cluster.deadline(20),
+            || cluster.leaders_now().into_iter().find(|id| *id != stale),
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+    cluster.heal();
+    cluster
+        .wait_for("the old leader steps down", cluster.deadline(20), || {
+            (!cluster.leaders_now().contains(&stale)).then_some(())
+        })
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+
+    let resp = put_following_the_leader(&cluster, stale, "/m2/04p/after")
+        .await
+        .unwrap_or_else(|e| panic!("put after the leader moved: {e}"));
+    assert_eq!(resp.revision, 4, "the refused send allocated nothing");
 
     cluster.shutdown().await;
 }
