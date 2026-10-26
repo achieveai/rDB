@@ -31,7 +31,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rdb_core::authority::partition::INSTANCE_LEN;
+use rdb_core::authority::clock::{expiry_proven, ClockView};
+use rdb_core::authority::grant::GrantRecord;
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord, INSTANCE_LEN};
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
     AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, BlockReason, Boundary,
@@ -391,6 +393,22 @@ pub enum Msg {
         fence: u64,
         /// The owner the record names.
         owner: Option<NodeId>,
+    },
+    /// A-R446: a routed `FenceProven` and what `partitions/1` and its owner's grant said when
+    /// this node read them for it ([`ControlAdapter::read_fence_facts`]). F1 is given the proof
+    /// only when [`bind_routed_fence`] holds; dropped unless `boot` is the node's own, as
+    /// [`Msg::Control`].
+    FenceBound {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition the proof was routed to.
+        partition: PartitionId,
+        /// The correlation it was routed with.
+        correlation: CorrelationId,
+        /// The proof as it arrived.
+        proof: Box<FencingProof>,
+        /// The records read, or why they could not be.
+        facts: Result<FenceFacts, String>,
     },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
@@ -2301,6 +2319,7 @@ impl Host {
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
             Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
             Msg::OwnerLearned { .. } => "owner_learned".to_owned(),
+            Msg::FenceBound { .. } => "fence_bound".to_owned(),
             _ => "other".to_owned(),
         };
         tracing::info!(
@@ -2349,6 +2368,7 @@ impl Host {
             | Msg::Fault { boot, .. }
             | Msg::Activated { boot, .. }
             | Msg::OwnerLearned { boot, .. }
+            | Msg::FenceBound { boot, .. }
                 if boot != self.boot =>
             {
                 self.drop_stale(&msg, boot);
@@ -2502,7 +2522,52 @@ impl Host {
                         "routed_admin_event"
                     );
                 }
-                self.push(site, EventKind::Kernel(kind), true, None);
+                // A-R446: a routed fence is bound to this node's own control reads before F1
+                // sees it (`bind_routed_fence`), from whichever process sent it.
+                if let KernelEvent::Recovery(RecoveryEvent::FenceProven(proof)) = kind {
+                    self.control.read_fence_facts(
+                        self.node,
+                        self.boot,
+                        partition,
+                        correlation,
+                        proof,
+                    );
+                } else {
+                    self.push(site, EventKind::Kernel(kind), true, None);
+                }
+                Ok(())
+            }
+            Msg::FenceBound {
+                partition,
+                correlation,
+                proof,
+                facts,
+                ..
+            } => {
+                match bind_routed_fence(&proof, facts, self.clock.now(), &self.budgets) {
+                    Ok(()) => {
+                        tracing::info!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            control_revision = proof.control_revision.0,
+                            "routed_fence_bound"
+                        );
+                        let site = Site {
+                            partition,
+                            correlation,
+                        };
+                        let kind = KernelEvent::Recovery(RecoveryEvent::FenceProven(proof));
+                        self.push(site, EventKind::Kernel(kind), true, None);
+                    }
+                    Err((reason, detail)) => tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        control_revision = proof.control_revision.0,
+                        reason,
+                        detail,
+                        "routed_fence_refused"
+                    ),
+                }
                 Ok(())
             }
             Msg::Answered {
@@ -9239,6 +9304,117 @@ fn resolve_position(at: i64, count: u64) -> Option<u64> {
     }
 }
 
+/// What a node reads for a routed `FenceProven` before F1 sees it (A-R446).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceFacts {
+    /// `partitions/1` as read.
+    pub record: PartitionRecord,
+    /// The owner boot its root names.
+    pub owner_boot: BootId,
+    /// Its `mod_revision`.
+    pub mod_revision: Revision,
+    /// `grants/{record.owner}`, read after it; `None` when absent.
+    pub grant: Option<GrantRecord>,
+}
+
+/// A-R446 (review of PR #63, option (b)): whether a routed `FenceProven` is true of the control
+/// records this node read for it. `Err` names the first check that failed, and why. F1 checks
+/// only the proof's lineage and its floor, and the commit CAS compares only
+/// `control_revision`, so without this a node would commit over a live grant on a proof an app
+/// made up.
+///
+/// Why check-then-CAS is sound (ruling A-R446a): no node admits while `partitions/1` is
+/// `Fencing` and its owner's grant is frozen with `prior_grant_id` and that grant's expiry is
+/// proven past. Only the record's owner can admit (`partition::classify`). It admits on its
+/// grant alone, whatever the lifecycle (`Authority::may_admit_at`), so `Fencing` by itself is not
+/// enough: checks 2, 5 and 6 are one unit. A frozen grant never comes back: `grant::self_replace`
+/// answers `Never` on `frozen`, and `grant::clear_verdict` refuses a frozen record (guard 1) and
+/// one whose partition names the node and is not `Serving` (guard 3). So every fact checked here
+/// stays true until `partitions/1` moves, and that fails the commit CAS. The one refusal that
+/// can be wrong is this node's clock view lagging the promoter's; the promote then times out.
+///
+/// 1. `partitions/1` is the proof's partition, at `control_revision`;
+/// 2. it is `Fencing`;
+/// 3. its generation and owner epoch are the proof's prior ones;
+/// 4. its root's owner boot is the proof's prior boot;
+/// 5. `grants/{owner}` is present, frozen, and the proof's prior grant;
+/// 6. the revocation is `ExpiryProven` (a routed `DurableDrain` is refused: only local paths
+///    send one), and this node's own clock view proves that grant's expiry past.
+pub(crate) fn bind_routed_fence(
+    proof: &FencingProof,
+    facts: Result<FenceFacts, String>,
+    now: Tick,
+    budgets: &Budgets,
+) -> Result<(), (&'static str, String)> {
+    let facts = facts.map_err(|error| ("control_read_failed", error))?;
+    let record = &facts.record;
+    if record.partition != proof.partition || facts.mod_revision != proof.control_revision {
+        return Err((
+            "revision",
+            format!(
+                "partitions/{} is at revision {}, the proof is for partitions/{} at {}",
+                record.partition.0,
+                facts.mod_revision.0,
+                proof.partition.0,
+                proof.control_revision.0
+            ),
+        ));
+    }
+    if record.lifecycle != PartitionLifecycle::Fencing {
+        return Err(("not_fencing", format!("lifecycle {:?}", record.lifecycle)));
+    }
+    if (record.generation, record.owner_epoch) != (proof.prior_generation, proof.prior_owner_epoch)
+    {
+        return Err((
+            "lineage",
+            format!(
+                "record at generation {} epoch {}, proof at {} epoch {}",
+                record.generation.0,
+                record.owner_epoch.0,
+                proof.prior_generation.0,
+                proof.prior_owner_epoch.0
+            ),
+        ));
+    }
+    if facts.owner_boot != proof.prior_boot_id {
+        return Err((
+            "owner_boot",
+            format!(
+                "record names boot {}, proof boot {}",
+                facts.owner_boot.0, proof.prior_boot_id.0
+            ),
+        ));
+    }
+    let grant = match facts.grant {
+        Some(grant) if grant.frozen && grant.grant == proof.prior_grant_id => grant,
+        Some(grant) => {
+            return Err((
+                "grant",
+                format!(
+                    "grants/{} holds grant {} frozen={}, proof grant {}",
+                    record.owner.0, grant.grant.0, grant.frozen, proof.prior_grant_id.0
+                ),
+            ))
+        }
+        None => return Err(("grant", format!("grants/{} is absent", record.owner.0))),
+    };
+    if !matches!(proof.revocation, Revocation::ExpiryProven { .. }) {
+        return Err(("revocation", format!("{:?}", proof.revocation)));
+    }
+    let mut view = ClockView::new();
+    view.accept(HostClock::control_time(now, budgets));
+    if expiry_proven(&view, grant.expiry_utc_ms, now, budgets).is_none() {
+        return Err((
+            "expiry_not_proven",
+            format!(
+                "grants/{} expires at {}, now {}",
+                record.owner.0, grant.expiry_utc_ms, now.0
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -9250,6 +9426,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Fault { .. } => "fault",
         Msg::Activated { .. } => "activated",
         Msg::OwnerLearned { .. } => "owner_learned",
+        Msg::FenceBound { .. } => "fence_bound",
         Msg::Inject { .. } => "inject",
         Msg::Frame { .. } => "frame",
         Msg::PeerAsk { .. } => "peer_ask",

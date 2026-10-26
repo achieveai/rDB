@@ -33,6 +33,8 @@ use config_core::{
     MutationResponse, PutRequest, WatchItem, WatchRequest,
 };
 use futures::StreamExt;
+use rdb_core::authority::grant::GrantRecord;
+use rdb_core::contracts::authority::FencingProof;
 use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
     ControlRecord, ReadOutcome, WatchCursor, WatchTermination,
@@ -44,7 +46,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
-use crate::host::Msg;
+use crate::host::{FenceFacts, Msg};
 use crate::transport::Links;
 
 /// Where a completion goes: the asking node and the boot it asked under, and the effect's
@@ -307,6 +309,43 @@ impl ControlAdapter {
         calls.push(task);
     }
 
+    /// A-R446: for a routed `FenceProven`, read `partitions/1` and then its owner's grant once,
+    /// and answer [`Msg::FenceBound`] with the proof and what was read, or why it could not be.
+    /// No retry: a refused fence fails its promote loud ("promote again"). It never posts a
+    /// control event, so A1 never hears it. Tracked with the node's calls, so a restart
+    /// abandons it.
+    pub fn read_fence_facts(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        correlation: CorrelationId,
+        proof: Box<FencingProof>,
+    ) {
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                let facts = fence_facts(&*store).await;
+                let msg = Msg::FenceBound {
+                    boot,
+                    partition,
+                    correlation,
+                    proof,
+                    facts,
+                };
+                if links.post(node, msg).is_err() {
+                    tracing::debug!(node = node.0, "control_completion_unclaimed");
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
     /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
     /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
     /// puts its count back to 0 before it answers, and the only reloads ever stopped early are
@@ -530,6 +569,36 @@ async fn call(
 const RETRY_BACKOFF_BASE_MILLIS: u64 = 50;
 /// The longest wait between two attempts (M9 S2a ruling, critic A3).
 const RETRY_BACKOFF_CAP_MILLIS: u64 = 2_000;
+
+/// [`ControlAdapter::read_fence_facts`]'s two reads: `partitions/1` (as a promote reads it),
+/// then `grants/{owner}` of the owner it names.
+async fn fence_facts(store: &dyn ConfigStore) -> Result<FenceFacts, String> {
+    let (record, root, mod_revision, _) = crate::admin::read_partition(store)
+        .await
+        .map_err(|error| error.to_string())?;
+    let key = ControlKey::Grant(record.owner).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| format!("get {key}: {error}"))?;
+    let grant = match read.record {
+        None => None,
+        Some(found) => Some(GrantRecord::decode(&found.value).ok_or_else(|| {
+            format!(
+                "{key} at revision {} is not a grant record",
+                found.mod_revision
+            )
+        })?),
+    };
+    Ok(FenceFacts {
+        record,
+        owner_boot: root.owner_boot,
+        mod_revision: Revision(mod_revision),
+        grant,
+    })
+}
 
 /// How long to wait after failed attempt `attempt` (1-based): 50, 100, 200 ms ... capped at 2 s.
 /// A reload's lists and a family's re-watches both wait this.

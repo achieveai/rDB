@@ -2017,7 +2017,7 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
 }
 
 /// `partitions/1` as a layout-3 record, its `mod_revision` and the read's store revision.
-async fn read_partition(
+pub(crate) async fn read_partition(
     store: &dyn ConfigStore,
 ) -> Result<(PartitionRecord, PartitionRoot, u64, u64), PromoteError> {
     let read = store
