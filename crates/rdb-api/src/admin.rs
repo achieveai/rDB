@@ -29,6 +29,7 @@ use bytes::Bytes;
 use config_core::{
     ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, MutationOutcome, PutRequest,
 };
+use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
 use rdb_core::authority::partition::{
     PartitionLifecycle, PartitionRecord, PartitionRoot, INSTANCE_LEN,
@@ -42,7 +43,7 @@ use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::{Budgets, EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
     AuthorityGeneration, BootId, ConfigVersion, CorrelationId, Generation, GrantId, NodeId,
-    OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
+    OperationId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
@@ -86,7 +87,9 @@ pub enum BootstrapError {
     NodeStopped,
 }
 
-/// The rf3 member set: node 1 primary as copy 0, nodes 2 and 3 regular secondaries.
+/// The rf3 member set: node 1 primary as copy 0, nodes 2 and 3 regular secondaries. For open
+/// and bootstrap only: it holds no shadow, so a promote reads the live roles from its target
+/// instead (review-s2 F-004, A-R412).
 #[must_use]
 pub fn members() -> Vec<Member> {
     (1..=3u8)
@@ -113,22 +116,25 @@ pub fn members_at(boot: BootId) -> Vec<Member> {
         .collect()
 }
 
-/// A recovery plan for partition 1 from `anchor`: rf3 at `version`, every node at `boot`, every
-/// copy a candidate and in `rebuild_required`, node 1 primary with `grant` at `generation`.
+/// A recovery plan for the anchor's partition from `anchor`: rf3 at `version` with `members`,
+/// the owner at `boot` in the authority view, every copy a candidate and in `rebuild_required`,
+/// the pinned primary with `grant` at `generation`. The host's restart re-plan uses it too
+/// (#42, A-R249).
 ///
 /// Only the pinned primary is `primary_eligible` (ruling A-R215). The host acquires, tracks and
 /// adopts on that copy alone, so F1 must lead with it even when another copy holds the longer
 /// prefix: the leader then catches up before its grant. Every copy eligible let `select_leader`
 /// name the prefix source, which owned the record while node 1 held the grant, and the open
 /// served nothing.
-fn recovery_plan(
+pub(crate) fn recovery_plan(
     anchor: LineageAnchor,
     version: ConfigVersion,
+    members: Vec<Member>,
     boot: BootId,
     grant: GrantId,
     generation: AuthorityGeneration,
 ) -> RecoveryPlan {
-    let config = PartitionConfig::new(PARTITION, version, members_at(boot));
+    let config = PartitionConfig::new(anchor.lineage.partition, version, members);
     RecoveryPlan {
         anchor,
         candidates: config
@@ -226,6 +232,7 @@ pub async fn bootstrap_at(
     let plan = recovery_plan(
         anchor,
         CONFIG_VERSION,
+        members_at(boot),
         boot,
         GrantId(1),
         AuthorityGeneration(1),
@@ -374,13 +381,13 @@ pub enum CounterError {
         key: String,
     },
     /// The directory has been opened [`MAX_OPENS`] times.
-    #[error("{key} has counted {MAX_OPENS} opens, the most one directory may have")]
+    #[error("{}", crate::db::error::counter_exhausted_text(.key, MAX_OPENS))]
     Exhausted {
         /// The counter's key.
         key: String,
     },
     /// The counter's value is not one this build writes.
-    #[error("{key} at revision {revision} is not an open counter")]
+    #[error("{}", crate::db::error::counter_unreadable_text(.key, *.revision))]
     Unreadable {
         /// The counter's key.
         key: String,
@@ -762,6 +769,15 @@ pub enum HealError {
         /// Why the last answer kept the grant, and the next step, in words (A-R191b).
         last: String,
     },
+    /// The grant is frozen for a takeover that has not finished. Only a promote settles it, so
+    /// the heal stops at its first look instead of waiting out its time (A-R266 follow-up).
+    #[error("the last run's grant for node {node} (grants/{node}) is frozen: {step}")]
+    Frozen {
+        /// The node.
+        node: u32,
+        /// The next step, in words.
+        step: String,
+    },
     /// The `partitions/1` read was served before the grant delete it must follow.
     #[error("partitions/1 was read at revision {read}, before the grant delete at {deleted}")]
     ReadBeforeDelete {
@@ -786,9 +802,25 @@ pub enum HealError {
     /// The store refused.
     #[error("control store: {0}")]
     Control(String),
-    /// Node 1's thread is gone.
-    #[error("node {} stopped before the heal reached it", OWNER.0)]
-    NodeStopped,
+    /// The owner's thread is gone.
+    #[error("node {} stopped before the heal reached it", .node.0)]
+    NodeStopped {
+        /// The owner the heal was handing the plan to.
+        node: NodeId,
+    },
+    /// No handshake from these nodes within the heal's time, so the plan cannot pin their boots.
+    #[error(
+        "no link to node {who} came up within {secs} seconds, so the heal cannot pin its \
+         boot: start node {who}, then open again",
+        who = names_in_words(.nodes),
+        secs = seconds_in_words(*.within_ms)
+    )]
+    PeersUnknown {
+        /// The nodes with no boot yet.
+        nodes: Vec<u32>,
+        /// The heal's bound.
+        within_ms: u128,
+    },
 }
 
 /// What a reopen's heal runs with: it runs as a task, after `Db::open` has returned.
@@ -798,19 +830,28 @@ pub(crate) struct HealCtx {
     pub(crate) boot: BootId,
     pub(crate) budgets: Budgets,
     pub(crate) clock: HostClock,
-    /// Node 1's mailbox.
+    /// The owner's mailbox.
     pub(crate) owner: std::sync::mpsc::Sender<Msg>,
+    /// The node `partitions/1` named owner when the open read it, and that this process runs
+    /// (arch-s2 B1, B2). The heal clears its grant alone and plans it primary; after a promote
+    /// it is not node 1, and node 1's frozen grant stays as the promote left it.
+    pub(crate) owner_node: NodeId,
     /// How long clearing the old grants may take.
     pub(crate) within: Duration,
+    /// The boot each member runs at: this open's for a node this process runs, the one its
+    /// last handshake reported for another ([`crate::transport::Links::boot_of`]); `None`
+    /// until that node's link has come up (arch-s2 B1).
+    pub(crate) member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
 }
 
 /// The correlation a heal's two events carry.
 const HEAL: CorrelationId = CorrelationId(2);
 
-/// Heal partition 1 after a reopen (M10, arch R3a, rulings A-R159, A-R163): clear the three old
-/// grants, node 1's first; only after node 1's grant is known gone, read `partitions/1`; then
-/// hand node 1's F1 a `Plan` from the record's root at config version + 1 with this open's
-/// boots, and a takeover authorization whose `control_revision` is the record's `mod_revision`.
+/// Heal partition 1 after a reopen (M10, arch R3a, rulings A-R159, A-R163): clear the old grant
+/// of the owner `partitions/1` names, and no other (arch-s2 B1); only after it is known gone,
+/// read `partitions/1` and check it still names that owner (B2); then hand the owner's F1 a
+/// `Plan` from the record's root at config version + 1 with this open's boots, the owner
+/// primary, and a takeover authorization whose `control_revision` is the record's `mod_revision`.
 /// The same proof `bootstrap` and the simulator's `reinspect_now` already use: a CAS at that
 /// revision lands only if nothing wrote `partitions/1` after the read.
 ///
@@ -833,11 +874,13 @@ const HEAL: CorrelationId = CorrelationId(2);
 /// [`HealError`]. Nothing is sent to node 1 unless every step held.
 pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
-    let gone = clear_until(&ctx, OWNER, deadline).await?;
-    for node in [NodeId(2), NodeId(3)] {
-        clear_until(&ctx, node, deadline).await?;
-    }
-    // Only now, after node 1's delete was acknowledged or its absence read (A-R163).
+    // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
+    // fence's reads and decision tick as fresh as they were.
+    let members = member_boots(&ctx, deadline).await?;
+    // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
+    // promote that moved the partition off it, which only that promote may settle.
+    let gone = clear_until(&ctx, ctx.owner_node, deadline).await?;
+    // Only now, after the owner's delete was acknowledged or its absence read (A-R163).
     let read = ctx
         .store
         .get(GetRequest {
@@ -873,6 +916,14 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
             found.mod_revision
         )));
     };
+    // B2: the grant cleared above must be the owner's this record names.
+    if record.owner != ctx.owner_node {
+        return Err(HealError::Record(format!(
+            "the record at revision {} names owner node {}, but this open found node {}: open \
+             again",
+            found.mod_revision, record.owner.0, ctx.owner_node.0
+        )));
+    }
     let healed = Healed {
         cleared,
         read_revision: Revision(read.read_revision),
@@ -925,7 +976,14 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         base_digest: root.base_digest,
     };
     let version = ConfigVersion(record.config_version.0 + 1);
-    let plan = recovery_plan(anchor, version, ctx.boot, view_grant, view_generation);
+    let plan = recovery_plan(
+        anchor,
+        version,
+        members,
+        ctx.boot,
+        view_grant,
+        view_generation,
+    );
     let fence = FencingProof {
         partition: PARTITION,
         prior_generation: record.generation,
@@ -966,9 +1024,119 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
                 correlation: HEAL,
                 kind: EventKind::Kernel(KernelEvent::Recovery(event)),
             })
-            .map_err(|_| HealError::NodeStopped)?;
+            .map_err(|_| HealError::NodeStopped {
+                node: ctx.owner_node,
+            })?;
     }
     Ok(healed)
+}
+
+/// The first wait between two heal attempts that found a peer's boot unknown.
+const HEAL_RETRY_FIRST: Duration = Duration::from_millis(500);
+/// The longest wait between two such attempts.
+const HEAL_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// [`heal`], again and again while it ends [`HealError::PeersUnknown`], until it ends any other
+/// way; the open's shutdown aborts the task that runs it (tester-s2 `lr up` race, ruling
+/// A-R271). On a slow host a peer's process can start after the first window has passed, and
+/// one attempt left the owner dead until it was opened again. Waiting for boots is the heal's
+/// first step and has done nothing yet, so trying again is safe. Any other error ends the heal
+/// as before. Each miss logs `heal_retry{attempt, missing, error, next_ms}`; the wait doubles
+/// from 0.5 s to 5 s.
+pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
+    let mut backoff = HEAL_RETRY_FIRST;
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
+        let again = HealCtx {
+            store: Arc::clone(&ctx.store),
+            owner: ctx.owner.clone(),
+            member_boot: Arc::clone(&ctx.member_boot),
+            ..ctx
+        };
+        match heal(again).await {
+            Err(HealError::PeersUnknown { nodes, within_ms }) => {
+                let missing = nodes.clone();
+                let error = HealError::PeersUnknown { nodes, within_ms };
+                tracing::warn!(
+                    attempt,
+                    missing = ?missing,
+                    %error,
+                    next_ms = backoff.as_millis(),
+                    "heal_retry"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(HEAL_RETRY_MAX);
+            }
+            ended => return ended,
+        }
+    }
+}
+
+/// The rf3 members of [`members`], each at the boot `ctx.member_boot` names for its node, once
+/// every one is known. Polls until `deadline`: a peer's boot arrives with its handshake.
+async fn member_boots(
+    ctx: &HealCtx,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<Member>, HealError> {
+    loop {
+        let found: Vec<(Member, Option<BootId>)> = members()
+            .into_iter()
+            .map(|member| Member {
+                role: if member.node == ctx.owner_node {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::RegularSecondary
+                },
+                ..member
+            })
+            .map(|member| (member, (ctx.member_boot)(member.node)))
+            .collect();
+        let missing: Vec<u32> = found
+            .iter()
+            .filter(|(_, boot)| boot.is_none())
+            .map(|(member, _)| member.node.0)
+            .collect();
+        if missing.is_empty() {
+            let members: Vec<Member> = found
+                .into_iter()
+                .filter_map(|(member, boot)| {
+                    Some(Member {
+                        boot: boot?,
+                        ..member
+                    })
+                })
+                .collect();
+            tracing::info!(
+                boots = ?members.iter().map(|m| (m.node.0, m.boot.0)).collect::<Vec<_>>(),
+                "heal_member_boots"
+            );
+            return Ok(members);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(missing = ?missing, "heal_peers_unknown");
+            return Err(HealError::PeersUnknown {
+                nodes: missing,
+                within_ms: ctx.within.as_millis(),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Node numbers in words: `2`, `2 and 3`, `1, 2 and 3`.
+fn names_in_words(nodes: &[u32]) -> String {
+    match nodes {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!(
+            "{} and {last}",
+            rest.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// How [`clear_until`] found a node's grant gone.
@@ -993,6 +1161,20 @@ async fn clear_until(
                 return Ok(Gone::Deleted(revision, record));
             }
             Ok((Clearance::Absent, None, read)) => return Ok(Gone::Absent(read)),
+            // Waiting never clears a frozen grant: only the promote that froze it, run again.
+            Ok((
+                clearance @ Clearance::Refused {
+                    refusal: ClearRefusal::Frozen,
+                    ..
+                },
+                ..,
+            )) => {
+                tracing::warn!(node = node.0, "heal_grant_frozen");
+                return Err(HealError::Frozen {
+                    node: node.0,
+                    step: kept_in_words(clearance, node, ctx.clock.now()),
+                });
+            }
             Ok((clearance, ..)) => last = kept_in_words(clearance, node, ctx.clock.now()),
             // A lost delete reply is read again next time round, as `clear_grant` advises.
             Err(error)
@@ -1046,9 +1228,11 @@ fn kept_in_words(clearance: Clearance, node: NodeId, now: Tick) -> String {
         Clearance::Refused {
             refusal: ClearRefusal::Frozen,
             ..
-        } => "it is frozen for a takeover that has not finished, so another open may be taking \
-              over this folder's data: let it finish or shut it down, then open again"
-            .to_owned(),
+        } => format!(
+            "a takeover from node {} is unfinished; run `admin promote <the node you chose>` \
+             again",
+            node.0
+        ),
         Clearance::Refused {
             refusal: ClearRefusal::PartitionInTransfer(partition),
             ..
@@ -1215,8 +1399,10 @@ async fn judge(
     })?;
     // R3a; M10 arch R5 row 9: A1's one minting site counts from 1, so a record holding 0 was
     // not written by A1. Refused before anything is deleted; a heal's proof carrying it would
-    // read as `NoGrantHeld`'s "none held".
-    if record.grant == GrantId(0) {
+    // read as `NoGrantHeld`'s "none held". A frozen grant 0 is a promote's (PR #41: it froze an
+    // owner that held no grant), so it goes on to the `Frozen` verdict, which never clears it
+    // and says to finish the takeover (A-R265).
+    if record.grant == GrantId(0) && !record.frozen {
         tracing::warn!(
             node = node.0,
             revision = found.mod_revision,
@@ -1371,6 +1557,817 @@ fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError 
         no_mutation,
         detail: format!("control store: {detail}; {tail}"),
         retry_after: None,
+    }
+}
+
+/// What an admin promote did (arch-s2 "Promote", ruling A-R256).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Promoted {
+    /// The node that owns partition 1 now.
+    pub owner: NodeId,
+    /// The node that owned it before the promote.
+    pub prior_owner: NodeId,
+    /// The member the new configuration leaves out.
+    pub dropped: NodeId,
+    /// The generation the new owner committed.
+    pub generation: Generation,
+    /// The prior owner's grant, now frozen: the one it held, or `GrantId(0)` ("none held")
+    /// when it held none and the promote created a frozen record in its place (PR #41).
+    pub frozen_grant: GrantId,
+    /// The fence's `control_revision`: `partitions/1`'s `mod_revision` after the promote wrote
+    /// it `Fencing`.
+    pub control_revision: Revision,
+}
+
+/// Why an admin promote did not make the node the owner. The first four change nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PromoteError {
+    /// The node is a `Shadow` member: it never counts toward an ACK, so it cannot own.
+    #[error("node {node} is catching up (shadow); promote node {instead} instead")]
+    Shadow {
+        /// The node asked for.
+        node: u32,
+        /// A regular member to name instead.
+        instead: u32,
+    },
+    /// The node holds no copy of partition 1.
+    #[error("node {node} holds no copy of partition 1; name a node that does")]
+    NotAMember {
+        /// The node named.
+        node: u32,
+    },
+    /// The node owns partition 1 already.
+    #[error("node {node} already owns partition 1; nothing was changed")]
+    AlreadyOwner {
+        /// The node named.
+        node: u32,
+    },
+    /// The node to drop is the node to promote.
+    #[error(
+        "the node to drop is the node to promote; drop another member, or name none to drop the \
+         owner"
+    )]
+    DropIsTarget,
+    /// No handshake from these nodes within the promote's time, so the plan cannot pin their
+    /// boots. Nothing was written.
+    #[error(
+        "no link to node {who} came up within {secs} seconds, so the promote cannot pin its \
+         boot: start node {who}, then promote again",
+        who = names_in_words(.nodes),
+        secs = seconds_in_words(*.within_ms)
+    )]
+    PeersUnknown {
+        /// The nodes with no boot yet.
+        nodes: Vec<u32>,
+        /// The promote's bound.
+        within_ms: u128,
+    },
+    /// `to` answered holding no configuration: it has landed none since its restart, so its
+    /// members' roles are unknown and a shadow could be pinned regular. Nothing was written,
+    /// and running it again will not help until a configuration lands (A-R415 C-1, A-R416).
+    #[error(
+        "node {node} holds no configuration since its restart, so the promote cannot tell which \
+         members are still catching up; nothing was changed. A promote needs a node that has \
+         landed a configuration since it started: start the node that owned partition 1, or \
+         promote a node that has not restarted since that node stopped"
+    )]
+    Unconfigured {
+        /// The node asked for.
+        node: u32,
+    },
+    /// `to`'s configuration is not the one `partitions/1` names, so its roles may be out of
+    /// date (A-R415 C-2). Nothing was written.
+    #[error(
+        "node {node} holds configuration version {held}, but partitions/1 is at version \
+         {current}, so its members' roles may be out of date; nothing was changed. Wait until \
+         node {node} has landed version {current}, then promote again"
+    )]
+    StaleMembers {
+        /// The node asked for.
+        node: u32,
+        /// The version it holds.
+        held: u64,
+        /// `partitions/1`'s version.
+        current: u64,
+    },
+    /// The control store refused, or the promote ran out of time after it wrote: the detail
+    /// says which, and the step.
+    #[error("control store: {0}")]
+    Control(String),
+    /// `partitions/1` or the owner's grant record is not one this build reads.
+    #[error("{0}")]
+    Record(String),
+    /// The new owner's node could not be sent the plan.
+    #[error(
+        "node {node} could not be sent the new plan; partition 1 takes no writes until a promote \
+         finishes: check that node {node} runs, then promote again"
+    )]
+    Unreachable {
+        /// The node.
+        node: u32,
+    },
+}
+
+impl PromoteError {
+    /// Whether the promote stopped before it wrote anything.
+    #[must_use]
+    pub const fn no_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::Shadow { .. }
+                | Self::NotAMember { .. }
+                | Self::AlreadyOwner { .. }
+                | Self::DropIsTarget
+                | Self::PeersUnknown { .. }
+                | Self::Unconfigured { .. }
+                | Self::StaleMembers { .. }
+        )
+    }
+}
+
+impl From<PromoteError> for ApiError {
+    /// A-R256: a refused argument is `INVALID_ARGUMENT`; anything else `UNAVAILABLE`. Each of
+    /// those texts but `Record`'s and `Unconfigured`'s ends "promote again", and promoting again
+    /// picks up where this one stopped, so its retry rule is `BoundedJitter`: the step says to
+    /// try again and agrees with the text. A record this build cannot read, or a `to` with no configuration since its
+    /// restart, is `NotWired`: retrying will not help.
+    fn from(error: PromoteError) -> Self {
+        let no_mutation = error.no_mutation();
+        let retry = match &error {
+            PromoteError::Shadow { .. }
+            | PromoteError::NotAMember { .. }
+            | PromoteError::AlreadyOwner { .. }
+            | PromoteError::DropIsTarget => return Self::invalid(error.to_string()),
+            PromoteError::Record(_) | PromoteError::Unconfigured { .. } => RetryRule::NotWired,
+            PromoteError::PeersUnknown { .. }
+            | PromoteError::StaleMembers { .. }
+            | PromoteError::Unreachable { .. }
+            | PromoteError::Control(_) => RetryRule::BoundedJitter,
+        };
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry,
+            no_mutation,
+            detail: error.to_string(),
+            retry_after: None,
+        }
+    }
+}
+
+/// What an admin promote runs with.
+pub(crate) struct PromoteCtx {
+    pub(crate) store: Arc<dyn ConfigStore>,
+    pub(crate) budgets: Budgets,
+    pub(crate) clock: HostClock,
+    /// The node to make the owner.
+    pub(crate) to: NodeId,
+    /// The member to leave out; `None` leaves out the prior owner.
+    pub(crate) drop: Option<NodeId>,
+    /// How long the whole promote may take, the prior grant's expiry and the commit included.
+    pub(crate) within: Duration,
+    /// The members partition 1 is pinned to now, with their roles. `Db::promote` reads them from
+    /// `to`'s newest configuration, never from [`members`], which holds no shadow.
+    pub(crate) members: Vec<Member>,
+    /// The version of the configuration `members` comes from. `promote` refuses
+    /// [`PromoteError::StaleMembers`] when it is not `partitions/1`'s (A-R415 C-2).
+    pub(crate) members_version: ConfigVersion,
+    /// The boot each member runs at, as for a heal ([`HealCtx::member_boot`]).
+    pub(crate) member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+    /// Deliver a message to a node's host.
+    pub(crate) send: Arc<dyn Fn(NodeId, Msg) -> Result<(), NodeStopped> + Send + Sync>,
+}
+
+/// The members a promote of `to` plans with, their roles, and the version of the configuration
+/// they come from: `to`'s own newest configuration, from its status `looked` (`None`: it did
+/// not answer within `within`). Never [`members`], which holds no shadow, so a shadow `to` is
+/// refused and a kept shadow stays one (review-s2 F-004, A-R412). `promote` refuses the set
+/// when its version is not `partitions/1`'s (A-R415 C-2). Refused before anything is written.
+///
+/// # Errors
+///
+/// - [`PromoteError::PeersUnknown`] naming `to` when it did not answer.
+/// - [`PromoteError::Unconfigured`] when it answered holding no configuration: it has landed
+///   none since its restart (A-R415 C-1, A-R416).
+pub(crate) fn promote_members(
+    to: NodeId,
+    looked: Option<crate::host::NodeStatus>,
+    within: Duration,
+) -> Result<(Vec<Member>, ConfigVersion), PromoteError> {
+    let error = match looked {
+        // `!pinned.is_empty()` is unreachable today (the host fills `pinned` and
+        // `config_version` from one committed config, which always has members); kept so a
+        // later split refuses here instead of pinning nobody. Defensive, no row.
+        Some(crate::host::NodeStatus {
+            pinned,
+            config_version: Some(version),
+            ..
+        }) if !pinned.is_empty() => return Ok((pinned, version)),
+        Some(_) => PromoteError::Unconfigured { node: to.0 },
+        None => PromoteError::PeersUnknown {
+            nodes: vec![to.0],
+            within_ms: within.as_millis(),
+        },
+    };
+    tracing::warn!(to = to.0, %error, "promote_members_unknown");
+    Err(error)
+}
+
+/// The correlation a promote's two events carry.
+const PROMOTE: CorrelationId = CorrelationId(4);
+
+/// Make `ctx.to` the owner of partition 1 while its owner is dead or cut off (arch-s2
+/// "Promote", A-R256). In order:
+///
+/// 1. Read `partitions/1`; refuse a `to` or `drop` that is not a member, a `Shadow` `to`, the
+///    owner as `to`, and `drop == to`, before anything is written.
+/// 2. Pin the boots of the two members kept: every member but `drop` (default: the prior
+///    owner). A promote always plans two members at a new generation.
+/// 3. CAS `partitions/1` to `Fencing` at the revision read, always: a promote that stopped may
+///    have written it already, and the write still gives this run a revision `R` of its own
+///    (A-R447).
+/// 4. Freeze `grants/{prior}`, or create it frozen when it is absent (PR #41): no renewal can
+///    move its expiry `E` after this.
+/// 5. Wait until control time is past `E + epsilon + delta` ([`expiry_proven`]): from then
+///    the prior owner admits nowhere.
+/// 6. Read `partitions/1` again, at a store revision not below the freeze, and refuse unless it
+///    is still at `R`. Store the plan, create-only, at [`promote_operation`]`(R)`
+///    ([`store_plan`]), then hand `to` the plan and a fence whose revocation is that
+///    `ExpiryProven` and whose `control_revision` is `R`. F1's commit is a CAS there. The node
+///    commits only the stored plan, never the one sent (A-R447, issue #70); the plan is sent
+///    too only so a node logs it arriving.
+/// 7. Wait until `partitions/1` names `to` as owner at a newer generation.
+///
+/// Running it again after it stopped picks up from the record and grant it left. Logged as
+/// `promote_*` lines.
+///
+/// [`expiry_proven`]: rdb_core::authority::clock::expiry_proven
+///
+/// # Errors
+///
+/// [`PromoteError`].
+pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
+    let deadline = tokio::time::Instant::now() + ctx.within;
+    let (record, root, mod_revision, _) = read_partition(&*ctx.store).await?;
+    let prior = record.owner;
+    let dropped = ctx.drop.unwrap_or(prior);
+    let member = |node: NodeId| ctx.members.iter().find(|member| member.node == node);
+    let target = member(ctx.to).ok_or(PromoteError::NotAMember { node: ctx.to.0 })?;
+    if target.role == ReplicaRole::Shadow {
+        let instead = ctx
+            .members
+            .iter()
+            .find(|member| member.role != ReplicaRole::Shadow && member.node != prior)
+            .map_or(prior, |member| member.node);
+        return Err(PromoteError::Shadow {
+            node: ctx.to.0,
+            instead: instead.0,
+        });
+    }
+    if ctx.to == prior {
+        return Err(PromoteError::AlreadyOwner { node: ctx.to.0 });
+    }
+    if ctx.members_version != record.config_version {
+        return Err(PromoteError::StaleMembers {
+            node: ctx.to.0,
+            held: ctx.members_version.0,
+            current: record.config_version.0,
+        });
+    }
+    if dropped == ctx.to {
+        return Err(PromoteError::DropIsTarget);
+    }
+    member(dropped).ok_or(PromoteError::NotAMember { node: dropped.0 })?;
+    tracing::info!(
+        to = ctx.to.0,
+        prior = prior.0,
+        dropped = dropped.0,
+        generation = record.generation.0,
+        lifecycle = ?record.lifecycle,
+        "promote_started"
+    );
+    let members = kept_boots(&ctx, dropped, deadline).await?;
+    tracing::info!(
+        members = ?members.iter().map(|m| (m.node.0, m.boot.0, m.role)).collect::<Vec<_>>(),
+        "promote_members_kept"
+    );
+
+    // 3. Fencing, written by this run even when a stopped run already wrote it (A-R447): the
+    // identical bytes still move `mod_revision`, so each run fences at a revision of its own,
+    // and its plan at `operations/` is keyed by it.
+    let fencing = PartitionRecord {
+        lifecycle: PartitionLifecycle::Fencing,
+        ..record
+    };
+    let fenced_at = cas(
+        &*ctx.store,
+        &ControlKey::Partition(PARTITION).encode(),
+        fencing.encode_with(&root),
+        mod_revision,
+    )
+    .await?;
+    tracing::info!(revision = fenced_at.0, "promote_fencing");
+
+    // 4. Freeze the prior owner's grant.
+    let (frozen, frozen_at) = freeze(&ctx, prior, root.owner_boot, deadline).await?;
+
+    // 5. Its expiry, proven past.
+    let (revocation, decided) = loop {
+        let now = ctx.clock.now();
+        let mut view = ClockView::new();
+        view.accept(HostClock::control_time(now, &ctx.budgets));
+        if let Some(revocation) = expiry_proven(&view, frozen.expiry_utc_ms, now, &ctx.budgets) {
+            break (revocation, now);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PromoteError::Control(format!(
+                "the expiry of grants/{} was not proven past within {} seconds; partition 1 \
+                 takes no writes until a promote finishes: promote again",
+                prior.0,
+                seconds_in_words(ctx.within.as_millis())
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    tracing::info!(
+        expiry = frozen.expiry_utc_ms,
+        now = decided.0,
+        "promote_expiry_proven"
+    );
+    // A member pinned unlinked whose handshake came during the wait is pinned at its boot after
+    // all, so F1 can count it (A-R401 F1). One that is still unlinked stays at `UNLINKED_BOOT`.
+    let members: Vec<Member> = members
+        .into_iter()
+        .map(|member| match (ctx.member_boot)(member.node) {
+            Some(boot) if member.boot == UNLINKED_BOOT => {
+                tracing::info!(
+                    node = member.node.0,
+                    boot = boot.0,
+                    "promote_member_linked_late"
+                );
+                Member { boot, ..member }
+            }
+            _ => member,
+        })
+        .collect();
+
+    // 6. The record again, after the freeze, and the plan.
+    let (fenced, fenced_root, control_revision, read_revision) =
+        read_partition(&*ctx.store).await?;
+    if read_revision < frozen_at.0 {
+        return Err(PromoteError::Control(format!(
+            "partitions/1 was read at revision {read_revision}, before the freeze at {}; promote \
+             again",
+            frozen_at.0
+        )));
+    }
+    let expected = PartitionRecord {
+        lifecycle: PartitionLifecycle::Fencing,
+        ..record
+    };
+    if fenced != expected || fenced_root != root {
+        return Err(PromoteError::Control(format!(
+            "partitions/1 changed during the promote (owner {}, generation {}, {:?}); promote \
+             again",
+            fenced.owner.0, fenced.generation.0, fenced.lifecycle
+        )));
+    }
+    if control_revision != fenced_at.0 {
+        return Err(PromoteError::Control(format!(
+            "partitions/1 was fenced again at revision {control_revision} after this promote \
+             fenced it at {}: another promote is running; promote again",
+            fenced_at.0
+        )));
+    }
+    let lineage = Lineage {
+        partition: PARTITION,
+        generation: record.generation,
+        owner_epoch: record.owner_epoch,
+    };
+    let anchor = LineageAnchor {
+        lineage,
+        base_seq: root.base_seq,
+        base_digest: root.base_digest,
+    };
+    let to_boot = members
+        .iter()
+        .find(|member| member.node == ctx.to)
+        .map_or(BOOT, |member| member.boot);
+    tracing::info!(
+        members = ?members.iter().map(|m| (m.node.0, m.boot.0, m.role)).collect::<Vec<_>>(),
+        config_version = record.config_version.0 + 1,
+        control_revision,
+        "promote_plan"
+    );
+    let plan = recovery_plan(
+        anchor,
+        ConfigVersion(record.config_version.0 + 1),
+        members,
+        to_boot,
+        GrantId(1),
+        AuthorityGeneration(1),
+    );
+    store_plan(&*ctx.store, fenced_at, &plan).await?;
+    let fence = FencingProof {
+        partition: PARTITION,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: frozen.grant,
+        prior_boot_id: root.owner_boot,
+        revocation,
+        control_revision: Revision(control_revision),
+        decision_tick: decided,
+    };
+    // A-R265/A-R266: as `Routed`, the one kernel-event message that crosses the wire, so a
+    // promote run from another process reaches `to` (an `Inject` never leaves its process). Both
+    // go the same way, in this order, as in one process.
+    for event in [
+        RecoveryEvent::Plan(Box::new(plan)),
+        RecoveryEvent::FenceProven(Box::new(fence)),
+    ] {
+        (ctx.send)(
+            ctx.to,
+            Msg::Routed {
+                partition: PARTITION,
+                correlation: PROMOTE,
+                kind: KernelEvent::Recovery(event),
+            },
+        )
+        .map_err(|_| PromoteError::Unreachable { node: ctx.to.0 })?;
+    }
+
+    // 7. The commit.
+    loop {
+        let (now, ..) = read_partition(&*ctx.store).await?;
+        if now.owner == ctx.to && now.generation > record.generation {
+            tracing::info!(
+                owner = ctx.to.0,
+                generation = now.generation.0,
+                "promote_committed"
+            );
+            return Ok(Promoted {
+                owner: ctx.to,
+                prior_owner: prior,
+                dropped,
+                generation: now.generation,
+                frozen_grant: frozen.grant,
+                control_revision: Revision(control_revision),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PromoteError::Control(format!(
+                "node {} did not commit partition 1 within {} seconds (partitions/1 names owner \
+                 {} at generation {}); partition 1 takes no writes until a promote finishes. If \
+                 node {} refused the fence, its log has a routed_fence_refused line saying why: \
+                 promote again",
+                ctx.to.0,
+                seconds_in_words(ctx.within.as_millis()),
+                now.owner.0,
+                now.generation.0,
+                ctx.to.0
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `partitions/1` as a layout-3 record, its `mod_revision` and the read's store revision.
+pub(crate) async fn read_partition(
+    store: &dyn ConfigStore,
+) -> Result<(PartitionRecord, PartitionRoot, u64, u64), PromoteError> {
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        })
+        .await
+        .map_err(|error| {
+            PromoteError::Control(format!("get partitions/1: {error}; promote again"))
+        })?;
+    let found = read
+        .record
+        .ok_or_else(|| PromoteError::Record("partitions/1 is absent".to_owned()))?;
+    match (
+        PartitionRecord::decode(&found.value),
+        PartitionRoot::decode(&found.value),
+    ) {
+        (Some(record), Some(root)) => Ok((record, root, found.mod_revision, read.read_revision)),
+        _ => Err(PromoteError::Record(format!(
+            "partitions/1 at revision {} carries no root (layout 3)",
+            found.mod_revision
+        ))),
+    }
+}
+
+/// Write `value` at `key` if it is still at `revision`; the revision it was written at.
+async fn cas(
+    store: &dyn ConfigStore,
+    key: &str,
+    value: Bytes,
+    revision: u64,
+) -> Result<Revision, PromoteError> {
+    let answer = store
+        .put(PutRequest {
+            key: Bytes::from(key.to_owned()),
+            value,
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        })
+        .await;
+    match answer {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            Ok(Revision(response.revision))
+        }
+        Ok(_) | Err(ConfigError::Conflict { .. }) => Err(PromoteError::Control(format!(
+            "{key} changed since it was read at revision {revision}; promote again"
+        ))),
+        Err(error) => Err(PromoteError::Control(format!(
+            "put {key} at revision {revision}: {error}; promote again"
+        ))),
+    }
+}
+
+/// The first [`OperationId`] a promote's stored plan takes: the promote tag in bits 48..64, as
+/// [`rdb_core::recovery::RECOVERY_CONTROL_REQUEST_BASE`] tags F1's requests, so
+/// `operations/` stays free below it for other operations (A-R447).
+pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
+
+/// The first byte of a stored promote plan: the layout of the postcard bytes after it. A build
+/// that reads another refuses it (`plan_unreadable`) instead of guessing at its fields.
+pub(crate) const PROMOTE_PLAN_VERSION: u8 = 1;
+
+/// The `operations/` key of the plan the promote that fenced `partitions/1` at `revision` stored
+/// (A-R447): `operations/{PROMOTE_OPERATION_BASE + revision}`.
+///
+/// # Errors
+///
+/// A text, when `revision` does not fit below the tag.
+pub(crate) fn promote_operation(revision: Revision) -> Result<ControlKey, String> {
+    if revision.0 >= 1 << 48 {
+        return Err(format!(
+            "revision {} is past the promote operation range",
+            revision.0
+        ));
+    }
+    Ok(ControlKey::Operation(OperationId(
+        PROMOTE_OPERATION_BASE + revision.0,
+    )))
+}
+
+/// A promote plan as stored: [`PROMOTE_PLAN_VERSION`], then the plan in postcard, the codec the
+/// links already use.
+pub(crate) fn encode_promote_plan(plan: &RecoveryPlan) -> Bytes {
+    let mut bytes = vec![PROMOTE_PLAN_VERSION];
+    bytes.extend(postcard::to_stdvec(plan).expect("a recovery plan serialises"));
+    Bytes::from(bytes)
+}
+
+/// The inverse of [`encode_promote_plan`], exactly: another version byte, or bytes left over
+/// after the plan, is refused.
+///
+/// # Errors
+///
+/// A text saying which.
+pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> {
+    let Some((&version, body)) = bytes.split_first() else {
+        return Err("the record is empty".to_owned());
+    };
+    if version != PROMOTE_PLAN_VERSION {
+        return Err(format!(
+            "plan version {version}, this build reads {PROMOTE_PLAN_VERSION}"
+        ));
+    }
+    let (plan, rest) =
+        postcard::take_from_bytes::<RecoveryPlan>(body).map_err(|error| error.to_string())?;
+    if !rest.is_empty() {
+        return Err(format!("{} bytes after the plan", rest.len()));
+    }
+    Ok(plan)
+}
+
+/// Promote step 6 (A-R447): create `plan` at [`promote_operation`]`(fenced_at)`. When the create
+/// is not reported applied (it conflicts, or its reply is lost), read it back and go on only when
+/// it holds exactly these bytes. Anything else is refused: promote again, which fences at a new
+/// revision. The node that commits reads its plan from here.
+async fn store_plan(
+    store: &dyn ConfigStore,
+    fenced_at: Revision,
+    plan: &RecoveryPlan,
+) -> Result<(), PromoteError> {
+    let key = promote_operation(fenced_at)
+        .map_err(|error| PromoteError::Control(format!("{error}; promote again")))?
+        .encode();
+    let value = encode_promote_plan(plan);
+    let created = store
+        .put(PutRequest {
+            key: Bytes::from(key.clone()),
+            value: value.clone(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        })
+        .await;
+    match created {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            tracing::info!(key = %key, revision = response.revision, "promote_plan_stored");
+            return Ok(());
+        }
+        Ok(_) | Err(ConfigError::Conflict { .. } | ConfigError::DeadlineExceededUnknownOutcome) => {
+        }
+        Err(error @ ConfigError::PermissionDenied { .. }) => {
+            return Err(PromoteError::Control(format!(
+                "create {key}: {error}; partition 1 is fencing and takes no writes until a \
+                 promote finishes. A promote needs rEtcd write access to operations/ as well as \
+                 partitions/ and grants/: grant it, then promote again"
+            )))
+        }
+        Err(error) => {
+            return Err(PromoteError::Control(format!(
+                "could not store the plan at {key}: {error}; promote again"
+            )))
+        }
+    }
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| {
+            PromoteError::Control(format!(
+                "get {key} after a create that was not reported applied: {error}; promote again"
+            ))
+        })?;
+    match read.record {
+        Some(found) if found.value == value => {
+            tracing::info!(key = %key, revision = found.mod_revision, "promote_plan_adopted");
+            Ok(())
+        }
+        Some(found) => Err(PromoteError::Control(format!(
+            "{key} holds another plan (revision {}); promote again",
+            found.mod_revision
+        ))),
+        None => Err(PromoteError::Control(format!(
+            "{key} is absent after a create that was not reported applied; promote again"
+        ))),
+    }
+}
+
+/// The boot a promote pins a kept member at when no link to it came up (D4, A-R398): `0`,
+/// which no process runs, since [`crate::db::next_boot`] starts at 1.
+///
+/// What it does, by F1's rules (critic-d4 Q1, A-R401 F1):
+/// - A dead member never answers F1's inventory query, so `recovery::select` counts only the
+///   live copies, and a lone survivor commits `ReadOnly` (`mode_for(1)`): no write is admitted.
+///   The pin plays no part in the mode.
+/// - A live member pinned here that does answer is counted, but its durability proof carries
+///   its real boot, which the barrier never matches to `0`: the barrier ends incomplete and
+///   nothing commits. The promote then fails "did not commit"; promoting again pins its real
+///   boot. `promote` re-reads the boot after the expiry wait, so a handshake that comes late
+///   is taken in that same run.
+/// - When the member starts again, it is re-planned at the boot its link reports, by one of two
+///   paths. Usually the owner sees `peer_booted` (its route still held the member's old boot)
+///   and `rejoin_if_stale` revokes and re-plans, since the live boot is newer than `0`; seen on
+///   the A-R401 F2 walk, `ReadOnly` gen 3 to `DegradedRf2` gen 4. When no `PeerBooted` comes (the
+///   route never held a boot), the owner's `repair_duty` of the `ReadOnly` commit is the
+///   fallback: it probes the member as a pinned regular secondary and the drain re-pins it.
+pub(crate) const UNLINKED_BOOT: BootId = BootId(0);
+
+/// The members kept, each at its boot; `to` becomes the primary and a `Shadow` stays one. Polls
+/// until `deadline`: a peer's boot arrives with its handshake. `to`'s boot is required. Another
+/// member with no handshake after a quarter of the promote's time is dead or cut off: it is
+/// pinned at [`UNLINKED_BOOT`] and logged `promote_member_unlinked`, rather than refusing the
+/// promote that S2-5's lone survivor needs (D4).
+async fn kept_boots(
+    ctx: &PromoteCtx,
+    dropped: NodeId,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<Member>, PromoteError> {
+    let kept: Vec<Member> = ctx
+        .members
+        .iter()
+        .filter(|member| member.node != dropped)
+        .map(|member| Member {
+            role: if member.node == ctx.to {
+                ReplicaRole::Primary
+            } else if member.role == ReplicaRole::Shadow {
+                ReplicaRole::Shadow
+            } else {
+                ReplicaRole::RegularSecondary
+            },
+            ..*member
+        })
+        .collect();
+    let unlinked_after = tokio::time::Instant::now() + ctx.within / 4;
+    loop {
+        let missing: Vec<u32> = kept
+            .iter()
+            .filter(|member| (ctx.member_boot)(member.node).is_none())
+            .map(|member| member.node.0)
+            .collect();
+        let target_known = !missing.contains(&ctx.to.0);
+        if missing.is_empty() || (target_known && tokio::time::Instant::now() >= unlinked_after) {
+            if !missing.is_empty() {
+                tracing::warn!(
+                    unlinked = ?missing,
+                    boot = UNLINKED_BOOT.0,
+                    "promote_member_unlinked"
+                );
+            }
+            return Ok(kept
+                .into_iter()
+                .map(|member| Member {
+                    boot: (ctx.member_boot)(member.node).unwrap_or(UNLINKED_BOOT),
+                    ..member
+                })
+                .collect());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(missing = ?missing, "promote_peers_unknown");
+            return Err(PromoteError::PeersUnknown {
+                nodes: missing,
+                within_ms: ctx.within.as_millis(),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Freeze `grants/{prior}`: CAS it `frozen` at the revision read, or create it frozen when it is
+/// absent, with `GrantId(0)` ("none held"), the prior owner's boot and control time now as `E`.
+/// A record already frozen is kept. Returns the frozen record and the revision of the write or
+/// of the read that found it frozen.
+async fn freeze(
+    ctx: &PromoteCtx,
+    prior: NodeId,
+    prior_boot: BootId,
+    deadline: tokio::time::Instant,
+) -> Result<(GrantRecord, Revision), PromoteError> {
+    let key = ControlKey::Grant(prior).encode();
+    loop {
+        let read = ctx
+            .store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+            .map_err(|error| PromoteError::Control(format!("get {key}: {error}; promote again")))?;
+        let (frozen, expected, created) = match &read.record {
+            Some(found) => {
+                let held = GrantRecord::decode(&found.value).ok_or_else(|| {
+                    PromoteError::Record(format!(
+                        "{key} at revision {} is not a grant record",
+                        found.mod_revision
+                    ))
+                })?;
+                if held.frozen {
+                    tracing::info!(
+                        grant = held.grant.0,
+                        revision = found.mod_revision,
+                        "promote_frozen_already"
+                    );
+                    return Ok((held, Revision(read.read_revision)));
+                }
+                (
+                    GrantRecord {
+                        frozen: true,
+                        ..held
+                    },
+                    found.mod_revision,
+                    false,
+                )
+            }
+            None => {
+                let now = ctx.clock.now();
+                let sample = HostClock::control_time(now, &ctx.budgets);
+                (
+                    GrantRecord {
+                        grant: GrantId(0),
+                        node: prior,
+                        boot: prior_boot,
+                        authority_generation: AuthorityGeneration::default(),
+                        expiry_utc_ms: i64::try_from(sample.estimate.0).unwrap_or(i64::MAX),
+                        frozen: true,
+                    },
+                    0,
+                    true,
+                )
+            }
+        };
+        match cas(&*ctx.store, &key, frozen.encode(), expected).await {
+            Ok(revision) => {
+                tracing::info!(
+                    grant = frozen.grant.0,
+                    created,
+                    revision = revision.0,
+                    expiry = frozen.expiry_utc_ms,
+                    "promote_frozen"
+                );
+                return Ok((frozen, revision));
+            }
+            // A renewal landed between the read and the freeze: read again.
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                tracing::info!(%error, "promote_freeze_retry");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -1828,6 +2825,15 @@ mod tests {
         store: Arc<dyn ConfigStore>,
         rt: &tokio::runtime::Runtime,
     ) -> (Result<Healed, HealError>, Vec<Msg>) {
+        heal_once_within(store, rt, Duration::from_millis(500))
+    }
+
+    /// [`heal_once`] with the heal's time set to `within`.
+    fn heal_once_within(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+    ) -> (Result<Healed, HealError>, Vec<Msg>) {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
             store,
@@ -1835,7 +2841,9 @@ mod tests {
             budgets: Budgets::SPEC_DEFAULTS,
             clock: HostClock::start(),
             owner,
-            within: Duration::from_millis(500),
+            within,
+            member_boot: Arc::new(|_| Some(OPEN_2)),
+            owner_node: OWNER,
         };
         let healed = rt.block_on(heal(ctx));
         (healed, mailbox.try_iter().collect())
@@ -2236,5 +3244,828 @@ mod tests {
             "case B: {healed:?}"
         );
         assert!(sent.is_empty(), "case B: {} messages sent", sent.len());
+    }
+
+    /// arch-s2 B1: the owner opens alone (`local=[1]`) and no link to node 2 or 3 comes up. The
+    /// heal cannot pin their boots, so it ends `PeersUnknown` naming both and saying to start
+    /// them. It waits for them first, so a heal that cannot pin them sends node 1 nothing. Unit
+    /// (~150 ms): `MemStore`, a 100 ms budget.
+    #[test]
+    fn m10_s2_a_heal_with_no_link_to_nodes_2_and_3_names_them_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            store: Arc::clone(&store),
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_millis(100),
+            member_boot: Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2)),
+            owner_node: OWNER,
+        };
+        let refused = rt
+            .block_on(heal(ctx))
+            .expect_err("nodes 2 and 3 have no link");
+        assert!(
+            matches!(&refused, HealError::PeersUnknown { nodes, .. } if nodes == &[2, 3]),
+            "{refused:?}"
+        );
+        let text = refused.to_string();
+        assert!(
+            text.contains("start node 2 and 3, then open again"),
+            "the text names both nodes and the next step: {text}"
+        );
+        assert_eq!(mailbox.try_iter().count(), 0, "node 1 was sent nothing");
+    }
+
+    // ---- admin promote (arch-s2 "Promote", A-R256) ----
+
+    /// Messages a promote sent, by node.
+    type Sent = Arc<std::sync::Mutex<Vec<(NodeId, Msg)>>>;
+
+    /// A promote of `to` over `store`, with nodes 1 to 3 at `OPEN_2` unless `boots` says
+    /// otherwise, and the rf3 `members`. Returns its answer and what it sent.
+    fn promote_once(
+        store: &Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+        to: NodeId,
+        drop: Option<NodeId>,
+        members: Vec<Member>,
+        boots: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+        within: Duration,
+    ) -> (Result<Promoted, PromoteError>, Vec<(NodeId, Msg)>) {
+        let sent: Sent = Arc::default();
+        let log = Arc::clone(&sent);
+        let ctx = PromoteCtx {
+            store: Arc::clone(store),
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            to,
+            drop,
+            within,
+            members,
+            members_version: CONFIG_VERSION,
+            member_boot: boots,
+            send: Arc::new(move |node, msg| {
+                log.lock().expect("log").push((node, msg));
+                Ok(())
+            }),
+        };
+        let answer = rt.block_on(promote(ctx));
+        let sent = std::mem::take(&mut *sent.lock().expect("sent"));
+        (answer, sent)
+    }
+
+    fn all_known() -> Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> {
+        Arc::new(|_| Some(OPEN_2))
+    }
+
+    /// `partitions/1`'s mod revision and `grants/1`, as read now.
+    fn promote_marks(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime) -> (u64, bool) {
+        let get = |key: String| {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from(key),
+            }))
+            .expect("get")
+            .record
+        };
+        let partition = get(ControlKey::Partition(PARTITION).encode()).expect("partitions/1");
+        (
+            partition.mod_revision,
+            get(ControlKey::Grant(OWNER).encode()).is_some(),
+        )
+    }
+
+    /// A-R256: a promote that names a node it cannot make the owner is refused before it writes
+    /// or sends anything, and each text says what to name instead: a node that holds no copy,
+    /// a shadow (R2-M3: name a regular member), the owner itself, `drop` equal to `to`, and a
+    /// member whose boot no link has reported. Cut: `Fencing` is written before the checks;
+    /// `partitions/1`'s revision moves. Unit (~150 ms): `MemStore`.
+    #[test]
+    fn m10_s2_a_promote_refused_by_its_arguments_writes_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let before = promote_marks(&*store, &rt);
+        let shadowed: Vec<Member> = members()
+            .into_iter()
+            .map(|member| Member {
+                role: if member.node == NodeId(3) {
+                    ReplicaRole::Shadow
+                } else {
+                    member.role
+                },
+                ..member
+            })
+            .collect();
+        let only_1: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> =
+            Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2));
+        let cases = [
+            (
+                NodeId(4),
+                None,
+                members(),
+                all_known(),
+                "node 4 holds no copy of partition 1; name a node that does",
+            ),
+            (
+                NodeId(3),
+                None,
+                shadowed,
+                all_known(),
+                "node 3 is catching up (shadow); promote node 2 instead",
+            ),
+            (
+                OWNER,
+                None,
+                members(),
+                all_known(),
+                "node 1 already owns partition 1; nothing was changed",
+            ),
+            (
+                NodeId(2),
+                Some(NodeId(2)),
+                members(),
+                all_known(),
+                "the node to drop is the node to promote; drop another member, or name none to \
+                 drop the owner",
+            ),
+            (
+                NodeId(2),
+                Some(NodeId(5)),
+                members(),
+                all_known(),
+                "node 5 holds no copy of partition 1; name a node that does",
+            ),
+            (
+                NodeId(2),
+                None,
+                members(),
+                only_1,
+                "no link to node 2 and 3 came up within 0.1 seconds, so the promote cannot pin \
+                 its boot: start node 2 and 3, then promote again",
+            ),
+        ];
+        for (to, drop, members, boots, text) in cases {
+            let (answer, sent) = promote_once(
+                &store,
+                &rt,
+                to,
+                drop,
+                members,
+                boots,
+                Duration::from_millis(100),
+            );
+            let refused = answer.expect_err("refused");
+            assert_eq!(refused.to_string(), text);
+            assert!(refused.no_mutation(), "{refused:?}");
+            assert!(sent.is_empty(), "{refused:?}: {} messages sent", sent.len());
+            assert_eq!(promote_marks(&*store, &rt), before, "{refused:?} wrote");
+        }
+    }
+
+    /// A-R256, PR #41: node 1 is dead and holds no grant. The promote writes `partitions/1`
+    /// `Fencing`, creates `grants/1` frozen with `GrantId(0)` ("none held"), waits
+    /// `E + epsilon + delta` out, and hands node 2 the plan (nodes 2 and 3, node 2 primary, config
+    /// version + 1) and an `ExpiryProven` fence whose `control_revision` is the `Fencing`
+    /// record's. Nothing commits here, so it ends saying to promote again; doing so keeps the
+    /// grant it left and fences again at a revision of its own (A-R447), and each run stores the
+    /// plan it sent at `operations/` under its own revision. Cut: the created grant is not frozen.
+    /// Unit (~1 s): `MemStore`.
+    #[test]
+    fn m10_s2_a_promote_of_an_owner_with_no_grant_freezes_a_new_one_and_fences_on_it() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let fenced_on = |sent: Vec<(NodeId, Msg)>| -> (FencingProof, RecoveryPlan) {
+            let (nodes, msgs): (Vec<NodeId>, Vec<Msg>) = sent.into_iter().unzip();
+            assert!(
+                nodes.iter().all(|node| *node == NodeId(2)),
+                "sent to node 2 only"
+            );
+            // A-R266: both as `Routed`, Plan first, so they cross the wire in one-process order.
+            let events: Vec<&RecoveryEvent> = msgs
+                .iter()
+                .map(|msg| match msg {
+                    Msg::Routed {
+                        kind: KernelEvent::Recovery(event),
+                        correlation: PROMOTE,
+                        ..
+                    } => event,
+                    other => panic!("a promote sends Routed recovery events only: {other:?}"),
+                })
+                .collect();
+            match events.as_slice() {
+                [RecoveryEvent::Plan(plan), RecoveryEvent::FenceProven(fence)] => {
+                    ((**fence).clone(), (**plan).clone())
+                }
+                other => panic!("Plan then FenceProven, once each: {other:?}"),
+            }
+        };
+        let within = Duration::from_millis(600);
+        let (answer, sent) =
+            promote_once(&store, &rt, NodeId(2), None, members(), all_known(), within);
+        let stopped = answer.expect_err("nothing commits here");
+        assert!(
+            stopped
+                .to_string()
+                .contains("node 2 did not commit partition 1")
+                && stopped
+                    .to_string()
+                    .contains("node 2 refused the fence, its log has a routed_fence_refused line")
+                && stopped.to_string().ends_with("promote again"),
+            "{stopped}"
+        );
+        assert!(!stopped.no_mutation());
+
+        let read = |key: String| {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from(key),
+            }))
+            .expect("get")
+            .record
+            .expect("present")
+        };
+        let partition = read(ControlKey::Partition(PARTITION).encode());
+        let record = PartitionRecord::decode(&partition.value).expect("record");
+        assert_eq!(
+            (record.owner, record.lifecycle),
+            (OWNER, PartitionLifecycle::Fencing)
+        );
+        let grant =
+            GrantRecord::decode(&read(ControlKey::Grant(OWNER).encode()).value).expect("grant");
+        assert_eq!(
+            (grant.grant, grant.node, grant.boot, grant.frozen),
+            (GrantId(0), OWNER, BootId(5), true)
+        );
+
+        let (fence, plan) = fenced_on(sent);
+        assert_eq!(
+            (
+                fence.prior_generation,
+                fence.prior_owner_epoch,
+                fence.prior_grant_id,
+                fence.prior_boot_id,
+                fence.control_revision,
+            ),
+            (
+                Generation(3),
+                OwnerEpoch(3),
+                GrantId(0),
+                BootId(5),
+                Revision(partition.mod_revision)
+            )
+        );
+        let Revocation::ExpiryProven {
+            frozen_expiry_utc_ms,
+            authority_utc_ms,
+            epsilon_ms,
+            delta_ms,
+            ..
+        } = fence.revocation
+        else {
+            panic!("not ExpiryProven: {:?}", fence.revocation);
+        };
+        assert_eq!(frozen_expiry_utc_ms, grant.expiry_utc_ms);
+        assert!(
+            authority_utc_ms > frozen_expiry_utc_ms + i64::from(epsilon_ms) + i64::from(delta_ms)
+        );
+        assert_eq!(
+            plan.config.config_version,
+            ConfigVersion(CONFIG_VERSION.0 + 1)
+        );
+        assert_eq!(
+            plan.config
+                .members
+                .iter()
+                .map(|member| (member.node, member.role))
+                .collect::<Vec<_>>(),
+            [
+                (NodeId(2), ReplicaRole::Primary),
+                (NodeId(3), ReplicaRole::RegularSecondary)
+            ]
+        );
+
+        let (again, resent) =
+            promote_once(&store, &rt, NodeId(2), None, members(), all_known(), within);
+        again.expect_err("still nothing commits");
+        let (refenced, replanned) = fenced_on(resent);
+        // A-R447: the second run fences again, so it has a revision of its own, and keeps the
+        // grant the first froze.
+        assert!(
+            refenced.control_revision > fence.control_revision
+                && refenced.prior_grant_id == GrantId(0),
+            "the second run fences at its own revision on the grant the first left: {refenced:?}"
+        );
+        assert_eq!(
+            (
+                stored_plan_at(&*store, &rt, fence.control_revision),
+                stored_plan_at(&*store, &rt, refenced.control_revision)
+            ),
+            (Some(plan), Some(replanned)),
+            "each run stored the plan it sent, at its own revision"
+        );
+    }
+
+    /// A-R265 (W7's walk `lr kill 1; lr promote 2; lr restart 1`): a promote that wrote, then
+    /// could not reach node 2, leaves `partitions/1` fencing and `grants/1` frozen. A reopen's
+    /// heal of node 1 cannot clear that grant, and its text says what does, in words: the
+    /// takeover is unfinished, run the promote again. The re-run then sends node 2 both events.
+    /// Both ways a promote freezes: node 1 held grant 4 (the walk), or held none and the promote
+    /// created grant 0 frozen (PR #41), which the heal once refused as "no grant issuer writes".
+    /// Waiting never clears a frozen grant, so the heal answers at its first look, well inside
+    /// its 10 s, not when its time runs out.
+    /// Cuts: the text loses its step, red; a frozen grant 0 refused as unwritten again, red; the
+    /// heal waits out its time on a frozen grant, as before, red.
+    /// Unit (~2 s): `MemStore`, two promotes of 600 ms per case and a heal that answers at once.
+    #[test]
+    fn m10_s2_a_heal_after_a_promote_that_could_not_reach_its_node_says_to_promote_again() {
+        const HEAL_WITHIN: Duration = Duration::from_secs(10);
+        let rt = runtime();
+        for held in [Some(GrantId(4)), None] {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            rooted(&*store, &rt, BootId(5));
+            if let Some(grant) = held {
+                old_grant(&*store, &rt, grant);
+            }
+            let ctx = PromoteCtx {
+                store: Arc::clone(&store),
+                budgets: Budgets::SPEC_DEFAULTS,
+                clock: HostClock::start(),
+                to: NodeId(2),
+                drop: None,
+                within: Duration::from_millis(600),
+                members: members(),
+                members_version: CONFIG_VERSION,
+                member_boot: all_known(),
+                send: Arc::new(|node, _| Err(NodeStopped(node))),
+            };
+            let refused = rt
+                .block_on(promote(ctx))
+                .expect_err("node 2 is unreachable");
+            assert!(
+                matches!(refused, PromoteError::Unreachable { node: 2 }),
+                "{held:?}: {refused:?}"
+            );
+            assert!(!refused.no_mutation(), "it wrote Fencing and the freeze");
+
+            let started = std::time::Instant::now();
+            let (healed, sent) = heal_once_within(Arc::clone(&store), &rt, HEAL_WITHIN);
+            let took = started.elapsed();
+            let stuck = healed.expect_err("grants/1 stays frozen");
+            assert_eq!(
+                stuck.to_string(),
+                "the last run's grant for node 1 (grants/1) is frozen: a takeover from node 1 is \
+                 unfinished; run `admin promote <the node you chose>` again",
+                "{held:?}"
+            );
+            let at_once = Duration::from_secs(1) * config_testkit::poll::deadline_scale();
+            assert!(
+                took < at_once,
+                "{held:?}: the heal answered after {took:?}, not at its first look (its time is \
+                 {HEAL_WITHIN:?})"
+            );
+            assert!(sent.is_empty(), "the heal sent node 1 nothing");
+
+            let (again, resent) = promote_once(
+                &store,
+                &rt,
+                NodeId(2),
+                None,
+                members(),
+                all_known(),
+                Duration::from_millis(600),
+            );
+            again.expect_err("nothing commits here");
+            let resent: Vec<_> = resent
+                .iter()
+                .map(|(node, msg)| match msg {
+                    Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::Plan(_)),
+                        ..
+                    } => (node.0, "plan"),
+                    Msg::Routed {
+                        kind: KernelEvent::Recovery(RecoveryEvent::FenceProven(_)),
+                        ..
+                    } => (node.0, "fence"),
+                    other => panic!("not a routed plan or fence: {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                resent,
+                [(2, "plan"), (2, "fence")],
+                "{held:?}: the re-run sends node 2 its plan and fence"
+            );
+        }
+    }
+
+    /// A-R260: after a promote the owner is node 2, so a heal whose owner's thread is gone
+    /// names node 2, not node 1. Cut: the text names `OWNER`. Unit (~10 ms): `MemStore`, a
+    /// mailbox whose receiver is dropped.
+    #[test]
+    fn m10_s2_a_heal_whose_owner_stopped_names_that_owner() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let written = rooted(&*store, &rt, BootId(5));
+        let found = rt
+            .block_on(store.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        let root = PartitionRoot::decode(&found.value).expect("root");
+        let record = PartitionRecord {
+            owner: NodeId(2),
+            ..PartitionRecord::decode(&found.value).expect("record")
+        };
+        put(&store, &rt, record.encode_with(&root), written);
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        drop(mailbox);
+        let ctx = HealCtx {
+            store: Arc::clone(&store),
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_millis(500),
+            member_boot: Arc::new(|_| Some(OPEN_2)),
+            owner_node: NodeId(2),
+        };
+        let stopped = rt.block_on(heal(ctx)).expect_err("node 2's thread is gone");
+        assert_eq!(
+            stopped.to_string(),
+            "node 2 stopped before the heal reached it",
+            "{stopped:?}"
+        );
+    }
+
+    /// D4 (A-R398, arch-s2 S2-5 non-owner survivor): nodes 1 and 2 are dead, so only node 3's
+    /// boot is known. `promote 3` still plans two members, node 3 primary and node 2 pinned at
+    /// [`UNLINKED_BOOT`], which no process runs, so F1 counts only node 3 and commits
+    /// `ReadOnly` (`mode_for(1)`). It used to wait out its whole time for node 2's handshake and
+    /// refuse "start node 2", so a survivor whose peers are both dead could never serve reads.
+    /// The target's own boot is still required: the row above, which names it, stays refused.
+    /// Cut: a member with no handshake is refused `PeersUnknown` again, red.
+    /// Unit (~1 s): `MemStore`, a 600 ms promote.
+    #[test]
+    fn m10_s2_d4_a_promote_with_its_other_member_dead_plans_it_unlinked_and_sends_the_plan() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(3),
+            None,
+            members(),
+            Arc::new(|node: NodeId| (node == NodeId(3)).then_some(OPEN_2)),
+            Duration::from_millis(600),
+        );
+        let stopped = answer.expect_err("nothing commits here");
+        assert!(
+            stopped
+                .to_string()
+                .contains("node 3 did not commit partition 1"),
+            "{stopped}"
+        );
+        let plans: Vec<&RecoveryPlan> = sent
+            .iter()
+            .filter_map(|(node, msg)| match msg {
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::Plan(plan)),
+                    ..
+                } if *node == NodeId(3) => Some(&**plan),
+                _ => None,
+            })
+            .collect();
+        let [plan] = plans.as_slice() else {
+            panic!("one plan, to node 3: {sent:?}");
+        };
+        assert_eq!(
+            plan.config
+                .members
+                .iter()
+                .map(|member| (member.node, member.role, member.boot))
+                .collect::<Vec<_>>(),
+            [
+                (NodeId(2), ReplicaRole::RegularSecondary, UNLINKED_BOOT),
+                (NodeId(3), ReplicaRole::Primary, OPEN_2)
+            ]
+        );
+    }
+
+    /// A-R401 F1 (critic-d4 Q1): node 2's handshake comes after the promote pinned it unlinked
+    /// but before the grant's expiry is proven. The plan sent then pins node 2 at its real
+    /// boot, so F1 can count it, instead of at [`UNLINKED_BOOT`], which a live copy's proof
+    /// never matches. Cut: no re-read after the expiry wait, red (node 2 at boot 0).
+    /// Unit (~1 s): `MemStore`, a 600 ms promote; node 2 links at 250 ms, after the 150 ms
+    /// unlinked bound.
+    #[test]
+    fn m10_s2_f1_a_member_that_links_during_the_expiry_wait_is_planned_at_its_boot() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let started = std::time::Instant::now();
+        let (_, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(3),
+            None,
+            members(),
+            Arc::new(move |node: NodeId| {
+                (node == NodeId(3) || started.elapsed() >= Duration::from_millis(250))
+                    .then_some(OPEN_2)
+            }),
+            Duration::from_millis(600),
+        );
+        let boots: Vec<(NodeId, BootId)> = sent
+            .iter()
+            .find_map(|(_, msg)| match msg {
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::Plan(plan)),
+                    ..
+                } => Some(
+                    plan.config
+                        .members
+                        .iter()
+                        .map(|member| (member.node, member.boot))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("a plan was sent");
+        assert_eq!(boots, [(NodeId(2), OPEN_2), (NodeId(3), OPEN_2)]);
+    }
+
+    /// A-R262: an `UNAVAILABLE` promote refusal says to promote again, and its next step agrees:
+    /// try again, never "retrying will not help". The whole text an app shows, for a promote
+    /// with no link to nodes 2 and 3. Cut: the rule is `NotWired`, and the step contradicts the
+    /// text. Unit (~150 ms): `MemStore`, a 100 ms budget.
+    #[test]
+    fn m10_s2_a_promote_refused_unavailable_says_to_try_again_in_its_next_step_too() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2)),
+            Duration::from_millis(100),
+        );
+        assert!(sent.is_empty());
+        let refused = ApiError::from(answer.expect_err("no link to nodes 2 and 3"));
+        assert_eq!(
+            refused.to_string(),
+            "UNAVAILABLE (no link to node 2 and 3 came up within 0.1 seconds, so the promote \
+             cannot pin its boot: start node 2 and 3, then promote again; next: the database is \
+             not serving right now: wait a few seconds and try again; if it keeps refusing, \
+             check that its nodes and its rEtcd are running (on a local run, \
+             `scripts/local-rdb.sh status`))"
+        );
+    }
+
+    // ---- A-R447: the plan a promote stores (issue #70) ----
+
+    /// The plan stored for the promote that fenced at `revision`, read now.
+    fn stored_plan_at(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+        revision: Revision,
+    ) -> Option<RecoveryPlan> {
+        let key = promote_operation(revision).expect("in range").encode();
+        rt.block_on(store.get(GetRequest {
+            key: Bytes::from(key),
+        }))
+        .expect("get")
+        .record
+        .map(|found| decode_promote_plan(&found.value).expect("a stored plan"))
+    }
+
+    /// The fence and plan a promote sent node 2, Plan first.
+    fn sent_pair(sent: &[(NodeId, Msg)]) -> (FencingProof, RecoveryPlan) {
+        match sent {
+            [(
+                NodeId(2),
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::Plan(plan)),
+                    ..
+                },
+            ), (
+                NodeId(2),
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::FenceProven(fence)),
+                    ..
+                },
+            )] => ((**fence).clone(), (**plan).clone()),
+            other => panic!("Plan then FenceProven to node 2: {other:?}"),
+        }
+    }
+
+    /// A-R447 step 6 (critic-63 A4): the create of the stored plan applies but its reply is
+    /// lost. The promote reads it back, finds exactly its own plan, and carries on: node 2 is
+    /// sent the plan and fence, and the record at the fence's revision holds the plan sent.
+    /// Cut: a create not reported applied is refused, red (nothing sent).
+    /// Unit (~1 s): `Scripted` over `MemStore`, a 600 ms promote that nothing commits.
+    #[test]
+    fn m10_s2_r447_a_promote_whose_plan_create_reply_was_lost_adopts_its_own_plan() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            lose_put_replies: 1,
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*store, &rt, BootId(5));
+        let within = Duration::from_millis(600);
+        let (answer, sent) =
+            promote_once(&store, &rt, NodeId(2), None, members(), all_known(), within);
+        let stopped = answer.expect_err("nothing commits here");
+        assert!(
+            stopped.to_string().contains("node 2 did not commit"),
+            "{stopped}"
+        );
+        let (fence, plan) = sent_pair(&sent);
+        assert_eq!(
+            stored_plan_at(&*store, &rt, fence.control_revision),
+            Some(plan)
+        );
+    }
+
+    /// A-R447 step 6: a stored plan the promote cannot stand behind is refused, and node 2 is
+    /// sent nothing. (a) The create never applied and the read-back finds nothing. (b) The key
+    /// already holds another plan. (c) The promoter may not write `operations/` (critic-63 A4):
+    /// partition 1 is already fencing and frozen, so the text says so and names the access.
+    /// (d) Any other create error, such as `Unavailable`, says only to promote again.
+    /// Cuts: absent on read-back carries on, red; another plan adopted, red; the text loses
+    /// `operations/`, red; every create error given the access text, red (d).
+    /// Unit (~3 s): four 600 ms promotes over `Scripted`/`MemStore`.
+    #[test]
+    fn m10_s2_r447_a_plan_that_did_not_land_or_is_not_this_runs_refuses_and_sends_nothing() {
+        let rt = runtime();
+        let within = Duration::from_millis(600);
+        let run = |store: Arc<dyn ConfigStore>| {
+            let (answer, sent) =
+                promote_once(&store, &rt, NodeId(2), None, members(), all_known(), within);
+            assert!(sent.is_empty(), "sent {sent:?}");
+            let refused = answer.expect_err("refused").to_string();
+            assert!(refused.ends_with("promote again"), "{refused}");
+            refused
+        };
+
+        let dropped: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            drop_puts: 1,
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*dropped, &rt, BootId(5));
+        let refused = run(dropped);
+        assert!(
+            refused.contains("is absent after a create that was not reported applied"),
+            "(a) {refused}"
+        );
+
+        // (b) `rooted` wrote revision 1 and this put writes 2, so the Fencing CAS lands at 3.
+        let taken: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*taken, &rt, BootId(5));
+        let other = encode_promote_plan(&recovery_plan(
+            LineageAnchor {
+                lineage: Lineage {
+                    partition: PARTITION,
+                    generation: Generation(3),
+                    owner_epoch: OwnerEpoch(3),
+                },
+                base_seq: Seq(7),
+                base_digest: Digest::ROOT,
+            },
+            ConfigVersion(CONFIG_VERSION.0 + 1),
+            members(),
+            OPEN_2,
+            GrantId(1),
+            AuthorityGeneration(1),
+        ));
+        let written = rt
+            .block_on(taken.put(PutRequest {
+                key: Bytes::from(promote_operation(Revision(3)).expect("in range").encode()),
+                value: other,
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("put the other plan");
+        assert_eq!(written.revision, 2);
+        let refused = run(taken);
+        assert!(refused.contains("holds another plan"), "(b) {refused}");
+
+        let denied: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_put_with: Some(ConfigError::PermissionDenied {
+                detail: "no grant for operations/".to_owned(),
+            }),
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*denied, &rt, BootId(5));
+        let refused = run(denied);
+        assert!(
+            refused.contains("partition 1 is fencing and takes no writes")
+                && refused.contains("rEtcd write access to operations/"),
+            "(c) {refused}"
+        );
+
+        // (d) Any other create error is not an access problem: the text says only to promote
+        // again (review-63b A1).
+        let unavailable: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_put_with: Some(ConfigError::Unavailable {
+                reason: "no quorum".to_owned(),
+            }),
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*unavailable, &rt, BootId(5));
+        let refused = run(unavailable);
+        assert!(
+            refused.contains("could not store the plan at operations/")
+                && refused.contains("promote again")
+                && !refused.contains("write access"),
+            "(d) {refused}"
+        );
+    }
+
+    /// A-R447 step 6: another promote fences `partitions/1` again while this one waits out the
+    /// grant. The record's bytes are the same, but its revision is not this run's, so this run
+    /// refuses and sends nothing: the newer run owns the fence.
+    /// Cut: the revision check removed: this run sends its fence at the other run's revision,
+    /// red.
+    /// The other run waits for this run's own `Fencing` write (a revision past the rooted one)
+    /// and only then CASes over it, so the order is a condition, not a sleep. Node 1's grant
+    /// stays live for a scaled second, which keeps this run in its expiry wait meanwhile.
+    /// Unit (~1 s at scale 1): `MemStore`.
+    #[test]
+    fn m10_s2_r447_a_promote_fenced_over_by_another_run_refuses_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let rooted_at = rooted(&*store, &rt, BootId(5));
+        let window = crate::host::test_patience(Duration::from_secs(1));
+        let live = GrantRecord {
+            grant: GrantId(4),
+            node: OWNER,
+            boot: BootId(5),
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: i64::try_from(HostClock::start().now().0).expect("fits")
+                + i64::try_from(window.as_millis()).expect("fits"),
+            frozen: false,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            value: live.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/1");
+        let other = Arc::clone(&store);
+        let rerun = std::thread::spawn(move || {
+            let rt = runtime();
+            let read = || async {
+                let found = other
+                    .get(GetRequest {
+                        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                    })
+                    .await
+                    .expect("get")
+                    .record
+                    .expect("partitions/1");
+                let fencing = PartitionRecord::decode(&found.value)
+                    .is_some_and(|record| record.lifecycle == PartitionLifecycle::Fencing);
+                (fencing && found.mod_revision > rooted_at).then_some(found)
+            };
+            let found = rt
+                .block_on(config_testkit::poll::poll_until_async(
+                    crate::host::test_patience(Duration::from_secs(2)),
+                    Duration::from_millis(5),
+                    read,
+                ))
+                .expect("this run's own Fencing write");
+            put(&other, &rt, found.value, found.mod_revision);
+        });
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            all_known(),
+            window + crate::host::test_patience(Duration::from_secs(2)),
+        );
+        rerun.join().expect("the other run's CAS");
+        let refused = answer.expect_err("fenced over").to_string();
+        assert!(
+            refused.contains("another promote is running; promote again"),
+            "{refused}"
+        );
+        assert!(sent.is_empty(), "sent {sent:?}");
     }
 }

@@ -3,6 +3,9 @@
 A 3-node rEtcd cluster on your machine, for manual testing only — not production guidance.
 Runs `tls.mode = "insecure"` + `--dev-allow-all` (see "Why the dev flags"); localhost only.
 
+For rDB on top of it, as three node processes, see [`rdb/local-cluster.md`](rdb/local-cluster.md)
+(`scripts/local-rdb.sh up` starts its own rEtcd).
+
 ## Prerequisites
 
 - Build prerequisites in the root [`README.md`](../README.md#build-prerequisites-windows)

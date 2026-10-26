@@ -105,8 +105,8 @@ use config_testkit::poll::{poll_until_async, Timeout};
 use ed25519_dalek::{Signer, SigningKey};
 
 use support::{
-    count_messages, deadline, log_field, log_file, log_lines, startup_deadline, DaemonProcess,
-    Harness, Health, NodeOptions, PolicyFixture, PRINCIPAL, TRUST_KEY_NAME,
+    count_messages, deadline, log_field, log_file, log_lines, startup_deadline, write_atomically,
+    DaemonProcess, Harness, Health, NodeOptions, PolicyFixture, PRINCIPAL, TRUST_KEY_NAME,
 };
 
 // =====================================================================================
@@ -187,16 +187,47 @@ async fn health_until(endpoint: &str, what: &str, want: impl Fn(&Health) -> bool
     }
 }
 
-/// Poll `log` until it holds at least `want` `policy_rejected` lines, or fail loudly.
+/// The `reason` of every `policy_rejected` line in `log`, in order, with consecutive repeats
+/// collapsed into one.
+///
+/// The poller logs a rejection on **every** tick while the files stay bad, so how many lines one
+/// bad state writes depends on how many ticks land before the row repairs it. A loaded host can
+/// put two ticks 226 ms apart (#58). The reasons and their order are what a row can assert; the
+/// line count is timing.
+fn rejection_reasons(log: &std::path::Path) -> Vec<String> {
+    let mut reasons = log_lines(log)
+        .iter()
+        .filter(|l| log_field(l, "@m") == Some("policy_rejected"))
+        .map(|l| log_field(l, "reason").unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    reasons.dedup();
+    reasons
+}
+
+/// The lines of `log`, once it holds at least `want` `policy_loaded` lines (A-R309: health can
+/// show an adoption before its line reaches the file).
+async fn loads_when(log: &std::path::Path, want: usize) -> Vec<serde_json::Value> {
+    support::log_lines_when(log, |lines| {
+        lines
+            .iter()
+            .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
+            .count()
+            >= want
+    })
+    .await
+}
+
+/// Poll `log` until it holds at least `want` distinct `policy_rejected` reasons in a row (see
+/// [`rejection_reasons`]), or fail loudly.
 async fn wait_for_rejections(log: &std::path::Path, want: usize, what: &str) {
     let deadline = tokio::time::Instant::now() + rotation_deadline();
     loop {
-        if count_messages(log, "policy_rejected") >= want {
+        if rejection_reasons(log).len() >= want {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "{what}: policy_rejected count never reached {want} within {:?}",
+            "{what}: policy_rejected reasons never reached {want} within {:?}",
             rotation_deadline()
         );
         // Bounded poll step, guarded by the deadline assertion above on every iteration.
@@ -350,7 +381,9 @@ async fn m6_10_break_glass_is_not_sticky() {
     .await;
     assert_eq!(second.policy_version, Some(1), "{second:#?}");
 
-    let loaded = log_lines(&log)
+    // Health can show version 1 before its line reaches the file (A-R309).
+    let loaded = loads_when(&log, 3)
+        .await
         .into_iter()
         .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
         .collect::<Vec<_>>();
@@ -403,7 +436,11 @@ async fn m6_11_polling_picks_up_a_new_document() {
     let before = support::health(&endpoint).await;
     assert_eq!(before.policy_version, Some(7), "{before:#?}");
     assert_eq!(
-        count_messages(&log, "policy_loaded"),
+        loads_when(&log, 1)
+            .await
+            .iter()
+            .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
+            .count(),
         1,
         "one adoption at startup"
     );
@@ -415,7 +452,9 @@ async fn m6_11_polling_picks_up_a_new_document() {
     .await;
     assert_eq!(after.policy_version, Some(8), "{after:#?}");
 
-    let loaded = log_lines(&log)
+    // Health can show version 8 before its line reaches the file (A-R309).
+    let loaded = loads_when(&log, 2)
+        .await
         .into_iter()
         .filter(|l| log_field(l, "@m") == Some("policy_loaded"))
         .collect::<Vec<_>>();
@@ -471,16 +510,12 @@ async fn m6_14_missing_files_are_distinguished_from_invalid_files() {
         .expect("remove the signature file, leaving the document behind");
     wait_for_rejections(&log, 1, "signature_file_missing").await;
 
-    let rejected = log_lines(&log)
-        .into_iter()
-        .filter(|l| log_field(l, "@m") == Some("policy_rejected"))
-        .collect::<Vec<_>>();
-    assert_eq!(rejected.len(), 1, "{rejected:#?}");
+    // One line per tick while the signature is gone, so only the reason is asserted (#58).
     assert_eq!(
-        log_field(&rejected[0], "reason"),
-        Some("signature_file_missing"),
+        rejection_reasons(&log),
+        ["signature_file_missing"],
         "{:#?}",
-        rejected[0]
+        log_lines(&log)
     );
 
     let mid = support::health(&endpoint).await;
@@ -503,8 +538,8 @@ async fn m6_14_missing_files_are_distinguished_from_invalid_files() {
     .await;
     assert_eq!(after.policy_version, Some(8), "{after:#?}");
     assert_eq!(
-        count_messages(&log, "policy_rejected"),
-        1,
+        rejection_reasons(&log),
+        ["signature_file_missing"],
         "only the deletion window was ever rejected"
     );
 
@@ -537,12 +572,14 @@ async fn m6_15_reload_is_atomic_under_a_half_written_file() {
         "the document has a real midpoint to tear at"
     );
 
-    // The new signature is written in full, matching where the deploy is headed; the document
-    // is written in two chunks with the poll tick landing between them — a deploy tool that
-    // writes in place rather than renaming (the row's own note).
-    std::fs::write(&fixture.signature_file, &sig).expect("write the new signature");
+    // The document is written in two chunks with the poll tick landing between them, beside the
+    // new signature written in full — a deploy tool that writes in place rather than renaming
+    // (the row's own note). The first chunk goes in before the signature: a tick between those
+    // two writes then sees a torn document too, not the old document beside the new signature,
+    // which is refused as `version_binding` and is not the state this row is about (#58).
     std::fs::write(&fixture.policy_file, &full_doc[..split])
         .expect("write only the first half of the document");
+    std::fs::write(&fixture.signature_file, &sig).expect("write the new signature");
 
     wait_for_rejections(&log, 1, "the half-written document").await;
     let mid = support::health(&endpoint).await;
@@ -553,17 +590,20 @@ async fn m6_15_reload_is_atomic_under_a_half_written_file() {
     );
     assert!(mid.ready, "{mid:#?}");
 
-    let rejected = log_lines(&log)
-        .into_iter()
-        .filter(|l| log_field(l, "@m") == Some("policy_rejected"))
-        .collect::<Vec<_>>();
-    assert_eq!(rejected.len(), 1, "{rejected:#?}");
-    let reason = log_field(&rejected[0], "reason").unwrap_or_default();
+    // One line per tick while the document is torn, so the reasons are asserted, not the count
+    // (#58). Every one is one of the two typed reasons the row names.
+    let torn_only = |reasons: &[String]| {
+        !reasons.is_empty()
+            && reasons
+                .iter()
+                .all(|r| r == "hash_mismatch" || r == "parse_error")
+    };
+    let reasons = rejection_reasons(&log);
     assert!(
-        reason == "hash_mismatch" || reason == "parse_error",
+        torn_only(&reasons),
         "a half-written document is refused as one of the two typed reasons the row names, \
-         got {reason:?}: {:#?}",
-        rejected[0]
+         got {reasons:?}: {:#?}",
+        log_lines(&log)
     );
 
     // Complete the write: the next tick succeeds, and nothing else was ever rejected.
@@ -575,10 +615,10 @@ async fn m6_15_reload_is_atomic_under_a_half_written_file() {
     )
     .await;
     assert_eq!(after.policy_version, Some(8), "{after:#?}");
-    assert_eq!(
-        count_messages(&log, "policy_rejected"),
-        1,
-        "only the torn attempt was ever rejected"
+    let reasons = rejection_reasons(&log);
+    assert!(
+        torn_only(&reasons),
+        "only the torn attempt was ever rejected, got {reasons:?}"
     );
 
     process.stop_gracefully(startup_deadline()).await;
@@ -794,35 +834,48 @@ async fn m6_118_policy_rejected_line_has_a_closed_reason_set() {
     std::fs::remove_file(&fixture.policy_file).expect("remove the document");
     wait_for_rejections(&log, 1, "policy_file_missing").await;
     fixture.write(10, &[""], &["root"]); // heals; byte-identical to active -> Unchanged, no line
-    assert_eq!(count_messages(&log, "policy_rejected"), 1);
+    assert_eq!(rejection_reasons(&log), ["policy_file_missing"]);
 
     // 2. signature_file_missing.
     std::fs::remove_file(&fixture.signature_file).expect("remove the signature");
     wait_for_rejections(&log, 2, "signature_file_missing").await;
     fixture.write(10, &[""], &["root"]);
-    assert_eq!(count_messages(&log, "policy_rejected"), 2);
+    assert_eq!(
+        rejection_reasons(&log),
+        ["policy_file_missing", "signature_file_missing"]
+    );
 
-    // 3. hash_mismatch: a complete, valid document that is not the one that was signed.
-    let (mismatched, sig) = mismatched_hash_document(11);
-    std::fs::write(&fixture.signature_file, &sig).expect("write the v11 signature");
-    std::fs::write(&fixture.policy_file, &mismatched).expect("write the mismatched document");
+    // Steps 3 to 5 each write two files. Each file goes in by rename, so no tick reads a file
+    // half-written: a truncated signature is `signature_invalid`, which no step expects (#58).
+    // The first file alone already makes this step's reason, and the row waits for that line
+    // before the second write. A tick reads the document, then the signature, so one that
+    // straddles the second write still holds this step's document: every pair any tick can
+    // see is refused for the previous step's reason or this one's, never a third.
+    //
+    // 3. hash_mismatch: a complete, valid document that is not the one that was signed. At the
+    // active version, so the new signature beside the active document is `hash_mismatch` too.
+    let (mismatched, sig) = mismatched_hash_document(10);
+    write_atomically(&fixture.signature_file, &sig);
     wait_for_rejections(&log, 3, "hash_mismatch").await;
+    write_atomically(&fixture.policy_file, &mismatched);
 
-    // 4. parse_error: bytes that are not JSON at all, signed as version 12.
+    // 4. parse_error: bytes that are not JSON at all, signed as version 12. The document goes
+    // first: beside the step-3 signature it is `parse_error` already, while the v12 signature
+    // beside the step-3 document would be `version_binding`.
     let garbage = b"not a policy document".to_vec();
     let garbage_sig = sign_bytes(12, &garbage);
-    std::fs::write(&fixture.signature_file, &garbage_sig).expect("write the v12 signature");
-    std::fs::write(&fixture.policy_file, &garbage).expect("write the unparseable document");
+    write_atomically(&fixture.policy_file, &garbage);
     wait_for_rejections(&log, 4, "parse_error").await;
+    write_atomically(&fixture.signature_file, &garbage_sig);
 
     // 5. version_binding: a well-formed document whose own version disagrees with what its
-    // signature commits to.
+    // signature commits to. The document goes first: beside the v12 signature it is
+    // `version_binding` already, while the v14 signature beside the garbage is `parse_error`.
     let bound_doc = document_bytes(13, &[""], &["root"]);
     let mismatched_sig = sign_bytes(14, &bound_doc);
-    std::fs::write(&fixture.signature_file, &mismatched_sig)
-        .expect("write the mismatched-version signature");
-    std::fs::write(&fixture.policy_file, &bound_doc).expect("write the version-13 document");
+    write_atomically(&fixture.policy_file, &bound_doc);
     wait_for_rejections(&log, 5, "version_binding").await;
+    write_atomically(&fixture.signature_file, &mismatched_sig);
 
     // Recover onto a clean, higher version before the rollback case.
     fixture.write(20, &[""], &["root"]);
@@ -832,6 +885,8 @@ async fn m6_118_policy_rejected_line_has_a_closed_reason_set() {
     .await;
 
     // 6. rollback: a fully valid, lower-versioned document, on a node with no break-glass flag.
+    // A tick between this rotation's two writes sees the v15 signature beside the v20 document,
+    // refused as `version_binding`, which collapses into step 5's reason (#58).
     fixture.write(15, &[""], &["root"]);
     wait_for_rejections(&log, 6, "rollback").await;
 
@@ -841,7 +896,6 @@ async fn m6_118_policy_rejected_line_has_a_closed_reason_set() {
         .into_iter()
         .filter(|l| log_field(l, "@m") == Some("policy_rejected"))
         .collect::<Vec<_>>();
-    assert_eq!(rejected.len(), 6, "{rejected:#?}");
     let expected_reasons = [
         "policy_file_missing",
         "signature_file_missing",
@@ -850,9 +904,7 @@ async fn m6_118_policy_rejected_line_has_a_closed_reason_set() {
         "version_binding",
         "rollback",
     ];
-    for (line, expected) in rejected.iter().zip(expected_reasons) {
-        assert_eq!(log_field(line, "reason"), Some(expected), "{line:#?}");
-    }
+    assert_eq!(rejection_reasons(&log), expected_reasons, "{rejected:#?}");
 
     const CLOSED_SET: [&str; 8] = [
         "signature_invalid",

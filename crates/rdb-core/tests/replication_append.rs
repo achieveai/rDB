@@ -67,7 +67,9 @@ use rdb_core::replication::append::{
     PROGRESS_KEY, UNSOLICITED,
 };
 use rdb_core::replication::catchup::{retransmit_timer, CatchupCursor, MAX_PROBE_ROUNDS};
-use rdb_core::replication::primary::{keepalive_timer, Primary, KEEPALIVE_MS};
+use rdb_core::replication::primary::{
+    keepalive_timer, shadow_timer, Primary, KEEPALIVE_MS, SHADOW_PROBE_MS, SHADOW_TIMER_BASE,
+};
 use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::{
     decode_recovery_append, decode_reply, encode_recovery_append, encode_reply, REPLY_MAGIC,
@@ -2109,11 +2111,11 @@ fn applied_from_c(module: &mut Replication, env: &ReplicationEnvelope) -> Append
 /// the ACK for 101 emit no second one. 101 under `NEW_GEN`, chained on `d100`, passes the normal
 /// ladder. Twins: a record at 100 under `GEN` whose digest is not `d100` quarantines
 /// `DIVERGENT_HISTORY` on the root-anchor clause (it chains on `d99`, so only the anchor can
-/// catch it), and the cursor stops on `CopyQuarantined`; and 51 under `GEN - 1` is not historical,
-/// so rows 4-6 run and answer `StaleGeneration`.
+/// catch it), and the cursor stops on `CopyQuarantined`; 51 under `GEN - 1` is historical too
+/// (any older generation below the floor, A-R223); and 101 under `GEN` or `GEN - 1` is above the
+/// floor, so it is not historical, rows 4-6 run and answer `StaleGeneration`.
 ///
-/// Not claimed here: the primary-side one-generation check (§3.6 step 1a), which is M7B-125's.
-/// Nor is "unrestamped" at the sender: the record checked below is this test's own. The cursor
+/// Not claimed here: "unrestamped" at the sender: the record checked below is this test's own. The cursor
 /// below is driven directly, as in
 /// `a_probe_answered_by_the_same_record_loops_until_the_cap_asks_for_a_snapshot`.
 #[retcd_test]
@@ -2216,27 +2218,42 @@ fn m7b_123_historical_envelopes_reach_copy_caught_up_and_root_anchor_quarantines
         [EffectKind::Kernel(KernelEffect::CopyQuarantined { copy })]
     );
 
-    // Twin: two generations back is not historical, so rows 4-6 refuse it.
+    // Twin: two generations back, below the floor, is historical too (A-R223): writeless
+    // reopens leave records sealed generations before the one the copy adopted.
     let (mut module, _) = behind_the_root();
     let older = under(record(51), Generation(GEN.0 - 1), EPOCH, CONFIG);
-    let before = rx(&module).clone();
-    let effects = sent_now(&mut module, C, &older);
-    assert_eq!(effects.len(), 1, "{effects:?}");
-    assert_eq!(
-        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
-        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
-    );
-    assert_eq!(rx(&module), &before, "a refused append changes nothing");
+    match applied_from_c(&mut module, &older) {
+        AppendOutcome::Accepted(ack) => assert_eq!(ack.progress.buffered_applied, AppliedSeq(51)),
+        other => panic!("51 two generations back is historical: {other:?}"),
+    }
+
+    // Twin: above the floor is not historical, under the predecessor or older, so rows 4-6
+    // refuse it: the adopted generation owns every sequence there.
+    for generation in [GEN, Generation(GEN.0 - 1)] {
+        let (mut module, _) = behind_the_root();
+        let above = under(record(ROOT_CUT + 1), generation, EPOCH, CONFIG);
+        let before = rx(&module).clone();
+        let effects = sent_now(&mut module, C, &above);
+        assert_eq!(effects.len(), 1, "{generation:?}: {effects:?}");
+        assert_eq!(
+            reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+            rejected(AppendReject::StaleGeneration { current: NEW_GEN }),
+            "{generation:?}"
+        );
+        assert_eq!(rx(&module), &before, "a refused append changes nothing");
+    }
 }
 
-/// D3 (lead ruling A-R169): generation 4 wrote nothing, so after `Recovered` into generation 5
-/// at `(10, d10)` the head B holds was sealed under `GEN`, two generations back, and is not
-/// historical (K-B-37 admits the predecessor only). The keepalive that sends it draws
-/// `AlreadyHave` and an ACK and stores nothing; without that ACK L1 never resumes. Twins, each
-/// still `StaleGeneration` and unchanged: another record at 10 (forged digest), one whose bytes
-/// do not hash to the d10 it claims, 11 (above the applied head and the floor), and a receiver
-/// whose floor is below the record it holds (never rebuilt by `Recovered`). From a member that
-/// is not the pinned primary it is `NotAMember`.
+/// D3 (lead ruling A-R169, re-pointed by A-R223): generation 4 wrote nothing, so after
+/// `Recovered` into generation 5 at `(10, d10)` the head B holds was sealed under `GEN`, two
+/// generations back. It is at the floor, so it is historical (any older generation, K1), and
+/// row 8 finds it held: the keepalive that sends it draws `AlreadyHave` and an ACK and stores
+/// nothing; without that ACK L1 never resumes. Twins: another record at 10 (forged digest)
+/// quarantines `DivergentHistory` on the root anchor, and one whose bytes do not hash to the d10
+/// it claims quarantines `CorruptHistory` on row 7 — historical records are judged, not skipped.
+/// Still `StaleGeneration` and unchanged: 11 (above the floor), and a receiver whose floor is
+/// below the record it holds (never rebuilt by `Recovered`). From a member that is not the
+/// pinned primary it is `NotAMember`.
 #[retcd_test]
 fn a_head_sealed_two_generations_back_draws_an_ack_and_stores_nothing() {
     let gen5 = Generation(GEN.0 + 2);
@@ -2288,23 +2305,41 @@ fn a_head_sealed_two_generations_back_draws_an_ack_and_stores_nothing() {
     let mut unsealed = held.clone();
     unsealed.mutations[0].value = Some(Bytes::from_static(b"other"));
     assert_eq!(unsealed.record_digest, d(10));
-    let above = chain(11).pop().expect("11");
-    for (name, env) in [
-        ("forged digest", &forged),
-        ("claimed digest", &unsealed),
-        ("above the head", &above),
+    // Historical, so row 8 judges the record at the floor against the root: a forgery is proof.
+    for (name, env, proof) in [
+        (
+            "forged digest",
+            &forged,
+            AppendReject::DivergentHistory { at: Seq(10) },
+        ),
+        (
+            "claimed digest",
+            &unsealed,
+            AppendReject::CorruptHistory { at: Seq(10) },
+        ),
     ] {
         let mut module = recovered_at_10();
-        let before = rx(&module).clone();
         let effects = on_gen5(&mut module, C, env);
-        assert_eq!(effects.len(), 1, "{name}: {effects:?}");
         assert_eq!(
             reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
-            stale,
+            rejected(proof),
             "{name}"
         );
-        assert_eq!(rx(&module), &before, "{name}: a refusal changes nothing");
+        assert_eq!(effects[1..], [quarantine_alert()], "{name}");
+        assert_eq!(
+            (rx(&module).quarantine(), rx(&module).applied_head()),
+            (Some(proof), head(10)),
+            "{name}"
+        );
     }
+    // 11 is above the floor, so generation 5 owns it and rows 4-6 refuse the older one.
+    let above = chain(11).pop().expect("11");
+    let mut module = recovered_at_10();
+    let before = rx(&module).clone();
+    let effects = on_gen5(&mut module, C, &above);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG), stale);
+    assert_eq!(rx(&module), &before, "a refusal changes nothing");
 
     let effects = on_gen5(&mut recovered_at_10(), A, &held);
     assert_eq!(
@@ -2355,7 +2390,7 @@ fn recovery_at(cutoff: u64, generation: Generation) -> RecoveryResult {
 
 /// C leading P and rebuilt by two of its own recoveries: at `(first, d(first))` into `NEW_GEN`,
 /// then — after applying `first + 1..=100` itself — at `(100, d100)` into generation 5. So its
-/// lineage's base is 100 and the one before began at `first` (lead ruling B-R71a).
+/// lineage's base is 100 and the one before began at `first`, and its ladder holds every record.
 fn primary_after_two_recoveries(first: u64) -> Primary {
     let mut history = DigestLadder::new();
     history.insert(Seq::ZERO, Digest::ROOT);
@@ -2374,10 +2409,6 @@ fn primary_after_two_recoveries(first: u64) -> Primary {
         },
     })
     .expect("C's tracker");
-    assert_eq!(
-        (tracker.base_seq(), tracker.prior_base()),
-        (Seq::ZERO, None)
-    );
     let mut primary = Primary::new(tracker);
     primary.on_recovered(&recovery_at(first, NEW_GEN), Tick(1));
     for seq in first + 1..=100 {
@@ -2390,10 +2421,7 @@ fn primary_after_two_recoveries(first: u64) -> Primary {
     }
     primary.on_recovered(&recovery_at(100, Generation(5)), Tick(2));
     let tracker = primary.tracker();
-    assert_eq!(
-        (tracker.head(), tracker.base_seq(), tracker.prior_base()),
-        (Seq(100), Seq(100), Some(Seq(first)))
-    );
+    assert_eq!((tracker.head(), tracker.base_seq()), (Seq(100), Seq(100)));
     primary
 }
 
@@ -2431,28 +2459,21 @@ const fn snapshot_b() -> EffectKind {
     })
 }
 
-/// M7B-125, lead rulings B-R71 and B-R71a: catch-up's one-generation limit (design §3.6 step
-/// 1a, K-B-37). C's lineage is based at 100, so records 51..=100 are its predecessor's
-/// history: B, at 50, gets them as they are. The record-level `generation` is not in the
-/// effect, which names sequences only. M7B-123 shows B admits such a record; that the sender
-/// does not re-stamp it (the sim's `send_envelopes` sends the stored bytes) no row pins.
+/// M7B-125, re-cut by lead ruling A-R223 (critic-d3 F2): the retained prefix is sent, and no
+/// snapshot is asked for it, whatever generation sealed it. C's lineage is based at 100, so
+/// records 51..=100 are older history: B, at 50, gets them as they are (the effect names
+/// sequences only; M7B-123 shows B admits a record sealed one or two generations back).
 ///
-/// - Twin (a), prior base 50: every record above it goes out, the first of them (51), the one at
-///   the base (100), and nothing is refused.
-/// - Twin (b), prior base 51: record 51 is older than the predecessor, which the receiver's
-///   historical rule does not admit, so C asks for a snapshot and sends nothing. From 51 on,
-///   record 52 goes out: the limit is exactly the prior base.
+/// - Twin (a), the lineage before began at 50: 51 and 100 go out.
+/// - Twin (b), it began at 51, so record 51 is two generations back: it goes out too. Before
+///   A-R223 this asked for a snapshot (step 1a); the receiver now takes it. The ACK path agrees:
+///   B's ACK at 40 is answered with 41.
+/// - Twin (c): a same-generation `Recovered` changes none of that.
 ///
-/// Twin (b) also takes an ACK: B at 40 would be sent 41, and gets the snapshot instead.
-///
-/// Credited for the continuous primary only: a node that stays primary across a generation
-/// change. Not covered (B-R71a): every primary `Recovered` builds starts with no prior base and
-/// keeps none through a same-generation `Recovered`, so step 1a never fires in a node's first
-/// generation as primary, including the B-R58b genesis walk; nor for the recovery source, nor a
-/// probe answer. A prior base taken across generations this node did not serve is not checked
-/// and can be too low.
+/// A record the primary does not retain still asks for a snapshot: that is
+/// `a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for` (K3).
 #[retcd_test]
-fn m7b_125_catch_up_sends_historical_records_unrestamped_or_snapshot_if_older() {
+fn m7b_125_catch_up_sends_the_retained_prefix_and_asks_no_snapshot() {
     // Twin (a).
     let mut primary = primary_after_two_recoveries(50);
     assert_eq!(b_needs(&mut primary, 50), [sends_b(51)]);
@@ -2460,70 +2481,199 @@ fn m7b_125_catch_up_sends_historical_records_unrestamped_or_snapshot_if_older() 
 
     // Twin (b).
     let mut primary = primary_after_two_recoveries(51);
-    assert_eq!(b_needs(&mut primary, 50), [snapshot_b()]);
+    assert_eq!(b_needs(&mut primary, 50), [sends_b(51)]);
     assert_eq!(
         primary.cursor(CopyId(1)).and_then(CatchupCursor::unacked),
-        None,
-        "nothing sent"
+        Some(Seq(51)),
+        "51 is in flight"
     );
-    assert!(!primary.awaits_ack());
-    // The ACK path reads the same limit: the tracker admits B's ACK at 40, and the cursor would
-    // send 41, which is older than the predecessor too.
     let progress = EffectKind::Kernel(KernelEffect::PeerProgress {
         peer: B,
         contiguous_seq: Seq(40),
     });
-    assert_eq!(b_acks(&mut primary, 40), [progress, snapshot_b()]);
-    assert_eq!(
-        primary.cursor(CopyId(1)).and_then(CatchupCursor::unacked),
-        None,
-        "nothing sent on the ACK"
-    );
-    assert_eq!(b_needs(&mut primary, 51), [sends_b(52)]);
+    assert_eq!(b_acks(&mut primary, 40), [progress, sends_b(41)]);
 
-    // Twin (c), tester-kbr1 F3: a `Recovered` in the generation already served (a mode change,
-    // or F1's rebuild) re-announces it. It keeps the prior base (B-R71a: only a rebuild into a
-    // new generation sets one), so step 1a still fires. Kills mutant K7 "same generation drops
-    // the prior base".
+    // Twin (c), tester-kbr1 F3: a `Recovered` in the generation already served.
     let mut primary = primary_after_two_recoveries(51);
     primary.on_recovered(&recovery_at(100, Generation(5)), Tick(4));
     let tracker = primary.tracker();
     assert_eq!(
-        (
-            tracker.lineage().generation,
-            tracker.base_seq(),
-            tracker.prior_base()
-        ),
-        (Generation(5), Seq(100), Some(Seq(51))),
-        "the same generation keeps the prior base"
+        (tracker.lineage().generation, tracker.base_seq()),
+        (Generation(5), Seq(100))
     );
-    assert_eq!(b_needs(&mut primary, 50), [snapshot_b()]);
-    assert_eq!(b_needs(&mut primary, 51), [sends_b(52)]);
+    assert_eq!(b_needs(&mut primary, 50), [sends_b(51)]);
 }
 
-/// The bases step 1a reads follow the primary's own recoveries (lead ruling B-R71a). A primary
-/// `Recovered` builds on C starts at the cutoff with no prior base; the next `Recovered`
-/// rebuilds it, and its base becomes the prior one.
+/// A primary `Recovered` builds starts its lineage at the cutoff; the next `Recovered` rebuilds
+/// it at its own cutoff (lead ruling B-R71).
 #[retcd_test]
-fn a_built_primary_knows_its_base_and_a_rebuilt_one_its_prior_base() {
+fn a_built_primary_knows_its_base_and_a_rebuilt_one_its_own() {
     let mut module = Replication::new();
     let first = requiring(recovered(40, d(40), takeover_config()), &[2], C);
     step(&mut module, &on(C, first));
     let tracker = module.primary(C, P).expect("built").tracker();
-    assert_eq!((tracker.base_seq(), tracker.prior_base()), (Seq(40), None));
+    assert_eq!(tracker.base_seq(), Seq(40));
     let second = event(EventKind::Kernel(KernelEvent::Recovered(Box::new(
         recovery_at(40, Generation(5)),
     ))));
     step(&mut module, &on(C, requiring(second, &[2], C)));
     let tracker = module.primary(C, P).expect("rebuilt").tracker();
     assert_eq!(
-        (
-            tracker.lineage().generation,
-            tracker.base_seq(),
-            tracker.prior_base()
-        ),
-        (Generation(5), Seq(40), Some(Seq(40)))
+        (tracker.lineage().generation, tracker.base_seq()),
+        (Generation(5), Seq(40))
     );
+}
+
+/// `(seq, d(seq))` for `0..=through`, `(0, ROOT)` first: what an engine holding that prefix
+/// reads back.
+fn engine_rungs(through: u64) -> Vec<(Seq, Digest)> {
+    (0..=through)
+        .map(|seq| (Seq(seq), if seq == 0 { Digest::ROOT } else { d(seq) }))
+        .collect()
+}
+
+/// K3 (lead ruling A-R223): C is primary at 100 in generation 5 but its ladder holds only the
+/// root and its head, as after a rebuild that kept nothing older. B at 50 meets `NotRetained`,
+/// so C asks for a snapshot. The consumer reads C's engine and calls
+/// `Replication::restore_primary_history`; B's next `NeedPrefix` is answered with 51, with no
+/// snapshot. Refusals change nothing: rungs that stop short of the head or do not start at 0,
+/// a rung that contradicts the ladder, a node with no primary, and a retired primary.
+#[retcd_test]
+fn a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for() {
+    let mut history = DigestLadder::new();
+    history.insert(Seq::ZERO, Digest::ROOT);
+    history.insert(Seq(100), d(100));
+    let tracker = ProgressTracker::new(TrackerInit {
+        config: takeover_config(),
+        own: CopyId(2),
+        lineage: authority(Generation(5), NEW_EPOCH),
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(100),
+            buffered_applied: AppliedSeq(100),
+            durable: DurableSeq(100),
+        },
+    })
+    .expect("C's tracker");
+    let mut module = Replication::new();
+    module.install_primary(tracker);
+    let mut primary = module.primary(C, P).cloned().expect("installed");
+    assert_eq!(b_needs(&mut primary, 50), [snapshot_b()]);
+
+    let invalid = |field| Err(RdbError::InvalidArgument { field });
+    let mut contradicts = engine_rungs(100);
+    contradicts[100].1 = d(99);
+    for (name, rungs) in [
+        ("short of the head", engine_rungs(99)),
+        ("contradicts the ladder", contradicts),
+        ("not from 0", engine_rungs(100)[1..].to_vec()),
+    ] {
+        let before = module.primary(C, P).cloned();
+        assert_eq!(
+            module.restore_primary_history(C, P, &rungs),
+            invalid("rungs"),
+            "{name}"
+        );
+        assert_eq!(
+            module.primary(C, P).cloned(),
+            before,
+            "{name}: nothing kept"
+        );
+    }
+    assert_eq!(
+        module.restore_primary_history(B, P, &engine_rungs(100)),
+        invalid("primary")
+    );
+
+    assert_eq!(
+        module.restore_primary_history(C, P, &engine_rungs(100)),
+        Ok(())
+    );
+    let mut primary = module.primary(C, P).cloned().expect("installed");
+    assert_eq!(b_needs(&mut primary, 50), [sends_b(51)]);
+    // Idempotent: the consumer may serve a second barrier from the same engine.
+    assert_eq!(
+        module.restore_primary_history(C, P, &engine_rungs(100)),
+        Ok(())
+    );
+
+    // A retired primary serves nothing, so it takes nothing.
+    let mut history = DigestLadder::new();
+    history.insert(Seq(10), d(10));
+    let old_primary = ProgressTracker::new(TrackerInit {
+        config: config(),
+        own: CopyId(0),
+        lineage: authority(GEN, EPOCH),
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(10),
+            buffered_applied: AppliedSeq(10),
+            durable: DurableSeq(10),
+        },
+    })
+    .expect("A's old primary");
+    let mut module = Replication::new();
+    module.install_primary(old_primary);
+    step(
+        &mut module,
+        &requiring(recovered(10, d(10), takeover_config()), &[0, 2], A),
+    );
+    assert!(module.primary(A, P).expect("kept").tracker().retired());
+    assert_eq!(
+        module.restore_primary_history(A, P, &engine_rungs(10)),
+        invalid("retired")
+    );
+}
+
+/// Regression, #50 40-run check runs 16 and 22 (2026-10-23): a copy whose cursor asked for a
+/// snapshot, and which then took the head from the keepalive rather than from the cursor, is
+/// still reported caught up. C at 100 holds only the root and its head; B at 99 meets
+/// `NotRetained`, so the cursor asks for a snapshot and sends nothing. The consumer restores C's
+/// ladder from its engine. Before B asks again, the keepalive sends it 100, which B takes. B's
+/// ACK at 100 must end the catch-up with `CopyCaughtUp{B, 100, d100}`: F1's rebuild waits on
+/// it, and without it db's `m10_d7_below_the_base_a_copy_catches_up` stayed `Rebuilding` for
+/// 90 s whenever the keepalive beat B's second `NeedPrefix`.
+#[retcd_test]
+fn a_copy_that_asked_a_snapshot_and_took_the_head_from_the_keepalive_is_caught_up() {
+    let mut history = DigestLadder::new();
+    history.insert(Seq::ZERO, Digest::ROOT);
+    history.insert(Seq(100), d(100));
+    let tracker = ProgressTracker::new(TrackerInit {
+        config: takeover_config(),
+        own: CopyId(2),
+        lineage: authority(Generation(5), NEW_EPOCH),
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(100),
+            buffered_applied: AppliedSeq(100),
+            durable: DurableSeq(100),
+        },
+    })
+    .expect("C's tracker");
+    let mut primary = Primary::new(tracker);
+    assert_eq!(b_needs(&mut primary, 99), [snapshot_b()]);
+    assert_eq!(primary.restore_history(&engine_rungs(100)), Ok(()));
+
+    let round = primary.on_admission(false, Tick(4));
+    assert!(
+        round.contains(&sends_b(100)),
+        "the keepalive sends B the head: {round:?}"
+    );
+    let caught_up = EffectKind::Kernel(KernelEffect::CopyCaughtUp {
+        copy: CopyId(1),
+        head: Seq(100),
+        digest: d(100),
+    });
+    let effects = b_acks(&mut primary, 100);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| **effect == caught_up)
+            .count(),
+        1,
+        "{effects:?}"
+    );
+    assert!(primary.cursor(CopyId(1)).is_none(), "the cursor is done");
 }
 
 // --- RecoveryAppend (§3.2a) ---------------------------------------------------------------
@@ -3568,6 +3718,16 @@ fn m7b_160_a_view_naming_a_config_without_this_copy_keeps_its_ack_out_of_every_c
 
 // --- Recovered builds R1's side (lead ruling B-R54) --------------------------------------------
 
+/// The boot `result`'s plan names for `copy`: F1 counts a proof only from it (A-R239a).
+fn named_boot(result: &RecoveryResult, copy: CopyId) -> BootId {
+    result
+        .committed
+        .pinned_config
+        .member(copy)
+        .expect("a required copy is a member")
+        .boot
+}
+
 /// `ev`, a `Recovered`, with a barrier over copies `copies`, each proved durable at the cutoff,
 /// stepped on `node`.
 fn requiring(mut ev: Event, copies: &[u8], node: NodeId) -> Event {
@@ -3582,6 +3742,7 @@ fn requiring(mut ev: Event, copies: &[u8], node: NodeId) -> Event {
             partition: P,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: named_boot(result, CopyId(copy)),
         })
         .collect();
     let required = copies.iter().map(|&copy| CopyId(copy)).collect();
@@ -5492,10 +5653,19 @@ fn m9_d3_06_receiver_a_retired_copy_still_truncates_on_a_re_emit_of_its_generati
         (NEW_GEN, head(11))
     );
     // B's primary, which the first pin built, is refused by the second; its receiver re-anchors.
+    // The first pin named the shadow D, so that primary armed the shadow probe; retired, it
+    // cancels it (lead ruling A-R228).
     let effects = step(&mut module, &recovered(10, d(10), takeover_config()));
-    assert_eq!(effects.len(), 2, "{effects:?}");
+    assert_eq!(effects.len(), 3, "{effects:?}");
     asks_new_primary(&effects[..1], 10);
     assert_eq!(effects[1], replica(ReplicaIgnoreReason::InvalidConfig));
+    assert_eq!(
+        effects[2],
+        EffectKind::Timer(TimerEffect::Cancel {
+            id: shadow_timer(P),
+            version: TimerVersion(1),
+        })
+    );
     let rx_ = rx(&module);
     assert_eq!(
         (rx_.applied_head(), rx_.retired(), rx_.history().highest()),
@@ -5645,4 +5815,678 @@ fn m10_d7_a_restore_history_takes_only_a_dense_agreeing_ladder() {
 
     assert_eq!(module.restore_history(B, P, &dense), Ok(()));
     assert_eq!(rx(&module).history().digest_at(Seq(5)), Some(d(5)));
+}
+
+// --- shadows are fed separately (lead ruling A-R228) ------------------------------------------
+
+/// D's receiver for `P` under `with_shadow()`, at `at`, durable there.
+fn d_receiver(at: Head) -> AppendReceiver {
+    AppendReceiver::new(ReceiverInit {
+        config: with_shadow(),
+        own: CopyId(3),
+        lineage: authority(GEN, EPOCH),
+        durable: DurableSeq(at.seq.0),
+        head: at,
+    })
+    .expect("D's receiver")
+}
+
+/// A's probe of D — its head record, 15 — delivered on D; then D's answer carried back to A.
+/// Returns what D answered and what A answered.
+fn probe_d(module: &mut Replication) -> (Vec<EffectKind>, Vec<EffectKind>) {
+    let body = chain(15)[14].encode().expect("encode");
+    let at_d = step(module, &on(D, delivered(label(A), body)));
+    let mut at_a = Vec::new();
+    for kind in &at_d {
+        if let EffectKind::Send(SendEffect::Unicast { to, frame }) = kind {
+            assert_eq!(*to, A, "D answers the primary");
+            let ev = event_at(
+                A,
+                EventKind::Transport(TransportEvent::Delivered {
+                    from: label(D),
+                    frame: frame.clone(),
+                }),
+            );
+            at_a.extend(step(module, &ev));
+        }
+    }
+    (at_d, at_a)
+}
+
+/// D walked from the root to `through` by appends from A, each committed: a shadow whose
+/// history agrees with A's and runs past A's head when `through` exceeds 15.
+fn d_holds_through(module: &mut Replication, through: u64) {
+    for (record, seq) in chain(through).iter().zip(1..) {
+        let body = record.encode().expect("encode");
+        let at_d = step(module, &on(D, delivered(label(A), body)));
+        let [EffectKind::Store(StoreEffect::Commit(batch))] = at_d.as_slice() else {
+            panic!("D takes {seq}: {at_d:?}");
+        };
+        step(module, &on(D, committed(batch.id.0, seq)));
+    }
+}
+
+/// The replies among D's effects.
+fn replies_of(effects: &[EffectKind]) -> Vec<AppendOutcome> {
+    effects
+        .iter()
+        .filter_map(|kind| match kind {
+            EffectKind::Send(SendEffect::Unicast { frame, .. }) => {
+                Some(decode_reply(&frame.body).expect("reply decodes"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_store(kind: &EffectKind) -> bool {
+    matches!(kind, EffectKind::Store(_))
+}
+
+/// Lead ruling A-R228, check 2. The shadow probe is A's head record, 15..15, and it never
+/// makes a shadow apply or overwrite anything:
+///
+/// - D at the root answers `NeedPrefix{0, ROOT}` and stores nothing.
+/// - D ahead of A on the same history (it holds 1..=20) answers `AlreadyHave` and its ACK at
+///   20; A cannot verify an ACK past its head and names it `SnapshotCatchupRequired{D, 15}`
+///   (B-R47 ruling 3). Nothing is sent to D and D keeps 20.
+/// - D ahead holding only rung 20 cannot place 15 and answers `ProbeDigestAt{15}`; A's cursor
+///   answers with its record 15 (the K-B-27 probe rounds, capped). D stores nothing.
+/// - D with another digest at 15 quarantines (`DivergentHistory{15}`, `Alert{CorruptHistory}`)
+///   and A names it `CopyQuarantined{D}`. D stores nothing and keeps its head.
+#[retcd_test]
+fn m10_s2_a_probe_never_makes_a_shadow_apply_whether_it_lacks_holds_ahead_or_differs() {
+    let mut module = a_b_c();
+    module.install_receiver(d_receiver(root_head()));
+    let (at_d, _) = probe_d(&mut module);
+    assert_eq!(
+        replies_of(&at_d),
+        [rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        })]
+    );
+    assert!(!at_d.iter().any(is_store), "{at_d:?}");
+
+    let mut module = a_b_c();
+    module.install_receiver(d_receiver(root_head()));
+    d_holds_through(&mut module, 20);
+    let (at_d, at_a) = probe_d(&mut module);
+    let replies = replies_of(&at_d);
+    assert!(
+        matches!(replies.as_slice(), [AppendOutcome::AlreadyHave, AppendOutcome::Accepted(ack)]
+            if ack.progress.buffered_applied == AppliedSeq(20)),
+        "{replies:?}"
+    );
+    assert!(!at_d.iter().any(is_store), "{at_d:?}");
+    assert_eq!(
+        at_a.last(),
+        Some(&EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: CopyId(3),
+            barrier: Seq(15),
+        })),
+        "{at_a:?}"
+    );
+    assert!(!at_a.iter().any(is_bare_send), "{at_a:?}");
+    assert_eq!(
+        module.receiver(D, P).map(AppendReceiver::applied_head),
+        Some(head(20))
+    );
+
+    let mut module = a_b_c();
+    module.install_receiver(d_receiver(head(20)));
+    let (at_d, at_a) = probe_d(&mut module);
+    assert_eq!(
+        replies_of(&at_d),
+        [AppendOutcome::ProbeDigestAt { seq: Seq(15) }]
+    );
+    assert!(!at_d.iter().any(is_store), "{at_d:?}");
+    assert_eq!(at_a, [head_to(3)]);
+
+    let differs = Head {
+        seq: Seq(15),
+        digest: d(14),
+    };
+    let mut module = a_b_c();
+    module.install_receiver(d_receiver(differs));
+    let (at_d, at_a) = probe_d(&mut module);
+    assert_eq!(
+        replies_of(&at_d),
+        [rejected(AppendReject::DivergentHistory { at: Seq(15) })]
+    );
+    assert!(at_d.contains(&quarantine_alert()), "{at_d:?}");
+    assert!(!at_d.iter().any(is_store), "{at_d:?}");
+    assert_eq!(
+        at_a,
+        [EffectKind::Kernel(KernelEffect::CopyQuarantined {
+            copy: CopyId(3)
+        })]
+    );
+    assert_eq!(
+        module.receiver(D, P).map(AppendReceiver::applied_head),
+        Some(differs)
+    );
+}
+
+/// Lead ruling A-R228, check 1. The shadow-probe timer id is `REPLICATION_TIMER_BASE + 2^41 +
+/// partition`: R1's tag `0x00C1` in bits 48..64, block 2 in bits 40..48, nothing in bits 32..40
+/// and the partition in bits 0..32. The keepalive is block 0 and the retransmit block 1 of the
+/// same tag, and every other module's timer carries another tag, so no partition id makes it
+/// equal any of them. `primary.rs` asserts the same spans at compile time; this row checks the
+/// decomposition at the edges of the partition range against every other timer id in use.
+#[retcd_test]
+fn m10_s2_the_shadow_timer_shares_no_id_with_any_other_timer() {
+    use rdb_core::authority::AuthorityTimer;
+    use rdb_core::protection::HEALTH_EVAL_TIMER;
+    use rdb_core::publication::post_apply_timer;
+    use rdb_core::recovery::DISCOVERY_TIMER;
+    use rdb_core::replication::primary::REPLICATION_TIMER_BASE;
+    assert_eq!(SHADOW_TIMER_BASE, REPLICATION_TIMER_BASE + (2 << 40));
+    let partitions = [0, 1, 4, 65_535, u32::MAX].map(PartitionId);
+    let parts = |id: TimerId| {
+        (
+            id.0 >> 48,
+            (id.0 >> 40) & 0xFF,
+            (id.0 >> 32) & 0xFF,
+            id.0 & 0xFFFF_FFFF,
+        )
+    };
+    let mut others: Vec<TimerId> = vec![HEALTH_EVAL_TIMER, DISCOVERY_TIMER];
+    others.extend(AuthorityTimer::ALL.map(AuthorityTimer::id));
+    for partition in partitions {
+        let p = u64::from(partition.0);
+        assert_eq!(parts(keepalive_timer(partition)), (0x00C1, 0, 0, p));
+        assert_eq!(parts(retransmit_timer(partition)), (0x00C1, 1, 0, p));
+        assert_eq!(parts(shadow_timer(partition)), (0x00C1, 2, 0, p));
+        others.extend([
+            keepalive_timer(partition),
+            retransmit_timer(partition),
+            post_apply_timer(partition),
+        ]);
+    }
+    for id in &others {
+        let tag = id.0 >> 48;
+        assert!(
+            tag != 0x00C1 || (id.0 >> 40) & 0xFF != 2,
+            "{id:?} is in the shadow block"
+        );
+    }
+    for partition in partitions {
+        assert!(!others.contains(&shadow_timer(partition)), "{partition:?}");
+    }
+}
+
+/// C leading at 15 under `takeover_config()` (A and B regular, D a shadow), its ladder the root
+/// and 1..=15, after the `Recovered` at `(15, d15)` into `NEW_GEN` that activates the plan at
+/// tick 1. Returns C and what that `Recovered` answered.
+fn c_leads_with_shadow() -> (Primary, Vec<EffectKind>) {
+    let mut history = DigestLadder::new();
+    for (seq, digest) in engine_rungs(15) {
+        history.insert(seq, digest);
+    }
+    let tracker = ProgressTracker::new(TrackerInit {
+        config: takeover_config(),
+        own: CopyId(2),
+        lineage: authority(GEN, EPOCH),
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(15),
+            buffered_applied: AppliedSeq(15),
+            durable: DurableSeq(15),
+        },
+    })
+    .expect("C's tracker");
+    let mut primary = Primary::new(tracker);
+    let activated = primary.on_recovered(&recovery_at(15, NEW_GEN), Tick(1));
+    (primary, activated)
+}
+
+fn shadow_fired(version: u64, at: u64) -> TimerFired {
+    TimerFired {
+        id: shadow_timer(P),
+        version: TimerVersion(version),
+        scheduled_at: Tick(at),
+    }
+}
+
+/// The shadow probe armed at `version`, [`SHADOW_PROBE_MS`] after `now`.
+fn shadow_arm(version: u64, now: u64) -> EffectKind {
+    EffectKind::Timer(TimerEffect::Arm {
+        id: shadow_timer(P),
+        version: TimerVersion(version),
+        at: Tick(now + SHADOW_PROBE_MS),
+    })
+}
+
+fn to_copy(copy: u8, seq: u64) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::SendEnvelopes {
+        copy: CopyId(copy),
+        from: Seq(seq),
+        through: Seq(seq),
+    })
+}
+
+/// `outcome` from D, as C's primary receives it at `now`.
+fn d_says(primary: &mut Primary, outcome: &AppendOutcome, now: u64) -> Vec<EffectKind> {
+    primary.on_reply(&label(D), encode_reply(outcome).as_ref(), Tick(now))
+}
+
+/// D's ACK at `seq` after the takeover.
+fn d_ack_at(seq: u64) -> AppendOutcome {
+    AppendOutcome::Accepted(AppendAck {
+        from: D,
+        boot: BootId(u64::from(D.0)),
+        role: ReplicaRole::Shadow,
+        ..ack_after_takeover(seq)
+    })
+}
+
+fn d_needs(have: u64) -> AppendOutcome {
+    rejected(AppendReject::NeedPrefix {
+        have: Seq(have),
+        head_digest: if have == 0 { Digest::ROOT } else { d(have) },
+    })
+}
+
+fn sends_in(effects: &[EffectKind]) -> Vec<EffectKind> {
+    effects
+        .iter()
+        .filter(|kind| is_bare_send(kind))
+        .cloned()
+        .collect()
+}
+
+fn caught_up_d(seq: u64) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::CopyCaughtUp {
+        copy: CopyId(3),
+        head: Seq(seq),
+        digest: d(seq),
+    })
+}
+
+fn local_applied(seq: u64) -> KernelEvent {
+    KernelEvent::LocalApplied {
+        seq: Seq(seq),
+        bytes: 0,
+        record_digest: d(seq),
+    }
+}
+
+/// Walk D from `have` to C's head `head` by its ACKs, checking each send, and return the
+/// effects of the ACK that closed the gap.
+fn d_walks(primary: &mut Primary, have: u64, head: u64) -> Vec<EffectKind> {
+    assert_eq!(
+        sends_in(&d_says(primary, &d_needs(have), 300)),
+        [to_copy(3, have + 1)]
+    );
+    for seq in have + 1..head {
+        assert!(
+            !primary.awaits_ack(),
+            "a shadow's record in flight holds no stream timer"
+        );
+        let answered = d_says(primary, &d_ack_at(seq), 300);
+        assert_eq!(sends_in(&answered), [to_copy(3, seq + 1)], "after {seq}");
+    }
+    d_says(primary, &d_ack_at(head), 300)
+}
+
+/// Lead ruling A-R228 (critic R2-M1's goal, spec §5.2 step 4 "shadows receive separately"). A
+/// shadow at the root reaches the head and stays current under new writes, on its own timer:
+///
+/// - The `Recovered` that activates the plan arms the shadow probe.
+/// - Its fire sends D the head, 15..15, and re-arms. D answers `NeedPrefix{0}`, which starts its
+///   cursor, and D's ACKs walk it 1..=15 to `CopyCaughtUp{D, 15}`. No record in flight to D
+///   holds the stream's retransmit (`awaits_ack`).
+/// - A new write, 16, ships to the regular A and B only (M7B-217 unchanged). The next fire
+///   sends D the head, 16; D asks from 15 and is walked to `CopyCaughtUp{D, 16}`.
+/// - D counts toward nothing: it is in no required set, no regular-secondary set, and the
+///   stream remembers nothing shipped to it. L1 never puts a shadow in its lag domain
+///   (M7B-131).
+///
+/// Cut: the fire sends no head to a shadow -> red at the first fire.
+#[retcd_test]
+fn m10_s2_a_shadow_at_the_root_is_probed_to_the_head_and_kept_current() {
+    let (mut c, activated) = c_leads_with_shadow();
+    assert_eq!(activated.last(), Some(&shadow_arm(1, 1)), "{activated:?}");
+    assert_eq!(c.shadow_probe(), Some(TimerVersion(1)));
+
+    let probe = c.on_shadow_tick(&shadow_fired(1, 201), Tick(201));
+    assert_eq!(probe, [to_copy(3, 15), shadow_arm(2, 201)]);
+    let closed = d_walks(&mut c, 0, 15);
+    assert!(closed.contains(&caught_up_d(15)), "{closed:?}");
+    assert!(c.cursor(CopyId(3)).is_none());
+
+    let shipped = c.on_kernel(&local_applied(16), Tick(350)).expect("R1's");
+    assert_eq!(
+        shipped,
+        [to_copy(0, 16), to_copy(1, 16)],
+        "the stream skips the shadow"
+    );
+    let probe = c.on_shadow_tick(&shadow_fired(2, 401), Tick(401));
+    assert_eq!(probe, [to_copy(3, 16), shadow_arm(3, 401)]);
+    let closed = d_walks(&mut c, 15, 16);
+    assert!(closed.contains(&caught_up_d(16)), "{closed:?}");
+
+    let tracker = c.tracker();
+    assert!(!tracker.required_copies().contains(&CopyId(3)));
+    assert!(!tracker.regular_secondaries().contains(&CopyId(3)));
+    assert_eq!(c.shipped(CopyId(3)), None);
+    assert_eq!(
+        c.on_shadow_tick(&shadow_fired(2, 401), Tick(450)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer),
+        "an earlier version is stale"
+    );
+}
+
+/// Lead ruling A-R228: a silent shadow does not change the stream's retransmit schedule. A
+/// leads at 15 with D a shadow. B's `NeedPrefix{12}` starts B's cursor at 13 and arms the
+/// retransmit; fires at 100, 200 and 300 mark the wait and re-send 13. Run once with D also
+/// walked from 12 and then silent, and once without D: the retransmit timer's arms and sends
+/// are identical, and D's own start arms nothing. D's record waits for the shadow probe.
+///
+/// Cut: `awaits_ack` counts a shadow's cursor -> red (D's start arms the retransmit).
+#[retcd_test]
+fn m10_s2_a_silent_shadow_leaves_the_regular_retransmit_schedule_alone() {
+    let need = rejected(AppendReject::NeedPrefix {
+        have: Seq(12),
+        head_digest: d(12),
+    });
+    let schedule = |with_d: bool| {
+        let mut module = a_b_c();
+        if with_d {
+            let started = step(&mut module, &reply_from_to(label(D), A, &need));
+            assert_eq!(started, [to_copy(3, 13)], "D's start arms no retransmit");
+        }
+        let mut out = vec![step(&mut module, &reply_from_to(label(B), A, &need))];
+        for (version, at) in [(1, 100), (2, 200), (3, 300)] {
+            out.push(step_at(
+                &mut module,
+                at,
+                &retransmit_fired_on(A, version, at),
+            ));
+        }
+        out
+    };
+    let without = schedule(false);
+    assert_eq!(without[0], [to_copy(1, 13), retransmit_arm(1, 100)]);
+    assert!(without[2].contains(&to_copy(1, 13)), "{without:?}");
+    assert_eq!(schedule(true), without);
+}
+
+/// Lead ruling A-R228, check 3. After the re-add generation pins D as a regular secondary, the
+/// shadow probe stops — the `Recovered` cancels the armed version and a fire of it is stale —
+/// and D moves to the stream: the next write ships to A, B and D, one send each, D's at 16
+/// right after the 15 it was walked to, so no gap and no double send.
+///
+/// Cut: the probe keeps running when no shadow is left -> red.
+#[retcd_test]
+fn m10_s2_a_shadow_re_added_as_regular_leaves_the_probe_for_the_stream() {
+    use ReplicaRole::{Primary as Leads, RegularSecondary as Regular};
+    let (mut c, _) = c_leads_with_shadow();
+    c.on_shadow_tick(&shadow_fired(1, 201), Tick(201));
+    let closed = d_walks(&mut c, 0, 15);
+    assert!(closed.contains(&caught_up_d(15)), "{closed:?}");
+
+    let mut readd = recovery_at(15, Generation(5));
+    let pin = pinned([Regular, Regular, Leads, Regular]);
+    readd.committed.authority_view.config_version = pin.config_version;
+    readd.committed.pinned_config = pin;
+    let effects = c.on_recovered(&readd, Tick(500));
+    assert!(
+        effects.contains(&EffectKind::Timer(TimerEffect::Cancel {
+            id: shadow_timer(P),
+            version: TimerVersion(2),
+        })),
+        "{effects:?}"
+    );
+    assert_eq!(c.shadow_probe(), None);
+    assert_eq!(
+        c.on_shadow_tick(&shadow_fired(2, 401), Tick(510)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer)
+    );
+    let shipped = c.on_kernel(&local_applied(16), Tick(520)).expect("R1's");
+    assert_eq!(shipped, [to_copy(0, 16), to_copy(1, 16), to_copy(3, 16)]);
+}
+
+/// Lead ruling A-R228: R1 owns the shadow-probe timer, so a fire of it is answered on every
+/// node, never declined — `StaleTimer` on a node that leads nothing and on a primary that has
+/// not armed it — and changes nothing.
+///
+/// Cut: `Replication::step` does not route the shadow timer -> red (declined).
+#[retcd_test]
+fn m10_s2_r1_answers_its_shadow_timer_on_every_node() {
+    let fire = |node| event_at(node, EventKind::Timer(shadow_fired(1, 200)));
+    let mut leads = a_b_c();
+    let before = leads.clone();
+    assert_eq!(
+        step_at(&mut leads, 200, &fire(A)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer)
+    );
+    assert_eq!(leads, before);
+    let mut nothing = Replication::new();
+    assert_eq!(
+        step_at(&mut nothing, 200, &fire(B)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer)
+    );
+}
+
+// --- a dormant receiver beside a live primary (A-R278, A-R314) ---------------------------------
+
+/// A-R278 (W6b): a live owner re-planning around a restarted copy is F1's catch-up source, and
+/// it holds its own copy as a primary. R1 sources a catch-up from a receiver only, so the host
+/// restores a dormant receiver for that copy beside the primary (A-R314). Here A leads P at 15,
+/// durable 10. With the primary alone the catch-up is refused `NotASource` (the host's fault
+/// before the fix). With the dormant receiver beside it, F1's catch-up of C through 15 starts,
+/// and the receiver serves that and nothing else: a plain append to it is refused with no
+/// reply, and neither the catch-up nor the append changes the primary. On a flush of A's own
+/// engine the receiver sends A no ACK and answers `RecoveryOnly` (A-R323 A-8); an ACK in A's
+/// own name is still refused `ForgedIdentity` and moves nothing. Cut: the receiver ACKs its
+/// own node on a flush, red.
+#[retcd_test]
+fn m10_s2_a_dormant_receiver_beside_a_live_primary_sources_the_catch_up_and_nothing_else() {
+    let rungs: Vec<(Seq, Digest)> = std::iter::once((Seq::ZERO, Digest::ROOT))
+        .chain((1..=15).map(|seq| (Seq(seq), d(seq))))
+        .collect();
+    let mut history = DigestLadder::new();
+    for seq in 1..=15 {
+        history.insert(Seq(seq), d(seq));
+    }
+    let mut module = Replication::new();
+    module.install_primary(
+        ProgressTracker::new(TrackerInit {
+            config: config(),
+            own: CopyId(0),
+            lineage: authority(GEN, EPOCH),
+            history,
+            local: ReplicaProgress {
+                received: ReceivedSeq(15),
+                buffered_applied: AppliedSeq(15),
+                durable: DurableSeq(10),
+            },
+        })
+        .expect("A's tracker"),
+    );
+    let credential = fence(0, EPOCH, Revision(7));
+    let catch_up_c = on(A, catch_up(0, 2, 15, credential));
+
+    let mut alone = module.clone();
+    assert_eq!(
+        step(&mut alone, &catch_up_c),
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::NotASource
+        ))],
+        "a primary alone is no catch-up source"
+    );
+
+    module.install_receiver(
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                head: head(15),
+                durable: DurableSeq(0),
+            },
+            REVISION,
+        )
+        .expect("A's dormant receiver"),
+    );
+    module
+        .restore_history(A, P, &rungs)
+        .expect("A's ladder, 0..=15");
+    let primary = module.primary(A, P).cloned().expect("A's primary");
+
+    let effects = step(&mut module, &catch_up_c);
+    assert!(
+        effects.contains(&EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes {
+            copy: CopyId(2),
+            from: Seq(15),
+            through: Seq(15),
+            credential,
+        })),
+        "A sources C's catch-up: {effects:?}"
+    );
+    assert!(module.source(A, P, CopyId(2)).is_some());
+    assert_eq!(module.primary(A, P), Some(&primary), "the catch-up");
+
+    let append = on(A, delivered(label(C), golden().encode().expect("encode")));
+    assert_eq!(
+        step(&mut module, &append),
+        vec![ignored(KernelIgnoredReason::AppendRejected(
+            AppendReject::NotAMember
+        ))],
+        "a plain append to the dormant receiver is refused with no reply"
+    );
+    assert_eq!(module.primary(A, P), Some(&primary), "the plain append");
+
+    // A-R323 A-8: on A's own flush the receiver sends A nothing. An ACK to its own node is no
+    // evidence, and the primary would refuse one as a forgery on every flush; the receiver
+    // answers `RecoveryOnly` instead.
+    let effects = step(&mut module, &on(A, flushed(&[(P, GEN, 15)])));
+    assert!(
+        effects.contains(&ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::RecoveryOnly
+        ))),
+        "{effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            EffectKind::Send(SendEffect::Unicast { to, .. }) if *to == A
+        )),
+        "the dormant receiver ACKed its own node: {effects:?}"
+    );
+    let flushed_primary = module.primary(A, P).cloned().expect("A's primary");
+
+    // A real ACK in A's own name is still a forgery, and moves nothing.
+    let forged = AppendOutcome::Accepted(AppendAck {
+        from: A,
+        boot: BootId(1),
+        ..ack(15, 15, 15)
+    });
+    assert_eq!(
+        step(&mut module, &reply_from_to(label(A), A, &forged)),
+        vec![ignored(KernelIgnoredReason::AckRejected(
+            AckRejectReason::ForgedIdentity
+        ))],
+        "the primary refuses an ACK in its own node's name"
+    );
+    assert_eq!(
+        module.primary(A, P),
+        Some(&flushed_primary),
+        "the forged ACK"
+    );
+}
+
+/// A's primary at `head`, durable `head`, its ladder `1..=head`, and, when `with_primary` is
+/// false, nothing else: only the dormant receiver for A's copy 0 at `head`.
+fn owner_with_dormant(head_at: u64, with_primary: bool) -> Replication {
+    let mut module = Replication::new();
+    if with_primary {
+        let mut history = DigestLadder::new();
+        for seq in 1..=head_at {
+            history.insert(Seq(seq), d(seq));
+        }
+        module.install_primary(
+            ProgressTracker::new(TrackerInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                history,
+                local: ReplicaProgress {
+                    received: ReceivedSeq(head_at),
+                    buffered_applied: AppliedSeq(head_at),
+                    durable: DurableSeq(head_at),
+                },
+            })
+            .expect("A's tracker"),
+        );
+    }
+    module.install_receiver(
+        AppendReceiver::dormant(
+            ReceiverInit {
+                config: config(),
+                own: CopyId(0),
+                lineage: authority(GEN, EPOCH),
+                head: head(head_at),
+                durable: DurableSeq(0),
+            },
+            REVISION,
+        )
+        .expect("A's dormant receiver"),
+    );
+    module
+}
+
+/// A-R327 (critic-degraded A-10): a receiver beside a serving primary only sources, whenever
+/// it was installed. A fenced recovery append with a valid credential, from C, reaches A's
+/// dormant receiver for copy 0 at 10. Without a primary on A it stages record 11, so the frame
+/// is one the receiver takes. Beside A's serving primary R1 refuses it `Replica(NotRequired)`
+/// with no reply and no store effect, and the receiver and the primary are unchanged. Once the
+/// takeover's `Recovered` retires that primary, the retransmitted append is staged (A-11).
+/// Cuts: R1 hands a recovery append to the receiver beside a primary, red; R1 refuses one
+/// beside any primary, retired or not, red.
+#[retcd_test]
+fn m10_s2_a_recovery_append_never_reaches_a_receiver_beside_a_serving_primary() {
+    let body = recovery_body(&fence(2, EPOCH, REVISION), &golden());
+    let append = on(A, delivered(label(C), body));
+
+    let mut alone = owner_with_dormant(10, false);
+    assert_eq!(
+        staged_batch(&step(&mut alone, &append)),
+        (BatchId(0), GEN, Seq(11)),
+        "without a primary the receiver stages it"
+    );
+
+    let mut module = owner_with_dormant(10, true);
+    let receiver = module.receiver(A, P).cloned().expect("A's receiver");
+    let primary = module.primary(A, P).cloned().expect("A's primary");
+    assert_eq!(
+        step(&mut module, &append),
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::NotRequired
+        ))],
+        "a recovery append beside a serving primary is refused, with no reply or store effect"
+    );
+    assert_eq!(module.receiver(A, P), Some(&receiver), "the receiver");
+    assert_eq!(module.primary(A, P), Some(&primary), "the primary");
+
+    // A-11: the guard is for a serving primary only. The takeover's `Recovered` retires A's
+    // primary and re-anchors the receiver at 10 in NEW_GEN; the source retransmits the append
+    // under the new lineage, and the receiver stages it. This is the handover's self-heal: an
+    // append refused before `Recovered` is taken after it.
+    step(
+        &mut module,
+        &requiring(recovered(10, d(10), takeover_config()), &[0, 2], A),
+    );
+    assert!(module.primary(A, P).expect("kept").tracker().retired());
+    let retransmit = recovery_body(
+        &fence_in(NEW_GEN, 2, NEW_EPOCH, REVISION),
+        &taken_over(golden()),
+    );
+    assert_eq!(
+        staged_batch(&step(&mut module, &on(A, delivered(label(C), retransmit)))),
+        (BatchId(0), NEW_GEN, Seq(11)),
+        "beside a retired primary the receiver stages the retransmitted append"
+    );
 }

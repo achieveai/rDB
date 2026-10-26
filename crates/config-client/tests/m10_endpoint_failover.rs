@@ -162,6 +162,43 @@ async fn m10_d14_a_failure_after_sending_never_moves_on() {
     live.shutdown().await;
 }
 
+/// A-R238 (tester F-002: "last: unavailable: Unknown error: transport error"): a read whose
+/// connection dies after the request was sent is `Unavailable`, and its reason names the
+/// endpoint, keeping the transport's code and message. Cut: no endpoint in the reason, and
+/// this row fails.
+#[retcd_test]
+async fn m10_a_read_cut_mid_request_names_the_endpoint() {
+    let reset = ResetServer::start().await;
+    let client = GrpcClient::connect(
+        vec![reset.endpoint.clone()],
+        options(Duration::from_secs(5)),
+    )
+    .expect("client connects");
+
+    let error = client
+        .get(GetRequest {
+            key: Bytes::from_static(b"/app/a"),
+        })
+        .await
+        .expect_err("the connection died under the request");
+    let ConfigError::Unavailable { reason } = &error else {
+        panic!("a read has no outcome to be unsure about, so it is Unavailable: {error:?}");
+    };
+    let named = format!(
+        "the connection to {} failed during the request (",
+        reset.endpoint
+    );
+    assert!(reason.starts_with(&named), "{reason}");
+    assert!(
+        reason.ends_with(')'),
+        "the code and message are kept: {reason}"
+    );
+    assert!(
+        reset.accepted() >= 1,
+        "the request never reached the socket"
+    );
+}
+
 /// D14 floor row 4 (review A2): a TLS refusal is a connect failure too, so it moves on.
 /// Two strangers, each ahead of a node this client trusts:
 /// - signed by another CA, which the client refuses during `connect()`;

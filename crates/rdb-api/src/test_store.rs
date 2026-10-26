@@ -71,6 +71,9 @@ pub(crate) struct Script {
     pub(crate) hold_watches: u32,
     /// The next delete fails with this, without deleting (M9 S2b review F-024).
     pub(crate) fail_delete_with: Option<ConfigError>,
+    /// The next put the steps above apply to fails with this, without writing (A-R447: a
+    /// promoter that may not write `operations/`).
+    pub(crate) fail_put_with: Option<ConfigError>,
     /// When set, only puts on a key that starts with this take the put steps above (`pass_puts`, `drop_puts`,
     /// `lose_put_replies`); a put on any other key goes straight through (A-R184).
     pub(crate) only_prefix: Option<Vec<u8>>,
@@ -268,6 +271,11 @@ impl ConfigStore for Scripted {
                 .as_ref()
                 .is_none_or(|prefix| request.key.starts_with(prefix));
             let scripted = keyed && !self.take(|script| &mut script.pass_puts);
+            if scripted {
+                if let Some(error) = self.script.lock().expect("script").fail_put_with.take() {
+                    return Err(error);
+                }
+            }
             if scripted && self.take(|script| &mut script.drop_puts) {
                 return Err(ConfigError::DeadlineExceededUnknownOutcome);
             }

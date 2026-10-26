@@ -868,6 +868,7 @@ mod offline_keys {
     pub(super) const COMPACT_REVISION: &[u8] = b"compact_revision";
     pub(super) const RETIRED_NODES: &[u8] = b"retired_nodes";
     pub(super) const MAX_COMMAND_SCHEMA: &[u8] = b"max_command_schema";
+    pub(super) const INSTALL_IN_PROGRESS: &[u8] = b"install_in_progress";
 }
 
 /// Read one postcard-encoded `state_meta` value out of an offline store.
@@ -913,7 +914,8 @@ fn offline_meta<T: serde::de::DeserializeOwned>(
 /// byte-identical output to the online builder for the same applied state, including any
 /// column family a later milestone adds. What it cannot reproduce is a *checkpoint*: an online
 /// build snapshots the database first, this one reads it live. With no writer attached there
-/// is nothing to be inconsistent with.
+/// is nothing to be inconsistent with — except an install that stopped half-way, whose marker
+/// makes this refuse (F-001).
 ///
 /// Returns the header it wrote, which carries everything the backup manifest needs — cluster
 /// id, recovery epoch, revision, record counts — and whose [`SnapshotHeader::meta`] is the
@@ -934,6 +936,24 @@ pub fn export_snapshot(
                 detail: format!("cannot open the store read-only: {e}"),
             }
         })?;
+
+    // F-001: a marker means an install stopped in its destructive middle. The data column
+    // families may be cleared or half-written while `last_applied` and the rest of the header
+    // fields are still the old state's, so an export would be a backup of a state no node
+    // ever had, with counts and a digest that agree with it. Opening the store redoes the
+    // install from the retained file; back up after that.
+    let installing: Option<StoredSnapshot> =
+        offline_meta(&db, data_dir, offline_keys::INSTALL_IN_PROGRESS)?;
+    if let Some(installing) = installing {
+        return Err(SnapshotFileError::Malformed {
+            file: show(data_dir),
+            detail: format!(
+                "a snapshot install ({}) is in progress or was interrupted, so the state is \
+                 half-replaced; open the store once to finish it, then back up",
+                installing.snapshot_id
+            ),
+        });
+    }
 
     let identity: config_core::ClusterIdentity =
         offline_meta(&db, data_dir, offline_keys::IDENTITY)?.ok_or_else(|| {

@@ -31,11 +31,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rdb_core::authority::partition::INSTANCE_LEN;
+use rdb_core::authority::clock::{expiry_proven, ClockView};
+use rdb_core::authority::grant::GrantRecord;
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord, INSTANCE_LEN};
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceCredential, FenceScope, Lineage,
-    PartitionMode, Verdict,
+    AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, BlockReason, Boundary,
+    DenyReason, FenceCredential, FenceScope, FencingProof, Lineage, PartitionMode, Revocation,
+    Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -51,7 +54,7 @@ use rdb_core::contracts::ids::{
     RequestIdentity, Revision, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
-use rdb_core::contracts::membership::{CopyId, PartitionConfig};
+use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
     DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
@@ -73,7 +76,9 @@ use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-use rdb_storage::{Inherited, PublishMark, RocksEngine, RocksSnapshot, MAX_CHAIN_DEPTH};
+use rdb_storage::{
+    Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions, MAX_CHAIN_DEPTH,
+};
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
@@ -115,6 +120,32 @@ const PUBLISH_MARKS: usize = 64;
 
 /// A publish mark as the host holds it: `(generation, seq, tick)`, a `published_at` entry.
 type Mark = (Generation, Seq, Tick);
+
+/// The width of one `published_at` bucket (design-ackfloor §3).
+const PUBLISH_BUCKET_MILLIS: u64 = 1_000;
+
+/// Record that `generation` published through `seq` at `now`: one `published_at` entry per
+/// (generation, `width` ms bucket), not one per write (design-ackfloor §3, D8). `width` is
+/// [`PUBLISH_BUCKET_MILLIS`] outside crate tests. A publish in the newest entry's bucket moves
+/// that entry up to its seq and its tick, so an entry `(g, seq, at)` still says every seq of
+/// `g` up to `seq` was published by `at`. Keeping the newest tick (Rev 3 A4) means
+/// [`Host::trim_aged`] frees a seq up to one bucket late, never early.
+fn record_published(
+    published: &mut VecDeque<Mark>,
+    width: u64,
+    generation: Generation,
+    seq: Seq,
+    now: Tick,
+) {
+    let bucket = |at: Tick| at.0 / width.max(1);
+    match published.back_mut() {
+        Some((g, last, at)) if *g == generation && bucket(*at) == bucket(now) => {
+            *last = (*last).max(seq);
+            *at = (*at).max(now);
+        }
+        _ => published.push_back((generation, seq, now)),
+    }
+}
 
 /// A-R183 C2: the publish marks of one partition's `published_at`, oldest first: every
 /// `step`-th entry, so at most [`PUBLISH_MARKS`] of them span the whole queue, and the newest
@@ -173,6 +204,27 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 /// the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
+/// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
+/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282). The clock
+/// starts at the later of the last admit and the last membership commit, and starts again
+/// whenever the blamed copy changes or its durable sequence advances, so a copy still catching
+/// up is never dropped. Longer than a process restart (2-5 s), which rejoins by `PeerBooted`
+/// instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
+pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
+
+/// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
+const DROP_CHECK_EVERY_MILLIS: u64 = 200;
+
+/// How long a repair that ended `ReadOnly` again waits before it runs again with nothing about
+/// its members moved (A-R353, amending A-R346): it doubles at each such retry, up to
+/// [`REPAIR_RETRY_CAP_MILLIS`], so a transient F1 miss never leaves the partition read-only for
+/// good, and a persistent one fences reads at most once a minute. Crate tests set the host
+/// field directly.
+const REPAIR_RETRY_FIRST_MILLIS: u64 = 5_000;
+
+/// The longest wait between two repairs of one partition with nothing moved (A-R353).
+const REPAIR_RETRY_CAP_MILLIS: u64 = 60_000;
+
 /// How many times R1 may re-send one record to one copy, with that copy's acknowledged
 /// progress unmoved and below the primary's applied head, before the host warns
 /// `replication_copy_not_advancing` (D4 re-sent about 150 times in silence). R1's retransmit
@@ -194,6 +246,12 @@ pub const TXN_WAITER_MARGIN_MILLIS: u64 = 500;
 
 /// The only affinity S0 writes in.
 const AFFINITY: AffinityId = AffinityId(1);
+
+/// The site of the host flusher's `Flushed`: no partition, no correlation.
+const FLUSH_SITE: Site = Site {
+    partition: PartitionId(0),
+    correlation: CorrelationId(0),
+};
 
 /// The longest the thread sleeps with nothing due, so a missed wake costs at most this.
 const IDLE_WAIT: Duration = Duration::from_millis(1_000);
@@ -224,6 +282,39 @@ pub(crate) fn test_discovery_window_millis() -> u64 {
 #[cfg(test)]
 pub(crate) fn test_patience(base: Duration) -> Duration {
     base * config_testkit::poll::deadline_scale()
+}
+
+/// The `Db` rows' budgets where L1's timing is not the subject (A-R392): the spec's, with the
+/// resume hold cut to 50 ms so a fresh partition admits at once, and L1's warn and pause ages
+/// scaled as a wait. At scale 1 they equal the spec's 1 s and 2 s exactly. The scale stretches
+/// deadlines only (AGENTS.md); this is the one protection budget that also stretches, because
+/// its age is measured against fsyncs and loop turns that a loaded host stalls for 0.5-2.8 s.
+/// A 400 ms pause age turned each such stall into a correct pause that the row did not expect
+/// (A-R291, A-R293, A-R313, A-R389, A-R391); A-R313 first scaled them this way, on one row.
+/// A row that asserts L1's timing takes [`test_budgets_pausing`] instead, or fixed literals
+/// (Trio's `fast_pause`, the spec-budget rows in `sync_tests`).
+#[cfg(test)]
+pub(crate) fn test_budgets() -> Budgets {
+    let millis = |base: u64| {
+        u64::try_from(test_patience(Duration::from_millis(base)).as_millis()).unwrap_or(u64::MAX)
+    };
+    Budgets {
+        resume_hold_millis: 50,
+        warn_age_millis: millis(Budgets::SPEC_DEFAULTS.warn_age_millis),
+        pause_age_millis: millis(Budgets::SPEC_DEFAULTS.pause_age_millis),
+        ..Budgets::SPEC_DEFAULTS
+    }
+}
+
+/// [`test_budgets`], with L1 warning at 200 ms and pausing at 400 ms at every scale: for the rows
+/// whose subject is an L1 pause, or its absence past the pause age (A-R392's opt-in list).
+#[cfg(test)]
+pub(crate) fn test_budgets_pausing() -> Budgets {
+    Budgets {
+        warn_age_millis: 200,
+        pause_age_millis: 400,
+        ..test_budgets()
+    }
 }
 
 /// Fail a test row at once when `status` shows F1 in a terminal phase. `Blocked` lasts until a
@@ -288,6 +379,39 @@ pub enum Msg {
         partition: PartitionId,
         /// The generation now marked.
         generation: Generation,
+    },
+    /// A-R399: who `partitions/{partition}` names as owner, read once after a node fence
+    /// ([`ControlAdapter::read_owner_after_fence`]). `None`: the record is absent or does not
+    /// decode. Changes only how this node refuses a client while fenced; dropped unless `boot`
+    /// is the node's own, as [`Msg::Control`].
+    OwnerLearned {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// The node fence the read was begun under ([`Host`]'s `owner_fence`).
+        fence: u64,
+        /// The owner the record names.
+        owner: Option<NodeId>,
+    },
+    /// A-R446: a routed `FenceProven` and what `partitions/1` and its owner's grant said when
+    /// this node read them for it ([`ControlAdapter::read_fence_facts`]). F1 is given the proof
+    /// only when [`bind_routed_fence`] holds; dropped unless `boot` is the node's own, as
+    /// [`Msg::Control`].
+    FenceBound {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition the proof was routed to.
+        partition: PartitionId,
+        /// The correlation it was routed with.
+        correlation: CorrelationId,
+        /// The proof as it arrived.
+        proof: Box<FencingProof>,
+        /// The records read, or why they could not be.
+        facts: Result<FenceFacts, String>,
+        /// Whether this is the one re-read after a refusal by this node's clock alone
+        /// ([`fence_recheck_millis`]; A-R446b).
+        rechecked: bool,
     },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
@@ -355,6 +479,19 @@ pub enum Msg {
         /// The event.
         kind: KernelEvent,
     },
+    /// A copy's answer to an inventory ask, stamped with the anchor it was asked about. The
+    /// asker drops it when that is not its current plan's anchor: a late answer to an older
+    /// run's ask, queued by the link while the copy was down (D8, A-R337).
+    Answered {
+        /// The partition.
+        partition: PartitionId,
+        /// The correlation.
+        correlation: CorrelationId,
+        /// The anchor of the ask this answers.
+        asked: LineageAnchor,
+        /// The answer: `InventoryReported` or `InventoryFailed`.
+        kind: KernelEvent,
+    },
     /// The control plane's watch of a committed recovery, heard by this member (M10 replaces
     /// the in-process fan-out; lead ruling, 2026-10-07).
     Landed {
@@ -378,8 +515,48 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<NodeStatus>,
     },
+    /// Peer `node` started again as `boot` (#42, A-R249). Local only: the net handshake posts
+    /// it when it sees a new boot for a known peer, and [`crate::db::Db::restart_node`] does in
+    /// process. The record owner re-plans each partition whose pinned config holds a member at an
+    /// older boot than its link now reports; any other node logs `peer_booted_ignored`.
+    PeerBooted {
+        /// The peer that restarted.
+        node: NodeId,
+        /// Its new boot.
+        boot: BootId,
+    },
+    /// **Dev tool only**, debug builds (ruling A-R230): damage the record at `key` in `ns` of
+    /// lineage `(partition, generation)` in this node's own copy, through
+    /// [`RocksEngine::damage_record`], and answer how it went. Local only, like
+    /// [`Msg::PeerBooted`]: never sent over the links. `rdb_dev admin damage-copy` uses it
+    /// through [`crate::db::Db::damage_record`].
+    #[cfg(debug_assertions)]
+    Damage {
+        /// The partition.
+        partition: PartitionId,
+        /// The lineage's generation.
+        generation: Generation,
+        /// The namespace.
+        ns: Namespace,
+        /// The key in `ns`, as stored: a `History` record's is its seq, u64 big-endian.
+        key: Vec<u8>,
+        /// Where the answer goes.
+        reply: Sender<Result<(), rdb_storage::DamageRefused>>,
+    },
+    /// F4 (ruling A-R317): this node's syncer finished the WAL sync it was handed. Local only,
+    /// like [`Msg::PeerBooted`]: only the node's own syncer thread posts it.
+    Synced(SyncDone),
     /// Stop the thread.
     Stop,
+}
+
+/// What a node's syncer reports when a WAL sync it ran returns ([`Msg::Synced`]).
+#[derive(Debug)]
+pub struct SyncDone {
+    sync: rdb_storage::WalSync,
+    flushed: Result<(), String>,
+    /// How long the WAL fsync ([`rdb_storage::WalSync::flush`]) took on the syncer, test delay included.
+    millis: u64,
 }
 
 /// A recovery request one node's F1 makes of a copy another node holds.
@@ -719,6 +896,10 @@ pub enum Answer {
         generation: Generation,
         /// The position of that view.
         at: Seq,
+        /// The node served it from a recovery `ReadOnly` generation (spec §8.4 step 4): a lone
+        /// copy's declared cutoff, which may lack writes acknowledged just before the loss
+        /// (A-R401 F3, A-R402).
+        recovery_mode: bool,
     },
     /// A put compiled and not sent. Send it with [`ClientCall::Resend`].
     Compiled(TxnRequest),
@@ -734,6 +915,17 @@ pub enum Answer {
         /// [`ClientCall::Resend`] caller already holds what it sent.
         request: Option<TxnRequest>,
     },
+}
+
+impl Answer {
+    /// This answer, with a read's `recovery_mode` set to `on`. Any other answer is unchanged.
+    #[must_use]
+    fn in_mode(mut self, on: bool) -> Self {
+        if let Self::Read { recovery_mode, .. } = &mut self {
+            *recovery_mode = on;
+        }
+        self
+    }
 }
 
 /// One node's state for one partition, for `nodes` and the ready poller.
@@ -768,9 +960,10 @@ pub struct NodeStatus {
     /// L1's mode, when live.
     pub protection: Option<String>,
     /// Whether this node admits writes now: L1 admits and A1 holds a grant. `None` while L1 is
-    /// not live. `protection` is L1 alone and `authority` A1 alone. A transaction still waiting
-    /// to publish can refuse a put `PROTECTION_PAUSED` while this is `true`; `published` and
-    /// `in_flight` show that (D13).
+    /// not live. `protection` is L1 alone and `authority` A1 alone. A put sent behind a
+    /// transaction still waiting to publish waits in the queue for it (`in_flight`), and is
+    /// refused `PROTECTION_PAUSED` only once that transaction passes its deadline unpublished,
+    /// which `waits_on` then names (lead ruling A-R252).
     pub admits: Option<bool>,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
@@ -789,6 +982,32 @@ pub struct NodeStatus {
     /// While a control reload of this node's is retrying, how many of its lists have failed.
     /// Filled by `Db::node_status` from the control adapter; the host itself leaves it `None`.
     pub reload_pending: Option<u32>,
+    /// How many entries each per-write index holds here (M10 S2, A-R272): read-only, for the
+    /// bench's memory proof. The host fills it; it never crosses the wire, so a status read
+    /// from a peer has `None`.
+    pub lengths: Option<IndexLengths>,
+    /// The members of the newest configuration this node landed or committed for the
+    /// partition, with their roles; empty before it holds one. `Db::promote` reads it from the
+    /// node it promotes, before it writes, so a shadow is refused and stays a shadow (review-s2
+    /// F-004, A-R412). Crosses the wire.
+    pub pinned: Vec<Member>,
+    /// The version of the configuration `pinned` belongs to; `None` before it holds one.
+    /// `admin::promote` refuses when it is not `partitions/1`'s (A-R415 C-2). Crosses the wire.
+    pub config_version: Option<ConfigVersion>,
+}
+
+/// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
+/// 0 where the node holds no such index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexLengths {
+    /// T1's dedup index: one entry per remembered request.
+    pub dedup: usize,
+    /// P1's status index: one entry per request whose status it holds.
+    pub status: usize,
+    /// R1's digest ladder: the primary's tracker history, or the receiver's on a secondary.
+    pub ladder: usize,
+    /// The host's `published_at` publish marks.
+    pub published_at: usize,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -888,6 +1107,7 @@ pub fn spawn(
         Budgets::SPEC_DEFAULTS,
         Limits::default(),
         BOOT,
+        StorageOptions::default(),
     )
 }
 
@@ -905,8 +1125,10 @@ pub(crate) fn spawn_with(
     budgets: Budgets,
     limits: Limits,
     boot: BootId,
+    storage: StorageOptions,
 ) -> Result<NodeHandle, String> {
-    let engine = RocksEngine::open(&dir)
+    // The open's storage options, on a restart too (A-R253).
+    let engine = RocksEngine::open_with(&dir, storage)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
     spawn_on(node, engine, links, control, clock, budgets, limits, boot)
 }
@@ -926,8 +1148,10 @@ pub(crate) fn spawn_on(
     boot: BootId,
 ) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
-    links.register(node, tx.clone());
+    links.register(node, tx.clone(), boot);
+    let path = engine.path().to_path_buf();
     let mut host = Host::new(node, engine, links, control, clock);
+    host.syncer = Some(Syncer::start(node, path, tx.clone())?);
     host.boot = boot;
     host.budgets = budgets;
     host.transaction = Transaction::with_limits(limits);
@@ -950,6 +1174,69 @@ pub(crate) fn spawn_on(
         tx,
         join: Some(join),
     })
+}
+
+/// The owner's re-plan of a partition after a member restarted (#42, A-R249; arch-s2 "Restart
+/// heal and drain"). A restarted copy is linked again only by a commit that pins its new boot,
+/// so the owner drains its own epoch and plans the next generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejoin {
+    /// `RevokeEpochRequested` for `epoch` is with A1; the plan follows its `DrainProof`.
+    Revoking { epoch: OwnerEpoch, replan: Replan },
+    /// The plan and its fence went to F1 for this generation; the commit ends the re-plan.
+    Planned {
+        generation: Generation,
+        replan: Replan,
+    },
+}
+
+/// What one re-plan is for, kept from its revocation to its commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Replan {
+    /// The member the plan leaves out (M10 S2 part (b)), if any.
+    drop: Option<NodeId>,
+    /// The restarted member the plan links again at its new boot, if any. When F1 blocks the
+    /// plan on its copy, the plan is replaced without it (rulings A-R306, A-R316), and it stays
+    /// out: nothing links a member that is not pinned until M3's add half lands.
+    rejoiner: Option<NodeId>,
+    /// A-R366: the re-plan is [`Host::shadow_duty`]'s promote, the only one that pins the
+    /// rejoiner shadow as a regular secondary. Any other re-plan (a restart) pins it again as a
+    /// shadow at its live boot.
+    promote: bool,
+    /// When the revocation was asked.
+    since: Tick,
+}
+
+/// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
+const REJOIN: CorrelationId = CorrelationId(3);
+
+/// The copy the owner holds responsible for L1 refusing writes, and since when (M10 S2 part (b)).
+#[derive(Debug, Clone, Copy)]
+struct Blame {
+    copy: CopyId,
+    /// When the clock started: the first check that found writes refused on account of `copy`,
+    /// or the last time its durable sequence advanced.
+    since: Tick,
+    durable: DurableSeq,
+    /// Whether `membership_drop_refused` was logged for this blame, so it is logged once.
+    refused_logged: bool,
+}
+
+impl Blame {
+    /// The blame after a check at `now` found writes refused on account of `copy` at `durable`:
+    /// `prev` kept while it names the same copy at the same durable sequence, a new clock
+    /// otherwise (A-R282 N1: a copy whose durable sequence advances is still catching up).
+    fn next(prev: Option<&Self>, copy: CopyId, durable: DurableSeq, now: Tick) -> Self {
+        match prev {
+            Some(prev) if prev.copy == copy && prev.durable == durable => *prev,
+            _ => Self {
+                copy,
+                since: now,
+                durable,
+                refused_logged: false,
+            },
+        }
+    }
 }
 
 /// A partition's activation marks on one node (ruling A-R184).
@@ -1012,6 +1299,39 @@ pub(crate) fn pause_before_inventory(node_dir: &std::path::Path, pause: Duration
         .push((node_dir.to_path_buf(), pause));
 }
 
+/// Test-only: node directories whose host loses its next landing's `CopyCaughtUp` once, as a
+/// dropped message would (#59 item 4).
+#[cfg(test)]
+static DROP_CAUGHT_UP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Test-only: the host on the copy at `node_dir` does not send its next landing's
+/// `CopyCaughtUp`, once; only [`Host::resend_caught_up`] can then deliver it.
+#[cfg(test)]
+pub(crate) fn drop_first_caught_up(node_dir: &std::path::Path) {
+    DROP_CAUGHT_UP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(node_dir.to_path_buf());
+}
+
+/// The first re-send of a landing's `CopyCaughtUp` (#59 item 4), and the cap its doubling
+/// stops at: a bounded backoff, kept until F1's post-commit sync reaches this copy.
+const CAUGHT_UP_RESEND_FIRST_MILLIS: u64 = 1_000;
+const CAUGHT_UP_RESEND_MAX_MILLIS: u64 = 8_000;
+/// The re-send that logs one warn, `caught_up_resend_unanswered`, and goes on: a count cap
+/// would bring back the silent stall after a long link hold (A-R422).
+const CAUGHT_UP_RESEND_WARN_AT: u32 = 16;
+
+/// A landing's `CopyCaughtUp`, kept for [`Host::resend_caught_up`] until F1 has it.
+#[derive(Debug)]
+struct CaughtUpResend {
+    event: RecoveryEvent,
+    emitter: NodeId,
+    correlation: CorrelationId,
+    attempt: u32,
+    next: Tick,
+}
+
 /// Node directories whose host sleeps once, for the time given, before its next barrier sync
 /// (a `SyncWalThrough` before the commit), as a slow fsync would (D10). Empty unless
 /// [`pause_before_sync`] armed it.
@@ -1029,10 +1349,191 @@ pub fn pause_before_sync(node_dir: &std::path::Path, pause: Duration) {
         .push((node_dir.to_path_buf(), pause));
 }
 
+/// F4 rows (ruling A-R317): node directories whose WAL syncs sleep first, as a slow disk's
+/// fsync would: `(dir, pause, every)`, once unless `every`. The sleep runs where the fsync runs,
+/// on the syncer or inline, so a row sees which thread a slow disk holds. Crate tests only.
+#[cfg(test)]
+static SLOW_SYNC: Mutex<Vec<(PathBuf, Duration, bool)>> = Mutex::new(Vec::new());
+
+/// Arm [`SLOW_SYNC`] for the host on `node_dir`, as `DbConfig::dir` joined with `nodes/<n>`.
+#[cfg(test)]
+pub(crate) fn slow_sync(node_dir: &std::path::Path, pause: Duration, every: bool) {
+    SLOW_SYNC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), pause, every));
+}
+
+/// Disarm every [`SLOW_SYNC`] entry for `node_dir`.
+#[cfg(test)]
+pub(crate) fn clear_slow_sync(node_dir: &std::path::Path) {
+    SLOW_SYNC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(dir, _, _)| dir != node_dir);
+}
+
+/// The [`SLOW_SYNC`] sleep armed for the engine at `path`, taken if it was armed once.
+#[cfg(test)]
+fn slow_sync_pause(path: &std::path::Path) -> Option<Duration> {
+    let mut armed = SLOW_SYNC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = armed.iter().position(|(dir, _, _)| path.starts_with(dir))?;
+    let (_, pause, every) = armed[at];
+    if !every {
+        armed.remove(at);
+    }
+    Some(pause)
+}
+
+#[cfg(not(test))]
+const fn slow_sync_pause(_path: &std::path::Path) -> Option<Duration> {
+    None
+}
+
+/// Run one WAL sync's fsync on this thread, after any [`SLOW_SYNC`] sleep: `(result, millis)`.
+fn run_wal_sync(
+    node: NodeId,
+    path: &std::path::Path,
+    sync: &rdb_storage::WalSync,
+) -> (Result<(), String>, u64) {
+    let started = Instant::now();
+    if let Some(pause) = slow_sync_pause(path) {
+        let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(node = node.0, millis, "test_sync_slowed");
+        std::thread::sleep(pause);
+    }
+    let flushed = sync.flush();
+    (flushed, millis(started))
+}
+
+/// F4 (ruling A-R317): a node's syncer, one thread that runs each WAL sync the node's thread
+/// began, one at a time, and posts [`Msg::Synced`] back to the node's mailbox. So the node's
+/// thread never waits on an fsync: timers, renewals, reads, L1 and commits go on meanwhile.
+#[derive(Debug)]
+struct Syncer {
+    jobs: Sender<rdb_storage::WalSync>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Syncer {
+    fn start(node: NodeId, path: PathBuf, mailbox: Sender<Msg>) -> Result<Self, String> {
+        let (jobs, rx) = mpsc::channel::<rdb_storage::WalSync>();
+        #[cfg(test)]
+        let span = tracing::Span::current();
+        let join = std::thread::Builder::new()
+            .name(format!("rdb-sync-{}", node.0))
+            .spawn(move || {
+                #[cfg(test)]
+                let _span = span.enter();
+                for sync in rx {
+                    let (flushed, millis) = run_wal_sync(node, &path, &sync);
+                    let done = SyncDone {
+                        sync,
+                        flushed,
+                        millis,
+                    };
+                    if mailbox.send(Msg::Synced(done)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| format!("node {}: spawn syncer: {e}", node.0))?;
+        Ok(Self {
+            jobs,
+            join: Some(join),
+        })
+    }
+
+    /// Close the job queue and wait for the sync in flight, if any, to return. A stuck disk
+    /// keeps this waiting, as a stuck inline fsync kept the node's stop waiting before A-R317.
+    fn stop(self) {
+        let Self { jobs, join } = self;
+        drop(jobs);
+        if let Some(join) = join {
+            if join.join().is_err() {
+                tracing::error!("syncer_thread_panicked");
+            }
+        }
+    }
+}
+
+/// F4 (A-R317): what a WAL sync is for, done when it returns. Each needs a sync that began
+/// after it was asked for, so one asked while a sync is in flight waits for the next.
+#[derive(Debug)]
+enum AfterSync {
+    /// The host flusher's `Flushed` over these prefixes.
+    Duty {
+        ticket: FlushTicket,
+        captured: Vec<CapturedPrefix>,
+    },
+    /// A module's `StoreEffect::Flush`.
+    Flush {
+        ticket: FlushTicket,
+        captured: Vec<CapturedPrefix>,
+        site: Site,
+    },
+    /// A1's revocation, staged; persisted once a sync that began after the write returns.
+    Revocation {
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        site: Site,
+    },
+    /// A-R217 and A-R326: a new generation's link, written unsynced. The acquires its landings
+    /// schedule wait in [`Host::link_pending`] until this sync returns.
+    Link {
+        partition: PartitionId,
+        generation: Generation,
+        started: Instant,
+    },
+    /// A-R326: a holder's recovery sync (`PeerAsk::Sync`), answered once this sync returns.
+    Answer {
+        reply: Reply,
+        copy: CopyId,
+        post_commit: bool,
+        captured: [CapturedPrefix; 1],
+    },
+}
+
+impl AfterSync {
+    fn captured(&self) -> &[CapturedPrefix] {
+        match self {
+            Self::Duty { captured, .. } | Self::Flush { captured, .. } => captured,
+            Self::Answer { captured, .. } => captured,
+            Self::Revocation { .. } | Self::Link { .. } => &[],
+        }
+    }
+}
+
+/// Where a holder's recovery-sync answer goes.
+#[derive(Debug, Clone, Copy)]
+enum Reply {
+    /// A peer's F1, over the peer link.
+    Peer {
+        asker: NodeId,
+        correlation: CorrelationId,
+    },
+    /// This node's own F1 (D10's own asks).
+    Here(Site),
+}
+
+/// A-R326: one landing's acquire, waiting in [`Host::link_pending`] for its link sync.
+type LinkWaiter = (Box<RecoveryResult>, Site);
+
+/// The sync in flight on the syncer.
+#[derive(Debug)]
+struct InFlight {
+    started: Instant,
+    after: Vec<AfterSync>,
+}
+
 /// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
-/// an iteration, when its own copy of partition 1 is durable further than the primary's floor
-/// and at least through the `Seq` given. So the peers' answers that would raise the floor land
-/// in its mailbox while it sleeps. Crate tests only.
+/// an iteration, when its own copy of partition 1 is durable further than the primary's floor,
+/// at least through the `Seq` given, and through everything it has applied (A-R389), while L1
+/// admits (A-R392). So the peers' answers that would raise the floor land in its mailbox while
+/// it sleeps, and nothing but those answers is needed to make every record safe. Crate tests
+/// only.
 #[cfg(test)]
 static STALL_LOOP: Mutex<Vec<(PathBuf, Seq, Duration)>> = Mutex::new(Vec::new());
 
@@ -1138,6 +1639,51 @@ struct RebuildWatch {
     unproven: BTreeSet<CopyId>,
     /// F1 named a copy the stall line does not carry yet (PC15: reported once per step).
     unreported: bool,
+}
+
+/// What a repair saw of one member it re-planned for (A-R346 M1): the boot its link reports
+/// and the durable sequence this primary's tracker holds for it. A new boot, a higher durable
+/// sequence, or the link going down and up again lets the next repair run at once
+/// ([`RepairHeld::moved`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairMark {
+    node: NodeId,
+    boot: Option<BootId>,
+    durable: DurableSeq,
+}
+
+/// One `Inspect` a repair check sent (A-R350): the node, and where its answer arrives.
+type RepairProbe = (NodeId, Receiver<NodeStatus>);
+
+/// The last repair of one partition (A-R346 M1, A-R353): what it saw of its members, when it
+/// ran, how long the next one waits with nothing moved, and whether that wait was logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepairHeld {
+    marks: Vec<RepairMark>,
+    at: Tick,
+    wait_millis: u64,
+    logged: bool,
+}
+
+impl RepairHeld {
+    /// Whether a member moved since this repair: another member set, a new boot, or a higher
+    /// durable sequence. Durable sequences number one partition's records across generations,
+    /// so they compare across the trackers each generation's primary builds; only a rise
+    /// counts, because a new tracker that has not heard a member yet reads it as 0.
+    fn moved(&self, now: &[RepairMark]) -> bool {
+        self.marks.len() != now.len()
+            || self.marks.iter().zip(now).any(|(last, now)| {
+                last.node != now.node || last.boot != now.boot || now.durable > last.durable
+            })
+    }
+
+    /// The wait after a retry of this repair with nothing moved: double this one, never past
+    /// [`REPAIR_RETRY_CAP_MILLIS`] (A-R353).
+    fn next_wait(&self) -> u64 {
+        self.wait_millis
+            .saturating_mul(2)
+            .min(REPAIR_RETRY_CAP_MILLIS)
+    }
 }
 
 /// One copy's sends of one record, for the stuck-cursor warning.
@@ -1276,10 +1822,12 @@ struct Host {
     next_flush: Tick,
     next_ticket: u64,
     next_trim: Tick,
-    /// Per partition, each published `(generation, seq)` and when it was published, oldest
-    /// first, until the trim duty ages it out. Only the owner's P1 publishes, so only the owner
-    /// fills it.
+    /// Per partition, the newest published `(generation, seq)` of each (generation, bucket) and
+    /// when it was published, oldest first, until the trim duty ages it out ([`record_published`]).
+    /// Only the owner's P1 publishes, so only the owner fills it.
     published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
+    /// [`PUBLISH_BUCKET_MILLIS`]; crate tests lower it.
+    publish_bucket_millis: u64,
     /// [`HOST_TRIM_EVERY_MILLIS`]; crate tests lower it.
     trim_every_millis: u64,
     /// D6 (A-R170 D, A-R172): per partition and generation, the newest trim floor `below` not yet
@@ -1316,6 +1864,8 @@ struct Host {
     /// Status queries sent and not yet stepped, by their event. Never in `pending`, so never
     /// behind a write (F-014): P1 answers one in the step that takes it.
     statuses: BTreeMap<EventId, (RequestIdentity, Sender<Answer>)>,
+    /// The anchor each queued inventory answer was asked about, by its event (D8, A-R337).
+    answer_stamps: BTreeMap<EventId, LineageAnchor>,
     /// The status query whose event is being stepped, until P1's answer takes it.
     answering: Option<(RequestIdentity, Sender<Answer>)>,
     plans: BTreeMap<PartitionId, RecoveryPlan>,
@@ -1332,9 +1882,69 @@ struct Host {
     /// Partitions whose dormant receiver holds its full ladder (A-R173, critic-d7 F2): built
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
+    /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
+    /// once by the first `SnapshotCatchupRequired` served at that generation.
+    primary_ladders: BTreeSet<(PartitionId, Generation)>,
+    /// H2 (A-R254): each `(partition, copy, barrier)` already served, so a repeat is dropped
+    /// (B-R48: R1 keeps no memory of its asks; the consumer dedups).
+    snapshots_served: BTreeSet<(PartitionId, CopyId, Seq)>,
+    /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root.
+    committed_correlation: BTreeMap<PartitionId, CorrelationId>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
+    /// #59 item 4: the `CopyCaughtUp` each such link answered, re-sent until F1 has it.
+    caught_up_resends: BTreeMap<(PartitionId, Generation), CaughtUpResend>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    /// Per partition, the restart re-plan this owner is running (#42, A-R249).
+    rejoins: BTreeMap<PartitionId, Rejoin>,
+    /// Per partition, each member a drop plan left out, at the boot it was pinned at (A-R329).
+    /// When its link reports a newer boot while the commit pins fewer than rf3's copies, the
+    /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
+    /// pinned again.
+    left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// The epoch of the `EpochRevocationPersisted` being offered, when that is the event in
+    /// hand. A1 emits `DrainProof` only for that event, and the proof is for that epoch alone:
+    /// a re-asked revocation persists twice, and a late second proof must not plan from a later
+    /// epoch (critic-degraded A-4, ruling A-R321).
+    revocation_persisted: Option<OwnerEpoch>,
+    /// A-R399 (tester-final D3): per partition, the owner `partitions/{p}` named when this node
+    /// read it after its last node fence; absent until that read answers. Read only while A1 is
+    /// fenced, to refuse a client `NOT_PRIMARY` naming that owner instead of `LEASE_EXPIRED`.
+    owner_after_fence: BTreeMap<PartitionId, Option<NodeId>>,
+    /// How many node fences this node has had: each one's owner reads carry it, so a read
+    /// begun under an earlier fence, answering late, is dropped (critic-d3 A3).
+    owner_fence: u64,
+    /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
+    blamed: BTreeMap<PartitionId, Blame>,
+    /// How many of A1's next `DrainProof`s this host loses, as if A1 never answered. Crate
+    /// tests only (A-R316).
+    #[cfg(test)]
+    drain_proofs_to_lose: u32,
+    /// Whether this host refuses every inventory F1 asks of it for a generation past the
+    /// first, as a copy it cannot take in does (`missed_generation_held_below_base`, #59).
+    /// Crate tests only (A-R346 M1).
+    #[cfg(test)]
+    refuse_inventories: bool,
+    /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
+    /// been linked again (critic-degraded M3).
+    repair_since: BTreeMap<PartitionId, Tick>,
+    /// Per partition, the last repair ([`RepairHeld`], A-R346 M1, A-R353). Kept across the
+    /// generations it makes, until the commit is not `ReadOnly` or such a member's link goes
+    /// down, so a repair that ends `ReadOnly` again runs again only once a member moved or its
+    /// wait has passed.
+    repaired: BTreeMap<PartitionId, RepairHeld>,
+    /// [`REPAIR_RETRY_FIRST_MILLIS`]; crate tests set it directly.
+    repair_retry_first_millis: u64,
+    /// Per partition, the `Inspect` probes the last repair check sent to the members it would
+    /// repair for, and when (A-R350): a repair runs only for a member that answered one.
+    repair_probes: BTreeMap<PartitionId, (Tick, Vec<RepairProbe>)>,
+    next_drop_check: Tick,
+    /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
+    peer_drop_after_millis: u64,
+    /// D9 (A-R398): a restart re-plan from an `Active` commit pins the restarted secondary as a
+    /// shadow ([`Self::restart_shadowed`]). Crate rows of the regular rejoin path (F1 routes the
+    /// catch-up, as it still does from any other commit) set it false.
+    restart_shadow: bool,
     /// The instance this node's engine is bound to when it started, whose open counter holds
     /// the activation marks (A-R184). `None` on an unbound engine (crate host rows): nothing
     /// is marked, and nothing waits on a mark.
@@ -1366,6 +1976,19 @@ struct Host {
     /// D10 (A-R196(1)): asks F1 put to a copy this node holds, answered once every effect of the
     /// step that made them is out, so the asks to peers leave before this node's own fsync.
     own_asks: Vec<(Site, PeerAsk)>,
+    /// F4 (A-R317): this node's syncer. `None` runs each sync inline, on this thread: a host a
+    /// crate row drives by hand has none.
+    syncer: Option<Syncer>,
+    /// The sync in flight on the syncer, at most one.
+    syncing: Option<InFlight>,
+    /// What waits for the next sync: asked for while one was in flight.
+    sync_next: Vec<AfterSync>,
+    /// A-R326: new generations whose link sync is requested and not yet returned, each with
+    /// the acquires its landings scheduled, run when it returns (A-R217).
+    link_pending: BTreeMap<(PartitionId, Generation), Vec<LinkWaiter>>,
+    /// [`rdb_storage::StorageOptions::sync_stuck_millis`]: a sync in flight longer faults the
+    /// node, so its grant lapses and another can take over.
+    sync_stuck_millis: u64,
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
@@ -1389,6 +2012,7 @@ impl Host {
     ) -> Self {
         let now = clock.now();
         let engine_instance = engine.instance();
+        let engine_sync_stuck = engine.storage_options().effective_sync_stuck_millis();
         let after_commit = after_commit_for(engine.path());
         Self {
             node,
@@ -1415,6 +2039,7 @@ impl Host {
             next_ticket: 1,
             next_trim: now.plus_millis(HOST_TRIM_EVERY_MILLIS),
             published_at: BTreeMap::new(),
+            publish_bucket_millis: PUBLISH_BUCKET_MILLIS,
             trim_every_millis: HOST_TRIM_EVERY_MILLIS,
             trim_floors: BTreeMap::new(),
             trim_deleted_at: BTreeMap::new(),
@@ -1429,6 +2054,7 @@ impl Host {
             pending: BTreeMap::new(),
             queued: BTreeMap::new(),
             statuses: BTreeMap::new(),
+            answer_stamps: BTreeMap::new(),
             answering: None,
             plans: BTreeMap::new(),
             committed: BTreeMap::new(),
@@ -1436,8 +2062,29 @@ impl Host {
             deferred_syncs: BTreeMap::new(),
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
+            primary_ladders: BTreeSet::new(),
+            snapshots_served: BTreeSet::new(),
+            committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
+            caught_up_resends: BTreeMap::new(),
             acquire_scheduled: BTreeSet::new(),
+            rejoins: BTreeMap::new(),
+            left_out: BTreeMap::new(),
+            revocation_persisted: None,
+            owner_after_fence: BTreeMap::new(),
+            owner_fence: 0,
+            blamed: BTreeMap::new(),
+            #[cfg(test)]
+            drain_proofs_to_lose: 0,
+            #[cfg(test)]
+            refuse_inventories: false,
+            repair_since: BTreeMap::new(),
+            repaired: BTreeMap::new(),
+            repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
+            repair_probes: BTreeMap::new(),
+            next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
+            peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
+            restart_shadow: true,
             instance: engine_instance,
             activation: BTreeMap::new(),
             after_commit,
@@ -1451,6 +2098,11 @@ impl Host {
             authority_views: BTreeMap::new(),
             frames_received: 0,
             own_asks: Vec::new(),
+            syncer: None,
+            syncing: None,
+            sync_next: Vec::new(),
+            link_pending: BTreeMap::new(),
+            sync_stuck_millis: engine_sync_stuck,
             #[cfg(test)]
             fail_step_view: false,
             #[cfg(test)]
@@ -1460,15 +2112,47 @@ impl Host {
         }
     }
 
-    fn run(mut self, rx: &Receiver<Msg>) {
-        // §4.1: replay every persisted revocation to A1 before anything else reaches it. M9
-        // persists none (Decision 4: `PersistEpochRevocation` is M10), so the replay is empty.
+    /// Queue `EpochRevocationRestored` for each revocation this node's store holds, in key order
+    /// (the sim's `restore_revocations`). A store that cannot list them faults the node: A1 would
+    /// otherwise start without fences a restart must keep.
+    fn restore_revocations(&mut self) {
+        let restored = match self.engine.epoch_revocations() {
+            Ok(restored) => restored,
+            Err(fault) => {
+                tracing::error!(node = self.node.0, ?fault, "revocation_replay_failed");
+                self.set_fault(Fault::from(format!(
+                    "read epoch revocations at start: {fault:?}"
+                )));
+                return;
+            }
+        };
         tracing::info!(
             node = self.node.0,
             kind = "revocation_replay",
-            count = 0,
+            count = restored.len(),
             "host_duty"
         );
+        for (partition, epoch) in restored {
+            let kind = EventKind::Kernel(KernelEvent::Authority(
+                AuthorityEvent::EpochRevocationRestored { partition, epoch },
+            ));
+            self.push(
+                Site {
+                    partition,
+                    correlation: REJOIN,
+                },
+                kind,
+                false,
+                None,
+            );
+        }
+    }
+
+    fn run(mut self, rx: &Receiver<Msg>) {
+        // §4.1 (L-R178e): replay every persisted revocation to A1 before anything else reaches
+        // it. The queue is empty here and the first `AcquireDue` waits for a recovery, so these
+        // are the first events A1 is offered. A fresh A1 serves nothing, so it fences nothing.
+        self.restore_revocations();
         'run: loop {
             #[cfg(test)]
             self.stall_loop();
@@ -1518,13 +2202,19 @@ impl Host {
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
+        // F4 (A-R317): the sync in flight returns before the final marks, so their synced write
+        // never waits behind it on a live node.
+        if let Some(syncer) = self.syncer.take() {
+            syncer.stop();
+            self.finish_sync_at_stop(rx);
+        }
         // A-R186: a clean stop writes one final synced mark set, whatever the period, so a
         // reopen ages every write this process published from its publish tick, not from its
         // landing. A crash or kill writes none; that tail keeps the landing plus the retention.
         if self.fault.is_none() {
             // PR #60 review F8: a synced write, timed like every other duty.
             let started = Instant::now();
-            let marked = self.mark_duty(self.clock.now(), 0, "final_marks");
+            let marked = self.mark_duty(self.clock.now(), 0, "final_marks", true);
             self.slow_step("duty", || "final_marks".to_owned(), started);
             if let Err(fault) = marked {
                 self.set_fault(fault);
@@ -1540,7 +2230,8 @@ impl Host {
     }
 
     /// [`STALL_LOOP`]: sleep once, armed for this copy, when its own copy of partition 1 is
-    /// durable through the armed `Seq` and further than the primary's floor.
+    /// durable through the armed `Seq`, through all it has applied, and further than the primary's
+    /// floor, while L1 admits.
     #[cfg(test)]
     fn stall_loop(&mut self) {
         let partition = PartitionId(1);
@@ -1557,18 +2248,38 @@ impl Host {
             return;
         };
         let floor = primary.tracker().min_required_durable().0;
-        let own = self
-            .engine
-            .durable(partition, self.adopted(partition).generation)
-            .0;
+        let generation = self.adopted(partition).generation;
+        let own = self.engine.durable(partition, generation).0;
+        // A-R389: and durable through all it has applied. A record applied but not yet synced
+        // here stays unsafe until this loop syncs it, which the stall forbids; L1 would then
+        // pause on the primary's own exposure, rightly, and no mail could clear it.
+        let applied = self.engine.buffered_applied(partition, generation).0;
         let through = armed[at].1;
-        if own < through.0 || own <= floor {
+        if own < through.0 || own <= floor || own < applied {
+            return;
+        }
+        // A-R392: and L1 admitting. A stall that begins paused can log no new `allow=false`
+        // after it, so the row would pass without testing anything.
+        let now = self.clock.now();
+        let admitting = self
+            .l1
+            .get(&partition)
+            .and_then(|l1| l1.protection.admission_state(now))
+            .is_some_and(|state| state.allow);
+        if !admitting {
             return;
         }
         let (_, _, pause) = armed.remove(at);
         drop(armed);
         let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
-        tracing::info!(node = self.node.0, own, floor, millis, "test_loop_stalled");
+        tracing::info!(
+            node = self.node.0,
+            own,
+            applied,
+            floor,
+            millis,
+            "test_loop_stalled"
+        );
         std::thread::sleep(pause);
     }
 
@@ -1581,16 +2292,22 @@ impl Host {
         let due = [
             Some(self.next_flush),
             Some(self.next_trim),
+            Some(self.next_drop_check),
             self.timers.values().map(|(_, at, _)| *at).min(),
             self.l1.values().filter_map(|l1| l1.next_eval).min(),
             self.delayed.keys().next().map(|(at, _)| *at),
+            self.caught_up_resends
+                .values()
+                .map(|resend| resend.next)
+                .min(),
         ]
         .into_iter()
         .flatten()
         .min();
-        due.map_or(IDLE_WAIT, |at| {
+        let wait = due.map_or(IDLE_WAIT, |at| {
             Duration::from_millis(HostClock::millis_until(now, at)).min(IDLE_WAIT)
-        })
+        });
+        self.until_stuck().map_or(wait, |stuck| wait.min(stuck))
     }
 
     // ------------------------------------------------------------------ mailbox
@@ -1604,6 +2321,8 @@ impl Host {
             Msg::Control { event, .. } => format!("control/{}", head(&format!("{event:?}"))),
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
             Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
+            Msg::OwnerLearned { .. } => "owner_learned".to_owned(),
+            Msg::FenceBound { .. } => "fence_bound".to_owned(),
             _ => "other".to_owned(),
         };
         tracing::info!(
@@ -1640,11 +2359,19 @@ impl Host {
 
     fn handle_msg(&mut self, msg: Msg) {
         if let Some(fault) = self.fault.clone() {
+            if let Msg::Synced(done) = msg {
+                self.finish_sync_after_fault(done);
+                return;
+            }
             self.answer_faulted(msg, &fault);
             return;
         }
         let outcome = match msg {
-            Msg::Control { boot, .. } | Msg::Fault { boot, .. } | Msg::Activated { boot, .. }
+            Msg::Control { boot, .. }
+            | Msg::Fault { boot, .. }
+            | Msg::Activated { boot, .. }
+            | Msg::OwnerLearned { boot, .. }
+            | Msg::FenceBound { boot, .. }
                 if boot != self.boot =>
             {
                 self.drop_stale(&msg, boot);
@@ -1672,6 +2399,34 @@ impl Host {
                 ..
             } => {
                 self.activated(partition, generation);
+                Ok(())
+            }
+            Msg::OwnerLearned {
+                partition,
+                fence,
+                owner,
+                ..
+            } => {
+                // A read begun under an earlier fence, or answering after A1 left Fenced, says
+                // nothing about this fence (critic-d3 A3).
+                if fence != self.owner_fence || fence_of(self.authority.state()).is_none() {
+                    tracing::debug!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        fence,
+                        current = self.owner_fence,
+                        "host_owner_learned_stale"
+                    );
+                } else {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        owner = owner.map(|owner| owner.0),
+                        fence,
+                        "host_owner_learned"
+                    );
+                    self.owner_after_fence.insert(partition, owner);
+                }
                 Ok(())
             }
             Msg::Inject {
@@ -1754,7 +2509,138 @@ impl Host {
                     partition,
                     correlation,
                 };
-                self.push(site, EventKind::Kernel(kind), true, None);
+                // A-R266: a promote's plan and fence come this way, from whichever process ran
+                // it; logged as `inject` lines are, so a row can see both arrive, in order.
+                let admin = match &kind {
+                    KernelEvent::Recovery(RecoveryEvent::Plan(_)) => Some("plan"),
+                    KernelEvent::Recovery(RecoveryEvent::FenceProven(_)) => Some("fence_proven"),
+                    _ => None,
+                };
+                if let Some(event) = admin {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        correlation = correlation.0,
+                        event,
+                        "routed_admin_event"
+                    );
+                }
+                // A-R446: a routed fence is bound to this node's own control reads before F1
+                // sees it (`bind_routed_fence`), from whichever process sent it. A-R447: a
+                // routed plan is only logged; the bound fence brings the stored one.
+                match kind {
+                    KernelEvent::Recovery(RecoveryEvent::FenceProven(proof)) => {
+                        self.control.read_fence_facts(
+                            self.node,
+                            self.boot,
+                            partition,
+                            correlation,
+                            proof,
+                            None,
+                        );
+                    }
+                    KernelEvent::Recovery(RecoveryEvent::Plan(_)) => {}
+                    kind => self.push(site, EventKind::Kernel(kind), true, None),
+                }
+                Ok(())
+            }
+            Msg::FenceBound {
+                partition,
+                correlation,
+                proof,
+                facts,
+                rechecked,
+                ..
+            } => {
+                let now = self.clock.now();
+                let expiry = facts
+                    .as_ref()
+                    .ok()
+                    .and_then(|facts| facts.grant.as_ref())
+                    .map(|grant| grant.expiry_utc_ms);
+                match bind_routed_fence(partition, &proof, facts, now, &self.budgets) {
+                    Ok(plan) => {
+                        tracing::info!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            control_revision = proof.control_revision.0,
+                            rechecked,
+                            "routed_fence_bound"
+                        );
+                        let site = Site {
+                            partition,
+                            correlation,
+                        };
+                        // A-R447: the stored plan, then the proof, in the order a promote sends
+                        // them.
+                        for event in [
+                            RecoveryEvent::Plan(Box::new(plan)),
+                            RecoveryEvent::FenceProven(proof),
+                        ] {
+                            let kind = KernelEvent::Recovery(event);
+                            self.push(site, EventKind::Kernel(kind), true, None);
+                        }
+                    }
+                    // A-R446b (critic-63 M2): this node's clock may lag the promoter's by up to 2ε
+                    // while both are in bound. Short by no more than that, it reads and checks
+                    // once more when its own clock would prove the expiry; never twice.
+                    Err(("expiry_not_proven", detail)) if !rechecked => {
+                        match expiry.and_then(|at| fence_recheck_millis(at, now, &self.budgets)) {
+                            Some(wait) => {
+                                tracing::info!(
+                                    node = self.node.0,
+                                    partition = partition.0,
+                                    control_revision = proof.control_revision.0,
+                                    wait_millis = wait,
+                                    detail,
+                                    "routed_fence_recheck"
+                                );
+                                self.control.read_fence_facts(
+                                    self.node,
+                                    self.boot,
+                                    partition,
+                                    correlation,
+                                    proof,
+                                    Some(Duration::from_millis(wait)),
+                                );
+                            }
+                            None => tracing::warn!(
+                                node = self.node.0,
+                                partition = partition.0,
+                                control_revision = proof.control_revision.0,
+                                reason = "expiry_not_proven",
+                                detail = format!("{detail}; short by more than 2 clock errors"),
+                                rechecked,
+                                "routed_fence_refused"
+                            ),
+                        }
+                    }
+                    Err((reason, detail)) => tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        control_revision = proof.control_revision.0,
+                        reason,
+                        detail,
+                        rechecked,
+                        "routed_fence_refused"
+                    ),
+                }
+                Ok(())
+            }
+            Msg::Answered {
+                partition,
+                correlation,
+                asked,
+                kind,
+            } => {
+                let site = Site {
+                    partition,
+                    correlation,
+                };
+                // Checked in `process`, against the plan current when the answer is offered.
+                let queued = self.queued(site, EventKind::Kernel(kind), true, None);
+                self.answer_stamps.insert(queued.event.id, asked);
+                self.queue.push_back(queued);
                 Ok(())
             }
             Msg::Landed {
@@ -1783,6 +2669,31 @@ impl Host {
                 let _ = reply.send(self.status(partition));
                 Ok(())
             }
+            Msg::PeerBooted { node, boot } => {
+                self.peer_booted(node, boot);
+                Ok(())
+            }
+            #[cfg(debug_assertions)]
+            Msg::Damage {
+                partition,
+                generation,
+                ns,
+                key,
+                reply,
+            } => {
+                let answer = self.engine.damage_record(partition, generation, ns, &key);
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    ?ns,
+                    refused = ?answer.as_ref().err(),
+                    "host_record_damage"
+                );
+                let _ = reply.send(answer);
+                Ok(())
+            }
+            Msg::Synced(done) => self.on_synced(done),
             Msg::Stop => Ok(()),
         };
         if let Err(fault) = outcome {
@@ -1875,6 +2786,9 @@ impl Host {
 
     /// Queue every duty due now: timers, L1's health evaluations, the flush, delayed items.
     fn run_due(&mut self) {
+        if self.stuck_sync() {
+            return;
+        }
         let now = self.clock.now();
         let due: Vec<TimerId> = self
             .timers
@@ -1934,6 +2848,11 @@ impl Host {
                 return;
             }
         }
+        if self.next_drop_check <= now {
+            self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
+            self.drop_duty(now);
+        }
+        self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
         for (_, item) in due {
@@ -1965,6 +2884,86 @@ impl Host {
         }
     }
 
+    /// #59 item 4: keep a landing's `CopyCaughtUp` for [`Self::resend_caught_up`], but only
+    /// when F1 can use it: the pin names this copy a regular secondary and the commit is not
+    /// `Active`, so F1 has a rebuild to pin (A-R422). A shadow's, or one for an `Active`
+    /// commit, is sent once and never re-sent.
+    fn track_caught_up(
+        &mut self,
+        result: &RecoveryResult,
+        event: &RecoveryEvent,
+        emitter: NodeId,
+        site: Site,
+    ) {
+        let regular =
+            result.committed.pinned_config.members.iter().any(|member| {
+                member.node == self.node && member.role == ReplicaRole::RegularSecondary
+            });
+        if !regular || result.mode == PartitionMode::Active {
+            return;
+        }
+        self.caught_up_resends.insert(
+            (site.partition, result.new_generation),
+            CaughtUpResend {
+                event: event.clone(),
+                emitter,
+                correlation: site.correlation,
+                attempt: 0,
+                next: self.clock.now().plus_millis(CAUGHT_UP_RESEND_FIRST_MILLIS),
+            },
+        );
+    }
+
+    /// #59 item 4: re-send each landing's `CopyCaughtUp` that is due, to the F1 that committed,
+    /// under its correlation, doubling the wait from [`CAUGHT_UP_RESEND_FIRST_MILLIS`] up to
+    /// [`CAUGHT_UP_RESEND_MAX_MILLIS`]. F1 takes a repeat as it takes the first: required and
+    /// awaited, it pins; already pinned, it syncs the copy again; once activating or active, it
+    /// ignores it. Ends at F1's post-commit sync ([`Self::request_holder_sync`]) or a newer
+    /// landing of the partition ([`Self::land`]); a node that stops drops it with the host.
+    fn resend_caught_up(&mut self, now: Tick) {
+        let node = self.node;
+        for (&(partition, generation), resend) in &mut self.caught_up_resends {
+            if resend.next > now {
+                continue;
+            }
+            resend.attempt = resend.attempt.saturating_add(1);
+            let wait = CAUGHT_UP_RESEND_FIRST_MILLIS
+                .saturating_mul(1 << resend.attempt.min(3))
+                .min(CAUGHT_UP_RESEND_MAX_MILLIS);
+            resend.next = now.plus_millis(wait);
+            tracing::debug!(
+                node = node.0,
+                partition = partition.0,
+                generation = generation.0,
+                attempt = resend.attempt,
+                "caught_up_resent"
+            );
+            if resend.attempt == CAUGHT_UP_RESEND_WARN_AT {
+                tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    emitter = resend.emitter.0,
+                    attempts = resend.attempt,
+                    "caught_up_resend_unanswered"
+                );
+            }
+            let msg = Msg::Routed {
+                partition,
+                correlation: resend.correlation,
+                kind: KernelEvent::Recovery(resend.event.clone()),
+            };
+            if let Err(fault) = self.links.send(node, resend.emitter, msg) {
+                tracing::debug!(
+                    node = node.0,
+                    emitter = resend.emitter.0,
+                    ?fault,
+                    "caught_up_resend_unreachable"
+                );
+            }
+        }
+    }
+
     /// The host flusher: every lineage the engine holds, through its applied prefix.
     ///
     /// A-R192b: when every lineage is already durable through its applied prefix, the sync
@@ -1976,7 +2975,14 @@ impl Host {
     /// A-R214: it also syncs while any write since the last sync is unsynced, as a dedup delete
     /// or an inherit at base 0 is: those raise no applied mark, so durable == applied misses
     /// them ([`RocksEngine::wal_synced_through_latest`]).
+    ///
+    /// F4 (A-R317): the fsync runs on the syncer and `Flushed` goes out when it returns. While
+    /// a sync is in flight the duty does nothing: one sync at a time, and the next duty after
+    /// it returns captures what was written meanwhile.
     fn flush_duty(&mut self) -> Result<(), Fault> {
+        if self.syncing.is_some() {
+            return Ok(());
+        }
         let lineages = self.engine.lineages();
         if lineages.is_empty() {
             return Ok(());
@@ -1989,7 +2995,7 @@ impl Host {
         let ticket = FlushTicket(self.next_ticket);
         self.next_ticket += 1;
         let started = Instant::now();
-        let kind = if synced {
+        let skipped = if synced {
             let captured = lineages
                 .into_iter()
                 .map(|(partition, generation)| CapturedPrefix {
@@ -1998,10 +3004,8 @@ impl Host {
                     through: self.engine.buffered_applied(partition, generation),
                 })
                 .collect();
-            match self.engine.sync_wal_through(captured) {
-                Ok(durable) => StorageEvent::Flushed { ticket, durable },
-                Err(fault) => StorageEvent::FlushFailed { ticket, fault },
-            }
+            self.start_sync(vec![AfterSync::Duty { ticket, captured }])?;
+            None
         } else {
             let durable = lineages
                 .into_iter()
@@ -2011,7 +3015,7 @@ impl Host {
                     through: self.engine.durable(partition, generation),
                 })
                 .collect();
-            StorageEvent::Flushed { ticket, durable }
+            Some(StorageEvent::Flushed { ticket, durable })
         };
         if self.flushed_once {
             tracing::debug!(
@@ -2033,12 +3037,302 @@ impl Host {
                 "host_duty"
             );
         }
-        let site = Site {
-            partition: PartitionId(0),
-            correlation: CorrelationId::default(),
-        };
-        self.push(site, EventKind::Storage(kind), false, None);
+        if let Some(kind) = skipped {
+            self.push(FLUSH_SITE, EventKind::Storage(kind), false, None);
+        }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------ syncer (F4, A-R317)
+
+    /// F4 (A-R317): `item` needs a WAL sync that begins after now. With one in flight it waits
+    /// for the next, which begins as soon as that one returns; otherwise one begins now.
+    fn request_sync(&mut self, item: AfterSync) -> Result<(), Fault> {
+        if self.syncing.is_some() {
+            self.sync_next.push(item);
+            return Ok(());
+        }
+        self.start_sync(vec![item])
+    }
+
+    /// Begin one WAL sync for `after` on this node's syncer. What it may credit is fixed now
+    /// ([`RocksEngine::begin_sync`]). Only crate tests build a host without a syncer (`Trio`
+    /// and the one-host rows, which step it by hand); there the sync runs inline on the
+    /// stepping thread. Outside tests a host without one faults rather than fsync inline,
+    /// because an inline fsync is the stall F4 removes (A-R317).
+    fn start_sync(&mut self, after: Vec<AfterSync>) -> Result<(), Fault> {
+        let captured = after
+            .iter()
+            .flat_map(|item| item.captured().iter().cloned())
+            .collect();
+        let sync = self.engine.begin_sync(captured);
+        let Some(syncer) = &self.syncer else {
+            return self.sync_without_syncer(sync, after);
+        };
+        if syncer.jobs.send(sync).is_err() {
+            return Err(Fault::from("the WAL syncer thread has stopped".to_owned()));
+        }
+        self.syncing = Some(InFlight {
+            started: Instant::now(),
+            after,
+        });
+        Ok(())
+    }
+
+    /// A crate test's hand-stepped host: the sync runs inline on the stepping thread.
+    #[cfg(test)]
+    fn sync_without_syncer(
+        &mut self,
+        sync: rdb_storage::WalSync,
+        after: Vec<AfterSync>,
+    ) -> Result<(), Fault> {
+        let (flushed, millis) = run_wal_sync(self.node, self.engine.path(), &sync);
+        let done = SyncDone {
+            sync,
+            flushed,
+            millis,
+        };
+        self.synced(done, after)
+    }
+
+    /// Outside tests every host is built by `spawn_on`, which starts its syncer; one without
+    /// it faults loudly instead of an fsync on the node's thread.
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
+    fn sync_without_syncer(
+        &mut self,
+        sync: rdb_storage::WalSync,
+        after: Vec<AfterSync>,
+    ) -> Result<(), Fault> {
+        drop((sync, after));
+        tracing::error!(node = self.node.0, "wal_sync_no_syncer");
+        Err(Fault::from(
+            "no WAL syncer: a host syncs only through its syncer (A-R317)".to_owned(),
+        ))
+    }
+
+    /// [`Msg::Synced`]: the sync in flight returned. Its work is answered, then the next sync
+    /// begins for what waited.
+    fn on_synced(&mut self, done: SyncDone) -> Result<(), Fault> {
+        let Some(flight) = self.syncing.take() else {
+            return Err(Fault::from(
+                "the WAL syncer returned a sync none was in flight for".to_owned(),
+            ));
+        };
+        self.synced(done, flight.after)?;
+        if self.syncing.is_none() && !self.sync_next.is_empty() {
+            let next = std::mem::take(&mut self.sync_next);
+            self.start_sync(next)?;
+        }
+        Ok(())
+    }
+
+    /// Finish one sync: the durable marks move ([`RocksEngine::finish_sync`]), then each of
+    /// `after` is answered with its own prefixes, in order.
+    fn synced(&mut self, done: SyncDone, after: Vec<AfterSync>) -> Result<(), Fault> {
+        let SyncDone {
+            sync,
+            flushed,
+            millis: took,
+        } = done;
+        let ok = flushed.is_ok();
+        let result = self.engine.finish_sync(sync, flushed);
+        if took > SLOW_STEP_MILLIS {
+            tracing::info!(node = self.node.0, millis = took, ok, "wal_sync_slow");
+        }
+        let mut at = 0;
+        for item in after {
+            let count = item.captured().len();
+            let flushed = |ticket| match &result {
+                Ok(durable) => StorageEvent::Flushed {
+                    ticket,
+                    durable: durable[at..at + count].to_vec(),
+                },
+                Err(fault) => StorageEvent::FlushFailed {
+                    ticket,
+                    fault: *fault,
+                },
+            };
+            match item {
+                AfterSync::Duty { ticket, .. } => {
+                    let kind = flushed(ticket);
+                    self.push(FLUSH_SITE, EventKind::Storage(kind), false, None);
+                }
+                AfterSync::Flush { ticket, site, .. } => {
+                    let kind = flushed(ticket);
+                    self.push(site, EventKind::Storage(kind), false, None);
+                }
+                AfterSync::Revocation {
+                    partition,
+                    epoch,
+                    site,
+                } => {
+                    if let Err(fault) = &result {
+                        tracing::error!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            epoch = epoch.0,
+                            ?fault,
+                            "persist_epoch_revocation_failed"
+                        );
+                        return Err(Fault::from(format!(
+                            "persist epoch {} revocation of partition {}: {fault:?}",
+                            epoch.0, partition.0
+                        )));
+                    }
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        epoch = epoch.0,
+                        "epoch_revocation_persisted"
+                    );
+                    let kind = EventKind::Kernel(KernelEvent::Authority(
+                        AuthorityEvent::EpochRevocationPersisted { partition, epoch },
+                    ));
+                    self.push(site, kind, true, None);
+                }
+                AfterSync::Link {
+                    partition,
+                    generation,
+                    started,
+                } => {
+                    let waiting = self
+                        .link_pending
+                        .remove(&(partition, generation))
+                        .unwrap_or_default();
+                    if let Err(fault) = &result {
+                        return Err(Fault::from(format!(
+                            "sync the link of p{} g{}: {fault:?}",
+                            partition.0, generation.0
+                        )));
+                    }
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        generation = generation.0,
+                        millis = millis(started),
+                        acquires = waiting.len(),
+                        "link_synced"
+                    );
+                    for (landed, site) in waiting {
+                        self.schedule_acquire(&landed, site);
+                    }
+                }
+                AfterSync::Answer {
+                    reply,
+                    copy,
+                    post_commit,
+                    captured: [capture],
+                } => {
+                    if let Some(answer) =
+                        self.sync_answer(capture, copy, post_commit, result.is_ok())
+                    {
+                        self.send_answer(reply, capture.partition, answer);
+                    }
+                }
+            }
+            at += count;
+        }
+        Ok(())
+    }
+
+    /// F4 (A-R317): a sync that returns after the node faulted is finished, so the engine counts
+    /// no sync in flight and a later stop finds none to wait for (critic-f4 A2: before this, the
+    /// stop logged a false `sync_lost_at_stop`). What waited on it is dropped: a faulted node
+    /// answers nothing, and a reopen recovers from disk.
+    fn finish_sync_after_fault(&mut self, done: SyncDone) {
+        let Some(flight) = self.syncing.take() else {
+            tracing::error!(node = self.node.0, "synced_with_none_in_flight_after_fault");
+            return;
+        };
+        let SyncDone {
+            sync,
+            flushed,
+            millis: took,
+        } = done;
+        let ok = flushed.is_ok();
+        let finished = self.engine.finish_sync(sync, flushed).is_ok();
+        tracing::info!(
+            node = self.node.0,
+            millis = took,
+            ok,
+            finished,
+            dropped = flight.after.len() + self.sync_next.len(),
+            "sync_finished_after_fault"
+        );
+        self.sync_next.clear();
+    }
+
+    /// F4 (A-R317): at stop, once the syncer has returned, finish the sync it was running, so
+    /// the engine raises its durable marks and counts no sync in flight before the final marks.
+    /// What waited on it is dropped: the node is stopping, and a reopen recovers from disk.
+    /// The syncer sends [`Msg::Synced`] before it exits, so a missing one is a fault.
+    fn finish_sync_at_stop(&mut self, rx: &Receiver<Msg>) {
+        let Some(flight) = self.syncing.take() else {
+            return;
+        };
+        let done = rx.try_iter().find_map(|msg| match msg {
+            Msg::Synced(done) => Some(done),
+            _ => None,
+        });
+        let Some(SyncDone {
+            sync,
+            flushed,
+            millis: took,
+        }) = done
+        else {
+            tracing::error!(node = self.node.0, "sync_lost_at_stop");
+            self.set_fault(Fault::from(
+                "the WAL syncer stopped without returning its sync".to_owned(),
+            ));
+            return;
+        };
+        let ok = flushed.is_ok();
+        let result = self.engine.finish_sync(sync, flushed);
+        tracing::info!(
+            node = self.node.0,
+            millis = took,
+            ok,
+            dropped = flight.after.len() + self.sync_next.len(),
+            "sync_finished_at_stop"
+        );
+        if let Err(fault) = result {
+            self.set_fault(Fault::from(format!(
+                "the WAL sync in flight at stop failed: {fault:?}"
+            )));
+        }
+    }
+
+    /// F4 (A-R317): a sync in flight past [`Self::sync_stuck_millis`] is a stuck disk. The
+    /// node faults, as any host fault does: it runs nothing more, so A1 renews no more, and the
+    /// grant lapses for another node to take over. `true` when it faulted.
+    fn stuck_sync(&mut self) -> bool {
+        let Some(flight) = &self.syncing else {
+            return false;
+        };
+        let held = millis(flight.started);
+        if held <= self.sync_stuck_millis {
+            return false;
+        }
+        tracing::error!(
+            node = self.node.0,
+            held_ms = held,
+            stuck_ms = self.sync_stuck_millis,
+            "wal_sync_stuck"
+        );
+        self.set_fault(Fault::from(format!(
+            "WAL sync in flight for {held} ms, past the {} ms stuck limit",
+            self.sync_stuck_millis
+        )));
+        true
+    }
+
+    /// How long until the sync in flight counts as stuck; `None` when none is in flight.
+    fn until_stuck(&self) -> Option<Duration> {
+        self.syncing.as_ref().map(|flight| {
+            Duration::from_millis(self.sync_stuck_millis.saturating_add(1))
+                .saturating_sub(flight.started.elapsed())
+        })
     }
 
     /// The trim duty (achieveai/rDB#34; ADR-rdb-0004 §4): per partition, the published writes
@@ -2067,6 +3361,7 @@ impl Host {
             now,
             trim_delete_period(self.budgets.dedup_retention_millis),
             "marks",
+            false,
         )?;
         self.retire_duty(now)
     }
@@ -2139,7 +3434,17 @@ impl Host {
     /// restored. A lost or late write only frees less. Only the owner publishes, so the other
     /// copies write none and keep the landing plus the retention (C7). `kind` names the
     /// `host_duty` line.
-    fn mark_duty(&mut self, now: Tick, period: u64, kind: &'static str) -> Result<(), Fault> {
+    ///
+    /// F4 (A-R317): the periodic duty stages its write, unsynced, and the syncer's next sync
+    /// makes it durable, so this thread never waits on an fsync for marks. `synced` writes them
+    /// synced instead: the clean stop does, once its syncer has stopped.
+    fn mark_duty(
+        &mut self,
+        now: Tick,
+        period: u64,
+        kind: &'static str,
+        synced: bool,
+    ) -> Result<(), Fault> {
         let mut due = Vec::new();
         for partition in &self.marks_restored {
             let last = self.marks_written.get(partition);
@@ -2168,9 +3473,13 @@ impl Host {
                 if kind == "final_marks" {
                     std::thread::sleep(self.step_pause);
                 }
-                self.engine
-                    .put_publish_marks(partition, &publish_marks(&marks))
-                    .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
+                let marks_now = publish_marks(&marks);
+                if synced {
+                    self.engine.put_publish_marks(partition, &marks_now)
+                } else {
+                    self.engine.stage_publish_marks(partition, &marks_now)
+                }
+                .map_err(|fault| format!("publish marks of p{}: {fault:?}", partition.0))?;
                 tracing::info!(
                     node = self.node.0,
                     kind,
@@ -2253,9 +3562,11 @@ impl Host {
         for ((partition, generation), below) in due {
             self.trim_floors.remove(&(partition, generation));
             self.trim_deleted_at.insert(partition, now);
+            // F4 (A-R317): staged; the syncer's next sync makes it durable. A crash before then
+            // may reseed it, as a reopen already may for every trim since the last delete.
             let deleted = self
                 .engine
-                .delete_dedup_trimmed(partition, generation, below)
+                .stage_dedup_trimmed(partition, generation, below)
                 .map_err(|fault| {
                     format!(
                         "dedup trim delete of p{} g{} below {}: {fault:?}",
@@ -2399,6 +3710,48 @@ impl Host {
             Some(Some(after)) => refused.with_retry_after(after),
             _ => refused,
         }
+    }
+
+    /// A-R399 (tester-final D3): a fenced node whose after-fence read of `partitions/{p}` named
+    /// another owner refuses a client `NOT_PRIMARY` with that owner as the hint, where it would
+    /// have refused `LEASE_EXPIRED`, so an app routed here re-reads the owner and leaves. Only
+    /// the refusal changes: an answer that is not a `LEASE_EXPIRED` refusal provably mutating
+    /// nothing, a node not fenced, a read not answered yet, or one naming this node or no one
+    /// goes out as it came. A1 is never told; nothing is admitted or made durable here.
+    fn redirect(&self, partition: PartitionId, answer: Answer) -> Answer {
+        let expired = match &answer {
+            Answer::Error { error, .. } => {
+                error.kind == ErrorKind::LeaseExpired && error.no_mutation
+            }
+            Answer::Read { outcome, .. } => {
+                *outcome == ReadServiceOutcome::Rejected(ErrorKind::LeaseExpired)
+            }
+            _ => false,
+        };
+        if !expired || fence_of(self.authority.state()).is_none() {
+            return answer;
+        }
+        let Some(Some(owner)) = self.owner_after_fence.get(&partition).copied() else {
+            return answer;
+        };
+        if owner == self.node {
+            return answer;
+        }
+        let request = match answer {
+            Answer::Error { request, .. } => request,
+            _ => None,
+        };
+        let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+            partition,
+            hint: Some(owner),
+        });
+        error.no_mutation = true;
+        error.detail = format!(
+            "node {} lost its grant, and partitions/{} names node {} as owner; this send wrote \
+             nothing",
+            self.node.0, partition.0, owner.0
+        );
+        Answer::Error { error, request }
     }
 
     /// A-R183 (critic-d6b candidate 3): how long until the trim duty can first free a dedup
@@ -2585,6 +3938,16 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
+        // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
+        // history; a later fence of either scope must not reuse it.
+        if fence_of(self.authority.state()).is_none() && !self.owner_after_fence.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                forgot = self.owner_after_fence.len(),
+                "host_owner_forgotten"
+            );
+            self.owner_after_fence.clear();
+        }
     }
 
     /// `txn_dispatch`: T1 hands `batch` to storage. The binding tick is `decided_at`, when A1
@@ -2690,8 +4053,36 @@ impl Host {
         } = queued;
         #[cfg(test)]
         let event = self.deny_reply_check(event);
+        self.revocation_persisted = match &event.kind {
+            EventKind::Kernel(KernelEvent::Authority(
+                AuthorityEvent::EpochRevocationPersisted { epoch, .. },
+            )) => Some(*epoch),
+            _ => None,
+        };
         if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
             self.plans.insert(event.partition, (**plan).clone());
+        }
+        // D8 (A-R337): an inventory answer to an older run's ask, which the link held while the
+        // copy was down, never reaches F1's current run: as Reported it reads `StaleLineage`,
+        // as Failed it drops the copy, and either shuts out a copy the current ask may admit.
+        if let Some(asked) = self.answer_stamps.remove(&event.id) {
+            let plan = self.plans.get(&event.partition).map(|plan| plan.anchor);
+            if plan != Some(asked) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = event.partition.0,
+                    failed = matches!(
+                        event.kind,
+                        EventKind::Kernel(KernelEvent::Recovery(
+                            RecoveryEvent::InventoryFailed { .. }
+                        ))
+                    ),
+                    seen_gen = asked.lineage.generation.0,
+                    plan_gen = plan.map(|anchor| anchor.lineage.generation.0),
+                    "inventory_answer_late"
+                );
+                return Ok(());
+            }
         }
         let arm = match &event.kind {
             EventKind::Kernel(kernel) => Arm::of(kernel),
@@ -2931,13 +4322,13 @@ impl Host {
                         self.timers.remove(id);
                     }
                 }
-                EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site)?,
+                EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site, effects)?,
             }
         }
         // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
         // its own fsync never delays theirs.
         for (site, ask) in std::mem::take(&mut self.own_asks) {
-            if let Some(answer) = self.answer(site.partition, &ask) {
+            if let Some(answer) = self.answer(site.partition, &ask, Reply::Here(site)) {
                 self.answer_here(site, answer);
             }
         }
@@ -2990,17 +4381,14 @@ impl Host {
                     }
                 }
             }
+            // F4 (A-R317): on the syncer; `Flushed` goes out when a sync that began after this
+            // effect returns.
             StoreEffect::Flush { ticket, captured } => {
-                match self.engine.sync_wal_through(captured.clone()) {
-                    Ok(durable) => StorageEvent::Flushed {
-                        ticket: *ticket,
-                        durable,
-                    },
-                    Err(fault) => StorageEvent::FlushFailed {
-                        ticket: *ticket,
-                        fault,
-                    },
-                }
+                return self.request_sync(AfterSync::Flush {
+                    ticket: *ticket,
+                    captured: captured.clone(),
+                    site,
+                });
             }
             // A handle still bound is refused, never rebound (the sim's rule).
             StoreEffect::Snapshot { handle, partition } => {
@@ -3029,8 +4417,37 @@ impl Host {
                     format!("{from:?} released unbound snapshot {}", handle.0).into()
                 });
             }
-            StoreEffect::PersistEpochRevocation { .. } => {
-                return Err(unsupported(self.node, "persist_epoch_revocation"));
+            // #42 (A-R249): a synced write, then A1 hears it is durable, as the sim routes it.
+            // A failed write faults the node: no `DrainProof` may stand on a revocation that a
+            // restart would forget.
+            // F4 (A-R317): staged here, and A1 hears it is persisted only when a sync that
+            // began after the write returns ([`Self::synced`]), so this thread never waits on
+            // that fsync.
+            StoreEffect::PersistEpochRevocation { partition, epoch } => {
+                if let Err(fault) = self.engine.stage_epoch_revocation(*partition, *epoch) {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        epoch = epoch.0,
+                        ?fault,
+                        "persist_epoch_revocation_failed"
+                    );
+                    return Err(Fault::from(format!(
+                        "persist epoch {} revocation of partition {}: {fault:?}",
+                        epoch.0, partition.0
+                    )));
+                }
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    epoch = epoch.0,
+                    "epoch_revocation_staged"
+                );
+                return self.request_sync(AfterSync::Revocation {
+                    partition: *partition,
+                    epoch: *epoch,
+                    site,
+                });
             }
         };
         self.push(site, EventKind::Storage(kind), false, None);
@@ -3038,7 +4455,13 @@ impl Host {
     }
 
     /// One kernel effect: recorded, routed, served, or refused by name (the sim's `kernel`).
-    fn kernel(&mut self, from: ModuleName, kernel: &KernelEffect, site: Site) -> Result<(), Fault> {
+    fn kernel(
+        &mut self,
+        from: ModuleName,
+        kernel: &KernelEffect,
+        site: Site,
+        step: &[Effect],
+    ) -> Result<(), Fault> {
         let node = self.node.0;
         match kernel {
             KernelEffect::Ignored { reason } => {
@@ -3052,6 +4475,9 @@ impl Host {
             }
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 tracing::info!(node, ?fact, "authority_fact");
+                if *fact == AuthorityFact::DrainProof && !self.lose_drain_proof(site) {
+                    self.drained(site, self.revocation_persisted)?;
+                }
             }
             KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
                 self.report_view(view);
@@ -3065,8 +4491,46 @@ impl Host {
                     at = self.stepped_at.0,
                     "authority_fence"
                 );
+                // A node fence is every served partition's, wherever A1 sited it: the ones A1
+                // views in this step and a T1 or P1 serves (A-R324, A-R331).
+                let sites = route::node_fence_sites(kernel, site.partition, step, |partition| {
+                    self.transaction.kernel(self.node, partition).is_some()
+                        || self.publication.kernel(self.node, partition).is_some()
+                });
+                for &partition in &sites {
+                    let event = KernelEvent::Authority(AuthorityEvent::Fence {
+                        scope: *scope,
+                        reason: *reason,
+                    });
+                    let at = Site { partition, ..site };
+                    self.push(at, EventKind::Kernel(event), true, None);
+                }
                 if *scope == FenceScope::Node {
                     self.schedule_acquire_after_fence(site);
+                    // A-R399: what each fenced partition's record names now, for the
+                    // refusals alone; a new fence forgets the last answer and reads again, and
+                    // a read begun under an earlier fence is dropped when it answers. Every
+                    // served partition, not the fence's own site alone: A1 may site a node fence
+                    // at partition 0, which no T1 or P1 serves, and the fan-out leaves the site
+                    // out.
+                    let mut fenced = sites;
+                    if self.transaction.kernel(self.node, site.partition).is_some()
+                        || self.publication.kernel(self.node, site.partition).is_some()
+                    {
+                        fenced.push(site.partition);
+                    }
+                    fenced.sort_unstable();
+                    fenced.dedup();
+                    self.owner_fence += 1;
+                    for partition in fenced {
+                        self.owner_after_fence.remove(&partition);
+                        self.control.read_owner_after_fence(
+                            self.node,
+                            self.boot,
+                            partition,
+                            self.owner_fence,
+                        );
+                    }
                 }
             }
             KernelEffect::SetAdmission(state) => {
@@ -3085,10 +4549,18 @@ impl Host {
             }
             KernelEffect::Recovery(effect) => return self.recovery_effect(effect, site),
             KernelEffect::Recovered(result) => self.recovered(result, site)?,
+            KernelEffect::SnapshotCatchupRequired { copy, barrier } => {
+                self.snapshot_catchup(site.partition, *copy, *barrier);
+                return Ok(());
+            }
+            KernelEffect::CopyAheadOnControl { copy } => {
+                self.copy_ahead(site.partition, *copy);
+                return Ok(());
+            }
             KernelEffect::Publication(effect) => {
                 return match effect {
                     PublicationEffect::Snapshot { identity, handle } => {
-                        self.previous_answer(*identity, *handle)
+                        self.previous_answer(site.partition, *identity, *handle)
                     }
                     PublicationEffect::Status(_)
                     | PublicationEffect::Mode { .. }
@@ -3147,10 +4619,9 @@ impl Host {
             }
             // Recorded for the trim duty, then routed to T1 below.
             KernelEffect::Published { lineage, seq, .. } => {
-                self.published_at
-                    .entry(lineage.partition)
-                    .or_default()
-                    .push_back((lineage.generation, *seq, self.clock.now()));
+                let published = self.published_at.entry(lineage.partition).or_default();
+                let (width, now) = (self.publish_bucket_millis, self.clock.now());
+                record_published(published, width, lineage.generation, *seq, now);
             }
             // A1 refused a check. The refusal the client sees (`LEASE_EXPIRED` and the like) does
             // not say which conjunct denied, so name it here (U1, ruling A-R109). Still routed.
@@ -3222,7 +4693,10 @@ impl Host {
             "recovered"
         );
         self.inherit(partition, result)?;
+        self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
+        self.committed_correlation
+            .insert(partition, site.correlation);
         if self.landed.insert((partition, result.new_generation)) {
             self.stamp_retirement(partition, result.new_generation);
         }
@@ -3263,9 +4737,1050 @@ impl Host {
                 );
             }
         }
-        self.schedule_acquire(result, site);
+        self.acquire_after_link(result, site);
         self.watch_rebuild(result, partition);
+        // A membership commit restarts the drop clock (A-R282 N1).
+        self.blamed.remove(&partition);
+        self.rejoin_committed(partition, result.new_generation);
         Ok(())
+    }
+
+    /// #42 (A-R249): peer `node` started again as `boot`. Each partition with a commit here is
+    /// checked; only its pinned primary acts (arch-s2: the record owner always heals).
+    fn peer_booted(&mut self, node: NodeId, boot: BootId) {
+        let link_boot = self.links.boot_of(node).map(|boot| boot.0);
+        tracing::info!(
+            node = self.node.0,
+            peer = node.0,
+            boot = boot.0,
+            link_boot = ?link_boot,
+            "peer_booted"
+        );
+        if self.committed.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                peer = node.0,
+                boot = boot.0,
+                why = "no recovery has committed on this node",
+                "peer_booted_ignored"
+            );
+            return;
+        }
+        let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
+        for partition in partitions {
+            if let Some(why) = self.rejoin_if_stale(partition) {
+                tracing::info!(
+                    node = self.node.0,
+                    peer = node.0,
+                    boot = boot.0,
+                    partition = partition.0,
+                    why,
+                    "peer_booted_ignored"
+                );
+            }
+        }
+    }
+
+    /// Start the restart re-plan when this node is `partition`'s pinned primary and a member's
+    /// link reports a newer boot than the commit pinned: ask A1 to revoke the committed epoch,
+    /// whose `DrainProof` [`Self::drained`] plans from. `Some(why)` when nothing was started.
+    /// A re-plan already running is left alone: one still revoking plans at the live boots,
+    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]).
+    fn rejoin_if_stale(&mut self, partition: PartitionId) -> Option<&'static str> {
+        let Some(committed) = self.committed.get(&partition) else {
+            return Some("no commit for this partition");
+        };
+        let config = &committed.committed.pinned_config;
+        let owner = config
+            .members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if !owner {
+            return Some("not the partition's pinned primary");
+        }
+        let stale: Vec<(u32, u64, u64)> = config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .filter_map(|member| {
+                let live = self.links.boot_of(member.node)?;
+                (live > member.boot).then_some((member.node.0, member.boot.0, live.0))
+            })
+            .collect();
+        let readd = if stale.is_empty() {
+            self.readd_candidate(partition, config)
+        } else {
+            None
+        };
+        if stale.is_empty() && readd.is_none() {
+            return Some("every member's pinned boot is current");
+        }
+        if let Some(rejoin) = self.rejoins.get(&partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                rejoin = ?rejoin,
+                stale = ?stale,
+                readd = ?readd.map(|member| member.node.0),
+                "rejoin_pending"
+            );
+            return None;
+        }
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = committed.new_generation.0,
+            epoch = epoch.0,
+            stale = ?stale,
+            readd = ?readd.map(|member| member.node.0),
+            "rejoin_revoke"
+        );
+        let rejoiner = stale
+            .first()
+            .map(|&(node, _, _)| NodeId(node))
+            .or(readd.map(|member| member.node));
+        self.revoke(partition, epoch, None, rejoiner);
+        None
+    }
+
+    /// A-R329: a member a drop left out of `partition` that started again since, while `config`
+    /// (the commit's) pins fewer regular copies than rf3. The restart re-plan pins it again as
+    /// a shadow, which L1 never counts and R1 catches up off the stream; [`Self::shadow_duty`]
+    /// promotes it once it reaches the cutoff. A member pinned in any role, a shadow included,
+    /// is already re-added. Only a boot newer than the one the drop recorded counts. That is the
+    /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
+    /// rejoiner) is re-added at once, and a copy dropped at its live boot waits for a restart.
+    fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
+        let copies = config
+            .members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        if copies >= crate::admin::members().len() {
+            return None;
+        }
+        self.left_out.get(&partition)?.iter().copied().find(|left| {
+            let pinned = config
+                .members
+                .iter()
+                .any(|member| member.node == left.node || member.copy == left.copy);
+            !pinned
+                && self
+                    .links
+                    .boot_of(left.node)
+                    .is_some_and(|live| live > left.boot)
+        })
+    }
+
+    /// D10 (A-R398): each member the commit this node knew pinned and `result` (committed here)
+    /// does not, at the boot it was pinned at, is left out, as [`Self::drained`] records a
+    /// drop. That covers a drop this node never planned: a promote's plan pins only the members
+    /// it keeps, so without this the owner a promote dropped is never a [`Self::readd_candidate`]
+    /// and stays out for good.
+    fn note_left_out(&mut self, partition: PartitionId, result: &RecoveryResult) {
+        let Some(prior) = self.committed.get(&partition) else {
+            return;
+        };
+        let pinned = &result.committed.pinned_config.members;
+        let gone: Vec<Member> = prior
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .filter(|member| !pinned.iter().any(|pin| pin.node == member.node))
+            .copied()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = result.new_generation.0,
+            left_out = ?gone.iter().map(|member| (member.node.0, member.boot.0)).collect::<Vec<_>>(),
+            "commit_left_out"
+        );
+        let entry = self.left_out.entry(partition).or_default();
+        for left in gone {
+            entry.retain(|member| member.node != left.node);
+            entry.push(left);
+        }
+    }
+
+    /// D9 (A-R398, arch-s2 S2-4): the restarted regular secondary a restart re-plan pins again
+    /// as a shadow. A restarted copy is behind by whatever it missed, and a wiped one holds
+    /// nothing; pinned regular, L1 counts it and refuses writes until it has caught up, for as
+    /// long as the copy takes. As a shadow L1 never counts it and F1's barrier skips it, so
+    /// writes go on with the two regular copies while R1 catches it up, and
+    /// [`Self::shadow_duty`] promotes it once it reaches the cutoff (two short re-plans, the
+    /// `behind` case's). Only from an `Active` commit, for a plain restart (no drop, not the
+    /// promote), and only when two regular copies whose pinned boot is current, and which
+    /// this owner can reach (ADV-2, A-R406: a held peer would leave a read-only plan), stay
+    /// pinned: otherwise the rejoiner stays regular, as before.
+    fn restart_shadowed(&self, committed: &RecoveryResult, replan: Replan) -> Option<NodeId> {
+        if !self.restart_shadow
+            || replan.promote
+            || replan.drop.is_some()
+            || committed.mode != PartitionMode::Active
+        {
+            return None;
+        }
+        let rejoiner = replan.rejoiner?;
+        let members = &committed.committed.pinned_config.members;
+        let restarted = members.iter().find(|member| {
+            member.node == rejoiner
+                && member.node != self.node
+                && member.role == ReplicaRole::RegularSecondary
+                && self
+                    .links
+                    .boot_of(member.node)
+                    .is_some_and(|live| live > member.boot)
+        })?;
+        let current = members
+            .iter()
+            .filter(|member| member.node != restarted.node && member.role != ReplicaRole::Shadow)
+            .filter(|member| {
+                member.node == self.node
+                    || (self.linked(member.node)
+                        && self
+                            .links
+                            .boot_of(member.node)
+                            .is_some_and(|live| live == member.boot))
+            })
+            .count();
+        (current >= 2).then_some(restarted.node)
+    }
+
+    /// Ask A1 to revoke `partition`'s committed `epoch`, whose `DrainProof` [`Self::drained`]
+    /// plans the next generation from, without `drop` when one is named. `rejoiner` is the
+    /// restarted member the plan links again, if it is for one.
+    fn revoke(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        drop: Option<NodeId>,
+        rejoiner: Option<NodeId>,
+    ) {
+        let replan = Replan {
+            drop,
+            rejoiner,
+            promote: false,
+            since: self.clock.now(),
+        };
+        self.start_revoke(partition, epoch, replan);
+    }
+
+    /// Ask A1 to revoke `partition`'s committed `epoch` for `replan`.
+    fn start_revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, replan: Replan) {
+        self.rejoins
+            .insert(partition, Rejoin::Revoking { epoch, replan });
+        let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
+        self.push(
+            Site {
+                partition,
+                correlation: REJOIN,
+            },
+            EventKind::Kernel(KernelEvent::Authority(revoke)),
+            false,
+            None,
+        );
+    }
+
+    /// A1's `DrainProof`: the epoch the re-plan revoked is durable, so no write is admitted
+    /// under it again. Plan the next generation with every member at the boot its link reports
+    /// now, fenced by the drain at the commit's revision (#42; the sim's `reinspect_now`). A
+    /// member the re-plan drops is left out (M10 S2 part (b)). `proved` is the epoch whose
+    /// persisted revocation A1 answered; a proof for any other epoch plans nothing (A-R321).
+    fn drained(&mut self, site: Site, proved: Option<OwnerEpoch>) -> Result<(), Fault> {
+        let partition = site.partition;
+        let Some(proved) = proved else {
+            return Err(Fault::from(format!(
+                "drain proof for partition {} outside an EpochRevocationPersisted step",
+                partition.0
+            )));
+        };
+        let Some(Rejoin::Revoking { epoch, replan }) = self.rejoins.get(&partition).copied() else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                rejoin = ?self.rejoins.get(&partition),
+                "drain_proof_unasked"
+            );
+            return Ok(());
+        };
+        if proved != epoch {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                proved = proved.0,
+                revoking = epoch.0,
+                "drain_proof_stale"
+            );
+            return Ok(());
+        }
+        let committed = self.committed.get(&partition).ok_or_else(|| {
+            Fault::from(format!(
+                "drain proof for partition {} with no commit to plan from",
+                partition.0
+            ))
+        })?;
+        let root = committed.selected.root;
+        if root.owner_epoch != epoch {
+            return Err(Fault::from(format!(
+                "drain proof for partition {}: epoch {} was revoked but the commit now serves \
+                 epoch {}",
+                partition.0, epoch.0, root.owner_epoch.0
+            )));
+        }
+        let anchor = LineageAnchor {
+            lineage: root,
+            base_seq: committed.selected.cutoff_seq,
+            base_digest: committed.selected.cutoff_digest,
+        };
+        let pinned = &committed.committed.pinned_config;
+        let shadowed = self.restart_shadowed(committed, replan);
+        let mut members: Vec<Member> = pinned
+            .members
+            .iter()
+            .filter(|member| Some(member.node) != replan.drop)
+            .map(|member| {
+                let boot = if member.node == self.node {
+                    self.boot
+                } else {
+                    // A member with no link keeps the boot it was pinned at: F1 then cannot
+                    // reach it, which its barrier names.
+                    self.links.boot_of(member.node).unwrap_or(member.boot)
+                };
+                // A-R329, A-R366: only `Self::shadow_duty`'s re-plan promotes its shadow; a
+                // restarted shadow stays a shadow at its live boot.
+                let promoted = replan.promote
+                    && member.role == ReplicaRole::Shadow
+                    && Some(member.node) == replan.rejoiner;
+                let role = if promoted {
+                    ReplicaRole::RegularSecondary
+                } else if Some(member.node) == shadowed {
+                    ReplicaRole::Shadow
+                } else {
+                    member.role
+                };
+                Member {
+                    boot,
+                    role,
+                    ..*member
+                }
+            })
+            .collect();
+        // A-R329: a rejoiner that is not pinned is a member a drop left out, linked again as a
+        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it off the
+        // stream; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
+        let readded = replan.rejoiner.and_then(|node| {
+            let left = self
+                .left_out
+                .get(&partition)?
+                .iter()
+                .find(|left| left.node == node)?;
+            let free = !pinned
+                .members
+                .iter()
+                .any(|member| member.node == node || member.copy == left.copy);
+            free.then(|| Member {
+                boot: self.links.boot_of(node).unwrap_or(left.boot),
+                role: ReplicaRole::Shadow,
+                ..*left
+            })
+        });
+        if let Some(member) = readded {
+            members.push(member);
+            members.sort_by_key(|member| member.copy);
+        }
+        if let Some(left) = replan
+            .drop
+            .and_then(|node| pinned.members.iter().find(|member| member.node == node))
+        {
+            let entry = self.left_out.entry(partition).or_default();
+            entry.retain(|member| member.node != left.node);
+            entry.push(*left);
+        }
+        // A1's own view when it published one; the plan's otherwise. A1 replaces it at the
+        // install after commit either way (as `admin::heal`).
+        let (view, view_source) = match self.authority_views.get(&partition) {
+            Some(view) => (view, "published"),
+            None => (&committed.committed.authority_view, "committed"),
+        };
+        let revision = committed.committed.revision;
+        let version = ConfigVersion(pinned.config_version.0 + 1);
+        let generation = root.generation.next();
+        let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
+        let plan = crate::admin::recovery_plan(
+            anchor,
+            version,
+            members,
+            self.boot,
+            view.grant_id,
+            view.authority_generation,
+        );
+        let fence = FencingProof {
+            partition,
+            prior_generation: root.generation,
+            prior_owner_epoch: root.owner_epoch,
+            prior_grant_id: view.grant_id,
+            prior_boot_id: self.boot,
+            revocation: Revocation::DurableDrain {
+                ack_revision: revision,
+            },
+            control_revision: revision,
+            decision_tick: self.clock.now(),
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            config_version = version.0,
+            control_revision = revision.0,
+            view_source,
+            boots = ?boots,
+            dropped = ?replan.drop.map(|node| node.0),
+            rejoiner = ?replan.rejoiner.map(|node| node.0),
+            readded = ?readded.map(|member| member.node.0),
+            shadowed = ?shadowed.map(|node| node.0),
+            "rejoin_plan"
+        );
+        self.rejoins
+            .insert(partition, Rejoin::Planned { generation, replan });
+        for event in [
+            RecoveryEvent::Plan(Box::new(plan)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ] {
+            self.push(
+                Site {
+                    partition,
+                    correlation: REJOIN,
+                },
+                EventKind::Kernel(KernelEvent::Recovery(event)),
+                false,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// The commit that ends a restart re-plan. A peer that restarted again while it ran was
+    /// pinned at its older boot, so the partition is checked once more: a newer boot supersedes
+    /// (arch-s2).
+    fn rejoin_committed(&mut self, partition: PartitionId, generation: Generation) {
+        if let (Some(left), Some(committed)) = (
+            self.left_out.get_mut(&partition),
+            self.committed.get(&partition),
+        ) {
+            let pinned = &committed.committed.pinned_config.members;
+            left.retain(|member| !pinned.iter().any(|pin| pin.node == member.node));
+        }
+        let Some(Rejoin::Planned {
+            generation: planned,
+            ..
+        }) = self.rejoins.get(&partition).copied()
+        else {
+            return;
+        };
+        if generation < planned {
+            return;
+        }
+        self.rejoins.remove(&partition);
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            "rejoin_committed"
+        );
+        if let Some(why) = self.rejoin_if_stale(partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                why,
+                "rejoin_current"
+            );
+        }
+    }
+
+    /// M10 S2 part (b): re-plan a partition without the copy L1 has refused its writes on
+    /// account of for `peer_drop_after_millis` (rulings A-R281 M1, A-R282 N1). The clock starts
+    /// again on an admit, a membership commit, a different blamed copy, or that copy's durable
+    /// sequence advancing, so a copy still catching up is never dropped.
+    fn drop_duty(&mut self, now: Tick) {
+        let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
+        for partition in partitions {
+            self.retry_blocked_rejoin(partition, now);
+            self.repair_duty(partition, now);
+            self.shadow_duty(partition);
+            let Some((copy, durable)) = self.holding_up(partition, now) else {
+                self.blamed.remove(&partition);
+                continue;
+            };
+            let blame = Blame::next(self.blamed.get(&partition), copy, durable, now);
+            self.blamed.insert(partition, blame);
+            let blamed_ms = HostClock::millis_until(blame.since, now);
+            if blamed_ms >= self.peer_drop_after_millis {
+                self.drop_copy(partition, blame, blamed_ms);
+            }
+        }
+    }
+
+    /// M3's repair half (critic-degraded M3, ruling A-R282): a `ReadOnly` commit whose pinned
+    /// member outside the barrier has been linked again for L1's resume hold is re-planned
+    /// with the same members, so the next generation can take writes. Nothing else ends it:
+    /// the member is pinned at the boot it runs, and a read-only partition holds no write up.
+    /// This only repairs; only [`Self::drop_copy`] drops. A member that is down is left alone.
+    ///
+    /// Bounded (A-R346 M1). A repair whose F1 run cannot take the member in (its inventory
+    /// refused, say) commits `ReadOnly` again, and repeating it would fence the partition every
+    /// hold for ever. So once a repair has run, the next one runs at once only when a member it
+    /// was for has moved: a new boot, a higher durable sequence, or its link down and up again.
+    /// Otherwise it waits (A-R353): [`REPAIR_RETRY_FIRST_MILLIS`] after the repair, doubling at
+    /// each retry up to [`REPAIR_RETRY_CAP_MILLIS`], because F1 can also leave a member out for
+    /// a reason that passes (a late inventory), and a bound with no retry would then keep the
+    /// partition read-only for good. A movement or a commit that is not `ReadOnly` starts the
+    /// wait again from the first. A held repair is logged once per wait,
+    /// `membership_repair_held`. Nothing runs while F1's rebuild is pinned, which F1's own
+    /// deadline bounds.
+    ///
+    /// Answered (A-R350). Once the hold has passed, a check sends each linked member an
+    /// `Inspect` and the next check reads the answers: an answer must arrive within one check.
+    /// The repair runs for the members that answered, and the rest are probed again. A
+    /// half-open link never repairs, so it never fences reads for nothing.
+    fn repair_duty(&mut self, partition: PartitionId, now: Tick) {
+        let read_only = self
+            .committed
+            .get(&partition)
+            .is_some_and(|committed| committed.mode == PartitionMode::ReadOnly);
+        if !read_only {
+            self.repaired.remove(&partition);
+        }
+        let outside = self.read_only_outside(partition);
+        if outside.is_empty()
+            || self
+                .rebuilds
+                .get(&partition)
+                .is_some_and(|watch| watch.pinned)
+        {
+            self.repair_since.remove(&partition);
+            self.repair_probes.remove(&partition);
+            return;
+        }
+        let linked: Vec<NodeId> = outside
+            .into_iter()
+            .filter(|node| self.linked(*node))
+            .collect();
+        if linked.is_empty() {
+            // Down: the next link is a new one, so the next repair may run.
+            self.repair_since.remove(&partition);
+            self.repaired.remove(&partition);
+            self.repair_probes.remove(&partition);
+            return;
+        }
+        let since = *self.repair_since.entry(partition).or_insert(now);
+        let linked_ms = HostClock::millis_until(since, now);
+        if linked_ms < self.budgets.resume_hold_millis {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let generation = committed.new_generation;
+        let epoch = committed.selected.root.owner_epoch;
+        let marks = self.repair_marks(partition, &linked);
+        // A-R353: with nothing moved, the next repair waits out the last one's wait, then runs
+        // with the wait doubled; a movement runs it at once with the first wait.
+        let mut wait_millis = self.repair_retry_first_millis;
+        if let Some(last) = self.repaired.get_mut(&partition) {
+            if !last.moved(&marks) {
+                let waited = HostClock::millis_until(last.at, now);
+                if waited < last.wait_millis {
+                    if !last.logged {
+                        last.logged = true;
+                        tracing::info!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            generation = generation.0,
+                            marks = ?marks,
+                            retry_in_ms = last.wait_millis - waited,
+                            "membership_repair_held"
+                        );
+                    }
+                    return;
+                }
+                wait_millis = last.next_wait();
+            }
+        }
+        // A-R350: a link that is up is not a member that answers. The repair runs only for a
+        // member that answered an `Inspect` the previous check sent it; one that did not (a
+        // half-open link, a stalled process) is probed again, and nothing is fenced for it. In
+        // this process the answer comes back over its own channel, not over `Links`, so a member
+        // whose direction back to this node is dropped is counted as not answering (A-R353).
+        let answered: Vec<NodeId> = match self.repair_probes.remove(&partition) {
+            Some((sent, probes))
+                if HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS =>
+            {
+                let dropped = self.links.dropped();
+                probes
+                    .into_iter()
+                    .filter(|(node, answer)| {
+                        linked.contains(node)
+                            && !dropped.contains(&(*node, self.node))
+                            && answer.try_recv().is_ok()
+                    })
+                    .map(|(node, _)| node)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        if answered.is_empty() {
+            let probes: Vec<RepairProbe> = linked
+                .iter()
+                .filter_map(|&node| {
+                    let (reply, answer) = mpsc::channel();
+                    let probe = Msg::Inspect { partition, reply };
+                    self.links
+                        .send(self.node, node, probe)
+                        .ok()
+                        .map(|()| (node, answer))
+                })
+                .collect();
+            tracing::debug!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                probed = ?probes.iter().map(|(node, _)| node.0).collect::<Vec<_>>(),
+                "membership_repair_probed"
+            );
+            self.repair_probes.insert(partition, (now, probes));
+            return;
+        }
+        self.repair_since.remove(&partition);
+        self.repaired.insert(
+            partition,
+            RepairHeld {
+                marks,
+                at: now,
+                wait_millis,
+                logged: false,
+            },
+        );
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            epoch = epoch.0,
+            outside = ?answered.iter().map(|node| node.0).collect::<Vec<_>>(),
+            linked_ms,
+            next_wait_ms = wait_millis,
+            "membership_repair_planned"
+        );
+        self.revoke(partition, epoch, None, None);
+    }
+
+    /// [`RepairMark`]s for `nodes` of `partition`, as this node sees them now.
+    fn repair_marks(&self, partition: PartitionId, nodes: &[NodeId]) -> Vec<RepairMark> {
+        let tracker = self
+            .replication
+            .primary(self.node, partition)
+            .map(|primary| primary.tracker());
+        nodes
+            .iter()
+            .map(|&node| RepairMark {
+                node,
+                boot: self.links.boot_of(node),
+                durable: tracker
+                    .and_then(|tracker| {
+                        tracker
+                            .peers()
+                            .find(|(_, peer)| peer.node == node)
+                            .and_then(|(copy, _)| tracker.known(copy))
+                    })
+                    .map_or(DurableSeq(0), |known| known.durable),
+            })
+            .collect()
+    }
+
+    /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
+    /// drop left out and a restart re-added, [`Self::readd_candidate`]) has applied up to the
+    /// commit's cutoff, as this primary's tracker last admitted it, the owner re-plans with it
+    /// as the rejoiner, and [`Self::drained`] pins it as a regular secondary. That run's F1
+    /// catches up what it still lacks and syncs it in the barrier before L1 counts it. Nothing
+    /// while a re-plan runs, or on a node that is not the commit's pinned primary.
+    fn shadow_duty(&mut self, partition: PartitionId) {
+        if self.rejoins.contains_key(&partition) {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let owner = members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        let Some(shadow) = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Shadow)
+            .copied()
+        else {
+            return;
+        };
+        if !owner {
+            return;
+        }
+        let Some(primary) = self.replication.primary(self.node, partition) else {
+            return;
+        };
+        let acked = primary
+            .tracker()
+            .peer(shadow.copy)
+            .map_or(0, |peer| peer.progress.buffered_applied.0);
+        let cutoff = committed.selected.cutoff_seq;
+        if acked < cutoff.0 {
+            return;
+        }
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = committed.new_generation.0,
+            shadow = shadow.node.0,
+            copy = shadow.copy.0,
+            acked,
+            cutoff = cutoff.0,
+            "shadow_promote"
+        );
+        let replan = Replan {
+            drop: None,
+            rejoiner: Some(shadow.node),
+            promote: true,
+            since: self.clock.now(),
+        };
+        self.start_revoke(partition, epoch, replan);
+    }
+
+    /// The regular secondaries `partition`'s commit pins, while that commit is `ReadOnly`, this
+    /// node is its pinned primary and no re-plan runs for it. Empty otherwise. All of them are
+    /// outside the barrier: a `ReadOnly` commit has one eligible regular copy holding it
+    /// (`recovery::mode_for`), the primary's.
+    fn read_only_outside(&self, partition: PartitionId) -> Vec<NodeId> {
+        if self.rejoins.contains_key(&partition) {
+            return Vec::new();
+        }
+        let Some(result) = self.committed.get(&partition) else {
+            return Vec::new();
+        };
+        let members = &result.committed.pinned_config.members;
+        let owner = members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if result.mode != PartitionMode::ReadOnly || !owner {
+            return Vec::new();
+        }
+        regular_secondaries(members)
+    }
+
+    /// Whether this node has a link to `node` now: in this process, registered and not held;
+    /// otherwise its process link is up. A link is not an answer (A-R350): a dropped direction,
+    /// like a half-open connection, still counts here, and only the repair's `Inspect` probe
+    /// says whether `node` answers ([`Self::repair_duty`]).
+    fn linked(&self, node: NodeId) -> bool {
+        if !self.links.knows(node) {
+            return self.links.net().is_some_and(|net| {
+                matches!(net.states().get(&node), Some(crate::net::LinkState::Up(_)))
+            });
+        }
+        let me = self.node;
+        let pair = if me.0 <= node.0 {
+            (me, node)
+        } else {
+            (node, me)
+        };
+        !self.links.held().contains(&pair)
+    }
+
+    /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
+    /// sequence, while this node is the partition's pinned primary and runs no re-plan for it:
+    /// the regular copy with the lowest durable sequence below L1's resume barrier, else L1's
+    /// `stalest_copy`. `None` while L1 admits, is not live here, or blocks for an operator,
+    /// which no re-plan may clear (spec §8.1).
+    ///
+    /// A re-plan holds nothing up while it runs. F1 ends every run it is given, committed or
+    /// `Blocked`, and [`Self::rejoin_blocked`] and [`Self::retry_blocked_rejoin`] act on a block
+    /// (ruling A-R316). This clock cannot see a rejoiner catch up: its catch-up runs from a
+    /// source with no tracker, so this primary's view of it does not move (critic-degraded M-1).
+    fn holding_up(&self, partition: PartitionId, now: Tick) -> Option<(CopyId, DurableSeq)> {
+        if self.rejoins.contains_key(&partition) {
+            return None;
+        }
+        let owner = self
+            .committed
+            .get(&partition)?
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if !owner {
+            return None;
+        }
+        let state = self.l1.get(&partition)?.protection.admission_state(now)?;
+        if state.allow || state.reason != Some(ErrorKind::ProtectionPaused) {
+            return None;
+        }
+        let tracker = self.replication.primary(self.node, partition)?.tracker();
+        let durable = |copy: CopyId| {
+            tracker
+                .peer(copy)
+                .map_or(ReplicaProgress::EMPTY, |peer| peer.progress)
+                .durable
+        };
+        // D1 (critic-degraded): the copy furthest below the barrier, when one is. A copy that
+        // acks keepalives moves `stalest_copy` away from itself at each ACK, so blamed by lag
+        // alone it would never be blamed for long, however far behind it stays.
+        let behind = tracker
+            .config()
+            .members
+            .iter()
+            .filter(|member| {
+                member.role == ReplicaRole::RegularSecondary
+                    && !state.lost_copies.contains(&member.copy)
+            })
+            .map(|member| (member.copy, durable(member.copy)))
+            .filter(|(_, at)| at.0 < state.resume_barrier.0)
+            .min_by_key(|(copy, at)| (at.0, copy.0));
+        let copy = behind.map_or(state.stalest_copy, |(copy, _)| Some(copy))?;
+        Some((copy, durable(copy)))
+    }
+
+    /// Start the re-plan that drops `blame`'s copy, unless the plan would keep fewer than two
+    /// copies: spec §8.3 has no one-copy fallback, so writes stay paused and that is logged once.
+    fn drop_copy(&mut self, partition: PartitionId, blame: Blame, blamed_ms: u64) {
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let holder = holder_of(members, blame.copy);
+        let (target, kept) = drop_target(members, holder, self.node);
+        let generation = committed.new_generation;
+        let epoch = committed.selected.root.owner_epoch;
+        let dropped = match target {
+            Ok(node) => node,
+            Err(why) => {
+                if !blame.refused_logged {
+                    tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        generation = generation.0,
+                        copy = blame.copy.0,
+                        holder = ?holder.map(|node| node.0),
+                        kept,
+                        blamed_ms,
+                        why,
+                        "membership_drop_refused"
+                    );
+                    if let Some(blame) = self.blamed.get_mut(&partition) {
+                        blame.refused_logged = true;
+                    }
+                }
+                return;
+            }
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            epoch = epoch.0,
+            copy = blame.copy.0,
+            dropped = dropped.0,
+            blamed_ms,
+            durable = blame.durable.0,
+            "membership_drop_planned"
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(dropped), None);
+    }
+
+    /// A-R306: F1 ended `Blocked` on this owner's re-plan, so the commit that would end it is
+    /// not coming, and writes and reads stay refused under the revoked epoch until something
+    /// replaces it. When the block names a copy ([`named_by_block`]), the plan is replaced at
+    /// once without that copy's member, never down to one copy or without this node
+    /// ([`drop_target`], A-R290). Otherwise (ruling A-R316) nobody is left out, and
+    /// [`Self::retry_blocked_rejoin`] sends the same plan again after `peer_drop_after_millis`.
+    /// A member left out stays out until M3's add half links it again.
+    fn rejoin_blocked(&mut self, partition: PartitionId, reason: &BlockReason) {
+        let Some(Rejoin::Planned {
+            generation: planned,
+            replan,
+        }) = self.rejoins.get(&partition).copied()
+        else {
+            return;
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let epoch = committed.selected.root.owner_epoch;
+        let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
+        // A-R329: a re-add F1 blocks on is given up, and the commit's members are planned
+        // again. The member stays left out at the boot it was planned at, so only another
+        // restart re-adds it, never a loop of re-adds.
+        let readd = replan
+            .rejoiner
+            .filter(|node| !members.iter().any(|member| member.node == *node))
+            .and_then(|node| {
+                self.left_out
+                    .get(&partition)?
+                    .iter()
+                    .find(|left| left.node == node)
+                    .copied()
+            });
+        if let Some(left) = readd.filter(|left| named_by_block(reason, Some(left.copy)).is_some()) {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                planned = planned.0,
+                readd = left.node.0,
+                waited_ms,
+                reason = ?reason,
+                "rejoin_readd_abandoned"
+            );
+            let live = self.links.boot_of(left.node).unwrap_or(left.boot);
+            if let Some(entry) = self
+                .left_out
+                .get_mut(&partition)
+                .and_then(|entry| entry.iter_mut().find(|member| member.node == left.node))
+            {
+                entry.boot = live;
+            }
+            self.blamed.remove(&partition);
+            self.revoke(partition, epoch, None, None);
+            return;
+        }
+        let candidate = block_leaves_out(reason, replan, members);
+        let verdict = candidate.map(|node| drop_target(members, Some(node), self.node).0);
+        let dropped = match verdict {
+            Some(Ok(node)) => node,
+            other => {
+                let why = match other {
+                    Some(Err(why)) => why,
+                    _ => "the block names no member to leave out",
+                };
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    planned = planned.0,
+                    reason = ?reason,
+                    candidate = ?candidate.map(|node| node.0),
+                    why,
+                    waited_ms,
+                    "rejoin_blocked"
+                );
+                return;
+            }
+        };
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            planned = planned.0,
+            rejoiner = ?replan.rejoiner.map(|node| node.0),
+            dropped = dropped.0,
+            waited_ms,
+            reason = ?reason,
+            "rejoin_abandoned"
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(dropped), None);
+    }
+
+    /// Whether this `DrainProof` is lost on purpose ([`Host::drain_proofs_to_lose`]).
+    #[cfg(test)]
+    fn lose_drain_proof(&mut self, site: Site) -> bool {
+        if self.drain_proofs_to_lose == 0 {
+            return false;
+        }
+        self.drain_proofs_to_lose -= 1;
+        tracing::warn!(
+            node = self.node.0,
+            partition = site.partition.0,
+            "drain_proof_lost_for_test"
+        );
+        true
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    fn lose_drain_proof(&mut self, _site: Site) -> bool {
+        false
+    }
+
+    /// A-R303: a re-plan F1 ended `Blocked` on that [`Self::rejoin_blocked`] could not replace
+    /// is sent again with the same members once it is `peer_drop_after_millis` old, so a block
+    /// that clears (a control-store outage, a copy that comes back) does not hold the partition
+    /// for ever.
+    ///
+    /// A revocation A1 has not answered with a `DrainProof` within `peer_drop_after_millis`
+    /// is asked again (ruling A-R316, critic-degraded A-2): A1 persists a repeated request
+    /// again, and answers it with the proof once the revocation is held.
+    fn retry_blocked_rejoin(&mut self, partition: PartitionId, now: Tick) {
+        let (planned, replan) = match self.rejoins.get(&partition).copied() {
+            None => return,
+            Some(Rejoin::Planned { generation, replan }) => (generation, replan),
+            Some(Rejoin::Revoking { epoch, replan }) => {
+                let waited_ms = HostClock::millis_until(replan.since, now);
+                if waited_ms >= self.peer_drop_after_millis {
+                    tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        epoch = epoch.0,
+                        dropped = ?replan.drop.map(|node| node.0),
+                        rejoiner = ?replan.rejoiner.map(|node| node.0),
+                        waited_ms,
+                        "rejoin_revoke_retry"
+                    );
+                    self.start_revoke(
+                        partition,
+                        epoch,
+                        Replan {
+                            since: now,
+                            ..replan
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        let blocked = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Blocked(_)));
+        let waited_ms = HostClock::millis_until(replan.since, now);
+        if !blocked || waited_ms < self.peer_drop_after_millis {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let epoch = committed.selected.root.owner_epoch;
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            planned = planned.0,
+            dropped = ?replan.drop.map(|node| node.0),
+            rejoiner = ?replan.rejoiner.map(|node| node.0),
+            waited_ms,
+            "rejoin_retry"
+        );
+        self.start_revoke(
+            partition,
+            epoch,
+            Replan {
+                since: now,
+                ..replan
+            },
+        );
     }
 
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
@@ -3332,9 +5847,7 @@ impl Host {
         else {
             return;
         };
-        // K1 ruling, condition 6: a rebuild that never pinned while L1 admits writes is not a
-        // stall anyone waits on, so the line is never printed then.
-        if self.admits(partition) == Some(true) {
+        if rebuild_quiet(&watch.mode, self.admits(partition)) {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -3344,17 +5857,20 @@ impl Host {
             return;
         }
         let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
-        let phase = self
-            .recoveries
-            .get(&partition)
-            .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
+        let f1_phase = self.recoveries.get(&partition).map(|f1| f1.phase());
+        let phase = f1_phase
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |phase| format!("{phase:?}"));
         let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
         let mode = watch.mode.clone();
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
-             waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
-             rebuild, so the partition",
-            partition.0, generation.0, watch.mode, watch.cutoff.0,
+             waited_ms={waited_ms} phase={phase}{}, so the partition",
+            partition.0,
+            generation.0,
+            watch.mode,
+            watch.cutoff.0,
+            unpinned_cause(f1_phase.as_ref()),
         );
         tracing::error!(
             node = self.node.0,
@@ -3467,6 +5983,7 @@ impl Host {
         emitter: NodeId,
     ) -> Result<(), Fault> {
         let partition = site.partition;
+        let landed_generation = result.new_generation;
         let first = self.landed.insert((partition, result.new_generation));
         let barrier = in_barrier(&result, self.node);
         tracing::info!(
@@ -3484,9 +6001,10 @@ impl Host {
         // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
         // generation now, before `Recovered` re-anchors its receiver, so it never carries an
         // unlinked generation into the next open.
-        // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is.
+        // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is: the
+        // acquire waits for the link's sync on the syncer (A-R326).
         let caught_up = if first && !barrier {
-            let caught_up = self.land_link(partition, &result);
+            let caught_up = self.land_link(partition, &result)?;
             self.sync_link(partition, result.new_generation)?;
             caught_up
         } else {
@@ -3496,9 +6014,21 @@ impl Host {
             self.stamp_retirement(partition, result.new_generation);
         }
         self.restore_marks(partition, result.new_generation)?;
+        // #59 item 4: the `CopyCaughtUp` below is kept for re-sending before the deferred
+        // syncs are answered, so a post-commit sync F1 sent before this landing ends it too
+        // (A-R422).
+        if first {
+            self.caught_up_resends
+                .retain(|(p, g), _| *p != partition || *g >= landed_generation);
+        }
+        if let Some(event) = &caught_up {
+            self.track_caught_up(&result, event, emitter, site);
+        }
         self.answer_deferred_syncs(partition, result.new_generation);
-        self.schedule_acquire(&result, site);
+        self.acquire_after_link(&result, site);
         self.committed.insert(partition, result.clone());
+        self.committed_correlation
+            .insert(partition, site.correlation);
         self.push(
             site,
             EventKind::Kernel(KernelEvent::Recovered(result)),
@@ -3507,7 +6037,27 @@ impl Host {
         );
         // Then it reports itself caught up at the cutoff to the F1 that committed, in B-R59's
         // shape; F1's `Committed` arm pins it and syncs it like any required copy.
+        // #59 item 4: a lost one is re-sent on a backoff until F1's post-commit sync for this
+        // generation reaches this copy ([`Self::resend_caught_up`]); a newer landing ends it.
         if let Some(event) = caught_up {
+            #[cfg(test)]
+            {
+                let mut dropped = DROP_CAUGHT_UP
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(at) = dropped
+                    .iter()
+                    .position(|dir| self.engine.path().starts_with(dir))
+                {
+                    dropped.remove(at);
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        "test_caught_up_dropped"
+                    );
+                    return Ok(());
+                }
+            }
             let msg = Msg::Routed {
                 partition,
                 correlation: site.correlation,
@@ -3528,16 +6078,26 @@ impl Host {
     /// Ruling A-R185 (critic-d7fix (c), C2, C3, C6): this copy landed `result` outside its
     /// barrier, so it does not hold the new generation. When it holds its newest older
     /// generation exactly through the cutoff, with the cutoff digest there, it links the new
-    /// generation onto it at the cutoff with [`Self::inherit_missed_link`]'s guards, and answers
-    /// the `CopyCaughtUp` to send: caught up at the cutoff, nothing to copy. Otherwise it writes
-    /// nothing, sends nothing and logs `land_link_refused{reason}`; the partition's writes then
-    /// stay paused until the database is opened again. Called once per (partition, generation):
+    /// generation onto it at the cutoff ([`Self::land_at`]), and answers the `CopyCaughtUp` to
+    /// send: caught up at the cutoff, nothing to copy. When it holds less (arm 3, A-R224 item
+    /// 3) it links at its own head, logged `land_link_behind`, gets a receiver there, and
+    /// answers nothing: its `Recovered` asks the primary for the rest. Otherwise it writes
+    /// nothing, sends nothing and logs `land_link_refused{reason}`. A copy refused past the
+    /// cutoff does not stall writes: the drop duty leaves it out, and once it restarts it is
+    /// re-added as a shadow and walked up from the root (#59,
+    /// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up`). Called once per
+    /// (partition, generation):
     /// `landed` dedups the landing.
+    ///
+    /// # Errors
+    ///
+    /// A `land_link_receiver_refused` fault when the link is made but the pin's own copy cannot
+    /// hold a receiver (review-r185 ADV2).
     fn land_link(
         &mut self,
         partition: PartitionId,
         result: &RecoveryResult,
-    ) -> Option<RecoveryEvent> {
+    ) -> Result<Option<RecoveryEvent>, Fault> {
         // The new generation's lineage, spelled once (review-r185 ADV1).
         let lineage = result.selected.root;
         let generation = lineage.generation;
@@ -3566,7 +6126,7 @@ impl Host {
                     "land_link_refused"
                 );
             }
-            None
+            Ok(None)
         };
         let Some(copy) = result
             .committed
@@ -3594,17 +6154,31 @@ impl Host {
             base_seq: cutoff,
             base_digest: digest,
         };
-        match self.inherit_missed_link(partition, anchor) {
-            Ok(from) => {
+        match self.land_at(partition, anchor) {
+            Ok((from, head, at)) => {
                 self.land_linked.insert((partition, generation));
-                tracing::info!(
-                    node,
-                    partition = partition.0,
-                    from = from.0,
-                    to = generation.0,
-                    base = cutoff.0,
-                    "land_link_inherited"
-                );
+                // Arm 3 (arch-s2, A-R224 item 3): behind the cutoff, linked at its own head.
+                let behind = head < cutoff;
+                if behind {
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        from = from.0,
+                        to = generation.0,
+                        head = head.0,
+                        base = cutoff.0,
+                        "land_link_behind"
+                    );
+                } else {
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        from = from.0,
+                        to = generation.0,
+                        base = cutoff.0,
+                        "land_link_inherited"
+                    );
+                }
                 // No frame of the new generation reaches R1 before `Recovered` (pushed after
                 // this), so the receiver installed here sees nothing before it re-anchors.
                 let held = self.replication.receiver(self.node, partition);
@@ -3621,6 +6195,21 @@ impl Host {
                         quarantined = kept.quarantine().is_some(),
                         "land_receiver_kept"
                     );
+                } else if result
+                    .committed
+                    .pinned_config
+                    .member(copy)
+                    .is_some_and(|member| member.role == ReplicaRole::Primary)
+                {
+                    // The pin's primary holds no receiver: it appends. Linked, nothing to send
+                    // (#59 item 5: before, `AppendReceiver::new` refused it, logged as an error).
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        generation = generation.0,
+                        "land_receiver_primary"
+                    );
+                    return Ok(None);
                 } else {
                     // Claims nothing durable, as a dormant receiver does: F1's sync proves the
                     // cutoff, and the next flush raises it (critic-d7fix follow-up A1).
@@ -3630,8 +6219,8 @@ impl Host {
                         own: copy,
                         lineage,
                         head: Head {
-                            seq: cutoff,
-                            digest,
+                            seq: head,
+                            digest: at,
                         },
                         durable: DurableSeq(durable),
                     });
@@ -3642,30 +6231,32 @@ impl Host {
                                 node,
                                 partition = partition.0,
                                 generation = generation.0,
-                                head = cutoff.0,
+                                head = head.0,
                                 durable,
                                 "land_receiver_installed"
                             );
                         }
+                        // review-r185 ADV2, #59: a member the pin names as a secondary that a
+                        // receiver still refuses (a root and a pin of different partitions) is a
+                        // broken commit, not a copy that cannot catch up: the node faults by
+                        // name, as `inherit` does.
                         Err(error) => {
-                            tracing::error!(
-                                node,
-                                partition = partition.0,
-                                generation = generation.0,
-                                ?error,
-                                "land_link_receiver_refused"
-                            );
-                            return None;
+                            return Err(Fault::from(format!(
+                                "land_link_receiver_refused p{} g{}: {error:?}",
+                                partition.0, generation.0
+                            )));
                         }
                     }
                 }
-                Some(RecoveryEvent::CopyCaughtUp {
+                // Behind, it is not caught up: its `Recovered` re-anchors the receiver at its
+                // head under the root and R1 sends the rest, older-stamped, then reports it.
+                Ok((!behind).then_some(RecoveryEvent::CopyCaughtUp {
                     copy,
                     head: cutoff,
                     digest,
-                })
+                }))
             }
-            Err(reason) => refused(reason.trim_start_matches("missed_generation_")),
+            Err(reason) => refused(reason),
         }
     }
 
@@ -3731,25 +6322,45 @@ impl Host {
     /// would leave the counter naming a generation no copy holds, and every later open would
     /// be `Stale`. One sync per generation change; none when every write is synced already.
     /// A failed sync faults the node, so nothing follows the link.
+    ///
+    /// A-R326: the sync runs on the syncer, requested after the link is written, so it covers
+    /// it. Until it returns the generation is in [`Self::link_pending`], and [`Self::land`]
+    /// holds the acquire there instead of scheduling it; the node's thread never waits.
     fn sync_link(&mut self, partition: PartitionId, generation: Generation) -> Result<(), Fault> {
         if self.engine.wal_synced_through_latest() {
             return Ok(());
         }
-        let started = Instant::now();
-        self.engine.sync_wal_through(Vec::new()).map_err(|fault| {
-            Fault::from(format!(
-                "sync the link of p{} g{}: {fault:?}",
-                partition.0, generation.0
-            ))
-        })?;
+        self.link_pending
+            .insert((partition, generation), Vec::new());
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
             generation = generation.0,
-            millis = millis(started),
-            "link_synced"
+            "link_sync_requested"
         );
-        Ok(())
+        self.request_sync(AfterSync::Link {
+            partition,
+            generation,
+            started: Instant::now(),
+        })
+    }
+
+    /// A-R217 and A-R326: [`Self::schedule_acquire`] once `result`'s generation is linked
+    /// durably. While [`Self::sync_link`]'s sync is in flight the acquire waits in
+    /// [`Self::link_pending`], and the `Link` continuation schedules it.
+    fn acquire_after_link(&mut self, result: &RecoveryResult, site: Site) {
+        let key = (site.partition, result.new_generation);
+        let Some(waiting) = self.link_pending.get_mut(&key) else {
+            self.schedule_acquire(result, site);
+            return;
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = site.partition.0,
+            generation = result.new_generation.0,
+            "acquire_waits_on_link_sync"
+        );
+        waiting.push((Box::new(result.clone()), site));
     }
 
     /// §4.1: A1's first `AcquireDue`, on the pinned primary only (the lowering's rule: the dead
@@ -4032,9 +6643,10 @@ impl Host {
     /// head is a re-send to a copy that is behind. After `stuck_resends` of them the copy is not
     /// advancing: warn once for the episode. A send that changes the record or the progress, or
     /// finds the copy level with the head, sets the count back to 0, so an episode begins when
-    /// the copy falls behind (D5: R1 re-sends seq 1 through L1's resume hold to copies that hold
-    /// it). The first send after the head moves past an unchanged copy repeats the last level
-    /// one, so it is re-send 1; a send that changes the record or the progress is not counted.
+    /// the copy falls behind (D5: while L1 rejects, R1's keepalive re-sends the head, seq 1 at a
+    /// start, to copies that hold it). The first send after the head moves past an unchanged copy
+    /// repeats the last level one, so it is re-send 1; a send that changes the record or the
+    /// progress is not counted.
     /// Nothing else changes; R1 keeps sending.
     fn count_resend(
         &mut self,
@@ -4172,13 +6784,12 @@ impl Host {
             // reason alone cannot say: a control-store outage on the activation CAS resolves
             // (A-R102), on a bound F1's recovery CAS too (A-R182), and a held fence may re-enter
             // at once. `Blocked` lasts until a fresh fence, `Quarantined` for good.
-            RecoveryEffect::BlockPromotion { .. } => {
-                let terminal = self.recoveries.get(&site.partition).is_some_and(|f1| {
-                    matches!(
-                        f1.phase(),
-                        RecoveryPhase::Blocked(_) | RecoveryPhase::Quarantined
-                    )
-                });
+            RecoveryEffect::BlockPromotion { reason } => {
+                let phase = self.recoveries.get(&site.partition).map(Recovery::phase);
+                let terminal = matches!(
+                    phase,
+                    Some(RecoveryPhase::Blocked(_) | RecoveryPhase::Quarantined)
+                );
                 tracing::info!(
                     node,
                     partition = site.partition.0,
@@ -4186,6 +6797,10 @@ impl Host {
                     terminal,
                     "recovery_fact"
                 );
+                // A re-plan F1 quarantined stays for the operator (spec §8.1).
+                if matches!(phase, Some(RecoveryPhase::Blocked(_))) {
+                    self.rejoin_blocked(site.partition, reason);
+                }
                 Ok(())
             }
             RecoveryEffect::RebuildStalled { copy } => {
@@ -4448,8 +7063,14 @@ impl Host {
 
     /// Restore R1's dormant receiver for this node's copy of `partition` (A-R173), from the
     /// engine's lineage at the seed's generation and the seed's epoch, revision and
-    /// configuration. A node already running a live side keeps it. `with_history` also gives
+    /// configuration. A node already running a live receiver keeps it. `with_history` also gives
     /// the receiver its verified ladder, `(0, ROOT)` through its head, once (critic-d7 F2).
+    ///
+    /// A live primary is no reason to skip a source (A-R278, A-R314): a live owner re-planning
+    /// around a restarted copy is F1's catch-up source, and R1 sources a catch-up from a receiver
+    /// only. The dormant receiver sits beside the primary, refuses every plain append, and R1
+    /// drops it at the next `Recovered`. A target restore (`with_history` false) beside a
+    /// serving primary is refused `serving_primary`: the receiver there only sources (A-R323).
     ///
     /// Nothing here faults the node (critic-d7 F5): a copy that cannot be restored is logged
     /// `dormant_restore_refused{reason}` and holds no receiver, so its catch-up is refused and
@@ -4457,10 +7078,28 @@ impl Host {
     fn restore_dormant(&mut self, partition: PartitionId, seed: &DormantSeed, with_history: bool) {
         let node = self.node;
         let held = self.replication.receiver(node, partition);
-        let dormant = held.map(AppendReceiver::is_dormant);
-        if dormant == Some(false)
-            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
-        {
+        let serving = self
+            .replication
+            .primary(node, partition)
+            .is_some_and(|primary| !primary.tracker().retired());
+        // D10 (A-R398): an owner promoted from a secondary still holds that side's receiver,
+        // retired by the promote's `Recovered` (B-R58a). R1 sources no catch-up from a retired
+        // receiver, so a source restore replaces it as if none were held.
+        let stale = serving && with_history && held.is_some_and(AppendReceiver::retired);
+        let dormant = held.filter(|_| !stale).map(AppendReceiver::is_dormant);
+        if dormant == Some(false) {
+            return;
+        }
+        // Beside a serving primary the receiver only sources (A-R314, A-R323 A-6): a target
+        // restore here would let recovery appends into the primary's own store.
+        if serving && !with_history {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                generation = seed.lineage.generation.0,
+                reason = "serving_primary",
+                "dormant_restore_refused"
+            );
             return;
         }
         if dormant.is_none() {
@@ -4582,6 +7221,139 @@ impl Host {
         Ok(rungs)
     }
 
+    /// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired`. The primary here met a record it
+    /// does not retain; this engine still holds every record, so the primary is given its
+    /// engine's ladder ([`Replication::restore_primary_history`], K3), once per generation, and
+    /// the copy's next `NeedPrefix` walks it record by record. The sim's twin is
+    /// `snapshot_catchup` in `rdb-sim`'s dispatch.
+    ///
+    /// Never faults the node. A repeat `(copy, barrier)` is dropped (B-R48). An ask after the
+    /// ladder was restored cannot be served by re-sending, so it is logged
+    /// `snapshot_catchup_unservable` (warn) and the copy stays behind, named. No primary here, an
+    /// unreadable ladder or a refused one is logged `snapshot_catchup_unserved{reason}` (warn).
+    fn snapshot_catchup(&mut self, partition: PartitionId, copy: CopyId, barrier: Seq) {
+        let node = self.node;
+        let started = Instant::now();
+        let unserved = |reason: &str| {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                reason,
+                "snapshot_catchup_unserved"
+            );
+        };
+        let Some(primary) = self.replication.primary(node, partition) else {
+            return unserved("no_primary");
+        };
+        let generation = primary.tracker().lineage().generation;
+        if !self.snapshots_served.insert((partition, copy, barrier)) {
+            return;
+        }
+        if self.primary_ladders.contains(&(partition, generation)) {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                generation = generation.0,
+                "snapshot_catchup_unservable"
+            );
+            return;
+        }
+        let read = match self.dormant_rungs(partition, generation) {
+            Ok(read) => read,
+            Err(reason) => return unserved(reason),
+        };
+        if self
+            .replication
+            .restore_primary_history(node, partition, &read)
+            .is_err()
+        {
+            return unserved("ladder_refused");
+        }
+        self.primary_ladders.insert((partition, generation));
+        tracing::info!(
+            node = node.0,
+            partition = partition.0,
+            copy = copy.0,
+            barrier = barrier.0,
+            generation = generation.0,
+            rungs = read.len(),
+            millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "snapshot_catchup_served"
+        );
+    }
+
+    /// H3 (I1, A-R254): R1's `CopyAheadOnControl`. `copy` answered `NeedLineage`, `NeedConfig`
+    /// or `UnknownEpoch`, so it has not landed the root this node holds. Re-post that root to
+    /// the copy's node as a landing, through [`Links::send`], which honours a hold or a drop
+    /// exactly as any peer message does, so a held copy is not reached early. Logged
+    /// `copy_ahead_reposted`. The cursor that emitted it stopped; the keepalive starts a new one
+    /// once the copy has landed. The sim's twin is `copy_ahead` in `rdb-sim`'s dispatch.
+    ///
+    /// Never faults the node: no committed root here (a recovery source's cursor, whose answer
+    /// is F1's) is logged `copy_ahead_unrouted`, a root whose pin has no such copy
+    /// `copy_ahead_unknown_copy`, and an unreachable node `copy_ahead_unreachable` (all warn).
+    fn copy_ahead(&mut self, partition: PartitionId, copy: CopyId) {
+        let node = self.node.0;
+        let (Some(result), Some(&correlation)) = (
+            self.committed.get(&partition),
+            self.committed_correlation.get(&partition),
+        ) else {
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                "copy_ahead_unrouted"
+            );
+            return;
+        };
+        let Some(member) = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.copy == copy)
+            .map(|member| member.node)
+        else {
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                "copy_ahead_unknown_copy"
+            );
+            return;
+        };
+        let generation = result.new_generation.0;
+        let msg = Msg::Landed {
+            result: result.clone(),
+            partition,
+            correlation,
+            emitter: self.node,
+            not_before: self.clock.now().plus_millis(CONTROL_WATCH_MILLIS),
+        };
+        match self.links.send(self.node, member, msg) {
+            Ok(()) => tracing::info!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                member = member.0,
+                generation,
+                "copy_ahead_reposted"
+            ),
+            Err(fault) => tracing::warn!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                member = member.0,
+                ?fault,
+                "copy_ahead_unreachable"
+            ),
+        }
+    }
+
     /// R1 answered under a catch-up's correlation and runs no source for its copy: it refused
     /// the catch-up, or its cursor stopped. Forget the asker, as the sim does, so a later
     /// `CopyCaughtUp` for that copy never reaches a stale F1; the asker's own deadline re-asks.
@@ -4674,12 +7446,21 @@ impl Host {
                 return;
             }
         }
-        let Some(answer) = self.answer(partition, ask) else {
+        let reply = Reply::Peer { asker, correlation };
+        let Some(answer) = self.answer(partition, ask, reply) else {
             return;
         };
-        let msg = Msg::Routed {
+        // An inventory goes back stamped with the anchor it answers, checked against the plan
+        // current when it is offered. A sync's answer leaves after its sync returns, through
+        // `send_answer` (A-R326), so `answer` never returns one here.
+        let PeerAsk::Inventory { anchor, .. } = *ask else {
+            self.send_answer(reply, partition, answer);
+            return;
+        };
+        let msg = Msg::Answered {
             partition,
             correlation,
+            asked: anchor,
             kind: KernelEvent::Recovery(answer),
         };
         if let Err(fault) = self.links.send(self.node, asker, msg) {
@@ -4692,7 +7473,36 @@ impl Host {
         }
     }
 
-    fn answer(&mut self, partition: PartitionId, ask: &PeerAsk) -> Option<RecoveryEvent> {
+    /// Send `answer` where `reply` says.
+    fn send_answer(&mut self, reply: Reply, partition: PartitionId, answer: RecoveryEvent) {
+        match reply {
+            Reply::Here(site) => self.answer_here(site, answer),
+            Reply::Peer { asker, correlation } => {
+                let msg = Msg::Routed {
+                    partition,
+                    correlation,
+                    kind: KernelEvent::Recovery(answer),
+                };
+                if let Err(fault) = self.links.send(self.node, asker, msg) {
+                    tracing::warn!(
+                        node = self.node.0,
+                        asker = asker.0,
+                        ?fault,
+                        "peer_answer_unreachable"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The answer to `ask` now, or `None` when there is none yet: a `PeerAsk::Sync` is
+    /// answered to `reply` once its sync returns (A-R326).
+    fn answer(
+        &mut self,
+        partition: PartitionId,
+        ask: &PeerAsk,
+        reply: Reply,
+    ) -> Option<RecoveryEvent> {
         match *ask {
             PeerAsk::Inventory { copy, anchor } => Some(self.inventory(partition, copy, anchor)),
             PeerAsk::Sync {
@@ -4700,7 +7510,10 @@ impl Host {
                 cutoff,
                 generation,
                 post_commit,
-            } => self.sync(partition, copy, cutoff, generation, post_commit),
+            } => {
+                self.request_holder_sync(partition, copy, cutoff, generation, post_commit, reply);
+                None
+            }
         }
     }
 
@@ -4722,7 +7535,15 @@ impl Host {
         anchor: LineageAnchor,
     ) -> RecoveryEvent {
         if anchor.lineage.generation > Generation(0) {
-            return match self.survivor(partition, copy, anchor) {
+            #[cfg(test)]
+            let survived = if self.refuse_inventories {
+                Err("refused_by_test")
+            } else {
+                self.survivor(partition, copy, anchor)
+            };
+            #[cfg(not(test))]
+            let survived = self.survivor(partition, copy, anchor);
+            return match survived {
                 Ok(inventory) => {
                     tracing::info!(
                         node = self.node.0,
@@ -4800,9 +7621,13 @@ impl Host {
     /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
     /// `Dispatcher::current_inventory` reports, read from this engine alone.
     ///
-    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at
+    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at or below
     /// `anchor.base_seq` (its stored link), and the digest it stores at the base is
-    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). A copy holding a newer generation of the
+    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). The digest chains every record before
+    /// it, so a match there proves the prefix. A copy that linked the generation below the
+    /// base (`land_link_behind`) and stored the base's record since holds the anchor too (D8,
+    /// A-R337). A link above the base has no producer and is refused. A copy holding a newer
+    /// generation of the
     /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
     /// plan is made, never here.
     fn survivor(
@@ -4834,7 +7659,7 @@ impl Host {
             .engine
             .link(partition, generation)
             .ok_or("anchor_generation_unlinked")?;
-        if link.base != anchor.base_seq {
+        if link.base > anchor.base_seq {
             return Err("base_differs");
         }
         let digest_at = |seq: Seq| -> Result<Digest, &'static str> {
@@ -4919,16 +7744,65 @@ impl Host {
         }
     }
 
-    /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`). `None` is a
-    /// withheld answer, logged as `sync_withheld`: F1's own timer reports it.
-    fn sync(
+    /// Where a copy that landed a commit outside its barrier links the new generation
+    /// (arch-s2 `land_at`, A-R224): at its own head of its newest older generation, when that
+    /// head is at or below the anchor's base. At the base, the digest there must be the
+    /// anchor's (arm 2). Below it (arm 3), the digest at its head is not checked here: the
+    /// `Recovered` that follows re-anchors the receiver at that head, and R1's prefix lookup
+    /// answers `Match` (catch-up, older-stamped records) or `Differs` (named divergence, arm 6).
+    /// Answers the generation linked from, the head and the digest there. A refusal writes
+    /// nothing and names its reason, as [`Self::inherit_missed_link`] does; that one stays the
+    /// survivor's exact-base guard (A-R177), and this one is never called from `survivor`.
+    fn land_at(
+        &mut self,
+        partition: PartitionId,
+        anchor: LineageAnchor,
+    ) -> Result<(Generation, Seq, Digest), &'static str> {
+        let to = anchor.lineage.generation;
+        let base = anchor.base_seq;
+        let from = self
+            .engine
+            .lineages()
+            .into_iter()
+            .filter(|(p, g)| *p == partition && *g < to)
+            .map(|(_, g)| g)
+            .max()
+            .ok_or("anchor_generation_absent")?;
+        let head = Seq(self.engine.buffered_applied(partition, from).0);
+        if head > base {
+            return Err("held_past_base");
+        }
+        let at = if head == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, from, head)?.1
+        };
+        if head == base && at != anchor.base_digest {
+            return Err("base_digest_differs");
+        }
+        if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
+            return Err("link_depth_ceiling");
+        }
+        self.views.remove(&partition);
+        match self.engine.inherit(partition, from, to, head) {
+            Ok(Inherited::Linked | Inherited::AlreadyInherited) => Ok((from, head, at)),
+            Ok(Inherited::Copied { .. }) => Err("copied"),
+            Err(_) => Err("link_refused"),
+        }
+    }
+
+    /// `SyncWalThrough` on this holder's engine (the sim's `sync_wal_through`), on the syncer
+    /// (A-R326): requested now, after the writes it must cover, and answered to `reply` by
+    /// [`Self::sync_answer`] once it returns. A request the syncer cannot take faults the node.
+    fn request_holder_sync(
         &mut self,
         partition: PartitionId,
         copy: CopyId,
         cutoff: Seq,
         generation: Generation,
         post_commit: bool,
-    ) -> Option<RecoveryEvent> {
+        reply: Reply,
+    ) {
         let node = self.node.0;
         if !post_commit {
             let pause = {
@@ -4946,17 +7820,88 @@ impl Host {
                 std::thread::sleep(pause);
             }
         }
-        let captured = vec![CapturedPrefix {
+        tracing::info!(
+            node,
+            partition = partition.0,
+            copy = copy.0,
+            cutoff = cutoff.0,
+            generation = generation.0,
+            post_commit,
+            "holder_sync_requested"
+        );
+        // #59 item 4: F1 syncs this copy after the commit only once it has what it needs from
+        // it, so the landing's `CopyCaughtUp` stops being re-sent.
+        if post_commit {
+            if let Some(resend) = self.caught_up_resends.remove(&(partition, generation)) {
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    generation = generation.0,
+                    attempts = resend.attempt,
+                    "caught_up_resend_done"
+                );
+            }
+        }
+        let capture = CapturedPrefix {
             partition,
             generation,
             through: AppliedSeq(cutoff.0),
-        }];
-        if let Err(fault) = self.engine.sync_wal_through(captured) {
+        };
+        let requested = self.request_sync(AfterSync::Answer {
+            reply,
+            copy,
+            post_commit,
+            captured: [capture],
+        });
+        if let Err(fault) = requested {
+            self.set_fault(fault);
+        }
+    }
+
+    /// Crate rows: a holder's recovery sync on this thread, begun and finished at once, and
+    /// its answer, as [`Self::request_holder_sync`] then the sync's return give it.
+    #[cfg(test)]
+    fn sync(
+        &mut self,
+        partition: PartitionId,
+        copy: CopyId,
+        cutoff: Seq,
+        generation: Generation,
+        post_commit: bool,
+    ) -> Option<RecoveryEvent> {
+        let capture = CapturedPrefix {
+            partition,
+            generation,
+            through: AppliedSeq(cutoff.0),
+        };
+        let sync = self.engine.begin_sync(vec![capture]);
+        let flushed = sync.flush();
+        let synced = self.engine.finish_sync(sync, flushed).is_ok();
+        self.sync_answer(capture, copy, post_commit, synced)
+    }
+
+    /// A holder's recovery sync returned (`synced` says whether it succeeded): the
+    /// `DurableAt` proof, or `None`, a withheld answer, logged as `sync_withheld`: F1's own
+    /// timer reports it.
+    fn sync_answer(
+        &mut self,
+        capture: CapturedPrefix,
+        copy: CopyId,
+        post_commit: bool,
+        synced: bool,
+    ) -> Option<RecoveryEvent> {
+        let node = self.node.0;
+        let CapturedPrefix {
+            partition,
+            generation,
+            through: AppliedSeq(cutoff),
+        } = capture;
+        let cutoff = Seq(cutoff);
+        if !synced {
             tracing::warn!(
                 node,
                 copy = copy.0,
                 cutoff = cutoff.0,
-                ?fault,
                 reason = "failed",
                 "sync_withheld"
             );
@@ -5005,11 +7950,14 @@ impl Host {
             post_commit,
             "sync_proven"
         );
+        // The boot of this process, the one that synced (A-R239a). Links here are in-process,
+        // so it is not the copy's claim; F1 counts it only if the plan names it.
         Some(RecoveryEvent::DurableAt(DurableProof {
             copy,
             partition,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: self.boot,
         }))
     }
 
@@ -5106,10 +8054,13 @@ impl Host {
                     return Ok(());
                 }
                 Err(error) => {
-                    let _ = reply.send(Answer::Error {
-                        error,
-                        request: None,
-                    });
+                    let _ = reply.send(self.redirect(
+                        partition,
+                        Answer::Error {
+                            error,
+                            request: None,
+                        },
+                    ));
                     return Ok(());
                 }
             },
@@ -5143,7 +8094,7 @@ impl Host {
                     kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
                     "client_compile"
                 );
-                let _ = reply.send(answer);
+                let _ = reply.send(self.redirect(partition, answer));
                 return Ok(());
             }
             ClientCall::Resend { request } => (
@@ -5288,9 +8239,33 @@ impl Host {
         puts: &[PutOp],
         remaining_millis: u64,
     ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
+        // A node that knows it is a secondary (it receives this partition's appends and is not
+        // its primary) sends the caller to the owner: `NOT_PRIMARY`, before the guard below,
+        // which would otherwise answer a retryable `UNAVAILABLE` and keep an app routed here
+        // (ruling A-R233). Never sent, so nothing mutated.
+        if self.replication.primary(self.node, partition).is_none()
+            && self.replication.receiver(self.node, partition).is_some()
+        {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                "client_compile_not_primary"
+            );
+            let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+                partition,
+                hint: None,
+            });
+            error.no_mutation = true;
+            error.detail = format!(
+                "node {} is a secondary of partition {}, not its owner; nothing was sent",
+                self.node.0, partition.0
+            );
+            return Ok(Err(error));
+        }
         let generation = self.adopted(partition).generation;
         // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
-        // Refused here and never sent (lead ruling on D1, 2026-10-07).
+        // Refused here and never sent (lead ruling on D1, 2026-10-07). The owner before it is
+        // ready keeps this answer (A-R233).
         if generation.0 == 0 {
             return Ok(Err(ApiError::not_adopted(self.node, partition)));
         }
@@ -5326,9 +8301,8 @@ impl Host {
             // The damaged chunk a Chunk or Publish arm met, with its upload, for the log (A-R132).
             let mut chunk = None;
             let compiled = match &put.change {
-                Change::Doc(delta) => {
-                    rdb_value::compile(view, &root, expected, delta).map_err(|e| compile_error(&e))
-                }
+                Change::Doc(delta) => rdb_value::compile(view, &root, expected, delta)
+                    .map_err(|e| compile_error(&root, &e)),
                 Change::Map(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
@@ -5336,7 +8310,7 @@ impl Host {
                     expected,
                     ops,
                 )
-                .map_err(|e| compile_error(&e)),
+                .map_err(|e| compile_error(&root, &e)),
                 Change::Set(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
@@ -5344,7 +8318,7 @@ impl Host {
                     expected,
                     ops,
                 )
-                .map_err(|e| compile_error(&e)),
+                .map_err(|e| compile_error(&root, &e)),
                 Change::List(edits) => list_compile(view, &root, expected, edits),
                 Change::Chunk { .. } | Change::Gc { .. } | Change::Clear
                     if put.expect.is_some() =>
@@ -5355,7 +8329,7 @@ impl Host {
                     )))
                 }
                 Change::Gc { floor } => rdb_value::blob::collect_garbage(view, &root, *floor)
-                    .map_err(|e| compile_error(&e)),
+                    .map_err(|e| compile_error(&root, &e)),
                 Change::Clear => self.clear(partition, identity, &root, view, published),
                 Change::Chunk {
                     upload,
@@ -5363,7 +8337,7 @@ impl Host {
                     bytes,
                 } => rdb_value::blob::put_chunk(view, &root, upload, *index, bytes).map_err(|e| {
                     chunk = damaged_chunk(&e).map(|index| (*upload, index));
-                    compile_error(&e)
+                    compile_error(&root, &e)
                 }),
                 // `serving` is the adopted generation the request will be fenced with
                 // (ADR-rdb-0014 §6 check 0).
@@ -5384,7 +8358,7 @@ impl Host {
                 )
                 .map_err(|e| {
                     chunk = damaged_chunk(&e).map(|index| (*upload, index));
-                    compile_error(&e)
+                    compile_error(&root, &e)
                 })
                 .and_then(|compiled| {
                     if compiled.mutations.is_empty() {
@@ -5419,6 +8393,8 @@ impl Host {
             remaining_millis,
             conditions,
             mutations,
+            acked_below: None,
+            pinned: Vec::new(),
         })))
     }
 
@@ -5488,14 +8464,14 @@ impl Host {
                     "not damaged",
                     "a write applied since may still be lost; clear again once it is published",
                 )?;
-                Err(compile_error(&error))
+                Err(compile_error(root, &error))
             }
             // No read gate (A-R139): none of these says the object is healthy or that nothing
             // is stored, and no_mutation=true holds on any view: INCOMPATIBLE_VERSION, a chunk
             // record at the root key (`KindMismatch`), a batch over the size limit, or
             // CORRUPT_HISTORY for a stored version with no value (`VersionWithoutValue`).
             Err(error) => {
-                let mut refused = compile_error(&error);
+                let mut refused = compile_error(root, &error);
                 if refused.kind == ErrorKind::IncompatibleVersion {
                     refused.detail.push_str("; not cleared");
                 }
@@ -5565,7 +8541,8 @@ impl Host {
             },
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
                 .read_answer(partition, *outcome, *value, &root, &look)
-                .map_err(|detail| fail_waiter(&pending.reply, detail))?,
+                .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .in_mode(self.recovery_mode(partition)),
             (reply, kind) => {
                 return Err(fail_waiter(
                     &pending.reply,
@@ -5576,6 +8553,7 @@ impl Host {
                 ));
             }
         };
+        let answer = self.redirect(partition, answer);
         // The caller stopped waiting, at its own deadline, before the answer came: the answer is
         // lost here. A write's caller then holds `UNKNOWN_OUTCOME`, which `status` settles.
         if pending.reply.send(answer).is_err() {
@@ -5622,8 +8600,10 @@ impl Host {
 
     /// P1's answer to a `ReadPrevious`: the kept view it handed out, read for the asked object,
     /// or why there is none. A handle storage never bound is a host fault.
+    /// `partition` is the site whose P1 answered, so `recovery_mode` reads that partition.
     fn previous_answer(
         &mut self,
+        partition: PartitionId,
         identity: RequestIdentity,
         handle: Result<SnapshotHandle, ErrorKind>,
     ) -> Result<(), Fault> {
@@ -5656,6 +8636,7 @@ impl Host {
                 seen: Seen::Absent,
                 generation: Generation(0),
                 at: Seq::ZERO,
+                recovery_mode: false,
             },
             Ok(handle) => {
                 let view = self.bound.get(&handle).ok_or_else(|| {
@@ -5672,10 +8653,20 @@ impl Host {
                     ReadServiceOutcome::Served,
                 )
                 .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .in_mode(self.recovery_mode(partition))
             }
         };
+        let answer = self.redirect(partition, answer);
         let _ = pending.reply.send(answer);
         self.release_queued(identity)
+    }
+
+    /// Whether this node's last committed recovery of `partition` is `ReadOnly`: its reads then
+    /// serve a lone copy's declared cutoff (spec §8.4 step 4, A-R402).
+    fn recovery_mode(&self, partition: PartitionId) -> bool {
+        self.committed
+            .get(&partition)
+            .is_some_and(|committed| committed.mode == PartitionMode::ReadOnly)
     }
 
     /// §4.2: the bytes come from the step view P1 just answered from, re-checked against the
@@ -5698,6 +8689,7 @@ impl Host {
                 seen: Seen::Absent,
                 generation,
                 at,
+                recovery_mode: false,
             });
         };
         let key = root.as_bytes();
@@ -5830,6 +8822,31 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             reload_pending: None,
+            lengths: Some(IndexLengths {
+                dedup: self
+                    .transaction
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.dedup().len()),
+                status: self
+                    .publication
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.status_len()),
+                ladder: match self.replication.primary(self.node, partition) {
+                    Some(primary) => primary.tracker().history().len(),
+                    None => receiver.map_or(0, |receiver| receiver.history().len()),
+                },
+                published_at: self.published_at.get(&partition).map_or(0, VecDeque::len),
+            }),
+            pinned: self
+                .committed
+                .get(&partition)
+                .map_or_else(Vec::new, |result| {
+                    result.committed.pinned_config.members.clone()
+                }),
+            config_version: self
+                .committed
+                .get(&partition)
+                .map(|result| result.committed.pinned_config.config_version),
         }
     }
 }
@@ -5841,6 +8858,19 @@ fn step_l1(
     event: &Event,
 ) -> Result<Vec<Effect>, RdbError> {
     let mut hosted = table.remove(&ctx.partition).unwrap_or_default();
+    // A-R297: every qualification edge L1 sees, so a pause with no `warn` before it can be
+    // traced to its input (a `Lost` edge pauses at once).
+    if let EventKind::Kernel(KernelEvent::QualificationChanged(edge)) = &event.kind {
+        tracing::debug!(
+            node = ctx.node.0,
+            partition = ctx.partition.0,
+            direction = ?edge.direction,
+            seq = edge.at_seq.0,
+            copies = ?edge.qualified_copies.iter().map(|copy| copy.0).collect::<Vec<_>>(),
+            cause = ?edge.cause,
+            "l1_qualification_edge"
+        );
+    }
     let before = hosted.protection.mode();
     let answer = hosted.protection.step(ctx, event);
     if hosted.protection == Protection::default() {
@@ -5853,6 +8883,7 @@ fn step_l1(
             partition = ctx.partition.0,
             from = before.map_or("inert", mode_name),
             to = after.map_or("inert", mode_name),
+            input = %event_name(&event.kind),
             "protection_mode"
         );
     }
@@ -5897,6 +8928,89 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
         .map(|member| member.node)
 }
 
+/// The regular secondaries among `members`: the copies outside a `ReadOnly` commit's barrier
+/// that M3's repair re-plans. A shadow is never one: L1 never counts it, and
+/// [`Host::shadow_duty`] promotes it.
+fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
+    members
+        .iter()
+        .filter(|member| member.role == ReplicaRole::RegularSecondary)
+        .map(|member| member.node)
+        .collect()
+}
+
+/// Whether a rebuild check that found F1 unpinned stays quiet. K1 ruling, condition 6: a
+/// rebuild that never pinned while L1 admits writes is not a stall anyone waits on. A
+/// `ReadOnly` commit takes no write whatever L1 says, so it is never quiet (A-R319, W5's probe:
+/// a read-only promote whose L1 had resumed was silent).
+fn rebuild_quiet(mode: &PartitionMode, admits: Option<bool>) -> bool {
+    *mode != PartitionMode::ReadOnly && admits == Some(true)
+}
+
+/// Why a watched rebuild is not pinned: the stall line's tail after `phase=`. F1 still
+/// `Committed` set up no rebuild at all: a `ReadOnly` commit whose second copy was not a source
+/// (D8, A-R337 item 3). "Never pinned" would send a reader looking for a rebuild that never
+/// existed, and no catch-up was ever needed, so `host_catch_up` is left out (critic-d8r A4).
+fn unpinned_cause(phase: Option<&RecoveryPhase>) -> &'static str {
+    match phase {
+        Some(RecoveryPhase::Committed) => ": F1 set up no rebuild",
+        _ => " host_catch_up=unsupported: F1 never pinned its rebuild",
+    }
+}
+
+/// Whether a plan run by `owner` may leave `holder` out of `members`, with how many copies it
+/// would keep. Never the owner's own copy, and never fewer than two copies: spec §8.3 has no
+/// one-copy fallback (M10 S2 part (b), A-R290).
+fn drop_target(
+    members: &[Member],
+    holder: Option<NodeId>,
+    owner: NodeId,
+) -> (Result<NodeId, &'static str>, usize) {
+    let kept = members
+        .iter()
+        .filter(|member| member.role != ReplicaRole::Shadow && Some(member.node) != holder)
+        .count();
+    let target = match holder.filter(|node| members.iter().any(|member| member.node == *node)) {
+        None => Err("the copy is not in the pinned configuration"),
+        Some(node) if node == owner => Err("the copy is this node's own"),
+        Some(_) if kept < 2 => Err("a plan keeps at least two copies"),
+        Some(node) => Ok(node),
+    };
+    (target, kept)
+}
+
+/// The member of `members` (the commit's) that F1's block on `replan` names, which
+/// [`Host::rejoin_blocked`] leaves out (ruling A-R316). `None` for a plan that already leaves
+/// one out: it is retried as it is, since leaving out another from the commit's members would
+/// put the first one back.
+fn block_leaves_out(reason: &BlockReason, replan: Replan, members: &[Member]) -> Option<NodeId> {
+    if replan.drop.is_some() {
+        return None;
+    }
+    let rejoiner = replan.rejoiner.and_then(|rejoiner| {
+        members
+            .iter()
+            .find(|member| member.node == rejoiner)
+            .map(|member| member.copy)
+    });
+    named_by_block(reason, rejoiner).and_then(|copy| holder_of(members, copy))
+}
+
+/// The copy F1's block names: the rejoiner's copy when the barrier misses it, else the one
+/// copy the barrier misses. `None` for a barrier missing several copies, none of them the
+/// rejoiner's, and for every other reason (`CasContention`, `OvertakenByPeer`,
+/// `ControlUnknown`, ...): those name no copy, so the plan is retried with the same members.
+fn named_by_block(reason: &BlockReason, rejoiner: Option<CopyId>) -> Option<CopyId> {
+    let BlockReason::BarrierIncomplete { missing } = reason else {
+        return None;
+    };
+    match rejoiner.filter(|copy| missing.contains(copy)) {
+        Some(copy) => Some(copy),
+        None if missing.len() == 1 => Some(missing[0]),
+        None => None,
+    }
+}
+
 /// Whether `node` holds a copy the committed barrier names (the sim's `in_barrier`).
 fn in_barrier(result: &RecoveryResult, node: NodeId) -> bool {
     result
@@ -5925,8 +9039,9 @@ fn fail_waiter(reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
     fault
 }
 
-/// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
-fn compile_error(error: &ValueError) -> ApiError {
+/// A value compile's refusal for the object at `root`, as the caller's error (§5.4 for documents,
+/// S0's subset).
+fn compile_error(root: &RootKey, error: &ValueError) -> ApiError {
     match error {
         // M9 S6: a clear of an object that reads back cleanly.
         ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks) => {
@@ -5958,7 +9073,11 @@ fn compile_error(error: &ValueError) -> ApiError {
             | Corrupt::ChunkMismatch { .. }
             | Corrupt::ChunkMissing { .. },
         ) => ApiError::new(ErrorKind::CorruptBlob, error.to_string()),
-        ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
+        // The caller's own object and element key, never a log's (#59, A-R230).
+        ValueError::Corrupt(corrupt) => match rdb_value::keys::parse(root.as_bytes()) {
+            Ok(parsed) => crate::db::error::corrupt_history(&parsed.object_id, corrupt),
+            Err(_) => crate::db::error::corrupt_history(root.as_bytes(), corrupt),
+        },
     }
 }
 
@@ -5997,36 +9116,26 @@ fn view_published(
     }
 }
 
-/// ADR-0013: the most bytes of a key a log line shows, as [`key_hex`].
-const KEY_HEX_MAX_BYTES: usize = 32;
-
-/// D9: a key as a log line carries it (ADR-0013): lowercase hex of its first
-/// [`KEY_HEX_MAX_BYTES`] bytes, never its text. The same rule as `config-core`'s and
-/// `config-engine`'s private copies.
-fn key_hex(key: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
-    for byte in key.iter().take(KEY_HEX_MAX_BYTES) {
-        // Writing to a String cannot fail.
-        write!(out, "{byte:02x}").expect("write to String");
-    }
-    out
-}
-
 /// D9: the `key_hex` a damage line names the object by: its id's, or the whole root key's
-/// when the root does not parse, with the parse fault, which names no bytes.
+/// when the root does not parse, with the parse fault, which names no bytes. The hex is
+/// `config_core::key_hex` (ADR-0013: lowercase, at most the first 32 bytes, never the text).
 fn object_key_hex(root: &RootKey) -> (String, Option<String>) {
     match rdb_value::keys::parse(root.as_bytes()) {
-        Ok(parsed) => (key_hex(&parsed.object_id), None),
-        Err(fault) => (key_hex(root.as_bytes()), Some(fault.to_string())),
+        Ok(parsed) => (config_core::key_hex(&parsed.object_id), None),
+        Err(fault) => (
+            config_core::key_hex(root.as_bytes()),
+            Some(fault.to_string()),
+        ),
     }
 }
 
 /// D9b: the code a damage line names stored damage by, never its `Display`, which for a map
 /// entry quotes the app's key (`Corrupt::Entry`). Exhaustive on purpose: a new variant is a
 /// compile error here, not a line that quietly falls back to the text.
-const fn damage_code(corrupt: &Corrupt) -> &'static str {
+fn damage_code(corrupt: &Corrupt) -> &'static str {
     match corrupt {
+        // The element's own fault; its key never reaches a log (#59, A-R230).
+        Corrupt::Element { error, .. } => damage_code(error),
         Corrupt::Envelope(_) => "envelope",
         Corrupt::Codec(_) => "codec",
         Corrupt::VersionWithoutValue => "version_without_value",
@@ -6169,7 +9278,7 @@ fn list_compile(
             }
         }
         .map(|compiled| compiled.compiled().clone())
-        .map_err(|e| compile_error(&e))
+        .map_err(|e| compile_error(root, &e))
     };
     let count = match expected {
         Expected::Absent => Ok(0),
@@ -6177,7 +9286,7 @@ fn list_compile(
         // because that refusal comes first.
         Expected::Version(_) => rdb_value::list::list(view, root)
             .map(|found| found.map_or(0, |list| list.count))
-            .map_err(|e| compile_error(&e)),
+            .map_err(|e| compile_error(root, &e)),
     };
     match count.and_then(|count| resolve_edits(edits, count)) {
         Ok(ops) => compile(&ops),
@@ -6252,6 +9361,172 @@ fn resolve_position(at: i64, count: u64) -> Option<u64> {
     }
 }
 
+/// What a node reads for a routed `FenceProven` before F1 sees it (A-R446).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceFacts {
+    /// `partitions/1` as read.
+    pub record: PartitionRecord,
+    /// The owner boot its root names.
+    pub owner_boot: BootId,
+    /// Its `mod_revision`.
+    pub mod_revision: Revision,
+    /// `grants/{record.owner}`, read after it; `None` when absent.
+    pub grant: Option<GrantRecord>,
+    /// The bytes at `operations/{tag + proof.control_revision}`, read last: the plan the
+    /// promote that fenced at that revision stored (A-R447); `None` when absent.
+    pub plan: Option<Bytes>,
+}
+
+/// A-R446 (review of PR #63, option (b)): whether a routed `FenceProven` is true of the control
+/// records this node read for it. `Err` names the first check that failed, and why. F1 checks
+/// only the proof's lineage and its floor, and the commit CAS compares only
+/// `control_revision`, so without this a node would commit over a live grant on a proof an app
+/// made up.
+///
+/// Why check-then-CAS is sound (ruling A-R446a): no node admits while `partitions/1` is
+/// `Fencing` and its owner's grant is frozen with `prior_grant_id` and that grant's expiry is
+/// proven past. Only the record's owner can admit (`partition::classify`). It admits on its
+/// grant alone, whatever the lifecycle (`Authority::may_admit_at`), so `Fencing` by itself is not
+/// enough: checks 2, 5 and 6 are one unit. A frozen grant never comes back: `grant::self_replace`
+/// answers `Never` on `frozen`, and `grant::clear_verdict` refuses a frozen record (guard 1) and
+/// one whose partition names the node and is not `Serving` (guard 3). So every fact checked here
+/// stays true until `partitions/1` moves, and that fails the commit CAS. The one refusal that
+/// can be wrong is this node's clock view lagging the promoter's; the host then reads and
+/// checks once more ([`fence_recheck_millis`]).
+///
+/// 0. the proof is for the partition it was routed to (critic-63 A1: F1 is given it there);
+/// 1. `partitions/1` is the proof's partition, at `control_revision`;
+/// 2. it is `Fencing`;
+/// 3. its generation and owner epoch are the proof's prior ones;
+/// 4. its root's owner boot is the proof's prior boot;
+/// 5. `grants/{owner}` is present, frozen, and the proof's prior grant;
+/// 6. the revocation is `ExpiryProven` (a routed `DurableDrain` is refused: only local paths
+///    send one), and this node's own clock view proves that grant's expiry past;
+/// 7. last (A-R447, issue #70), the promote that fenced at `control_revision` stored its plan
+///    at `operations/` (`plan_absent`), and it reads as one exactly (`plan_unreadable`).
+///
+/// `Ok` is that stored plan: the only plan the host gives F1 with a routed fence. A routed
+/// `Plan` is never pushed, so an app with only the link cert cannot choose the members, roles
+/// or boots a promote commits. The record is created once and never rewritten, and the commit
+/// CAS at `control_revision` pins the key it was read at.
+pub(crate) fn bind_routed_fence(
+    routed: PartitionId,
+    proof: &FencingProof,
+    facts: Result<FenceFacts, String>,
+    now: Tick,
+    budgets: &Budgets,
+) -> Result<RecoveryPlan, (&'static str, String)> {
+    if routed != proof.partition {
+        return Err((
+            "partition",
+            format!(
+                "routed to partition {}, the proof is for partition {}",
+                routed.0, proof.partition.0
+            ),
+        ));
+    }
+    let facts = facts.map_err(|error| ("control_read_failed", error))?;
+    let record = &facts.record;
+    if record.partition != proof.partition || facts.mod_revision != proof.control_revision {
+        return Err((
+            "revision",
+            format!(
+                "partitions/{} is at revision {}, the proof is for partitions/{} at {}",
+                record.partition.0,
+                facts.mod_revision.0,
+                proof.partition.0,
+                proof.control_revision.0
+            ),
+        ));
+    }
+    if record.lifecycle != PartitionLifecycle::Fencing {
+        return Err(("not_fencing", format!("lifecycle {:?}", record.lifecycle)));
+    }
+    if (record.generation, record.owner_epoch) != (proof.prior_generation, proof.prior_owner_epoch)
+    {
+        return Err((
+            "lineage",
+            format!(
+                "record at generation {} epoch {}, proof at {} epoch {}",
+                record.generation.0,
+                record.owner_epoch.0,
+                proof.prior_generation.0,
+                proof.prior_owner_epoch.0
+            ),
+        ));
+    }
+    if facts.owner_boot != proof.prior_boot_id {
+        return Err((
+            "owner_boot",
+            format!(
+                "record names boot {}, proof boot {}",
+                facts.owner_boot.0, proof.prior_boot_id.0
+            ),
+        ));
+    }
+    let grant = match facts.grant {
+        Some(grant) if grant.frozen && grant.grant == proof.prior_grant_id => grant,
+        Some(grant) => {
+            return Err((
+                "grant",
+                format!(
+                    "grants/{} holds grant {} frozen={}, proof grant {}",
+                    record.owner.0, grant.grant.0, grant.frozen, proof.prior_grant_id.0
+                ),
+            ))
+        }
+        None => return Err(("grant", format!("grants/{} is absent", record.owner.0))),
+    };
+    if !matches!(proof.revocation, Revocation::ExpiryProven { .. }) {
+        return Err(("revocation", format!("{:?}", proof.revocation)));
+    }
+    let mut view = ClockView::new();
+    view.accept(HostClock::control_time(now, budgets));
+    if expiry_proven(&view, grant.expiry_utc_ms, now, budgets).is_none() {
+        return Err((
+            "expiry_not_proven",
+            format!(
+                "grants/{} expires at {}, now {}",
+                record.owner.0, grant.expiry_utc_ms, now.0
+            ),
+        ));
+    }
+    let Some(stored) = facts.plan else {
+        return Err((
+            "plan_absent",
+            format!(
+                "no plan stored for the promote that fenced at revision {}",
+                proof.control_revision.0
+            ),
+        ));
+    };
+    crate::admin::decode_promote_plan(&stored).map_err(|error| ("plan_unreadable", error))
+}
+
+/// A-R446b (critic-63 M2): how long to wait before reading and checking a routed fence once
+/// more, when [`bind_routed_fence`] refused it only because this node's clock does not yet prove
+/// `expiry_utc_ms` past. Two clocks each within ε of the authority can differ by 2ε, so a node
+/// short by at most 2ε waits until its own clock would prove it: `Some(ms)`. Short by more, the
+/// fence is early on any clock in bound: `None`, refused for good. ε and δ are the ones
+/// [`bind_routed_fence`] uses: `HostClock::control_time`'s fresh sample, error
+/// `clock_error_millis`, plus `dispatch_margin_millis`.
+pub(crate) fn fence_recheck_millis(
+    expiry_utc_ms: i64,
+    now: Tick,
+    budgets: &Budgets,
+) -> Option<u64> {
+    let epsilon = i64::try_from(budgets.clock_error_millis).ok()?;
+    let delta = i64::try_from(budgets.dispatch_margin_millis).ok()?;
+    let now = i64::try_from(now.0).ok()?;
+    // `expiry_proven` holds once now > expiry + ε + δ.
+    let short = expiry_utc_ms
+        .saturating_add(epsilon)
+        .saturating_add(delta)
+        .saturating_add(1)
+        .saturating_sub(now);
+    (short > 0 && short <= epsilon.saturating_mul(2)).then_some(short.unsigned_abs())
+}
+
 fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -6262,15 +9537,22 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Control { .. } => "control",
         Msg::Fault { .. } => "fault",
         Msg::Activated { .. } => "activated",
+        Msg::OwnerLearned { .. } => "owner_learned",
+        Msg::FenceBound { .. } => "fence_bound",
         Msg::Inject { .. } => "inject",
         Msg::Frame { .. } => "frame",
         Msg::PeerAsk { .. } => "peer_ask",
         Msg::CatchUp { .. } => "catch_up",
         Msg::Restore { .. } => "restore",
         Msg::Routed { .. } => "routed",
+        Msg::Answered { .. } => "answered",
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",
         Msg::Inspect { .. } => "inspect",
+        Msg::PeerBooted { .. } => "peer_booted",
+        #[cfg(debug_assertions)]
+        Msg::Damage { .. } => "damage",
+        Msg::Synced(_) => "synced",
         Msg::Stop => "stop",
     }
 }
@@ -6378,6 +9660,7 @@ fn object_answer_unchecked(
             seen,
             generation,
             at,
+            recovery_mode: false,
         },
         Err(error) => {
             let chunk = upload.zip(damaged_chunk(&error));
@@ -6385,7 +9668,7 @@ fn object_answer_unchecked(
                 ValueError::Corrupt(corrupt) => Some(damage_code(corrupt)),
                 ValueError::Apply(_) => None,
             };
-            let error = compile_error(&error);
+            let error = compile_error(root, &error);
             log_stored_damage(node, root, &error, damage, chunk);
             Answer::Error {
                 error,
@@ -6499,6570 +9782,12 @@ fn head(debug: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rdb_core::contracts::errors::RetryRule;
-    use rdb_core::contracts::ids::{ClientId, ReceivedSeq, RequestId, TenantId};
-    use rdb_core::contracts::txn::{Durability, Outcome};
-    use rdb_value::delta::Op;
-    use rdb_value::path::Path;
-    use rdb_value::value::{Int, Map, MapKey};
-
-    /// This test's log lines whose message is `$message`. A macro, because the JSON value type
-    /// is not nameable here without a `serde_json` dependency.
-    macro_rules! logged {
-        ($method:expr, $message:expr) => {
-            config_testkit::logs::lines_for_current_test(module_path!(), $method)
-                .into_iter()
-                .filter(|line| line["@m"] == $message)
-                .collect::<Vec<_>>()
-        };
-    }
-
-    /// This test's `replication_copy_not_advancing` lines.
-    macro_rules! not_advancing {
-        ($method:expr) => {
-            logged!($method, "replication_copy_not_advancing")
-        };
-    }
-
-    /// M9 S2b, critic M2 (guard 4): after `Db::restart_node`, a `grants/1` read the previous
-    /// process asked for can still land in the new process's mailbox, since `abort` reaches a
-    /// control call only at an await. An unheld A1 acts on any read of its own grant: on
-    /// `Absent` it re-arms `AcquireDue`, and the acquire that follows commits a grant for the
-    /// new boot, which has no R1 instance to serve it. So the host drops a completion stamped
-    /// with another boot. The second half is the control: the same read stamped with this
-    /// process's boot does arm the acquire, so the first half's quiet is the boot check's.
-    /// A control fault is dropped the same way (review F-006): the previous process's failed
-    /// call must not fault the new one, and the same fault from this boot does.
-    /// Unit (~300 ms): one host, no thread; a `MemStore` shows whether a grant was written.
-    #[test]
-    fn a_grant_read_from_the_previous_boot_never_starts_an_acquire() {
-        use config_core::{ConfigStore, GetRequest};
-        use rdb_core::contracts::control::{ControlKey, ReadOutcome};
-        use rdb_core::contracts::ids::{ControlRequestId, Revision};
-
-        let dir = config_testkit::fs::temp_dir();
-        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let links = Links::new();
-        let (tx, _completions) = mpsc::channel();
-        links.register(NodeId(1), tx);
-        let store = Arc::new(config_testkit::MemStore::new());
-        let control = ControlAdapter::new(
-            Arc::clone(&store) as Arc<dyn ConfigStore>,
-            rt.handle().clone(),
-            Arc::clone(&links),
-        );
-        let mut host = Host::new(NodeId(1), engine, links, control, HostClock::start());
-        host.boot = BootId(2);
-        // The retry an acted-on read arms is due one renewal later: 20 ms here, not 500.
-        host.budgets.renew_millis = 20;
-        let read_from = |boot| Msg::Control {
-            partition: PartitionId(1),
-            correlation: CorrelationId(9),
-            boot,
-            event: ControlEvent::Value {
-                request: ControlRequestId(1),
-                key: ControlKey::Grant(NodeId(1)),
-                outcome: ReadOutcome::Absent { as_of: Revision(5) },
-            },
-        };
-        let fault_from = |boot| Msg::Fault {
-            boot,
-            kind: "control_reload_failed",
-            detail: "grants/: the store could not list it".to_owned(),
-        };
-        let grant = || {
-            rt.block_on(store.get(GetRequest {
-                key: Bytes::from(ControlKey::Grant(NodeId(1)).encode()),
-            }))
-            .expect("read grants/1")
-            .record
-        };
-
-        host.handle(read_from(BOOT));
-        // Fifteen retry intervals: an acted-on read has committed its grant long before.
-        let until = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < until {
-            host.run_due();
-            host.drain();
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(host.fault.is_none(), "{:?}", host.fault);
-        assert_eq!(
-            grant(),
-            None,
-            "a read the boot-1 process asked for made the boot-2 process acquire grants/1"
-        );
-        assert!(
-            host.timers.is_empty(),
-            "the stale read armed {:?}",
-            host.timers
-        );
-        assert!(host.authority.view().state.is_unheld());
-        host.handle(fault_from(BOOT));
-        assert!(
-            host.fault.is_none(),
-            "a control fault from the boot-1 process faulted the boot-2 process: {:?}",
-            host.fault
-        );
-
-        host.handle(read_from(BootId(2)));
-        host.drain();
-        assert_eq!(
-            host.timers.len(),
-            1,
-            "the same read from this boot arms the acquire's retry"
-        );
-
-        host.handle(fault_from(BootId(2)));
-        assert!(
-            host.fault.is_some(),
-            "the same fault from this boot faults the node"
-        );
-    }
-
-    /// Defect D1 (2026-10-07, `rdb_dev` walk 2) and the lead's ruling on it: a put sent before
-    /// the node adopted a generation was compiled against generation 0 and refused
-    /// `GENERATION_CHANGED`. Every sent put carries `expected_generation`, so before adoption
-    /// there is nothing to fence it with: the host refuses it, retryable, and sends nothing.
-    #[test]
-    fn a_put_before_any_adoption_is_refused_here_and_never_sent() {
-        let dir = config_testkit::fs::temp_dir();
-        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let links = Links::new();
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
-        let mut host = Host::new(NodeId(1), engine, links, control, HostClock::start());
-        let (reply, answers) = mpsc::channel();
-        let identity = RequestIdentity {
-            tenant: TenantId(1),
-            client: ClientId(1),
-            request: RequestId(7),
-        };
-        host.client(Client {
-            partition: PartitionId(1),
-            call: ClientCall::Put {
-                identity,
-                object: Bytes::from_static(b"a"),
-                change: byte_doc(b"v"),
-                expect: None,
-                remaining_millis: 5_000,
-            },
-            reply,
-        })
-        .expect("no host fault");
-
-        match answers.try_recv() {
-            Ok(Answer::Error { error, request }) => {
-                assert_eq!(error, ApiError::not_adopted(NodeId(1), PartitionId(1)));
-                assert_eq!(error.name(), "UNAVAILABLE");
-                assert!(error.no_mutation, "nothing was sent, so nothing mutated");
-                assert!(request.is_none(), "no request exists for `retry` to replay");
-            }
-            other => panic!("expected a local refusal, got {other:?}"),
-        }
-        assert!(host.queue.is_empty(), "nothing reached T1");
-        assert!(host.pending.is_empty(), "no reply is awaited");
-    }
-
-    /// D2 ruling, rule 3: a sync at seq 0 is answered `Digest::ROOT` by the holder itself,
-    /// after commit as before it; at seq 1 with no stored record it is still withheld.
-    #[test]
-    fn a_post_commit_sync_proves_root_at_seq_zero_and_nothing_without_a_record() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
-        let (partition, generation) = (PartitionId(1), Generation(1));
-        // Durable through seq 1, with no history record there.
-        engine
-            .commit(rdb_core::contracts::storage::Batch {
-                id: rdb_core::contracts::ids::BatchId(1),
-                partition,
-                generation,
-                seq: Seq(1),
-                writes: Vec::new(),
-            })
-            .expect("commit seq 1");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let links = Links::new();
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
-        let mut host = Host::new(NodeId(2), engine, links, control, HostClock::start());
-
-        let proof = match host.sync(partition, CopyId(1), Seq::ZERO, generation, true) {
-            Some(RecoveryEvent::DurableAt(proof)) => proof,
-            other => panic!("expected a proof at seq 0, got {other:?}"),
-        };
-        assert_eq!(
-            (proof.copy, proof.seq, proof.digest),
-            (CopyId(1), DurableSeq(0), Digest::ROOT)
-        );
-        assert_eq!(
-            host.sync(partition, CopyId(1), Seq(1), generation, true),
-            None,
-            "no record at seq 1: withheld, never ROOT"
-        );
-        // Withheld for the missing record, not for a short sync.
-        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
-    }
-
-    /// A-R192b: the flush duty syncs only while some lineage is applied past its durable mark.
-    /// Once all are durable through applied, it pushes the same `Flushed` with no fsync: a
-    /// WAL-flush fault armed then stays armed. The next commit makes the duty sync again, and
-    /// the fault fires there. Cut (never skip): the fault fires early. Cut (always skip): the
-    /// first duty leaves seq 1 not durable.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn the_flush_duty_syncs_only_while_a_lineage_is_applied_past_durable() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        let mut host = host_over(&path, &rt);
-        let (partition, generation) = (PartitionId(1), Generation(1));
-        let commit = |host: &mut Host, seq: u64| {
-            host.engine
-                .commit(rdb_core::contracts::storage::Batch {
-                    id: rdb_core::contracts::ids::BatchId(seq),
-                    partition,
-                    generation,
-                    seq: Seq(seq),
-                    writes: Vec::new(),
-                })
-                .expect("commit");
-        };
-        let last = |host: &mut Host| {
-            host.queue
-                .pop_back()
-                .map(|queued| queued.event.kind)
-                .expect("the duty pushed an event")
-        };
-        let durable_through = |seq: u64| {
-            EventKind::Storage(StorageEvent::Flushed {
-                ticket: FlushTicket(0),
-                durable: vec![DurablePrefix {
-                    partition,
-                    generation,
-                    through: DurableSeq(seq),
-                }],
-            })
-        };
-        let without_ticket = |kind: EventKind| match kind {
-            EventKind::Storage(StorageEvent::Flushed { durable, .. }) => {
-                EventKind::Storage(StorageEvent::Flushed {
-                    ticket: FlushTicket(0),
-                    durable,
-                })
-            }
-            other => other,
-        };
-
-        commit(&mut host, 1);
-        host.flush_duty().expect("flush");
-        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
-        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
-        // A-R214: that sync wrote the durable mark unsynced, so one more duty syncs it.
-        host.flush_duty().expect("flush");
-        assert!(host.engine.wal_synced_through_latest());
-        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
-
-        host.engine
-            .inject_fault(rdb_storage::InjectedFault::WalFlush);
-        host.flush_duty().expect("flush");
-        assert_eq!(
-            host.engine.armed_fault(),
-            Some(rdb_storage::InjectedFault::WalFlush),
-            "nothing to sync: no fsync"
-        );
-        assert_eq!(without_ticket(last(&mut host)), durable_through(1));
-
-        commit(&mut host, 2);
-        host.flush_duty().expect("flush");
-        assert_eq!(host.engine.armed_fault(), None, "seq 2 needed a sync");
-        assert!(
-            matches!(
-                last(&mut host),
-                EventKind::Storage(StorageEvent::FlushFailed { .. })
-            ),
-            "the armed fault failed that sync"
-        );
-        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
-    }
-
-    /// A-R214: a host over a fresh engine whose one lineage is synced and quiet: a WAL-flush
-    /// fault armed then survives a duty. Every lineage is durable through applied after it.
-    #[cfg(debug_assertions)]
-    fn quiet_host_with_wal_flush_armed(
-        path: &std::path::Path,
-        rt: &tokio::runtime::Runtime,
-    ) -> Host {
-        let mut host = host_over(path, rt);
-        host.engine
-            .commit(rdb_core::contracts::storage::Batch {
-                id: rdb_core::contracts::ids::BatchId(1),
-                partition: PartitionId(2),
-                generation: Generation(1),
-                seq: Seq(1),
-                writes: Vec::new(),
-            })
-            .expect("commit");
-        host.flush_duty().expect("flush");
-        host.flush_duty().expect("flush");
-        host.engine
-            .inject_fault(rdb_storage::InjectedFault::WalFlush);
-        host.flush_duty().expect("flush");
-        assert_eq!(
-            host.engine.armed_fault(),
-            Some(rdb_storage::InjectedFault::WalFlush),
-            "a quiet duty does not sync"
-        );
-        host
-    }
-
-    /// A-R214: with every lineage still durable through applied, the next duty syncs anyway,
-    /// and the armed fault fails that sync.
-    #[cfg(debug_assertions)]
-    fn assert_next_duty_syncs(host: &mut Host, what: &str) {
-        let durable_at_applied = host
-            .engine
-            .lineages()
-            .into_iter()
-            .all(|(p, g)| host.engine.durable(p, g).0 == host.engine.buffered_applied(p, g).0);
-        assert!(durable_at_applied, "{what}: no applied mark moved");
-        host.flush_duty().expect("flush");
-        assert_eq!(host.engine.armed_fault(), None, "{what}: the duty synced");
-        assert!(
-            matches!(
-                host.queue.pop_back().map(|queued| queued.event.kind),
-                Some(EventKind::Storage(StorageEvent::FlushFailed { .. }))
-            ),
-            "{what}: the armed fault failed that sync"
-        );
-    }
-
-    /// A-R214 row 1: the retire duty's dedup delete raises no applied mark, so durable ==
-    /// applied alone would skip the next duty and leave the delete in the OS cache. The
-    /// duty syncs it. Cut (durable == applied alone): the fault stays armed, red.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn a_dedup_delete_alone_still_makes_the_flush_duty_sync() {
-        let rt = current_thread();
-        let dir = config_testkit::fs::temp_dir();
-        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
-        host.engine
-            .delete_dedup_below(PartitionId(2), Generation(1), &2_u64.to_be_bytes())
-            .expect("dedup delete");
-        assert_next_duty_syncs(&mut host, "a dedup delete");
-    }
-
-    /// Review-s1 F-003 (D10's cap): a mailbox holding more than `MAIL_BEFORE_DUTIES` letters,
-    /// then `Stop`, with the flush duty due. `Host::run` takes exactly that many, runs the due
-    /// duties, and only then reads on to `Stop`, so steady mail cannot starve them. Each letter
-    /// is a stale-boot `Activated`, which logs one line and changes nothing. Cut: the read's
-    /// bound `taken < MAIL_BEFORE_DUTIES` lifted; the run reads every letter and `Stop` before
-    /// any duty, and no flush line is logged, red. Dropping `|| taken == MAIL_BEFORE_DUTIES`
-    /// alone stays green, and rightly: `taken` counts across passes, so the next pass reads
-    /// nothing and the loop ends at the same letter. That clause saves one drain. Unit, under
-    /// a second.
-    #[config_log::retcd_test]
-    fn a_full_mailbox_runs_the_due_duties_after_the_cap_before_reading_on() {
-        const METHOD: &str = "a_full_mailbox_runs_the_due_duties_after_the_cap_before_reading_on";
-        const LETTERS: usize = MAIL_BEFORE_DUTIES + 44;
-        let rt = current_thread();
-        let dir = config_testkit::fs::temp_dir();
-        let mut host = host_over(&dir.path().join("node"), &rt);
-        host.engine
-            .commit(rdb_core::contracts::storage::Batch {
-                id: rdb_core::contracts::ids::BatchId(1),
-                partition: PartitionId(2),
-                generation: Generation(1),
-                seq: Seq(1),
-                writes: Vec::new(),
-            })
-            .expect("commit");
-        host.next_flush = host.clock.now();
-        let stale = BootId(host.boot.0 + 1);
-        let (tx, rx) = mpsc::channel();
-        for _ in 0..LETTERS {
-            tx.send(Msg::Activated {
-                boot: stale,
-                partition: PartitionId(2),
-                generation: Generation(1),
-            })
-            .expect("send");
-        }
-        tx.send(Msg::Stop).expect("send");
-        host.run(&rx);
-
-        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-        let letters = lines
-            .iter()
-            .filter(|line| line["@m"] == "control_stale_boot_dropped")
-            .count();
-        assert_eq!(letters, LETTERS, "every letter was read");
-        let flush = lines
-            .iter()
-            .position(|line| line["@m"] == "host_duty" && line["kind"] == "flush")
-            .expect("the flush duty ran before Stop");
-        let before = lines[..flush]
-            .iter()
-            .filter(|line| line["@m"] == "control_stale_boot_dropped")
-            .count();
-        assert_eq!(
-            before, MAIL_BEFORE_DUTIES,
-            "the duty ran right after the cap"
-        );
-    }
-
-    /// PR #60 review F4: a queued event that faults the node ends its turn. The mailbox holds
-    /// `MAIL_BEFORE_DUTIES` letters, then `Stop`, with the flush duty due: first an injected
-    /// timer whose offer faults (`fail_step_view`), then stale-boot letters that change nothing.
-    /// The read stops at the cap with the timer still queued, so the drain after it faults, and
-    /// the flush duty after that drain must not run. Cut: the duties run on whatever the
-    /// drain did, and a `flush` duty line follows the fault, red. Unit, under a second.
-    #[config_log::retcd_test]
-    fn a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn() {
-        const METHOD: &str = "a_fault_in_the_drain_after_the_cap_runs_no_duty_in_that_turn";
-        let rt = current_thread();
-        let dir = config_testkit::fs::temp_dir();
-        let mut host = host_over(&dir.path().join("node"), &rt);
-        host.engine
-            .commit(rdb_core::contracts::storage::Batch {
-                id: rdb_core::contracts::ids::BatchId(1),
-                partition: PartitionId(2),
-                generation: Generation(1),
-                seq: Seq(1),
-                writes: Vec::new(),
-            })
-            .expect("commit");
-        host.next_flush = host.clock.now();
-        host.fail_step_view = true;
-        let stale = BootId(host.boot.0 + 1);
-        let (tx, rx) = mpsc::channel();
-        tx.send(Msg::Inject {
-            partition: PartitionId(2),
-            correlation: CorrelationId::default(),
-            kind: EventKind::Timer(TimerFired {
-                id: HEALTH_EVAL_TIMER,
-                version: TimerVersion(0),
-                scheduled_at: host.clock.now(),
-            }),
-        })
-        .expect("send");
-        for _ in 1..MAIL_BEFORE_DUTIES {
-            tx.send(Msg::Activated {
-                boot: stale,
-                partition: PartitionId(2),
-                generation: Generation(1),
-            })
-            .expect("send");
-        }
-        tx.send(Msg::Stop).expect("send");
-        host.run(&rx);
-
-        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-        let fault = lines
-            .iter()
-            .position(|line| line["@m"] == "host_fault")
-            .expect("the injected timer faulted the node");
-        let letters = lines[..fault]
-            .iter()
-            .filter(|line| line["@m"] == "control_stale_boot_dropped")
-            .count();
-        assert_eq!(letters, MAIL_BEFORE_DUTIES - 1, "it faulted after the cap");
-        let after: Vec<_> = lines[fault + 1..]
-            .iter()
-            .filter(|line| line["@m"] == "host_duty" || line["@m"] == "host_fault")
-            .collect();
-        assert!(after.is_empty(), "nothing ran after the fault: {after:?}");
-    }
-
-    /// PR #60 review F4: the first fault is the one the node keeps and reports. A later one is
-    /// logged, never kept. Cut: `set_fault` overwrites, and the status names the later one, red.
-    #[test]
-    fn a_second_fault_keeps_the_first() {
-        let rt = current_thread();
-        let dir = config_testkit::fs::temp_dir();
-        let mut host = host_over(&dir.path().join("node"), &rt);
-        host.set_fault(Fault::from("the first".to_owned()));
-        host.set_fault(Fault::from("the second".to_owned()));
-        assert_eq!(
-            host.status(PartitionId(2)).fault.as_deref(),
-            Some("the first"),
-            "the first fault is kept"
-        );
-    }
-
-    /// PR #60 review F8: the final marks a clean stop writes are a synced write, timed like
-    /// every other duty, so a slow one logs `host_slow_step`. The host restored its marks and
-    /// published seq 6 of generation 1, so the stop has marks to write; that write is held past
-    /// the 250 ms threshold (`step_pause`, inside the write only). The row checks the write ran
-    /// (`host_duty` `final_marks`, the mark on disk) and was logged slow, after it. Cut: the
-    /// `slow_step` call removed, and no such line, red. Unit, about 0.3 s.
-    #[config_log::retcd_test]
-    fn a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow() {
-        const METHOD: &str = "a_slow_final_marks_write_on_a_clean_stop_is_logged_as_slow";
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        reopened_with_marks(&path, 2, &[]);
-        let published = (Generation(1), Seq(6), Tick(HostClock::start().now().0 - 10));
-        {
-            let mut host = host_over(&path, &rt);
-            host.restore_marks(PartitionId(1), Generation(2))
-                .expect("restore");
-            host.published_at
-                .entry(PartitionId(1))
-                .or_default()
-                .push_back(published);
-            host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
-            let (tx, rx) = mpsc::channel();
-            tx.send(Msg::Stop).expect("send stop");
-            host.run(&rx);
-        }
-
-        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-        let wrote = lines
-            .iter()
-            .position(|line| line["@m"] == "host_duty" && line["kind"] == "final_marks")
-            .expect("the clean stop wrote its final marks");
-        let slow: Vec<_> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line["@m"] == "host_slow_step")
-            .map(|(at, line)| (at, line["step"].clone(), line["what"].clone()))
-            .collect();
-        assert_eq!(
-            slow.iter()
-                .map(|(_, step, what)| (step, what))
-                .collect::<Vec<_>>(),
-            [(
-                &serde_json::json!("duty"),
-                &serde_json::json!("final_marks")
-            )],
-            "the slow final write was logged as slow"
-        );
-        assert!(slow[0].0 > wrote, "logged once the write had run");
-        let marks: Vec<Mark> = RocksEngine::open(&path)
-            .expect("open engine")
-            .publish_marks(PartitionId(1))
-            .expect("read marks")
-            .into_iter()
-            .map(|mark| (mark.generation, mark.seq, mark.tick))
-            .collect();
-        assert_eq!(marks, [published], "the final write reached the disk");
-    }
-
-    /// PR #60 review F9: an offer is timed whatever it answers. Here the step view fails
-    /// (`fail_step_view`), so Transaction's offer of an injected timer ends in a host error,
-    /// after a pause past the threshold. Cut: only an offer that delivers is timed, and no
-    /// `Transaction` line, red. Unit, about 0.6 s: Authority's offer is held too.
-    #[config_log::retcd_test]
-    fn a_slow_offer_that_fails_is_logged_as_slow() {
-        const METHOD: &str = "a_slow_offer_that_fails_is_logged_as_slow";
-        let rt = current_thread();
-        let dir = config_testkit::fs::temp_dir();
-        let mut host = host_over(&dir.path().join("node"), &rt);
-        host.step_pause = Duration::from_millis(SLOW_STEP_MILLIS + 50);
-        host.fail_step_view = true;
-        host.handle(Msg::Inject {
-            partition: PartitionId(2),
-            correlation: CorrelationId::default(),
-            kind: EventKind::Timer(TimerFired {
-                id: HEALTH_EVAL_TIMER,
-                version: TimerVersion(0),
-                scheduled_at: host.clock.now(),
-            }),
-        });
-        host.drain();
-        let fault = host.fault.clone().expect("the offer failed");
-        assert!(fault.detail.contains("injected"), "{fault:?}");
-
-        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-        let slow: Vec<String> = lines
-            .iter()
-            .filter(|line| line["@m"] == "host_slow_step" && line["step"] == "module")
-            .filter_map(|line| line["what"].as_str().map(str::to_owned))
-            .collect();
-        assert!(
-            slow.iter().any(|what| what.starts_with("Transaction on")),
-            "the failed offer was timed: {slow:?}"
-        );
-    }
-
-    /// A-R214 row 2: an inherit at base 0 (a landing at cutoff 0) writes the link and the
-    /// seal, and leaves both lineages applied and durable at 0. The duty syncs it. Cut
-    /// (durable == applied alone): the fault stays armed, red.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn an_inherit_at_base_zero_still_makes_the_flush_duty_sync() {
-        let rt = current_thread();
-        let dir = config_testkit::fs::temp_dir();
-        let mut host = quiet_host_with_wal_flush_armed(&dir.path().join("node"), &rt);
-        let inherited = host
-            .engine
-            .inherit(PartitionId(1), Generation(1), Generation(2), Seq::ZERO)
-            .expect("inherit");
-        assert_eq!(inherited, Inherited::Linked);
-        assert_next_duty_syncs(&mut host, "an inherit at base 0");
-    }
-
-    /// Defect D2 (2026-10-07, `rdb_dev --hold 1-2,1-3`, walk A10): with both secondaries
-    /// unreachable F1 commits `ReadOnly` at cutoff 0, and the partition stayed read-only in
-    /// silence. Since the D2 kernel step, F1 pins that rebuild at the commit and, at each
-    /// deadline, names every copy that has not proved the point (`RebuildStalled`). The host
-    /// turns that into one stall line naming the mode and those copies, which stays as printed
-    /// while F1 keeps naming them. PC15 and mutant M26: F1 names both copies in one step, and a
-    /// repeat names no new copy, so across six deadlines the log holds exactly one error line.
-    #[config_log::retcd_test]
-    fn a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled() {
-        const METHOD: &str =
-            "a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled";
-        let dir = config_testkit::fs::temp_dir();
-        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let links = Links::new();
-        let (tx, rx) = mpsc::channel();
-        links.register(NodeId(1), tx.clone());
-        links.hold(NodeId(1), NodeId(2));
-        links.hold(NodeId(1), NodeId(3));
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control =
-            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
-        let clock = HostClock::start();
-        let mut host = Host::new(NodeId(1), engine, links, control, clock);
-        // The walk, faster: F1's deadline is the discovery window, shortened once F1 has
-        // committed, so the commit's CAS keeps the spec's 2 s against a host stall. The
-        // never-pinned watch is pushed out of reach, so only F1's own report can produce the line.
-        host.rebuild_pin_wait_millis = 60_000;
-        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
-            tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
-        }))
-        .expect("bootstrap");
-        let partition = PartitionId(1);
-        let step = |host: &mut Host| {
-            if host.status(partition).recovered.is_some() {
-                host.budgets.discovery_window_millis = test_discovery_window_millis();
-            }
-            host.run_due();
-            host.drain();
-            assert_eq!(host.fault, None, "a stall is reported, never a fault");
-            assert_not_blocked(
-                &host.status(partition),
-                host.budgets.discovery_window_millis,
-            );
-            if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
-                host.handle(msg);
-            }
-        };
-
-        // The line lands at F1's first deadline after the commit, two 2 s windows (4.0 s at
-        // scale 1): `Trio::PATIENCE`'s margin.
-        let patience = test_patience(Duration::from_secs(8));
-        let deadline = Instant::now() + patience;
-        let stalled = loop {
-            step(&mut host);
-            if let Some(line) = host.status(partition).stalled {
-                break line;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no stall reported within {patience:?}"
-            );
-        };
-        assert!(host.rebuilds[&partition].pinned, "F1 pinned at the commit");
-        assert_eq!(
-            host.status(partition).recovery.as_deref(),
-            Some("Rebuilding")
-        );
-        for part in [
-            "recovery_rebuild_stalled partition=1 gen=1 mode=ReadOnly cutoff=0 required=[0, 1, 2] \
-             unproven=[1, 2]",
-            "phase=Rebuilding",
-        ] {
-            assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
-        }
-
-        // Five more of F1's deadlines: it names both copies again, and the line does not move.
-        // Each deadline re-asks copy 2 (`rebuild_pinned`), so they are counted from the log,
-        // not assumed from elapsed time: the scaled window made a fixed 100 ms less than one.
-        let asks_of_copy_2 = || {
-            logged!(METHOD, "rebuild_pinned")
-                .into_iter()
-                .filter(|line| line["copy"] == 2)
-                .count()
-        };
-        let more = asks_of_copy_2() + 5;
-        let mut read = Instant::now();
-        loop {
-            step(&mut host);
-            if read.elapsed() >= Duration::from_millis(50) {
-                read = Instant::now();
-                if asks_of_copy_2() >= more {
-                    break;
-                }
-            }
-            assert!(
-                Instant::now() < deadline + patience,
-                "five more deadlines not within {patience:?}"
-            );
-        }
-        assert_eq!(host.status(partition).stalled, Some(stalled));
-        let logged = logged!(METHOD, "recovery_rebuild_stalled");
-        assert_eq!(logged.len(), 1, "one error line for the stall: {logged:?}");
-        assert_eq!(logged[0]["@l"], "Error", "{}", logged[0]);
-    }
-
-    /// Tester gap G1 (2026-10-07, mutant M3): the stall watch must stay quiet for an `Active`
-    /// commit. Watching one too printed `stalled ... mode=Active phase=Committed` on every
-    /// healthy start, and no row failed. Three nodes, no holds, driven past the watch's wait.
-    #[test]
-    fn an_active_commit_is_never_reported_stalled() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            host.rebuild_pin_wait_millis = 50;
-        });
-        trio.bootstrap();
-
-        // Until node 1 has landed generation 1, then for 4x the watch's wait.
-        let quiet_until = trio.until("generation 1 landed on node 1", |trio| {
-            let status = trio.status(0);
-            assert_eq!(status.stalled, None, "a healthy start reported a stall");
-            (status.recovered == Some(Generation(1))).then(|| {
-                assert_eq!(status.recovery.as_deref(), Some("Committed"));
-                Instant::now() + Duration::from_millis(200)
-            })
-        });
-        trio.until("the watch's wait passed", |trio| {
-            assert_eq!(
-                trio.status(0).stalled,
-                None,
-                "a healthy start reported a stall"
-            );
-            (Instant::now() >= quiet_until).then_some(())
-        });
-    }
-
-    /// A-R102 addendum, item 3, at the host (W10-D1): a resolving activation still names the
-    /// pinned configuration. Node 1 starts with its links to 2 and 3 held, so F1 commits
-    /// `ReadOnly` and rebuilds; the control store goes down before the links heal, so the
-    /// activation CAS answers `Unavailable` and F1 waits in `ActivationUnresolved`. A
-    /// `SyncWalThrough` asked then is served from the pinned configuration (`rebuild_pinned`),
-    /// as in `Committed`, `Rebuilding` and `ActivationProposed`. When the store answers again,
-    /// writes resume with no restart (Walk 10's r24n, which used to stay `Blocked`).
-    /// Integration (~3 s): bootstrap's discovery window, then the activation's own deadline.
-    #[config_log::retcd_test]
-    fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
-        const METHOD: &str =
-            "a_resolving_activation_still_serves_syncs_from_the_pinned_configuration";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        trio.bootstrap();
-        trio.until("F1 rebuilding on node 1", |trio| {
-            (trio.status(0).recovery.as_deref() == Some("Rebuilding")).then_some(())
-        });
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        trio.links.heal_all();
-        trio.until("F1 resolving on node 1", |trio| {
-            (trio.status(0).recovery.as_deref() == Some("ActivationUnresolved")).then_some(())
-        });
-
-        let pinned_asks_of_copy_2 = || {
-            logged!(METHOD, "rebuild_pinned")
-                .into_iter()
-                .filter(|line| line["node"] == 1 && line["copy"] == 2)
-                .count()
-        };
-        let before = pinned_asks_of_copy_2();
-        let sync = RecoveryEffect::SyncWalThrough {
-            copy: CopyId(2),
-            cutoff: Seq::ZERO,
-        };
-        let site = Site {
-            partition: PartitionId(1),
-            correlation: CorrelationId(0),
-        };
-        trio.nodes[0]
-            .0
-            .recovery_effect(&sync, site)
-            .expect("sync effect");
-        assert_eq!(
-            trio.status(0).recovery.as_deref(),
-            Some("ActivationUnresolved"),
-            "precondition: still resolving when the sync was asked"
-        );
-        assert_eq!(
-            pinned_asks_of_copy_2(),
-            before + 1,
-            "a sync asked while resolving is served from the pinned configuration"
-        );
-
-        trio.mem.stop_failing();
-        trio.ready();
-        assert_eq!(trio.status(0).recovery.as_deref(), Some("Committed"));
-    }
-
-    /// Node 1's `recovery_fact` lines for `BlockPromotion`, as `(effect, terminal)`.
-    fn block_facts(method: &str) -> Vec<(String, Option<bool>)> {
-        logged!(method, "recovery_fact")
-            .into_iter()
-            .filter(|line| line["node"] == 1)
-            .filter_map(|line| {
-                let effect = line["effect"].as_str()?.to_owned();
-                effect
-                    .starts_with("BlockPromotion")
-                    .then(|| (effect, line["terminal"].as_bool()))
-            })
-            .collect()
-    }
-
-    /// BlockPromotion item (lead, 2026-10-23): a block a control-store outage resolves is
-    /// logged `terminal=false`. The activation row's start: F1 commits `ReadOnly` with its
-    /// peers held, the store goes down, and the activation CAS answers `Unavailable`. F1 reports
-    /// `BlockPromotion { reason: ControlUnavailable }` and resolves in `ActivationUnresolved`
-    /// (A-R102), so the block does not last. Cut: `terminal` from the reason and the binding (a
-    /// control outage terminal when unbound, as every `Trio` host is) logs `true` here.
-    /// Integration (~3 s): bootstrap's discovery window, then the activation's own deadline.
-    #[config_log::retcd_test]
-    fn m10_a_block_a_store_outage_resolves_is_logged_not_terminal() {
-        const METHOD: &str = "m10_a_block_a_store_outage_resolves_is_logged_not_terminal";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        trio.bootstrap();
-        trio.until("F1 rebuilding on node 1", |trio| {
-            (trio.status(0).recovery.as_deref() == Some("Rebuilding")).then_some(())
-        });
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        trio.links.heal_all();
-        trio.until("F1 resolving on node 1", |trio| {
-            (trio.status(0).recovery.as_deref() == Some("ActivationUnresolved")).then_some(())
-        });
-
-        let facts = block_facts(METHOD);
-        assert!(!facts.is_empty(), "the outage was reported as a block");
-        for (effect, terminal) in &facts {
-            assert!(
-                effect.starts_with("BlockPromotion { reason: Control"),
-                "only the outage blocked: {facts:?}"
-            );
-            assert_eq!(*terminal, Some(false), "F1 resolves this one: {facts:?}");
-        }
-        trio.mem.stop_failing();
-        trio.ready();
-    }
-
-    /// BlockPromotion item (lead, 2026-10-23): a block that lasts is logged `terminal=true`.
-    /// Node 1 starts with its peers held, and the control store goes down while F1 collects, so
-    /// the recovery CAS answers `Unavailable`. Unbound, as every `Trio` host is, F1 stays
-    /// `Blocked(ControlUnavailable)` until a fresh fence, and no fence comes while the store is
-    /// down. Cut: `terminal` from the reason alone (a control outage never terminal) logs
-    /// `false` here. Integration (~2 s): bootstrap's discovery window.
-    #[config_log::retcd_test]
-    fn m10_a_block_that_lasts_is_logged_terminal() {
-        const METHOD: &str = "m10_a_block_that_lasts_is_logged_terminal";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        trio.bootstrap();
-        trio.until("F1 collecting on node 1", |trio| {
-            matches!(
-                trio.status(0).recovery.as_deref(),
-                Some("Fenced" | "Collecting")
-            )
-            .then_some(())
-        });
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        // `Trio::step` fails a row on a block, which is what this row waits for: step by hand.
-        let deadline = Instant::now() + test_patience(Trio::PATIENCE);
-        let phase = loop {
-            for (host, _, rx) in &mut trio.nodes {
-                host.run_due();
-                host.drain();
-                while let Ok(msg) = rx.try_recv() {
-                    host.handle(msg);
-                }
-                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
-            }
-            if let Some(phase) = trio
-                .status(0)
-                .recovery
-                .filter(|phase| phase.starts_with("Blocked("))
-            {
-                break phase;
-            }
-            assert!(Instant::now() < deadline, "F1 never blocked on node 1");
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        assert_eq!(phase, "Blocked(ControlUnavailable)");
-
-        assert_eq!(
-            block_facts(METHOD),
-            vec![(
-                "BlockPromotion { reason: ControlUnavailable }".to_owned(),
-                Some(true)
-            )]
-        );
-        trio.mem.stop_failing();
-    }
-
-    /// Tester gap G2 (2026-10-07, mutant M4): once F1 sends its post-commit sync, the rebuild
-    /// is pinned and the never-pinned watch must stay quiet. The D2 row's start (`ReadOnly` at
-    /// cutoff 0), then the `SyncWalThrough` F1 sends at commit, through the host's own effect
-    /// path. Since the D2 kernel step F1 also names the held copies at its deadline, so a stall
-    /// line may appear; this row pins only that it is never the never-pinned one. The window is
-    /// the spec's 2 s, since it is also the CAS deadline a host stall must not outlast.
-    #[config_log::retcd_test]
-    fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
-        let dir = config_testkit::fs::temp_dir();
-        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let links = Links::new();
-        let (tx, rx) = mpsc::channel();
-        links.register(NodeId(1), tx.clone());
-        links.hold(NodeId(1), NodeId(2));
-        links.hold(NodeId(1), NodeId(3));
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control =
-            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
-        let clock = HostClock::start();
-        let mut host = Host::new(NodeId(1), engine, links, control, clock);
-        host.rebuild_pin_wait_millis = 50;
-        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
-            tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
-        }))
-        .expect("bootstrap");
-        let partition = PartitionId(1);
-
-        let step = |host: &mut Host| {
-            host.run_due();
-            host.drain();
-            assert_eq!(host.fault, None);
-            assert_not_blocked(
-                &host.status(partition),
-                host.budgets.discovery_window_millis,
-            );
-            if let Some(line) = host.status(partition).stalled {
-                assert!(
-                    line.contains("unproven="),
-                    "a pinned rebuild's only stall line is F1's own: {line}"
-                );
-            }
-            if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
-                host.handle(msg);
-            }
-        };
-        let patience = test_patience(Duration::from_secs(5));
-        let deadline = Instant::now() + patience;
-        while !host.rebuilds.contains_key(&partition) {
-            assert!(
-                Instant::now() < deadline,
-                "no rebuild watch within {patience:?}"
-            );
-            step(&mut host);
-        }
-        assert_eq!(
-            host.status(partition).recovery.as_deref(),
-            Some("Rebuilding")
-        );
-
-        // Copy 1's holder is node 2, behind a held link: the ask is buffered, nothing answers.
-        let sync = RecoveryEffect::SyncWalThrough {
-            copy: CopyId(1),
-            cutoff: Seq::ZERO,
-        };
-        let site = Site {
-            partition,
-            correlation: CorrelationId(0),
-        };
-        host.recovery_effect(&sync, site).expect("sync effect");
-        assert!(
-            host.rebuilds[&partition].pinned,
-            "a post-commit sync pins the watch"
-        );
-
-        // Past the check: it ran, and it stayed quiet.
-        let quiet_until = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < quiet_until {
-            step(&mut host);
-        }
-        assert!(
-            !host
-                .delayed
-                .values()
-                .any(|item| matches!(item, Delayed::RebuildCheck { .. })),
-            "the rebuild check has not run yet"
-        );
-    }
-
-    /// OB2 (2026-10-07, `rdb_dev` at dd41368): `nodes` printed every secondary as `gen=0
-    /// applied=0 durable=0` while the owner's puts were `BufferedOnTwo`, because the view read
-    /// the store at the adopted generation and a secondary adopts none. A secondary now reports
-    /// what its receiver took, and a node holding nothing says so instead of printing zeros.
-    /// Node 2's flush is held, so its durable point stays behind the head it applied: `applied`
-    /// must be the receiver's buffered head, not its durable point (tester gap G3, mutant M7).
-    #[test]
-    fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |_| {});
-        let partition = PartitionId(1);
-        for (host, _, _) in &trio.nodes {
-            assert_eq!(
-                host.status(partition).holds,
-                None,
-                "nothing held before bootstrap"
-            );
-        }
-        trio.nodes[1].0.next_flush = Tick(u64::MAX);
-        trio.bootstrap();
-
-        // Until node 2's receiver has taken the start record at seq 1.
-        let head = trio.until("node 2's receiver took a record", |trio| {
-            let head = trio.nodes[1]
-                .0
-                .replication
-                .receiver(NodeId(2), partition)
-                .map_or(0, |receiver| receiver.buffered_applied_seq().0);
-            (head >= 1).then_some(head)
-        });
-        let secondary = &trio.nodes[1].0;
-        let status = secondary.status(partition);
-        assert_eq!(status.role, "secondary");
-        let held = status
-            .holds
-            .expect("a secondary with a receiver holds its lineage");
-        assert_eq!(
-            (held.applied, held.durable),
-            (head, 0),
-            "applied is the buffered head; durable stays at 0 while node 2's flush is held"
-        );
-        assert_eq!(
-            secondary.adopted(partition).generation,
-            Generation(0),
-            "a secondary adopts no generation, so the store view at it is empty"
-        );
-        assert_eq!(
-            (held.generation, held.owner_epoch),
-            (Generation(1), OwnerEpoch(1))
-        );
-        assert_eq!(
-            held.applied,
-            secondary
-                .engine
-                .buffered_applied(partition, Generation(1))
-                .0,
-            "the head is the record the store holds at the receiver's generation"
-        );
-    }
-
-    /// T1 (the tester's write-path row; walks A9, B2, C2, D1, D3 and I1): one request id's
-    /// life, over three real hosts. A put publishes at seq 2, after the start record. The same
-    /// request sent again is answered seq 2 and appends nothing. A put under a stale version is
-    /// refused, provably mutates nothing, and takes no seq. The same id with another value is
-    /// `REQUEST_ID_REUSE` and leaves the object as it was. Status resolves the id to seq 2.
-    #[test]
-    fn one_request_id_publishes_once_and_its_misuses_are_refused() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-
-        let first = match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, request } => {
-                assert_eq!(
-                    (
-                        result.generation,
-                        result.seq,
-                        result.outcome,
-                        result.durability
-                    ),
-                    (
-                        Generation(1),
-                        Seq(2),
-                        Outcome::Published,
-                        Durability::BufferedOnTwo
-                    )
-                );
-                assert_eq!(
-                    request.expected_generation,
-                    Some(Generation(1)),
-                    "every sent put carries its generation fence"
-                );
-                request
-            }
-            other => panic!("put a=1: {other:?}"),
-        };
-        let head = trio.head();
-        assert_eq!(head, Some(2));
-
-        match trio.ask(ClientCall::Resend { request: first }) {
-            Answer::Txn { result, .. } => {
-                assert_eq!(result.seq, Seq(2), "a resend is the same transaction");
-            }
-            other => panic!("resend: {other:?}"),
-        }
-        assert_eq!(trio.head(), head, "a resend appends nothing");
-
-        match trio.ask(put(2, b"a", b"x", Some(1))) {
-            Answer::Error { error, .. } => {
-                assert_eq!(error.name(), "CONDITION_FAILED");
-                assert!(error.no_mutation, "a failed condition mutated nothing");
-            }
-            other => panic!("put a=x at stale version 1: {other:?}"),
-        }
-        match trio.ask(put(3, b"b", b"2", None)) {
-            Answer::Txn { result, .. } => {
-                assert_eq!(result.seq, Seq(3), "the refused put took no seq");
-            }
-            other => panic!("put b=2: {other:?}"),
-        }
-
-        match trio.ask(put(1, b"a", b"other", None)) {
-            Answer::Error { error, .. } => assert_eq!(error.name(), "REQUEST_ID_REUSE"),
-            other => panic!("request 1 with another value: {other:?}"),
-        }
-        match trio.ask(get(4, b"a")) {
-            Answer::Read { seen, .. } => {
-                assert_eq!(
-                    doc_bytes(seen),
-                    Some((2, Bytes::from_static(b"1"))),
-                    "a is unchanged"
-                );
-            }
-            other => panic!("get a: {other:?}"),
-        }
-
-        match trio.ask(ClientCall::Status {
-            identity: identity(1),
-            generation: None,
-        }) {
-            Answer::Status(TxnStatus::Resolved(result)) => {
-                assert_eq!((result.generation, result.seq), (Generation(1), Seq(2)));
-            }
-            other => panic!("status of request 1: {other:?}"),
-        }
-    }
-
-    /// T2 (the tester's barrier-read row; walks E1, E2 and E3): with both secondaries cut off,
-    /// node 1 applies a put that no copy can acknowledge. A read at the barrier waits for it,
-    /// and never answers the old value. A read of the previous view answers the old value at
-    /// once. When the links heal, the put publishes and the waiting read answers the new value.
-    #[test]
-    fn a_read_waits_at_the_barrier_while_the_previous_view_answers_at_once() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        match trio.ask(put(1, b"a", b"old", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=old: {other:?}"),
-        }
-
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        let put_new = trio.call(put(2, b"a", b"new", None));
-        trio.until("node 1 applied a=new", |trio| {
-            (trio.head() == Some(3)).then_some(())
-        });
-        let barrier = trio.call(get(3, b"a"));
-        trio.until("node 1 took the read", |trio| {
-            trio.nodes[0]
-                .0
-                .pending
-                .contains_key(&identity(3))
-                .then_some(())
-        });
-        // The next round's drain runs the read through P1, which answers or parks it there.
-        trio.step();
-        assert!(barrier.try_recv().is_err(), "the read waits at the barrier");
-        assert!(put_new.try_recv().is_err(), "no copy acknowledged the put");
-
-        match trio.ask(ClientCall::GetPrevious {
-            identity: identity(4),
-            object: Bytes::from_static(b"a"),
-        }) {
-            Answer::Read {
-                outcome,
-                seen,
-                generation,
-                at,
-            } => assert_eq!(
-                (outcome, doc_bytes(seen), generation, at),
-                (
-                    ReadServiceOutcome::Served,
-                    Some((2, Bytes::from_static(b"old"))),
-                    Generation(1),
-                    Seq(2)
-                )
-            ),
-            other => panic!("get a --previous: {other:?}"),
-        }
-        assert!(barrier.try_recv().is_err(), "the read still waits");
-
-        trio.links.heal_all();
-        match trio.answer(&put_new) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
-            other => panic!("put a=new after the heal: {other:?}"),
-        }
-        match trio.answer(&barrier) {
-            Answer::Read {
-                outcome, seen, at, ..
-            } => assert_eq!(
-                (outcome, doc_bytes(seen), at),
-                (
-                    ReadServiceOutcome::WaitedAtBarrier,
-                    Some((3, Bytes::from_static(b"new"))),
-                    Seq(3)
-                )
-            ),
-            other => panic!("the waiting read: {other:?}"),
-        }
-    }
-
-    /// A10, end to end (the tester's row (b), mutant M19). Both secondaries are cut off from the
-    /// start, so F1 commits `ReadOnly` at cutoff 0 and names both copies stalled. After the heal
-    /// the partition activates, and activation clears the stall line. Then two puts publish at
-    /// seq 2 and 3, and L1 stays unpaused past its pause age, except for a pause that a stall of
-    /// this thread explains, which must end with L1 admitting (D16). Cuts (D16): a 600 ms stall
-    /// of the thread fails the old watch and passes this one; with that stall, an L1 that never
-    /// resumes after a pause fails this one.
-    ///
-    /// Not D4's regression guard: stepped by hand, it passed 20 of 20 with D4 unfixed, where the
-    /// threaded walk lost a copy in ~3 of 23. The sim row `m9_d4_00` guards D4.
-    /// Integration (~5 s at scale 1): the stall line waits two 2 s windows, then the row watches
-    /// twice L1's pause age to show L1 never paused. Tagged so its lines land in its own log
-    /// file (#50).
-    #[config_log::retcd_test]
-    fn a_start_cut_off_from_both_secondaries_heals_into_a_writable_partition() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast_pause);
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        trio.bootstrap();
-        let stalled = trio.until("F1's stall line", |trio| trio.status(0).stalled);
-        assert!(stalled.contains("unproven=[1, 2]"), "{stalled}");
-
-        trio.links.heal_all();
-        trio.ready();
-        assert_eq!(
-            trio.status(0).stalled,
-            None,
-            "activation clears the stall line"
-        );
-        // D16: this one thread steps all three hosts, so a stall of it leaves the puts undurable
-        // everywhere for as long as it lasts. Past the pause age L1 pauses, as the spec says it
-        // must (600-680 ms under gate load, int fa72544; diag-d16). So a gap of a flush period
-        // or more between looks is a stall; a pause that begins within one pause age of one is
-        // allowed, and the window starts again from the stall. The watch ends only with L1
-        // healthy and admitting, so a pause with no stall, or one that never ends, still fails.
-        let stall = Duration::from_millis(HOST_FLUSH_EVERY_MILLIS);
-        let pause_age = Duration::from_millis(Trio::PAUSE_AGE_MILLIS);
-        let mut last = Instant::now();
-        for (request, object, seq) in [(1, b"a", 2), (2, b"b", 3)] {
-            match trio.ask(put(request, object, b"v", None)) {
-                Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(seq)),
-                other => panic!("put {request}: {other:?}"),
-            }
-        }
-        let mut past_pause = Instant::now() + 2 * pause_age;
-        let mut woke: Option<Instant> = None;
-        let mut held_since: Option<Instant> = None;
-        trio.until("twice the pause age, unpaused and admitting", |trio| {
-            let now = Instant::now();
-            if now.duration_since(last) >= stall {
-                woke = Some(now);
-                past_pause = past_pause.max(now + 2 * pause_age);
-            }
-            last = now;
-            let status = trio.status(0);
-            let held = matches!(
-                status.protection.as_deref(),
-                Some("paused" | "reprotecting")
-            );
-            if held {
-                let began = *held_since.get_or_insert(now);
-                assert!(
-                    woke.and_then(|woke| began.checked_duration_since(woke))
-                        .is_some_and(|since| since < pause_age),
-                    "L1 paused after the heal with no stall of this thread before it: {status:?}"
-                );
-            } else {
-                held_since = None;
-            }
-            (now >= past_pause && !held && status.admits == Some(true)).then_some(())
-        });
-    }
-
-    /// The tester's row (d), moved onto the pinned stall by the K1 ruling (condition 6), and
-    /// defect D7. Only link 1-3 is held, so F1 commits `DegradedRf2` at cutoff 0 and, since K1,
-    /// pins that rebuild at the commit and asks every copy to sync. Copy 2 never answers, so F1
-    /// names it at its deadline and the host's line says what is true while L1 pauses writes for
-    /// the unheard copy (B-R38): writes stay paused until it returns (PC17, mutant M28).
-    /// D7: node 2 heard the sync for generation 1 before it landed that generation, proved it,
-    /// and then faulted inheriting it. A sync for a generation not yet landed now waits for the
-    /// landing, so the proof is of a generation the copy holds.
-    #[config_log::retcd_test]
-    fn a_degraded_commit_with_a_copy_away_is_reported_stalled_with_writes_paused() {
-        const METHOD: &str =
-            "a_degraded_commit_with_a_copy_away_is_reported_stalled_with_writes_paused";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            host.rebuild_pin_wait_millis = 50;
-        });
-        trio.links.hold(NodeId(1), NodeId(3));
-        trio.bootstrap();
-        trio.short_window_after_commit();
-        let stalled = trio.until("a stall line", |trio| trio.status(0).stalled);
-        assert!(
-            trio.nodes[0].0.rebuilds[&PartitionId(1)].pinned,
-            "F1 pinned the rebuild at the commit"
-        );
-        assert_eq!(trio.status(0).admits, Some(false), "L1 pauses writes");
-        for part in [
-            "recovery_rebuild_stalled partition=1 gen=1 mode=DegradedRf2 cutoff=0 \
-             required=[0, 1, 2] unproven=[",
-            "2] phase=Rebuilding: F1 pinned its rebuild, but these copies have not proved it, so \
-             the partition stays DegradedRf2, and its writes stay paused until the database is \
-             opened again",
-        ] {
-            assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
-        }
-        assert!(!stalled.contains("never pinned"), "{stalled}");
-
-        // The never-pinned report (M27), asked for directly: since K1 no M9 run leaves a
-        // rebuild unpinned. While L1 pauses writes it is printed, in PC17's words.
-        let host = &mut trio.nodes[0].0;
-        let watch = host.rebuilds.get_mut(&PartitionId(1)).expect("the watch");
-        watch.pinned = false;
-        let generation = watch.generation;
-        host.stalled.remove(&PartitionId(1));
-        host.rebuild_check(PartitionId(1), generation);
-        let never = host
-            .status(PartitionId(1))
-            .stalled
-            .expect("the never-pinned line");
-        assert!(
-            never.ends_with(
-                "F1 never pinned its rebuild, so the partition stays DegradedRf2, and its writes \
-                 stay paused until the database is opened again"
-            ),
-            "{never}"
-        );
-
-        // D7: node 2 proved generation 1 only after it landed it.
-        let node2 = |message: &str| {
-            logged!(METHOD, message)
-                .into_iter()
-                .filter(|line| line["node"] == 2 && line["generation"] == 1)
-                .map(|line| line["@t"].as_str().unwrap_or_default().to_owned())
-                .collect::<Vec<_>>()
-        };
-        let landed = node2("recovered_landed");
-        let proved = node2("sync_proven");
-        assert_eq!(landed.len(), 1, "node 2 landed generation 1 once");
-        assert!(
-            !proved.is_empty() && proved.iter().all(|at| *at > landed[0]),
-            "node 2 proved generation 1 at {proved:?}, landed it at {landed:?}"
-        );
-    }
-
-    /// PR #33 F-002 (amending ADR-rdb-0009 D3 rule 4). Link 1-3 is held, so F1 commits
-    /// `DegradedRf2` at cutoff 0 and node 1 applies the start record at seq 1. From the commit on,
-    /// node 1's peer frames are set aside, so no copy's acknowledgement reaches R1 and seq 1 stays
-    /// unpublished. After the heal, node 3 proves the rebuild and F1's activation lands while
-    /// seq 1 is still pending: the order in which a CAS answer beats copy 2's ack. P1 keeps the
-    /// view it holds at seq 0, so `GetPrevious` is answered from it, not refused. The frames are
-    /// then delivered and seq 1 publishes. Stepped by hand; no link 1-2 hold, which R1 may report
-    /// as a lost copy.
-    #[test]
-    fn a_re_emit_while_the_start_record_is_pending_keeps_the_previous_view() {
-        /// [`Trio::step`], with every `Frame` to node 1 set aside in `deferred`.
-        fn step(trio: &mut Trio, deferred: &mut Vec<Msg>) {
-            for (index, (host, _, rx)) in trio.nodes.iter_mut().enumerate() {
-                host.run_due();
-                host.drain();
-                while let Ok(msg) = rx.try_recv() {
-                    if index == 0 && matches!(msg, Msg::Frame { .. }) {
-                        deferred.push(msg);
-                    } else {
-                        host.handle(msg);
-                    }
-                }
-                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
-                assert_not_blocked(
-                    &host.status(PartitionId(1)),
-                    host.budgets.discovery_window_millis,
-                );
-            }
-        }
-        fn until<T>(
-            trio: &mut Trio,
-            deferred: &mut Vec<Msg>,
-            what: &str,
-            mut done: impl FnMut(&Trio) -> Option<T>,
-        ) -> T {
-            let deadline = Instant::now() + test_patience(Trio::PATIENCE);
-            loop {
-                step(trio, deferred);
-                if let Some(found) = done(trio) {
-                    return found;
-                }
-                assert!(Instant::now() < deadline, "not in time: {what}");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        let view = |trio: &Trio| {
-            trio.nodes[0]
-                .0
-                .publication
-                .view(NodeId(1), PartitionId(1))
-                .expect("P1 serves partition 1 on node 1")
-        };
-
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.links.hold(NodeId(1), NodeId(3));
-        trio.bootstrap();
-        trio.until("F1 committed on node 1", |trio| {
-            trio.status(0).recovered.map(|_| ())
-        });
-        let mut deferred = Vec::new();
-        until(&mut trio, &mut deferred, "node 1 applied seq 1", |trio| {
-            (trio.head() == Some(1)).then_some(())
-        });
-        let mode = |trio: &Trio| trio.nodes[0].0.committed[&PartitionId(1)].mode.clone();
-        assert_eq!(mode(&trio), PartitionMode::DegradedRf2);
-        assert_eq!(
-            trio.status(0).published,
-            Some((Generation(1), Seq(0))),
-            "seq 1 is pending"
-        );
-        let before = view(&trio);
-        assert!(before.kept.is_some(), "P1 holds the view at seq 0");
-
-        trio.links.heal(NodeId(1), NodeId(3));
-        until(&mut trio, &mut deferred, "the activation landed", |trio| {
-            (mode(trio) == PartitionMode::Active).then_some(())
-        });
-        step(&mut trio, &mut deferred);
-        assert_eq!(
-            trio.status(0).published,
-            Some((Generation(1), Seq(0))),
-            "the activation landed before any ack of seq 1"
-        );
-        let after = view(&trio);
-
-        let previous = trio.call(ClientCall::GetPrevious {
-            identity: identity(1),
-            object: Bytes::from_static(b"a"),
-        });
-        match until(&mut trio, &mut deferred, "the previous read", |_| {
-            previous.try_recv().ok()
-        }) {
-            Answer::Read {
-                outcome, seen, at, ..
-            } => assert_eq!(
-                (outcome, doc_bytes(seen), at),
-                (ReadServiceOutcome::Served, None, Seq(0)),
-                "answered from the view kept at seq 0"
-            ),
-            other => panic!("get a --previous while seq 1 is pending: {other:?}"),
-        }
-        assert_eq!(
-            (&after.kept, after.opening.len()),
-            (&before.kept, 0),
-            "the re-emit kept the view and opened none"
-        );
-
-        assert!(!deferred.is_empty(), "the copies' acks were set aside");
-        for msg in deferred {
-            trio.nodes[0].0.handle(msg);
-        }
-        trio.until("seq 1 published", |trio| {
-            (trio.status(0).published == Some((Generation(1), Seq(1)))).then_some(())
-        });
-    }
-
-    /// F8, the host half (K1 ruling, condition 5): in `DegradedRf2` with copy 2 away, F1 names
-    /// it again at every deadline, and the host prints its stall once. Each deadline re-asks
-    /// copy 2, which the host logs as `rebuild_pinned`, so the row counts deadlines from the log
-    /// rather than assuming them from elapsed time. Mutant M26 (report at every naming) fails it.
-    #[config_log::retcd_test]
-    fn a_degraded_stall_is_printed_once_across_three_deadlines() {
-        const METHOD: &str = "a_degraded_stall_is_printed_once_across_three_deadlines";
-        let asks_of_copy_2 = || {
-            logged!(METHOD, "rebuild_pinned")
-                .into_iter()
-                .filter(|line| line["node"] == 1 && line["copy"] == 2)
-                .count()
-        };
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            host.rebuild_pin_wait_millis = 50;
-        });
-        trio.links.hold(NodeId(1), NodeId(3));
-        trio.bootstrap();
-        trio.short_window_after_commit();
-        let stalled = trio.until("a stall line", |trio| trio.status(0).stalled);
-
-        // The commit's ask and three deadlines' asks; the log is read every 50 ms, not per step.
-        let mut read = Instant::now();
-        trio.until("three more of F1's deadlines", |_| {
-            if read.elapsed() < Duration::from_millis(50) {
-                return None;
-            }
-            read = Instant::now();
-            (asks_of_copy_2() >= 4).then_some(())
-        });
-        assert_eq!(
-            trio.status(0).stalled,
-            Some(stalled),
-            "the line stays as printed"
-        );
-        let logged = logged!(METHOD, "recovery_rebuild_stalled");
-        assert_eq!(logged.len(), 1, "one line across the deadlines: {logged:?}");
-        assert_eq!(logged[0]["@l"], "Error", "{}", logged[0]);
-    }
-
-    /// K1 ruling, condition 6: no stall line says writes are paused while L1 admits them, and
-    /// a rebuild that never pinned is not reported at all then. M9 reaches neither: K1 pins
-    /// every cutoff-0 commit, and an unheard copy pauses writes (B-R38). So the watch is set by
-    /// hand on an `Active`, admitting node, and each report is asked for directly.
-    #[test]
-    fn a_stall_line_never_says_writes_are_paused_while_they_are_admitted() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        assert_eq!(trio.status(0).admits, Some(true), "L1 admits writes");
-        let partition = PartitionId(1);
-        let host = &mut trio.nodes[0].0;
-        let generation = Generation(9);
-        host.rebuilds.insert(
-            partition,
-            RebuildWatch {
-                generation,
-                mode: PartitionMode::DegradedRf2,
-                cutoff: Seq(1),
-                required: vec![CopyId(0), CopyId(1), CopyId(2)],
-                since: host.clock.now(),
-                pinned: false,
-                unproven: BTreeSet::new(),
-                unreported: false,
-            },
-        );
-
-        host.rebuild_check(partition, generation);
-        assert_eq!(
-            host.stalled.get(&partition),
-            None,
-            "never-pinned while admitting"
-        );
-
-        let watch = host.rebuilds.get_mut(&partition).expect("watch");
-        watch.pinned = true;
-        watch.unproven.insert(CopyId(2));
-        watch.unreported = true;
-        host.report_unproven();
-        let line = host
-            .status(partition)
-            .stalled
-            .expect("the pinned stall line");
-        assert!(
-            line.ends_with("so the partition stays DegradedRf2 and does not activate"),
-            "{line}"
-        );
-    }
-
-    /// F-012 (S0 review): the stall line says writes stay paused only while L1 pauses them. L1
-    /// is mode-blind, so nothing orders its resume after F1's activation, which is what clears
-    /// the line. On a real `DegradedRf2` heal F1 activated first in 6 of 6 runs here, even with
-    /// a zero resume hold, so this row orders them by hand instead. L1 pauses for real: both
-    /// links are held, and a put stays unacknowledged past the pause age. Then a stall line is
-    /// written for a `DegradedRf2` watch set by hand, as the K1 row above does, and it says
-    /// writes stay paused. After the heal L1 resumes, and that watch never activates. Once L1
-    /// admits writes, the line must stop saying they are paused. Status names the held put as
-    /// the write the owner's queue waits on (`waits_on`, U1), and nothing once it publishes.
-    /// Integration (~1 s): three hosts stepped by hand, through a real L1 pause and resume.
-    #[test]
-    fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast_pause);
-        trio.bootstrap();
-        trio.ready();
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        let unacknowledged = trio.call(put(1, b"a", b"1", None));
-        let paused = trio.until("L1 pauses writes", |trio| {
-            let status = trio.status(0);
-            (status.admits == Some(false)).then_some(status)
-        });
-        assert_eq!(
-            paused.waits_on,
-            Some(Seq(2)),
-            "waits_on names the applied, unpublished put: {paused:?}"
-        );
-
-        let partition = PartitionId(1);
-        let host = &mut trio.nodes[0].0;
-        let generation = Generation(9);
-        host.rebuilds.insert(
-            partition,
-            RebuildWatch {
-                generation,
-                mode: PartitionMode::DegradedRf2,
-                cutoff: Seq(1),
-                required: vec![CopyId(0), CopyId(1), CopyId(2)],
-                since: host.clock.now(),
-                pinned: true,
-                unproven: BTreeSet::from([CopyId(2)]),
-                unreported: true,
-            },
-        );
-        host.report_unproven();
-        let paused = trio.status(0).stalled.expect("the stall line");
-        assert!(paused.contains("writes stay paused"), "{paused}");
-
-        trio.links.heal_all();
-        trio.ready();
-        let status = trio.status(0);
-        assert_eq!(
-            trio.nodes[0]
-                .0
-                .rebuilds
-                .get(&partition)
-                .map(|w| w.generation),
-            Some(generation),
-            "the watch is still there: nothing activated it"
-        );
-        let line = status.stalled.expect("the stall line still stands");
-        assert!(
-            !line.contains("writes stay paused"),
-            "L1 admits writes while the stall line says: {line}"
-        );
-        assert!(
-            line.ends_with("so the partition stays DegradedRf2 and does not activate"),
-            "{line}"
-        );
-        let published = trio.until("seq 2 publishes", |trio| {
-            let status = trio.status(0);
-            (status.published.map(|(_, seq)| seq) == Some(Seq(2))).then_some(status)
-        });
-        assert_eq!(
-            published.waits_on, None,
-            "waits_on once the put published: {published:?}"
-        );
-        drop(unacknowledged);
-    }
-
-    /// A node that faults answers every waiting caller instead of leaving it hanging, and a
-    /// waiting put keeps its request so the caller can resend it elsewhere. Every call after
-    /// that is refused at once. The fault here is the control adapter's own (`Msg::Fault`), the
-    /// one input that faults a healthy node without a kernel or storage defect.
-    #[test]
-    fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let waiting = trio.call(put(1, b"a", b"1", None));
-        let (host, _, mailbox) = &mut trio.nodes[0];
-        // The mailbox is shared with peer and control traffic, so the put need not be first.
-        while !host.pending.contains_key(&identity(1)) {
-            match mailbox.try_recv() {
-                Ok(msg) => host.handle(msg),
-                Err(_) => break,
-            }
-        }
-        assert!(
-            host.pending.contains_key(&identity(1)),
-            "the put waits: {:?}",
-            waiting.try_recv()
-        );
-
-        host.handle(Msg::Fault {
-            boot: BOOT,
-            kind: "control_fault_test",
-            detail: "injected".to_owned(),
-        });
-        assert!(host.fault.is_some(), "the node is faulted");
-        match waiting.try_recv() {
-            Ok(Answer::Error {
-                error,
-                request: Some(request),
-            }) => {
-                assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
-                assert!(error.detail.contains("injected"), "{error:?}");
-                assert_eq!(request.identity, identity(1));
-            }
-            other => panic!("the waiting put: {other:?}"),
-        }
-
-        let (reply, refused) = mpsc::channel();
-        host.handle(Msg::Client(Client {
-            partition: PartitionId(1),
-            call: get(2, b"a"),
-            reply,
-        }));
-        match refused.try_recv() {
-            Ok(Answer::Error {
-                error,
-                request: None,
-            }) => assert!(error.detail.contains("injected"), "{error:?}"),
-            other => panic!("a call after the fault: {other:?}"),
-        }
-        assert!(host.pending.is_empty(), "nothing is left waiting");
-    }
-
-    /// M9 serves only an empty copy, so a copy that holds anything must answer
-    /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
-    /// drops what the copy holds. Two ways to hold something: an anchor past the root, and a
-    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root of the
-    /// bootstrap's generation-0 anchor. M10: a later generation is a reopen's, answered only
-    /// from what the copy stores, so an empty copy asked for one answers `InventoryFailed`.
-    #[test]
-    fn a_copy_that_holds_anything_never_reports_an_empty_inventory() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        let root = LineageAnchor {
-            lineage: Lineage {
-                partition: PartitionId(1),
-                generation: Generation(1),
-                owner_epoch: OwnerEpoch(1),
-            },
-            base_seq: Seq::ZERO,
-            base_digest: Digest::ROOT,
-        };
-        let past_root = LineageAnchor {
-            base_seq: Seq(1),
-            ..root
-        };
-        let bootstrap = LineageAnchor {
-            lineage: Lineage {
-                generation: Generation(0),
-                owner_epoch: OwnerEpoch(0),
-                ..root.lineage
-            },
-            ..root
-        };
-        let report =
-            |trio: &mut Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
-
-        assert!(
-            matches!(
-                report(&mut trio, bootstrap),
-                RecoveryEvent::InventoryReported(_)
-            ),
-            "an empty copy reports the root"
-        );
-        assert_eq!(
-            report(
-                &mut trio,
-                LineageAnchor {
-                    base_seq: Seq(1),
-                    ..bootstrap
-                }
-            ),
-            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "an anchor past the root"
-        );
-        assert_eq!(
-            report(&mut trio, root),
-            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "an empty copy asked for a reopen's generation 1"
-        );
-        trio.bootstrap();
-        trio.ready();
-        assert_eq!(
-            report(&mut trio, bootstrap),
-            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "a copy holding generation 1, asked for the bootstrap's empty anchor"
-        );
-        // M10 (reopen): a copy holding the anchor's generation reports from its engine, and
-        // one whose stored base is not the anchor's answers nothing.
-        assert!(
-            matches!(report(&mut trio, root), RecoveryEvent::InventoryReported(_)),
-            "a copy holding generation 1 at its anchor"
-        );
-        assert_eq!(
-            report(&mut trio, past_root),
-            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-            "a copy whose generation 1 starts elsewhere"
-        );
-    }
-
-    /// A-R177 rows: `n` chained records in `generation` of partition 1, committed as R1 stages
-    /// them (the record, its `History` row, the applied-head `Progress` row). Their digests,
-    /// `[0]` at seq 1.
-    fn write_chain(engine: &mut RocksEngine, generation: Generation, n: u64) -> Vec<Digest> {
-        use rdb_core::contracts::digest::Domain;
-        use rdb_core::contracts::envelope::EnvelopeHeader;
-        use rdb_core::contracts::ids::{BatchId, ClientId, LeaseId, TenantId};
-        use rdb_core::contracts::storage::{Batch, Write};
-        use rdb_core::contracts::txn::Outcome;
-        use rdb_core::contracts::version::ENVELOPE_VERSION;
-        let mut digests: Vec<Digest> = Vec::new();
-        for seq in 1..=n {
-            let mut env = ReplicationEnvelope {
-                header: EnvelopeHeader {
-                    protocol_version: ENVELOPE_VERSION,
-                    partition: PartitionId(1),
-                    generation,
-                    config_version: ConfigVersion(1),
-                    owner_epoch: OwnerEpoch(generation.0),
-                    seq: Seq(seq),
-                    body_len: 0,
-                },
-                lease_id: LeaseId(1),
-                prev_digest: digests.last().copied().unwrap_or(Digest::ROOT),
-                request_identity: RequestIdentity {
-                    tenant: TenantId(1),
-                    client: ClientId(1),
-                    request: RequestId(seq),
-                },
-                request_digest: Digest::of(Domain::Record, &[&seq.to_le_bytes()]),
-                conditions_result: Vec::new(),
-                mutations: vec![Write {
-                    ns: Namespace::User,
-                    key: Bytes::copy_from_slice(&seq.to_be_bytes()),
-                    value: Some(Bytes::from_static(b"v")),
-                }],
-                result: Outcome::Published,
-                record_digest: Digest::ROOT,
-            };
-            env.record_digest = env.compute_record_digest().expect("digest");
-            digests.push(env.record_digest);
-            let mut progress = seq.to_le_bytes().to_vec();
-            progress.extend_from_slice(&env.record_digest.0);
-            let mut writes = env.mutations.clone();
-            writes.push(Write {
-                ns: Namespace::History,
-                key: Bytes::copy_from_slice(&seq.to_be_bytes()),
-                value: Some(env.encode().expect("encode")),
-            });
-            writes.push(Write {
-                ns: Namespace::Progress,
-                key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
-                value: Some(Bytes::from(progress)),
-            });
-            engine
-                .commit(Batch {
-                    id: BatchId(seq),
-                    partition: PartitionId(1),
-                    generation,
-                    seq: Seq(seq),
-                    writes,
-                })
-                .expect("commit");
-        }
-        digests
-    }
-
-    /// Node 2's host over the engine at `path`, which a row filled first.
-    fn host_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
-        let engine = RocksEngine::open(path).expect("open engine");
-        let links = Links::new();
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
-        Host::new(NodeId(2), engine, links, control, HostClock::start())
-    }
-
-    /// A reopen's anchor at `generation`, from `base` with `digest` there.
-    fn anchor_at(generation: u64, base: u64, digest: Digest) -> LineageAnchor {
-        LineageAnchor {
-            lineage: Lineage {
-                partition: PartitionId(1),
-                generation: Generation(generation),
-                owner_epoch: OwnerEpoch(generation),
-            },
-            base_seq: Seq(base),
-            base_digest: digest,
-        }
-    }
-
-    fn current_thread() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime")
-    }
-
-    /// A-R177 row 2 (critic-f5 C1-C4): a copy that missed generation 2, written nowhere, holds
-    /// generation 1 exactly through the anchor's base with the anchor's digest there. Its
-    /// inventory links generation 2 onto generation 1 at the base and reports from it.
-    #[test]
-    fn a_copy_that_missed_a_writeless_generation_links_it_at_inventory() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let digests = write_chain(
-            &mut RocksEngine::open(&path).expect("open engine"),
-            Generation(1),
-            2,
-        );
-        let rt = current_thread();
-        let mut host = host_over(&path, &rt);
-        match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1])) {
-            RecoveryEvent::InventoryReported(inventory) => {
-                assert_eq!(inventory.head, (Seq(2), digests[1]));
-            }
-            other => panic!("expected a report, got {other:?}"),
-        }
-        assert_eq!(
-            host.engine.link(PartitionId(1), Generation(2)),
-            Some(rdb_storage::Link {
-                parent: Generation(1),
-                base: Seq(2),
-                copied: false,
-            })
-        );
-    }
-
-    /// A commit into generation 2 at `(cutoff, digest)`, as node 2 hears it: a trio's
-    /// bootstrap commit, moved on a generation. Its pin names node 2 a secondary.
-    fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.until("node 1 committed", |trio| {
-            trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
-        });
-        let mut result = (*trio.nodes[0].0.committed[&PartitionId(1)]).clone();
-        result.new_generation = Generation(2);
-        result.selected.root.generation = Generation(2);
-        result.selected.cutoff_seq = Seq(cutoff);
-        result.selected.cutoff_digest = digest;
-        result.retained_status_map.predecessor_generation = Generation(1);
-        result
-    }
-
-    /// A-R217 rows: node 1's host, the pinned primary of [`landing_at`]'s commit, over the engine
-    /// at `path`, with an open bound, so a landing it links can go on to `activate`.
-    fn primary_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
-        let engine = RocksEngine::open(path).expect("open engine");
-        let links = Links::new();
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
-        let mut host = Host::new(NodeId(1), engine, links, control, HostClock::start());
-        host.instance = Some([7_u8; INSTANCE_LEN]);
-        host
-    }
-
-    /// The newest generation `host` asked the open counter to mark activated for partition 1.
-    fn asked(host: &Host) -> Generation {
-        host.activation
-            .get(&PartitionId(1))
-            .map_or(Generation::default(), |activation| activation.asked)
-    }
-
-    /// Ruling A-R217 (review-s1 F-001), row 1: the path through `inherit`, which `recovered`
-    /// takes on the copy that ran F1 and `land` takes on a barrier copy. The link is synced
-    /// before `activate` may run: with the WAL sync failing, `recovered` faults and nothing
-    /// asks the open counter to mark generation 2. Without the fault the same landing reaches
-    /// `activate`, so the refusal is the sync's doing. Cut: `sync_link` returns before syncing;
-    /// the armed landing is `Ok` and asks for generation 2, red. Unit, under a second.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn a_link_that_cannot_be_synced_never_reaches_activate_through_inherit() {
-        let rt = current_thread();
-        let site = Site {
-            partition: PartitionId(1),
-            correlation: CorrelationId(0),
-        };
-        for armed in [true, false] {
-            let dir = config_testkit::fs::temp_dir();
-            let path = dir.path().join("node");
-            let digests = write_chain(
-                &mut RocksEngine::open(&path).expect("open engine"),
-                Generation(1),
-                2,
-            );
-            let result = landing_at(2, digests[1]);
-            let mut host = primary_over(&path, &rt);
-            if armed {
-                host.engine
-                    .inject_fault(rdb_storage::InjectedFault::WalFlush);
-                let outcome = host.recovered(&result, site);
-                assert!(
-                    outcome
-                        .as_ref()
-                        .is_err_and(|fault| fault.detail.contains("sync the link")),
-                    "a failed link sync faults the node: {outcome:?}"
-                );
-                assert_eq!(asked(&host), Generation::default(), "activate never ran");
-            } else {
-                host.recovered(&result, site).expect("recovered");
-                assert_eq!(asked(&host), Generation(2), "the landing reaches activate");
-            }
-        }
-    }
-
-    /// Ruling A-R217 (review-s1 F-001), row 2: the path through `land_link`, which `land` takes
-    /// on a copy outside the barrier. That link is synced before `activate` may run too. The
-    /// pinned primary lands here outside an empty barrier, so `schedule_acquire` would ask
-    /// for generation 2 next. Cut: the `sync_link` after `land_link` is dropped; the armed
-    /// landing is `Ok` and asks for generation 2, red. Unit, under a second.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn a_link_that_cannot_be_synced_never_reaches_activate_through_land_link() {
-        let rt = current_thread();
-        let site = Site {
-            partition: PartitionId(1),
-            correlation: CorrelationId(0),
-        };
-        for armed in [true, false] {
-            let dir = config_testkit::fs::temp_dir();
-            let path = dir.path().join("node");
-            let digests = write_chain(
-                &mut RocksEngine::open(&path).expect("open engine"),
-                Generation(1),
-                2,
-            );
-            let mut result = landing_at(2, digests[1]);
-            result.barrier = rdb_core::contracts::recovery::RecoveryBarrier::try_new(
-                &[],
-                &BTreeSet::new(),
-                Seq(2),
-                digests[1],
-            )
-            .expect("an empty barrier");
-            assert!(!in_barrier(&result, NodeId(1)), "node 1 is outside it");
-            let mut host = primary_over(&path, &rt);
-            if armed {
-                host.engine
-                    .inject_fault(rdb_storage::InjectedFault::WalFlush);
-                let outcome = host.land(Box::new(result), site, NodeId(3));
-                assert!(
-                    outcome
-                        .as_ref()
-                        .is_err_and(|fault| fault.detail.contains("sync the link")),
-                    "a failed link sync faults the node: {outcome:?}"
-                );
-                assert_eq!(asked(&host), Generation::default(), "activate never ran");
-            } else {
-                host.land(Box::new(result), site, NodeId(3)).expect("land");
-                assert_eq!(
-                    host.engine.link(PartitionId(1), Generation(2)),
-                    Some(rdb_storage::Link {
-                        parent: Generation(1),
-                        base: Seq(2),
-                        copied: false,
-                    }),
-                    "land_link linked generation 2"
-                );
-                assert_eq!(asked(&host), Generation(2), "the landing reaches activate");
-            }
-        }
-    }
-
-    /// Ruling A-R185 (critic-d7fix (c)): a copy that lands a commit outside its barrier while it
-    /// holds its older generation exactly through the cutoff, with the cutoff digest there,
-    /// links the new generation at the cutoff, gets the receiver a barrier copy gets (A-R185a),
-    /// and answers the `CopyCaughtUp` that `land` sends to F1. Cut: the receiver install is
-    /// dropped, and R1 holds none. Unit, about 2.5 s (the trio's bootstrap window).
-    #[config_log::retcd_test]
-    fn a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_up() {
-        const METHOD: &str =
-            "a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_up";
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let digests = write_chain(
-            &mut RocksEngine::open(&path).expect("open engine"),
-            Generation(1),
-            2,
-        );
-        let result = landing_at(2, digests[1]);
-        let rt = current_thread();
-        let mut host = host_over(&path, &rt);
-        let copy = result
-            .committed
-            .pinned_config
-            .members
-            .iter()
-            .find(|member| member.node == NodeId(2))
-            .expect("node 2 is pinned")
-            .copy;
-        assert_eq!(
-            host.land_link(PartitionId(1), &result),
-            Some(RecoveryEvent::CopyCaughtUp {
-                copy,
-                head: Seq(2),
-                digest: digests[1],
-            })
-        );
-        assert_eq!(
-            host.engine.link(PartitionId(1), Generation(2)),
-            Some(rdb_storage::Link {
-                parent: Generation(1),
-                base: Seq(2),
-                copied: false,
-            })
-        );
-        let receiver = host
-            .replication
-            .receiver(NodeId(2), PartitionId(1))
-            .expect("a receiver at the cutoff");
-        assert_eq!(
-            (receiver.lineage().generation, receiver.applied_head().seq),
-            (Generation(2), Seq(2))
-        );
-        assert_eq!(logged!(METHOD, "land_link_inherited").len(), 1);
-        assert_eq!(logged!(METHOD, "land_receiver_installed").len(), 1);
-    }
-
-    /// Ruling A-R185 rows 3 and 4 (critic-d7fix C2): a copy holding past the cutoff (data an
-    /// ask must not truncate), or holding a different digest at it, links nothing, installs no
-    /// receiver, answers nothing to send, and logs `land_link_refused` with the reason; the
-    /// host does not fault. Unit, about 2.5 s.
-    #[config_log::retcd_test]
-    fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links_nothing() {
-        const METHOD: &str =
-            "a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links_nothing";
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let digests = write_chain(
-            &mut RocksEngine::open(&path).expect("open engine"),
-            Generation(1),
-            3,
-        );
-        let past = landing_at(2, digests[1]);
-        let mut off = past.clone();
-        off.selected.cutoff_seq = Seq(3);
-        let rt = current_thread();
-        let mut host = host_over(&path, &rt);
-        let held = host.engine.lineages();
-        for result in [&past, &off] {
-            assert_eq!(host.land_link(PartitionId(1), result), None);
-            assert_eq!(host.engine.lineages(), held, "nothing linked");
-            assert!(host
-                .replication
-                .receiver(NodeId(2), PartitionId(1))
-                .is_none());
-            assert_eq!(host.fault, None);
-        }
-        let reasons: Vec<_> = logged!(METHOD, "land_link_refused")
-            .into_iter()
-            .map(|line| line["reason"].clone())
-            .collect();
-        assert_eq!(
-            reasons,
-            ["held_past_base", "base_digest_differs"].map(serde_json::Value::from)
-        );
-    }
-
-    /// review-r185 ADV2 and ADV3: the refusals no row reached, each by name and at its level.
-    /// A copy holding no older generation has nothing to link, which is expected on a first
-    /// landing, so it logs at info. One already holding the new generation, or one the pin
-    /// does not name, logs at warn. None links, installs a receiver or faults the host. Cut
-    /// (every reason at warn): red. Unit.
-    #[config_log::retcd_test]
-    fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
-        const METHOD: &str = "a_landing_with_nothing_to_link_is_refused_by_name_at_its_level";
-        let result = landing_at(0, Digest::ROOT);
-        let mut outside = result.clone();
-        outside
-            .committed
-            .pinned_config
-            .members
-            .retain(|member| member.node != NodeId(2));
-        let rt = current_thread();
-        let empty = config_testkit::fs::temp_dir();
-        let mut fresh = host_over(&empty.path().join("node"), &rt);
-        let ahead = config_testkit::fs::temp_dir();
-        let path = ahead.path().join("node");
-        write_chain(
-            &mut RocksEngine::open(&path).expect("open engine"),
-            Generation(2),
-            1,
-        );
-        let mut holding = host_over(&path, &rt);
-        let refuses = |host: &mut Host, result: &RecoveryResult| {
-            let held = host.engine.lineages();
-            assert_eq!(host.land_link(PartitionId(1), result), None);
-            assert_eq!(host.engine.lineages(), held, "nothing linked");
-            assert!(host
-                .replication
-                .receiver(NodeId(2), PartitionId(1))
-                .is_none());
-            assert_eq!(host.fault, None);
-        };
-        refuses(&mut fresh, &result);
-        refuses(&mut holding, &result);
-        refuses(&mut fresh, &outside);
-        let refused: Vec<_> = logged!(METHOD, "land_link_refused")
-            .into_iter()
-            .map(|line| (line["reason"].clone(), line["@l"].clone()))
-            .collect();
-        assert_eq!(
-            refused,
-            [
-                ("anchor_generation_absent", "Information"),
-                ("held_at_or_above_generation", "Warning"),
-                ("not_a_member", "Warning"),
-            ]
-            .map(|(reason, level)| (
-                serde_json::Value::from(reason),
-                serde_json::Value::from(level)
-            ))
-        );
-    }
-
-    /// A-R177 rows 3-5 (critic-f5 C2): the guards refuse before anything is written, each by
-    /// name: the digest at the base differs, the copy holds past the base (uncertain data an
-    /// ask must not truncate), or below it.
-    #[test]
-    fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let digests = write_chain(
-            &mut RocksEngine::open(&path).expect("open engine"),
-            Generation(1),
-            3,
-        );
-        let rt = current_thread();
-        let mut host = host_over(&path, &rt);
-        let held = host.engine.lineages();
-        for (anchor, reason) in [
-            (
-                anchor_at(2, 3, digests[1]),
-                "missed_generation_base_digest_differs",
-            ),
-            (
-                anchor_at(2, 2, digests[1]),
-                "missed_generation_held_past_base",
-            ),
-            (
-                anchor_at(2, 4, digests[2]),
-                "missed_generation_held_below_base",
-            ),
-        ] {
-            assert_eq!(
-                host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
-                Err(reason)
-            );
-            assert_eq!(
-                host.inventory(PartitionId(1), CopyId(1), anchor),
-                RecoveryEvent::InventoryFailed { copy: CopyId(1) }
-            );
-            assert_eq!(host.engine.lineages(), held, "{reason}: nothing written");
-        }
-    }
-
-    /// S1-8 D2: each `step_view` line names the depth of the view it built, the levels a read
-    /// through it walks (O(1), never a walk of the lineage). Generation 1 holds its own
-    /// writes, one level; generation 2 inherited onto it reads through two.
-    #[config_log::retcd_test]
-    fn the_step_view_line_names_the_view_depth() {
-        const METHOD: &str = "the_step_view_line_names_the_view_depth";
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let mut engine = RocksEngine::open(&path).expect("open engine");
-        write_chain(&mut engine, Generation(1), 2);
-        engine
-            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(2))
-            .expect("inherit");
-        drop(engine);
-        let rt = current_thread();
-        let mut host = host_over(&path, &rt);
-        for generation in [Generation(1), Generation(2)] {
-            host.refresh_view(PartitionId(1), generation)
-                .expect("step view");
-        }
-        let depths: Vec<_> = logged!(METHOD, "step_view")
-            .into_iter()
-            .map(|line| (line["generation"].clone(), line["depth"].clone()))
-            .collect();
-        assert_eq!(
-            depths,
-            [(1, 1), (2, 2)].map(|(g, d)| (serde_json::json!(g), serde_json::json!(d))),
-            "the step_view lines"
-        );
-    }
-
-    /// A-R177 row 6 (critic-f5 C1): a link onto a parent already at the chain ceiling would be
-    /// a multi-batch flatten inside the discovery window, so it is refused, nothing staged.
-    #[test]
-    fn a_missed_generation_is_not_linked_onto_a_parent_at_the_chain_ceiling() {
-        let ceiling = MAX_CHAIN_DEPTH as u64;
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let digests = {
-            let mut engine = RocksEngine::open(&path).expect("open engine");
-            let digests = write_chain(&mut engine, Generation(1), 2);
-            for to in 2..=ceiling {
-                assert_eq!(
-                    engine.inherit(PartitionId(1), Generation(to - 1), Generation(to), Seq(2)),
-                    Ok(Inherited::Linked)
-                );
-            }
-            assert_eq!(
-                engine.chain_depth(PartitionId(1), Generation(ceiling)),
-                MAX_CHAIN_DEPTH
-            );
-            digests
-        };
-        let rt = current_thread();
-        let mut host = host_over(&path, &rt);
-        let held = host.engine.lineages();
-        let anchor = anchor_at(ceiling + 1, 2, digests[1]);
-        assert_eq!(
-            host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
-            Err("missed_generation_link_depth_ceiling")
-        );
-        assert_eq!(host.engine.lineages(), held, "nothing staged or linked");
-    }
-
-    /// A-R177 row 8 (critic-f5 C3): the node stops after the link and before its answer. The
-    /// next open's inventory, from the same directory, reports as a copy that landed the
-    /// generation, and the link is unchanged.
-    #[test]
-    fn a_link_made_at_inventory_survives_a_restart_before_the_answer() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let digests = write_chain(
-            &mut RocksEngine::open(&path).expect("open engine"),
-            Generation(1),
-            2,
-        );
-        let anchor = anchor_at(2, 2, digests[1]);
-        let rt = current_thread();
-        {
-            let mut host = host_over(&path, &rt);
-            assert!(host.survivor(PartitionId(1), CopyId(1), anchor).is_ok());
-        }
-        let mut host = host_over(&path, &rt);
-        match host.inventory(PartitionId(1), CopyId(1), anchor) {
-            RecoveryEvent::InventoryReported(inventory) => {
-                assert_eq!(inventory.head, (Seq(2), digests[1]));
-            }
-            other => panic!("expected a report after the restart, got {other:?}"),
-        }
-        assert_eq!(
-            host.engine.link(PartitionId(1), Generation(2)),
-            Some(rdb_storage::Link {
-                parent: Generation(1),
-                base: Seq(2),
-                copied: false,
-            })
-        );
-    }
-
-    /// D5's guard: a healthy start logs no `replication_copy_not_advancing`. L1 holds its resume
-    /// for longer than `stuck_resends` retransmits, and R1 re-sends seq 1 through that hold (OB1)
-    /// to copies that acknowledged it. A copy level with the primary's head is not stuck, however
-    /// often a record is re-sent to it.
-    /// Integration (~1.4 s): the resume hold must outlast the threshold on R1's 100 ms timer.
-    #[config_log::retcd_test]
-    fn a_healthy_start_reports_no_copy_stuck_through_the_resume_hold() {
-        const METHOD: &str = "a_healthy_start_reports_no_copy_stuck_through_the_resume_hold";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.resume_hold_millis = 600;
-            host.stuck_resends = 3;
-        });
-        trio.bootstrap();
-        trio.ready();
-        assert!(
-            trio.nodes[0]
-                .0
-                .resends
-                .values()
-                .any(|entry| entry.through == Seq(1)),
-            "R1 sent seq 1 during the hold"
-        );
-        let warned = not_advancing!(METHOD);
-        assert!(warned.is_empty(), "a healthy start warned: {warned:?}");
-    }
-
-    /// D4's shape at the host: the copy acknowledged the record R1 keeps re-sending (through 1,
-    /// acked 1), and the head moved past it to 2. The host cannot make R1 do that without the
-    /// kernel defect, so the row hands `count_resend` the sends directly, against node 1's real
-    /// head. It uses a copy id R1 never sends to, so only the row's sends touch the slot, as only
-    /// R1's through-1 re-sends touched copy 2's in D4 (copy 2's own slot takes the put's seq 2).
-    /// Level with the head nothing is counted. The first send once behind repeats the last
-    /// level one, so it is re-send 1; the `stuck_resends`-th warns, and later ones do not.
-    /// The kernel side is the sim row `m9_d4_00`. Then a member copy's line names the node and
-    /// boot its configuration pins (Message 6), where the unsent copy's names neither.
-    #[config_log::retcd_test]
-    fn a_copy_acked_below_the_head_is_reported_once_it_stops_advancing() {
-        const METHOD: &str = "a_copy_acked_below_the_head_is_reported_once_it_stops_advancing";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.stuck_resends = 3;
-        });
-        trio.bootstrap();
-        trio.ready();
-        let send = |trio: &mut Trio| {
-            trio.nodes[0].0.count_resend(
-                PartitionId(1),
-                Generation(1),
-                UNSENT,
-                Seq(1),
-                acked_at(1, 1),
-            );
-        };
-
-        assert_eq!(trio.head(), Some(1));
-        for _ in 0..6 {
-            send(&mut trio);
-        }
-        assert_eq!(not_advancing!(METHOD).len(), 0, "level with the head");
-
-        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
-        trio.admits_for(1_000);
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1: {other:?}"),
-        }
-        assert_eq!(trio.head(), Some(2));
-        assert_eq!(
-            trio.nodes[0].0.resends[&(PartitionId(1), UNSENT)].episode(),
-            (Generation(1), Seq(1), acked_at(1, 1)),
-            "R1 did not touch the row's slot"
-        );
-        send(&mut trio);
-        send(&mut trio);
-        assert_eq!(
-            not_advancing!(METHOD).len(),
-            0,
-            "re-sends 1 and 2 while behind"
-        );
-        send(&mut trio);
-        assert_eq!(not_advancing!(METHOD).len(), 1, "re-send 3 warns");
-        send(&mut trio);
-        send(&mut trio);
-        let warned = not_advancing!(METHOD);
-        assert_eq!(warned.len(), 1, "one line per episode: {warned:?}");
-        let line = &warned[0];
-        assert_eq!(
-            (
-                &line["copy"],
-                &line["through"],
-                &line["head"],
-                &line["acked_applied"],
-                &line["resends"]
-            ),
-            (&UNSENT.0.into(), &1.into(), &2.into(), &1.into(), &3.into()),
-            "{line}"
-        );
-        assert!(
-            line["copy_node"].is_null() && line["copy_boot"].is_null(),
-            "a copy outside the configuration names no member: {line}"
-        );
-
-        // Message 6: a member's line names the node and the boot the configuration pins to it,
-        // so a restarted node (a later boot) reads as the copy that stopped. Copy 1 is node 2.
-        // Its slot holds R1's last level send, so the first send here starts the episode.
-        for _ in 0..4 {
-            trio.nodes[0].0.count_resend(
-                PartitionId(1),
-                Generation(1),
-                CopyId(1),
-                Seq(1),
-                acked_at(1, 1),
-            );
-        }
-        let warned = not_advancing!(METHOD);
-        assert_eq!(warned.len(), 2, "{warned:?}");
-        let line = &warned[1];
-        assert_eq!(
-            (&line["copy"], &line["copy_node"], &line["copy_boot"]),
-            (&1.into(), &2.into(), &BOOT.0.into()),
-            "{line}"
-        );
-    }
-
-    /// Lead ruling, mutants M35 and M40: the rule reads the copy's acked **applied** position,
-    /// and a change in it starts a new episode. R1 re-sends seq 3 at head 3 while the copy's
-    /// acked applied climbs 1, 2, 3 and its acked durable stays at 1. Each step is a copy that
-    /// is advancing, so no line: two re-sends at 1 and two at 2 stay under the threshold only
-    /// if the climb restarts the count (M40), and at 3 the copy is level by applied though not
-    /// by durable (M35). Same direct route and unsent copy id as the D4-shape row.
-    #[config_log::retcd_test]
-    fn a_copy_whose_acked_applied_climbs_is_not_reported_while_durable_lags() {
-        const METHOD: &str = "a_copy_whose_acked_applied_climbs_is_not_reported_while_durable_lags";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.stuck_resends = 3;
-        });
-        trio.bootstrap();
-        trio.ready();
-        for (request, object, seq) in [(1, b"a", 2), (2, b"b", 3)] {
-            match trio.ask(put(request, object, b"v", None)) {
-                Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(seq)),
-                other => panic!("put {request}: {other:?}"),
-            }
-        }
-        assert_eq!(trio.head(), Some(3));
-
-        for (applied, sends) in [(1, 3), (2, 3), (3, 4)] {
-            for _ in 0..sends {
-                trio.nodes[0].0.count_resend(
-                    PartitionId(1),
-                    Generation(1),
-                    UNSENT,
-                    Seq(3),
-                    acked_at(applied, 1),
-                );
-            }
-        }
-        let warned = not_advancing!(METHOD);
-        assert!(warned.is_empty(), "an advancing copy warned: {warned:?}");
-    }
-
-    /// M9 S2a ruling guard "the `past_horizon` computation": `authority_view` logs
-    /// `margin_ms` = `valid_through` - `at`, and `past_horizon` only when that is below 0.
-    /// While renewals commit every view has time left; once the store stops answering, the
-    /// grant runs out and the view A1 publishes at the fence has none.
-    /// Integration (~5.5 s at scale 1, measured alone, review F-006): the grant must expire at
-    /// the spec's horizon.
-    #[config_log::retcd_test]
-    fn the_view_line_says_past_horizon_only_once_no_time_is_left() {
-        const METHOD: &str = "the_view_line_says_past_horizon_only_once_no_time_is_left";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        trio.until("node 1 fenced", |trio| {
-            trio.status(0).authority.starts_with("fenced").then_some(())
-        });
-
-        let views: Vec<_> = logged!(METHOD, "authority_view")
-            .into_iter()
-            .filter(|line| line["node"] == 1)
-            .collect();
-        for line in &views {
-            let left = line["valid_through"].as_i64().expect("valid_through")
-                - line["at"].as_i64().expect("at");
-            assert_eq!(line["margin_ms"], left, "{line}");
-            assert_eq!(line["past_horizon"], left < 0, "{line}");
-        }
-        assert!(
-            views.iter().any(|line| line["past_horizon"] == false),
-            "a view with time left: {views:?}"
-        );
-        assert!(
-            views.iter().any(|line| line["past_horizon"] == true),
-            "the fence's view has none: {views:?}"
-        );
-    }
-
-    /// The `Acquire` firings queued on `host`, with the tick each is queued for.
-    fn queued_acquires(host: &Host) -> Vec<(Tick, TimerFired)> {
-        host.delayed
-            .iter()
-            .filter_map(|((at, _), item)| match item {
-                Delayed::Event(Queued {
-                    event:
-                        Event {
-                            kind: EventKind::Timer(fired),
-                            ..
-                        },
-                    ..
-                }) if fired.id == AuthorityTimer::Acquire.id() => Some((*at, *fired)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// A-R165 item 2: after an `Active` commit the primary's first `Acquire` is queued
-    /// [`ACQUIRE_AFTER_ACTIVE_MILLIS`] out; after any other commit it keeps
-    /// [`ACQUIRE_AFTER_RECOVERED_MILLIS`]. Three nodes with no holds commit `Active`; with node
-    /// 1's links to 2 and 3 held, F1 commits `ReadOnly`. The firing is read off node 1's queue
-    /// in the round the commit lands, before it can fire.
-    /// Integration (~4 s): two discovery windows.
-    #[test]
-    fn the_first_acquire_after_an_active_commit_is_queued_sooner() {
-        let first_acquire = |held: bool| {
-            let dir = config_testkit::fs::temp_dir();
-            let mut trio = Trio::new(dir.path(), Trio::fast);
-            if held {
-                trio.links.hold(NodeId(1), NodeId(2));
-                trio.links.hold(NodeId(1), NodeId(3));
-            }
-            trio.bootstrap();
-            trio.until("F1 committed on node 1", |trio| {
-                trio.status(0).recovered.map(|_| {
-                    let now = trio.clock.now().0;
-                    queued_acquires(&trio.nodes[0].0)
-                        .iter()
-                        .map(|(at, _)| at.0.saturating_sub(now))
-                        .collect::<Vec<_>>()
-                })
-            })
-        };
-        let active = first_acquire(false);
-        let [left] = active.as_slice() else {
-            panic!("one Acquire queued after the Active commit, not {active:?}");
-        };
-        assert!(
-            *left <= ACQUIRE_AFTER_ACTIVE_MILLIS,
-            "Active: due in {left} ms"
-        );
-        let read_only = first_acquire(true);
-        let [left] = read_only.as_slice() else {
-            panic!("one Acquire queued after the ReadOnly commit, not {read_only:?}");
-        };
-        assert!(
-            *left > ACQUIRE_AFTER_ACTIVE_MILLIS && *left <= ACQUIRE_AFTER_RECOVERED_MILLIS,
-            "ReadOnly: due in {left} ms"
-        );
-    }
-
-    /// D7 host wiring (B-R59, the sim's `catch_up`): F1's `CatchUp` on node 1 goes to node 2,
-    /// which holds the source copy; R1 there sends its stored records to node 3 as recovery
-    /// appends, and its `CopyCaughtUp` comes back to node 1, the node that asked. Live receivers
-    /// stand in for the sides a reopen does not have yet (A-R173 rules on those).
-    /// Integration (~3 s): bootstrap's discovery window, then one catch-up.
-    #[config_log::retcd_test]
-    fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
-        use rdb_core::contracts::ids::Revision;
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let receivers = |trio: &Trio| {
-            [1usize, 2].map(|i| {
-                let host = &trio.nodes[i].0;
-                host.replication
-                    .receiver(host.node, PartitionId(1))
-                    .map(|receiver| (receiver.lineage(), receiver.applied_head().seq))
-            })
-        };
-        let (lineage, through) = trio.until("nodes 2 and 3 hold node 1's head", |trio| {
-            let head = trio.head()?;
-            match receivers(trio) {
-                [Some((lineage, a)), Some((_, b))] if a.0 == head && b.0 == head && head > 0 => {
-                    Some((lineage, a))
-                }
-                _ => None,
-            }
-        });
-        let credential = FenceCredential {
-            partition: PartitionId(1),
-            prior_generation: lineage.generation,
-            prior_owner_epoch: lineage.owner_epoch,
-            control_revision: Revision(u64::MAX),
-            sender: CopyId(1),
-        };
-        let site = Site {
-            partition: PartitionId(1),
-            correlation: CorrelationId(u64::MAX),
-        };
-        let effect = RecoveryEffect::CatchUp {
-            from: CopyId(1),
-            to: CopyId(2),
-            through,
-            credential,
-        };
-        trio.nodes[0]
-            .0
-            .recovery_effect(&effect, site)
-            .expect("routed");
-
-        // Node 1's mail is read here before it is handled, to see the report arrive.
-        let patience = test_patience(Trio::PATIENCE);
-        let deadline = Instant::now() + patience;
-        let reported = loop {
-            let mut reported = None;
-            for (host, _, rx) in &mut trio.nodes {
-                host.run_due();
-                host.drain();
-                while let Ok(msg) = rx.try_recv() {
-                    if let Msg::Routed {
-                        kind: KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp { copy, head, .. }),
-                        correlation,
-                        ..
-                    } = &msg
-                    {
-                        reported = Some((host.node, *copy, *head, *correlation));
-                    }
-                    host.handle(msg);
-                }
-                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
-            }
-            if let Some(reported) = reported {
-                break reported;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no CopyCaughtUp reached node 1 within {patience:?}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        assert_eq!(
-            reported,
-            (NodeId(1), CopyId(2), through, CorrelationId(u64::MAX)),
-            "node 2's report reaches node 1 under the asking correlation"
-        );
-        assert!(
-            trio.nodes[1].0.catch_ups.is_empty(),
-            "the source forgets the asker once it has reported"
-        );
-        let sent: Vec<_> = config_testkit::logs::lines_for_current_test(
-            module_path!(),
-            "d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked",
-        )
-        .into_iter()
-        .filter(|line| line["@m"] == "recovery_envelopes_sent")
-        .map(|line| (line["node"].clone(), line["to"].clone()))
-        .collect();
-        assert!(
-            sent.contains(&(serde_json::json!(2), serde_json::json!(3))),
-            "node 2 sent recovery appends to node 3: {sent:?}"
-        );
-    }
-
-    /// Message 6, round 4 (A-R96 host trigger and status). A node fence queues one `Acquire`
-    /// firing at A1's current `Acquire` timer version, one renewal later: the kernel drops a
-    /// firing older than that version as stale, and without the firing A1 never polls its grant
-    /// and writes never resume. Status says `admits=false` while fenced, though L1 still allows.
-    /// The second fence shows the version is read, not assumed: A1 has re-armed `Acquire`
-    /// since the first, so it is above 0 there. Between them the grant is replaced, so writes
-    /// resume each time.
-    /// Integration (~3 s): bootstrap's discovery window, then two fences on a 600 ms grant.
-    #[config_log::retcd_test]
-    fn each_node_fence_queues_an_acquire_at_the_current_timer_version() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.grant_millis = 600;
-            host.budgets.renew_millis = 100;
-        });
-        trio.bootstrap();
-        trio.ready();
-        let mut versions = Vec::new();
-        for fence in 1..=2 {
-            trio.mem
-                .failing_with(config_core::ConfigError::Unavailable {
-                    reason: "the control store is down".to_owned(),
-                });
-            let (status, queued, current) = trio.until("node 1 fenced", |trio| {
-                let status = trio.status(0);
-                let host = &trio.nodes[0].0;
-                status.authority.starts_with("fenced").then(|| {
-                    let current = host.authority.timer_version(AuthorityTimer::Acquire);
-                    (status, queued_acquires(host), current)
-                })
-            });
-            assert_eq!(
-                (status.admits, status.protection.as_deref()),
-                (Some(false), Some("healthy")),
-                "fence {fence}: L1 allows, A1 does not: {status:?}"
-            );
-            let [(at, fired)] = queued.as_slice() else {
-                panic!("fence {fence}: one Acquire queued, not {queued:?}");
-            };
-            assert_eq!(fired.version, current, "fence {fence}");
-            assert_eq!(fired.scheduled_at, *at, "fence {fence}");
-            versions.push(current.0);
-
-            // D15: A1 re-arms `Acquire` only when a poll does not acquire. While the store is
-            // down every poll reads `Unavailable` and re-arms, so wait for that before the store
-            // returns. Otherwise a first poll that comes after the old grant expires acquires at
-            // once, and the version stays 0 (seen under load). Versions never fall in a boot,
-            // so the second fence's version is above 0 by construction.
-            if fence == 1 {
-                trio.until("A1 re-armed Acquire during the outage", |trio| {
-                    let host = &trio.nodes[0].0;
-                    (host.authority.timer_version(AuthorityTimer::Acquire) > current).then_some(())
-                });
-            }
-            trio.mem.stop_failing();
-            trio.until("node 1 holds a grant again", |trio| {
-                (trio.status(0).admits == Some(true)).then_some(())
-            });
-        }
-        assert!(versions[1] > 0, "the second fence's version: {versions:?}");
-    }
-
-    /// Msg 8, F-001: `admits` is A1's own admission verdict, not "L1 allows and A1 is `Held`".
-    /// While the control store is down A1 still holds, but denies `ControlUnavailable` before
-    /// it fences, and status said `admits=true` there. After the store returns, `admits=true`
-    /// means a put lands.
-    /// Integration (~2 s): bootstrap's discovery window, then one store outage on a 600 ms grant.
-    #[config_log::retcd_test]
-    fn admits_follows_a1s_verdict_while_the_grant_is_still_held() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.grant_millis = 600;
-            host.budgets.renew_millis = 100;
-        });
-        trio.bootstrap();
-        trio.ready();
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        let denied = trio.until("node 1 stops admitting", |trio| {
-            let status = trio.status(0);
-            (status.admits != Some(true)).then_some(status)
-        });
-        trio.mem.stop_failing();
-        assert!(
-            denied.authority.starts_with("held("),
-            "admits went false before the fence, while the grant is still held: {denied:?}"
-        );
-        assert_eq!(denied.admits, Some(false), "{denied:?}");
-        trio.until("node 1 admits again", |trio| {
-            (trio.status(0).admits == Some(true)).then_some(())
-        });
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("a put once status admits: {other:?}"),
-        }
-    }
-
-    /// Msg 8, walk 8d: while a self-replace re-acquires, A1 is `Unheld` with the old fence as
-    /// `last_fence`, and status reported it as a live fence. rdb_dev then said "nothing in M9
-    /// replaces it" one step before the new grant committed. Only `Fenced` is a fence.
-    /// Unit (~0 ms).
-    #[test]
-    fn status_reports_a_fence_only_while_fenced() {
-        let unheld = AuthorityState::Unheld {
-            last_fence: Some(DenyReason::Expired),
-            acquire: None,
-        };
-        assert_eq!(fence_of(&unheld), None, "unheld after a fence");
-        assert_eq!(fence_of(&AuthorityState::default()), None, "unheld at boot");
-        let fenced = AuthorityState::Fenced {
-            reason: DenyReason::Expired,
-            at: Tick(0),
-        };
-        assert_eq!(fence_of(&fenced), Some(DenyReason::Expired));
-    }
-
-    /// Msg 8, F-004 and F-016: status says whether A1's after-fence poll is live, from A1
-    /// itself. An `Expired` fence polls; a freeze of the record afterwards stops the poll while
-    /// the fence still reads `Expired`, so the reason alone cannot tell (F-016). The freeze is
-    /// written with no step in between, after the failing calls have drained, so no poll can
-    /// read the record unfrozen and replace it.
-    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
-    #[config_log::retcd_test]
-    fn status_says_the_after_fence_poll_stopped_when_the_record_is_frozen_later() {
-        use config_core::{ConfigStore as _, GetRequest, MutationOutcome, PutRequest};
-        use rdb_core::authority::grant::GrantRecord;
-        use rdb_core::contracts::control::ControlKey;
-
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.grant_millis = 600;
-            host.budgets.renew_millis = 100;
-        });
-        trio.bootstrap();
-        trio.ready();
-        let held = trio.status(0);
-        assert_eq!(
-            (held.fence, held.fence_polling, held.replace_stopped),
-            (None, false, false),
-            "{held:?}"
-        );
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        let fenced = trio.until("node 1 fenced", |trio| {
-            let status = trio.status(0);
-            status.fence.is_some().then_some(status)
-        });
-        assert_eq!(
-            (
-                fenced.fence,
-                fenced.fence_polling,
-                fenced.replace_stopped,
-                fenced.admits
-            ),
-            (Some(DenyReason::Expired), true, false, Some(false)),
-            "{fenced:?}"
-        );
-
-        // No step from here to the freeze: nothing new is sent, and what was sent fails.
-        std::thread::sleep(Duration::from_millis(50));
-        trio.mem.stop_failing();
-        let key = Bytes::from(ControlKey::Grant(NodeId(1)).encode());
-        let found = trio
-            .rt
-            .block_on(trio.mem.get(GetRequest { key: key.clone() }))
-            .expect("get grants/1")
-            .record
-            .expect("grants/1 exists");
-        let mut record = GrantRecord::decode(&found.value).expect("a grant record");
-        record.frozen = true;
-        let put = trio
-            .rt
-            .block_on(trio.mem.put(PutRequest {
-                key,
-                value: record.encode(),
-                expected_mod_revision: Some(found.mod_revision),
-                dedup: None,
-            }))
-            .expect("put grants/1 frozen");
-        assert_eq!(put.outcome, MutationOutcome::Applied);
-
-        let stopped = trio.until("the poll reads the frozen record", |trio| {
-            let status = trio.status(0);
-            (!status.fence_polling).then_some(status)
-        });
-        assert_eq!(
-            (
-                stopped.fence,
-                stopped.authority.as_str(),
-                stopped.replace_stopped,
-                stopped.admits
-            ),
-            (
-                Some(DenyReason::Expired),
-                "fenced(Expired)",
-                true,
-                Some(false)
-            ),
-            "the reason is unchanged; only the poll says it stopped: {stopped:?}"
-        );
-    }
-
-    /// U1 (ruling A-R109) end to end: a write applied and unpublished when a node fence lands.
-    /// Both copies' ACKs to the owner are dropped, so the put (seq 2) is applied on node 1 and
-    /// never published, and T1's queue is frozen on it. The control store then fails until A1
-    /// fences, which turns that freeze into a lost-authority one: status names seq 2 as the
-    /// write the queue waits on, and does not admit. The store returns and A1 replaces its own
-    /// grant (A-R96), and the queue still waits on seq 2: only its publication resolves it. Once
-    /// the links heal it publishes, `waits_on` clears, and writes are admitted again.
-    /// Integration (~3.5 s): bootstrap's discovery window, then one fence on a 600 ms grant.
-    #[config_log::retcd_test]
-    fn a_write_unpublished_at_a_fence_is_what_the_queue_waits_on_until_it_publishes() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.grant_millis = 600;
-            host.budgets.renew_millis = 100;
-        });
-        trio.bootstrap();
-        trio.ready();
-        trio.links.drop_direction(NodeId(2), NodeId(1));
-        trio.links.drop_direction(NodeId(3), NodeId(1));
-        let unacknowledged = trio.call(put(1, b"a", b"1", None));
-        trio.until("node 1 applies seq 2", |trio| {
-            (trio.head() == Some(2)).then_some(())
-        });
-
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        let fenced = trio.until("node 1 fenced", |trio| {
-            let status = trio.status(0);
-            status.fence.is_some().then_some(status)
-        });
-        assert_eq!(
-            (
-                fenced.waits_on,
-                fenced.admits,
-                fenced.published.map(|(_, seq)| seq)
-            ),
-            (Some(Seq(2)), Some(false), Some(Seq(1))),
-            "waits_on names the unpublished put at the fence: {fenced:?}"
-        );
-
-        trio.mem.stop_failing();
-        let replaced = trio.until("node 1 holds a grant again", |trio| {
-            let status = trio.status(0);
-            status.authority.starts_with("held(").then_some(status)
-        });
-        assert_eq!(
-            (replaced.waits_on, replaced.published.map(|(_, seq)| seq)),
-            (Some(Seq(2)), Some(Seq(1))),
-            "waits_on still names the put under the new grant: {replaced:?}"
-        );
-
-        trio.links.heal_all();
-        let published = trio.until("seq 2 publishes", |trio| {
-            let status = trio.status(0);
-            (status.published.map(|(_, seq)| seq) == Some(Seq(2))).then_some(status)
-        });
-        assert_eq!(
-            published.waits_on, None,
-            "waits_on once the put published: {published:?}"
-        );
-        trio.until("node 1 admits writes", |trio| {
-            (trio.status(0).admits == Some(true)).then_some(())
-        });
-        drop(unacknowledged);
-    }
-
-    /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
-    /// logged, never dropped in silence, and the primary neither faults nor stops taking
-    /// writes: copy 1 still acknowledges. The `SendFailed` event it also queues is not asserted:
-    /// no M9 kernel module consumes it yet.
-    #[config_log::retcd_test]
-    fn a_send_to_a_stopped_peer_is_logged_and_writes_go_on() {
-        const METHOD: &str = "a_send_to_a_stopped_peer_is_logged_and_writes_go_on";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        // Node 3 stops: its mailbox is gone, so a send to it fails instead of being buffered.
-        drop(std::mem::replace(&mut trio.nodes[2].2, mpsc::channel().1));
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1 with node 3 stopped: {other:?}"),
-        }
-        assert!(
-            trio.nodes[0].0.fault.is_none(),
-            "{:?}",
-            trio.nodes[0].0.fault
-        );
-
-        let failed = logged!(METHOD, "send_failed");
-        assert!(
-            failed
-                .iter()
-                .any(|line| line["node"] == 1 && line["to"] == 3),
-            "node 1's send to node 3 is reported: {failed:?}"
-        );
-    }
-
-    /// The stuck-cursor warning (lead, after D4). Link 1-3 is held once the partition is
-    /// active, so copy 2 (node 3) never acknowledges the put's record and R1 re-sends it every
-    /// 100 ms. After `stuck_resends` re-sends the host warns once, naming copy 2; the re-sends
-    /// after that do not repeat it, and copy 1, which acknowledged, is never named.
-    /// Integration (~1.4 s): R1's retransmit runs on its fixed 100 ms timer.
-    #[config_log::retcd_test]
-    fn a_copy_that_never_acknowledges_a_record_is_reported_once() {
-        const METHOD: &str = "a_copy_that_never_acknowledges_a_record_is_reported_once";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.stuck_resends = 3;
-        });
-        trio.bootstrap();
-        trio.ready();
-        trio.links.hold(NodeId(1), NodeId(3));
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1: {other:?}"),
-        }
-        trio.until("twice the re-sends that report a copy", |trio| {
-            let resends = trio.nodes[0].0.resends.get(&(PartitionId(1), CopyId(2)));
-            resends.filter(|entry| entry.resends >= 6).map(drop)
-        });
-
-        let warned = not_advancing!(METHOD);
-        assert_eq!(warned.len(), 1, "one line per episode: {warned:?}");
-        let line = &warned[0];
-        assert_eq!(
-            (
-                &line["@l"],
-                &line["partition"],
-                &line["copy"],
-                &line["through"]
-            ),
-            (&"Warning".into(), &1.into(), &2.into(), &2.into()),
-            "{line}"
-        );
-    }
-
-    /// Mutant M13: a read reply must match the step view it was served from, version and digest,
-    /// or the node faults rather than answer. P1 computes the digest from that same view, so no
-    /// client call reaches a mismatch; the row hands node 1 a forged reply instead.
-    #[test]
-    fn a_read_reply_that_does_not_match_the_step_view_faults_instead_of_answering() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1: {other:?}"),
-        }
-        match trio.ask(get(2, b"a")) {
-            Answer::Read { seen, .. } => {
-                assert_eq!(doc_bytes(seen), Some((2, Bytes::from_static(b"1"))))
-            }
-            other => panic!("get a: {other:?}"),
-        }
-
-        let host = &mut trio.nodes[0].0;
-        let root = root_key(TenantId(1), AFFINITY, b"a");
-        let forged = Digest::of(Domain::ReadValue, &[root.as_bytes(), b"forged"]);
-        let (reply, answer) = mpsc::channel();
-        host.pending.insert(
-            identity(3),
-            Pending {
-                reply,
-                kind: PendingKind::Read(root, Look::Doc),
-                event: EventId(0),
-                since: Tick(0),
-            },
-        );
-        let fault = host
-            .reply(
-                PartitionId(1),
-                &ReplyEffect::Read {
-                    identity: identity(3),
-                    outcome: ReadServiceOutcome::Served,
-                    value: Some((2, forged)),
-                },
-            )
-            .expect_err("a forged digest faults the node");
-        assert!(
-            fault.detail.contains("does not match the step view"),
-            "{fault:?}"
-        );
-        // The waiting read is told the host faulted, at once, not left to time out as "no read
-        // answer in 1s" (lead ruling 3, 2026-10-07).
-        match answer.try_recv() {
-            Ok(Answer::Error {
-                error,
-                request: None,
-            }) => {
-                assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
-                assert_eq!(error.detail, format!("host fault: {}", fault.detail));
-            }
-            other => panic!("the waiting read is answered with the fault: {other:?}"),
-        }
-    }
-
-    /// The answer a call's waiter holds right after `handle` returns: `None` when the waiter
-    /// was dropped unanswered, as a `Db` would then wait out its timeout.
-    fn answered_now(answer: &Receiver<Answer>) -> Option<Answer> {
-        match answer.try_recv() {
-            Ok(answer) => Some(answer),
-            Err(mpsc::TryRecvError::Disconnected) => None,
-            Err(mpsc::TryRecvError::Empty) => panic!("the waiter is neither answered nor dropped"),
-        }
-    }
-
-    /// F-001 (S0 review): a put or compile whose step view cannot be built faults the node.
-    /// Its own caller hears that at once, as `set_fault` tells every pending call; dropped, it
-    /// would wait out the `Db`'s timeout and read as "no answer". Both arms that compile.
-    #[test]
-    fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
-        for (name, call) in [
-            ("put", put(1, b"a", b"1", None)),
-            ("compile", compile(1, b"a", b"1")),
-        ] {
-            let dir = config_testkit::fs::temp_dir();
-            let mut trio = Trio::new(dir.path(), Trio::fast);
-            trio.bootstrap();
-            trio.ready();
-            let host = &mut trio.nodes[0].0;
-            host.fail_step_view = true;
-            let (reply, answer) = mpsc::channel();
-            host.handle(Msg::Client(Client {
-                partition: PartitionId(1),
-                call,
-                reply,
-            }));
-            let fault = host.fault.clone().expect("the node faulted");
-            assert!(fault.detail.contains("injected"), "{name}: {fault:?}");
-            match answered_now(&answer) {
-                Some(Answer::Error {
-                    error,
-                    request: None,
-                }) => assert_eq!(
-                    (error.retry, error.detail),
-                    (RetryRule::NotWired, format!("host fault: {}", fault.detail)),
-                    "{name}"
-                ),
-                other => panic!("{name}: the caller is told the host faulted: {other:?}"),
-            }
-        }
-    }
-
-    /// S1-8, admits at fault: a faulted node answers every call with its fault, so its status
-    /// never says it admits writes, though L1 still allows and A1 still holds its grant.
-    /// Before, `admits` read only L1 and A1 and said `true` beside `fault`.
-    #[test]
-    fn a_faulted_node_does_not_say_it_admits_writes() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let host = &mut trio.nodes[0].0;
-        host.fail_step_view = true;
-        let (reply, _answer) = mpsc::channel();
-        host.handle(Msg::Client(Client {
-            partition: PartitionId(1),
-            call: put(1, b"a", b"1", None),
-            reply,
-        }));
-        let status = trio.status(0);
-        assert!(status.fault.is_some(), "the node faulted: {status:?}");
-        assert_eq!(status.admits, Some(false), "{status:?}");
-    }
-
-    /// A-R178, the pending loop: a put already dispatched, waiting on its copies, when the
-    /// node faults on stored damage, is answered with that damage: `CORRUPT_HISTORY`, retry
-    /// `Quarantine`, its request named, and `no_mutation` false as before, since it was sent.
-    /// Only node 1 steps, so no copy acks and the put stays pending.
-    #[test]
-    fn a_dispatched_put_is_refused_with_the_damage_its_node_faulted_on() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let answer = trio.call(put(1, b"a", b"1", None));
-        let (host, _, rx) = &mut trio.nodes[0];
-        let deadline = Instant::now() + test_patience(Duration::from_secs(5));
-        while host.pending.is_empty() {
-            assert!(Instant::now() < deadline, "the put was never dispatched");
-            while let Ok(msg) = rx.try_recv() {
-                host.handle(msg);
-            }
-            host.drain();
-        }
-        assert!(answer.try_recv().is_err(), "the put is still waiting");
-        host.set_fault(Fault {
-            damage: Some(ErrorKind::CorruptHistory),
-            detail: "a damaged read".to_owned(),
-        });
-        match answer.try_recv() {
-            Ok(Answer::Error {
-                error,
-                request: Some(_),
-            }) => assert_eq!(
-                (error.kind, error.retry, error.no_mutation),
-                (ErrorKind::CorruptHistory, RetryRule::Quarantine, false),
-                "{error:?}"
-            ),
-            other => panic!("the pending put is answered with the damage: {other:?}"),
-        }
-    }
-
-    /// F-001 (S0 review): a reply whose kind does not answer the waiting call faults the node,
-    /// and that call is told so at once. The same for P1's previous-view answer, to a call that
-    /// did not ask for one or under a handle storage never bound. The replies are forged: no
-    /// client call reaches these arms once one identity has one waiter (F-002).
-    #[test]
-    fn a_reply_the_waiting_call_cannot_take_answers_it_with_the_host_fault() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        let host = &mut trio.nodes[0].0;
-        let root = root_key(TenantId(1), AFFINITY, b"a");
-        let cases: [(&str, PendingKind); 3] = [
-            // A status query is never a pending waiter since F-014, so the read reply meets a
-            // previous-view call instead.
-            (
-                "read reply to a previous-view call",
-                PendingKind::Previous(root.clone()),
-            ),
-            (
-                "previous view to a read",
-                PendingKind::Read(root.clone(), Look::Doc),
-            ),
-            ("unbound previous view", PendingKind::Previous(root)),
-        ];
-        for (n, (name, kind)) in (1u64..).zip(cases) {
-            let (reply, answer) = mpsc::channel();
-            let waiter = Pending {
-                reply,
-                kind,
-                event: EventId(0),
-                since: Tick(0),
-            };
-            host.pending.insert(identity(n), waiter);
-            let fault = if n == 1 {
-                host.reply(
-                    PartitionId(1),
-                    &ReplyEffect::Read {
-                        identity: identity(n),
-                        outcome: ReadServiceOutcome::Served,
-                        value: None,
-                    },
-                )
-            } else {
-                host.previous_answer(identity(n), Ok(SnapshotHandle(7)))
-            }
-            .expect_err(name);
-            match answered_now(&answer) {
-                Some(Answer::Error {
-                    error,
-                    request: None,
-                }) => assert_eq!(
-                    (error.retry, error.detail),
-                    (RetryRule::NotWired, format!("host fault: {}", fault.detail)),
-                    "{name}"
-                ),
-                other => panic!("{name}: the caller is told the host faulted: {other:?}"),
-            }
-        }
-    }
-
-    /// A waiter that has neither an answer nor been dropped.
-    fn still_waits(name: &str, waiter: &Receiver<Answer>) {
-        match waiter.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => {}
-            other => panic!("{name} still waits: {other:?}"),
-        }
-    }
-
-    /// F-002 (S0 review): one identity, one waiter. A `Db` is shared across threads (`rdb_dev`'s
-    /// `put&`), so a second call can come under an identity whose first call still waits. It
-    /// queues behind that call and is submitted once that call is answered: every caller gets
-    /// its own answer, and no reply meets a call it cannot answer. Before, the newer call
-    /// replaced the waiter, so the older caller was answered by nobody, and a put over a read
-    /// waiting at the barrier faulted the node.
-    ///
-    /// - (a) Behind a put in flight: the same request resent, the same request resent by a
-    ///   caller that has already given up, and a changed payload. A status query under the
-    ///   same identity does not queue (F-014, round 2 R1): it is answered at once, `Unknown`
-    ///   while the put is unpublished, and the put still waits. The changed
-    ///   payload still ends in `REQUEST_ID_REUSE`, but only once the put is answered (here, at
-    ///   the heal): queued, it waits for the first call's answer, where before it was refused
-    ///   at once. The given-up caller's resend is still submitted, as its `UNKNOWN_OUTCOME`
-    ///   allows, and publishes nothing more: the kernel de-duplicates it. A compile under the
-    ///   waiting identity does not queue either (S1 guard G11): it sends nothing, and it is
-    ///   how `retry N --payload` starts while request N still waits.
-    /// - (b) A put under the identity of a read waiting at the barrier.
-    /// - (c) A host fault answers the waiting call and every call queued behind it (F-001).
-    #[config_log::retcd_test]
-    fn a_second_call_under_a_waiting_identity_queues_and_each_caller_gets_its_own_answer() {
-        const METHOD: &str =
-            "a_second_call_under_a_waiting_identity_queues_and_each_caller_gets_its_own_answer";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1: {other:?}"),
-        }
-        let hold = |trio: &Trio| {
-            trio.links.hold(NodeId(1), NodeId(2));
-            trio.links.hold(NodeId(1), NodeId(3));
-        };
-
-        // (a)
-        let compiled = match trio.ask(compile(10, b"a", b"2")) {
-            Answer::Compiled(request) => request,
-            other => panic!("compile request 10: {other:?}"),
-        };
-        hold(&trio);
-        let first = trio.call(ClientCall::Resend {
-            request: compiled.clone(),
-        });
-        trio.until("node 1 applied request 10", |trio| {
-            (trio.head() == Some(3)).then_some(())
-        });
-        match trio.ask(ClientCall::Status {
-            identity: identity(10),
-            generation: None,
-        }) {
-            Answer::Status(TxnStatus::Unknown) => {}
-            other => panic!("status of request 10 while it waits: {other:?}"),
-        }
-        let recompiled = trio.call(compile(10, b"a", b"3"));
-        for _ in 0..3 {
-            trio.step();
-        }
-        match recompiled.try_recv() {
-            Ok(Answer::Compiled(request)) => assert_eq!(request.identity, identity(10)),
-            other => panic!("a compile under the waiting request 10 is not queued: {other:?}"),
-        }
-        let same = trio.call(ClientCall::Resend {
-            request: compiled.clone(),
-        });
-        drop(trio.call(ClientCall::Resend { request: compiled }));
-        let changed = trio.call(put(10, b"a", b"other", None));
-        for _ in 0..3 {
-            trio.step();
-        }
-        for (name, waiter) in [
-            ("the put", &first),
-            ("the same request", &same),
-            ("the changed payload", &changed),
-        ] {
-            still_waits(name, waiter);
-        }
-        trio.links.heal_all();
-        match trio.answer(&first) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
-            other => panic!("request 10: {other:?}"),
-        }
-        match trio.answer(&same) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3), "the same transaction"),
-            other => panic!("request 10 resent: {other:?}"),
-        }
-        match trio.answer(&changed) {
-            Answer::Error { error, .. } => assert_eq!(error.name(), "REQUEST_ID_REUSE"),
-            other => panic!("request 10 with another value: {other:?}"),
-        }
-        let calls = |request: u64| {
-            logged!(METHOD, "client_call")
-                .iter()
-                .filter(|line| line["request"] == request)
-                .count()
-        };
-        trio.until("the given-up resend was submitted", |_| {
-            (calls(10) == 5).then_some(())
-        });
-        for _ in 0..3 {
-            trio.step();
-        }
-        assert_eq!(trio.head(), Some(3), "request 10 published once");
-
-        // (b)
-        // A-R124d: put 20 needs node 1's grant, which can lapse after (a)'s hold. No retention
-        // or deadline here depends on the time.
-        trio.admits_for(1_000);
-        hold(&trio);
-        let put_b = trio.call(put(20, b"b", b"1", None));
-        trio.until("node 1 applied request 20", |trio| {
-            (trio.head() == Some(4)).then_some(())
-        });
-        let read = trio.call(get(21, b"b"));
-        trio.until("node 1 took the read", |trio| {
-            trio.nodes[0]
-                .0
-                .pending
-                .contains_key(&identity(21))
-                .then_some(())
-        });
-        trio.step();
-        let over = trio.call(put(21, b"c", b"1", None));
-        for _ in 0..3 {
-            trio.step();
-        }
-        for (name, waiter) in [("put b", &put_b), ("the read", &read), ("put c", &over)] {
-            still_waits(name, waiter);
-        }
-        trio.links.heal_all();
-        match trio.answer(&put_b) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(4)),
-            other => panic!("put b: {other:?}"),
-        }
-        match trio.answer(&read) {
-            Answer::Read { outcome, seen, .. } => assert_eq!(
-                (outcome, doc_bytes(seen)),
-                (
-                    ReadServiceOutcome::WaitedAtBarrier,
-                    Some((4, Bytes::from_static(b"1")))
-                )
-            ),
-            other => panic!("the read at the barrier: {other:?}"),
-        }
-        // Sent the moment the read is answered, which can still be inside L1's resume hold
-        // after the heal: then the kernel refuses it, and that refusal is its own answer.
-        match trio.answer(&over) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(5)),
-            Answer::Error { error, .. } => assert_eq!(error.name(), "PROTECTION_PAUSED"),
-            other => panic!("put c under the read's identity: {other:?}"),
-        }
-
-        // (c)
-        trio.ready();
-        let head = trio.head().expect("node 1 holds the partition");
-        hold(&trio);
-        let put_d = trio.call(put(30, b"d", b"1", None));
-        trio.until("node 1 applied request 30", |trio| {
-            (trio.head() == Some(head + 1)).then_some(())
-        });
-        let queued = trio.call(get(30, b"d"));
-        for _ in 0..3 {
-            trio.step();
-        }
-        still_waits("the get behind put d", &queued);
-        let host = &mut trio.nodes[0].0;
-        host.fail_step_view = true;
-        let (reply, faulting) = mpsc::channel();
-        host.handle(Msg::Client(Client {
-            partition: PartitionId(1),
-            call: put(31, b"e", b"1", None),
-            reply,
-        }));
-        assert!(host.fault.is_some(), "the node faulted");
-        for (name, waiter) in [
-            ("put d", &put_d),
-            ("the get behind it", &queued),
-            ("the faulting put", &faulting),
-        ] {
-            match waiter.try_recv() {
-                Ok(Answer::Error { error, .. }) => {
-                    assert_eq!(error.retry, RetryRule::NotWired, "{name}: {error:?}");
-                }
-                other => panic!("{name} is told the host faulted: {other:?}"),
-            }
-        }
-        assert_eq!(logged!(METHOD, "client_call_queued").len(), 5);
-    }
-
-    /// F-002's bound: past [`MAX_QUEUED_PER_IDENTITY`] calls queued under one identity, the next
-    /// is refused at once and nothing of it is sent. A write past the bound is `UNKNOWN_OUTCOME`
-    /// (round 2 R2): the call it queued behind may yet publish, so the caller asks `status`. A
-    /// resend carries its request back; a put was never compiled, so it has none (the `Db`
-    /// sends every put as a resend). A read past the bound stays `INVALID_ARGUMENT`. The queued
-    /// resends are each answered with the one transaction once the heal lets it publish, and
-    /// only they and the first were ever sent.
-    #[config_log::retcd_test]
-    fn a_call_past_the_queue_bound_for_its_identity_is_refused_and_sends_nothing() {
-        const METHOD: &str =
-            "a_call_past_the_queue_bound_for_its_identity_is_refused_and_sends_nothing";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let compiled = match trio.ask(compile(1, b"a", b"1")) {
-            Answer::Compiled(request) => request,
-            other => panic!("compile request 1: {other:?}"),
-        };
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        let resend = || ClientCall::Resend {
-            request: compiled.clone(),
-        };
-        let first = trio.call(resend());
-        trio.until("node 1 applied request 1", |trio| {
-            (trio.head() == Some(2)).then_some(())
-        });
-        let queued: Vec<_> = (0..MAX_QUEUED_PER_IDENTITY)
-            .map(|_| trio.call(resend()))
-            .collect();
-        let past_resend = trio.call(resend());
-        let past_put = trio.call(put(1, b"a", b"1", None));
-        let past_get = trio.call(get(1, b"a"));
-        for _ in 0..3 {
-            trio.step();
-        }
-        for (name, waiter, request) in [
-            ("a resend", &past_resend, Some(compiled.clone())),
-            ("a put", &past_put, None),
-        ] {
-            match waiter.try_recv() {
-                Ok(Answer::Error {
-                    error,
-                    request: got,
-                }) => {
-                    assert_eq!(
-                        (error.name(), error.retry, error.no_mutation),
-                        ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus, false),
-                        "{name}: {error:?}"
-                    );
-                    assert_eq!(got, request, "{name}");
-                }
-                other => panic!("{name} past the bound is refused at once: {other:?}"),
-            }
-        }
-        match past_get.try_recv() {
-            Ok(Answer::Error {
-                error,
-                request: None,
-            }) => assert_eq!(
-                (error.name(), error.retry, error.no_mutation),
-                ("INVALID_ARGUMENT".to_owned(), RetryRule::Definitive, true),
-                "{error:?}"
-            ),
-            other => panic!("a get past the bound is refused at once: {other:?}"),
-        }
-        still_waits("the first resend", &first);
-        for waiter in &queued {
-            still_waits("a queued resend", waiter);
-        }
-        trio.links.heal_all();
-        for waiter in std::iter::once(&first).chain(&queued) {
-            match trio.answer(waiter) {
-                Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-                other => panic!("request 1: {other:?}"),
-            }
-        }
-        let sent = logged!(METHOD, "client_call")
-            .into_iter()
-            .filter(|line| line["request"] == 1)
-            .count();
-        assert_eq!(
-            sent,
-            1 + MAX_QUEUED_PER_IDENTITY,
-            "the first call and the queued ones; nothing past the bound"
-        );
-    }
-
-    /// F-014 (round 2 R1): P1 may withhold a published put's reply for good (a Reply check A1
-    /// denies, a fence, a new lineage), and nothing else answers that waiter. Before, the waiter
-    /// held its identity forever and every later call under it queued behind, the status query
-    /// included: the one call that resolves an `UNKNOWN_OUTCOME` could never be answered.
-    /// Now a status query never queues behind a write, and a put's waiter expires at its
-    /// request's deadline plus [`TXN_WAITER_MARGIN_MILLIS`] as `UNKNOWN_OUTCOME`. Here A1
-    /// denies the Reply check: the status query answers `Resolved` at the put's seq while the
-    /// put still waits, the put expires, the resend queued behind it is released and gets the
-    /// published result again, and so does a resend after. The node never faults (`Trio::step`
-    /// checks).
-    #[config_log::retcd_test]
-    fn a_put_whose_reply_p1_withholds_expires_and_its_status_is_answered_meanwhile() {
-        const METHOD: &str =
-            "a_put_whose_reply_p1_withholds_expires_and_its_status_is_answered_meanwhile";
-        const REMAINING_MILLIS: u64 = 1_000;
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let compiled = match trio.ask(ClientCall::Compile {
-            identity: identity(1),
-            puts: vec![PutOp {
-                group: AFFINITY,
-                object: Bytes::from_static(b"a"),
-                change: byte_doc(b"1"),
-                expect: None,
-            }],
-            remaining_millis: REMAINING_MILLIS,
-        }) {
-            Answer::Compiled(request) => request,
-            other => panic!("compile request 1: {other:?}"),
-        };
-        trio.nodes[0].0.deny_reply_checks = true;
-        let sent = Instant::now();
-        let put = trio.call(ClientCall::Resend {
-            request: compiled.clone(),
-        });
-        trio.until("node 1 applied request 1", |trio| {
-            (trio.head() == Some(2)).then_some(())
-        });
-        // Asked until P1 has published: before, its index answers `Unknown`. Each is answered
-        // while the put still waits, which a status queued behind the put never is.
-        let deadline = Instant::now() + test_patience(Trio::PATIENCE);
-        let status = loop {
-            let answer = trio.ask(ClientCall::Status {
-                identity: identity(1),
-                generation: None,
-            });
-            still_waits("the put whose reply P1 withheld", &put);
-            match answer {
-                Answer::Status(TxnStatus::Resolved(result)) => break result,
-                Answer::Status(TxnStatus::Unknown | TxnStatus::Unresolved { .. }) => {}
-                other => panic!("status of request 1: {other:?}"),
-            }
-            assert!(Instant::now() < deadline, "request 1 never resolved");
-        };
-        assert_eq!(status.seq, Seq(2), "the status is the put's");
-        // P1 has already withheld the put's reply, so clearing the deny cannot revive it; it lets
-        // the resend queued behind the put be answered once the expiry releases it.
-        trio.nodes[0].0.deny_reply_checks = false;
-        let behind = trio.call(ClientCall::Resend {
-            request: compiled.clone(),
-        });
-        for _ in 0..3 {
-            trio.step();
-        }
-        still_waits("the put whose reply P1 withheld", &put);
-        still_waits("the resend queued behind it", &behind);
-
-        let expired = trio.answer(&put);
-        assert!(
-            sent.elapsed() >= Duration::from_millis(REMAINING_MILLIS),
-            "expired after {:?}, inside the request's deadline",
-            sent.elapsed()
-        );
-        match expired {
-            Answer::Error { error, request } => {
-                assert_eq!(
-                    (error.name(), error.retry, error.no_mutation),
-                    ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus, false),
-                    "{error:?}"
-                );
-                assert_eq!(request, Some(compiled.clone()), "the request comes back");
-            }
-            other => panic!("the withheld put expires: {other:?}"),
-        }
-        let logged = logged!(METHOD, "txn_waiter_expired");
-        assert_eq!(logged.len(), 1, "{logged:?}");
-        assert_eq!(logged[0]["request"], 1, "{}", logged[0]);
-        // The expiry frees the identity: the queued resend goes out and gets the replay.
-        match trio.answer(&behind) {
-            Answer::Txn { result, .. } => assert_eq!(result, status, "the queued resend"),
-            other => panic!("the resend queued behind the withheld put: {other:?}"),
-        }
-        let dequeued = logged!(METHOD, "client_call_dequeued")
-            .into_iter()
-            .filter(|line| line["request"] == 1)
-            .count();
-        assert_eq!(dequeued, 1, "the queued resend was released by the expiry");
-
-        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
-        trio.admits_for(1_000);
-        match trio.ask(ClientCall::Resend { request: compiled }) {
-            Answer::Txn { result, .. } => assert_eq!(result, status, "the replayed result"),
-            other => panic!("request 1 resent after expiry: {other:?}"),
-        }
-        assert_eq!(trio.head(), Some(2), "request 1 published once");
-    }
-
-    /// F-014's guard (review leftover): an expiry meets only the waiter it was scheduled for.
-    /// Put A is answered before its deadline (a forged P1 refusal, as the rows above forge
-    /// replies), which releases resend B, queued behind it under the same identity. A's expiry
-    /// is still due and fires while B waits: it must leave B alone. Nothing is drained, so no
-    /// module answers B; only the host's own duties run.
-    #[config_log::retcd_test]
-    fn an_expiry_never_expires_the_call_released_after_its_put() {
-        const METHOD: &str = "an_expiry_never_expires_the_call_released_after_its_put";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        let host = &mut trio.nodes[0].0;
-        let request = |remaining_millis| TxnRequest {
-            api_version: API_VERSION,
-            identity: identity(1),
-            affinity: AFFINITY,
-            expected_generation: Some(Generation(1)),
-            remaining_millis,
-            conditions: Vec::new(),
-            mutations: Vec::new(),
-        };
-        let send = |host: &mut Host, remaining_millis| {
-            let (reply, answer) = mpsc::channel();
-            host.client(Client {
-                partition: PartitionId(1),
-                call: ClientCall::Resend {
-                    request: request(remaining_millis),
-                },
-                reply,
-            })
-            .expect("sent");
-            answer
-        };
-        // A's deadline is 0, so its expiry is due after the margin alone; B's is out of reach.
-        let a = send(host, 0);
-        let a_event = host.pending[&identity(1)].event;
-        let b = send(host, 60_000);
-        still_waits("resend B, queued behind A", &b);
-        host.reply(
-            PartitionId(1),
-            &ReplyEffect::Failed {
-                identity: identity(1),
-                error: RdbError::UnknownOutcome {
-                    partition: PartitionId(1),
-                    identity: identity(1),
-                },
-            },
-        )
-        .expect("A is answered");
-        match a.try_recv() {
-            Ok(Answer::Error { error, .. }) => assert_eq!(error.name(), "UNKNOWN_OUTCOME"),
-            other => panic!("put A: {other:?}"),
-        }
-        let b_event = host.pending[&identity(1)].event;
-        assert_ne!(a_event, b_event, "B, released, is the waiter now");
-
-        let a_due = |host: &Host| {
-            host.delayed
-                .values()
-                .any(|item| matches!(item, Delayed::TxnExpiry { event, .. } if *event == a_event))
-        };
-        assert!(a_due(host), "A's expiry is still due");
-        let deadline = Instant::now() + test_patience(Trio::PATIENCE);
-        while a_due(host) {
-            host.run_due();
-            assert!(Instant::now() < deadline, "A's expiry never fired");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        still_waits("resend B, after A's expiry fired", &b);
-        assert_eq!(
-            host.pending.get(&identity(1)).map(|waiter| waiter.event),
-            Some(b_event)
-        );
-        assert_eq!(logged!(METHOD, "txn_waiter_expired").len(), 0);
-        assert_eq!(host.fault, None);
-    }
-
-    /// M9 S3-2: the owner publishes a write after its caller stopped waiting. The answer has
-    /// nowhere to go, so the host logs `reply_undelivered` once, naming the node and request,
-    /// and does not fault; `status` with the same id then settles it at the seq it published.
-    /// Trio (~2 s): the hold keeps the write unpublished until the caller is gone.
-    #[config_log::retcd_test]
-    fn a_write_published_after_its_caller_left_is_logged_undelivered_and_status_settles_it() {
-        const METHOD: &str =
-            "a_write_published_after_its_caller_left_is_logged_undelivered_and_status_settles_it";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1: {other:?}"),
-        }
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        drop(trio.call(put(2, b"a", b"2", None)));
-        trio.until("node 1 applied request 2", |trio| {
-            (trio.head() == Some(3)).then_some(())
-        });
-        assert!(
-            logged!(METHOD, "reply_undelivered").is_empty(),
-            "not yet published"
-        );
-
-        trio.links.heal_all();
-        let lines = trio.until("reply_undelivered", |_| {
-            let lines = logged!(METHOD, "reply_undelivered");
-            (!lines.is_empty()).then_some(lines)
-        });
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            lines[0]["node"] == 1 && lines[0]["request"] == 2,
-            "{lines:?}"
-        );
-        // A-R124d: after a 2 s-scale hold node 1's grant can lapse, and a fenced node answers
-        // `status` `Unknown`. The default retention is a day, so the wait moves nothing past it.
-        trio.admits_for(1_000);
-        match trio.ask(ClientCall::Status {
-            identity: identity(2),
-            generation: None,
-        }) {
-            Answer::Status(TxnStatus::Resolved(result)) => {
-                assert_eq!((result.generation, result.seq), (Generation(1), Seq(3)));
-            }
-            other => panic!("status of request 2: {other:?}"),
-        }
-    }
-
-    /// M9 S3-5: the owner's trim duty lets a published write's retained answer go once it is
-    /// `dedup_retention_millis` old, never before (a 1.1 s look covers a trim tick, so a duty
-    /// that ignored the age would have trimmed). One `below` = the last aged seq + 1 covers
-    /// both writes, sent to T1 and P1 together: afterwards `status` is `Unknown` for both, and
-    /// a resend of the first is not replayed from the dedup index but runs afresh, where its
-    /// `Absent` condition fails. Only node 1 trims. Trio (~4 s): a 1.5 s retention.
-    #[config_log::retcd_test]
-    fn the_trim_duty_drops_both_retained_answers_once_they_age_and_not_before() {
-        const METHOD: &str =
-            "the_trim_duty_drops_both_retained_answers_once_they_age_and_not_before";
-        const RETENTION_MILLIS: u64 = 1_500;
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.dedup_retention_millis = RETENTION_MILLIS;
-        });
-        trio.bootstrap();
-        // A-R124b: the status and resend inside the 1.5 s retention need the grant for about
-        // 1.2 s more, and no wait can come between them without passing the retention.
-        trio.admits_for(RETENTION_MILLIS);
-        let first = match trio.ask(compile(1, b"a", b"1")) {
-            Answer::Compiled(request) => request,
-            other => panic!("compile request 1: {other:?}"),
-        };
-        let resend = |trio: &mut Trio| {
-            trio.ask(ClientCall::Resend {
-                request: first.clone(),
-            })
-        };
-        match resend(&mut trio) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("request 1: {other:?}"),
-        }
-        match trio.ask(put(2, b"b", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
-            other => panic!("request 2: {other:?}"),
-        }
-        let status = |trio: &mut Trio, request| {
-            trio.ask(ClientCall::Status {
-                identity: identity(request),
-                generation: None,
-            })
-        };
-
-        let looked = trio.clock.now().plus_millis(1_100);
-        trio.until("1.1 s, a trim tick", |trio| {
-            (trio.clock.now() >= looked).then_some(())
-        });
-        match status(&mut trio, 1) {
-            Answer::Status(TxnStatus::Resolved(result)) => assert_eq!(result.seq, Seq(2)),
-            other => panic!("status 1 inside the retention: {other:?}"),
-        }
-        match resend(&mut trio) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2), "replayed"),
-            other => panic!("resend 1 inside the retention: {other:?}"),
-        }
-
-        let trims = trio.until("node 1 trims below 4", |_| {
-            let trims = logged!(METHOD, "host_duty")
-                .into_iter()
-                .filter(|line| line["kind"] == "trim")
-                .collect::<Vec<_>>();
-            trims.iter().any(|line| line["below"] == 4).then_some(trims)
-        });
-        assert!(
-            trims
-                .iter()
-                .all(|line| line["node"] == 1 && line["generation"] == 1),
-            "{trims:?}"
-        );
-        assert_eq!(
-            trims.last().map(|line| line["below"] == 4),
-            Some(true),
-            "{trims:?}"
-        );
-        // A-R124b: node 1's grant can lapse and fence it here; a fenced node answers `Unknown`
-        // and refuses the resend `LEASE_EXPIRED`. Both are trimmed already, so waiting only ages them.
-        trio.admits_for(1_000);
-        for request in [1, 2] {
-            match status(&mut trio, request) {
-                Answer::Status(TxnStatus::Unknown) => {}
-                other => panic!("status {request} after the trim: {other:?}"),
-            }
-        }
-        match resend(&mut trio) {
-            Answer::Error { error, .. } => {
-                assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
-            }
-            other => panic!("resend 1 after the trim runs afresh and fails: {other:?}"),
-        }
-    }
-
-    /// Tester coverage ask (S3-5): the trim duty skips a partition with nothing published to
-    /// age and goes on to the next. Node 1 holds an empty publish queue for partition 0, which
-    /// sorts before partition 1, as an idle partition's does once its last entry aged out. The
-    /// write on partition 1 is still trimmed. A duty that stopped at the idle partition would
-    /// never trim partition 1. Trio (~4 s): a 300 ms retention, one trim tick past it.
-    #[config_log::retcd_test]
-    fn the_trim_duty_passes_an_idle_partition_and_trims_the_next() {
-        const METHOD: &str = "the_trim_duty_passes_an_idle_partition_and_trims_the_next";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.dedup_retention_millis = 300;
-        });
-        trio.bootstrap();
-        trio.ready();
-        let owner = &mut trio.nodes[0].0;
-        assert_eq!(owner.node, NodeId(1));
-        owner.published_at.insert(PartitionId(0), VecDeque::new());
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1: {other:?}"),
-        }
-        let trims = trio.until("node 1 trims partition 1 below 3", |_| {
-            let trims = logged!(METHOD, "host_duty")
-                .into_iter()
-                .filter(|line| line["kind"] == "trim")
-                .collect::<Vec<_>>();
-            trims.iter().any(|line| line["below"] == 3).then_some(trims)
-        });
-        assert!(
-            trims
-                .iter()
-                .all(|line| line["node"] == 1 && line["partition"] == 1),
-            "nothing trimmed for the idle partition: {trims:?}"
-        );
-    }
-
-    /// D6 (ruling A-R172): the trim duty deletes trimmed Dedup rows on disk at most once per a
-    /// quarter of the retention, with the latest floor. Trim ticks every 50 ms and a 400 ms
-    /// retention make a 100 ms period; puts about 40 ms apart give a trim on most ticks. So
-    /// the deletes run, but on fewer ticks than the trims, and node 1's disk keeps fewer
-    /// generation-1 Dedup rows than it wrote. A delete on every trim fails the count.
-    /// Trio (~3 s): a 1.5 s run of puts on real trim ticks.
-    #[config_log::retcd_test]
-    fn the_durable_trim_delete_runs_at_most_once_per_period() {
-        use rdb_core::transaction::dedup::parse_dedup_key;
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.trim_every_millis = 50;
-            host.budgets.dedup_retention_millis = 400;
-        });
-        trio.bootstrap();
-        trio.ready();
-        let until = trio.clock.now().plus_millis(1_500);
-        let mut request = 1;
-        let mut landed = 0_usize;
-        while trio.clock.now() < until {
-            match trio.ask(put(request, b"a", b"1", None)) {
-                Answer::Txn { .. } => landed += 1,
-                Answer::Error { error, .. } => {
-                    assert_ne!(
-                        error.kind,
-                        ErrorKind::Overloaded,
-                        "put {request}: {error:?}"
-                    );
-                }
-                other => panic!("put {request}: {other:?}"),
-            }
-            request += 1;
-            let next = trio.clock.now().plus_millis(40);
-            trio.until("40 ms", |trio| (trio.clock.now() >= next).then_some(()));
-        }
-        let owner = &trio.nodes[0].0;
-        let (trims, deletes) = (owner.trims_sent, owner.trim_deletes);
-        assert!(trims >= 4, "trims {trims}, deletes {deletes}");
-        assert!(
-            deletes >= 1 && deletes < trims,
-            "trims {trims}, deletes {deletes}: at most one delete per period"
-        );
-        let view = owner
-            .engine
-            .snapshot(PartitionId(1), Generation(1), STEP_VIEW)
-            .expect("view");
-        let held = view
-            .scan(Namespace::Dedup, &[], usize::MAX)
-            .into_iter()
-            .filter(|(key, _)| {
-                parse_dedup_key(key).is_some_and(|key| key.generation == Generation(1))
-            })
-            .count();
-        assert!(
-            held < landed,
-            "node 1 holds {held} generation-1 Dedup rows of {landed} puts that landed"
-        );
-    }
-
-    /// A-R183 rows: the `(generation, below)` of every `DedupTrim` the host queued.
-    fn dedup_trims_queued(host: &Host) -> Vec<(u64, u64)> {
-        host.queue
-            .iter()
-            .filter_map(|queued| match queued.event.kind {
-                EventKind::Kernel(KernelEvent::DedupTrim { generation, below }) => {
-                    Some((generation.0, below.0))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// A-R183 rows: a reopened copy of partition 1 that served generation 1 through seq 7 and
-    /// now serves generation `serving`, linked onto it, with `marks` left by an earlier process.
-    fn reopened_with_marks(path: &std::path::Path, serving: u64, marks: &[Mark]) {
-        let mut engine = RocksEngine::open(path).expect("open engine");
-        if engine.lineages().is_empty() {
-            write_chain(&mut engine, Generation(1), 7);
-        }
-        for to in 2..=serving {
-            if !engine
-                .lineages()
-                .contains(&(PartitionId(1), Generation(to)))
-            {
-                engine
-                    .inherit(PartitionId(1), Generation(to - 1), Generation(to), Seq(7))
-                    .expect("inherit");
-            }
-        }
-        engine
-            .put_publish_marks(PartitionId(1), &publish_marks(marks))
-            .expect("put marks");
-    }
-
-    /// A-R183 row 1, the tail (critic-d6b F1/F3), and A-R193: marks left by an earlier process
-    /// reach seq 5 of generation 1, published two retentions ago. The restore itself trims
-    /// seqs 1-5, before the landing's `Recovered`, with no trim tick, and nothing above: rows 6
-    /// and 7 were never marked, so they wait for the landing plus the retention, as before. The
-    /// floor keeps seq 5's tick read as later by the clock error (C5); restored out of order, the
-    /// trim would stop below seq 4.
-    #[test]
-    fn a_reopen_trims_what_the_marks_cover_at_restore_and_spares_the_tail() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        let now = HostClock::start().now();
-        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
-        let old = Tick(now.0 - 2 * retention);
-        reopened_with_marks(
-            &path,
-            2,
-            &[
-                (Generation(1), Seq(3), old),
-                (Generation(1), Seq(5), old.plus_millis(10)),
-            ],
-        );
-        let mut host = host_over(&path, &rt);
-        host.restore_marks(PartitionId(1), Generation(2))
-            .expect("restore");
-        let epsilon = Budgets::SPEC_DEFAULTS.clock_error_millis;
-        assert_eq!(
-            dedup_trims_queued(&host),
-            [(1, 6)],
-            "one trim at restore, below seq 6"
-        );
-        assert_eq!(
-            host.trim_floors[&(PartitionId(1), Generation(1))],
-            (Seq(6), old.plus_millis(10 + epsilon)),
-            "the floor is seq 5's tick read as later by the clock error (C5)"
-        );
-        assert!(
-            host.published_at[&PartitionId(1)].is_empty(),
-            "nothing marked is left to age"
-        );
-        host.trim_duty(host.clock.now()).expect("trim");
-        assert_eq!(dedup_trims_queued(&host), [(1, 6)], "the tick adds no trim");
-        assert_eq!(host.trim_deletes, 1, "the floor is deleted on disk too");
-    }
-
-    /// PR #60 review F2: marks of two generations, both a retention old, as several clean
-    /// reopens inside one window leave them. The restore trims both before the landing's
-    /// `Recovered`, a `DedupTrim` and a `StatusTrim` for each, with no trim tick. Before, the
-    /// sweep stopped at the first generation's end, and generation 2's entries counted against
-    /// the dedup cap until later ticks took them one generation each. Cut: `trim_aged` takes
-    /// one generation per sweep, and only generation 1 is queued.
-    #[test]
-    fn a_reopen_trims_the_aged_marks_of_every_generation_at_restore() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        let now = HostClock::start().now();
-        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
-        let old = Tick(now.0 - 2 * retention);
-        reopened_with_marks(
-            &path,
-            3,
-            &[
-                (Generation(1), Seq(5), old),
-                (Generation(2), Seq(9), old.plus_millis(10)),
-            ],
-        );
-        let mut host = host_over(&path, &rt);
-        host.restore_marks(PartitionId(1), Generation(3))
-            .expect("restore");
-        assert_eq!(
-            dedup_trims_queued(&host),
-            [(1, 6), (2, 10)],
-            "both generations trimmed at restore"
-        );
-        let status_trims: Vec<(u64, u64)> = host
-            .queue
-            .iter()
-            .filter_map(|queued| match queued.event.kind {
-                EventKind::Kernel(KernelEvent::StatusTrim { generation, below }) => {
-                    Some((generation.0, below.0))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(status_trims, [(1, 6), (2, 10)], "and both status floors");
-        assert!(
-            host.published_at[&PartitionId(1)].is_empty(),
-            "nothing aged is left"
-        );
-    }
-
-    /// A-R183 row 2: a store with no marks (a crash before the first write of marks, or data
-    /// from an older build) restores nothing, and the first trim takes nothing.
-    #[test]
-    fn a_reopen_with_no_marks_trims_nothing_on_its_first_tick() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        reopened_with_marks(&path, 2, &[]);
-        let mut host = host_over(&path, &rt);
-        host.restore_marks(PartitionId(1), Generation(2))
-            .expect("restore");
-        host.trim_duty(host.clock.now()).expect("trim");
-        assert_eq!(dedup_trims_queued(&host), [], "nothing trimmed");
-    }
-
-    /// A-R183 row 3, the daily restart (critic-d6b F2): a middle process restores generation
-    /// 1's marks, publishes nothing, writes its marks and quits before they age. The next
-    /// reopen still holds them and, once they age, trims generation 1 at once. A process that
-    /// wrote only what it published itself would erase them, and generation 1 would wait for
-    /// a landing plus the retention after every restart.
-    #[test]
-    fn publish_marks_outlive_a_process_that_published_nothing() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        let now = HostClock::start().now();
-        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
-        let period = trim_delete_period(retention);
-        let young = Tick(now.0 - retention / 2);
-        reopened_with_marks(&path, 2, &[(Generation(1), Seq(5), young)]);
-        {
-            let mut middle = host_over(&path, &rt);
-            // A trim tick before the landing writes nothing: no marks were read yet.
-            middle.trim_duty(now).expect("a tick before the landing");
-            middle
-                .restore_marks(PartitionId(1), Generation(2))
-                .expect("restore");
-            middle.trim_duty(now).expect("trim");
-            middle
-                .trim_duty(now.plus_millis(period + 1_000))
-                .expect("a mark write");
-            assert_eq!(
-                dedup_trims_queued(&middle),
-                [],
-                "not aged in the middle process"
-            );
-        }
-        RocksEngine::open(&path)
-            .expect("open engine")
-            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(7))
-            .expect("inherit");
-        let mut next = host_over(&path, &rt);
-        next.restore_marks(PartitionId(1), Generation(3))
-            .expect("restore");
-        next.trim_duty(young.plus_millis(retention + 1_000))
-            .expect("trim");
-        assert_eq!(
-            dedup_trims_queued(&next),
-            [(1, 6)],
-            "generation 1 trimmed at once"
-        );
-    }
-
-    /// A-R186: a clean stop writes the publish marks at once, inside the mark period. The host
-    /// restored its marks (none), then published seqs 6 and 7 of generation 1. Its stop through
-    /// `run` leaves both on disk, ticks verbatim (C1), with no trim tick in between. Without the
-    /// final write the disk keeps the empty set and a reopen ages them from its landing.
-    #[test]
-    fn a_clean_stop_writes_the_publish_marks_at_once() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        reopened_with_marks(&path, 2, &[]);
-        let now = HostClock::start().now();
-        let published = [
-            (Generation(1), Seq(6), Tick(now.0 - 20)),
-            (Generation(1), Seq(7), Tick(now.0 - 10)),
-        ];
-        {
-            let mut host = host_over(&path, &rt);
-            host.restore_marks(PartitionId(1), Generation(2))
-                .expect("restore");
-            host.published_at
-                .entry(PartitionId(1))
-                .or_default()
-                .extend(published);
-            let (tx, rx) = mpsc::channel();
-            tx.send(Msg::Stop).expect("send stop");
-            host.run(&rx);
-        }
-        let marks: Vec<Mark> = RocksEngine::open(&path)
-            .expect("open engine")
-            .publish_marks(PartitionId(1))
-            .expect("read marks")
-            .into_iter()
-            .map(|mark| (mark.generation, mark.seq, mark.tick))
-            .collect();
-        assert_eq!(marks, published, "the stop wrote both marks verbatim");
-    }
-
-    /// A-R183, lead k205: rows trimmed in memory but not yet deleted on disk keep their mark. A
-    /// process trims generation 1 below 6 and quits inside the delete period, so seqs 1-5 are
-    /// still on disk. The next reopen trims them on its first tick, from their publish, not a
-    /// retention after its landing. Marks taken from the in-memory queue alone dropped them.
-    #[test]
-    fn rows_trimmed_but_not_yet_deleted_keep_their_mark_across_a_reopen() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        let now = HostClock::start().now();
-        let retention = Budgets::SPEC_DEFAULTS.dedup_retention_millis;
-        let period = trim_delete_period(retention);
-        let old = Tick(now.0 - 2 * retention);
-        reopened_with_marks(&path, 2, &[(Generation(1), Seq(5), old)]);
-        {
-            let mut first = host_over(&path, &rt);
-            first
-                .restore_marks(PartitionId(1), Generation(2))
-                .expect("restore");
-            // The last delete ran just now, so this process quits before the next one.
-            first
-                .trim_deleted_at
-                .insert(PartitionId(1), now.plus_millis(1_000));
-            first.trim_duty(now).expect("trim");
-            first
-                .trim_duty(now.plus_millis(period + 500))
-                .expect("a mark write");
-            assert_eq!(dedup_trims_queued(&first), [(1, 6)], "trimmed in memory");
-            assert_eq!(first.trim_deletes, 0, "seqs 1-5 are still on disk");
-        }
-        RocksEngine::open(&path)
-            .expect("open engine")
-            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(7))
-            .expect("inherit");
-        let mut next = host_over(&path, &rt);
-        next.restore_marks(PartitionId(1), Generation(3))
-            .expect("restore");
-        next.trim_duty(next.clock.now()).expect("trim");
-        assert_eq!(
-            dedup_trims_queued(&next),
-            [(1, 6)],
-            "generation 1 trimmed on the first tick"
-        );
-    }
-
-    /// A-R183 row 4 (critic-d6b C3): a mark of a lineage the engine does not hold, or of a
-    /// generation not below the one served, is not restored, and the node does not fault. A
-    /// restored mark of generation 1 here would send a durable delete for a lineage the engine
-    /// does not hold, which faults the node.
-    #[test]
-    fn publish_marks_of_a_lineage_not_held_or_not_older_are_not_restored() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        let now = HostClock::start().now();
-        let old = Tick(now.0 - 2 * Budgets::SPEC_DEFAULTS.dedup_retention_millis);
-        {
-            let mut engine = RocksEngine::open(&path).expect("open engine");
-            write_chain(&mut engine, Generation(2), 2);
-            engine
-                .put_publish_marks(
-                    PartitionId(1),
-                    &publish_marks(&[
-                        (Generation(1), Seq(5), old),
-                        (Generation(2), Seq(1), old),
-                        (Generation(3), Seq(1), old),
-                    ]),
-                )
-                .expect("put marks");
-        }
-        let mut host = host_over(&path, &rt);
-        host.restore_marks(PartitionId(1), Generation(2))
-            .expect("restore");
-        host.trim_duty(host.clock.now())
-            .expect("no mark restored, so no delete to fault on");
-        assert_eq!(dedup_trims_queued(&host), [], "nothing trimmed");
-    }
-
-    /// critic-d6b C6: floors of two generations of one partition trimmed inside one delete
-    /// period are both deleted on disk when the period ends. Keyed by partition alone, the
-    /// newer floor overwrote the older, and the older generation's rows stayed on disk.
-    #[test]
-    fn two_generations_trimmed_in_one_delete_period_are_both_deleted() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        reopened_with_marks(&path, 2, &[]);
-        let mut host = host_over(&path, &rt);
-        let now = host.clock.now();
-        let retention = host.budgets.dedup_retention_millis;
-        let old = Tick(now.0 - 2 * retention);
-        host.published_at.insert(
-            PartitionId(1),
-            VecDeque::from([(Generation(1), Seq(3), old), (Generation(2), Seq(9), old)]),
-        );
-        host.trim_deleted_at.insert(PartitionId(1), now);
-        host.trim_duty(now).expect("trim generation 1");
-        host.trim_duty(now).expect("trim generation 2");
-        assert_eq!(dedup_trims_queued(&host), [(1, 4), (2, 10)]);
-        assert_eq!(host.trim_deletes, 0, "inside the period");
-        host.trim_duty(now.plus_millis(trim_delete_period(retention)))
-            .expect("the period ends");
-        assert_eq!(host.trim_deletes, 2, "both floors deleted");
-    }
-
-    /// A-R183 row 5 (critic-d6b candidate 3): an `OVERLOADED` from a full dedup index says when
-    /// the trim duty can first free room: not before the first retire due or the oldest publish
-    /// one retention on, at the trim tick that runs it. Kind and retry rule stay the kernel's.
-    /// Trio (~2 s): a cap of 2 and a 5-minute retention, so nothing frees while it runs.
-    #[config_log::retcd_test]
-    fn a_dedup_cap_overload_says_when_the_cap_can_first_free() {
-        const RETENTION: u64 = 300_000;
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.dedup_retention_millis = RETENTION;
-            host.transaction = Transaction::with_limits(Limits {
-                dedup_cap: 2,
-                ..Limits::default()
-            });
-        });
-        trio.bootstrap();
-        trio.ready();
-        for (request, key) in [(1, b"a"), (2, b"b")] {
-            match trio.ask(put(request, key, b"1", None)) {
-                Answer::Txn { .. } => {}
-                other => panic!("put {request}: {other:?}"),
-            }
-        }
-        let error = match trio.ask(put(3, b"c", b"1", None)) {
-            Answer::Error { error, .. } => error,
-            other => panic!("put 3 on a full cap: {other:?}"),
-        };
-        let answered = trio.clock.now();
-        assert_eq!(
-            (error.kind, error.retry),
-            (ErrorKind::Overloaded, RetryRule::BoundedJitter),
-            "{error:?}"
-        );
-        let owner = &trio.nodes[0].0;
-        let due = owner
-            .retire_due
-            .values()
-            .copied()
-            .chain(
-                owner
-                    .published_at
-                    .get(&PartitionId(1))
-                    .and_then(VecDeque::front)
-                    .map(|&(_, _, at)| at.plus_millis(RETENTION)),
-            )
-            .min()
-            .expect("a free is scheduled");
-        let after = error.retry_after().expect("a not-before hint");
-        assert!(
-            answered.plus_millis(u64::try_from(after.as_millis()).expect("millis")) >= due,
-            "the hint {after:?} names a time before the earliest free {due:?}"
-        );
-        assert!(
-            after <= Duration::from_millis(RETENTION + owner.trim_every_millis),
-            "the hint {after:?} is past one retention and a trim tick"
-        );
-        assert!(error.detail.contains("not before ~"), "{error:?}");
-    }
-
-    /// A-R187 (A-R209): a full dedup cap that nothing scheduled frees gives no hint, never an
-    /// invented one. Node 1 holds two scheduled frees that free nothing T1 holds. One is real:
-    /// the bootstrap's publish at seq 1, which carries no request, so T1 retained nothing for
-    /// it. The other is a retire due for the generation node 1 serves, below which no generation
-    /// holds a row. Before A-R187 each was named as the hint. Cut either half of the rule and
-    /// the hint comes back.
-    ///
-    /// Constructed: T1's two entries are real puts, and their own buckets are taken out by hand.
-    /// That stands in for entries no bucket covers (a condition failure T1 retains, A-R108),
-    /// which this Trio cannot retain at the cap without a publish; the retire due is set by
-    /// hand too. Trio (~1 s), a 5-minute retention.
-    #[config_log::retcd_test]
-    fn a_full_dedup_cap_that_nothing_scheduled_frees_gives_no_hint() {
-        const RETENTION: u64 = 300_000;
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.dedup_retention_millis = RETENTION;
-            host.transaction = Transaction::with_limits(Limits {
-                dedup_cap: 2,
-                ..Limits::default()
-            });
-        });
-        trio.bootstrap();
-        trio.ready();
-        for (request, key) in [(1, b"a"), (2, b"b")] {
-            match trio.ask(put(request, key, b"1", None)) {
-                Answer::Txn { .. } => {}
-                other => panic!("put {request}: {other:?}"),
-            }
-        }
-        let owner = &mut trio.nodes[0].0;
-        let kernel = owner
-            .transaction
-            .kernel(owner.node, PartitionId(1))
-            .expect("node 1 serves partition 1");
-        assert_eq!(kernel.dedup().len(), 2, "the cap is full");
-        let served = kernel.lineage().generation;
-        let published = owner
-            .published_at
-            .get_mut(&PartitionId(1))
-            .expect("the puts published");
-        published.retain(|&(_, seq, _)| seq == Seq(1));
-        assert_eq!(
-            published
-                .iter()
-                .map(|&(g, seq, _)| (g, seq))
-                .collect::<Vec<_>>(),
-            [(served, Seq(1))],
-            "the bootstrap's publish is left"
-        );
-        let now = owner.clock.now();
-        owner
-            .retire_due
-            .insert((PartitionId(1), served), now.plus_millis(2_000));
-
-        let error = match trio.ask(put(3, b"c", b"1", None)) {
-            Answer::Error { error, .. } => error,
-            other => panic!("put 3 on a full cap: {other:?}"),
-        };
-        assert_eq!(
-            (error.kind, error.retry),
-            (ErrorKind::Overloaded, RetryRule::BoundedJitter),
-            "{error:?}"
-        );
-        assert_eq!(error.retry_after(), None, "{error:?}");
-        assert!(!error.detail.contains("not before"), "{error:?}");
-    }
-
-    /// A-R183 with A-R164: publish marks that do not decode fault the restore, so the landing
-    /// faults the node. They are never read as "no marks", which would hide the damage.
-    #[test]
-    fn undecodable_publish_marks_fault_the_restore() {
-        let dir = config_testkit::fs::temp_dir();
-        let path = dir.path().join("node");
-        let rt = current_thread();
-        reopened_with_marks(&path, 2, &[]);
-        {
-            let raw = rocksdb::DB::open_cf(
-                &rocksdb::Options::default(),
-                &path,
-                rdb_storage::keys::COLUMN_FAMILIES,
-            )
-            .expect("raw open");
-            let cf = raw.cf_handle(rdb_storage::keys::CF_METADATA).expect("cf");
-            let mut key = b"publish".to_vec();
-            key.extend_from_slice(&1_u32.to_be_bytes());
-            raw.put_cf(cf, &key, [1, 2, 3]).expect("raw put");
-        }
-        let mut host = host_over(&path, &rt);
-        let fault = host
-            .restore_marks(PartitionId(1), Generation(2))
-            .expect_err("a fault, not an empty list");
-        assert_eq!(fault.detail, "publish marks of p1: Corrupt", "{fault:?}");
-    }
-
-    /// A-R183 C2: the marks of a long queue are at most [`PUBLISH_MARKS`] spread along it, plus
-    /// the newest entry of each generation, in order.
-    #[test]
-    fn publish_marks_sample_the_queue_and_keep_each_generations_newest() {
-        let mut published: VecDeque<(Generation, Seq, Tick)> = (1..=1_000)
-            .map(|seq| (Generation(1), Seq(seq), Tick(seq)))
-            .collect();
-        published.extend((1_001..=1_003).map(|seq| (Generation(2), Seq(seq), Tick(seq))));
-        let marks = sample_marks(&published);
-        assert!(marks.len() <= PUBLISH_MARKS + 2, "{} marks", marks.len());
-        assert!(marks.len() >= PUBLISH_MARKS / 2, "{} marks", marks.len());
-        assert!(marks.contains(&(Generation(1), Seq(1_000), Tick(1_000))));
-        assert_eq!(
-            marks.last(),
-            Some(&(Generation(2), Seq(1_003), Tick(1_003)))
-        );
-        assert!(marks.windows(2).all(|pair| pair[0] < pair[1]), "in order");
-        assert_eq!(sample_marks(&VecDeque::new()), []);
-    }
-
-    /// M9 S3-5c, guard 1: a write ages from its publication, never from its commit. Node 1
-    /// applies request 3 with both links held, so it is committed and unpublished. Past the
-    /// retention it is still held, and the trim spares it. Once healed it publishes, and a
-    /// resend right away replays it from the dedup index. Once aged from its publication a
-    /// trim takes it, and a resend runs afresh and fails its condition. Aged from the commit,
-    /// the host would trim it while held, when T1 has no entry for it yet, and never again:
-    /// the entry would outlive the retention and the last resend would still replay.
-    /// Trio (~4 s): a 300 ms retention. The hold ends at node 1's first trim tick once the
-    /// write is 300 ms old; the wait after publication is the retention, a trim period and a
-    /// margin.
-    #[config_log::retcd_test]
-    fn a_write_held_past_the_retention_ages_from_its_publication_not_its_commit() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.dedup_retention_millis = 300;
-        });
-        trio.bootstrap();
-        trio.ready();
-        match trio.ask(put(1, b"a", b"1", None)) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("put a=1: {other:?}"),
-        }
-        let held = match trio.ask(compile(3, b"b", b"1")) {
-            Answer::Compiled(request) => request,
-            other => panic!("compile request 3: {other:?}"),
-        };
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        let answer = trio.call(ClientCall::Resend {
-            request: held.clone(),
-        });
-        trio.until("node 1 applied request 3", |trio| {
-            (trio.head() == Some(3)).then_some(())
-        });
-        // A-R124a: held until node 1's first trim tick at or past the write's age, 0.3 to
-        // 1.3 s, not a fixed 1.5 s, since P1 answers a held write UNKNOWN_OUTCOME 2 s after it
-        // applies. A tick that trims nothing logs nothing, so the tick is read from
-        // `next_trim`, which each tick sets to its own time plus the period.
-        // Residual exposure: a stall over about 2 s minus this hold still crosses that deadline.
-        let aged = trio.clock.now().plus_millis(300);
-        trio.until("held past the retention and then a trim tick", |trio| {
-            let ticked = trio.nodes[0].0.next_trim.0 - HOST_TRIM_EVERY_MILLIS;
-            (ticked >= aged.0).then_some(())
-        });
-        trio.links.heal_all();
-        match trio.answer(&answer) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
-            other => panic!("request 3 after the heal: {other:?}"),
-        }
-        match trio.ask(ClientCall::Resend {
-            request: held.clone(),
-        }) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3), "replayed"),
-            other => panic!("resend 3 right after its publication: {other:?}"),
-        }
-        let aged = trio
-            .clock
-            .now()
-            .plus_millis(300 + HOST_TRIM_EVERY_MILLIS + 200);
-        trio.until("aged from its publication, then a trim tick", |trio| {
-            (trio.clock.now() >= aged).then_some(())
-        });
-        // A-R123: by now the grant may have expired and fenced node 1, and a resend inside that
-        // window is refused `LEASE_EXPIRED` rather than run. Waiting only ages the entry more.
-        trio.admits_for(1_000);
-        match trio.ask(ClientCall::Resend { request: held }) {
-            Answer::Error { error, .. } => {
-                assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
-            }
-            other => panic!("resend 3 once aged from its publication: {other:?}"),
-        }
-    }
-
-    /// U1 (ruling A-R109): a check A1 refuses is logged `authority_check_denied` with its
-    /// reason, which the client's refusal does not carry. The positive control for that line:
-    /// with the control store down, A1 still holds its grant but denies `ControlUnavailable`,
-    /// and a put's dispatch check is refused for that reason.
-    /// Trio (~2 s): bootstrap, then one store outage on a 100 ms renewal.
-    #[config_log::retcd_test]
-    fn a_dispatch_check_a1_denies_is_logged_with_its_reason() {
-        const METHOD: &str = "a_dispatch_check_a1_denies_is_logged_with_its_reason";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.renew_millis = 100;
-        });
-        trio.bootstrap();
-        trio.ready();
-        assert!(logged!(METHOD, "authority_check_denied").is_empty());
-        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
-        trio.admits_for(1_000);
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        trio.until("node 1 stops admitting", |trio| {
-            (trio.status(0).admits != Some(true)).then_some(())
-        });
-        let refused = trio.ask(put(1, b"a", b"1", None));
-        trio.mem.stop_failing();
-        assert!(matches!(refused, Answer::Error { .. }), "{refused:?}");
-        let lines = trio.until("authority_check_denied", |_| {
-            let lines = logged!(METHOD, "authority_check_denied");
-            (!lines.is_empty()).then_some(lines)
-        });
-        assert!(
-            lines.iter().any(|line| line["node"] == 1
-                && line["checkpoint"] == "StorageDispatch"
-                && line["reason"] == "ControlUnavailable"),
-            "{lines:?}"
-        );
-    }
-
-    /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
-    /// `count_resend` calls touch its slot.
-    const UNSENT: CopyId = CopyId(9);
-
-    /// A copy's acknowledged progress, received with applied.
-    fn acked_at(applied: u64, durable: u64) -> ReplicaProgress {
-        ReplicaProgress {
-            received: ReceivedSeq(applied),
-            buffered_applied: AppliedSeq(applied),
-            durable: DurableSeq(durable),
-        }
-    }
-
-    fn identity(request: u64) -> RequestIdentity {
-        RequestIdentity {
-            tenant: TenantId(1),
-            client: ClientId(1),
-            request: RequestId(request),
-        }
-    }
-
-    fn put(
-        request: u64,
-        object: &'static [u8],
-        value: &'static [u8],
-        if_version: Option<u64>,
-    ) -> ClientCall {
-        ClientCall::Put {
-            identity: identity(request),
-            object: Bytes::from_static(object),
-            change: byte_doc(value),
-            expect: if_version.map(Expected::Version),
-            remaining_millis: 5_000,
-        }
-    }
-
-    /// A byte-string document, as `Db::put` writes one.
-    fn byte_doc(value: &[u8]) -> Change {
-        Change::Doc(Delta(vec![Op::Replace(Value::Bytes(value.to_vec()))]))
-    }
-
-    /// A read's version and bytes when it saw a byte-string document, `None` when absent.
-    fn doc_bytes(seen: Seen) -> Option<(u64, Bytes)> {
-        match seen {
-            Seen::Absent => None,
-            Seen::Doc(Document {
-                version,
-                value: Value::Bytes(bytes),
-            }) => Some((version, Bytes::from(bytes))),
-            other => panic!("not a byte-string document: {other:?}"),
-        }
-    }
-
-    fn compile(request: u64, object: &'static [u8], value: &'static [u8]) -> ClientCall {
-        ClientCall::Compile {
-            identity: identity(request),
-            puts: vec![PutOp {
-                group: AFFINITY,
-                object: Bytes::from_static(object),
-                change: byte_doc(value),
-                expect: None,
-            }],
-            remaining_millis: 5_000,
-        }
-    }
-
-    fn get(request: u64, object: &'static [u8]) -> ClientCall {
-        ClientCall::Get {
-            identity: identity(request),
-            object: Bytes::from_static(object),
-            look: Look::Doc,
-        }
-    }
-
-    /// The upload every S4-4 row writes under.
-    const U1: Upload = [1; 16];
-
-    /// A compile of chunk `index` of [`U1`] under `object`.
-    fn chunk_call(
-        request: u64,
-        object: &'static [u8],
-        index: u32,
-        bytes: &'static [u8],
-        expect: Option<Expected>,
-    ) -> ClientCall {
-        let change = chunk_of(U1, index, bytes);
-        compile_change(request, object, change, expect)
-    }
-
-    /// Chunk `index` of `upload`.
-    fn chunk_of(upload: Upload, index: u32, bytes: &'static [u8]) -> Change {
-        Change::Chunk {
-            upload,
-            index,
-            bytes: Bytes::from_static(bytes),
-        }
-    }
-
-    /// A compile of the publish of `blob`, uploaded as [`U1`] in chunks of 4.
-    fn publish_call(
-        request: u64,
-        object: &'static [u8],
-        blob: &[u8],
-        expect: Option<Expected>,
-    ) -> ClientCall {
-        compile_change(request, object, publish_of(U1, blob), expect)
-    }
-
-    /// The publish of `blob`, uploaded as `upload` in chunks of 4.
-    fn publish_of(upload: Upload, blob: &[u8]) -> Change {
-        use sha2::Digest as _;
-        Change::Publish {
-            upload,
-            size: blob.len() as u64,
-            chunk_size: 4,
-            sha256: sha2::Sha256::digest(blob).into(),
-        }
-    }
-
-    /// A refusal as `(kind, retry, no_mutation, whether it names a request)`.
-    fn refusal(answer: Answer) -> (ErrorKind, RetryRule, bool, bool) {
-        match answer {
-            Answer::Error { error, request } => (
-                error.kind,
-                error.retry,
-                error.no_mutation,
-                request.is_some(),
-            ),
-            other => panic!("not refused: {other:?}"),
-        }
-    }
-
-    /// S4-4 main line, 4c, 4x: arch §4 guards 7, 8, 10 and 11, and both blob kinds end to end.
-    /// A repeated chunk, a gc with nothing to collect, and the same publish compile to nothing,
-    /// and nothing is sent. The publish's check 0 needs `serving` to be the adopted generation.
-    /// A chunk under other bytes is UPLOAD_CHUNK_CONFLICT. A chunk or gc with an `expect` is
-    /// refused. A read of a damaged chunk is CORRUPT_BLOB. Every refusal is at the compile and
-    /// names no request.
-    /// Mutants: m7 (empty compile sent) and m8 (`Generation(0)`) answer `Compiled`. m10a and
-    /// m10b (rows dropped) answer `BoundedJitter`. m11 (expect ignored) answers `Unchanged`.
-    /// Trio, about 1 s.
-    #[test]
-    fn a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        assert_eq!(trio.write(chunk_call(1, b"b", 0, b"HELL", None)), Ok(2));
-        assert_eq!(trio.write(chunk_call(2, b"b", 1, b"O", None)), Ok(3));
-        let publish = publish_call(3, b"b", b"HELLO", Some(Expected::Absent));
-        assert_eq!(trio.write(publish), Ok(4));
-
-        for (what, call) in [
-            ("the same chunk", chunk_call(4, b"b", 0, b"HELL", None)),
-            (
-                "a gc with nothing to collect",
-                compile_change(5, b"b", Change::Gc { floor: 4 }, None),
-            ),
-            (
-                "the same publish",
-                publish_call(6, b"b", b"HELLO", Some(Expected::Absent)),
-            ),
-        ] {
-            match trio.ask(call) {
-                Answer::Unchanged => {}
-                other => panic!("{what}: {other:?}"),
-            }
-        }
-
-        assert_eq!(
-            refusal(trio.ask(chunk_call(7, b"b", 0, b"XXXX", None))),
-            (
-                ErrorKind::UploadChunkConflict,
-                RetryRule::Reconcile,
-                true,
-                false
-            ),
-            "other bytes under a stored chunk"
-        );
-        let stale = Some(Expected::Version(4));
-        for (what, call) in [
-            ("a chunk", chunk_call(8, b"b", 0, b"HELL", stale)),
-            (
-                "a gc",
-                compile_change(9, b"b", Change::Gc { floor: 4 }, stale),
-            ),
-        ] {
-            assert_eq!(
-                refusal(trio.ask(call)),
-                (
-                    ErrorKind::InvalidArgument,
-                    RetryRule::Definitive,
-                    true,
-                    false
-                ),
-                "{what} with an expect"
-            );
-        }
-
-        let range = |trio: &mut Trio, request, offset, len| {
-            trio.look(request, b"b", Look::Range { offset, len })
-                .map(|seen| match seen {
-                    Seen::Range { bytes, .. } => bytes,
-                    other => panic!("a range read: {other:?}"),
-                })
-        };
-        assert_eq!(range(&mut trio, 10, 0, 5), Ok(Bytes::from_static(b"HELLO")));
-
-        // Other bytes over chunk 1, written as `rdb_dev admin damage-chunk` does.
-        let root = root_key(TenantId(1), AFFINITY, b"b");
-        let damage = TxnRequest {
-            api_version: API_VERSION,
-            identity: identity(11),
-            affinity: AFFINITY,
-            expected_generation: None,
-            remaining_millis: 5_000,
-            conditions: Vec::new(),
-            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
-                key: rdb_value::keys::chunk_key(&root, &U1, 1),
-                value: rdb_value::envelope::seal(rdb_value::envelope::Kind::Chunk, b"damaged")
-                    .expect("seven bytes fit an envelope"),
-                expected_version: None,
-            }],
-        };
-        match trio.ask(ClientCall::Resend { request: damage }) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(5)),
-            other => panic!("the damage write: {other:?}"),
-        }
-        assert_eq!(
-            range(&mut trio, 12, 0, 4),
-            Ok(Bytes::from_static(b"HELL")),
-            "chunk 0 is intact"
-        );
-        match range(&mut trio, 13, 4, 1) {
-            Err(error) => assert_eq!(
-                (error.kind, error.retry, error.no_mutation),
-                (ErrorKind::CorruptBlob, RetryRule::Quarantine, false)
-            ),
-            Ok(bytes) => panic!("a damaged chunk read as {bytes:?}"),
-        }
-
-        // A blob root whose envelope does not open is none of the four blob variants: it is
-        // CORRUPT_HISTORY, as for any object (review F4).
-        let damage = TxnRequest {
-            api_version: API_VERSION,
-            identity: identity(14),
-            affinity: AFFINITY,
-            expected_generation: None,
-            remaining_millis: 5_000,
-            conditions: Vec::new(),
-            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
-                key: root.to_bytes(),
-                value: Bytes::from_static(b"not an envelope"),
-                expected_version: None,
-            }],
-        };
-        match trio.ask(ClientCall::Resend { request: damage }) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(6)),
-            other => panic!("the root damage write: {other:?}"),
-        }
-        match range(&mut trio, 15, 0, 4) {
-            Err(error) => assert_eq!(
-                (error.kind, error.retry, error.no_mutation),
-                (ErrorKind::CorruptHistory, RetryRule::Quarantine, false)
-            ),
-            Ok(bytes) => panic!("a damaged root read as {bytes:?}"),
-        }
-    }
-
-    /// S4-4 4h, C-3: arch §4 guard 9. With both secondaries cut off, node 1 applies a publish
-    /// that cannot publish. The same publish re-issued meanwhile finds its blob at the root, but
-    /// above P1's published seq. So it is UNKNOWN_OUTCOME at the compile, naming no request, and
-    /// never `unchanged`. After the heal the held publish publishes, and the re-issue is
-    /// `unchanged`. Mutant m9 (the check dropped) answers `Unchanged` while held.
-    /// Trio, about 1 s.
-    #[test]
-    fn a_publish_reissued_before_its_blob_publishes_is_an_unknown_outcome_not_unchanged() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        assert_eq!(trio.write(chunk_call(1, b"h", 0, b"abcd", None)), Ok(2));
-        let publish = |request| publish_call(request, b"h", b"abcd", Some(Expected::Absent));
-        let request = match trio.ask(publish(2)) {
-            Answer::Compiled(request) => request,
-            other => panic!("compile the publish: {other:?}"),
-        };
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        let held = trio.call(ClientCall::Resend { request });
-        trio.until("node 1 applied the publish", |trio| {
-            (trio.head() == Some(3)).then_some(())
-        });
-
-        assert_eq!(
-            refusal(trio.ask(publish(3))),
-            (
-                ErrorKind::UnknownOutcome,
-                RetryRule::QueryStatus,
-                false,
-                false
-            ),
-            "the blob is at the root and not published"
-        );
-        assert!(held.try_recv().is_err(), "no copy acknowledged the publish");
-
-        trio.links.heal_all();
-        match trio.answer(&held) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
-            other => panic!("the held publish after the heal: {other:?}"),
-        }
-        match trio.ask(publish(4)) {
-            Answer::Unchanged => {}
-            other => panic!("the publish once published: {other:?}"),
-        }
-    }
-
-    /// Review F1 (A-R133), C-3 and ADR-rdb-0014 O9: "already published" is a read, so it is
-    /// given only while a read would be. A blob publishes; the control store then fails until
-    /// A1 fences node 1, and a plain read is refused. The same publish re-issued meanwhile is
-    /// refused as that read is, and sends nothing, so it says `no_mutation`. Once the store
-    /// returns and node 1 admits again, the re-issue is `unchanged`. Mutant m24 (the read gate
-    /// cut) answers `Unchanged` while fenced, as 2cc5b24 did; mutant m28 (`no_mutation` not set)
-    /// says `false`.
-    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
-    #[config_log::retcd_test]
-    fn a_publish_reissued_while_fenced_is_refused_as_a_read_is_and_unchanged_once_admitted() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.grant_millis = 600;
-            host.budgets.renew_millis = 100;
-        });
-        trio.bootstrap();
-        trio.ready();
-        assert_eq!(trio.write(chunk_call(1, b"f", 0, b"abcd", None)), Ok(2));
-        let publish = |request| publish_call(request, b"f", b"abcd", Some(Expected::Absent));
-        assert_eq!(trio.write(publish(2)), Ok(3));
-
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
-        let read = ClientCall::Get {
-            identity: identity(3),
-            object: Bytes::from_static(b"f"),
-            look: Look::Range { offset: 0, len: 4 },
-        };
-        let refused = match trio.ask(read) {
-            Answer::Read {
-                outcome: ReadServiceOutcome::Rejected(kind),
-                ..
-            } => crate::db::refused_read(kind),
-            other => panic!("a read while fenced: {other:?}"),
-        };
-        assert_eq!(
-            refusal(trio.ask(publish(4))),
-            (refused.kind, refused.retry, true, false),
-            "the publish while fenced, as the read ({refused:?}) but sending nothing"
-        );
-
-        trio.mem.stop_failing();
-        trio.ready();
-        match trio.ask(publish(5)) {
-            Answer::Unchanged => {}
-            other => panic!("the publish once node 1 admits again: {other:?}"),
-        }
-    }
-
-    /// Review F-002, the Set arm: arch §4 guard 2. A set change compiled at version 2 and sent
-    /// after another write moved the set to 3 is refused by the kernel, on the version the
-    /// compile attached. Mutant m15 (the Set arm's version guard cut from what it compiles)
-    /// publishes it. Trio, about 1 s.
-    #[test]
-    fn a_set_change_sent_after_the_set_moved_is_refused_by_the_kernel() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let add = |n| Change::Set(vec![ElemOp::Add(int(n))]);
-        let created = compile_change(1, b"s", add(1), Some(Expected::Absent));
-        assert_eq!(trio.write(created), Ok(2));
-        let stale = trio.compiled(compile_change(2, b"s", add(2), None));
-        assert_eq!(trio.write(compile_change(3, b"s", add(3), None)), Ok(3));
-        assert_eq!(
-            trio.sent(stale),
-            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
-            "compiled at version 2, sent at 3"
-        );
-        let members = Look::Members {
-            after: None,
-            limit: 10,
-        };
-        match trio.look(4, b"s", members) {
-            Ok(Seen::Members(page)) => {
-                let keys: Vec<_> = page.members.into_iter().map(|m| m.key).collect();
-                assert_eq!(keys, vec![int(1), int(3)], "2 was never added");
-            }
-            other => panic!("members of s: {other:?}"),
-        }
-    }
-
-    /// Review F2 (A-R133), the Map arm: arch §4 guard 2. A map change compiled at version 2 and
-    /// sent after another write moved the map to 3 is refused by the kernel, on the version the
-    /// compile attached. The map keeps the other write's keys, values and count. Mutant m23 (the
-    /// Map arm's version guard cut from what it compiles) publishes it. Trio, about 1 s.
-    #[test]
-    fn a_map_change_sent_after_the_map_moved_is_refused_by_the_kernel() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let put = |key, n| Change::Map(vec![ElemOp::Put(text(key), int(n))]);
-        let created = compile_change(1, b"m", put("a", 1), Some(Expected::Absent));
-        assert_eq!(trio.write(created), Ok(2));
-        let stale = trio.compiled(compile_change(2, b"m", put("b", 2), None));
-        assert_eq!(
-            trio.write(compile_change(3, b"m", put("c", 3), None)),
-            Ok(3)
-        );
-        assert_eq!(
-            trio.sent(stale),
-            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
-            "compiled at version 2, sent at 3"
-        );
-        let members = Look::Members {
-            after: None,
-            limit: 10,
-        };
-        match trio.look(4, b"m", members) {
-            Ok(Seen::Members(page)) => {
-                let entries: Vec<_> = page.members.into_iter().map(|m| (m.key, m.value)).collect();
-                assert_eq!(
-                    (page.collection.version, page.collection.count, entries),
-                    (
-                        3,
-                        2,
-                        vec![(text("a"), Some(int(1))), (text("c"), Some(int(3)))]
-                    ),
-                    "b was never put"
-                );
-            }
-            other => panic!("members of m: {other:?}"),
-        }
-    }
-
-    /// Review F-002, the Publish arm: arch §4 guard 2. A publish of upload 2 compiled over the
-    /// blob at version 3 and sent after a publish of upload 3 replaced it is refused by the
-    /// kernel. Mutant m16 (the Publish arm's version guard cut from what it compiles) publishes
-    /// it. Trio, about 1 s.
-    #[test]
-    fn a_publish_sent_after_the_blob_moved_is_refused_by_the_kernel() {
-        const U2: Upload = [2; 16];
-        const U3: Upload = [3; 16];
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        assert_eq!(trio.write(chunk_call(1, b"p", 0, b"abcd", None)), Ok(2));
-        let first = publish_call(2, b"p", b"abcd", Some(Expected::Absent));
-        assert_eq!(trio.write(first), Ok(3));
-        let chunk = |request, upload, bytes| {
-            compile_change(request, b"p", chunk_of(upload, 0, bytes), None)
-        };
-        assert_eq!(trio.write(chunk(3, U2, b"wxyz")), Ok(4));
-        assert_eq!(trio.write(chunk(4, U3, b"1234")), Ok(5));
-        let stale = trio.compiled(compile_change(5, b"p", publish_of(U2, b"wxyz"), None));
-        let replace = publish_of(U3, b"1234");
-        let replace = compile_change(6, b"p", replace, Some(Expected::Version(3)));
-        assert_eq!(trio.write(replace), Ok(6));
-        assert_eq!(
-            trio.sent(stale),
-            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
-            "compiled over version 3, sent at 6"
-        );
-        match trio.look(7, b"p", Look::Range { offset: 0, len: 4 }) {
-            Ok(Seen::Range { blob, bytes }) => assert_eq!(
-                (blob.version, blob.manifest.upload, bytes),
-                (6, U3, Bytes::from_static(b"1234"))
-            ),
-            other => panic!("a range read of p: {other:?}"),
-        }
-    }
-
-    /// Review F-003: arch §4 guards 2 and 12 together. A list edit with a stale guard and a
-    /// position outside the list is CONDITION_FAILED, not INVALID_ARGUMENT: the guard is
-    /// compiled first, so a write that raced this one reads as the race. So is an edit to a
-    /// list that is not there. Mutant m17 (`list_compile` returns the position's refusal without
-    /// compiling the guard) answers INVALID_ARGUMENT for both. Trio, about 1 s.
-    #[test]
-    fn a_stale_list_edit_at_a_bad_position_is_a_condition_failure() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let push = |s: &str| ListEdit::Push(text(s));
-        let created = Change::List(vec![push("a"), push("b"), push("c")]);
-        let created = compile_change(1, b"l", created, Some(Expected::Absent));
-        assert_eq!(trio.write(created), Ok(2));
-        let more = compile_change(2, b"l", Change::List(vec![push("d")]), None);
-        assert_eq!(trio.write(more), Ok(3));
-        for (request, object, at) in [(3, &b"l"[..], -5), (4, &b"none"[..], 0)] {
-            let call = ClientCall::Compile {
-                identity: identity(request),
-                puts: vec![PutOp {
-                    group: AFFINITY,
-                    object: Bytes::copy_from_slice(object),
-                    change: Change::List(vec![ListEdit::Remove { at }]),
-                    expect: Some(Expected::Version(2)),
-                }],
-                remaining_millis: 5_000,
-            };
-            assert_eq!(
-                trio.write(call),
-                Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
-                "remove {at} at version 2 of {object:?}"
-            );
-        }
-    }
-
-    /// Review F-004: a gc's floor reaches `collect_garbage` as the caller gave it. Two chunks of
-    /// an upload nothing publishes, at versions 2 and 3: a gc with floor 2 deletes the first and
-    /// keeps the second, so the first compiles to a write again and the second to nothing.
-    /// Mutant m18a (floor 0) collects nothing, so the gc answers `Unchanged`; m18b (floor
-    /// `u64::MAX`) collects both. Trio, about 1 s.
-    #[test]
-    fn a_gc_deletes_the_unnamed_chunks_at_or_below_its_floor_and_keeps_the_rest() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        assert_eq!(trio.write(chunk_call(1, b"g", 0, b"abcd", None)), Ok(2));
-        assert_eq!(trio.write(chunk_call(2, b"g", 1, b"ef", None)), Ok(3));
-        let gc = compile_change(3, b"g", Change::Gc { floor: 2 }, None);
-        assert_eq!(trio.write(gc), Ok(4));
-        match trio.ask(chunk_call(4, b"g", 0, b"abcd", None)) {
-            Answer::Compiled(_) => {}
-            other => panic!("chunk 0, at version 2, was collected: {other:?}"),
-        }
-        match trio.ask(chunk_call(5, b"g", 1, b"ef", None)) {
-            Answer::Unchanged => {}
-            other => panic!("chunk 1, at version 3, was kept: {other:?}"),
-        }
-    }
-
-    /// Review F-008, the `GenerationChanged` half of a stale token (C-2): a token from another
-    /// generation is `STALE_CONTINUATION`, retry `Reconcile`, as one from another list version
-    /// is. Forged here, since no generation changes in a Trio row. Mutant m21 (that variant cut
-    /// from the arm) answers `INVALID_ARGUMENT`. Trio, about 1 s.
-    #[test]
-    fn a_token_from_another_generation_must_reconcile() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let created = Change::List(vec![ListEdit::Push(text("a")), ListEdit::Push(text("b"))]);
-        let created = compile_change(1, b"l", created, Some(Expected::Absent));
-        assert_eq!(trio.write(created), Ok(2));
-        let first = match trio.look(2, b"l", Look::Items { at: 0, limit: 1 }) {
-            Ok(Seen::Items(items)) => items,
-            other => panic!("items of l: {other:?}"),
-        };
-        let token = first.next.expect("a page of 1 of 2 has a next token");
-        let forged = Token {
-            generation: Generation(token.generation.0 + 1),
-            ..token
-        };
-        match trio.look(
-            3,
-            b"l",
-            Look::ItemsAfter {
-                token: forged,
-                limit: 10,
-            },
-        ) {
-            Err(error) => assert_eq!(
-                (error.kind, error.retry),
-                (ErrorKind::StaleContinuation, RetryRule::Reconcile),
-                "{error:?}"
-            ),
-            Ok(seen) => panic!(
-                "a token from generation {} read: {seen:?}",
-                forged.generation.0
-            ),
-        }
-    }
-
-    /// Three hosts on this thread, stepped by hand, for the rows that need a whole partition.
-    /// Fields drop in order: the hosts close before the runtime their control calls run on.
-    struct Trio {
-        nodes: Vec<(Host, Sender<Msg>, Receiver<Msg>)>,
-        links: Arc<Links>,
-        store: Arc<dyn config_core::ConfigStore>,
-        /// The same store, to make it fail.
-        mem: Arc<config_testkit::MemStore>,
-        clock: HostClock,
-        rt: tokio::runtime::Runtime,
-    }
-
-    impl Trio {
-        /// Every `until` gives up after this long, times the deadline scale. The longest wait is a
-        /// stall line at F1's first deadline after a commit, two of the spec's 2 s windows: 4.0 s
-        /// at scale 1 (2026-10-08), so this leaves 4 s.
-        const PATIENCE: Duration = Duration::from_secs(8);
-        /// [`Self::fast_pause`]'s L1 pause age: the spec's 2,000 ms, shortened.
-        const PAUSE_AGE_MILLIS: u64 = 400;
-
-        /// Three hosts on `dir`, each tuned by `tune`, not yet bootstrapped.
-        fn new(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> Self {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .expect("runtime");
-            let links = Links::new();
-            let mem = Arc::new(config_testkit::MemStore::new());
-            let store: Arc<dyn config_core::ConfigStore> = Arc::clone(&mem) as _;
-            let control =
-                ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
-            let clock = HostClock::start();
-            let nodes = (1..=3u32)
-                .map(|n| {
-                    let engine = RocksEngine::open(dir.join(n.to_string())).expect("open engine");
-                    let (tx, rx) = mpsc::channel();
-                    links.register(NodeId(n), tx.clone());
-                    let mut host = Host::new(
-                        NodeId(n),
-                        engine,
-                        Arc::clone(&links),
-                        Arc::clone(&control),
-                        clock,
-                    );
-                    tune(&mut host);
-                    (host, tx, rx)
-                })
-                .collect();
-            Self {
-                nodes,
-                links,
-                store,
-                mem,
-                clock,
-                rt,
-            }
-        }
-
-        /// The spec's budgets with L1's resume hold shortened, so a start reaches `ready` in
-        /// about the 2 s discovery window. The window stays the spec's: it is also F1's CAS and
-        /// barrier deadline, and a host stall past a short one blocks F1 for good (Trio flake,
-        /// 2026-10-08: ~470 ms against 300 ms). Only rows that count F1's deadlines shorten it.
-        fn fast(host: &mut Host) {
-            host.budgets.resume_hold_millis = 50;
-        }
-
-        /// [`Self::fast`], and L1 warns and pauses at a fifth of the spec's ages, so a row can
-        /// watch past the pause age in well under a second.
-        fn fast_pause(host: &mut Host) {
-            Self::fast(host);
-            host.budgets.warn_age_millis = Self::PAUSE_AGE_MILLIS / 2;
-            host.budgets.pause_age_millis = Self::PAUSE_AGE_MILLIS;
-        }
-
-        fn bootstrap(&self) {
-            let owner = self.nodes[0].1.clone();
-            self.rt
-                .block_on(crate::admin::bootstrap(
-                    &self.store,
-                    self.clock.now(),
-                    |msg| owner.send(msg).map_err(|_| NodeStopped(NodeId(1))),
-                ))
-                .expect("bootstrap");
-        }
-
-        /// For rows that count F1's post-commit deadlines: the spec's window until node 1 has
-        /// committed, so the commit's CAS outlasts a host stall, then the short test window for
-        /// every deadline armed after it.
-        fn short_window_after_commit(&mut self) {
-            self.until("F1 committed on node 1", |trio| {
-                trio.status(0).recovered.map(|_| ())
-            });
-            for (host, _, _) in &mut self.nodes {
-                host.budgets.discovery_window_millis = test_discovery_window_millis();
-            }
-        }
-
-        /// One round: each host runs its due work and its queue, then takes its mail.
-        fn step(&mut self) {
-            for (host, _, rx) in &mut self.nodes {
-                host.run_due();
-                host.drain();
-                while let Ok(msg) = rx.try_recv() {
-                    host.handle(msg);
-                }
-                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
-                assert_not_blocked(
-                    &host.status(PartitionId(1)),
-                    host.budgets.discovery_window_millis,
-                );
-            }
-        }
-
-        /// Step until `done` answers, or fail naming `what` after [`Self::PATIENCE`].
-        fn until<T>(&mut self, what: &str, mut done: impl FnMut(&Self) -> Option<T>) -> T {
-            let patience = test_patience(Self::PATIENCE);
-            let deadline = Instant::now() + patience;
-            loop {
-                self.step();
-                if let Some(found) = done(self) {
-                    return found;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "not within {:?}: {what}",
-                    patience
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-
-        fn status(&self, node: usize) -> NodeStatus {
-            self.nodes[node].0.status(PartitionId(1))
-        }
-
-        fn ready(&mut self) {
-            self.until("node 1 admits writes", |trio| {
-                (trio.status(0).admits == Some(true)).then_some(())
-            });
-        }
-
-        /// [`Self::ready`], and node 1's grant runs at least `millis` more (A-R123, A-R124).
-        /// Under full-suite load a grant sometimes stops renewing and lapses; `admits` stays
-        /// true until the fence, but a check in the last 100 ms is refused `LEASE_EXPIRED`
-        /// (seen 2026-10-19 at margin 29 ms). A lapsed grant makes this wait for the fence and
-        /// the re-acquire.
-        fn admits_for(&mut self, millis: u64) {
-            self.until("node 1 admits writes with time left on its grant", |trio| {
-                let now = trio.clock.now().0;
-                let left = trio.nodes[0]
-                    .0
-                    .authority_views
-                    .get(&PartitionId(1))
-                    .map(|view| view.valid_through_tick.0.saturating_sub(now));
-                (trio.status(0).admits == Some(true) && left.is_some_and(|left| left >= millis))
-                    .then_some(())
-            });
-        }
-
-        /// The head node 1 has applied.
-        fn head(&self) -> Option<u64> {
-            self.status(0).holds.map(|held| held.applied)
-        }
-
-        /// Send `call` to node 1, the owner, as `Db` does.
-        fn call(&self, call: ClientCall) -> Receiver<Answer> {
-            let (reply, answer) = mpsc::channel();
-            self.nodes[0]
-                .1
-                .send(Msg::Client(Client {
-                    partition: PartitionId(1),
-                    call,
-                    reply,
-                }))
-                .expect("node 1's mailbox");
-            answer
-        }
-
-        fn answer(&mut self, answer: &Receiver<Answer>) -> Answer {
-            self.until("an answer", |_| answer.try_recv().ok())
-        }
-
-        fn ask(&mut self, call: ClientCall) -> Answer {
-            let answer = self.call(call);
-            self.answer(&answer)
-        }
-    }
-
-    /// A `ClientCall::Compile` of one change to `object`, as `Db::write` sends first.
-    fn compile_change(
-        request: u64,
-        object: &'static [u8],
-        change: Change,
-        expect: Option<Expected>,
-    ) -> ClientCall {
-        ClientCall::Compile {
-            identity: identity(request),
-            puts: vec![PutOp {
-                group: AFFINITY,
-                object: Bytes::from_static(object),
-                change,
-                expect,
-            }],
-            remaining_millis: 5_000,
-        }
-    }
-
-    fn text(s: &str) -> Value {
-        Value::Text(s.to_owned())
-    }
-
-    fn int(n: u64) -> Value {
-        Value::Integer(Int::from(n))
-    }
-
-    fn json_map(entries: &[(&str, Value)]) -> Value {
-        let mut map = Map::new();
-        for (key, value) in entries {
-            map.insert(MapKey::new(*key), value.clone());
-        }
-        Value::Map(map)
-    }
-
-    fn path(text: &str) -> Path {
-        Path::parse(text).expect("a path")
-    }
-
-    /// Where a write was refused, as `rdb_dev` prints it: the compile answered an error, so no
-    /// request was built (`request=-`), or it compiled and the kernel refused the request it was
-    /// sent as (`request=<R>`).
-    #[derive(Debug, PartialEq, Eq)]
-    enum Refused {
-        AtCompile(ErrorKind),
-        ByKernel(ErrorKind),
-    }
-
-    impl Trio {
-        /// Compile `call`, then send what it compiled to, as `Db::write` does. `Ok` is the
-        /// published seq.
-        fn write(&mut self, call: ClientCall) -> Result<u64, Refused> {
-            let request = match self.ask(call) {
-                Answer::Compiled(request) => request,
-                Answer::Error { error, .. } => return Err(Refused::AtCompile(error.kind)),
-                other => panic!("compile: {other:?}"),
-            };
-            self.sent(request)
-        }
-
-        /// The request `call` compiles to, not yet sent.
-        fn compiled(&mut self, call: ClientCall) -> TxnRequest {
-            match self.ask(call) {
-                Answer::Compiled(request) => request,
-                other => panic!("compile: {other:?}"),
-            }
-        }
-
-        /// Send `request`, as [`Self::write`] does once it has compiled.
-        fn sent(&mut self, request: TxnRequest) -> Result<u64, Refused> {
-            match self.ask(ClientCall::Resend { request }) {
-                Answer::Txn { result, .. } => Ok(result.seq.0),
-                Answer::Error { error, .. } => Err(Refused::ByKernel(error.kind)),
-                other => panic!("send: {other:?}"),
-            }
-        }
-
-        /// What a read of `object` through `look` saw, or its refusal.
-        fn look(
-            &mut self,
-            request: u64,
-            object: &'static [u8],
-            look: Look,
-        ) -> Result<Seen, ApiError> {
-            let call = ClientCall::Get {
-                identity: identity(request),
-                object: Bytes::from_static(object),
-                look,
-            };
-            match self.ask(call) {
-                Answer::Read { seen, .. } => Ok(seen),
-                Answer::Error { error, .. } => Err(error),
-                other => panic!("read: {other:?}"),
-            }
-        }
-    }
-
-    /// S4-1 (main line, 1k): arch §4 guards 1 and 2. A stale `Version` guard is refused by the
-    /// compile, before a request exists. A create over an existing document compiles, and the
-    /// kernel refuses it on the `Absent` condition the compile attached. Mutant m1 (the compile
-    /// ignores `expect`) publishes the stale change; m2 (conditions dropped) publishes the
-    /// create and empties the document. Trio, about 1 s.
-    #[test]
-    fn a_stale_document_change_is_refused_by_the_compile_and_a_create_over_one_by_the_kernel() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let replace = |value: Value| Change::Doc(Delta(vec![Op::Replace(value)]));
-        let created = json_map(&[
-            ("n", int(1)),
-            ("tags", Value::Array(vec![text("a"), text("x")])),
-        ]);
-        assert_eq!(
-            trio.write(compile_change(
-                1,
-                b"d",
-                replace(created),
-                Some(Expected::Absent)
-            )),
-            Ok(2)
-        );
-        let change = Change::Doc(Delta(vec![
-            Op::Increment(path("/n"), Int::from(5_u64)),
-            Op::Set(path("/tags/1"), text("b")),
-        ]));
-        assert_eq!(
-            trio.write(compile_change(2, b"d", change, Some(Expected::Version(2)))),
-            Ok(3)
-        );
-        let changed = Seen::Doc(Document {
-            version: 3,
-            value: json_map(&[
-                ("n", int(6)),
-                ("tags", Value::Array(vec![text("a"), text("b")])),
-            ]),
-        });
-        assert_eq!(trio.look(3, b"d", Look::Doc), Ok(changed.clone()));
-
-        let stale = Change::Doc(Delta(vec![Op::Increment(path("/n"), Int::from(1_u64))]));
-        assert_eq!(
-            trio.write(compile_change(4, b"d", stale, Some(Expected::Version(2)))),
-            Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
-            "a stale guard is refused before a request exists"
-        );
-        let over = replace(json_map(&[]));
-        assert_eq!(
-            trio.write(compile_change(5, b"d", over, Some(Expected::Absent))),
-            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
-            "a create compiles without reading; the kernel's Absent condition refuses it"
-        );
-        assert_eq!(trio.look(6, b"d", Look::Doc), Ok(changed), "d is unchanged");
-    }
-
-    /// S4-2 (2n, 2k, 2p): arch §4 guards 2, 3 and 5. A failed `need` is a failed condition,
-    /// either way round. A create over an existing map is refused by the kernel. A document read
-    /// of a map is refused, never `absent`. Mutant m3 (the element arm cut) answers
-    /// `INVALID_ARGUMENT` for the needs; m5 (read errors as `Seen::Absent`) reads the map as
-    /// absent; m2 publishes the create. Trio, about 1 s.
-    #[test]
-    fn a_failed_need_is_a_condition_failure_and_a_map_never_reads_as_a_document() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let map = Change::Map(vec![
-            ElemOp::Put(text("a"), int(1)),
-            ElemOp::Put(text("b"), int(2)),
-        ]);
-        assert_eq!(
-            trio.write(compile_change(1, b"m", map, Some(Expected::Absent))),
-            Ok(2)
-        );
-        let set = Change::Set(vec![ElemOp::Add(int(1))]);
-        assert_eq!(
-            trio.write(compile_change(2, b"s", set, Some(Expected::Absent))),
-            Ok(3)
-        );
-
-        for (request, need) in [
-            (3, ElemOp::NeedPresent(int(9))),
-            (4, ElemOp::NeedAbsent(int(1))),
-        ] {
-            let change = Change::Set(vec![need.clone()]);
-            assert_eq!(
-                trio.write(compile_change(
-                    request,
-                    b"s",
-                    change,
-                    Some(Expected::Version(3))
-                )),
-                Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
-                "{need:?}"
-            );
-        }
-        let over = Change::Map(vec![ElemOp::Put(text("z"), int(1))]);
-        assert_eq!(
-            trio.write(compile_change(5, b"m", over, Some(Expected::Absent))),
-            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
-            "a create over the map is the kernel's refusal"
-        );
-        match trio.look(6, b"m", Look::Doc) {
-            Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
-            Ok(seen) => panic!("a map read as a document: {seen:?}"),
-        }
-        let members = Look::Members {
-            after: None,
-            limit: 10,
-        };
-        match trio.look(7, b"m", members) {
-            Ok(Seen::Members(page)) => {
-                let keys: Vec<_> = page
-                    .members
-                    .iter()
-                    .map(|member| member.key.clone())
-                    .collect();
-                assert_eq!(
-                    (page.collection.version, page.collection.count, keys),
-                    (2, 2, vec![text("a"), text("b")]),
-                    "m is as created"
-                );
-            }
-            other => panic!("members of m: {other:?}"),
-        }
-    }
-
-    /// S4-3 3n2, 3n4, 3n5, 3n6 and the running count (3x): arch §4 guards 12 and 13 (A-R116).
-    /// `-k` names `count - k`; a position below 0 or past the end is refused, naming the edit;
-    /// each push or insert moves the count up and each remove moves it down, so a later edit
-    /// resolves against the list as the earlier edits leave it. Mutant m12a (below 0 clamps to 0)
-    /// removes item 0; m12b (negatives never resolved) refuses `-1`; m12c (off by one) removes
-    /// item 1; m13 (a push does not move the count) removes the old last item. Unit.
-    #[test]
-    fn a_negative_position_counts_from_the_end_of_the_list_the_earlier_edits_leave() {
-        let z = || Value::Text("z".to_owned());
-        assert_eq!(
-            resolve_edits(&[ListEdit::Remove { at: -1 }], 3),
-            Ok(vec![ListOp::Remove { at: 2 }]),
-            "-1 is the last item"
-        );
-        assert_eq!(
-            resolve_edits(&[ListEdit::Push(z()), ListEdit::Remove { at: -1 }], 3),
-            Ok(vec![ListOp::Push(z()), ListOp::Remove { at: 3 }]),
-            "the push moved the end"
-        );
-        assert_eq!(
-            resolve_edits(
-                &[
-                    ListEdit::Insert { at: -1, value: z() },
-                    ListEdit::Move { from: -1, to: 0 }
-                ],
-                2
-            ),
-            Ok(vec![
-                ListOp::Insert { at: 1, value: z() },
-                ListOp::Move { from: 2, to: 0 }
-            ]),
-            "the insert moved the end"
-        );
-        assert_eq!(
-            resolve_edits(&[ListEdit::Replace { at: -1, value: z() }], 3),
-            Ok(vec![ListOp::Replace { at: 2, value: z() }]),
-            "a replace resolves -1 as every edit does"
-        );
-        for (edits, count, refused) in [
-            (
-                vec![ListEdit::Remove { at: -4 }],
-                3,
-                "edit 0: position -4 is not inside the list of 3",
-            ),
-            (
-                vec![ListEdit::Remove { at: -1 }, ListEdit::Remove { at: -1 }],
-                1,
-                "edit 1: position -1 is not inside the list of 0",
-            ),
-            (
-                vec![ListEdit::Insert { at: -1, value: z() }],
-                0,
-                "edit 0: position -1 is not inside the list of 0",
-            ),
-            (
-                vec![ListEdit::Replace { at: 3, value: z() }],
-                3,
-                "edit 0: position 3 is not inside the list of 3",
-            ),
-        ] {
-            let error = resolve_edits(&edits, count).expect_err(refused);
-            assert_eq!(
-                (error.kind, error.detail.as_str()),
-                (ErrorKind::InvalidArgument, refused)
-            );
-        }
-    }
-
-    /// Review F-008: an insert may name the count, the end of the list; no other edit may.
-    /// Mutant m19 (the end never allowed) refuses it. Unit.
-    #[test]
-    fn an_insert_at_the_count_adds_at_the_end() {
-        let z = Value::Text("z".to_owned());
-        assert_eq!(
-            resolve_edits(
-                &[ListEdit::Insert {
-                    at: 3,
-                    value: z.clone()
-                }],
-                3
-            ),
-            Ok(vec![ListOp::Insert { at: 3, value: z }])
-        );
-    }
-
-    /// Review F-008: a move's destination counts from the end when negative, as its source
-    /// does: `-1` is the last position. Mutant m20 (`to` never resolved) refuses it. Unit.
-    #[test]
-    fn a_move_to_a_negative_position_counts_from_the_end() {
-        assert_eq!(
-            resolve_edits(&[ListEdit::Move { from: 0, to: -1 }], 3),
-            Ok(vec![ListOp::Move { from: 0, to: 2 }])
-        );
-    }
-
-    /// S4-3 3n1, 3n2, 3e and 3t: arch §4 guards 14, 12 and 4. A read's negative `--from`
-    /// resolves against the list the read sees, and a start before 0 or past the end is refused.
-    /// `-4` of 3 is refused by the compile, before a request exists. A fresh continuation token
-    /// continues after its page; one whose list has changed is `STALE_CONTINUATION` with retry
-    /// `Reconcile`, as the kernel's own stale continuation is. Mutant m14 (resolved against 0)
-    /// refuses `-1`; m12c (off by one) lists from item 1; m12a publishes the `-4` remove; m4a
-    /// (built with `ApiError::new`) answers retry `BoundedJitter`; m4b (the arm cut) answers
-    /// `CONDITION_FAILED`. Trio, about 1 s.
-    #[test]
-    fn a_list_read_resolves_its_start_against_the_list_and_a_stale_token_must_reconcile() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let push = |s: &str| ListEdit::Push(text(s));
-        let created = Change::List(vec![push("a"), push("b"), push("c")]);
-        assert_eq!(
-            trio.write(compile_change(1, b"l", created, Some(Expected::Absent))),
-            Ok(2)
-        );
-        let page = |seen: Result<Seen, ApiError>| match seen {
-            Ok(Seen::Items(items)) => items,
-            other => panic!("items of l: {other:?}"),
-        };
-        let last = page(trio.look(2, b"l", Look::Items { at: -1, limit: 10 }));
-        let listed = |items: Items| -> Vec<(u64, Value)> {
-            items
-                .items
-                .into_iter()
-                .map(|item| (item.position, item.value))
-                .collect()
-        };
-        assert_eq!(listed(last), vec![(2, text("c"))], "-1 is the last of 3");
-        for (request, at) in [(3, -4), (4, 99)] {
-            match trio.look(request, b"l", Look::Items { at, limit: 10 }) {
-                Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
-                Ok(seen) => panic!("a read from {at} of 3 was answered: {seen:?}"),
-            }
-        }
-
-        let past = Change::List(vec![ListEdit::Remove { at: -4 }]);
-        assert_eq!(
-            trio.write(compile_change(5, b"l", past, Some(Expected::Version(2)))),
-            Err(Refused::AtCompile(ErrorKind::InvalidArgument)),
-            "-4 of 3 is refused before a request exists"
-        );
-
-        let first = page(trio.look(6, b"l", Look::Items { at: 0, limit: 2 }));
-        let token = first.next.expect("a page of 2 of 3 has a next token");
-        let rest = page(trio.look(7, b"l", Look::ItemsAfter { token, limit: 10 }));
-        assert_eq!(
-            listed(rest),
-            vec![(2, text("c"))],
-            "a fresh token continues after its page"
-        );
-        let more = Change::List(vec![push("z")]);
-        assert_eq!(
-            trio.write(compile_change(8, b"l", more, Some(Expected::Version(2)))),
-            Ok(3)
-        );
-        match trio.look(9, b"l", Look::ItemsAfter { token, limit: 10 }) {
-            Err(error) => assert_eq!(
-                (error.kind, error.retry),
-                (ErrorKind::StaleContinuation, RetryRule::Reconcile),
-                "{error:?}"
-            ),
-            Ok(seen) => panic!("a token from before the push still read: {seen:?}"),
-        }
-    }
-
-    /// A raw write of `value` over the root of `object`, as `rdb_dev admin damage` sends it.
-    fn damage_write(request: u64, object: &[u8], value: Bytes) -> TxnRequest {
-        TxnRequest {
-            api_version: API_VERSION,
-            identity: identity(request),
-            affinity: AFFINITY,
-            expected_generation: None,
-            remaining_millis: 5_000,
-            conditions: Vec::new(),
-            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
-                key: root_key(TenantId(1), AFFINITY, object).to_bytes(),
-                value,
-                expected_version: None,
-            }],
-        }
-    }
-
-    /// A sound document envelope with `codec_version` `0x02` and its digest recomputed: a record
-    /// a newer build could have written, as `rdb_dev admin damage --as newer` writes it.
-    fn newer_build_document() -> Bytes {
-        use rdb_value::envelope::{digest, seal, Kind, HEADER_LEN};
-        let mut bytes = seal(Kind::Document, &[0xf6]).expect("a null fits").to_vec();
-        bytes[2] = 0x02;
-        let head: [u8; 8] = bytes[..8].try_into().expect("a header is 40 bytes");
-        let sum = digest(&head, &bytes[HEADER_LEN..]);
-        bytes[8..HEADER_LEN].copy_from_slice(&sum);
-        Bytes::from(bytes)
-    }
-
-    fn clear_call(request: u64, object: &'static [u8]) -> ClientCall {
-        compile_change(request, object, Change::Clear, None)
-    }
-
-    /// #55 (A-R150 F6, F7): a map write that names a newer build's entry is refused at the
-    /// compile, and the detail names the entry's key, after the op index and the newer-build
-    /// prefix: `op 0: written by a newer build: map entry "b": ...`. Two ops or one, the same
-    /// text. Nothing is sent, so `d` keeps its value; a page after `b` reads it.
-    /// Integration (~1 s): Trio, three map writes and a page.
-    #[config_log::retcd_test]
-    fn m9_s7_a_map_write_refused_for_a_newer_entry_names_its_key() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let made = Change::Map(vec![
-            ElemOp::Put(text("a"), int(1)),
-            ElemOp::Put(text("b"), int(2)),
-            ElemOp::Put(text("d"), int(3)),
-        ]);
-        assert_eq!(
-            trio.write(compile_change(1, b"m", made, Some(Expected::Absent))),
-            Ok(2)
-        );
-        // `admin damage m --element "b" --as newer`: the entry's record, not the root's.
-        let root = root_key(TenantId(1), AFFINITY, b"m");
-        let damage = TxnRequest {
-            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
-                key: rdb_value::keys::element_key(&root, &text("b")).expect("a text key"),
-                value: newer_build_document(),
-                expected_version: None,
-            }],
-            ..damage_write(2, b"m", Bytes::new())
-        };
-        assert_eq!(trio.sent(damage), Ok(3));
-
-        let named = "op 0: written by a newer build: map entry \"b\": unknown codec version 0x02; \
-                     open the folder with the newer build";
-        for (request, ops) in [
-            (
-                3,
-                vec![
-                    ElemOp::Put(text("d"), int(4)),
-                    ElemOp::Put(text("b"), int(9)),
-                ],
-            ),
-            (4, vec![ElemOp::Put(text("b"), int(9))]),
-        ] {
-            match trio.ask(compile_change(request, b"m", Change::Map(ops), None)) {
-                Answer::Error {
-                    error,
-                    request: sent,
-                } => assert_eq!(
-                    (error.kind, error.detail.as_str(), sent.is_some()),
-                    (ErrorKind::IncompatibleVersion, named, false),
-                    "request {request}"
-                ),
-                other => panic!("not refused: {other:?}"),
-            }
-        }
-        let after_b = Look::Members {
-            after: Some(text("b")),
-            limit: 10,
-        };
-        match trio.look(5, b"m", after_b) {
-            Ok(Seen::Members(page)) => {
-                let entries: Vec<_> = page
-                    .members
-                    .iter()
-                    .map(|member| (member.key.clone(), member.value.clone()))
-                    .collect();
-                assert_eq!(entries, [(text("d"), Some(int(3)))], "d is unchanged");
-            }
-            other => panic!("members of m after b: {other:?}"),
-        }
-    }
-
-    /// Ruling A-R154 (PR #56, Revobot Q4): a log line never carries a map key's text (ADR-0013).
-    /// A map write refused for a newer build's entry (#55) and a document write whose path
-    /// names a missing map key both answer the caller with the key readable, as before. Their
-    /// `client_compile` lines carry the refusal's kind only, and no line of the test's log
-    /// holds either key's text.
-    /// Integration (~1 s): Trio, two writes, a raw damage write and two refused compiles.
-    #[config_log::retcd_test]
-    fn m9_close_a_refused_write_answers_its_key_and_never_logs_it() {
-        const METHOD: &str = "m9_close_a_refused_write_answers_its_key_and_never_logs_it";
-        // Distinct from every other word in the log, the test's own name included.
-        const ENTRY: &str = "kq7-entry";
-        const SEGMENT: &str = "zx9-field";
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let made = Change::Map(vec![ElemOp::Put(text(ENTRY), int(1))]);
-        assert_eq!(
-            trio.write(compile_change(1, b"m", made, Some(Expected::Absent))),
-            Ok(2)
-        );
-        let root = root_key(TenantId(1), AFFINITY, b"m");
-        let damage = TxnRequest {
-            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
-                key: rdb_value::keys::element_key(&root, &text(ENTRY)).expect("a text key"),
-                value: newer_build_document(),
-                expected_version: None,
-            }],
-            ..damage_write(2, b"m", Bytes::new())
-        };
-        assert_eq!(trio.sent(damage), Ok(3));
-        let doc = Change::Doc(Delta(vec![Op::Replace(json_map(&[("a", int(1))]))]));
-        assert_eq!(
-            trio.write(compile_change(3, b"doc", doc, Some(Expected::Absent))),
-            Ok(4)
-        );
-
-        let refused = [
-            (
-                4,
-                b"m" as &'static [u8],
-                Change::Map(vec![ElemOp::Put(text(ENTRY), int(9))]),
-                ErrorKind::IncompatibleVersion,
-                format!(
-                    "op 0: written by a newer build: map entry \"{ENTRY}\": unknown codec \
-                     version 0x02; open the folder with the newer build"
-                ),
-            ),
-            (
-                5,
-                b"doc",
-                Change::Doc(Delta(vec![Op::Remove(path(&format!("/{SEGMENT}")))])),
-                ErrorKind::InvalidArgument,
-                format!("op 0: nothing at segment \"{SEGMENT}\""),
-            ),
-        ];
-        for (request, object, change, kind, detail) in refused {
-            match trio.ask(compile_change(request, object, change, None)) {
-                Answer::Error { error, .. } => assert_eq!(
-                    (error.kind, error.detail.as_str()),
-                    (kind, detail.as_str()),
-                    "request {request}: the reply names the key readably"
-                ),
-                other => panic!("request {request} not refused: {other:?}"),
-            }
-        }
-
-        let compiles = logged!(METHOD, "client_compile");
-        for (request, kind) in [(4, "INCOMPATIBLE_VERSION"), (5, "INVALID_ARGUMENT")] {
-            let lines: Vec<_> = compiles
-                .iter()
-                .filter(|line| line["request"] == request)
-                .collect();
-            assert!(
-                !lines.is_empty(),
-                "request {request}: no client_compile line"
-            );
-            for line in lines {
-                assert!(
-                    line["compiled"] == false && line["kind"] == kind,
-                    "request {request}: {line}"
-                );
-            }
-        }
-        let leaks: Vec<String> =
-            config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
-                .iter()
-                .map(ToString::to_string)
-                .filter(|line| line.contains(ENTRY) || line.contains(SEGMENT))
-                .collect();
-        assert!(leaks.is_empty(), "log lines carry a key's text: {leaks:#?}");
-    }
-
-    /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
-    /// given without sending are reads, so a node gives them only while a read would be given.
-    /// Admitting: a healthy object and one with only upload chunks are CONDITION_FAILED, a
-    /// missing one `unchanged`, a newer build's one INCOMPATIBLE_VERSION, and a clear with an
-    /// expect INVALID_ARGUMENT, none naming a request. Fenced: healthy, chunks-only and missing
-    /// are refused as a plain read is, with `no_mutation`, never CONDITION_FAILED or
-    /// `unchanged`; newer is still
-    /// INCOMPATIBLE_VERSION, which claims nothing about the object; a damaged one compiles, is
-    /// sent, and the kernel refuses it. Once node 1 admits again that clear publishes.
-    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
-    #[config_log::retcd_test]
-    fn m9_s6_a_clear_answers_without_sending_only_while_a_read_would_be_answered() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.budgets.grant_millis = 600;
-            host.budgets.renew_millis = 100;
-        });
-        trio.bootstrap();
-        trio.ready();
-        let doc = || Change::Doc(Delta(vec![Op::Replace(text("v"))]));
-        assert_eq!(
-            trio.write(compile_change(1, b"healthy", doc(), None)),
-            Ok(2)
-        );
-        assert_eq!(
-            trio.write(compile_change(2, b"damaged", doc(), None)),
-            Ok(3)
-        );
-        assert_eq!(trio.write(compile_change(3, b"newer", doc(), None)), Ok(4));
-        let broken = Bytes::from_static(b"damaged");
-        assert_eq!(trio.sent(damage_write(4, b"damaged", broken)), Ok(5));
-        assert_eq!(
-            trio.sent(damage_write(5, b"newer", newer_build_document())),
-            Ok(6)
-        );
-        assert_eq!(
-            trio.write(chunk_call(6, b"chunks", 0, b"HELL", None)),
-            Ok(7)
-        );
-
-        let kind = |answer| refusal(answer).0;
-        let (not_damaged, _, _, request) = refusal(trio.ask(clear_call(7, b"healthy")));
-        assert_eq!((not_damaged, request), (ErrorKind::ConditionFailed, false));
-        let (only_chunks, _, _, request) = refusal(trio.ask(clear_call(8, b"chunks")));
-        assert_eq!((only_chunks, request), (ErrorKind::ConditionFailed, false));
-        match trio.ask(clear_call(9, b"missing")) {
-            Answer::Unchanged => {}
-            other => panic!("a clear of nothing: {other:?}"),
-        }
-        let newer = (ErrorKind::IncompatibleVersion, RetryRule::Quarantine, false);
-        let quarantined = |answer| {
-            let (kind, retry, _, request) = refusal(answer);
-            (kind, retry, request)
-        };
-        assert_eq!(quarantined(trio.ask(clear_call(10, b"newer"))), newer);
-        let expect = Some(Expected::Version(2));
-        assert_eq!(
-            kind(trio.ask(compile_change(11, b"healthy", Change::Clear, expect))),
-            ErrorKind::InvalidArgument,
-            "a clear takes no expect"
-        );
-
-        trio.mem
-            .failing_with(config_core::ConfigError::Unavailable {
-                reason: "the control store is down".to_owned(),
-            });
-        trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
-        let read = ClientCall::Get {
-            identity: identity(12),
-            object: Bytes::from_static(b"healthy"),
-            look: Look::Doc,
-        };
-        let refused = match trio.ask(read) {
-            Answer::Read {
-                outcome: ReadServiceOutcome::Rejected(kind),
-                ..
-            } => crate::db::refused_read(kind),
-            other => panic!("a read while fenced: {other:?}"),
-        };
-        assert_eq!(refused.kind, ErrorKind::LeaseExpired, "{refused:?}");
-        for (request, object) in [
-            (13, &b"healthy"[..]),
-            (14, &b"chunks"[..]),
-            (15, &b"missing"[..]),
-        ] {
-            assert_eq!(
-                refusal(trio.ask(clear_call(request, object))),
-                (refused.kind, refused.retry, true, false),
-                "{} while fenced, as the read but sending nothing",
-                String::from_utf8_lossy(object)
-            );
-        }
-        assert_eq!(
-            quarantined(trio.ask(clear_call(16, b"newer"))),
-            newer,
-            "newer while fenced"
-        );
-        let request = trio.compiled(clear_call(17, b"damaged"));
-        assert_eq!(
-            trio.sent(request),
-            Err(Refused::ByKernel(ErrorKind::LeaseExpired)),
-            "a damaged object's clear is sent, and the fenced kernel refuses it"
-        );
-
-        trio.mem.stop_failing();
-        trio.ready();
-        assert!(trio.write(clear_call(18, b"damaged")).is_ok(), "cleared");
-        match trio.ask(clear_call(19, b"damaged")) {
-            Answer::Unchanged => {}
-            other => panic!("a clear once cleared: {other:?}"),
-        }
-    }
-
-    /// M9 S6 review F-006: the `clear_compiled` line names the root `deleted` when the batch
-    /// deletes it, `guarded` when a version condition keeps it, and `absent` when the guard
-    /// says there is none; `deletes` and `faulting` are the batch's own counts.
-    /// Unit (~10 ms): `log_clear` on three batches built by hand.
-    #[config_log::retcd_test]
-    fn m9_s6_the_clear_line_names_what_the_batch_does_to_the_root() {
-        const METHOD: &str = "m9_s6_the_clear_line_names_what_the_batch_does_to_the_root";
-        let root = root_key(TenantId(1), AFFINITY, b"o");
-        let element = Bytes::from_static(b"an element key");
-        let delete = |key: Bytes| Mutation::Delete {
-            key,
-            expected_version: Some(3),
-        };
-        let batches = [
-            (
-                1,
-                vec![delete(element.clone()), delete(root.to_bytes())],
-                vec![Condition::VersionEquals {
-                    key: root.to_bytes(),
-                    version: 3,
-                }],
-                1,
-            ),
-            (
-                2,
-                vec![delete(element.clone())],
-                vec![Condition::VersionEquals {
-                    key: root.to_bytes(),
-                    version: 3,
-                }],
-                0,
-            ),
-            (
-                3,
-                vec![delete(element)],
-                vec![Condition::Absent {
-                    key: root.to_bytes(),
-                }],
-                1,
-            ),
-        ];
-        for (request, mutations, conditions, faulting) in batches {
-            let cleared = Cleared {
-                compiled: Compiled {
-                    mutations,
-                    conditions,
-                },
-                damage: Corrupt::VersionWithoutValue,
-                faulting,
-            };
-            log_clear(NodeId(1), identity(request), &root, &cleared);
-        }
-
-        let lines = logged!(METHOD, "clear_compiled");
-        let seen: Vec<_> = lines
-            .iter()
-            .map(|line| {
-                (
-                    line["request"].clone(),
-                    line["root"].clone(),
-                    line["deletes"].clone(),
-                    line["faulting"].clone(),
-                    line["key_hex"].clone(),
-                )
-            })
-            .collect();
-        let want = |request: u64, root: &str, deletes: u64, faulting: u64| {
-            (
-                request.into(),
-                root.into(),
-                deletes.into(),
-                faulting.into(),
-                "6f".into(),
-            )
-        };
-        assert_eq!(
-            seen,
-            vec![
-                want(1, "deleted", 2, 1),
-                want(2, "guarded", 1, 0),
-                want(3, "absent", 1, 1),
-            ],
-            "{lines:?}"
-        );
-    }
-
-    /// D9 (ADR-0013): the damage lines name the object by `key_hex`, its id's first 32 bytes
-    /// as lowercase hex, and never by its text. `stored_damage`, with and without a chunk, and
-    /// `clear_compiled` for the tester's `zqa` and for a 40-byte id cut to 32 bytes.
-    /// Unit (~10 ms): the two log functions called by hand.
-    #[config_log::retcd_test]
-    fn d9_damage_lines_carry_the_object_as_key_hex_capped_at_32_bytes() {
-        const METHOD: &str = "d9_damage_lines_carry_the_object_as_key_hex_capped_at_32_bytes";
-        let long = [b'z'; 40];
-        let error = ApiError::new(ErrorKind::CorruptHistory, "damaged".to_owned());
-        for (request, object) in [(1, &b"zqa"[..]), (2, &long[..])] {
-            let root = root_key(TenantId(1), AFFINITY, object);
-            log_stored_damage(NodeId(1), &root, &error, None, None);
-            log_stored_damage(NodeId(1), &root, &error, None, Some(([7; 16], 2)));
-            let cleared = Cleared {
-                compiled: Compiled {
-                    mutations: vec![Mutation::Delete {
-                        key: root.to_bytes(),
-                        expected_version: Some(3),
-                    }],
-                    conditions: Vec::new(),
-                },
-                damage: Corrupt::VersionWithoutValue,
-                faulting: 1,
-            };
-            log_clear(NodeId(1), identity(request), &root, &cleared);
-        }
-
-        let short = "7a7161".to_owned();
-        let capped = "7a".repeat(32);
-        for (message, want) in [
-            ("stored_damage", vec![&short, &short, &capped, &capped]),
-            ("clear_compiled", vec![&short, &capped]),
-        ] {
-            let lines = logged!(METHOD, message);
-            let named: Vec<_> = lines.iter().map(|line| line["key_hex"].clone()).collect();
-            let want: Vec<serde_json::Value> =
-                want.into_iter().map(|hex| hex.as_str().into()).collect();
-            assert_eq!(named, want, "{message}: {lines:?}");
-            for line in &lines {
-                let text = line.to_string();
-                assert!(
-                    line.get("object").is_none() && line.get("root_unparsed").is_none(),
-                    "{message} names the object only by key_hex: {text}"
-                );
-                assert!(
-                    !text.contains("zqa") && !text.contains("zzzz"),
-                    "{message} carries the object's text: {text}"
-                );
-            }
-        }
-    }
-
-    /// D9b: the damage lines name the damage by a code, never by the error's text. A map
-    /// entry's damage quotes the app's key in its `Display` ("map entry \"zqk-secret\": ..."),
-    /// so the refusal's detail is left out of `stored_damage`, and `clear_compiled` logs
-    /// `damage_code`. The damage is built by hand: no stored record carries it to these sites
-    /// today, so the row pins the sites, whatever text a refusal carries.
-    /// Unit (~10 ms): the two log functions called by hand.
-    #[config_log::retcd_test]
-    fn d9b_damage_lines_log_a_code_and_never_the_error_text() {
-        const METHOD: &str = "d9b_damage_lines_log_a_code_and_never_the_error_text";
-        let entry = Corrupt::Entry {
-            key: Value::Text("zqk-secret".to_owned()),
-            error: rdb_value::envelope::EnvelopeError::UnknownKind(0),
-        };
-        let text = entry.to_string();
-        assert!(
-            text.contains("zqk-secret"),
-            "the fixture quotes the key: {text}"
-        );
-        let root = root_key(TenantId(1), AFFINITY, b"m");
-        let refused = ApiError::new(ErrorKind::CorruptHistory, text);
-        log_stored_damage(NodeId(1), &root, &refused, None, None);
-        log_stored_damage(NodeId(1), &root, &refused, Some(damage_code(&entry)), None);
-        log_stored_damage(
-            NodeId(1),
-            &root,
-            &refused,
-            Some(damage_code(&entry)),
-            Some(([7; 16], 2)),
-        );
-        let cleared = Cleared {
-            compiled: Compiled {
-                mutations: vec![Mutation::Delete {
-                    key: root.to_bytes(),
-                    expected_version: Some(3),
-                }],
-                conditions: Vec::new(),
-            },
-            damage: entry,
-            faulting: 1,
-        };
-        log_clear(NodeId(1), identity(1), &root, &cleared);
-
-        let stored = logged!(METHOD, "stored_damage");
-        let codes: Vec<_> = stored.iter().map(|line| line["damage"].clone()).collect();
-        assert_eq!(
-            codes,
-            [serde_json::Value::Null, "entry".into(), "entry".into()],
-            "{stored:?}"
-        );
-        let clear = logged!(METHOD, "clear_compiled");
-        assert_eq!(clear.len(), 1, "{clear:?}");
-        assert_eq!(clear[0]["damage"], "entry", "{clear:?}");
-        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-        for line in &lines {
-            let text = line.to_string();
-            assert!(
-                !text.contains("zqk") && line.get("detail").is_none(),
-                "a log line carries the error's text: {text}"
-            );
-        }
-    }
-
-    /// M9 S6 review Q-1: "nothing to clear" is answered only for a view P1 has published in the
-    /// view's own generation. A published position of another generation, or none yet, is
-    /// UNKNOWN_OUTCOME naming the generations; the same seq in the view's generation is Ok.
-    /// The host adopts a generation from A1 and P1 takes its lineage from recovery, so the two
-    /// can differ for a step (`deliver`'s AdoptAuthority; publication's `on_recovered`).
-    /// Unit (~50 ms): one empty engine, no thread.
-    #[test]
-    fn m9_s6_nothing_to_clear_needs_a_publish_in_the_views_own_generation() {
-        const CLAIM: &str = "nothing to clear";
-        const THEN: &str = "if an earlier clear sent deletes, ask its status";
-        let dir = config_testkit::fs::temp_dir();
-        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
-        let view = engine
-            .snapshot(PartitionId(1), Generation(1), SnapshotHandle(0))
-            .expect("snapshot");
-        assert_eq!(
-            view_published(&view, Some((Generation(1), view.at())), CLAIM, THEN),
-            Ok(())
-        );
-        let other = view_published(&view, Some((Generation(0), view.at())), CLAIM, THEN)
-            .expect_err("other");
-        assert_eq!(other.kind, ErrorKind::UnknownOutcome, "{other:?}");
-        assert!(
-            other.detail.contains("of generation 0, not generation 1"),
-            "{other:?}"
-        );
-        let none = view_published(&view, None, CLAIM, THEN).expect_err("none");
-        assert_eq!(none.kind, ErrorKind::UnknownOutcome, "{none:?}");
-        assert!(none.detail.contains("nothing published yet"), "{none:?}");
-    }
-
-    /// M9 S6 contract 5, held copies, guard 15: with both secondaries cut off, node 1 applies a
-    /// clear that cannot publish. The clear asked again meanwhile finds nothing stored, above
-    /// P1's published seq, so it is UNKNOWN_OUTCOME naming no request, never `unchanged`: the
-    /// first clear may still be lost. After the heal the held clear publishes, and the next is
-    /// `unchanged`. Trio, about 1 s.
-    #[test]
-    fn m9_s6_a_clear_asked_again_before_the_first_publishes_is_an_unknown_outcome() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let doc = Change::Doc(Delta(vec![Op::Replace(text("v"))]));
-        assert_eq!(trio.write(compile_change(1, b"d", doc, None)), Ok(2));
-        let broken = Bytes::from_static(b"damaged");
-        assert_eq!(trio.sent(damage_write(2, b"d", broken)), Ok(3));
-        let request = trio.compiled(clear_call(3, b"d"));
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        let held = trio.call(ClientCall::Resend { request });
-        trio.until("node 1 applied the clear", |trio| {
-            (trio.head() == Some(4)).then_some(())
-        });
-
-        assert_eq!(
-            refusal(trio.ask(clear_call(4, b"d"))),
-            (
-                ErrorKind::UnknownOutcome,
-                RetryRule::QueryStatus,
-                false,
-                false
-            ),
-            "nothing is stored, and that is not published"
-        );
-        assert!(held.try_recv().is_err(), "no copy acknowledged the clear");
-
-        trio.links.heal_all();
-        match trio.answer(&held) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(4)),
-            other => panic!("the held clear after the heal: {other:?}"),
-        }
-        match trio.ask(clear_call(5, b"d")) {
-            Answer::Unchanged => {}
-            other => panic!("a clear once published: {other:?}"),
-        }
-    }
-    /// Review R-2 (PR #53): "not damaged" is a read of the step view, which holds writes applied
-    /// and not yet published. With both secondaries cut off, an app put repairs a map's damaged
-    /// entry and applies on node 1 only. A clear asked meanwhile finds the map healthy, but the
-    /// repair may still be lost, so it is UNKNOWN_OUTCOME naming no request, never
-    /// CONDITION_FAILED. After the heal the repair publishes, and the clear is CONDITION_FAILED.
-    /// Trio, about 1 s.
-    #[test]
-    fn m9_s6_a_clear_that_finds_an_unpublished_repair_is_an_unknown_outcome() {
-        let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), Trio::fast);
-        trio.bootstrap();
-        trio.ready();
-        let put = |n| Change::Map(vec![ElemOp::Put(text("a"), int(n))]);
-        assert_eq!(trio.write(compile_change(1, b"m", put(1), None)), Ok(2));
-        // The entry's bytes broken, and the root written again in the same commit, so the
-        // entry is not newer than its root and an app put still compiles over it.
-        let root = root_key(TenantId(1), AFFINITY, b"m");
-        let mut fields = rdb_value::value::Map::new();
-        fields.insert(rdb_value::value::MapKey::new("keys"), int(1));
-        fields.insert(rdb_value::value::MapKey::new("count"), int(1));
-        let payload = rdb_value::cbor::encode(&Value::Map(fields)).expect("a root encodes");
-        let sealed = rdb_value::envelope::seal(rdb_value::envelope::Kind::Map, &payload)
-            .expect("a root fits");
-        let damage = TxnRequest {
-            api_version: API_VERSION,
-            identity: identity(2),
-            affinity: AFFINITY,
-            expected_generation: None,
-            remaining_millis: 5_000,
-            conditions: Vec::new(),
-            mutations: vec![
-                rdb_core::contracts::txn::Mutation::Put {
-                    key: root.to_bytes(),
-                    value: sealed,
-                    expected_version: None,
-                },
-                rdb_core::contracts::txn::Mutation::Put {
-                    key: rdb_value::keys::element_key(&root, &text("a")).expect("a text key"),
-                    value: Bytes::from_static(b"damaged"),
-                    expected_version: None,
-                },
-            ],
-        };
-        assert_eq!(trio.sent(damage), Ok(3));
-        let members = Look::Members {
-            after: None,
-            limit: 10,
-        };
-        match trio.look(10, b"m", members) {
-            Err(error) => assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}"),
-            other => panic!("members of a damaged map: {other:?}"),
-        }
-        let repair = trio.compiled(compile_change(3, b"m", put(2), None));
-        trio.links.hold(NodeId(1), NodeId(2));
-        trio.links.hold(NodeId(1), NodeId(3));
-        let held = trio.call(ClientCall::Resend { request: repair });
-        trio.until("node 1 applied the repair", |trio| {
-            (trio.head() == Some(4)).then_some(())
-        });
-
-        assert_eq!(
-            refusal(trio.ask(clear_call(4, b"m"))),
-            (
-                ErrorKind::UnknownOutcome,
-                RetryRule::QueryStatus,
-                false,
-                false
-            ),
-            "the map reads back cleanly only through a repair not yet published"
-        );
-        assert!(held.try_recv().is_err(), "no copy acknowledged the repair");
-
-        trio.links.heal_all();
-        match trio.answer(&held) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(4)),
-            other => panic!("the held repair after the heal: {other:?}"),
-        }
-        assert_eq!(
-            refusal(trio.ask(clear_call(5, b"m"))),
-            (
-                ErrorKind::ConditionFailed,
-                RetryRule::Definitive,
-                true,
-                false
-            ),
-            "once the repair is published the map is not damaged"
-        );
-    }
-    /// Ruling A-R184, the write gate: the lead asked that a second recovery in one open go
-    /// through the gate too, so a write is refused, and nothing is sent, while the primary has
-    /// not heard that the open counter marks its adopted generation activated, even with a grant
-    /// held. `admits` says false meanwhile, so `wait_ready` waits for the mark. Here the mark
-    /// is taken back by hand, which is what a second recovery's commit leaves until its own mark
-    /// lands. Cut: `unactivated` answers `None`, and the put publishes. Trio, about 1 s.
-    #[test]
-    fn a_write_under_a_generation_not_marked_activated_is_refused_and_sends_nothing() {
-        let dir = config_testkit::fs::temp_dir();
-        let instance = [7_u8; INSTANCE_LEN];
-        let mut trio = Trio::new(dir.path(), |host| {
-            Trio::fast(host);
-            host.instance = Some(instance);
-        });
-        trio.rt
-            .block_on(crate::admin::count_open(
-                &*trio.store,
-                &instance,
-                true,
-                crate::admin::COUNT_WITHIN,
-            ))
-            .expect("the open counter");
-        trio.bootstrap();
-        trio.ready();
-        let add = |n| Change::Set(vec![ElemOp::Add(int(n))]);
-        assert_eq!(
-            trio.write(compile_change(1, b"s", add(1), Some(Expected::Absent))),
-            Ok(2),
-            "a write once the mark is heard"
-        );
-        let marked = trio.nodes[0]
-            .0
-            .activation
-            .get_mut(&PartitionId(1))
-            .expect("node 1 asked for a mark");
-        assert_eq!(marked.marked, Generation(1), "{marked:?}");
-        marked.marked = Generation(0);
-        assert!(
-            trio.status(0).authority.starts_with("held"),
-            "{:?}",
-            trio.status(0)
-        );
-        assert_eq!(trio.status(0).admits, Some(false), "{:?}", trio.status(0));
-        // review-r184 A1: the refusal reads as one sentence, no run of spaces from a wrap.
-        let refusal = trio.nodes[0]
-            .0
-            .unactivated(PartitionId(1))
-            .expect("the refusal");
-        assert_eq!(
-            refusal.detail,
-            "generation 1 of partition 1 on node 1 is not yet marked activated in the open \
-             counter; nothing was sent"
-        );
-        let head = trio.head();
-        assert_eq!(
-            trio.write(compile_change(2, b"s", add(2), None)),
-            Err(Refused::ByKernel(ErrorKind::Unavailable)),
-            "refused before it is sent"
-        );
-        assert_eq!(trio.head(), head, "nothing was sent");
-    }
-}
+mod catchup_tests;
+#[cfg(test)]
+mod drop_tests;
+#[cfg(test)]
+mod sync_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod trio;

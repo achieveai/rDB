@@ -752,9 +752,12 @@ impl PolicyFixture {
 
     /// Write a document at `version` granting [`PRINCIPAL`] read and write on each prefix.
     ///
-    /// The signature is written **first** so the pair is never observed as "new document, old
-    /// signature": the poller reads the document then the signature, and the reverse order would
-    /// hand it a `hash_mismatch` on every rotation for one tick.
+    /// The two files are two renames, and a poll can land between them. A missing file is
+    /// written **last**, so that poll finds the same file missing as before the write and is
+    /// refused for the same reason, not a new one (#58). When both files exist (a rotation), no
+    /// order hides the change: one poll can see the new signature beside the old document and
+    /// refuse it as `version_binding` or `hash_mismatch`. A row that counts `policy_rejected`
+    /// lines across a rotation must allow for that.
     pub fn write(&self, version: u64, prefixes: &[&str], admins: &[&str]) {
         use config_core::policy::{document_hash, grant, signature_payload, PolicySignature};
         use ed25519_dalek::Signer;
@@ -790,8 +793,16 @@ impl PolicyFixture {
         }
         .encode()
         .expect("an envelope encodes");
-        write_atomically(&self.signature_file, &envelope);
-        write_atomically(&self.policy_file, &bytes);
+        let signature_pair = (&self.signature_file, &envelope);
+        let document_pair = (&self.policy_file, &bytes);
+        let signature_missing = self.policy_file.exists() && !self.signature_file.exists();
+        let (first, last) = if signature_missing {
+            (document_pair, signature_pair)
+        } else {
+            (signature_pair, document_pair)
+        };
+        write_atomically(first.0, first.1);
+        write_atomically(last.0, last.1);
     }
 
     /// Remove both files, which is how a node starts with no valid policy at all.
@@ -808,7 +819,7 @@ pub const TRUST_KEY_NAME: &str = "rotate";
 ///
 /// A poller that reads a half-written document sees a `parse_error` and keeps the old policy,
 /// which is correct but makes a rotation row flap; renaming into place removes the window.
-fn write_atomically(path: &Path, bytes: &[u8]) {
+pub fn write_atomically(path: &Path, bytes: &[u8]) {
     let staging = path.with_extension("staging");
     std::fs::write(&staging, bytes).expect("write the staged policy artifact");
     std::fs::rename(&staging, path).expect("rename the staged policy artifact into place");
@@ -1244,6 +1255,35 @@ pub fn log_lines(path: &Path) -> Vec<serde_json::Value> {
                 .unwrap_or_else(|e| panic!("malformed JSONL in {}: {e}\n{line}", path.display()))
         })
         .collect()
+}
+
+/// Every JSON line of a running daemon's log, once `ready` holds for them.
+///
+/// The daemon writes its log from a background thread (A-R309), so a line logged just before
+/// something a row can observe (a health field, an RPC answer) can reach the file a moment
+/// after it. A row that reads such a line while the daemon runs waits for it here. A row that
+/// reads after the daemon exited needs no wait: exit writes every queued line.
+///
+/// At the deadline it returns the last read, so the row's own assertion says what is missing.
+pub async fn log_lines_when(
+    path: &Path,
+    ready: impl Fn(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    let read = || {
+        if path.exists() {
+            log_lines(path)
+        } else {
+            Vec::new()
+        }
+    };
+    let waited =
+        config_testkit::poll::poll_until_async(deadline(10), Duration::from_millis(50), || {
+            let lines = read();
+            let found = ready(&lines).then_some(lines);
+            async move { found }
+        })
+        .await;
+    waited.unwrap_or_else(|_| read())
 }
 
 /// This node's JSONL log file (`<log-dir>/<node_id>.jsonl`), whether or not it exists yet.

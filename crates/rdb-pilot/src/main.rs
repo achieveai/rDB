@@ -24,11 +24,39 @@
 //!
 //! Every open prints `ready ms=<open-to-ready> heal=<HealState>` (`reopen i ready ...` for a
 //! reopen). Exits: 0 done; 1 a write or read failed; 2 bad arguments or setup; 3 the folder was
-//! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`); 4 `--verify`
-//! found a journalled key missing or wrong; 5 not ready in time.
+//! refused, by `Db::open` or by a reopen's heal (`open refused: <Variant>: ...`), or with
+//! `--nodes` a node refused the link (`links down after Ss: node N: refused: ...`: another CA, the
+//! wrong node at that address, something that is not TLS, a newer protocol); 4 `--verify`
+//! found a journalled key missing or wrong; 5 not ready in time; 6 a `--retry-for` put whose
+//! status answered `Expired`: too old to settle, so whether it landed is not known (read the
+//! object). The same list ends the usage text that a bad argument, `--help` included, prints.
 //!
 //! Logs go to `L/pilot_kv.jsonl` (default `D` with `.logs` appended) and never carry key or
 //! value text (ADR-0013, A-R154): the pilot logs counts and indices only.
+//!
+//! # Against node processes (M10 S2, ruling A-R226)
+//!
+//! ```text
+//! pilot_kv --dir D --control E --nodes 1=ADDR,2=ADDR,3=ADDR --cert-dir C [--app NAME]
+//!          [--client-id N] [--put KEY=VALUE] [--get KEY] [...the flags above]
+//! ```
+//!
+//! With `--nodes` the pilot runs no copy itself: it opens its `Db` with `local = []` and links
+//! that dial every node, as the app `NAME` (default `pilot`, certificate `C/app-NAME.*`), under
+//! client id `N` (default 1). It waits up to 5 s for every node's link, then prints
+//! `link node=N down: <why>` for each node that is not up and `links up nodes=<the rest>`, and
+//! goes on: the open decides whether the nodes that are up can serve, so a node `lr kill`
+//! stopped and promoted away is no failure. A refused handshake exits 3. `D` then holds only
+//! the journal. `--put` writes one value and
+//! prints `put seq=<seq> request=<id>`; `--get` prints `get value=<text>` or `get absent`.
+//! A put that gets no answer prints `put <error> request=<id>: ...` and then the request's
+//! `status ...`; with `--retry-for S` it then sends the same request again until answered,
+//! printing `retry ok seq=<seq> outcome=<Published|RecoveredApplied>` (scenario S2-7). A
+//! `GENERATION_CHANGED` resend is never sent again: the pilot asks `status` until it says, and
+//! prints `retry settled seq=<seq> ...` or `retry settled expired ...` (D5).
+//! `--request-id N` sends the put under the app's own id `app_request_id(N)`, so two pilots
+//! with different `--client-id` can send the same id (scenario S2-8).
+//! `scripts/local-rdb.sh up` prints the exact command for its run.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
@@ -37,12 +65,25 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeMap;
+
 use config_core::ConfigStore;
 use rdb_api::db::ReadyError;
-use rdb_api::{Db, DbConfig, Timeouts};
+use rdb_api::net::faults::Faults;
+use rdb_api::net::wire::Label;
+use rdb_api::net::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
+use rdb_api::transport::Links;
+use rdb_api::{
+    ApiError, BootId, ClientId, Db, DbConfig, ErrorKind, NodeId, PutError, PutOk, Timeouts,
+    TxnRequest, TxnStatus,
+};
 
 /// The ack journal's file name, inside the rDB folder.
 const JOURNAL: &str = "pilot_kv.journal";
+
+/// The exit code of a `--retry-for` put whose status answered `Expired` (A-R401 F5): too old to
+/// settle, so whether it landed is not known. Not 0, so a kit never reads it as "applied once".
+const EXPIRED: u8 = 6;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -54,10 +95,28 @@ struct Args {
     reopens: u64,
     verify: bool,
     bench: bool,
+    /// `--nodes`: the node processes to dial. Empty: all three copies in this process.
+    nodes: BTreeMap<u32, String>,
+    cert_dir: Option<PathBuf>,
+    app: String,
+    client_id: u32,
+    put: Option<(String, String)>,
+    get: Option<String>,
+    /// `--retry-for`: how long a `--put` with no answer is sent again. Zero: never.
+    retry_for: Duration,
+    /// `--request-id`: the app's own request number for `--put` (`app_request_id`).
+    request_id: Option<u64>,
 }
 
 const USAGE: &str = "usage: pilot_kv --dir D --control host:port[,host:port...] [--log-dir L] \
-                     [--ready-secs S] [--write N] [--reopens K] [--verify] [--bench]";
+                     [--ready-secs S] [--write N] [--reopens K] [--verify] [--bench] \
+                     [--nodes 1=ADDR,2=ADDR,3=ADDR --cert-dir C [--app NAME] [--client-id N]] \
+                     [--put KEY=VALUE [--request-id N] [--retry-for S]] [--get KEY]\n\
+                     exits: 0 done; 1 a write or read failed, or a retry still unsettled; \
+                     2 bad arguments or setup; 3 the folder or a link was refused; \
+                     4 --verify found a key missing or wrong; 5 not ready in time; \
+                     6 a retried put's status answered Expired: whether it landed is not \
+                     known, read the object";
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut dir = None;
@@ -68,6 +127,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut reopens = 0;
     let mut verify = false;
     let mut bench = false;
+    let mut nodes = BTreeMap::new();
+    let mut cert_dir = None;
+    let mut app = "pilot".to_owned();
+    let mut client_id = rdb_api::db::DEFAULT_CLIENT.0;
+    let mut put = None;
+    let mut get = None;
+    let mut retry_for = Duration::ZERO;
+    let mut request_id = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -103,12 +170,60 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--verify" => verify = true,
             "--bench" => bench = true,
+            "--nodes" => {
+                for pair in value("--nodes")?
+                    .split(',')
+                    .filter(|p| !p.trim().is_empty())
+                {
+                    let (n, addr) = pair
+                        .trim()
+                        .split_once('=')
+                        .ok_or_else(|| format!("--nodes: {pair:?} is not N=host:port"))?;
+                    let n = n
+                        .parse::<u32>()
+                        .map_err(|_| format!("--nodes: {n:?} is not a node number"))?;
+                    nodes.insert(n, addr.to_owned());
+                }
+            }
+            "--cert-dir" => cert_dir = Some(PathBuf::from(value("--cert-dir")?)),
+            "--app" => app = value("--app")?,
+            "--client-id" => {
+                let text = value("--client-id")?;
+                client_id = text
+                    .parse::<u32>()
+                    .map_err(|_| format!("--client-id takes a number, got {text}"))?;
+            }
+            "--put" => {
+                let text = value("--put")?;
+                let (k, v) = text
+                    .split_once('=')
+                    .ok_or_else(|| "--put takes KEY=VALUE".to_owned())?;
+                put = Some((k.to_owned(), v.to_owned()));
+            }
+            "--get" => get = Some(value("--get")?),
+            "--request-id" => {
+                let text = value("--request-id")?;
+                let n = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--request-id takes a number, got {text}"))?;
+                request_id = Some(n);
+            }
+            "--retry-for" => {
+                let text = value("--retry-for")?;
+                let secs = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--retry-for takes whole seconds, got {text}"))?;
+                retry_for = Duration::from_secs(secs);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
     let dir = dir.ok_or("--dir is required")?;
     if control.is_empty() {
         return Err("--control is required: the rEtcd client endpoints".to_owned());
+    }
+    if !nodes.is_empty() && cert_dir.is_none() {
+        return Err("--nodes needs --cert-dir: the run's certificates".to_owned());
     }
     let log_dir = log_dir.unwrap_or_else(|| {
         let mut name = dir.as_os_str().to_owned();
@@ -124,6 +239,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         reopens,
         verify,
         bench,
+        nodes,
+        cert_dir,
+        app,
+        client_id,
+        put,
+        get,
+        retry_for,
+        request_id,
     })
 }
 
@@ -321,12 +444,26 @@ fn run(args: &Args) -> ExitCode {
         }
     };
     let store: Arc<dyn ConfigStore> = Arc::new(client);
+    let (local, links) = if args.nodes.is_empty() {
+        (rdb_api::db::ALL_NODES.to_vec(), None)
+    } else {
+        match connect(&rt, args) {
+            Ok(links) => (Vec::new(), Some(links)),
+            Err(code) => return code,
+        }
+    };
     let config = DbConfig {
+        ack_floor: true,
         dir: args.dir.clone(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        local,
+        links,
+        client: ClientId(args.client_id),
+        boot: None,
+        storage: rdb_api::StorageOptions::default(),
     };
     tracing::info!(
         write = args.write,
@@ -352,8 +489,291 @@ fn run(args: &Args) -> ExitCode {
         };
     }
     let code = check_phase(&db, args);
+    if code != ExitCode::SUCCESS {
+        db.shutdown();
+        return code;
+    }
+    let code = point_phase(&db, args);
     db.shutdown();
     code
+}
+
+/// How long `--nodes` waits for every link before it goes on with those that are up (as
+/// `rdb_dev` does). Never longer than `--ready-secs`.
+const LINK_WAIT: Duration = Duration::from_secs(5);
+
+/// `--nodes`: links that dial every node as app `--app`, given up to [`LINK_WAIT`] to come up
+/// before the `Db` opens. Exit 2 when the certificates cannot be read or the links cannot
+/// start, 3 when a node refuses the handshake. A node that is not up is no failure (A-R299,
+/// tester-s2 F-T2): a dead owner is promoted away, and the open decides whether the nodes that
+/// are up can serve. Each such link is said, and keeps being redialled.
+fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, ExitCode> {
+    let label = Label::App(args.app.clone());
+    let cert_dir = args.cert_dir.as_deref().ok_or(ExitCode::from(2))?;
+    let tls = certs::load(cert_dir, &label).map_err(|error| {
+        eprintln!("pilot_kv: --cert-dir: {error}");
+        ExitCode::from(2)
+    })?;
+    let dial: BTreeMap<NodeId, String> = args
+        .nodes
+        .iter()
+        .map(|(n, addr)| (NodeId(*n), addr.clone()))
+        .collect();
+    let peers: Vec<NodeId> = dial.keys().copied().collect();
+    let links = Links::new();
+    let net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label,
+                boot: BootId(0),
+                tls,
+                peers: peers.iter().copied().collect(),
+                dial,
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+            },
+            &links,
+            None,
+        )
+        .map_err(|error| {
+            eprintln!("pilot_kv: links: {error}");
+            ExitCode::from(2)
+        })?
+    };
+    let started = std::time::Instant::now();
+    let waited = rt.block_on(net.wait_up(&peers, args.ready.min(LINK_WAIT)));
+    let lines = link_lines(&net.states()).map_err(|refused| {
+        let down = waited.err().unwrap_or(refused);
+        tracing::error!(%down, refused = true, "pilot_links_down");
+        // A refusal does not heal by waiting, so it ends the run at once.
+        println!(
+            "links down after {:.1}s: {down}",
+            started.elapsed().as_secs_f64()
+        );
+        ExitCode::from(3)
+    })?;
+    tracing::info!(links = ?lines, client = args.client_id, "pilot_links_up");
+    lines.iter().for_each(|line| println!("{line}"));
+    Ok(links)
+}
+
+/// What `--nodes` prints once the link wait ends: `link node=N down: <last dial error>` for
+/// each node that is not up, then `links up nodes=<the nodes that are>`. `Err` with the
+/// refusals when a node refused the handshake: that is the run's exit 3.
+fn link_lines(states: &BTreeMap<NodeId, LinkState>) -> Result<Vec<String>, String> {
+    let refused: Vec<String> = states
+        .iter()
+        .filter_map(|(node, state)| match state {
+            LinkState::Refused(why) => Some(format!("node {}: refused: {why}", node.0)),
+            _ => None,
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Err(refused.join("; "));
+    }
+    let mut lines: Vec<String> = states
+        .iter()
+        .filter_map(|(node, state)| match state {
+            LinkState::Waiting(why) => Some(format!(
+                "link node={} down: {}",
+                node.0,
+                why.as_deref().unwrap_or("not reached yet")
+            )),
+            _ => None,
+        })
+        .collect();
+    let up: Vec<String> = states
+        .iter()
+        .filter(|(_, state)| matches!(state, LinkState::Up(_)))
+        .map(|(node, _)| node.0.to_string())
+        .collect();
+    lines.push(format!("links up nodes={}", up.join(",")));
+    Ok(lines)
+}
+
+/// A status answer as one line: `resolved seq=<seq> outcome=<..>`, `unknown`, `expired`.
+fn status_line(status: &TxnStatus) -> String {
+    match status {
+        TxnStatus::Resolved(result) => format!(
+            "resolved seq={} outcome={}",
+            result.seq.0,
+            variant(&result.outcome)
+        ),
+        TxnStatus::Unresolved { seq } => format!("unresolved seq={}", seq.0),
+        TxnStatus::Unknown => "unknown".to_owned(),
+        TxnStatus::Expired => "expired".to_owned(),
+    }
+}
+
+/// `--retry-for`: send `request` again, same identity and payload, until it is answered or
+/// `within` passes. Prints `retry <i> <error>` for each refusal and `retry ok seq=..
+/// outcome=..` for the answer: `RecoveredApplied` says the first send had applied and this one
+/// applied nothing. A `GENERATION_CHANGED` refusal proves this send wrote nothing, so it is never
+/// sent again: the pilot asks `Db::status` with the generation it was sent under, as embed.md's
+/// "did my write land?" says (D5, A-R398). Exit 1 when it is still unanswered.
+fn retry(db: &Db, request: TxnRequest, within: Duration) -> Result<(), ExitCode> {
+    let (id, sent_in) = (request.identity.request, request.expected_generation);
+    settle(
+        within,
+        Duration::from_millis(500),
+        || db.resend_within(request.clone(), Duration::from_secs(10)),
+        || db.status(id, sent_in),
+        &mut |line| println!("{line}"),
+    )
+}
+
+/// [`retry`]'s loop over a resend and a status look, so a row can drive it without a cluster.
+/// `status_pause`: the wait between two status looks that settle nothing.
+fn settle(
+    within: Duration,
+    status_pause: Duration,
+    mut resend: impl FnMut() -> Result<PutOk, PutError>,
+    mut status: impl FnMut() -> Result<TxnStatus, ApiError>,
+    say: &mut dyn FnMut(String),
+) -> Result<(), ExitCode> {
+    let deadline = Instant::now() + within;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let error = match resend() {
+            Ok(ok) => {
+                let outcome = variant(&ok.outcome);
+                tracing::info!(attempt, seq = ok.seq.0, outcome, "pilot_retry_answered");
+                say(format!(
+                    "retry ok seq={} outcome={outcome} attempt={attempt}",
+                    ok.seq.0
+                ));
+                return Ok(());
+            }
+            Err(error) => error.error,
+        };
+        let name = error.name();
+        tracing::warn!(attempt, error = name, "pilot_retry_refused");
+        say(format!("retry {attempt} {}: {error}", name.to_lowercase()));
+        if error.kind == ErrorKind::GenerationChanged {
+            return settle_by_status(deadline, status_pause, &mut status, say);
+        }
+        if Instant::now() >= deadline {
+            return Err(ExitCode::from(1));
+        }
+        let pause = error.retry_after.unwrap_or(Duration::from_millis(500));
+        std::thread::sleep(pause.min(Duration::from_secs(2)));
+    }
+}
+
+/// After a `GENERATION_CHANGED`: ask `status` until it says what became of the request, never
+/// sending it again. Prints each answer as `status ...`, then `retry settled ...`.
+fn settle_by_status(
+    deadline: Instant,
+    pause: Duration,
+    status: &mut dyn FnMut() -> Result<TxnStatus, ApiError>,
+    say: &mut dyn FnMut(String),
+) -> Result<(), ExitCode> {
+    loop {
+        match status() {
+            Ok(answer) => {
+                say(format!("status {}", status_line(&answer)));
+                match answer {
+                    TxnStatus::Resolved(result) => {
+                        tracing::info!(seq = result.seq.0, "pilot_retry_settled");
+                        say(format!(
+                            "retry settled seq={} outcome={}: an earlier send applied it; nothing \
+                             was sent again",
+                            result.seq.0,
+                            variant(&result.outcome)
+                        ));
+                        return Ok(());
+                    }
+                    TxnStatus::Expired => {
+                        tracing::info!("pilot_retry_settled_expired");
+                        say(
+                            "retry settled expired: too old to settle; read the object to see \
+                             its value"
+                                .to_owned(),
+                        );
+                        return Err(ExitCode::from(EXPIRED));
+                    }
+                    TxnStatus::Unknown | TxnStatus::Unresolved { .. } => {}
+                }
+            }
+            Err(error) => say(format!("status {}: {error}", error.name().to_lowercase())),
+        }
+        if Instant::now() >= deadline {
+            say(
+                "retry unsettled: status did not say; it is not proof that nothing landed, so \
+                 read the object"
+                    .to_owned(),
+            );
+            return Err(ExitCode::from(1));
+        }
+        std::thread::sleep(pause);
+    }
+}
+
+/// `--put` then `--get`, each once. Exit 1 when either fails.
+fn point_phase(db: &Db, args: &Args) -> ExitCode {
+    if let Some((key, value)) = &args.put {
+        let sent = match args.request_id {
+            Some(n) => match rdb_api::app_request_id(n) {
+                Some(request) => db.put_as(request, key.as_bytes(), value.as_bytes(), None),
+                None => {
+                    println!("put failed: --request-id {n} is 2^63 or more");
+                    return ExitCode::from(2);
+                }
+            },
+            None => db.put(key.as_bytes(), value.as_bytes(), None),
+        };
+        match sent {
+            Ok(ok) => {
+                tracing::info!(seq = ok.seq.0, "pilot_put");
+                println!("put seq={} request={}", ok.seq.0, ok.request.0);
+            }
+            Err(PutError {
+                error,
+                request: Some(request),
+            }) => {
+                let name = error.name();
+                let id = request.identity.request.0;
+                tracing::warn!(error = name, request = id, "pilot_put_unanswered");
+                println!("put {} request={id}: {error}", name.to_lowercase());
+                match db.status(request.identity.request, None) {
+                    Ok(status) => println!("status {}", status_line(&status)),
+                    Err(error) => println!("status {}: {error}", error.name().to_lowercase()),
+                }
+                if args.retry_for.is_zero() {
+                    return ExitCode::from(1);
+                }
+                if let Err(code) = retry(db, *request, args.retry_for) {
+                    return code;
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error.error, "pilot_put_failed");
+                println!("put failed: {}", error.error);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if let Some(key) = &args.get {
+        match db.get(key.as_bytes()) {
+            Ok(got) => {
+                tracing::info!(present = got.value.is_some(), "pilot_get");
+                match got.value {
+                    Some((_, value)) => {
+                        println!("get value={}", String::from_utf8_lossy(&value));
+                    }
+                    None => println!("get absent"),
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "pilot_get_failed");
+                println!("get failed: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Open the folder and wait until node 1 admits writes. Prints `<label> ms=<open-to-ready>
@@ -393,7 +813,7 @@ fn open_ready(
             error @ (ReadyError::TimedOut { .. }
             | ReadyError::Stopped { .. }
             | ReadyError::Blocked { .. }
-            | ReadyError::Quarantined
+            | ReadyError::Quarantined { .. }
             | ReadyError::Faulted { .. }),
         ) => {
             tracing::error!(%error, "pilot_not_ready");
@@ -430,7 +850,13 @@ fn millis(duration: Duration) -> u64 {
 /// A last line a kill cut short is dropped first (PR #60 review F7): appended to, it and the
 /// first new line would make one malformed line, and the journal would no longer read back.
 /// Its put was acknowledged, but the line was never whole, so it was already left out.
+///
+/// It makes its own folder: an app-only open (`--nodes`) claims no folder, so nothing else
+/// makes `--dir`.
 fn open_journal(path: &Path, journal: &Journal) -> std::io::Result<File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     if journal.torn {
         // Through its own handle: on Windows an append-only one may not truncate.
         OpenOptions::new()
@@ -746,6 +1172,158 @@ mod tests {
         );
         assert!(parsed(&["--dir", "D", "--control", "c:1", "--reopens", "x"]).is_err());
         assert_eq!(args.log_dir, PathBuf::from("D.logs"));
+    }
+
+    /// M10 S2, found walking S2-8: with `--nodes` the Db claims no folder, so nothing made
+    /// `--dir` and the first journal line failed "cannot find the path". The journal makes its
+    /// own folder.
+    #[test]
+    fn the_journal_opens_in_a_folder_nothing_made_yet() {
+        let root = config_testkit::fs::temp_dir();
+        let path = root.path().join("not-yet").join(JOURNAL);
+        let mut file = open_journal(&path, &Journal::default()).expect("opens");
+        writeln!(file, "x").expect("writes");
+        assert!(path.is_file());
+    }
+
+    /// A-R299 (tester-s2 F-T2): a node that is down is said and the run goes on with the rest;
+    /// only a refused handshake ends it. Cut: a node not up is an `Err` again (the exit 5 seen
+    /// after `lr kill 1` and `lr promote 2`), and this goes red. Unit.
+    #[test]
+    fn a_node_that_is_down_is_said_and_the_run_goes_on_and_a_refusal_ends_it() {
+        let down = "nothing is listening at 127.0.0.1:18341 (connection refused)";
+        let states = BTreeMap::from([
+            (NodeId(1), LinkState::Waiting(Some(down.to_owned()))),
+            (NodeId(2), LinkState::Up(BootId(7))),
+            (NodeId(3), LinkState::Up(BootId(8))),
+        ]);
+        assert_eq!(
+            link_lines(&states),
+            Ok(vec![
+                format!("link node=1 down: {down}"),
+                "links up nodes=2,3".to_owned()
+            ])
+        );
+        let never = BTreeMap::from([(NodeId(2), LinkState::Waiting(None))]);
+        assert_eq!(
+            link_lines(&never),
+            Ok(vec![
+                "link node=2 down: not reached yet".to_owned(),
+                "links up nodes=".to_owned()
+            ])
+        );
+        let refused = BTreeMap::from([
+            (NodeId(1), LinkState::Refused("another CA".to_owned())),
+            (NodeId(2), LinkState::Up(BootId(7))),
+        ]);
+        assert_eq!(
+            link_lines(&refused),
+            Err("node 1: refused: another CA".to_owned())
+        );
+    }
+
+    /// M10 S2 (A-R226): `--nodes` names the node processes and needs the run's certificates;
+    /// `--client-id`, `--app`, `--put` and `--get` parse as given, and default to one client.
+    #[test]
+    fn node_process_arguments_parse_and_nodes_need_certificates() {
+        let parsed = |words: &[&str]| parse(words.iter().map(|word| (*word).to_owned()));
+        let base = ["--dir", "D", "--control", "c:1"];
+        let with = |extra: &[&str]| {
+            let mut words = base.to_vec();
+            words.extend_from_slice(extra);
+            parsed(&words)
+        };
+        assert_eq!(
+            with(&["--nodes", "1=a:1"]).expect_err("no certificates"),
+            "--nodes needs --cert-dir: the run's certificates"
+        );
+        let args = with(&[
+            "--nodes",
+            "1=127.0.0.1:41, 2=127.0.0.1:42,3=127.0.0.1:43",
+            "--cert-dir",
+            "C",
+            "--app",
+            "pilot-a",
+            "--client-id",
+            "7",
+            "--put",
+            "k=v=w",
+            "--request-id",
+            "5",
+            "--retry-for",
+            "30",
+            "--get",
+            "k",
+        ])
+        .expect("parses");
+        assert_eq!(
+            args.nodes.values().collect::<Vec<_>>(),
+            ["127.0.0.1:41", "127.0.0.1:42", "127.0.0.1:43"]
+        );
+        assert_eq!((args.app.as_str(), args.client_id), ("pilot-a", 7));
+        assert_eq!(args.put, Some(("k".to_owned(), "v=w".to_owned())));
+        assert_eq!(args.get.as_deref(), Some("k"));
+        assert_eq!(args.request_id, Some(5));
+        assert_eq!(args.retry_for, Duration::from_secs(30));
+        let local = with(&[]).expect("parses");
+        assert!(local.nodes.is_empty());
+        assert_eq!(local.client_id, rdb_api::db::DEFAULT_CLIENT.0);
+        assert_eq!((local.request_id, local.retry_for), (None, Duration::ZERO));
+        assert!(with(&["--retry-for", "soon"]).is_err());
+        assert!(with(&["--put", "novalue"]).is_err());
+        assert!(with(&["--nodes", "x=a:1", "--cert-dir", "C"]).is_err());
+    }
+
+    /// D5 (A-R398, arch-s2 S2-7 "a retry across a failover applies once"): an `UNAVAILABLE`
+    /// resend is sent again, but a `GENERATION_CHANGED` one never is. The pilot asks `status`
+    /// instead, until it says, as embed.md's "did my write land?" does. On the walk the pilot
+    /// resent 169 times and never asked. Cut: the `GENERATION_CHANGED` arm removed, so the third
+    /// resend panics here, red. `Expired` exits 6, never 0 (A-R401 F5); cut: it
+    /// answers `Ok` again, red. Unit (~20 ms): no `Db`.
+    #[test]
+    fn d5_a_generation_changed_resend_is_settled_by_status_and_never_sent_again() {
+        let mut resends = 0;
+        let mut looks = 0;
+        let mut lines = Vec::new();
+        let answer = settle(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                resends += 1;
+                let (kind, retry_after) = match resends {
+                    1 => (ErrorKind::Unavailable, Some(Duration::from_millis(1))),
+                    2 => (ErrorKind::GenerationChanged, None),
+                    n => panic!("resend {n} after GENERATION_CHANGED"),
+                };
+                let mut error = ApiError::new(kind, "refused");
+                error.retry_after = retry_after;
+                Err(PutError {
+                    error,
+                    request: None,
+                })
+            },
+            || {
+                looks += 1;
+                Ok(if looks == 1 {
+                    TxnStatus::Unknown
+                } else {
+                    TxnStatus::Expired
+                })
+            },
+            &mut |line| lines.push(line),
+        );
+        assert_eq!(answer, Err(ExitCode::from(EXPIRED)), "{lines:?}");
+        assert_eq!((resends, looks), (2, 2), "{lines:?}");
+        assert!(
+            lines[1].starts_with("retry 2 generation_changed"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[2..4],
+            ["status unknown", "status expired"],
+            "{lines:?}"
+        );
+        assert!(lines[4].starts_with("retry settled expired"), "{lines:?}");
     }
 
     /// The marked span of an example, as embed.md's code block for it must read.

@@ -382,9 +382,28 @@ impl RdbError {
     /// `ProtectionPaused` proves it although its retry rule is `RetryAfterRecovery` (M10 D4,
     /// lead ruling A-R180, ADR-rdb-0004 §5 amendment of 2026-10-22). Every paused refusal is made
     /// before apply: admission check 8, a freeze, or `LocalStorageFenced` at
-    /// `Boundary::PreApply`, which after apply is `UnknownOutcome` instead. Its classmates do not:
-    /// `LeaseExpired` is also what a deny after apply answers, and `DivergenceRequiresOperator`
-    /// keeps `false` by the same lead ruling.
+    /// `Boundary::PreApply`, which after apply is `UnknownOutcome` instead.
+    /// `DivergenceRequiresOperator` keeps `false` by the same lead ruling.
+    ///
+    /// `LeaseExpired` proves it too (M10 S2, lead ruling A-R342, ADR-rdb-0004 §5 amendment of
+    /// 2026-10-24), with the same retry rule. Every producer refuses before apply: admission's
+    /// authority check and freeze, the `StorageDispatch` check and its re-ask, and a refused read.
+    /// After apply every `DenyReason` answers `UnknownOutcome` instead
+    /// ([`crate::contracts::authority::DenyReason::client_error_kind`]).
+    ///
+    /// `RecoveryReadOnly` proves it too (M10 S2, lead ruling A-R401 F4, ADR-rdb-0004 §5 amendment
+    /// of 2026-10-24), with the same retry rule. Its one producer, `admission::freeze_error` of
+    /// `FreezeCause::RecoveryReadOnly`, answers only before apply: admission check 7, the frozen
+    /// queue's dispatch reply, an undispatched check, and a drain of the queue. A dispatched write
+    /// is kept, never answered with it (K-A-46).
+    ///
+    /// `GenerationChanged` proves it too (M10 S2, lead rulings A-R296 and A-R298, ADR-rdb-0004 §5
+    /// amendment of 2026-10-23), though its retry rule is `Reconcile`. Every producer refuses
+    /// before apply: admission checks 5 and 6, the `StorageDispatch` check, the dedup lookup of a
+    /// request an older generation retained (step 11, which never executes it), and a recovery
+    /// stranding the queue and an undispatched check. `DenyReason::GenerationChanged` after apply
+    /// answers `UnknownOutcome` instead. Its classmates `RequestIdReuse` and `StaleContinuation`
+    /// keep `false`.
     ///
     /// `true` says nothing about other sends of the same request identity (#35). Admission checks
     /// 1–10 run before the dedup lookup (ADR-rdb-0004 §3), so a resend of an identity that has
@@ -401,7 +420,13 @@ impl RdbError {
         matches!(
             self.retry_rule(),
             RetryRule::Definitive | RetryRule::BoundedJitter
-        ) || matches!(self, Self::ProtectionPaused { .. })
+        ) || matches!(
+            self,
+            Self::ProtectionPaused { .. }
+                | Self::GenerationChanged { .. }
+                | Self::LeaseExpired { .. }
+                | Self::RecoveryReadOnly { .. }
+        )
     }
 
     /// Which capability an [`Self::Unavailable`] names, or `None` for every other error.

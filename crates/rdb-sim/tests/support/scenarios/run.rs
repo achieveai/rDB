@@ -811,6 +811,8 @@ fn txn_request(submit: &ClientOp, digest_id: u64) -> TxnRequest {
                 expected_version: None,
             })
             .collect(),
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 
@@ -864,8 +866,9 @@ fn recovery_plan(
 /// Walked by hand on the A1/P1 case (2026-10-02). That leader commits the next generation, and
 /// the owner F1 picks (the selected copy's holder, not the leader) installs its lineage, but the
 /// generation never activates: the leader's rebuild hears no `SyncProven` after its commit, and
-/// a write in it is refused `RecoveryReadOnly`. Led by the owner instead, the run stops at R1's
-/// `CopyAheadOnControl`, which `harness::dispatch::deliver::kernel` still refuses (I1, owed).
+/// a write in it is refused `RecoveryReadOnly`. Led by the owner instead, the generation commits
+/// and activates, since the dispatcher consumes R1's `CopyAheadOnControl` (I1, `copy_ahead`)
+/// (W6b probe 2026-10-24, not pinned by a row).
 fn reinspect(
     plan: &RunPlan,
     state: &mut Lowering,

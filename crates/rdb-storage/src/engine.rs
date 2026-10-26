@@ -22,33 +22,136 @@
 //! experiment must copy the directory **before** any reopen (critic F3). [`dump`] opens
 //! read-only and does not flush.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
+use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, OwnerEpoch, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, DurablePrefix, Namespace, StorageFault};
 use rdb_core::replication::append::PROGRESS_KEY;
-use rdb_core::transaction::dedup::parse_dedup_value;
+use rdb_core::transaction::dedup::{
+    is_floor_record_id, parse_dedup_key, parse_dedup_value, FLOOR_AFFINITY,
+};
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction, IteratorMode, Options,
-    WriteBatch, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRecoveryMode, Direction,
+    IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 
 use rdb_core::contracts::trace::Version;
 
 use crate::keys::{
     self, decode_copying, decode_key, decode_mark, decode_publish_marks, decode_publish_marks_key,
-    encode_key, encode_publish_marks, frame, ns_byte, ns_from_byte, private_key, publish_marks_key,
-    tombstone, unframe, Frame, Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES,
-    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, PARENT_KEY,
+    decode_revoked, decode_revoked_key, encode_key, encode_publish_marks, encode_revoked, frame,
+    ns_byte, ns_from_byte, private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame,
+    Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES, COPYING_KEY, DURABLE_KEY,
+    FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY,
     PRIVATE_NS, SEALED_KEY,
 };
 
 /// The `tracing` target of every event this crate emits.
 pub(crate) const LOG_TARGET: &str = "rdb_storage";
+
+/// RocksDB 0.23's own memtable budget per column family, which an engine keeps when
+/// [`StorageOptions::write_buffer_bytes`] is `None` (64 MiB).
+pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 << 20;
+
+/// Engine options a caller may set at open (ruling A-R248). The default is the engine as
+/// pinned in code: every option `None` leaves RocksDB's own value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageOptions {
+    /// The memtable budget of each column family, in bytes (RocksDB's `write_buffer_size`):
+    /// a column family whose memtable reaches it switches to a new one and flushes the full
+    /// one to an SST. `None` keeps [`DEFAULT_WRITE_BUFFER_BYTES`].
+    pub write_buffer_bytes: Option<usize>,
+    /// The memtable budget of the whole store, every column family together, in bytes
+    /// (RocksDB's `db_write_buffer_size`, ruling A-R300). When the memtables reach about 7/8
+    /// of it, RocksDB switches the oldest one out and flushes it, so memtable memory stays near
+    /// the budget however long the writes go on. A write that finds the memtables at the budget
+    /// waits for a flush to free memory (A-R349), so a flush that lags under load slows writes
+    /// rather than letting memory grow past the budget. `None` keeps
+    /// [`DEFAULT_MEMTABLE_BUDGET_BYTES`] (64 MiB).
+    ///
+    /// It also caps two things that would otherwise outgrow it:
+    /// - each column family's own budget, which opens at the smaller of this and
+    ///   [`Self::write_buffer_bytes`]. One memtable bigger than the store's budget could never
+    ///   fill, and RocksDB sizes a memtable's allocation blocks from it.
+    /// - the WAL: `max_total_wal_size` is [`WAL_BUDGETS`] times this. A column family written
+    ///   rarely keeps its oldest WAL file alive; past that size RocksDB flushes it so the file
+    ///   can go. RocksDB's own limit is 4 times the sum of every column family's memtables.
+    pub memtable_budget_bytes: Option<usize>,
+    /// The block cache of the whole store, every column family together, in bytes (ruling
+    /// A-R315): one LRU cache that every column family's table reads share. `None` keeps
+    /// [`DEFAULT_BLOCK_CACHE_BYTES`] (64 MiB). Without it RocksDB gives each column family a
+    /// cache of its own, 32 MiB each, so the store's read cache grew with its column families.
+    pub block_cache_bytes: Option<usize>,
+    /// How long one WAL sync may stay in flight before the node that runs it faults, in
+    /// milliseconds (ruling A-R317). The engine does not read it; the host's syncer does. A
+    /// slow sync that returns inside it costs nothing but durable lag; one still running past
+    /// it is a stuck disk, and the node gives up its grant so another can take over. `None`
+    /// keeps [`DEFAULT_SYNC_STUCK_MILLIS`].
+    pub sync_stuck_millis: Option<u64>,
+}
+
+/// The default block cache of one store, all column families together (A-R315): 64 MiB.
+pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 << 20;
+
+/// The default of [`StorageOptions::sync_stuck_millis`] (A-R317): 5 s, about 1.7 times the
+/// slowest WAL sync measured under load (2,973 ms, lr6). A stuck disk then costs about 8 s
+/// before another node takes over: this, plus the 2.9 s the last renewed grant still lives.
+pub const DEFAULT_SYNC_STUCK_MILLIS: u64 = 5_000;
+
+/// The default memtable budget of one store, all column families together (A-R300): 64 MiB,
+/// one column family's worth at RocksDB's own size.
+pub const DEFAULT_MEMTABLE_BUDGET_BYTES: usize = 64 << 20;
+
+/// `max_total_wal_size` in memtable budgets (A-R300). Four is RocksDB's own ratio of WAL to
+/// memtable memory.
+pub const WAL_BUDGETS: u64 = 4;
+
+impl StorageOptions {
+    /// The memtable budget each column family is asked for, before the store's budget caps
+    /// it (see [`Self::effective_cf_write_buffer_bytes`]).
+    #[must_use]
+    pub fn effective_write_buffer_bytes(&self) -> usize {
+        self.write_buffer_bytes
+            .unwrap_or(DEFAULT_WRITE_BUFFER_BYTES)
+    }
+
+    /// The memtable budget of the whole store.
+    #[must_use]
+    pub fn effective_memtable_budget_bytes(&self) -> usize {
+        self.memtable_budget_bytes
+            .unwrap_or(DEFAULT_MEMTABLE_BUDGET_BYTES)
+    }
+
+    /// The memtable budget each column family opens with: the smaller of the two.
+    #[must_use]
+    pub fn effective_cf_write_buffer_bytes(&self) -> usize {
+        self.effective_write_buffer_bytes()
+            .min(self.effective_memtable_budget_bytes())
+    }
+
+    /// The block cache of the whole store.
+    #[must_use]
+    pub fn effective_block_cache_bytes(&self) -> usize {
+        self.block_cache_bytes.unwrap_or(DEFAULT_BLOCK_CACHE_BYTES)
+    }
+
+    /// The stuck-sync limit, in milliseconds: [`Self::sync_stuck_millis`] or its default.
+    #[must_use]
+    pub fn effective_sync_stuck_millis(&self) -> u64 {
+        self.sync_stuck_millis.unwrap_or(DEFAULT_SYNC_STUCK_MILLIS)
+    }
+
+    /// `max_total_wal_size`: [`WAL_BUDGETS`] memtable budgets.
+    #[must_use]
+    pub fn max_total_wal_bytes(&self) -> u64 {
+        WAL_BUDGETS.saturating_mul(self.effective_memtable_budget_bytes() as u64)
+    }
+}
 
 /// Why [`RocksEngine::open`] or [`dump`] refused a directory.
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +174,10 @@ pub enum OpenError {
         found: Vec<String>,
     },
     /// The format marker is missing from a non-empty directory, or names another format.
-    #[error("database at {path} has format {found:?}; this build reads only {FORMAT_VERSION}")]
+    #[error(
+        "database at {path} has format {found:?}; this build reads formats \
+         {OLDEST_FORMAT_VERSION} through {FORMAT_VERSION}"
+    )]
     Format {
         /// The directory.
         path: PathBuf,
@@ -120,6 +226,24 @@ pub enum OpenError {
     },
 }
 
+/// Why `RocksEngine::damage_record` (debug builds only, a dev tool) refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DamageRefused {
+    /// No value is stored at that key of that lineage: absent, a tombstone, or no bytes.
+    /// Nothing was written.
+    #[error("no stored value at key {key_hex} to damage")]
+    NoValue {
+        /// The physical key, hex.
+        key_hex: String,
+    },
+    /// RocksDB refused the read or the write.
+    #[error("damage write failed: {detail}")]
+    WriteFailed {
+        /// RocksDB's message.
+        detail: String,
+    },
+}
+
 /// Why [`RocksEngine::bind_instance`] refused. Nothing was written in either case.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
@@ -158,9 +282,12 @@ pub(crate) struct Marks {
 
 /// One core set's data engine on RocksDB.
 ///
-/// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). The write-order mutex is `&mut self`:
-/// a capture and its sync cannot interleave with a commit. When M9 adds IO workers it becomes a
-/// real `Mutex`.
+/// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). Every write and every capture goes
+/// through `&mut self`, so they are ordered. The WAL sync itself is not held under it (ruling
+/// A-R317, spec §6.1): [`Self::begin_sync`] fixes, under `&mut self`, what a sync may credit,
+/// [`WalSync::flush`] fsyncs the WAL files on any thread while commits go on, and
+/// [`Self::finish_sync`] moves the durable marks. A sync makes durable exactly the writes that
+/// returned before it began; a write made during it is durable only after the next one.
 ///
 /// A [`crate::RocksSnapshot`] shares the database (M10 decision 2): dropping the engine closes
 /// RocksDB and releases its `LOCK` and its directory claim only once every view taken from it
@@ -172,16 +299,30 @@ pub struct RocksEngine {
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
     /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
     instance: Option<[u8; INSTANCE_LEN]>,
+    /// The format marker on disk: [`FORMAT_VERSION`], or [`OLDEST_FORMAT_VERSION`] until the
+    /// first epoch revocation moves it.
+    format: u32,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
     /// The lock on the directory's [`CLAIM_FILE`] (lead ruling A-R168); `None` on a read-only
     /// open. Every view holds a clone, so the claim outlives the last handle on `db`.
     pub(crate) claim: Option<Arc<File>>,
     /// A-R214: RocksDB's latest sequence number when the WAL was last known synced through
-    /// it: read just before a `flush_wal(true)` that succeeded, or just after a synced write.
+    /// it: read when a WAL sync that succeeded began, or just after a synced write.
     /// `None` until then, so a fresh open counts as unsynced. A write after it, synced or not,
-    /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`].
+    /// moves the latest sequence past it; see [`Self::wal_synced_through_latest`]. It never
+    /// moves backwards (A-R317): a sync that began before a synced write ends after it.
     synced_seq: Option<u64>,
+    /// The options this engine was opened with; the host reads
+    /// [`StorageOptions::sync_stuck_millis`] from them.
+    storage: StorageOptions,
+    /// A-R317: a sync [`Self::begin_sync`] began and [`Self::finish_sync`] has not finished.
+    /// A synced write, or another sync, begun meanwhile would wait on that fsync inside
+    /// RocksDB, on the caller's thread: each logs an error instead of passing silently.
+    sync_in_flight: bool,
+    /// How many times a [`WalSync::flush`] synced the WAL files through its own handles
+    /// (A-R365): RocksDB's `rocksdb.wal.synced` does not see those, so [`Self::wal_syncs`] adds them.
+    wal_flushes: Arc<AtomicU64>,
     /// Debug builds: the options a writable open used, kept for their WAL-sync counter
     /// ([`Self::wal_syncs`]); `None` on a read-only open.
     #[cfg(debug_assertions)]
@@ -196,7 +337,7 @@ pub struct RocksEngine {
 pub enum InjectedFault {
     /// The next [`RocksEngine::commit`]'s write: nothing of the batch is applied.
     Commit,
-    /// The next [`RocksEngine::sync_wal_through`]'s `flush_wal(true)`: no watermark moves.
+    /// The next WAL sync's fsync ([`WalSync::flush`]): no watermark moves.
     WalFlush,
     /// The next [`RocksEngine::sync_wal_through`]'s durable-mark write, after the WAL sync
     /// succeeded: the disk state a crash between the two leaves.
@@ -208,8 +349,8 @@ pub enum InjectedFault {
     /// switch or a copy with no keys.
     CopyBatch,
     /// The next synced metadata put ([`RocksEngine::bind_instance`],
-    /// [`RocksEngine::put_publish_marks`]): nothing is written and nothing counts as synced
-    /// (review-s1 F-008). Not reached by a bind of the id the copy already holds.
+    /// [`RocksEngine::put_publish_marks`], [`RocksEngine::persist_epoch_revocation`]): nothing is
+    /// written and nothing counts as synced (review-s1 F-008). Not reached by a bind of the id the copy already holds.
     SyncedPut,
 }
 
@@ -226,6 +367,128 @@ impl InjectedFault {
             Self::CopyBatch => "copy-batch",
             Self::SyncedPut => "synced-put",
         }
+    }
+}
+
+/// One WAL sync, begun by [`RocksEngine::begin_sync`] (ruling A-R317). It holds what that
+/// sync may credit, fixed when it began, and the database directory, so [`Self::flush`] can
+/// run on another thread while the engine's owner goes on committing. Hand it back to
+/// [`RocksEngine::finish_sync`] to move the durable marks.
+pub struct WalSync {
+    /// Kept so the database outlives this sync even if its engine drops first.
+    _db: Arc<DB>,
+    /// The directory claim, held while `_db` is (A-R168): a sync that outlives its engine, as
+    /// on a node-thread panic, must not let another open take the directory under it. Declared
+    /// after `_db`, so it drops after it.
+    _claim: Option<Arc<File>>,
+    /// The database directory, where RocksDB keeps its WAL files.
+    dir: PathBuf,
+    /// The engine's count of WAL syncs made here ([`RocksEngine::wal_syncs`]).
+    flushes: Arc<AtomicU64>,
+    /// RocksDB's latest sequence number when the sync began (A-R214).
+    latest: u64,
+    /// Set when an armed [`InjectedFault::WalFlush`] fired at the start: the fsync fails with
+    /// this, without touching a file.
+    failed: Option<String>,
+    captured: Vec<CapturedPrefix>,
+    /// Per capture, in order: the most it may be credited, `min(captured, applied)` at the
+    /// start; `None` for a lineage the engine did not hold then.
+    credits: Vec<Option<u64>>,
+    /// Ancestor levels an inherited capture reads through, each with the most it may be
+    /// credited: its link's base, and the level's applied mark, at the start.
+    ancestors: Vec<((PartitionId, Generation), u64)>,
+}
+
+impl WalSync {
+    /// The fsync of every live WAL file. Blocks for as long as the disk takes, and takes no
+    /// engine lock, so commits on the engine's own thread go on meanwhile.
+    ///
+    /// Each file is synced through a handle of its own, never RocksDB's (critic-f4 P1, A-R365).
+    /// RocksDB opens its WAL as a synchronous handle, and Windows serializes all I/O on one
+    /// synchronous file object, so `flush_wal(true)` (`FlushFileBuffers` on RocksDB's handle)
+    /// held every commit's `WriteFile` for the whole fsync: measured 69 ms and 96 ms waits, one per
+    /// fsync. A second handle is a second file object, and its flush still writes the file's
+    /// cached data, so commits go on. Measured (A-R373 D1): after 1 GiB written through one
+    /// handle, a flush through another took 422-478 ms and the writer's own flush then 0.1-4.6 ms.
+    /// Nothing is buffered inside RocksDB: without `manual_wal_flush` each commit reaches the OS
+    /// before it returns.
+    ///
+    /// # Errors
+    ///
+    /// The file system's error naming the file or directory, the injected fault's, or no WAL
+    /// file found in two listings.
+    pub fn flush(&self) -> Result<(), String> {
+        if let Some(failed) = &self.failed {
+            return Err(failed.clone());
+        }
+        // A listing can fall between RocksDB creating the next WAL and deleting the last one
+        // and see neither, and a WAL RocksDB is deleting refuses an open with access denied.
+        // Both are passing states, so list once more before calling either a fault; on that
+        // last pass a refused open fails the sync (critic-f4, A-R373).
+        let (mut synced, refused) = self.sync_wal_files(false)?;
+        if synced == 0 || refused {
+            (synced, _) = self.sync_wal_files(true)?;
+        }
+        if synced == 0 {
+            return Err(format!("no WAL file to sync in {}", self.dir.display()));
+        }
+        // RocksDB's own sync also fsyncs the WAL directory once a new WAL exists, so the new
+        // file's entry survives a power cut. On Linux that is a real step; RocksDB's Windows
+        // env makes it a no-op (`WinDirectory::Fsync` returns OK), and Windows cannot open a
+        // directory as a `File`. So sync it wherever the OS can (A-R373).
+        // Never executed on this host; the first Linux gate owes a row (achieveai/rDB#71).
+        if cfg!(unix) {
+            std::fs::File::open(&self.dir)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| format!("sync the WAL directory {}: {e}", self.dir.display()))?;
+        }
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Lists the directory and fsyncs each `*.log` through a handle of its own. Returns how
+    /// many it synced, and whether it skipped one whose open was refused (access denied, as
+    /// for a WAL being deleted). On the `last` pass a refused open is an error instead.
+    fn sync_wal_files(&self, last: bool) -> Result<(usize, bool), String> {
+        let entries = std::fs::read_dir(&self.dir)
+            .map_err(|e| format!("list the WAL files in {}: {e}", self.dir.display()))?;
+        let mut synced = 0;
+        let mut refused = false;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| format!("list the WAL files in {}: {e}", self.dir.display()))?
+                .path();
+            if path.extension().is_none_or(|ext| ext != "log") {
+                continue;
+            }
+            // Opened for write so the flush may run, never created or truncated. A WAL that
+            // RocksDB deleted since the listing held nothing unflushed: skip it.
+            let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && !last => {
+                    refused = true;
+                    continue;
+                }
+                Err(e) => return Err(format!("open WAL {} to sync it: {e}", path.display())),
+            };
+            file.sync_all()
+                .map_err(|e| format!("sync WAL {}: {e}", path.display()))?;
+            synced += 1;
+        }
+        Ok((synced, refused))
+    }
+}
+
+impl std::fmt::Debug for WalSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalSync")
+            .field("latest", &self.latest)
+            .field("failed", &self.failed)
+            .field("captured", &self.captured)
+            .field("credits", &self.credits)
+            .field("ancestors", &self.ancestors)
+            .finish_non_exhaustive()
     }
 }
 
@@ -256,14 +519,16 @@ impl RocksEngine {
         self.injected
     }
 
-    /// Debug builds only: how many times RocksDB has synced this engine's WAL since it opened,
-    /// by its own count (`rocksdb.wal.synced`). A synced write adds one; an unsynced write adds
-    /// none (review-s1 F-008). Zero on a read-only open.
+    /// Debug builds only: how many times this engine's WAL has been synced since it opened:
+    /// RocksDB's own count (`rocksdb.wal.synced`), which a synced write adds one to and an
+    /// unsynced write none (review-s1 F-008), plus each [`WalSync::flush`] that synced the WAL
+    /// files through its own handles (A-R365). Zero on a read-only open.
     #[cfg(debug_assertions)]
     #[must_use]
     pub fn wal_syncs(&self) -> u64 {
         self.options.as_ref().map_or(0, |options| {
             options.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced)
+                + self.wal_flushes.load(Ordering::Relaxed)
         })
     }
 
@@ -271,14 +536,44 @@ impl RocksEngine {
     /// only once it returns `Ok` does [`Self::wal_synced_through_latest`] count it, so the
     /// flush duty may skip its next fsync. Fault point [`InjectedFault::SyncedPut`].
     fn put_metadata_synced(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.put_metadata_synced_all(&[(key, value)])
+    }
+
+    /// [`Self::put_metadata_synced`] for several keys in one atomic batch: all land or none.
+    fn put_metadata_synced_all(&mut self, puts: &[(&[u8], &[u8])]) -> Result<(), String> {
+        self.put_metadata_all(puts, true)
+    }
+
+    /// [`Self::put_metadata_synced_all`], or with `sync` off the same batch staged: written to
+    /// the WAL unsynced, so it is durable only after the next WAL sync that begins after it
+    /// returns (A-R317), and [`Self::wal_synced_through_latest`] is `false` until then. The
+    /// staged form exists so a node's thread never waits on an fsync for these keys: its
+    /// syncer's next sync carries them. Fault point [`InjectedFault::SyncedPut`] either way.
+    fn put_metadata_all(&mut self, puts: &[(&[u8], &[u8])], sync: bool) -> Result<(), String> {
         self.fire(InjectedFault::SyncedPut)?;
+        if sync {
+            self.note_synced_write("metadata");
+        }
         let mut opts = WriteOptions::default();
-        opts.set_sync(true);
-        self.db
-            .put_cf_opt(self.cf(CF_METADATA), key, value, &opts)
-            .map_err(|e| e.to_string())?;
-        self.synced_seq = Some(self.db.latest_sequence_number());
+        opts.set_sync(sync);
+        let mut write = WriteBatch::default();
+        for (key, value) in puts {
+            write.put_cf(self.cf(CF_METADATA), key, value);
+        }
+        self.db.write_opt(write, &opts).map_err(|e| e.to_string())?;
+        if sync {
+            self.synced_seq = Some(self.db.latest_sequence_number());
+        }
         Ok(())
+    }
+
+    /// A-R317: log `synced_write_during_sync` when a synced write named `what` starts while a
+    /// sync is in flight. RocksDB makes such a write wait for that fsync on the caller's
+    /// thread, which on a node's thread is the stall F4 removes, so it is loud, never silent.
+    fn note_synced_write(&self, what: &'static str) {
+        if self.sync_in_flight {
+            tracing::error!(target: LOG_TARGET, what, "synced_write_during_sync");
+        }
     }
 
     /// `Err` once, if [`Self::inject_fault`] armed `at`. The `fault_injected` line is
@@ -301,7 +596,19 @@ impl RocksEngine {
     ///
     /// [`OpenError::NoDatabase`] when `path` holds no database, else as [`Self::open`].
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf(), true).map_err(refused)
+        Self::open_existing_with(path, StorageOptions::default())
+    }
+
+    /// [`Self::open_existing`] with `options` (ruling A-R248).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_existing`].
+    pub fn open_existing_with(
+        path: impl AsRef<Path>,
+        options: StorageOptions,
+    ) -> Result<Self, OpenError> {
+        Self::open_inner(path.as_ref().to_path_buf(), true, options).map_err(refused)
     }
 
     /// Open, or create, the engine at `path`.
@@ -317,34 +624,66 @@ impl RocksEngine {
     ///
     /// An [`OpenError`] naming the refusal.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        Self::open_inner(path.as_ref().to_path_buf(), false).map_err(refused)
+        Self::open_with(path, StorageOptions::default())
+    }
+
+    /// [`Self::open`] with `options` (ruling A-R248).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`].
+    pub fn open_with(path: impl AsRef<Path>, options: StorageOptions) -> Result<Self, OpenError> {
+        Self::open_inner(path.as_ref().to_path_buf(), false, options).map_err(refused)
     }
 
     /// The claim comes first, before any read of the directory (lead ruling A-R168). Without it
     /// a racing loser's read-only checks met the winner's `LOG`, or a copy it had not finished
     /// creating, and the loser was told `Backend` instead of `Locked`. RocksDB's `LOCK` stays as
     /// the second line.
-    fn open_inner(path: PathBuf, must_exist: bool) -> Result<Self, OpenError> {
+    fn open_inner(
+        path: PathBuf,
+        must_exist: bool,
+        storage: StorageOptions,
+    ) -> Result<Self, OpenError> {
         if must_exist && !path.is_dir() {
             return Err(OpenError::NoDatabase { path });
         }
+        let mut steps = OpenSteps::start(&path);
         let claim = claim(&path)?;
+        steps.done("claim");
         let existed = path.join("CURRENT").exists();
         if must_exist && !existed {
             return Err(OpenError::NoDatabase { path });
         }
         if existed {
             verify_column_families(&path)?;
+            steps.done("verify_column_families");
             // S1-P1: decide every refusal on a read-only open, which writes no file. A writable
             // open replays, flushes and rotates before the marker can be read.
             read_only(&path)?;
+            steps.done("read_only_open");
         }
-        let options = db_options(!existed);
-        let db = DB::open_cf_descriptors(&options, &path, descriptors())
+        // A-R315: one block cache for the store, shared by every column family.
+        let cache = Cache::new_lru_cache(storage.effective_block_cache_bytes());
+        let mut options = db_options(!existed, storage);
+        // A-R349: `db_write_buffer_size` alone only asks for a flush; under load the flushes lag
+        // and the memtables outgrew the budget (4.3 MiB on a 1 MiB budget). A manager that
+        // stalls makes it a bound: a write that finds the memtables at the budget waits for a
+        // flush to free memory.
+        options.set_write_buffer_manager(&WriteBufferManager::new_write_buffer_manager(
+            storage.effective_memtable_budget_bytes(),
+            true,
+        ));
+        steps.done("options");
+        let db = DB::open_cf_descriptors(&options, &path, descriptors(storage, &cache))
             .map_err(|e| backend(&path, &e))?;
-        let created = ensure_format(&db, &path, existed)?;
+        steps.done("db_open");
+        let (created, format) = ensure_format(&db, &path, existed)?;
+        steps.done("ensure_format");
         let instance = read_instance(&db, &path)?;
+        steps.done("read_instance");
         let lineages = restore_lineages(&db, &path)?;
+        steps.done("restore_lineages");
         for (&(partition, generation), marks) in &lineages {
             tracing::info!(
                 target: LOG_TARGET,
@@ -359,13 +698,22 @@ impl RocksEngine {
             );
         }
         check_marks(&lineages)?;
+        steps.done("check_marks");
+        steps.finish();
         tracing::info!(
             target: LOG_TARGET,
             path = %path.display(),
             format_version = FORMAT_VERSION,
+            format,
             created,
             lineages = lineages.len(),
             instance_hex = instance.map(|id| hex(&id)),
+            // What the caller asked RocksDB for, not a size RocksDB reports back (A-R253).
+            write_buffer_bytes_asked = storage.effective_write_buffer_bytes(),
+            memtable_budget_bytes = storage.effective_memtable_budget_bytes(),
+            cf_write_buffer_bytes = storage.effective_cf_write_buffer_bytes(),
+            max_total_wal_bytes = storage.max_total_wal_bytes(),
+            block_cache_bytes = storage.effective_block_cache_bytes(),
             "storage_open"
         );
         Ok(Self {
@@ -373,9 +721,13 @@ impl RocksEngine {
             path,
             lineages,
             instance,
+            format,
             injected: None,
             claim: Some(Arc::new(claim)),
             synced_seq: None,
+            storage,
+            sync_in_flight: false,
+            wal_flushes: Arc::default(),
             #[cfg(debug_assertions)]
             options: Some(options),
         })
@@ -398,12 +750,13 @@ impl RocksEngine {
         } else {
             Err(OpenError::NoDatabase { path: path.clone() })
         };
-        let (db, lineages) = opened.map_err(refused)?;
+        let (db, lineages, format) = opened.map_err(refused)?;
         let instance = read_instance(&db, &path).map_err(refused)?;
         tracing::info!(
             target: LOG_TARGET,
             path = %path.display(),
             format_version = FORMAT_VERSION,
+            format,
             lineages = lineages.len(),
             instance_hex = instance.map(|id| hex(&id)),
             "storage_open_read_only"
@@ -413,16 +766,20 @@ impl RocksEngine {
             path,
             lineages,
             instance,
+            format,
             injected: None,
             claim: None,
             synced_seq: None,
+            storage: StorageOptions::default(),
+            sync_in_flight: false,
+            wal_flushes: Arc::default(),
             #[cfg(debug_assertions)]
             options: None,
         })
     }
 
     /// A-R214: whether every write so far is synced: no write, synced or not, since the last
-    /// `flush_wal(true)` that succeeded or the last synced write. `false` on a fresh open. A
+    /// WAL sync that succeeded or the last synced write. `false` on a fresh open. A
     /// caller that finds every durable mark at its applied mark still syncs when this is
     /// `false`, because an unsynced write that raises no applied mark (a dedup delete, an
     /// inherit at base 0, a durable-mark write) lives only in the OS cache until a sync.
@@ -431,10 +788,115 @@ impl RocksEngine {
         self.synced_seq == Some(self.db.latest_sequence_number())
     }
 
+    /// What column family `cf`'s active memtable holds, as `(bytes, entries)`: RocksDB's
+    /// `rocksdb.cur-size-active-mem-table` and `rocksdb.num-entries-active-mem-table`. A
+    /// memtable that reached [`StorageOptions::write_buffer_bytes`] was switched out for a
+    /// flush, so its entries no longer count here (A-R248).
+    ///
+    /// # Errors
+    ///
+    /// When `cf` is not one of [`COLUMN_FAMILIES`], or RocksDB cannot answer.
+    pub fn active_memtable(&self, cf: &str) -> Result<(u64, u64), String> {
+        let handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| format!("no column family {cf}"))?;
+        let read = |property: &str| {
+            self.db
+                .property_int_value_cf(handle, property)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("RocksDB has no {property} for {cf}"))
+        };
+        Ok((
+            read("rocksdb.cur-size-active-mem-table")?,
+            read("rocksdb.num-entries-active-mem-table")?,
+        ))
+    }
+
+    /// Memtable bytes of the whole store: RocksDB's `rocksdb.cur-size-all-mem-tables` (active
+    /// and not yet flushed) summed over [`COLUMN_FAMILIES`] and RocksDB's `default`. This is
+    /// what [`StorageOptions::memtable_budget_bytes`] bounds (A-R300).
+    ///
+    /// # Errors
+    ///
+    /// When RocksDB cannot answer for a column family.
+    pub fn memtable_bytes(&self) -> Result<u64, String> {
+        const PROPERTY: &str = "rocksdb.cur-size-all-mem-tables";
+        let mut total = self
+            .db
+            .property_int_value(PROPERTY)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("RocksDB has no {PROPERTY} for default"))?;
+        for cf in COLUMN_FAMILIES {
+            let handle = self
+                .db
+                .cf_handle(cf)
+                .ok_or_else(|| format!("no column family {cf}"))?;
+            total += self
+                .db
+                .property_int_value_cf(handle, PROPERTY)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("RocksDB has no {PROPERTY} for {cf}"))?;
+        }
+        Ok(total)
+    }
+
+    /// The block caches the store reads through, as `(capacity, usage)` in bytes, each cache
+    /// counted once (A-R315). Every column family and RocksDB's `default` is asked for its
+    /// cache's id (`rocksdb.block-cache-entry-stats`), capacity and usage; column families
+    /// that share a cache report the same id. So a store with one shared cache answers that
+    /// cache's numbers, and one with a cache per column family answers their sum.
+    ///
+    /// # Errors
+    ///
+    /// When RocksDB cannot answer for a column family, or its entry stats name no cache.
+    pub fn block_cache(&self) -> Result<(u64, u64), String> {
+        let mut caches = BTreeMap::new();
+        for cf in std::iter::once("default").chain(COLUMN_FAMILIES) {
+            let handle = self
+                .db
+                .cf_handle(cf)
+                .ok_or_else(|| format!("no column family {cf}"))?;
+            let int = |property: &str| {
+                self.db
+                    .property_int_value_cf(handle, property)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("RocksDB has no {property} for {cf}"))
+            };
+            let stats = self
+                .db
+                .property_value_cf(handle, "rocksdb.block-cache-entry-stats")
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("RocksDB has no block cache entry stats for {cf}"))?;
+            // "Block cache <id> capacity: ..." (RocksDB's `CacheEntryRoleStats::ToString`).
+            let id = stats
+                .strip_prefix("Block cache ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .ok_or_else(|| format!("no cache id in {cf}'s entry stats: {stats}"))?
+                .to_owned();
+            caches.insert(
+                id,
+                (
+                    int("rocksdb.block-cache-capacity")?,
+                    int("rocksdb.block-cache-usage")?,
+                ),
+            );
+        }
+        Ok(caches
+            .values()
+            .fold((0, 0), |(cap, used), (c, u)| (cap + c, used + u)))
+    }
+
     /// The directory this engine is open on.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The options this engine was opened with; the defaults on a read-only open.
+    #[must_use]
+    pub const fn storage_options(&self) -> StorageOptions {
+        self.storage
     }
 
     /// Every lineage the engine holds, in `(partition, generation)` order.
@@ -496,8 +958,33 @@ impl RocksEngine {
         partition: PartitionId,
         marks: &[PublishMark],
     ) -> Result<(), StorageFault> {
-        let written =
-            self.put_metadata_synced(&publish_marks_key(partition), &encode_publish_marks(marks));
+        self.write_publish_marks(partition, marks, true)
+    }
+
+    /// [`Self::put_publish_marks`] staged, not synced (A-R317): durable only after the next WAL
+    /// sync that begins after it returns. A node's thread writes its periodic marks this way, so
+    /// it never waits on an fsync for them; a lost or late mark only frees less (A-R183).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_publish_marks`].
+    pub fn stage_publish_marks(
+        &mut self,
+        partition: PartitionId,
+        marks: &[PublishMark],
+    ) -> Result<(), StorageFault> {
+        self.write_publish_marks(partition, marks, false)
+    }
+
+    fn write_publish_marks(
+        &mut self,
+        partition: PartitionId,
+        marks: &[PublishMark],
+        sync: bool,
+    ) -> Result<(), StorageFault> {
+        let key = publish_marks_key(partition);
+        let value = encode_publish_marks(marks);
+        let written = self.put_metadata_all(&[(&key, &value)], sync);
         if let Err(e) = written {
             tracing::error!(
                 target: LOG_TARGET,
@@ -546,6 +1033,233 @@ impl RocksEngine {
                 partition = partition.0,
                 len = raw.len(),
                 "publish_marks_undecodable"
+            );
+            StorageFault::Corrupt
+        })
+    }
+
+    /// Record that this node never serves `epoch` of `partition` again, with a synced write,
+    /// before this returns `Ok` (spec §7.3 step 2; A1's `StoreEffect::PersistEpochRevocation`).
+    /// Adds to the epochs already revoked; revoking one again writes the same set. On a
+    /// format-1 copy the same batch moves the marker to [`FORMAT_VERSION`], so a format-1 build
+    /// refuses the copy from then on instead of opening it blind to the revocation.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when the epochs already stored cannot be read;
+    /// [`StorageFault::WriteFailed`] when RocksDB refuses the write. Either way nothing is
+    /// written and the revocation does not count.
+    pub fn persist_epoch_revocation(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+    ) -> Result<(), StorageFault> {
+        self.write_epoch_revocation(partition, epoch, true)
+    }
+
+    /// [`Self::persist_epoch_revocation`] staged, not synced (A-R317): the revocation is durable
+    /// only after the next WAL sync that begins after this returns, and does not count until
+    /// then. The host stages it on the node's thread and tells A1 it is persisted only when its
+    /// syncer's next sync returns, so the thread never waits on that fsync.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::persist_epoch_revocation`].
+    pub fn stage_epoch_revocation(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+    ) -> Result<(), StorageFault> {
+        self.write_epoch_revocation(partition, epoch, false)
+    }
+
+    fn write_epoch_revocation(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        sync: bool,
+    ) -> Result<(), StorageFault> {
+        let mut epochs = self.revoked(partition)?.unwrap_or_default();
+        epochs.insert(epoch);
+        let key = revoked_key(partition);
+        let value = encode_revoked(&epochs);
+        let marker = FORMAT_VERSION.to_be_bytes();
+        let mut puts: Vec<(&[u8], &[u8])> = vec![(&key, &value)];
+        if self.format < FORMAT_VERSION {
+            puts.push((FORMAT_KEY, &marker));
+        }
+        if let Err(e) = self.put_metadata_all(&puts, sync) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                epoch = epoch.0,
+                error = %e,
+                "epoch_revocation_write_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let from_format = self.format;
+        self.format = FORMAT_VERSION;
+        // A staged write is not persisted until a sync returns, so it logs its own name: the
+        // host logs `epoch_revocation_persisted` only then (critic-f4 A3).
+        if sync {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                epoch = epoch.0,
+                revoked = epochs.len(),
+                from_format,
+                format = self.format,
+                "epoch_revocation_persisted"
+            );
+        } else {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                epoch = epoch.0,
+                revoked = epochs.len(),
+                from_format,
+                format = self.format,
+                "epoch_revocation_written_unsynced"
+            );
+        }
+        Ok(())
+    }
+
+    /// Every epoch revocation this copy holds, by partition then epoch, for the host to replay
+    /// to A1 at start (`AuthorityEvent::EpochRevocationRestored`). Empty on a copy that holds
+    /// none, as on any format-1 copy.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when a read fails or a stored value is not whole epochs. Never
+    /// a shorter list in its place: a revocation that cannot be read is not "not revoked".
+    pub fn epoch_revocations(&self) -> Result<Vec<(PartitionId, OwnerEpoch)>, StorageFault> {
+        let mut out = Vec::new();
+        let start = IteratorMode::From(keys::REVOKED_PREFIX, Direction::Forward);
+        for item in self.db.iterator_cf(self.cf(CF_METADATA), start) {
+            let (key, value) = item.map_err(|e| {
+                tracing::error!(target: LOG_TARGET, error = %e, "epoch_revocations_read_failed");
+                StorageFault::Corrupt
+            })?;
+            if !key.starts_with(keys::REVOKED_PREFIX) {
+                break;
+            }
+            // A lineage-scoped key can start with these bytes too (partition "revo", a
+            // generation starting "ked"). It is that lineage's, not a revocation: open reads it
+            // as a lineage key first, and so does this scan.
+            if decode_key(&key).is_some() {
+                continue;
+            }
+            let Some(partition) = decode_revoked_key(&key) else {
+                // Open refuses an undefined short key, so this is not reached on a copy open
+                // accepted. Kept: a short key that is not a revocation is never read as none.
+                tracing::error!(
+                    target: LOG_TARGET,
+                    key_hex = hex(&key),
+                    "epoch_revocation_key_undecodable"
+                );
+                return Err(StorageFault::Corrupt);
+            };
+            let epochs = Self::decode_epochs(partition, &value)?;
+            out.extend(epochs.into_iter().map(|epoch| (partition, epoch)));
+        }
+        Ok(out)
+    }
+
+    /// `partition`'s revoked epochs; `None` when it has none.
+    fn revoked(
+        &self,
+        partition: PartitionId,
+    ) -> Result<Option<BTreeSet<OwnerEpoch>>, StorageFault> {
+        let raw = self
+            .db
+            .get_cf(self.cf(CF_METADATA), revoked_key(partition))
+            .map_err(|e| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    error = %e,
+                    "epoch_revocations_read_failed"
+                );
+                StorageFault::Corrupt
+            })?;
+        raw.map(|raw| Self::decode_epochs(partition, &raw))
+            .transpose()
+    }
+
+    /// **Dev tool only** (M10 S2, ruling A-R230; `rdb_dev admin damage-copy`). Flip every bit of
+    /// the last byte of the value stored at `key` in `ns` of lineage `(partition, generation)`,
+    /// in **this copy only**, with a synced write, so the next read of it fails its own check:
+    /// a `History` record (key: the seq, u64 BE) fails [`crate::verify_lineage`] at that seq, and
+    /// a sealed value fails its envelope digest (`CORRUPT_HISTORY`). The frame and version stay,
+    /// so the record still reads as a value. Nothing is replicated: the other copies keep the
+    /// good record. Reads only this lineage's own key, never through the chain. Debug builds
+    /// only, like [`Self::inject_fault`]; the product never calls it.
+    ///
+    /// # Errors
+    ///
+    /// [`DamageRefused::NoValue`] when no value is stored there (absent, a tombstone, or a
+    /// value with no bytes): nothing is written. [`DamageRefused::WriteFailed`] when RocksDB
+    /// refuses the write.
+    #[cfg(debug_assertions)]
+    pub fn damage_record(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: &[u8],
+    ) -> Result<(), DamageRefused> {
+        let raw = encode_key(partition, generation, ns, key);
+        let cf = self.cf(keys::cf_for(ns));
+        let found = self
+            .db
+            .get_cf(cf, &raw)
+            .map_err(|e| DamageRefused::WriteFailed {
+                detail: e.to_string(),
+            })?;
+        // Absent reads as empty, which does not unframe: one guard for all three cases.
+        let mut value = found.unwrap_or_default();
+        if !matches!(unframe(&value), Some(Frame::Value(_, bytes)) if !bytes.is_empty()) {
+            return Err(DamageRefused::NoValue { key_hex: hex(&raw) });
+        }
+        let last = value.len() - 1;
+        value[last] ^= 0xFF;
+        // A synced write, debug builds only: named like every other, so one made while a sync
+        // runs is loud (critic-f4 A5).
+        self.note_synced_write("damage");
+        let mut write = WriteBatch::default();
+        write.put_cf(cf, &raw, &value);
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(write, &opts)
+            .map_err(|e| DamageRefused::WriteFailed {
+                detail: e.to_string(),
+            })?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        tracing::warn!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            ns = ?ns,
+            key_hex = %hex(&raw),
+            offset = last,
+            "record_damaged"
+        );
+        Ok(())
+    }
+
+    fn decode_epochs(
+        partition: PartitionId,
+        raw: &[u8],
+    ) -> Result<BTreeSet<OwnerEpoch>, StorageFault> {
+        decode_revoked(raw).ok_or_else(|| {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                len = raw.len(),
+                "epoch_revocations_undecodable"
             );
             StorageFault::Corrupt
         })
@@ -616,6 +1330,17 @@ impl RocksEngine {
             private_key(batch.partition, batch.generation, APPLIED_KEY),
             applied.0.to_be_bytes(),
         );
+        // An ack floor's record and deletes mean nothing to a format-1 build, which would
+        // re-execute a resend the floor dropped (review-s2 F-006, A-R411). The same batch moves
+        // the marker, as an epoch revocation does, so a format-1 build refuses this copy.
+        let upgrade = self.format < FORMAT_VERSION && carries_ack_floor(&batch);
+        if upgrade {
+            write.put_cf(
+                self.cf(CF_METADATA),
+                FORMAT_KEY,
+                FORMAT_VERSION.to_be_bytes(),
+            );
+        }
         let mut opts = WriteOptions::default();
         opts.set_sync(false);
         opts.disable_wal(false);
@@ -634,6 +1359,18 @@ impl RocksEngine {
             return Err(StorageFault::WriteFailed);
         }
         self.lineages.insert(key, Marks { applied, ..marks });
+        if upgrade {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = batch.partition.0,
+                generation = batch.generation.0,
+                seq = batch.seq.0,
+                from_format = self.format,
+                format = FORMAT_VERSION,
+                "format_marker_moved_for_ack_floor"
+            );
+            self.format = FORMAT_VERSION;
+        }
         tracing::info!(
             target: LOG_TARGET,
             partition = batch.partition.0,
@@ -646,9 +1383,10 @@ impl RocksEngine {
         Ok(applied)
     }
 
-    /// Sync the WAL and report which captured prefixes are now durable.
+    /// Sync the WAL and report which captured prefixes are now durable: [`Self::begin_sync`],
+    /// [`WalSync::flush`] and [`Self::finish_sync`] back to back, on this thread.
     ///
-    /// `flush_wal(true)` syncs the whole engine WAL, so each prefix is confirmed through
+    /// [`WalSync::flush`] syncs every WAL file, so each prefix is confirmed through
     /// `min(captured, applied)`. The `durable` marks are written **after** the sync returns, in
     /// a separate unsynced write: on a host crash they can lag, never lead. Writing them first
     /// would make a failed sync a false durable mark. A lineage the engine was never given is
@@ -662,80 +1400,116 @@ impl RocksEngine {
         &mut self,
         captured: Vec<CapturedPrefix>,
     ) -> Result<Vec<DurablePrefix>, StorageFault> {
+        let sync = self.begin_sync(captured);
+        let flushed = sync.flush();
+        self.finish_sync(sync, flushed)
+    }
+
+    /// Begin one WAL sync (ruling A-R317, spec §6.1): fix, now, what it may credit. Each
+    /// capture is credited through `min(captured, applied now)`, and each ancestor an inherited
+    /// lineage reads through through its link's base as linked now. So a commit that returns
+    /// after this call is never credited by this sync, whatever its seq: it is durable only
+    /// after the next one. The returned [`WalSync`] runs the fsync on any thread; hand it back
+    /// to [`Self::finish_sync`]. An armed [`InjectedFault::WalFlush`] fires here and fails that
+    /// fsync without calling RocksDB.
+    pub fn begin_sync(&mut self, captured: Vec<CapturedPrefix>) -> WalSync {
+        if self.sync_in_flight {
+            tracing::error!(target: LOG_TARGET, "sync_began_during_sync");
+        }
+        self.sync_in_flight = true;
         // A-R214: read before the sync, so a write racing it can only cost one more sync.
         let latest = self.db.latest_sequence_number();
-        let synced = self
-            .fire(InjectedFault::WalFlush)
-            .and_then(|()| self.db.flush_wal(true).map_err(|e| e.to_string()));
-        if let Err(e) = synced {
-            tracing::error!(target: LOG_TARGET, error = %e, "wal_sync_failed");
-            return Err(StorageFault::FlushFailed);
-        }
-        self.synced_seq = Some(latest);
-        let mut next = self.lineages.clone();
-        let mut marks_write = WriteBatch::default();
-        let mut durable = Vec::with_capacity(captured.len());
-        let mut raised = Vec::new();
+        let failed = self.fire(InjectedFault::WalFlush).err();
+        let mut credits = Vec::with_capacity(captured.len());
+        let mut ancestors = Vec::new();
         for capture in &captured {
-            // A lineage this engine was never given holds nothing: its durable prefix is the
-            // empty one, and the sync creates no entry for it. One it made was a child with
-            // "history" that the inherit creating the lineage later refused (defect D7).
-            if !next.contains_key(&(capture.partition, capture.generation)) {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    partition = capture.partition.0,
-                    generation = capture.generation.0,
-                    "wal_sync_unknown_lineage"
-                );
-                durable.push(DurablePrefix {
-                    partition: capture.partition,
-                    generation: capture.generation,
-                    through: DurableSeq(0),
-                });
+            let key = (capture.partition, capture.generation);
+            let Some(marks) = self.lineages.get(&key) else {
+                credits.push(None);
                 continue;
-            }
+            };
             // An inherited base is the parent's batches in this same WAL, so the sync that makes
             // it durable in the child makes it durable in every ancestor, through each level's
             // base (`MemoryEngine::sync_ancestors`).
-            let mut level = (capture.partition, capture.generation);
+            let mut level = key;
             let mut through = capture.through.0;
-            while let Some(link) = next.get(&level).and_then(|marks| marks.link) {
+            while let Some(link) = self.lineages.get(&level).and_then(|marks| marks.link) {
                 through = through.min(link.base.0);
                 level = (capture.partition, link.parent);
-                let parent = next.entry(level).or_default();
-                let synced = DurableSeq(through.min(parent.applied.0));
-                if synced > parent.durable {
-                    parent.durable = synced;
-                    marks_write.put_cf(
-                        self.cf(CF_METADATA),
-                        private_key(level.0, level.1, DURABLE_KEY),
-                        synced.0.to_be_bytes(),
-                    );
-                    raised.push((level, synced));
-                }
+                let applied = self
+                    .lineages
+                    .get(&level)
+                    .map_or(0, |parent| parent.applied.0);
+                ancestors.push((level, through.min(applied)));
             }
-            let marks = next
-                .entry((capture.partition, capture.generation))
-                .or_default();
-            let through = capture.through.0.min(marks.applied.0);
-            // B-R13: the one sanctioned crossing from applied to durable in this crate. A real
-            // `flush_wal(true)` just returned over the whole WAL, which holds this prefix.
-            let synced = DurableSeq(through);
-            if synced > marks.durable {
-                marks.durable = synced;
+            credits.push(Some(capture.through.0.min(marks.applied.0)));
+        }
+        WalSync {
+            _db: Arc::clone(&self.db),
+            _claim: self.claim.clone(),
+            dir: self.path.clone(),
+            flushes: Arc::clone(&self.wal_flushes),
+            latest,
+            failed,
+            captured,
+            credits,
+            ancestors,
+        }
+    }
+
+    /// Finish a sync [`Self::begin_sync`] began, given how its [`WalSync::flush`] ended. The
+    /// marks are read **now**, not as they were at the start (critic-f4 M6): a commit, an
+    /// inherit or a seal made while the fsync ran stays, and a mark only ever moves up, to what
+    /// the start fixed. The A-R214 synced marker never moves backwards either.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::FlushFailed`] when the fsync failed, or when the durable marks cannot be
+    /// written after it; no durable mark moves in either case.
+    pub fn finish_sync(
+        &mut self,
+        sync: WalSync,
+        flushed: Result<(), String>,
+    ) -> Result<Vec<DurablePrefix>, StorageFault> {
+        self.sync_in_flight = false;
+        if let Err(e) = flushed {
+            tracing::error!(target: LOG_TARGET, error = %e, "wal_sync_failed");
+            return Err(StorageFault::FlushFailed);
+        }
+        self.synced_seq = Some(
+            self.synced_seq
+                .map_or(sync.latest, |seen| seen.max(sync.latest)),
+        );
+        // B-R13: the one sanctioned crossing from applied to durable in this crate. A real
+        // fsync of every WAL file just returned, which held every prefix credited
+        // here when the sync began.
+        let mut raise: BTreeMap<(PartitionId, Generation), DurableSeq> = BTreeMap::new();
+        let wanted = sync.ancestors.iter().copied().chain(
+            sync.captured
+                .iter()
+                .zip(&sync.credits)
+                .filter_map(|(capture, credit)| {
+                    credit.map(|through| ((capture.partition, capture.generation), through))
+                }),
+        );
+        for (key, through) in wanted {
+            let Some(marks) = self.lineages.get(&key) else {
+                continue;
+            };
+            let synced = DurableSeq(through.min(marks.applied.0));
+            if synced > marks.durable && raise.get(&key).is_none_or(|at| synced > *at) {
+                raise.insert(key, synced);
+            }
+        }
+        if !raise.is_empty() {
+            let mut marks_write = WriteBatch::default();
+            for (&(partition, generation), synced) in &raise {
                 marks_write.put_cf(
                     self.cf(CF_METADATA),
-                    private_key(capture.partition, capture.generation, DURABLE_KEY),
+                    private_key(partition, generation, DURABLE_KEY),
                     synced.0.to_be_bytes(),
                 );
             }
-            durable.push(DurablePrefix {
-                partition: capture.partition,
-                generation: capture.generation,
-                through: marks.durable,
-            });
-        }
-        if !marks_write.is_empty() {
             let written = self
                 .fire(InjectedFault::MarkWrite)
                 .and_then(|()| self.db.write(marks_write).map_err(|e| e.to_string()));
@@ -744,25 +1518,55 @@ impl RocksEngine {
                 return Err(StorageFault::FlushFailed);
             }
         }
-        self.lineages = next;
-        for ((partition, generation), synced) in raised {
-            tracing::info!(
-                target: LOG_TARGET,
-                partition = partition.0,
-                generation = generation.0,
-                durable = synced.0,
-                "wal_sync_ancestor"
-            );
+        for (key, synced) in &raise {
+            if let Some(marks) = self.lineages.get_mut(key) {
+                marks.durable = *synced;
+            }
         }
-        for (capture, prefix) in captured.iter().zip(&durable) {
+        for &(level, _) in &sync.ancestors {
+            if let Some(synced) = raise.remove(&level) {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    partition = level.0 .0,
+                    generation = level.1 .0,
+                    durable = synced.0,
+                    "wal_sync_ancestor"
+                );
+            }
+        }
+        let mut durable = Vec::with_capacity(sync.captured.len());
+        for (capture, credit) in sync.captured.iter().zip(&sync.credits) {
+            let key = (capture.partition, capture.generation);
+            // A lineage this engine was not given when the sync began holds nothing it could
+            // credit: its durable prefix is the empty one, and the sync creates no entry for it.
+            // One it made was a child with "history" that the inherit creating the lineage later
+            // refused (defect D7).
+            let through = if credit.is_some() {
+                self.lineages
+                    .get(&key)
+                    .map_or(DurableSeq(0), |marks| marks.durable)
+            } else {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    partition = capture.partition.0,
+                    generation = capture.generation.0,
+                    "wal_sync_unknown_lineage"
+                );
+                DurableSeq(0)
+            };
             tracing::debug!(
                 target: LOG_TARGET,
                 partition = capture.partition.0,
                 generation = capture.generation.0,
                 captured = capture.through.0,
-                durable = prefix.through.0,
+                durable = through.0,
                 "wal_sync"
             );
+            durable.push(DurablePrefix {
+                partition: capture.partition,
+                generation: capture.generation,
+                through,
+            });
         }
         Ok(durable)
     }
@@ -859,6 +1663,33 @@ impl RocksEngine {
         generation: Generation,
         below: Seq,
     ) -> Result<usize, StorageFault> {
+        self.trim_dedup(partition, generation, below, true)
+    }
+
+    /// [`Self::delete_dedup_trimmed`] staged, not synced (A-R317): the delete is durable only
+    /// after the next WAL sync that begins after this returns. A node's thread deletes this way,
+    /// so it never waits on that fsync; a crash before the sync may reseed what it deleted, as a
+    /// reopen already may for every trim since the last delete (A-R172).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete_dedup_trimmed`].
+    pub fn stage_dedup_trimmed(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        below: Seq,
+    ) -> Result<usize, StorageFault> {
+        self.trim_dedup(partition, generation, below, false)
+    }
+
+    fn trim_dedup(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        below: Seq,
+        sync: bool,
+    ) -> Result<usize, StorageFault> {
         if !self.lineages.contains_key(&(partition, generation)) {
             tracing::error!(
                 target: LOG_TARGET,
@@ -891,7 +1722,7 @@ impl RocksEngine {
             scanned += 1;
             let seq = match unframe(&value) {
                 Some(Frame::Value(_, bytes)) => parse_dedup_value(bytes).map(|v| v.seq),
-                // T1 never deletes a Dedup row, but a tombstone holds nothing to seed.
+                // An ack floor's delete on a linked lineage is a tombstone: nothing to seed.
                 Some(Frame::Tombstone(_)) => continue,
                 None => None,
             };
@@ -910,8 +1741,11 @@ impl RocksEngine {
                 deleted += 1;
             }
         }
+        if sync {
+            self.note_synced_write("dedup_trim");
+        }
         let mut opts = WriteOptions::default();
-        opts.set_sync(true);
+        opts.set_sync(sync);
         if let Err(e) = self.db.write_opt(write, &opts) {
             tracing::error!(
                 target: LOG_TARGET,
@@ -921,6 +1755,11 @@ impl RocksEngine {
                 "dedup_trim_delete_failed"
             );
             return Err(StorageFault::WriteFailed);
+        }
+        // A synced write that deleted something synced the WAL through it, as
+        // `put_metadata_synced` does (A-R214). An empty batch is not counted: it may not sync.
+        if sync && deleted > 0 {
+            self.synced_seq = Some(self.db.latest_sequence_number());
         }
         tracing::info!(
             target: LOG_TARGET,
@@ -1142,6 +1981,16 @@ impl std::fmt::Display for RawRecord {
                 );
                 return write!(f, "publish_marks p={} {marks}", partition.0);
             }
+            if let Some(partition) = decode_revoked_key(&self.key) {
+                let epochs = decode_revoked(&self.value).map_or_else(
+                    || format!("<undecodable {}>", hex(&self.value)),
+                    |epochs| {
+                        let shown: Vec<String> = epochs.iter().map(|e| e.0.to_string()).collect();
+                        format!("[{}]", shown.join(" "))
+                    },
+                );
+                return write!(f, "revoked_epochs p={} {epochs}", partition.0);
+            }
             return write!(
                 f,
                 "unknown key={} value={}",
@@ -1236,10 +2085,13 @@ fn dump_inner(path: &Path) -> Result<Vec<RawRecord>, OpenError> {
 /// Options pinned in code (the M8 architecture §2, working notes not in the repository).
 /// `create` only for a fresh directory, so an existing one with a missing column family is
 /// refused rather than silently completed.
-fn db_options(create: bool) -> Options {
+fn db_options(create: bool, storage: StorageOptions) -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(create);
     opts.create_missing_column_families(create);
+    // A-R300: one memtable budget for the store, and a WAL bounded by it.
+    opts.set_db_write_buffer_size(storage.effective_memtable_budget_bytes());
+    opts.set_max_total_wal_size(storage.max_total_wal_bytes());
     // Not SkipAnyCorruptedRecord: skipping a mid-WAL record breaks contiguity. Not
     // AbsoluteConsistency: a torn tail would refuse to open.
     opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime);
@@ -1256,11 +2108,86 @@ fn db_options(create: bool) -> Options {
     opts
 }
 
-fn descriptors() -> Vec<ColumnFamilyDescriptor> {
+/// Each of [`COLUMN_FAMILIES`]' options, RocksDB's own but for the memtable budget (A-R248,
+/// capped by the store's budget since A-R300). RocksDB's `default` column family holds
+/// nothing of ours and keeps its own.
+fn cf_options(storage: StorageOptions, cache: &Cache) -> Options {
+    let mut opts = Options::default();
+    opts.set_write_buffer_size(storage.effective_cf_write_buffer_bytes());
+    opts.set_block_based_table_factory(&table_options(cache));
+    opts
+}
+
+/// RocksDB's own table options but for the block cache: the store's one cache (A-R315), so
+/// no column family gets a 32 MiB cache of its own.
+fn table_options(cache: &Cache) -> BlockBasedOptions {
+    let mut table = BlockBasedOptions::default();
+    table.set_block_cache(cache);
+    table
+}
+
+fn descriptors(storage: StorageOptions, cache: &Cache) -> Vec<ColumnFamilyDescriptor> {
     COLUMN_FAMILIES
         .iter()
-        .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+        .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(storage, cache)))
+        // A-R315: named here because rust-rocksdb otherwise adds `default` with
+        // `Options::default()`, and so a 32 MiB cache of its own. Its memtable stays RocksDB's.
+        .chain(std::iter::once(ColumnFamilyDescriptor::new("default", {
+            let mut opts = Options::default();
+            opts.set_block_based_table_factory(&table_options(cache));
+            opts
+        })))
         .collect()
+}
+
+/// The time each step of an open takes (A-R377): a reopen was seen to hang 20-40 s with the
+/// step unknown (A-R375). Each step logs `storage_open_step{step, ms}` at Debug; the open ends
+/// with `storage_open_timing{total_ms, slowest, slowest_ms}` at Info.
+struct OpenSteps<'a> {
+    path: &'a Path,
+    began: std::time::Instant,
+    last: std::time::Instant,
+    slowest: (&'static str, f64),
+}
+
+impl<'a> OpenSteps<'a> {
+    fn start(path: &'a Path) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            path,
+            began: now,
+            last: now,
+            slowest: ("none", 0.0),
+        }
+    }
+
+    /// `step` has just finished: log how long it took since the last one did.
+    fn done(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
+        self.last = now;
+        if ms > self.slowest.1 {
+            self.slowest = (step, ms);
+        }
+        tracing::debug!(
+            target: LOG_TARGET,
+            path = %self.path.display(),
+            step,
+            ms,
+            "storage_open_step"
+        );
+    }
+
+    fn finish(self) {
+        tracing::info!(
+            target: LOG_TARGET,
+            path = %self.path.display(),
+            total_ms = self.began.elapsed().as_secs_f64() * 1000.0,
+            slowest = self.slowest.0,
+            slowest_ms = self.slowest.1,
+            "storage_open_timing"
+        );
+    }
 }
 
 /// Refuse a column-family set that is not exactly ours plus RocksDB's `default`.
@@ -1286,14 +2213,20 @@ type Lineages = BTreeMap<(PartitionId, Generation), Marks>;
 
 /// Open `path` read-only and make every check `open` makes. A directory with no marker that
 /// holds nothing passes: `open` would stamp it, and a reader finds nothing in it either way.
-fn read_only(path: &Path) -> Result<(DB, Lineages), OpenError> {
-    let db = DB::open_cf_for_read_only(&db_options(false), path, COLUMN_FAMILIES, false)
-        .map_err(|e| backend(path, &e))?;
-    check_format(&db, path, true)?;
+fn read_only(path: &Path) -> Result<(DB, Lineages, u32), OpenError> {
+    let db = DB::open_cf_for_read_only(
+        &db_options(false, StorageOptions::default()),
+        path,
+        COLUMN_FAMILIES,
+        false,
+    )
+    .map_err(|e| backend(path, &e))?;
+    // `None` only for a directory that holds nothing, which `open` would stamp.
+    let format = check_format(&db, path, true)?.unwrap_or(FORMAT_VERSION);
     read_instance(&db, path)?;
     let lineages = restore_lineages(&db, path)?;
     check_marks(&lineages)?;
-    Ok((db, lineages))
+    Ok((db, lineages, format))
 }
 
 /// The instance marker, `None` when absent. A marker that is not [`INSTANCE_LEN`] bytes is a
@@ -1335,22 +2268,37 @@ fn check_marks(lineages: &Lineages) -> Result<(), OpenError> {
 }
 
 /// Check the format marker, writing it (synced) into a directory that holds nothing yet.
-/// Returns whether it wrote the marker.
-fn ensure_format(db: &DB, path: &Path, existed: bool) -> Result<bool, OpenError> {
-    let stamp = check_format(db, path, existed)?;
-    if stamp {
+/// Returns whether it wrote the marker, and the marker now on disk.
+fn ensure_format(db: &DB, path: &Path, existed: bool) -> Result<(bool, u32), OpenError> {
+    let found = check_format(db, path, existed)?;
+    if found.is_none() {
         let meta = handle(db, path, CF_METADATA)?;
         let mut opts = WriteOptions::default();
         opts.set_sync(true);
         db.put_cf_opt(meta, FORMAT_KEY, FORMAT_VERSION.to_be_bytes(), &opts)
             .map_err(|e| backend(path, &e))?;
     }
-    Ok(stamp)
+    Ok((found.is_none(), found.unwrap_or(FORMAT_VERSION)))
 }
 
-/// Refuse a missing or foreign format marker. `Ok(true)`: no marker, and the directory holds
-/// nothing, so it is safe to stamp. Writes nothing, so a read-only open can run it.
-fn check_format(db: &DB, path: &Path, existed: bool) -> Result<bool, OpenError> {
+/// Whether `batch` writes any part of an ack floor (A-R252): a `Dedup` delete, which only a floor
+/// licenses, or a floor record's put. A format-1 build reads both as plain dedup rows, so either
+/// one needs the format-2 marker (review-s2 F-006).
+fn carries_ack_floor(batch: &Batch) -> bool {
+    batch.writes.iter().any(|w| {
+        w.ns == Namespace::Dedup
+            && (w.value.is_none()
+                || parse_dedup_key(&w.key).is_some_and(|k| {
+                    k.affinity == FLOOR_AFFINITY && is_floor_record_id(k.identity.request)
+                }))
+    })
+}
+
+/// Refuse a missing or foreign format marker. `Ok(Some(version))`: a marker this build opens,
+/// [`OLDEST_FORMAT_VERSION`] through [`FORMAT_VERSION`]. `Ok(None)`: no marker, and the
+/// directory holds nothing, so it is safe to stamp. Writes nothing, so a read-only open can run
+/// it.
+fn check_format(db: &DB, path: &Path, existed: bool) -> Result<Option<u32>, OpenError> {
     let meta = handle(db, path, CF_METADATA)?;
     let found = db.get_cf(meta, FORMAT_KEY).map_err(|e| backend(path, &e))?;
     let refuse = |found: Option<u32>| OpenError::Format {
@@ -1366,15 +2314,15 @@ fn check_format(db: &DB, path: &Path, existed: bool) -> Result<bool, OpenError> 
                     key_hex: hex(FORMAT_KEY),
                     problem: "the format marker is not 4 bytes".to_string(),
                 })?;
-            if version == FORMAT_VERSION {
-                Ok(false)
+            if (OLDEST_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
+                Ok(Some(version))
             } else {
                 Err(refuse(Some(version)))
             }
         }
         // A directory that crashed between creation and the marker write holds nothing, so it
         // is still safe to stamp. One holding any record is not.
-        None if !existed || is_empty(db, path)? => Ok(true),
+        None if !existed || is_empty(db, path)? => Ok(None),
         None => Err(refuse(None)),
     }
 }
@@ -1411,6 +2359,7 @@ fn restore_lineages(
             if key.as_ref() == FORMAT_KEY
                 || key.as_ref() == INSTANCE_KEY
                 || decode_publish_marks_key(&key).is_some()
+                || decode_revoked_key(&key).is_some()
             {
                 continue;
             }

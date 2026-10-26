@@ -25,10 +25,10 @@ use rdb_core::contracts::txn::scoped_key;
 use rdb_core::replication::append::PROGRESS_KEY;
 use rdb_sim::storage::history::{canonical_history_from, CanonicalHistory};
 use rdb_storage::keys::{cf_for, encode_key, CF_METADATA, COLUMN_FAMILIES};
-use rdb_storage::{
-    dump, verify_lineage, InheritError, Inherited, InjectedFault, LineageFault, Link, OpenError,
-    RocksEngine,
-};
+use rdb_storage::{dump, verify_lineage, InheritError, Inherited, Link, OpenError, RocksEngine};
+// The fault-injection rows run in debug builds only, as the hooks do.
+#[cfg(debug_assertions)]
+use rdb_storage::{InjectedFault, LineageFault};
 
 const P: PartitionId = PartitionId(1);
 const G0: Generation = Generation(0);
@@ -310,6 +310,7 @@ fn m8s_12_behind_cutoff_writes_nothing_until_the_parent_catches_up() {
 /// A full copy that fails after its first key batch leaves g2 staging:
 /// verify names it, writes to it are refused, a re-run with other arguments is refused and
 /// leaves it alone, and the same-args re-run clears it and converges.
+#[cfg(debug_assertions)]
 #[retcd_test]
 fn m8s_15_16_18_34_a_failed_copy_is_staged_refused_and_a_rerun_converges() {
     let dir = data_dir("15-staged");
@@ -354,6 +355,7 @@ fn m8s_15_16_18_34_a_failed_copy_is_staged_refused_and_a_rerun_converges() {
 
 /// A failed linked switch batch writes nothing and a re-run links; an inject point
 /// a linked switch never reaches stays armed and does not fail it.
+#[cfg(debug_assertions)]
 #[retcd_test]
 fn m8s_19_20_a_failed_linked_switch_writes_nothing_and_an_unreached_point_stays_armed() {
     let dir = data_dir("19-switch");
@@ -802,6 +804,7 @@ fn m8s_33_base_zero_copies_nothing() {
 }
 
 /// Leave g2 staging a full copy of g1 as of seq 2 (g1 holds 3): the switch batch fails.
+#[cfg(debug_assertions)]
 fn stage_g2_from_g1(engine: &mut RocksEngine) {
     write(engine, G1, 3);
     engine.inject_fault(InjectedFault::Switch);
@@ -817,6 +820,7 @@ fn stage_g2_from_g1(engine: &mut RocksEngine) {
 /// refused by name and writes nothing — before the fix it sealed g1 for g3 and left g2 stuck
 /// with `copying` forever. The way out is the same-args re-run of g2, after which g1 is sealed for
 /// g2 and `1->3` is `parent_sealed_for_other`.
+#[cfg(debug_assertions)]
 #[retcd_test]
 fn m8s_35_t1_second_child_is_refused_while_a_sibling_is_staging() {
     let dir = data_dir("t1-staging-sibling");
@@ -851,6 +855,7 @@ fn m8s_35_t1_second_child_is_refused_while_a_sibling_is_staging() {
 /// A defect found by hand: a parent left staging by a failed full copy holds staged keys and no
 /// applied mark. Inheriting from it must be refused by name, not linked at base 0 — linking let
 /// the child read bytes that were never switched in (`read g4` -> `k version=2 from=2`).
+#[cfg(debug_assertions)]
 #[retcd_test]
 fn m8s_t2_inherit_from_a_staging_parent_is_refused() {
     let dir = data_dir("t2-staging-parent");
@@ -1076,6 +1081,7 @@ fn zz_child_inherits_then_aborts() {
         "linked" => {
             linked_g2(&mut engine);
         }
+        #[cfg(debug_assertions)]
         "staged" => {
             write(&mut engine, G1, 1100);
             engine.inject_fault(InjectedFault::CopyBatch);
@@ -1151,6 +1157,7 @@ fn m8s_22_a_crash_after_a_linked_switch_keeps_it_whole() {
 
 /// A process crash with a copy staged leaves the staging and whole copy batches, never a
 /// lineage record or a seal; the same call again converges.
+#[cfg(debug_assertions)]
 #[retcd_test]
 fn m8s_17_a_crash_with_a_copy_staged_converges_on_a_rerun() {
     let dir = data_dir("17-crash-staged");
@@ -1178,6 +1185,7 @@ fn m8s_17_a_crash_with_a_copy_staged_converges_on_a_rerun() {
 
 /// `fault_injected` names the point by its CLI spelling in a
 /// `point` field, as `fault_not_reached` does, so one log query finds both.
+#[cfg(debug_assertions)]
 #[retcd_test]
 fn m8s_19_s1_p5_fault_injected_names_its_point() {
     let dir = data_dir("19-p5");
@@ -1368,4 +1376,51 @@ fn m10_w2_delete_dedup_trimmed_drops_what_t1_trimmed_and_nothing_else() {
         Err(StorageFault::Corrupt)
     );
     assert_eq!(dedup_and_rest(&engine, G1).0, before, "nothing deleted");
+}
+
+/// M10 S2 W9 (arch-s2 triage "`delete_dedup_trimmed` without `synced_seq`"): the trim's write is
+/// synced, so once it returns every write so far counts as synced and the flush duty may skip
+/// its next fsync (A-R214), as after any other synced write. RocksDB's own WAL-sync count sees
+/// exactly one sync. Cut: drop the `synced_seq` line from `delete_dedup_trimmed`; the trim
+/// still syncs, but the engine does not count it, and the row is red. Debug builds only, as the
+/// count is. Unit, under a second.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_a_dedup_trim_counts_as_synced() {
+    let dir = data_dir("m10-dedup-trim-synced");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = linked_g2(&mut engine);
+    write_after(&mut engine, G2, (10, &g1), 14);
+    assert!(!engine.wal_synced_through_latest(), "commits are unsynced");
+    let before = engine.wal_syncs();
+    assert_eq!(engine.delete_dedup_trimmed(P, G2, Seq(13)), Ok(2));
+    assert_eq!(
+        engine.wal_syncs(),
+        before + 1,
+        "the trim synced the WAL once"
+    );
+    assert!(
+        engine.wal_synced_through_latest(),
+        "the trim counts as synced"
+    );
+}
+
+/// A trim that deletes nothing writes an empty batch. It is not counted, since nothing says
+/// RocksDB must sync one (on 2026-10-23 its ticker did count one sync here; the log line
+/// `empty_trim_wal_syncs` records it). So the commits before it stay unsynced and the flush duty
+/// still syncs them: at worst one extra fsync. Cut: count every trim; the row is red.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn m10_s2_an_empty_dedup_trim_does_not_count_as_synced() {
+    let dir = data_dir("m10-dedup-trim-empty");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = linked_g2(&mut engine);
+    write_after(&mut engine, G2, (10, &g1), 14);
+    let before = engine.wal_syncs();
+    assert_eq!(engine.delete_dedup_trimmed(P, G2, Seq(0)), Ok(0));
+    tracing::info!(syncs = engine.wal_syncs() - before, "empty_trim_wal_syncs");
+    assert!(
+        !engine.wal_synced_through_latest(),
+        "an empty trim is not counted"
+    );
 }

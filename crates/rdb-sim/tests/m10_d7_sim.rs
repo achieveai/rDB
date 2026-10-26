@@ -144,6 +144,8 @@ fn submit() -> SeedEvent {
                 value: Bytes::from_static(b"1"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         }),
     )
 }
@@ -431,6 +433,24 @@ fn m10_d7_b_lags_its_a1_view_lands_before_c_s_frame_and_the_frame_is_staged() {
         Some(cases::PLAN_AT + 1 + FRAME_DELAY),
         "then C's frame lands and B applies the cutoff record"
     );
+
+    // #59 item 9: A1's view raises a lower held epoch (`view_refusal` installs it), so a seed
+    // restored at epoch 0 is repaired before C's frame and every assert above stays green. The
+    // epoch the receiver was restored at is asserted directly: the credential's prior epoch,
+    // which is at least 1.
+    let (_, _, sample) = plan.survivors.first().expect("placed");
+    let prior_epoch = sample.anchor_seen.lineage.owner_epoch.0;
+    assert!(prior_epoch >= 1, "the prior lineage has an owner epoch");
+    let restored_epoch: Vec<(u64, u64)> = logged(METHOD, "dormant_restored")
+        .iter()
+        .filter_map(|line| Some((line["node"].as_u64()?, line["owner_epoch"].as_u64()?)))
+        .filter(|(node, _)| *node == u64::from(B_NODE.0))
+        .collect();
+    assert_eq!(
+        restored_epoch,
+        vec![(u64::from(B_NODE.0), prior_epoch)],
+        "B's dormant receiver is restored at the credential's prior epoch, not one A1 repairs"
+    );
 }
 
 /// [`plan`] with A an empty copy of this partition: its store holds no record of generation 1,
@@ -536,14 +556,14 @@ const CRASH_HEAD: Seq = Seq(5);
 /// When A's crash is planned: taken at its next storage effect.
 const CRASH_AT: u64 = 50;
 const RESTART_AT: u64 = 200;
-/// How far after the first plan placement sends it again: after F1 blocks at its deadline.
+/// How far after the first plan placement sends it again: after F1 blocks on A's new boot.
 const REOPEN_AFTER: u64 = 2_300;
 const REBOOT: BootId = BootId(2);
 
 /// [`plan_at`] with A at 1 of [`CRASH_HEAD`]. The B to A link carries the catch-up's first three
 /// frames at once and holds the next two 100 ms, so A lands records 2 and 3, and the crash
 /// planned at [`CRASH_AT`] is taken at record 4's commit. A restarts at [`RESTART_AT`]. B and C
-/// run on: F1 blocks at its deadline, and placement sends its plan and fence again
+/// run on: F1 blocks on A's proof from its new boot, and placement sends its plan and fence again
 /// [`REOPEN_AFTER`] later, naming A under its new boot.
 fn crash_plan() -> RunPlan {
     let mut plan = plan_at(CRASH_HEAD, &[(A_NODE, 1)]);
@@ -597,12 +617,20 @@ fn crash_plan() -> RunPlan {
     plan
 }
 
-/// A-R173 (Q6): A, owed four records, crashes after landing two. That recovery blocks, named,
-/// with nothing of the third landed. On the reopen A's receiver is restored at its new head, it
-/// takes only the last two, F1 commits, and the write publishes and reads back.
+/// A-R173 (Q6): A, owed four records, crashes after landing two, and lands the last two only
+/// after its restart. F1 counts a proof only from the boot its plan names (A-R239), so A's proof
+/// from its new boot blocks that recovery at once, `BarrierIncomplete` naming A, with the boot
+/// change logged. Placement's reopen names A under its new boot, F1 commits, and the write
+/// publishes and reads back.
+///
+/// Re-cut 2026-10-23 (A-R239, W9 `65f314e`). Before the barrier retry (R2-A1), A's records 4
+/// and 5 came only on the reopen. The retry now re-sends them at the first deadline, so the row
+/// claims they land after the restart, not after the reopen. Without the boot check, the retry
+/// committed generation 2 naming A's dead boot, every ack from A was refused `StaleBoot`, and
+/// the write was refused `ProtectionPaused`. Cut: remove the boot check, and this row goes red.
 #[retcd_test]
-fn m10_d7_a_crashes_mid_catch_up_and_the_reopen_resumes_from_its_new_head() {
-    const METHOD: &str = "m10_d7_a_crashes_mid_catch_up_and_the_reopen_resumes_from_its_new_head";
+fn m10_d7_a_crashes_mid_catch_up_and_the_reopen_names_its_new_boot() {
+    const METHOD: &str = "m10_d7_a_crashes_mid_catch_up_and_the_reopen_names_its_new_boot";
     support::preamble();
     let mut runner = Runner::new(&crash_plan()).expect("plan");
     runner.queue(&submit()).expect("queue");
@@ -623,14 +651,14 @@ fn m10_d7_a_crashes_mid_catch_up_and_the_reopen_resumes_from_its_new_head() {
         .filter_map(|event| match &event.kind {
             TraceKind::BatchApply {
                 generation, seq, ..
-            } if *generation == PRIOR => Some((event.logical_tick >= reopen, seq.0)),
+            } if *generation == PRIOR => Some((event.logical_tick >= RESTART_AT, seq.0)),
             _ => None,
         })
         .collect();
     assert_eq!(
         applied,
         vec![(false, 1), (false, 2), (false, 3), (true, 4), (true, 5)],
-        "A lands 2 and 3, crashes at 4, and the reopen sends only 4 and 5"
+        "A lands 2 and 3, crashes at 4, and takes only 4 and 5 after its restart"
     );
     let heads: Vec<Option<u64>> = logged(METHOD, "dormant_restored")
         .iter()
@@ -645,6 +673,22 @@ fn m10_d7_a_crashes_mid_catch_up_and_the_reopen_resumes_from_its_new_head() {
     assert!(
         logged(METHOD, "dormant_restore_refused").is_empty(),
         "no restore refused"
+    );
+    let changed: Vec<(Option<u64>, Option<u64>, Option<u64>)> =
+        logged(METHOD, "barrier_boot_changed")
+            .iter()
+            .map(|line| {
+                (
+                    line["copy"].as_u64(),
+                    line["named_boot"].as_u64(),
+                    line["proof_boot"].as_u64(),
+                )
+            })
+            .collect();
+    assert_eq!(
+        changed,
+        vec![(Some(u64::from(copy_of(A_NODE).0)), Some(1), Some(REBOOT.0))],
+        "F1 refuses A's proof once: the plan names boot 1 and boot 2 answered"
     );
     let report = ran.expect("runs");
     assert!(

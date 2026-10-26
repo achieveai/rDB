@@ -1022,8 +1022,9 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
 ///
 /// Not asserted: generation 3 activating. C leads the recovery but does not own the new
 /// generation, and its rebuild never proves the other copies, so a write in generation 3 is
-/// refused `RecoveryReadOnly`. When B leads instead, the run stops at I1's `deliver::kernel`
-/// (R1's `CopyAheadOnControl`). Owed with M7A-58.
+/// refused `RecoveryReadOnly`. When B leads instead, generation 3 commits and activates: the
+/// dispatcher consumes R1's `CopyAheadOnControl` (I1, `copy_ahead`), and L1 on B resumes
+/// (W6b probe 2026-10-24, not pinned by a row). Owed with M7A-58.
 #[retcd_test]
 fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_runs_through_the_runner() {
     use rdb_core::contracts::authority::{AuthorityIgnoreReason, Checkpoint};
@@ -2982,6 +2983,8 @@ mod semantic_runs {
                 value: Bytes::from_static(b"v"),
                 expected_version: None,
             }],
+            acked_below: None,
+            pinned: Vec::new(),
         };
         let plan = served(vec![seed(
             200,

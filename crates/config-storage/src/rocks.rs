@@ -211,6 +211,18 @@ const KEY_CURRENT_SNAPSHOT: &[u8] = b"current_snapshot";
 /// from the retained `.snap` before anything is served (ADR-0022 "Install: two-phase").
 const KEY_INSTALL_IN_PROGRESS: &[u8] = b"install_in_progress";
 
+/// A wait on the state-machine lock this long or longer is logged (`state machine lock
+/// waited`). Readers take that lock on whatever thread calls them, runtime workers included,
+/// so a long hold anywhere stalls them; this is how a log shows it.
+const SM_LOCK_WAIT_LOGGED: std::time::Duration = std::time::Duration::from_millis(100);
+
+std::thread_local! {
+    /// `true` while this thread runs a closure handed to [`RocksShared::run`], i.e. on the
+    /// blocking pool. A lock wait logged with `store_thread = false` stalled some other thread,
+    /// such as a runtime worker.
+    static ON_STORE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The journal key for a revision: big-endian, so lexicographic order is numeric order.
 fn event_key(revision: u64) -> [u8; 8] {
     revision.to_be_bytes()
@@ -555,8 +567,29 @@ impl RocksShared {
         self.log.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The state-machine lock. A wait of [`SM_LOCK_WAIT_LOGGED`] or more is logged with the
+    /// caller's location and whether it waited on the blocking pool.
+    #[track_caller]
     fn sm(&self) -> MutexGuard<'_, SmInner> {
-        self.sm.lock().unwrap_or_else(|e| e.into_inner())
+        match self.sm.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let started = std::time::Instant::now();
+                let guard = self.sm.lock().unwrap_or_else(|e| e.into_inner());
+                let waited = started.elapsed();
+                if waited >= SM_LOCK_WAIT_LOGGED {
+                    let caller = std::panic::Location::caller();
+                    tracing::warn!(
+                        waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                        caller = %format_args!("{}:{}", caller.file(), caller.line()),
+                        store_thread = ON_STORE_THREAD.with(std::cell::Cell::get),
+                        "state machine lock waited"
+                    );
+                }
+                guard
+            }
+        }
     }
 
     fn recv(&self) -> MutexGuard<'_, Option<PathBuf>> {
@@ -817,7 +850,19 @@ impl RocksShared {
     {
         let shared = Arc::clone(self);
         let span = shared.span.clone();
-        match tokio::task::spawn_blocking(move || span.in_scope(|| f(&shared))).await {
+        let on_pool = move || {
+            // Cleared on drop, so a panicking closure does not leave a pooled thread marked.
+            struct Marked;
+            impl Drop for Marked {
+                fn drop(&mut self) {
+                    ON_STORE_THREAD.with(|flag| flag.set(false));
+                }
+            }
+            ON_STORE_THREAD.with(|flag| flag.set(true));
+            let _marked = Marked;
+            span.in_scope(|| f(&shared))
+        };
+        match tokio::task::spawn_blocking(on_pool).await {
             Ok(result) => result,
             Err(join) => Err(io_error(
                 ErrorSubject::Store,
@@ -1527,10 +1572,26 @@ fn open_boundary(
     }
 }
 
+/// RocksDB `max_background_jobs` for every store (A-R286). RocksDB gives a quarter to flushes,
+/// so 16 is 4 flush and 12 compaction jobs, and at open it raises the process-wide flush and
+/// compaction thread pools to at least that.
+///
+/// The default, 2, means one flush thread for every store in the process. A snapshot checkpoint
+/// flushes the memtable and waits for that thread, so one slow flush held up every other store's
+/// checkpoint: under load ten stores' checkpoints, 2.3-3.0 s each, finished within 80 ms of one
+/// another, and each store's synced log writes waited for its own checkpoint meanwhile.
+///
+/// Why 16: the point was 4 flush threads instead of 1, and RocksDB derives the flush share from
+/// this one number. Only 2 and 16 were measured, on `m5_snapshot_cluster` 20 times under load
+/// at scale 3. With 2, and the capture already moved into `build_snapshot`, it passed 16/20.
+/// With 16 it passed 20/20. Values between 2 and 16 are unmeasured; a lower one may do as well.
+const MAX_BACKGROUND_JOBS: i32 = 16;
+
 fn open_db(dir: &Path, path: &Path) -> Result<DB, StorageOpenError> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
+    db_opts.set_max_background_jobs(MAX_BACKGROUND_JOBS);
 
     let mut cf_opts = Options::default();
     cf_opts.set_compression_type(DBCompressionType::Lz4);
@@ -2982,55 +3043,27 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
             .await
     }
 
-    /// Capture the view the next [`RocksSnapshotBuilder::build_snapshot`] will export.
+    /// Hand out a builder. It captures nothing: the view is taken in
+    /// [`RocksSnapshotBuilder::build_snapshot`] (A-R286).
     ///
-    /// The capture happens **here**, under the state-machine mutex, and not in
-    /// `build_snapshot` — which OpenRaft runs concurrently with further applies (research §1.3,
-    /// trap T3). `apply` holds this mutex across its entire synced batch, so a view taken while
-    /// holding it can never straddle one: the exported data and the exported `last_applied`
-    /// describe the same instant. A snapshot whose header said index N while its bytes held
-    /// N+5 would install a follower into a state no leader ever had.
+    /// OpenRaft awaits this method on its state-machine worker, so every apply queues behind
+    /// it. A capture here took one RocksDB checkpoint — a memtable flush that waits on the
+    /// shared flush threads, 2-3 s under load — and stalled every write for that long.
+    /// `build_snapshot` runs in a spawned task, concurrently with further applies (research
+    /// §1.3, trap T3), and that is safe for this capture: it reads `last_applied` and the rest
+    /// of the header back from the checkpoint, and `apply` writes them in the same batch as the
+    /// records, so the exported data and the exported `last_applied` always describe the same
+    /// instant, however far apply has moved on. A snapshot whose header said index N while its
+    /// bytes held N+5 would install a follower into a state no leader ever had.
     ///
-    /// The view itself is a [`rocksdb::checkpoint::Checkpoint`] — a directory of hard links,
-    /// so its cost is the number of SST files rather than the size of the database — because
-    /// `rocksdb::Snapshot` borrows the `DB` and cannot be stored in a builder that outlives
-    /// this call without `unsafe`, which this crate forbids.
-    ///
-    /// This method cannot return an error (OpenRaft's signature has no `Result`), so a failed
-    /// capture is recorded as "no view" and `build_snapshot` retries it. That is not a
-    /// workaround: `build_snapshot` returning `Err` is *fatal* to the node (research §1.5), so
-    /// every transient failure that can be retried must be.
+    /// A snapshot *install* is the one writer that does not move records and metadata in one
+    /// batch, and it can run while a build is in flight. So a build discards a view that holds
+    /// the install marker, and publishes only while no install is in flight and only a view at
+    /// least as new as `current_snapshot` (F-001, [`publish_blocker`]).
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        let shared = Arc::clone(&self.shared);
-        // Three errors are collapsed into "no view" here — the blocking-pool join, the
-        // poison/boundary guard, and the checkpoint itself. Collapsing them is forced by the
-        // signature; losing them is not, so each one is named before it is dropped, otherwise
-        // a node that quietly retries every build forever has no diagnosis (C5-14).
-        let captured = match shared
-            .run(|s| match capture_view(s) {
-                Ok(view) => Ok(Some(view)),
-                Err(e) => {
-                    tracing::warn!(
-                        reason = "capture_failed",
-                        detail = %e,
-                        "snapshot_view_unavailable"
-                    );
-                    Ok(None)
-                }
-            })
-            .await
-        {
-            Ok(view) => view,
-            Err(e) => {
-                tracing::warn!(
-                    reason = "store_unavailable",
-                    detail = %e,
-                    "snapshot_view_unavailable"
-                );
-                None
-            }
-        };
-        RocksSnapshotBuilder { shared, captured }
+        RocksSnapshotBuilder {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Create the file OpenRaft will stream an incoming snapshot into, and remember where it is.
@@ -3157,8 +3190,10 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
 
 /// The consistent view one snapshot is exported from.
 ///
-/// Captured under the state-machine mutex in [`RaftStateMachine::get_snapshot_builder`], so the
-/// checkpoint's contents and the metadata below describe the same applied instant.
+/// Captured in [`RocksSnapshotBuilder::build_snapshot`]. Every field below is read back from
+/// the checkpoint itself, not from the in-memory state machine, so the checkpoint's contents and
+/// the metadata describe the same applied instant without holding the state-machine lock while
+/// the checkpoint is taken (A-R279).
 struct CapturedView {
     snapshot_id: String,
     created_unix_ms: u64,
@@ -3166,19 +3201,36 @@ struct CapturedView {
     membership: StoredMembership<RaftNodeId, RaftNode>,
     cluster_revision: u64,
     compact_revision: u64,
-    /// The retired-node set at capture (M5-R21). Taken from the in-memory state machine under
-    /// the same lock as the revisions above, so the header describes one applied state rather
-    /// than two moments stitched together.
+    /// The retired-node set at capture (M5-R21). Read from the checkpoint like the revisions
+    /// above, so the header describes one applied state rather than two moments stitched
+    /// together.
     retired_nodes: BTreeSet<NodeId>,
-    /// The activation watermark at capture (M6-R15), taken under the same lock.
+    /// The activation watermark at capture (M6-R15), read from the checkpoint too.
     max_applied_command_schema: u16,
     /// The checkpoint directory. Removed once the export finishes, successfully or not.
     checkpoint: PathBuf,
 }
 
-/// Take a checkpoint of the database together with the applied metadata that describes it.
+/// Names each capture's checkpoint directory before the metadata that gives the snapshot its id
+/// has been read. Process-wide, so two stores capturing in the same millisecond never collide.
+static CAPTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Take a checkpoint of the database, then read the applied metadata that describes it from the
+/// checkpoint.
+///
+/// The state-machine lock is **not** held here (A-R279). The checkpoint flushes the memtable and
+/// queues behind every other store's flush on RocksDB's shared flush thread, and readers take
+/// that lock synchronously from runtime workers, so holding it here stalled them for seconds.
+///
+/// Consistency comes from the data instead of the lock: `apply` writes the records and all of the
+/// metadata below in one write batch, and a checkpoint is one point-in-time image of the
+/// database, so the metadata read back from it describes exactly the records it holds. A
+/// snapshot install is the exception, and its image is refused rather than read (F-001).
+///
+/// `Ok(None)` when the checkpoint landed inside a snapshot install; see [`view_from_checkpoint`].
+/// The checkpoint is removed and the caller captures again once the install has finished.
 #[allow(clippy::result_large_err)]
-fn capture_view(s: &RocksShared) -> Result<CapturedView, StorageError<RaftNodeId>> {
+fn capture_view(s: &RocksShared) -> Result<Option<CapturedView>, StorageError<RaftNodeId>> {
     s.guard(ErrorSubject::Snapshot(None), ErrorVerb::Write)?;
     let dir = s.snapshot_dir();
     std::fs::create_dir_all(&dir).map_err(|e| {
@@ -3189,13 +3241,14 @@ fn capture_view(s: &RocksShared) -> Result<CapturedView, StorageError<RaftNodeId
         )
     })?;
 
-    let sm = s.sm();
     let created_unix_ms = snapshot::unix_ms();
-    let snapshot_id = snapshot::snapshot_id(sm.last_applied, created_unix_ms);
-    let checkpoint = snapshot::build_view_path(&s.path, &snapshot_id);
-    // A leftover from an interrupted build under the same id: `create_checkpoint` refuses an
-    // existing directory, and keeping it would fail every future build with the same name.
+    let sequence = CAPTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let checkpoint =
+        snapshot::build_view_path(&s.path, &format!("capture-{created_unix_ms}-{sequence}"));
+    // A leftover from an interrupted build under the same name: `create_checkpoint` refuses an
+    // existing directory.
     let _ = std::fs::remove_dir_all(&checkpoint);
+    let started = std::time::Instant::now();
     rocksdb::checkpoint::Checkpoint::new(&s.db)
         .and_then(|c| c.create_checkpoint(&checkpoint))
         .map_err(|e| {
@@ -3205,21 +3258,159 @@ fn capture_view(s: &RocksShared) -> Result<CapturedView, StorageError<RaftNodeId
                 format!("cannot checkpoint into {}: {e}", checkpoint.display()),
             )
         })?;
-    Ok(CapturedView {
-        snapshot_id,
+    tracing::debug!(
+        checkpoint = %checkpoint.display(),
+        checkpoint_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "snapshot view checkpointed"
+    );
+    s.faults.during_snapshot_capture();
+    match view_from_checkpoint(checkpoint.clone(), created_unix_ms) {
+        Ok(Some(view)) => Ok(Some(view)),
+        Ok(None) => {
+            // F-001: the checkpoint landed inside a snapshot install. Its data column families
+            // are cleared or half-written while its header fields are still the old state's,
+            // so it describes no state any leader ever had. Discarded, never exported.
+            let _ = std::fs::remove_dir_all(&checkpoint);
+            tracing::info!(
+                checkpoint = %checkpoint.display(),
+                "snapshot_build_view_mid_install"
+            );
+            Ok(None)
+        }
+        Err(detail) => {
+            // Hard links: a view nobody will export would pin every SST file it references.
+            let _ = std::fs::remove_dir_all(&checkpoint);
+            Err(io_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                format!("cannot read the build view's metadata: {detail}"),
+            ))
+        }
+    }
+}
+
+/// Read the applied metadata a checkpoint holds. The defaults are `load_state`'s, so a key an
+/// older build never wrote reads here exactly as it would when the store opens.
+///
+/// `Ok(None)` when the checkpoint holds an `install_in_progress` marker (F-001). An install
+/// clears the data column families and streams the new records in several batches, and moves
+/// `last_applied` and the rest of the header fields only in its final batch, which also deletes
+/// the marker. So a checkpoint with the marker is the one image whose metadata does **not**
+/// describe its records, and the "apply writes records and metadata in one batch" argument that
+/// makes every other checkpoint safe does not cover it.
+fn view_from_checkpoint(
+    checkpoint: PathBuf,
+    created_unix_ms: u64,
+) -> Result<Option<CapturedView>, String> {
+    let opts = Options::default();
+    let cf_names = DB::list_cf(&opts, &checkpoint).map_err(|e| e.to_string())?;
+    let db = DB::open_cf_for_read_only(&opts, &checkpoint, &cf_names, false)
+        .map_err(|e| e.to_string())?;
+    let installing: Option<StoredSnapshot> =
+        read_meta(&db, CF_STATE_META, KEY_INSTALL_IN_PROGRESS)?;
+    if installing.is_some() {
+        return Ok(None);
+    }
+    let last_applied: Option<LogId<RaftNodeId>> = read_meta(&db, CF_STATE_META, KEY_LAST_APPLIED)?;
+    Ok(Some(CapturedView {
+        snapshot_id: snapshot::snapshot_id(last_applied, created_unix_ms),
         created_unix_ms,
-        last_applied: sm.last_applied,
-        membership: sm.membership.clone(),
-        cluster_revision: sm.kv.cluster_revision(),
-        compact_revision: sm.kv.compact_revision(),
-        retired_nodes: sm.kv.retired_nodes().clone(),
-        max_applied_command_schema: sm.kv.max_applied_command_schema(),
+        last_applied,
+        membership: read_meta(&db, CF_STATE_META, KEY_MEMBERSHIP)?.unwrap_or_default(),
+        cluster_revision: read_meta(&db, CF_STATE_META, KEY_CLUSTER_REVISION)?.unwrap_or(0),
+        compact_revision: read_meta(&db, CF_STATE_META, KEY_COMPACT_REVISION)?.unwrap_or(0),
+        retired_nodes: read_meta(&db, CF_STATE_META, KEY_RETIRED_NODES)?.unwrap_or_default(),
+        max_applied_command_schema: read_meta(&db, CF_STATE_META, KEY_MAX_COMMAND_SCHEMA)?
+            .unwrap_or(config_core::COMMAND_SCHEMA_V1),
         checkpoint,
-    })
+    }))
 }
 
 /// How many times a build re-captures before giving up and returning the fatal error.
 const BUILD_ATTEMPTS: u32 = 3;
+
+/// How often a build that captured mid-install checks whether the install has committed.
+const INSTALL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long one build waits, in total, for installs to commit before a mid-install view counts
+/// as a failed attempt. An install that fails mid-replacement poisons the store, which ends the
+/// wait at once (the next capture fails at its guard); this limit is for an install that never
+/// finishes and never fails, so a build cannot wait for ever on a stuck node.
+///
+/// When it expires: that wait returns an error, which spends one of [`BUILD_ATTEMPTS`]. Every
+/// later mid-install view in the same build fails its attempt at once (one poll, no further
+/// wait). Once all attempts are spent the build returns `Err`, which OpenRaft turns into a
+/// fatal error for the node. Nothing is published in any of those attempts. No row covers it:
+/// it needs a 300 s wait.
+const INSTALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Wait until no snapshot install is in progress (F-001), polling the in-memory mirror of the
+/// marker. The mirror is set right after the marker is durable and cleared with the final
+/// batch's state, so "clear" means the next checkpoint holds either the old state or the whole
+/// new one. One poll interval always passes first: a checkpoint can catch the durable marker
+/// just before the mirror is set.
+#[allow(clippy::result_large_err)]
+async fn wait_for_install(
+    shared: &Arc<RocksShared>,
+    started: std::time::Instant,
+) -> Result<(), StorageError<RaftNodeId>> {
+    loop {
+        tokio::time::sleep(INSTALL_POLL).await;
+        // A poisoned store fails the next capture at its guard, which is the error to report.
+        if shared.is_poisoned() || shared.sm().install_in_progress.is_none() {
+            return Ok(());
+        }
+        if started.elapsed() >= INSTALL_PATIENCE {
+            return Err(io_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                format!(
+                    "a snapshot install has been in progress for over {} s; \
+                     the build view would be a mid-install image",
+                    INSTALL_PATIENCE.as_secs()
+                ),
+            ));
+        }
+    }
+}
+
+/// What one export did with its view.
+enum Exported {
+    /// The view was exported and is now `current_snapshot`.
+    Published(StoredSnapshot),
+    /// Nothing was published because a snapshot install is in flight (F-001): either the view
+    /// itself landed mid-install, or an install began after the capture and has not committed.
+    /// The build waits for the install and captures again; no attempt is spent.
+    InstallInFlight,
+    /// `current_snapshot` already covers more than the view, so the view was not published
+    /// (F-001): an install committed between the capture and the publish. `current` is the
+    /// snapshot that stays current, and the build hands that one to OpenRaft, whose
+    /// `update_snapshot` ignores a meta at or below the one it holds.
+    Superseded {
+        current: StoredSnapshot,
+        view: Option<LogId<RaftNodeId>>,
+    },
+}
+
+/// Why a view must not become `current_snapshot` now, if it must not (F-001).
+///
+/// An install in flight blocks it, because the install's final batch writes `current_snapshot`
+/// to disk *before* it takes this lock to update the mirror; a publish in that gap would see
+/// the old mirror and overwrite the installed snapshot on disk with an older one. A current
+/// snapshot that covers more than the view blocks it, because replacing it would move the
+/// snapshot this node serves backwards.
+fn publish_blocker(sm: &SmInner, view: Option<LogId<RaftNodeId>>) -> Option<Exported> {
+    if sm.install_in_progress.is_some() {
+        return Some(Exported::InstallInFlight);
+    }
+    sm.current_snapshot
+        .as_ref()
+        .filter(|current| current.last_log_id > view)
+        .map(|current| Exported::Superseded {
+            current: current.clone(),
+            view,
+        })
+}
 
 /// Holds `snapshot_builds_in_flight` up for exactly as long as one build runs, however it ends.
 struct InFlightBuild(Arc<RocksShared>);
@@ -3232,18 +3423,40 @@ impl Drop for InFlightBuild {
     }
 }
 
-/// `RocksSm`'s [`RaftSnapshotBuilder`]: exports the view captured in `get_snapshot_builder`
-/// into `<data_dir>/snapshots/<id>.snap` and publishes it (ADR-0022).
+/// `RocksSm`'s [`RaftSnapshotBuilder`]: captures a view, exports it into
+/// `<data_dir>/snapshots/<id>.snap` and publishes it (ADR-0022).
 pub struct RocksSnapshotBuilder {
     shared: Arc<RocksShared>,
-    /// The view captured when this builder was handed out, or `None` if that capture failed
-    /// and [`RocksSnapshotBuilder::build_snapshot`] must take its own.
-    captured: Option<CapturedView>,
 }
 
 impl Debug for RocksSnapshotBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RocksSnapshotBuilder")
+    }
+}
+
+impl RocksSnapshotBuilder {
+    /// Record the build time and hand OpenRaft an open handle to `stored`'s file.
+    async fn open_built(
+        &self,
+        stored: StoredSnapshot,
+        elapsed_ms: u64,
+    ) -> Result<Snapshot<TypeConfig>, StorageError<RaftNodeId>> {
+        self.shared
+            .snapshot_build_ms
+            .store(elapsed_ms, Ordering::SeqCst);
+        let path = snapshot::snap_path(&self.shared.path, &stored.snapshot_id);
+        let file = tokio::fs::File::open(&path).await.map_err(|e| {
+            io_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                format!("cannot open published snapshot {}: {e}", path.display()),
+            )
+        })?;
+        Ok(Snapshot {
+            meta: stored.meta(),
+            snapshot: Box::new(file),
+        })
     }
 }
 
@@ -3263,37 +3476,19 @@ impl RaftSnapshotBuilder<TypeConfig> for RocksSnapshotBuilder {
         let _in_flight = InFlightBuild(Arc::clone(&self.shared));
         let started = std::time::Instant::now();
         let mut last_err = None;
-        for attempt in 0..BUILD_ATTEMPTS {
-            let captured = self.captured.take();
-            if attempt > 0 {
-                self.shared
-                    .snapshot_build_retries
-                    .fetch_add(1, Ordering::SeqCst);
-            }
+        let mut attempt = 0;
+        while attempt < BUILD_ATTEMPTS {
+            // A fresh view per attempt: a failed export removes its checkpoint.
             let result = self
                 .shared
-                .run(move |s| {
-                    let view = match captured {
-                        Some(view) => view,
-                        None => capture_view(s)?,
-                    };
-                    export_snapshot(s, view)
+                .run(|s| match capture_view(s)? {
+                    Some(view) => export_snapshot(s, view),
+                    None => Ok(Exported::InstallInFlight),
                 })
                 .await;
-            match result {
-                Ok(stored) => {
-                    let elapsed = started.elapsed().as_millis() as u64;
-                    self.shared
-                        .snapshot_build_ms
-                        .store(elapsed, Ordering::SeqCst);
-                    let path = snapshot::snap_path(&self.shared.path, &stored.snapshot_id);
-                    let file = tokio::fs::File::open(&path).await.map_err(|e| {
-                        io_error(
-                            ErrorSubject::Snapshot(None),
-                            ErrorVerb::Read,
-                            format!("cannot open published snapshot {}: {e}", path.display()),
-                        )
-                    })?;
+            let elapsed = started.elapsed().as_millis() as u64;
+            let failed = match result {
+                Ok(Exported::Published(stored)) => {
                     tracing::info!(
                         snapshot_id = %stored.snapshot_id,
                         last_log_index = stored.covered_index(),
@@ -3301,15 +3496,35 @@ impl RaftSnapshotBuilder<TypeConfig> for RocksSnapshotBuilder {
                         duration_ms = elapsed,
                         "snapshot_built"
                     );
-                    return Ok(Snapshot {
-                        meta: stored.meta(),
-                        snapshot: Box::new(file),
-                    });
+                    return self.open_built(stored, elapsed).await;
                 }
-                Err(e) => {
-                    tracing::warn!(attempt, detail = %e, "snapshot_build_attempt_failed");
-                    last_err = Some(e);
+                Ok(Exported::Superseded { current, view }) => {
+                    tracing::info!(
+                        snapshot_id = %current.snapshot_id,
+                        last_log_index = current.covered_index(),
+                        view_last_log_id = ?view,
+                        duration_ms = elapsed,
+                        "snapshot_build_superseded"
+                    );
+                    return self.open_built(current, elapsed).await;
                 }
+                // F-001: an install is in flight. Not a failure, so no attempt is spent: wait
+                // for the install to commit, then capture again.
+                Ok(Exported::InstallInFlight) => {
+                    match wait_for_install(&self.shared, started).await {
+                        Ok(()) => continue,
+                        Err(e) => e,
+                    }
+                }
+                Err(e) => e,
+            };
+            tracing::warn!(attempt, detail = %failed, "snapshot_build_attempt_failed");
+            last_err = Some(failed);
+            attempt += 1;
+            if attempt < BUILD_ATTEMPTS {
+                self.shared
+                    .snapshot_build_retries
+                    .fetch_add(1, Ordering::SeqCst);
             }
         }
         self.shared
@@ -3363,7 +3578,7 @@ fn fsync_dir(dir: &Path) {
 fn export_snapshot(
     s: &RocksShared,
     view: CapturedView,
-) -> Result<StoredSnapshot, StorageError<RaftNodeId>> {
+) -> Result<Exported, StorageError<RaftNodeId>> {
     let result = export_into_file(s, &view);
     // Hard links, but a directory per interrupted build would still pin every SST file it
     // referenced and grow the data directory without bound.
@@ -3375,7 +3590,12 @@ fn export_snapshot(
 fn export_into_file(
     s: &RocksShared,
     view: &CapturedView,
-) -> Result<StoredSnapshot, StorageError<RaftNodeId>> {
+) -> Result<Exported, StorageError<RaftNodeId>> {
+    // Checked here to skip a pointless export, and again under the lock at publish, which is
+    // the check that counts.
+    if let Some(blocked) = publish_blocker(&s.sm(), view.last_applied) {
+        return Ok(blocked);
+    }
     let opts = Options::default();
     let cf_names = DB::list_cf(&opts, &view.checkpoint).map_err(|e| {
         io_error(
@@ -3543,12 +3763,38 @@ fn export_into_file(
             )
         })?,
     );
-    s.write(batch, true, ErrorSubject::Snapshot(None), ErrorVerb::Write)?;
-    s.sm().current_snapshot = Some(stored.clone());
+    {
+        // F-001: check and publish under one hold of the state-machine lock. An install sets
+        // its in-memory marker under this lock (after the durable marker, before it clears
+        // anything) and clears it, with the new `current_snapshot`, under this lock after its
+        // final batch. So with no marker seen here, an install has either committed (and the
+        // newer check sees it) or not yet set its marker, which it cannot do until this write is
+        // done; its final batch then replaces this one. Held for one small synced write, as
+        // `apply` holds it for its batch — never for the checkpoint, which stays outside the
+        // lock (A-R279).
+        let mut sm = s.sm();
+        if let Some(blocked) = publish_blocker(&sm, view.last_applied) {
+            let in_use = [
+                sm.current_snapshot.as_ref(),
+                sm.install_in_progress.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|other| other.snapshot_id == stored.snapshot_id);
+            drop(sm);
+            // The file was renamed in but never became current, so nothing serves it.
+            if !in_use {
+                let _ = std::fs::remove_file(&final_path);
+            }
+            return Ok(blocked);
+        }
+        s.write(batch, true, ErrorSubject::Snapshot(None), ErrorVerb::Write)?;
+        sm.current_snapshot = Some(stored.clone());
+    }
     s.snapshot_publications.fetch_add(1, Ordering::SeqCst);
 
     prune_snapshots(s, &stored.snapshot_id);
-    Ok(stored)
+    Ok(Exported::Published(stored))
 }
 
 /// Delete published snapshots beyond the retained count, newest first, never the current one
@@ -4061,7 +4307,15 @@ fn install_received(
         // The marker stays on disk on purpose: the state machine is mid-replacement, and the
         // next open must redo the install rather than serve a mixture.
         s.snapshot_install_failures.fetch_add(1, Ordering::SeqCst);
-        snapshot_error(e)
+        let err = snapshot_error(e);
+        // And so the store is poisoned, like every other fatal store error (critic-f A-1).
+        // Until the redo, this process holds a half-replaced state: serving a read or a build
+        // from it would serve a mixture, and the in-memory marker would stay set, so a build
+        // would wait `INSTALL_PATIENCE` for an install that will never commit. OpenRaft turns
+        // this error into a fatal one anyway; poisoning makes the store agree.
+        s.poisoned.store(true, Ordering::SeqCst);
+        tracing::error!(detail = %err, "snapshot_install_failed_store_poisoned");
+        err
     })?;
 
     let limits = *s.sm().kv.limits();

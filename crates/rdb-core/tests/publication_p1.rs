@@ -37,8 +37,8 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::publication::{
-    AppliedCandidate, FreezeCause, PubMode, PublicationEffect, PublicationEvent, StatusEntry,
-    StatusOutcome,
+    AckFloor, AppliedCandidate, FreezeCause, PubMode, PublicationEffect, PublicationEvent,
+    StatusEntry, StatusOutcome,
 };
 use rdb_core::contracts::qualification::{
     QualificationCause, QualificationChanged, QualificationDirection,
@@ -50,6 +50,7 @@ use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageEvent, StoreE
 use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{CapabilityState, ReadServiceOutcome, Version};
 use rdb_core::contracts::transport::PeerLabel;
+use rdb_core::contracts::txn::MAX_PINS;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnResult, TxnStatus};
 use rdb_core::publication::status::to_wire;
 use rdb_core::publication::{
@@ -59,7 +60,9 @@ use rdb_core::publication::{
     PUBLICATION_CORRELATION_BASE, PUBLICATION_SNAPSHOT_BASE, WAITER_CAP,
 };
 use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
-use rdb_core::transaction::dedup::{dedup_key, dedup_value};
+use rdb_core::transaction::dedup::{
+    dedup_key, dedup_value, floor_record_id, floor_value, APP_ID_MIN, FLOOR_AFFINITY, OPEN_BITS,
+};
 use rdb_core::transaction::RETENTION_CAP_ENTRIES;
 
 const NODE: NodeId = NodeId(1);
@@ -154,6 +157,7 @@ fn candidate_of(partition: PartitionId, seq: u64, request: u64) -> AppliedCandid
             Verdict::Admit,
             1,
         ),
+        ack_floor: None,
     }
 }
 
@@ -2900,6 +2904,126 @@ fn m7a_172_recovery_folds_status_by_sequence_not_by_presence() {
     }
 }
 
+/// A-R394 E2, M7A-172's twin for entries the post-apply deadline left `Unknown`: applied here,
+/// never confirmed, then a recovery. One the cutoff retained landed, so it folds to
+/// `RecoveredApplied` with the result the status seed builds; one above the cutoff stays
+/// `Unknown`, under every map, and never becomes `StatusExpired`, the answer for a dropped
+/// one. An uncertain map moves none.
+#[retcd_test]
+fn m10_r394_e2_recovery_folds_an_unknown_entry_the_cutoff_retained() {
+    let entry = |seq: u64| StatusEntry {
+        request: req(seq),
+        lineage: lineage(),
+        seq: Some(Seq(seq)),
+        record_digest: Some(d(seq)),
+        outcome: StatusOutcome::Unknown,
+        snapshot: None,
+        at: Tick::ZERO,
+    };
+    let map = |uncertain, discarded_from: Option<u64>| RetainedStatusMap {
+        predecessor_generation: GEN,
+        predecessor_cutoff: Seq(10),
+        retained_through: Seq(10),
+        discarded_from: discarded_from.map(Seq),
+        uncertain,
+    };
+    let applied = |seq: u64| StatusOutcome::RecoveredApplied {
+        result: result(P, seq),
+    };
+    let unknown = StatusOutcome::Unknown;
+    for (m, want) in [
+        (
+            map(false, Some(11)),
+            [applied(9), applied(10), unknown, unknown],
+        ),
+        (map(true, Some(11)), [unknown; 4]),
+        (
+            map(false, None),
+            [applied(9), applied(10), unknown, unknown],
+        ),
+    ] {
+        let mut index = StatusIndex::new(GEN);
+        for seq in 9..=12 {
+            index.record(entry(seq)).expect("under the cap");
+        }
+        index.fold_recovered(&m);
+        let got: Vec<_> = (9..=12).map(|seq| index.lookup(req(seq), GEN)).collect();
+        assert_eq!(got, want, "{m:?}");
+        assert_eq!(
+            index.lookup_any(req(10)),
+            want[1],
+            "{m:?}: no generation named"
+        );
+    }
+}
+
+/// The status reply for `r{n}` in the predecessor generation, as `want`.
+fn status_is(rig: &mut Rig, n: u64, want: TxnStatus) -> Vec<EffectKind> {
+    let got = rig.step(status(n, Some(GEN)));
+    assert_eq!(
+        got,
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(n),
+            status: want,
+        })],
+        "r{n}"
+    );
+    got
+}
+
+/// A-R397 (critic-e2 A4a): the quarantine arm's `Unknown` entry folds as the post-apply
+/// deadline's does. Through `Module::step`: a deny quarantines r5, then a recovery. A cutoff
+/// at r5 carried it into the new lineage, so ADR-rdb-0004's fold row answers
+/// `RECOVERED_APPLIED` with the retained result; a cutoff below it, r5 discarded, stays
+/// `Unknown`.
+#[retcd_test]
+fn m10_r397_a4_a_quarantined_entry_the_cutoff_retained_folds_to_recovered_applied() {
+    let applied = TxnStatus::Resolved(TxnResult {
+        outcome: Outcome::RecoveredApplied,
+        ..result(P, 5)
+    });
+    for (cutoff, discarded_from, want) in [(5, None, applied), (4, Some(5), TxnStatus::Unknown)] {
+        let mut rig = Rig::new();
+        let c = rig.pending_with_recheck(5);
+        let effects = rig.step(answer(
+            Checkpoint::Publication,
+            c,
+            Verdict::Deny(DenyReason::Expired),
+        ));
+        assert!(effects.contains(&quarantined(5)), "{effects:?}");
+        rig.step(recovered(
+            PartitionMode::Active,
+            cutoff,
+            false,
+            discarded_from,
+        ));
+        status_is(&mut rig, 5, want);
+    }
+}
+
+/// A-R397 (critic-e2 A4b): a write still pending when the recovery lands. Its `on_candidate`
+/// entry is `Unknown` with a seq, and the fold runs before `pending` is dropped. Above the
+/// cutoff it stays `Unknown` — never `StatusExpired`, which would say it was dropped. At the
+/// cutoff the record is on every required copy, so it answers `RecoveredApplied`, as the
+/// seed answers from its dedup row. A write dispatched but never a candidate has no entry and
+/// answers `Unknown` whatever the cutoff.
+#[retcd_test]
+fn m10_r397_a4_a_write_pending_at_recovery_resolves_only_when_the_cutoff_retained_it() {
+    let applied = TxnStatus::Resolved(TxnResult {
+        outcome: Outcome::RecoveredApplied,
+        ..result(P, 5)
+    });
+    for (cutoff, want) in [(4, TxnStatus::Unknown), (5, applied)] {
+        let mut rig = Rig::new();
+        rig.step(candidate(5, 5));
+        assert!(rig.view().pending.is_some(), "cutoff {cutoff}: r5 pending");
+        rig.step(recovered(PartitionMode::Active, cutoff, false, None));
+        assert!(rig.view().pending.is_none(), "cutoff {cutoff}: dropped");
+        status_is(&mut rig, 5, want);
+        status_is(&mut rig, 9, TxnStatus::Unknown);
+    }
+}
+
 // ---- reads ------------------------------------------------------------------------------------
 
 /// A fresh read waits behind the candidate and is served at the new published position.
@@ -5424,6 +5548,8 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
 ///   `seed_pending` (M7A-194) read the dedup namespace of the step's snapshot — rows at or below
 ///   `retained_through`, the recovered cutoff, which is the published position — and expose
 ///   whether that read is still owed; neither hands back a view or a sequence above it.
+///   `status_len` (M10 S2, A-R272) is how many status entries are held: a number, never a
+///   sequence or a view.
 /// - `status.rs`: the KA-9 wire map and the status index. `entry` hands back a status entry: its
 ///   `seq` is the request's own position and its `snapshot` is `None` while pending, so it names no
 ///   view anyone can read. `restore` and `recovered_outcome` (M7A-194) are the seed's write and
@@ -5432,6 +5558,9 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
 ///   a generation, never a sequence or a view.
 ///   `with_cap` and `cap` (PR #1 R1-F006, K-A-12) build the index with a bound and report it: a
 ///   number, never a sequence or a view.
+///   `forget_below` and `set_floor` (M10 S2, A-R255) apply an ack floor: the publish's and the
+///   seed's write, which take a floor in and hand nothing out. `floor_count` is how many floors
+///   are held: a number, never a sequence or a view.
 /// - `view.rs`: the KA-8 fake's constructor and scripting.
 const PUB_FNS: [(&str, &str, &[&str]); 4] = [
     (
@@ -5464,6 +5593,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
             "publication_snapshot",
             "published",
             "seed_pending",
+            "status_len",
             "try_seed",
             "view",
         ],
@@ -5474,7 +5604,9 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
         &[
             "cap",
             "entry",
+            "floor_count",
             "fold_recovered",
+            "forget_below",
             "is_empty",
             "is_retired",
             "len",
@@ -5486,6 +5618,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
             "recovered_outcome",
             "restore",
             "retire",
+            "set_floor",
             "to_wire",
             "trim",
             "with_cap",
@@ -7631,4 +7764,271 @@ fn a_publication_deny_for_local_storage_while_blocked_holds_after_the_re_emit() 
             cause: FreezeCause::LocalStorageFenced
         }
     );
+}
+
+// ---- M10 S2: the ack floor (A-R252, A-R255) ----------------------------------------------------
+
+/// An ack floor of `below` with `pins`.
+fn ack(below: u64, pins: &[u64]) -> AckFloor {
+    let mut pinned = [None; MAX_PINS];
+    for (slot, pin) in pinned.iter_mut().zip(pins) {
+        *slot = Some(*pin);
+    }
+    AckFloor { below, pinned }
+}
+
+impl Rig {
+    /// [`Self::published`] for a candidate that carries `floor`, as T1 fills it.
+    fn published_with_floor(&mut self, seq: u64, floor: AckFloor) {
+        self.step(EventKind::Kernel(KernelEvent::AppliedCandidate(Box::new(
+            AppliedCandidate {
+                ack_floor: Some(floor),
+                ..candidate_of(P, seq, seq)
+            },
+        ))));
+        self.qualify(seq);
+        let c = match self.step(gained(seq)).as_slice() {
+            [EffectKind::Kernel(KernelEffect::AuthorityCheck {
+                checkpoint: Checkpoint::Publication,
+                correlation,
+                ..
+            })] => *correlation,
+            other => panic!("expected one Publication check, got {other:?}"),
+        };
+        self.snapshot_at(seq);
+        let effects = self.step(answer(Checkpoint::Publication, c, Verdict::Admit));
+        assert!(published_any(&effects), "{effects:?}");
+        let (opened, _) = snapshot_ledger(&effects);
+        assert_eq!(self.step(ready_of(opened[0], seq)), vec![]);
+    }
+}
+
+/// M10 S2 P1 (A-R255): a published candidate's ack floor forgets the statuses T1 deleted, before
+/// its own status is written, and keeps the pins. Requests 5 to 8 publish plainly; 9 carries
+/// `below 8, pin 6`: 5 and 7 are forgotten, 6 stays, and 5, under the effective floor 6,
+/// answers `Expired` to the client. 10 carries `below 10`: only 10 is left, and 5 to 9 answer
+/// `Expired`. 11 carries a lower floor, `below 7`, which lowers nothing. The index never holds
+/// more than the unacknowledged ids and one floor for the open.
+#[retcd_test]
+fn m10_s2_p1_a_a_published_ack_floor_forgets_released_statuses_and_keeps_pins() {
+    let status_of = |n: u64, status: TxnStatus| {
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(n),
+            status,
+        })]
+    };
+    let index = |rig: &Rig| rig.p1.kernel(NODE, P).expect("P1 holds P").view().status;
+    let held = |rig: &Rig| -> Vec<u64> {
+        (1..=12)
+            .filter(|n| {
+                matches!(
+                    index(rig).lookup(req(*n), GEN),
+                    StatusOutcome::Published { .. }
+                )
+            })
+            .collect()
+    };
+    let mut rig = Rig::new();
+    for seq in 5..=8 {
+        rig.published(seq);
+    }
+    assert_eq!(held(&rig), [5, 6, 7, 8], "fixture: four plain publishes");
+    assert_eq!(index(&rig).floor_count(), 0, "fixture: no floor yet");
+
+    rig.published_with_floor(9, ack(8, &[6]));
+    assert_eq!(held(&rig), [6, 8, 9], "5 and 7 forgotten, the pin kept");
+    assert_eq!((index(&rig).len(), index(&rig).floor_count()), (3, 1));
+    assert_eq!(
+        rig.step(status(5, Some(GEN))),
+        status_of(5, TxnStatus::Expired)
+    );
+    assert_eq!(
+        rig.step(status(6, Some(GEN))),
+        status_of(6, TxnStatus::Resolved(result(P, 6))),
+        "a pinned id still replays"
+    );
+
+    rig.published_with_floor(10, ack(10, &[]));
+    assert_eq!(held(&rig), [10]);
+    assert_eq!((index(&rig).len(), index(&rig).floor_count()), (1, 1));
+    for n in 5..=9 {
+        assert_eq!(
+            rig.step(status(n, Some(GEN))),
+            status_of(n, TxnStatus::Expired),
+            "r{n} is under the floor"
+        );
+    }
+
+    rig.published_with_floor(11, ack(7, &[]));
+    assert_eq!(held(&rig), [10, 11], "a lower floor forgets nothing more");
+    assert_eq!(
+        rig.step(status(9, Some(GEN))),
+        status_of(9, TxnStatus::Expired),
+        "the floor never falls"
+    );
+}
+
+/// M10 S2 P1 (A-R255): the status index's floor, without the kernel. 1,000 writes, each acking
+/// the one before, leave one entry and one floor: flat. A pin never applied answers `Unknown`
+/// and the id under it `StatusExpired`. Another client, another open of the same client and an
+/// app-chosen id are untouched. A lower floor lowers nothing. Forgetting leaves no trace an index
+/// that never held the ids lacks (`by_request` included). Retire drops the generation's floors,
+/// and a floor set after it does not land.
+#[retcd_test]
+fn m10_s2_p1_b_the_status_floor_is_flat_scoped_and_retires_with_its_generation() {
+    let id = |client: u32, request: u64| RequestIdentity {
+        tenant: TenantId(1),
+        client: ClientId(client),
+        request: RequestId(request),
+    };
+    let entry = |identity: RequestIdentity| StatusEntry {
+        request: identity,
+        lineage: lineage(),
+        seq: Some(Seq(identity.request.0 % 1_000_000)),
+        record_digest: None,
+        outcome: published_status(identity.request.0 % 1_000_000),
+        snapshot: None,
+        at: Tick::ZERO,
+    };
+    let other_open = (1 << OPEN_BITS) + 3;
+    let app = APP_ID_MIN + 3;
+    let mut index = StatusIndex::new(GEN);
+    for kept in [id(2, 500), id(1, other_open), id(1, app)] {
+        index.record(entry(kept)).expect("under the cap");
+    }
+    for n in 1..=1_000 {
+        index.record(entry(id(1, n))).expect("under the cap");
+        index.forget_below(GEN, id(1, n), &ack(n, &[]));
+        assert_eq!(
+            (index.len(), index.floor_count()),
+            (4, 1),
+            "after write {n}"
+        );
+    }
+    index.forget_below(GEN, id(1, 1_010), &ack(1_010, &[1_005]));
+    let lookup = |index: &StatusIndex, identity| index.lookup(identity, GEN);
+    assert_eq!(lookup(&index, id(1, 1_004)), StatusOutcome::StatusExpired);
+    assert_eq!(
+        lookup(&index, id(1, 1_005)),
+        StatusOutcome::Unknown,
+        "a pin never applied is not under the floor"
+    );
+    for kept in [id(2, 500), id(1, other_open), id(1, app)] {
+        assert_eq!(
+            lookup(&index, kept),
+            entry(kept).outcome,
+            "{kept:?} is outside the floor's scope"
+        );
+    }
+    assert_eq!(lookup(&index, id(2, 499)), StatusOutcome::Unknown);
+    assert_eq!(
+        lookup(&index, id(1, (1 << OPEN_BITS) + 2)),
+        StatusOutcome::Unknown
+    );
+
+    index.forget_below(GEN, id(1, app), &ack(app, &[]));
+    index.set_floor(GEN, id(1, app + 1));
+    assert_eq!(index.floor_count(), 1, "an app-chosen id gets no floor");
+    index.forget_below(GEN, id(1, 900), &ack(900, &[]));
+    assert_eq!(
+        lookup(&index, id(1, 950)),
+        StatusOutcome::StatusExpired,
+        "a lower floor lowers nothing"
+    );
+
+    let mut forgot = StatusIndex::new(GEN);
+    let mut never = StatusIndex::new(GEN);
+    for n in 1..=3 {
+        forgot.record(entry(id(1, n))).expect("under the cap");
+    }
+    never.open(GEN);
+    forgot.forget_below(GEN, id(1, 4), &ack(4, &[]));
+    never.set_floor(GEN, id(1, 4));
+    assert_eq!(forgot, never, "forgetting leaves nothing behind");
+
+    index.retire(GEN);
+    assert_eq!(
+        index.floor_count(),
+        0,
+        "retire drops the generation's floors"
+    );
+    index.set_floor(GEN, id(1, 2_000));
+    assert_eq!(
+        index.floor_count(),
+        0,
+        "no floor lands in a retired generation"
+    );
+}
+
+/// M10 S2 P1 (A-R252 A1): after a restart the status seed reads T1's floor record and holds the
+/// floor, so an id T1 already deleted answers `Expired` as it did before, not `Unknown`. The
+/// snapshot holds gen `GEN`'s rows for 6 and 7 and the open's floor record at `below 6`; T1 had
+/// deleted 4 and 5. Without the record (the cut) 4 answers `Unknown`. The record itself is not
+/// loaded as a status entry.
+#[retcd_test]
+fn m10_s2_p1_c_the_status_seed_learns_the_floor_from_t1s_floor_record() {
+    let next = Generation(GEN.0 + 1);
+    let row = |n: u64| {
+        (
+            dedup_key(GEN, AffinityId(1), req(n)),
+            dedup_value(Digest::ROOT, Seq(n), EPOCH),
+        )
+    };
+    let record = (
+        dedup_key(
+            GEN,
+            FLOOR_AFFINITY,
+            RequestIdentity {
+                request: floor_record_id(0),
+                ..req(0)
+            },
+        ),
+        floor_value(RequestId(6), Seq(7), EPOCH),
+    );
+    let status_of = |n: u64, status: TxnStatus| {
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(n),
+            status,
+        })]
+    };
+    let applied = |n: u64| {
+        TxnStatus::Resolved(TxnResult {
+            outcome: Outcome::RecoveredApplied,
+            ..result(P, n)
+        })
+    };
+    for with_record in [false, true] {
+        let mut rig = Rig::new();
+        rig.snapshot.dedup = vec![row(6), row(7)];
+        if with_record {
+            rig.snapshot.dedup.push(record.clone());
+            rig.snapshot.dedup.sort();
+        }
+        rig.snapshot.generation = next;
+        rig.step(recovered(PartitionMode::Active, 7, false, None));
+        rig.snapshot_at(7);
+        let under = if with_record {
+            TxnStatus::Expired
+        } else {
+            TxnStatus::Unknown
+        };
+        for (n, want) in [(4, under), (5, under), (6, applied(6)), (7, applied(7))] {
+            assert_eq!(
+                rig.step(status(n, Some(GEN))),
+                status_of(n, want),
+                "record {with_record}: r{n}"
+            );
+        }
+        let kernel = rig.p1.kernel(NODE, P).expect("P1 holds P");
+        assert!(
+            kernel.seed_pending().is_none(),
+            "record {with_record}: loaded"
+        );
+        let view = kernel.view();
+        assert_eq!(
+            (view.status.len(), view.status.floor_count()),
+            (2, usize::from(with_record)),
+            "record {with_record}: two entries, and the floor is not one"
+        );
+    }
 }

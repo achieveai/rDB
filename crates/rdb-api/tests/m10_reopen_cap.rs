@@ -29,12 +29,19 @@ fn m10_s1_6_a_full_cap_frees_at_the_reopen_once_its_writes_aged_since_their_publ
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     let open = || {
+        // This row pins how the cap fills: the ack floor would empty it (A-R252).
         let config = DbConfig {
+            ack_floor: false,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: Some(2),
             dedup_retention: Some(RETENTION),
+            local: rdb_api::db::ALL_NODES.to_vec(),
+            links: None,
+            client: rdb_api::db::DEFAULT_CLIENT,
+            boot: None,
+            storage: rdb_api::StorageOptions::default(),
         };
         let db = rt
             .block_on(Db::open(config, Arc::clone(&store), rt.handle().clone()))

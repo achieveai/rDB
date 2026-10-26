@@ -228,12 +228,14 @@ allows; it is not a new rule.
 | Error | Retry rule | Class |
 |---|---|---|
 | `NOT_PRIMARY`, `ROUTE_CHANGED` | refresh route; **retain request identity and expected generation** | no admission |
-| `LEASE_EXPIRED`, `RECOVERY_READ_ONLY` | retry after health/authority recovers; **do not assume an already-admitted request failed** | no admission *for this submission* |
+| `LEASE_EXPIRED` | retry after health/authority recovers; **do not assume an already-admitted request failed** | proves no mutation *by this submission* (amended 2026-10-24, below) |
+| `RECOVERY_READ_ONLY` | retry after health/authority recovers; **do not assume an already-admitted request failed** | no admission *for this submission* |
 | `PROTECTION_PAUSED` | retry after health/authority recovers; **do not assume an already-admitted request failed** | proves no mutation *by this submission* (amended 2026-10-22, below) |
 | `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | definitive rejection before mutation; the caller changes the request intentionally | proves no mutation *by this submission* |
 | `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | definitive no-admission; bounded jittered retry | proves no mutation *by this submission* |
 | `UNKNOWN_OUTCOME` | query status with the **same identity**; never generate a new request id | ambiguous |
-| `GENERATION_CHANGED`, `REQUEST_ID_REUSE` | reconcile or fail; never transparent replay | ambiguous / conflicting |
+| `GENERATION_CHANGED` | reconcile or fail; never transparent replay | proves no mutation *by this submission* (amended 2026-10-23, below) |
+| `REQUEST_ID_REUSE` | reconcile or fail; never transparent replay | ambiguous / conflicting |
 | `STATUS_EXPIRED` | retention passed; absence proves nothing | ambiguous |
 | `INCOMPATIBLE_VERSION`, `CORRUPT_HISTORY` | quarantine / reject; operator or rollout action | reject |
 | `DIVERGENCE_REQUIRES_OPERATOR` | the partition is blocked (ADR-rdb-0009, B-R26): no data-path exit; retry after the operator removes the diverged copies and fences; **do not assume an already-admitted request failed** | no admission *for this submission* |
@@ -261,10 +263,69 @@ only.
 - What it does not change: the proof covers this send only (#35, above). A resend of an identity
   that may have applied still reports no proof to the app (`Db::retried`), and one waiter per
   identity keeps a resend's answer off the original's.
-- Not moved: `LEASE_EXPIRED` is also what a deny after apply answers, so it proves nothing.
-  `RECOVERY_READ_ONLY` and `DIVERGENCE_REQUIRES_OPERATOR` are unchanged by this ruling.
+- Not moved: `LEASE_EXPIRED` was then also what a deny after apply answered, so it proved
+  nothing (moved on 2026-10-24, below). `RECOVERY_READ_ONLY` and `DIVERGENCE_REQUIRES_OPERATOR`
+  are unchanged by this ruling.
 - Pinned by `a_failed_batch_answers_the_queue_behind_it` (each answer's proof) and
   `no_deny_reason_after_apply_is_paused_or_proves_no_mutation` in `rdb-core/tests/transaction_t1.rs`.
+
+**Amended 2026-10-23 (M10 S2, lead rulings A-R296 and A-R298; critic-degraded): `GENERATION_CHANGED`
+proves no mutation by this submission.** It keeps its retry rule, reconcile.
+- Why it holds: every producer refuses before apply. They are admission checks 5 and 6, the
+  `StorageDispatch` check, the dedup lookup of a request an older generation retained (§3 step 11,
+  which never executes it), and a recovery stranding the queue and an undispatched check.
+- The boundary: `DenyReason::GenerationChanged` after apply now answers `UNKNOWN_OUTCOME`, as
+  `LocalStorageFenced` does. No caller denies a write after apply this way today; the mapping keeps
+  a future one from claiming a false "definitely not applied".
+- What it does not change: the proof covers this send only (#35, above). A resend still reports no
+  proof to the app (`Db::retried`). `REQUEST_ID_REUSE` keeps no proof.
+- Pinned by `a_queued_put_stranded_by_a_new_generation_proves_no_mutation` and
+  `a_write_applied_before_a_generation_change_never_proves_no_mutation` in
+  `rdb-core/tests/transaction_t1.rs`.
+
+**Amended 2026-10-24 (M10 S2, lead rulings A-R342 and A-R343; critic-q3; tester-s2 Q3):
+`LEASE_EXPIRED` proves no mutation by this submission.** It keeps its retry rule.
+- Why it holds: every producer refuses before apply. They are admission's authority check (§3
+  check 6) and a freeze for a lost grant, the `StorageDispatch` check and its re-ask, and a
+  refused read, which writes nothing.
+- The boundary: after apply every `DenyReason` answers `UNKNOWN_OUTCOME`, the lease reasons and
+  `ControlUnavailable` (A-R285 had left it `LEASE_EXPIRED`) included. No caller denies a write
+  after apply today; the mapping keeps a future one from claiming a false "definitely not
+  applied". A kind the mapping gains later falls to `UNKNOWN_OUTCOME` in `deny_error`, never to
+  a proof.
+- Why it matters: while an owner waited to abandon a rejoin, every refused write said "not
+  proven", although nothing was written, so an app had to ask status for each one.
+- What it does not change: the proof covers this send only (#35, above). A resend still reports no
+  proof to the app (`Db::retried`). A resend that the ack floor has passed answers
+  `STATUS_EXPIRED` and is never applied.
+- Pinned by `a_lease_deny_before_apply_proves_no_mutation`,
+  `a_lease_deny_after_apply_answers_unknown_outcome` and
+  `no_deny_reason_after_apply_is_paused_or_proves_no_mutation` in
+  `rdb-core/tests/transaction_t1.rs`.
+
+**Amended 2026-10-24 (M10 S2, lead ruling A-R401 F4; critic-d4 Q3): `RECOVERY_READ_ONLY` proves
+no mutation by this submission.** It keeps its retry rule.
+- Why it holds: its one producer, `admission::freeze_error` of `FreezeCause::RecoveryReadOnly`,
+  answers only before apply: §3 check 7, the frozen queue's dispatch reply, an undispatched
+  check, and a drain of the queue. A dispatched write is kept, never answered with it (K-A-46).
+- Why it matters: S2-5's lone survivor refuses every write this way, and each refusal said "not
+  proven" although nothing was written.
+- What it does not change: the proof covers this send only (#35, above). A resend still reports
+  no proof to the app (`Db::retried`).
+- Pinned by `a_recovery_read_only_refusal_proves_no_mutation` in
+  `rdb-core/tests/transaction_t1.rs`.
+
+**Noted 2026-10-24 (M10 S2, lead rulings A-R398 and A-R399; docs only, no rule change): a fenced
+former owner also answers `NOT_PRIMARY`.** The row above, its retry rule and its class are
+unchanged.
+- The producer: an owner fenced while cut off from rEtcd reads `partitions/{p}` once the cut
+  ends. If that names another node, it answers `NOT_PRIMARY` with that node as the hint, in place
+  of the `LEASE_EXPIRED` it would give (`host_owner_learned` in its log).
+- It rewrites only a `LEASE_EXPIRED` that already proved no mutation, so the `NOT_PRIMARY` keeps
+  `no_mutation` true and the request a resend carries.
+- Pinned by `m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner`
+  and `m10_s2_a_fenced_owner_rewrites_only_a_lease_expired_that_mutated_nothing` in
+  `rdb-api/src/host/tests.rs`.
 
 ### 6. The local apply never returns success
 
@@ -277,6 +338,7 @@ publication rules are in the kernel-a design note).
 Consequences that follow and are therefore not separate decisions:
 
 - A post-apply timeout or lease loss returns `UNKNOWN_OUTCOME`, never a definitive failure (§5.3).
+  The deny mapping says the same for every reason after apply (amended 2026-10-24, §5).
 - That partition's normal read/write queue freezes until the transaction is resolved by a replica
   ACK or an explicit recovery decision. No later transaction may skip the unresolved sequence.
 - A transaction received by a replica may recover even if its client never saw success (§5.3).

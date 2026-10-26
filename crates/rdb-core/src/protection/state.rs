@@ -87,12 +87,14 @@ pub(super) struct State {
     peer_progress: BTreeMap<CopyId, Tick>,
     lost: BTreeSet<CopyId>,
     blocked: Option<BlockReason>,
-    /// Whether the next resume is this generation's first: set at construction, cleared by every
-    /// pause (ruling A-R165, ADR-0006 amendment 2026-10-23). The first resume still passes
-    /// through `Reprotecting` and still needs the exact barrier, a qualifying secondary and lag
-    /// below `resume_lag_millis`; it skips only the hold. The instance starts `Paused` because no
-    /// copy qualifies yet, not because anything oscillated, so there is nothing to damp. Every
-    /// later resume holds the full `resume_hold_millis`.
+    /// Whether the next resume is this generation's first: set at construction, spent by any pause
+    /// from a mode other than `Paused`. The rule is ADR-0006's amendment 2026-10-23 (rulings A-R165,
+    /// A-R344, A-R364): a pause while still `Paused`, such as R1's `Lost{ConfigChanged}` at the
+    /// generation's start, keeps it. The first resume still passes through `Reprotecting` and still
+    /// needs the exact barrier, a qualifying secondary and lag below `resume_lag_millis`; it skips
+    /// only the hold. The instance starts `Paused` because no copy qualifies yet, not because
+    /// anything oscillated, so there is nothing to damp. Every later resume holds the full
+    /// `resume_hold_millis`.
     first_resume: bool,
 }
 
@@ -481,8 +483,12 @@ impl State {
 
     /// `* -> Paused { paused_prefix = highest_applied, resume_barrier = highest_applied }`.
     fn pause_at_head(&mut self) {
+        // ADR-0006 amendment 2026-10-23 (A-R344, A-R364): a pause from any mode but `Paused`
+        // spends the first-resume skip; a `Lost` while still `Paused` keeps it.
+        if self.mode != Mode::Paused {
+            self.first_resume = false;
+        }
         self.mode = Mode::Paused;
-        self.first_resume = false;
         self.paused_prefix = self.highest_applied;
         self.resume_barrier = self.highest_applied;
     }

@@ -265,6 +265,13 @@ pub struct Dispatcher {
     plans: BTreeMap<(NodeId, PartitionId), PartitionConfig>,
     /// Each `(node, partition)` whose dormant receiver holds its ladder: the host's `ladders`.
     ladders: BTreeSet<(NodeId, PartitionId)>,
+    /// Each `(node, partition, generation)` whose primary was given its engine's ladder by the
+    /// `SnapshotCatchupRequired` consumer (K3, the H2 twin): once per generation. Process memory,
+    /// dropped with the process.
+    primary_ladders: BTreeSet<(NodeId, PartitionId, Generation)>,
+    /// Each `(node, partition, copy, barrier)` the `SnapshotCatchupRequired` consumer served: it
+    /// is served and logged once (lead ruling B-R48: the consumer dedups per copy and barrier).
+    snapshots_served: BTreeSet<(NodeId, PartitionId, CopyId, Seq)>,
     /// The last `RecoveryResult` each F1 emitted, by the emitter's `(node, partition)`: what a
     /// post-commit `SyncWalThrough` is served from (lead ruling B-R55 item 3, M7B-137). After
     /// commit the copies are the pinned configuration's and the cutoff lives in the new
@@ -407,6 +414,8 @@ impl Dispatcher {
             catch_ups: BTreeMap::new(),
             plans: BTreeMap::new(),
             ladders: BTreeSet::new(),
+            primary_ladders: BTreeSet::new(),
+            snapshots_served: BTreeSet::new(),
             committed: BTreeMap::new(),
             transfer_plans: BTreeMap::new(),
             transfers: BTreeMap::new(),
@@ -831,6 +840,9 @@ impl Dispatcher {
         self.catch_ups.retain(|(_, _, source), _| *source != node);
         self.plans.retain(|(held, _), _| *held != node);
         self.ladders.retain(|(held, _)| *held != node);
+        self.primary_ladders.retain(|(held, _, _)| *held != node);
+        self.snapshots_served
+            .retain(|(held, _, _, _)| *held != node);
     }
 
     /// Hold, for release with this restart, each partition's newest committed root, when its
@@ -1423,14 +1435,15 @@ impl Dispatcher {
         control: &mut ControlStore,
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        let mut effects = effects.into_iter();
-        while let Some(effect) = effects.next() {
-            if self.is_down(node) || (touches_storage(&effect) && self.crash_check(node)?) {
-                let mut rest = vec![effect];
-                rest.extend(effects);
+        let mut effects = effects;
+        // By index, so a node fence can read the views A1 emitted beside it (A-R331).
+        for index in 0..effects.len() {
+            if self.is_down(node) || (touches_storage(&effects[index]) && self.crash_check(node)?) {
+                let rest = effects.split_off(index);
                 self.deliver_while_down(node, boot, rest);
                 return Ok(());
             }
+            let effect = &effects[index];
             let site = (node, effect.partition, effect.correlation);
             match &effect.kind {
                 EffectKind::AdoptAuthority {
@@ -1449,7 +1462,7 @@ impl Dispatcher {
                     );
                 }
                 EffectKind::Control(_) => {
-                    control.submit(node, &effect)?;
+                    control.submit(node, effect)?;
                     self.pump(control, scheduler)?;
                 }
                 EffectKind::Reply(reply) => self.replies.push((node, reply.clone())),
@@ -1468,7 +1481,7 @@ impl Dispatcher {
                     self.clock.cancel(node, *id, *version);
                 }
                 EffectKind::Kernel(kernel) => {
-                    self.kernel(node, effect.from, kernel, site, scheduler)?;
+                    self.kernel(node, effect.from, kernel, site, &effects, scheduler)?;
                 }
             }
         }
@@ -1707,6 +1720,7 @@ impl Dispatcher {
         from: ModuleName,
         kernel: &KernelEffect,
         site: (NodeId, PartitionId, CorrelationId),
+        step: &[Effect],
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
         let note = match kernel {
@@ -1774,6 +1788,12 @@ impl Dispatcher {
             } => {
                 return self.send_envelopes(node, *copy, (*first, *through), site, scheduler);
             }
+            KernelEffect::SnapshotCatchupRequired { copy, barrier } => {
+                return self.snapshot_catchup(node, site.1, *copy, *barrier);
+            }
+            KernelEffect::CopyAheadOnControl { copy } => {
+                return self.copy_ahead(node, site.1, *copy, scheduler.now());
+            }
             KernelEffect::SendRecoveryEnvelopes {
                 copy,
                 from: first,
@@ -1816,6 +1836,17 @@ impl Dispatcher {
             let at = scheduler
                 .now()
                 .plus_millis(hop::delay(&self.hops, node, kernel));
+            // A node fence is every served partition's, wherever A1 sited it: the ones A1
+            // views in this step and a T1 or P1 serves (A-R324, A-R331).
+            let sites = route::node_fence_sites(kernel, site.1, step, |partition| {
+                self.transaction.kernel(node, partition).is_some()
+                    || self.publication.kernel(node, partition).is_some()
+            });
+            for partition in sites {
+                let fanned = EventKind::Kernel(event.clone());
+                let id = self.schedule(scheduler, at, (node, partition, site.2), fanned)?;
+                self.routed.insert(id);
+            }
             let id = self.schedule(scheduler, at, site, EventKind::Kernel(event))?;
             self.routed.insert(id);
             return Ok(());
@@ -1829,11 +1860,9 @@ impl Dispatcher {
         ) {
             return Ok(());
         }
-        // No consumer this harness knows: R1's `SnapshotCatchupRequired` and
-        // `CopyAheadOnControl`, and any arm added
-        // to the `#[non_exhaustive]` enum later. Refused by name, because absorbing one would
-        // drop it silently (B-R28) and every row asserting one would pass on a dispatcher that
-        // never delivered it.
+        // No consumer this harness knows: any arm added to the `#[non_exhaustive]` enum later.
+        // Refused by name, because absorbing one would drop it silently (B-R28) and every row
+        // asserting one would pass on a dispatcher that never delivered it.
         tracing::warn!(?kernel, node = node.0, "kernel effect refused: no consumer");
         Err(SimError::unavailable("harness::dispatch::deliver::kernel"))
     }
@@ -1894,6 +1923,176 @@ impl Dispatcher {
             };
             self.send_body(node, to, (config, sender), record, site, scheduler)?;
         }
+        Ok(())
+    }
+
+    /// R1's `SnapshotCatchupRequired` (the twin of the host's H2 arm, lead ruling A-R223): the
+    /// primary on `node` met a record it does not retain. Its engine still holds every record
+    /// (history is never pruned), so the consumer gives the primary its engine's ladder
+    /// ([`Replication::restore_primary_history`], K3), once per generation, and the copy's next
+    /// `NeedPrefix` — the keepalive's head draws one — walks it record by record. Each
+    /// `(copy, barrier)` is served and logged once, `snapshot_catchup_served{copy, barrier,
+    /// rungs, millis}` (B-R48: the consumer dedups).
+    ///
+    /// A new ask after the ladder was restored cannot be served by re-sending: the copy is past
+    /// the head or the probe cap ran out, and snapshot transfer waits for pruning. It is logged
+    /// `snapshot_catchup_unservable` (warn) and the copy stays behind, named.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Unavailable`] under the kernel seam when `node` hosts no primary there: a
+    /// recovery source's ask, which nothing consumes (F1's deadline answers it). The same when
+    /// the engine's ladder cannot be read or the primary refuses it, logged
+    /// `snapshot_catchup_unserved{reason}`: the engine and the primary disagree, a harness fault.
+    fn snapshot_catchup(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        copy: CopyId,
+        barrier: Seq,
+    ) -> Result<(), SimError> {
+        let started = std::time::Instant::now();
+        let unserved = |reason: &str| {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                reason,
+                "snapshot_catchup_unserved"
+            );
+            Err(SimError::unavailable("harness::dispatch::deliver::kernel"))
+        };
+        let Some(primary) = self.replication.primary(node, partition) else {
+            return unserved("no_primary");
+        };
+        let generation = primary.tracker().lineage().generation;
+        if !self
+            .snapshots_served
+            .insert((node, partition, copy, barrier))
+        {
+            return Ok(());
+        }
+        if self
+            .primary_ladders
+            .contains(&(node, partition, generation))
+        {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                generation = generation.0,
+                "snapshot_catchup_unservable"
+            );
+            return Ok(());
+        }
+        let read = match self.dormant_rungs(node, partition, generation) {
+            Ok(read) => read,
+            Err(reason) => return unserved(reason),
+        };
+        if self
+            .replication
+            .restore_primary_history(node, partition, &read)
+            .is_err()
+        {
+            return unserved("ladder_refused");
+        }
+        self.primary_ladders.insert((node, partition, generation));
+        let rungs = read.len();
+        tracing::info!(
+            node = node.0,
+            partition = partition.0,
+            copy = copy.0,
+            barrier = barrier.0,
+            generation = generation.0,
+            rungs,
+            millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "snapshot_catchup_served"
+        );
+        Ok(())
+    }
+
+    /// R1's `CopyAheadOnControl` (the twin of the host's H3 arm, I1): `copy` answered
+    /// `NeedLineage`, `NeedConfig` or `UnknownEpoch`, so it has not landed the root `node`
+    /// committed. The consumer re-posts that root to the copy's node as a member watch, which
+    /// honours a crash or a cut exactly as the first one did ([`Self::run_due_watches`]), so a
+    /// held copy is not reached early. Skipped when a watch for that member already carries the
+    /// root or a newer one; logged `copy_ahead_reposted` or `copy_ahead_pending`. The cursor that
+    /// emitted it stopped; the keepalive starts a new one once the copy has landed.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Unavailable`] under the kernel seam when `node` committed no root for the
+    /// partition (a recovery source's cursor, whose answer is F1's), logged
+    /// `copy_ahead_unrouted`; [`SimError::Config`] naming `copy` when the root's pin has no such
+    /// copy.
+    fn copy_ahead(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        copy: CopyId,
+        now: Tick,
+    ) -> Result<(), SimError> {
+        let Some((result, correlation)) = self.committed.get(&(node, partition)) else {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                "copy_ahead_unrouted"
+            );
+            return Err(SimError::unavailable("harness::dispatch::deliver::kernel"));
+        };
+        let member = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.copy == copy)
+            .map(|member| member.node)
+            .ok_or(SimError::Config { field: "copy" })?;
+        let revision = result.committed.revision;
+        let generation = result.new_generation;
+        let pending = self
+            .held
+            .iter()
+            .map(|(_, held)| held)
+            .chain(self.watches.values())
+            .any(|watch| {
+                watch.member == member
+                    && watch.partition == partition
+                    && watch.result.committed.revision >= revision
+            });
+        if pending || !self.member_watches {
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                member = member.0,
+                generation = generation.0,
+                deaf = !self.member_watches,
+                "copy_ahead_pending"
+            );
+            return Ok(());
+        }
+        let watch = Watch {
+            member,
+            emitter: node,
+            partition,
+            correlation: *correlation,
+            result: result.clone(),
+        };
+        let at = now.plus_millis(CONTROL_WATCH_MILLIS);
+        self.watches.insert((at, self.next_watch), watch);
+        self.next_watch += 1;
+        tracing::info!(
+            node = node.0,
+            partition = partition.0,
+            copy = copy.0,
+            member = member.0,
+            generation = generation.0,
+            "copy_ahead_reposted"
+        );
         Ok(())
     }
 
@@ -2234,8 +2433,12 @@ impl Dispatcher {
 
     /// The twin of the host's `restore_dormant` (A-R173): restore R1's dormant receiver for
     /// `node`'s copy of `partition` from its engine's lineage at the seed's generation. A node
-    /// running a live side (a live receiver, or a primary) keeps it. `with_history` also gives
-    /// the receiver its ladder, `(0, ROOT)` through its head, once.
+    /// running a live receiver keeps it. A live primary is no reason to skip a source (A-R278,
+    /// A-R314): R1 sources a catch-up from a receiver only, so the dormant receiver sits beside
+    /// the primary, refuses every plain append, and R1 drops it at the next `Recovered`. A
+    /// target restore (`with_history` false) beside a serving primary is refused
+    /// `serving_primary`: the receiver there only sources (A-R323).
+    /// `with_history` also gives the receiver its ladder, `(0, ROOT)` through its head, once.
     ///
     /// Never faults: a copy that cannot be restored is logged `dormant_restore_refused{reason}`
     /// and holds no receiver, so R1 refuses its catch-up `NotASource` and F1's deadline ends
@@ -2257,11 +2460,8 @@ impl Dispatcher {
             .replication
             .receiver(node, partition)
             .map(AppendReceiver::is_dormant);
-        // A live side is kept. The receiver half is pinned by m7b_136. No row reaches the primary
-        // half yet: that takes a second recovery of a live partition (slice-2 residual, A-R216).
-        if dormant == Some(false)
-            || (dormant.is_none() && self.replication.primary(node, partition).is_some())
-        {
+        // A live receiver is kept; it is pinned by m7b_136.
+        if dormant == Some(false) {
             return;
         }
         let refused = |reason: &str| {
@@ -2273,6 +2473,14 @@ impl Dispatcher {
                 "dormant_restore_refused"
             );
         };
+        let serving = self
+            .replication
+            .primary(node, partition)
+            .is_some_and(|primary| !primary.tracker().retired());
+        if serving && !with_history {
+            refused("serving_primary");
+            return;
+        }
         if dormant.is_none() {
             match self.dormant_receiver(node, partition, seed) {
                 Ok(receiver) => {
@@ -2281,6 +2489,7 @@ impl Dispatcher {
                         partition = partition.0,
                         copy = receiver.copy().0,
                         generation = receiver.lineage().generation.0,
+                        owner_epoch = receiver.lineage().owner_epoch.0,
                         head = receiver.applied_head().seq.0,
                         revision = seed.revision.0,
                         "dormant_restored"
@@ -2706,8 +2915,12 @@ impl Dispatcher {
     /// new generation. When it holds its newest older generation exactly through the cutoff,
     /// with the cutoff digest there, it links the new generation onto it at the cutoff,
     /// installs a receiver at the cutoff unless a live one is held (A-R185a), and answers the
-    /// `CopyCaughtUp` to send: caught up at the cutoff, nothing to copy. Otherwise it writes
-    /// nothing, sends nothing, and logs `land_link_refused` with the host's reason. Called once
+    /// `CopyCaughtUp` to send: caught up at the cutoff, nothing to copy. When it holds less than
+    /// the cutoff (arm 3, A-R224 item 3) it links at its own head instead, logged
+    /// `land_link_behind`, keeps or installs a receiver at that head, and answers nothing: its
+    /// `Recovered` re-anchors that receiver under the root and asks the primary for the rest,
+    /// which R1 sends as the older-stamped records they are. Otherwise it writes nothing, sends
+    /// nothing, and logs `land_link_refused` with the host's reason. Called once
     /// per `(member, partition, generation)`: [`Self::landed`] dedups the landing.
     ///
     /// The host's chain-depth guard has no twin: the memory engine has no depth ceiling.
@@ -2769,29 +2982,44 @@ impl Dispatcher {
             return refused("anchor_generation_absent");
         };
         let head = Seq(engine.buffered_applied(partition, from).0);
-        if head < cutoff {
-            return refused("held_below_base");
-        }
         if head > cutoff {
             return refused("held_past_base");
         }
-        let Some(at) = stored_digest(engine, (member, partition, from), cutoff) else {
+        // Arm 3 (arch-s2, A-R224 item 3): a copy behind the cutoff links at its own head, so
+        // the new generation holds exactly what it holds. Its digest there is not checked here:
+        // the `Recovered` that follows re-anchors the receiver at that head under the root, and
+        // R1's `NeedPrefix` lookup answers `Match` (catch-up, older-stamped records) or
+        // `Differs` (named divergence, arm 6).
+        let behind = head < cutoff;
+        let Some(at) = stored_digest(engine, (member, partition, from), head) else {
             return refused("no_record");
         };
-        if at != digest {
+        if !behind && at != digest {
             return refused("base_digest_differs");
         }
-        if engine.inherit(partition, from, generation, cutoff).is_err() {
+        if engine.inherit(partition, from, generation, head).is_err() {
             return refused("link_refused");
         }
-        tracing::info!(
-            node = member.0,
-            partition = partition.0,
-            from = from.0,
-            to = generation.0,
-            base = cutoff.0,
-            "land_link_inherited"
-        );
+        if behind {
+            tracing::info!(
+                node = member.0,
+                partition = partition.0,
+                from = from.0,
+                to = generation.0,
+                head = head.0,
+                base = cutoff.0,
+                "land_link_behind"
+            );
+        } else {
+            tracing::info!(
+                node = member.0,
+                partition = partition.0,
+                from = from.0,
+                to = generation.0,
+                base = cutoff.0,
+                "land_link_inherited"
+            );
+        }
         let held = self.replication.receiver(member, partition);
         if let Some(kept) = held.filter(|held| !held.is_dormant()) {
             // A live receiver re-anchors itself on `Recovered`, and a quarantined one stays
@@ -2815,8 +3043,8 @@ impl Dispatcher {
                     owner_epoch: result.committed.authority_view.lineage.owner_epoch,
                 },
                 head: Head {
-                    seq: cutoff,
-                    digest,
+                    seq: head,
+                    digest: at,
                 },
                 durable: DurableSeq(0),
             });
@@ -2827,7 +3055,7 @@ impl Dispatcher {
                         node = member.0,
                         partition = partition.0,
                         generation = generation.0,
-                        head = cutoff.0,
+                        head = head.0,
                         "land_receiver_installed"
                     );
                 }
@@ -2843,7 +3071,8 @@ impl Dispatcher {
                 }
             }
         }
-        Some(RecoveryEvent::CopyCaughtUp {
+        // Behind, it is not caught up: R1 walks it after its `Recovered`, and reports that.
+        (!behind).then_some(RecoveryEvent::CopyCaughtUp {
             copy,
             head: cutoff,
             digest,
@@ -3032,12 +3261,17 @@ impl Dispatcher {
             self.notes.push(withheld(SyncWithheldReason::NoDigest));
             return Ok(());
         };
+        // The holder's current boot, the process that synced (A-R239a).
+        let boot = self.boot(holder).ok_or(SimError::Config {
+            field: "holder boot",
+        })?;
         let kind = EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::DurableAt(
             DurableProof {
                 copy,
                 partition,
                 seq,
                 digest,
+                boot,
             },
         )));
         let now = scheduler.now();
@@ -3596,9 +3830,11 @@ mod tests {
     /// The split is the claim. The first four arms are recorded; the fifth has no consumer at
     /// all and is refused under its seam name. It was `SetAdmission` until B-R42 recorded that
     /// arm, then `QualificationChanged` until it was routed (2026-09-26), then R1's
-    /// `SendEnvelopes` until B-R57 gave it a provider; now R1's `SnapshotCatchupRequired`. The
-    /// example must be an arm with no consumer, so when one is given a provider, re-point it, do
-    /// not delete it.
+    /// `SendEnvelopes` until B-R57 gave it a provider, then R1's `SnapshotCatchupRequired` until
+    /// M10 slice 2 gave it the H2 twin. Every arm now has a consumer, so the example is that
+    /// effect on a node hosting no primary, a recovery source's ask, which nothing consumes
+    /// (`snapshot_catchup_unserved{reason: no_primary}`). When it is given a provider, re-point
+    /// it, do not delete it.
     #[test]
     fn recorded_arms_are_kept_and_a_later_kernel_event_half_is_still_refused() {
         use rdb_core::contracts::errors::ErrorKind;
@@ -3675,7 +3911,7 @@ mod tests {
             Err(crate::error::SimError::Unavailable {
                 seam: "harness::dispatch::deliver::kernel"
             }),
-            "SnapshotCatchupRequired has no consumer, so it is refused"
+            "SnapshotCatchupRequired on a node with no primary has no consumer, so it is refused"
         );
         assert!(dispatcher.has_notes());
         assert_eq!(
@@ -3760,6 +3996,118 @@ mod tests {
                 scheduled_at: Tick(10),
             }),
             "and the armed tick survives on the payload"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dormant_twin_tests {
+    //! A-R323 A-7 (W6b): the simulator's twin of the host's `restore_dormant` beside a serving
+    //! primary. No scenario reaches it: the simulator has no rejoin, so its only catch-ups run
+    //! after a restart of every copy, when no node serves a primary yet.
+
+    use rdb_core::contracts::authority::Lineage;
+    use rdb_core::contracts::envelope::ReplicaProgress;
+    use rdb_core::contracts::ids::{
+        AppliedSeq, BootId, ConfigVersion, DurableSeq, Generation, NodeId, OwnerEpoch, PartitionId,
+        ReceivedSeq, ReplicaRole, Revision, Seq,
+    };
+    use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+    use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
+
+    use super::{Dispatcher, DormantSeed};
+    use crate::storage::history::canonical_history;
+    use crate::storage::memory::MemoryEngine;
+
+    const OWNER: NodeId = NodeId(1);
+    const P: PartitionId = PartitionId(1);
+    const HEAD: u64 = 3;
+
+    /// Node 1 serving generation 1 of `P` at [`HEAD`] as copy 0's primary, its engine holding
+    /// the same records, and the seed a catch-up routed through it carries.
+    fn serving_owner() -> (Dispatcher, DormantSeed) {
+        let lineage = Lineage {
+            partition: P,
+            generation: Generation(1),
+            owner_epoch: OwnerEpoch(1),
+        };
+        let member = |copy: u8, node: u32, role| Member {
+            copy: CopyId(copy),
+            node: NodeId(node),
+            boot: BootId(1),
+            role,
+        };
+        let config = PartitionConfig::new(
+            P,
+            ConfigVersion(1),
+            vec![
+                member(0, 1, ReplicaRole::Primary),
+                member(1, 2, ReplicaRole::RegularSecondary),
+                member(2, 3, ReplicaRole::RegularSecondary),
+            ],
+        );
+        let history = canonical_history(lineage, ConfigVersion(1), HEAD).expect("history");
+        let mut engine = MemoryEngine::new(OWNER);
+        for batch in &history.batches {
+            engine.commit(batch.clone()).expect("commit");
+        }
+        let mut ladder = DigestLadder::new();
+        for seq in 1..=HEAD {
+            ladder.insert(Seq(seq), history.digest(seq));
+        }
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register_node(OWNER, BootId(1));
+        dispatcher.engines.insert(OWNER, engine);
+        dispatcher.replication.install_primary(
+            ProgressTracker::new(TrackerInit {
+                config: config.clone(),
+                own: CopyId(0),
+                lineage,
+                history: ladder,
+                local: ReplicaProgress {
+                    received: ReceivedSeq(HEAD),
+                    buffered_applied: AppliedSeq(HEAD),
+                    durable: DurableSeq(HEAD),
+                },
+            })
+            .expect("node 1's tracker"),
+        );
+        let seed = DormantSeed {
+            config,
+            lineage,
+            revision: Revision(1),
+        };
+        (dispatcher, seed)
+    }
+
+    /// A-R314 and A-R323: beside a serving primary, a source restore (`with_history`) installs
+    /// the dormant receiver at the engine's head with its ladder, so R1 can source the catch-up
+    /// from the owner; a target restore installs nothing. Cuts: the old early return on a
+    /// primary put back, no receiver after the source restore, red; the target skip removed, a
+    /// receiver after the target restore, red. Unit, under a second.
+    #[test]
+    fn beside_a_serving_primary_a_source_restore_installs_and_a_target_restore_does_not() {
+        let (mut dispatcher, seed) = serving_owner();
+        dispatcher.restore_dormant(OWNER, P, &seed, false);
+        assert!(
+            dispatcher.replication.receiver(OWNER, P).is_none(),
+            "a target restore installed a receiver beside the primary"
+        );
+
+        dispatcher.restore_dormant(OWNER, P, &seed, true);
+        let receiver = dispatcher
+            .replication
+            .receiver(OWNER, P)
+            .expect("a source restore installs the dormant receiver beside the primary");
+        assert!(receiver.is_dormant());
+        assert_eq!(receiver.applied_head().seq, Seq(HEAD));
+        assert!(
+            dispatcher.ladders.contains(&(OWNER, P)),
+            "and builds its ladder"
+        );
+        assert!(
+            dispatcher.replication.primary(OWNER, P).is_some(),
+            "the primary stays"
         );
     }
 }

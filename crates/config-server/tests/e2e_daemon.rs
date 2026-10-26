@@ -668,13 +668,23 @@ async fn e2e_10_cross_process_trace_correlation() {
     })
     .await;
 
-    let traced: Vec<serde_json::Value> = nodes
-        .iter()
-        .flat_map(|n| support::log_lines(&n.log_file()))
-        .filter(|line| {
-            line.get("trace_id").and_then(serde_json::Value::as_str) == Some(trace_id.as_str())
+    // Health can show the put before its lines reach the files (A-R309), so wait for them: a
+    // traced line on every node, and the leader's apply line.
+    let is_traced = |line: &serde_json::Value| {
+        line.get("trace_id").and_then(serde_json::Value::as_str) == Some(trace_id.as_str())
+    };
+    let mut traced: Vec<serde_json::Value> = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let lines = support::log_lines_when(&node.log_file(), |lines| {
+            lines.iter().any(|line| {
+                is_traced(line)
+                    && (index != leader
+                        || line.get("op").and_then(serde_json::Value::as_str) == Some("apply"))
+            })
         })
-        .collect();
+        .await;
+        traced.extend(lines.into_iter().filter(|line| is_traced(line)));
+    }
     assert!(
         !traced.is_empty(),
         "no daemon line carried trace_id {trace_id}; the client's trace never crossed a process \
@@ -738,7 +748,16 @@ async fn e2e_11_per_process_log_files_exist_and_are_tagged() {
     wait_formed(&harness, &nodes).await;
 
     for node in &nodes {
-        let lines = support::log_lines(&node.log_file());
+        // Formation can finish before a node's lines reach its file (A-R309): wait for one of
+        // its own lines, which the assertions below need.
+        let lines = support::log_lines_when(&node.log_file(), |lines| {
+            lines.iter().any(|l| {
+                !l.get("@logger")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| t.starts_with("openraft") || t.starts_with("memberlist"))
+            })
+        })
+        .await;
         assert!(!lines.is_empty(), "node {} logged nothing", node.node_id());
         let methods: std::collections::BTreeSet<&str> = lines
             .iter()
@@ -858,13 +877,18 @@ async fn e2e_13_unlisted_principal_denied_at_process_level() {
         "expected PermissionDenied, got {error:?}"
     );
 
-    let denials: Vec<serde_json::Value> = support::log_lines(&nodes[leader].log_file())
-        .into_iter()
-        .filter(|line| {
-            line.get("decision").and_then(serde_json::Value::as_str) == Some("deny")
-                && line.get("principal").and_then(serde_json::Value::as_str)
-                    == Some(UNLISTED_PRINCIPAL)
+    let is_denial = |line: &serde_json::Value| {
+        line.get("decision").and_then(serde_json::Value::as_str) == Some("deny")
+            && line.get("principal").and_then(serde_json::Value::as_str) == Some(UNLISTED_PRINCIPAL)
+    };
+    // The refusal can reach the client before its audit line reaches the file (A-R309).
+    let denials: Vec<serde_json::Value> =
+        support::log_lines_when(&nodes[leader].log_file(), |lines| {
+            lines.iter().any(is_denial)
         })
+        .await
+        .into_iter()
+        .filter(|line| is_denial(line))
         .collect();
     assert!(
         !denials.is_empty(),
@@ -2445,6 +2469,22 @@ async fn wait_on_policy_state(process: &DaemonProcess, state: serde_json::Value)
     }
 }
 
+/// The `reason` of every `policy_rejected` line in `log`, in order, consecutive repeats collapsed:
+/// the poller logs one per tick while a file stays bad, so the count is timing (#58).
+fn e46_rejection_reasons(log: &std::path::Path) -> Vec<String> {
+    let mut reasons = support::log_lines(log)
+        .iter()
+        .filter(|l| support::log_field(l, "@m") == Some("policy_rejected"))
+        .map(|l| {
+            support::log_field(l, "reason")
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    reasons.dedup();
+    reasons
+}
+
 /// Wait until `log` holds at least `want` lines carrying `@m == message`, or fail loudly.
 async fn wait_for_log_message(log: &std::path::Path, message: &str, want: usize) {
     let started = tokio::time::Instant::now();
@@ -2540,27 +2580,34 @@ async fn e2e_46_daemon_break_glass_rollback_is_audited() {
     for &index in &ordinary {
         fixtures[index].write(5, &E46_V5_PREFIXES, &[]);
     }
+    // The write is two renames. A tick between them sees the v5 signature beside the v9
+    // document and refuses it as `version_binding` before any `rollback` line, and every later
+    // tick logs `rollback` again (#58). So the row waits for the reason, not for a line count,
+    // and allows exactly that one earlier reason.
     for &index in &ordinary {
-        let log = support::log_file(&harness.nodes[index]);
-        wait_for_log_message(&log, "policy_rejected", 1).await;
+        let log = &support::log_file(&harness.nodes[index]);
+        let reasons = poll_until_async(deadline(10), Duration::from_millis(50), || async move {
+            let reasons = e46_rejection_reasons(log);
+            (reasons.last().map(String::as_str) == Some("rollback")).then_some(reasons)
+        })
+        .await
+        .unwrap_or_else(|Timeout { elapsed, .. }| {
+            panic!(
+                "node {}: no rollback refusal within {elapsed:?}: {:?}",
+                harness.nodes[index].node_id,
+                e46_rejection_reasons(log)
+            )
+        });
+        assert!(
+            reasons == ["rollback"] || reasons == ["version_binding", "rollback"],
+            "node {}: {reasons:?}",
+            harness.nodes[index].node_id
+        );
         let health = support::health(processes[index].health_endpoint()).await;
         assert_eq!(
             health.policy_version,
             Some(9),
             "a refused rollback must not move node {}'s active version: {health:#?}",
-            harness.nodes[index].node_id
-        );
-        let rejected: Vec<serde_json::Value> = support::log_lines(&log)
-            .into_iter()
-            .filter(|l| support::log_field(l, "@m") == Some("policy_rejected"))
-            .collect();
-        assert_eq!(
-            rejected
-                .last()
-                .and_then(|l| l.get("reason"))
-                .and_then(serde_json::Value::as_str),
-            Some("rollback"),
-            "node {}: {rejected:#?}",
             harness.nodes[index].node_id
         );
     }
@@ -2570,6 +2617,11 @@ async fn e2e_46_daemon_break_glass_rollback_is_audited() {
     processes[BREAK_GLASS]
         .stop_gracefully(startup_deadline())
         .await;
+    // The stopped process wrote all its lines on exit; the restart appends to the same file.
+    let loads_before = support::count_messages(
+        &support::log_file(&harness.nodes[BREAK_GLASS]),
+        "policy_loaded",
+    );
     std::fs::remove_file(&harness.nodes[BREAK_GLASS].shutdown_file)
         .expect("remove the shutdown file before restarting (E2E-08's own rule)");
     let mut spec = harness.spec(BREAK_GLASS);
@@ -2582,10 +2634,15 @@ async fn e2e_46_daemon_break_glass_rollback_is_audited() {
     wait_on_policy_version(&restarted, 9).await;
     processes[BREAK_GLASS] = restarted;
     let bg_log = support::log_file(&harness.nodes[BREAK_GLASS]);
-    let restart_load = support::log_lines(&bg_log)
-        .into_iter()
-        .rfind(|l| support::log_field(l, "@m") == Some("policy_loaded"))
-        .expect("the restart's own startup adoption is logged");
+    let is_load = |l: &serde_json::Value| support::log_field(l, "@m") == Some("policy_loaded");
+    // Health can show version 9 before the load's line reaches the file (A-R309).
+    let restart_load = support::log_lines_when(&bg_log, |lines| {
+        lines.iter().filter(|l| is_load(l)).count() > loads_before
+    })
+    .await
+    .into_iter()
+    .rfind(|l| is_load(l))
+    .expect("the restart's own startup adoption is logged");
     assert_eq!(
         restart_load
             .get("break_glass")
@@ -2732,9 +2789,9 @@ fn e40_write_policy(dir: &std::path::Path, version: u64, grants: &[(&str, &str)]
     }
     .encode()
     .expect("an envelope encodes");
-    // Signature written first, exactly as `PolicyFixture::write` orders it: the poller reads
-    // the document then the signature, and the reverse order would hand it a `hash_mismatch` on
-    // every rotation for one tick.
+    // Signature written first, as `PolicyFixture::write` orders a rotation. Neither order hides
+    // a rotation: a tick between the two renames sees a mixed pair and refuses it (#58). This
+    // row counts no refusals, so that one tick is harmless here.
     write_staged(&dir.join("policy.json.sig"), &envelope);
     write_staged(&dir.join("policy.json"), &bytes);
 }

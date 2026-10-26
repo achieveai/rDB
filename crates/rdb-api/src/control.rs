@@ -33,6 +33,8 @@ use config_core::{
     MutationResponse, PutRequest, WatchItem, WatchRequest,
 };
 use futures::StreamExt;
+use rdb_core::authority::grant::GrantRecord;
+use rdb_core::contracts::authority::FencingProof;
 use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
     ControlRecord, ReadOutcome, WatchCursor, WatchTermination,
@@ -44,7 +46,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
-use crate::host::Msg;
+use crate::host::{FenceFacts, Msg};
 use crate::transport::Links;
 
 /// Where a completion goes: the asking node and the boot it asked under, and the effect's
@@ -219,6 +221,128 @@ impl ControlAdapter {
                         }
                     }
                     Err(error) => fault(&links, site, "activate", error.to_string()),
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
+    /// A-R399 (tester-final D3): after a node fence, read who `partitions/{partition}` names as
+    /// owner, for the host's refusals only. Retries at [`retry_backoff`] of the attempt while
+    /// the store does not answer (a [`transient`] error: the node may still be cut from rEtcd);
+    /// any other error is logged once as a warning and answers `None`. Stops at the first
+    /// answer: [`Msg::OwnerLearned`] with the owner, or `None` when the record is absent or does
+    /// not decode. It never posts a control event, so A1 never hears it. Tracked with the
+    /// node's calls, so a restart abandons it.
+    pub fn read_owner_after_fence(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        fence: u64,
+    ) {
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                let key = ControlKey::Partition(partition).encode();
+                let mut attempt = 0_u32;
+                let owner = loop {
+                    let read = store
+                        .get(GetRequest {
+                            key: Bytes::from(key.clone()),
+                        })
+                        .await;
+                    match read {
+                        Ok(read) => {
+                            break read.record.and_then(|found| {
+                                rdb_core::authority::partition::PartitionRecord::decode(
+                                    &found.value,
+                                )
+                                .map(|record| record.owner)
+                            });
+                        }
+                        // critic-d3 A1: an error retrying cannot cure is said once, and the
+                        // host keeps refusing `LEASE_EXPIRED`.
+                        Err(error) if !transient(&error) => {
+                            tracing::warn!(
+                                node = node.0,
+                                partition = partition.0,
+                                attempt,
+                                %error,
+                                "host_owner_read_failed"
+                            );
+                            break None;
+                        }
+                        Err(error) => {
+                            attempt = attempt.saturating_add(1);
+                            tracing::debug!(
+                                node = node.0,
+                                partition = partition.0,
+                                attempt,
+                                %error,
+                                "host_owner_read_retry"
+                            );
+                            tokio::time::sleep(retry_backoff(attempt)).await;
+                        }
+                    }
+                };
+                let msg = Msg::OwnerLearned {
+                    boot,
+                    partition,
+                    fence,
+                    owner,
+                };
+                if links.post(node, msg).is_err() {
+                    tracing::debug!(node = node.0, "control_completion_unclaimed");
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
+    /// A-R446: for a routed `FenceProven`, read `partitions/1` and then its owner's grant once,
+    /// and answer [`Msg::FenceBound`] with the proof and what was read, or why it could not be.
+    /// With `recheck_after`, it waits that long first and the answer is marked `rechecked`
+    /// (A-R446b: [`crate::host::fence_recheck_millis`]). No other retry: a refused fence fails
+    /// its promote loud ("promote again"). It never posts a
+    /// control event, so A1 never hears it. Tracked with the node's calls, so a restart
+    /// abandons it.
+    pub fn read_fence_facts(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        correlation: CorrelationId,
+        proof: Box<FencingProof>,
+        recheck_after: Option<std::time::Duration>,
+    ) {
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                if let Some(wait) = recheck_after {
+                    tokio::time::sleep(wait).await;
+                }
+                let facts = fence_facts(&*store, proof.control_revision).await;
+                let msg = Msg::FenceBound {
+                    boot,
+                    partition,
+                    correlation,
+                    proof,
+                    facts,
+                    rechecked: recheck_after.is_some(),
+                };
+                if links.post(node, msg).is_err() {
+                    tracing::debug!(node = node.0, "control_completion_unclaimed");
                 }
             }
             .instrument(Span::current()),
@@ -452,6 +576,47 @@ async fn call(
 const RETRY_BACKOFF_BASE_MILLIS: u64 = 50;
 /// The longest wait between two attempts (M9 S2a ruling, critic A3).
 const RETRY_BACKOFF_CAP_MILLIS: u64 = 2_000;
+
+/// [`ControlAdapter::read_fence_facts`]'s three reads: `partitions/1` (as a promote reads it),
+/// then `grants/{owner}` of the owner it names, then the plan stored for the proof's
+/// `control_revision` (A-R447: [`crate::admin::promote_operation`]).
+async fn fence_facts(store: &dyn ConfigStore, revision: Revision) -> Result<FenceFacts, String> {
+    let (record, root, mod_revision, _) = crate::admin::read_partition(store)
+        .await
+        .map_err(|error| error.to_string())?;
+    let key = ControlKey::Grant(record.owner).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| format!("get {key}: {error}"))?;
+    let grant = match read.record {
+        None => None,
+        Some(found) => Some(GrantRecord::decode(&found.value).ok_or_else(|| {
+            format!(
+                "{key} at revision {} is not a grant record",
+                found.mod_revision
+            )
+        })?),
+    };
+    let key = crate::admin::promote_operation(revision)?.encode();
+    let plan = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| format!("get {key}: {error}"))?
+        .record
+        .map(|found| found.value);
+    Ok(FenceFacts {
+        record,
+        owner_boot: root.owner_boot,
+        mod_revision: Revision(mod_revision),
+        grant,
+        plan,
+    })
+}
 
 /// How long to wait after failed attempt `attempt` (1-based): 50, 100, 200 ms ... capped at 2 s.
 /// A reload's lists and a family's re-watches both wait this.
@@ -743,8 +908,10 @@ async fn watch(
     let opened_at = tokio::time::Instant::now();
     let mut served = false;
     let started = Instant::now();
+    // Watches are leader-served: open at the leader wherever it is, not at one endpoint
+    // (#57, A-R229).
     let opened = store
-        .watch(WatchRequest {
+        .watch_leader(WatchRequest {
             prefix: Bytes::from_static(name.as_bytes()),
             start_after_revision: from.0,
             progress_interval: None,
@@ -771,7 +938,7 @@ async fn watch(
                     Err((kind, detail)) => return fault(&links, site, kind, detail),
                 };
                 cursor = Revision(event.revision);
-                tracing::debug!(
+                tracing::info!(
                     node = site.node.0,
                     prefix = name,
                     revision = event.revision,
@@ -979,7 +1146,7 @@ mod tests {
     fn a_watch_that_ends_names_why_to_its_node() {
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let cases = [
             (
                 ConfigError::RevisionCompacted {
@@ -1148,7 +1315,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
         adapter.submit(
             NodeId(1),
@@ -1256,7 +1423,7 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as _;
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
         let reload = || {
             adapter.submit(
@@ -1317,7 +1484,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1383,7 +1550,7 @@ mod tests {
         });
         let links = Links::new();
         let (tx, _rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1462,8 +1629,8 @@ mod tests {
         let links = Links::new();
         let (tx1, rx1) = std::sync::mpsc::channel();
         let (tx2, rx2) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx1);
-        links.register(NodeId(2), tx2);
+        links.register(NodeId(1), tx1, crate::host::BOOT);
+        links.register(NodeId(2), tx2, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1567,7 +1734,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1682,7 +1849,7 @@ mod tests {
         }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),
@@ -1779,6 +1946,9 @@ mod tests {
     struct ScriptedWatch {
         streams: Mutex<BTreeMap<String, std::collections::VecDeque<Stream>>>,
         arrivals: Mutex<Vec<tokio::time::Instant>>,
+        /// Refuse every `watch` and serve the script on `watch_leader` only, as a store whose
+        /// first endpoint is a follower does (#57).
+        leader_only: bool,
     }
 
     impl ScriptedWatch {
@@ -1791,6 +1961,7 @@ mod tests {
                         .collect(),
                 ),
                 arrivals: Mutex::new(Vec::new()),
+                leader_only: false,
             }
         }
     }
@@ -1843,6 +2014,29 @@ mod tests {
             'a: 'b,
             Self: 'b,
         {
+            if self.leader_only {
+                return Box::pin(std::future::ready(Err(ConfigError::NotLeader {
+                    hint: None,
+                })));
+            }
+            self.open(request)
+        }
+
+        fn watch_leader<'a, 'b>(
+            &'a self,
+            request: WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.open(request)
+        }
+    }
+
+    impl ScriptedWatch {
+        /// The next scripted stream for `request`'s prefix.
+        fn open(&self, request: WatchRequest) -> Reply<'_, config_core::WatchStream> {
             lock(&self.arrivals).push(tokio::time::Instant::now());
             let prefix = String::from_utf8_lossy(&request.prefix).into_owned();
             let next = lock(&self.streams)
@@ -1865,6 +2059,102 @@ mod tests {
                 Box::pin(futures::stream::iter(items).chain(quiet));
             Box::pin(std::future::ready(Ok(stream)))
         }
+    }
+
+    /// M10 S2 (#57 walk, lead to W7): each rEtcd event a watch delivers is logged
+    /// `control_watch_event` at info, so a walk at rdb_dev's default level sees a change reach a
+    /// node. It was debug, below what a walk reads. Cut: back to debug, and `@l` reads `Debug`.
+    /// Unit.
+    #[config_log::retcd_test]
+    fn a_delivered_watch_event_is_logged_at_info() {
+        let script = BTreeMap::from([(
+            ControlPrefix::Partitions.encode().to_owned(),
+            vec![Stream::of(vec![Ok(WatchItem::Event(
+                config_core::MutationEvent {
+                    revision: 4,
+                    key: Bytes::from_static(b"partitions/1"),
+                    kind: config_core::MutationEventKind::Delete,
+                },
+            ))])],
+        )]);
+        let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch::new(script));
+        let links = Links::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx, crate::host::BOOT);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(watch(
+            store,
+            links,
+            SITE,
+            ControlPrefix::Partitions,
+            Revision(2),
+            Arc::new(AtomicU32::new(0)),
+        ));
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            "a_delivered_watch_event_is_logged_at_info",
+        )
+        .into_iter()
+        .filter(|line| line["@m"] == "control_watch_event")
+        .collect();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0]["@l"], "Information", "{}", lines[0]);
+        assert_eq!(lines[0]["revision"], 4, "{}", lines[0]);
+    }
+
+    /// #57 (A-R229): a node's control watch opens at the leader. Through a store whose `watch`
+    /// is refused `NotLeader` (its first endpoint a follower) and whose `watch_leader` serves,
+    /// the node still gets the change. Cut: open with `watch` again, and the node gets a
+    /// `NotLeader` termination instead. Unit.
+    #[test]
+    fn a_control_watch_opens_at_the_leader() {
+        let script = BTreeMap::from([(
+            ControlPrefix::Partitions.encode().to_owned(),
+            vec![Stream::of(vec![Ok(WatchItem::Event(
+                config_core::MutationEvent {
+                    revision: 4,
+                    key: Bytes::from_static(b"partitions/1"),
+                    kind: config_core::MutationEventKind::Delete,
+                },
+            ))])],
+        )]);
+        let store = ScriptedWatch {
+            leader_only: true,
+            ..ScriptedWatch::new(script)
+        };
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx, crate::host::BOOT);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(watch(
+            Arc::new(store),
+            links,
+            SITE,
+            ControlPrefix::Partitions,
+            Revision(2),
+            Arc::new(AtomicU32::new(0)),
+        ));
+        let first = rx.try_iter().find_map(|msg| match msg {
+            Msg::Control { event, .. } => Some(event),
+            _ => None,
+        });
+        assert_eq!(
+            first,
+            Some(ControlEvent::Watched {
+                prefix: ControlPrefix::Partitions,
+                cursor: WatchCursor {
+                    revision: Revision(4)
+                },
+                changes: vec![ControlChange {
+                    key: ControlKey::Partition(PartitionId(1)),
+                    revision: Revision(4),
+                }],
+            })
+        );
     }
 
     /// A resume point is only right if it is the furthest revision the node was told about:
@@ -1908,7 +2198,7 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch::new(script));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
@@ -2003,7 +2293,7 @@ mod tests {
         )])));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        links.register(NodeId(1), tx);
+        links.register(NodeId(1), tx, crate::host::BOOT);
         let adapter = ControlAdapter::new(
             Arc::clone(&store) as Arc<dyn ConfigStore>,
             rt.handle().clone(),

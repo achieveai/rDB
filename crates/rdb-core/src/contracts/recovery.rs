@@ -25,7 +25,7 @@ use crate::contracts::authority::{
     AuthorityView, BlockReason, FenceCredential, FencingProof, Lineage, PartitionMode,
 };
 use crate::contracts::digest::Digest;
-use crate::contracts::ids::{DurableSeq, Generation, PartitionId, Revision, Seq};
+use crate::contracts::ids::{BootId, DurableSeq, Generation, PartitionId, Revision, Seq};
 use crate::contracts::membership::{CopyId, PartitionConfig};
 use crate::contracts::time::Tick;
 use crate::contracts::trace::QuarantineReason;
@@ -55,6 +55,13 @@ pub struct DurableProof {
     pub seq: DurableSeq,
     /// The digest at that position, so a proof cannot be reused against a different history.
     pub digest: Digest,
+    /// The boot of the process that synced (M10 S2, rulings A-R239, A-R239a). The host stamps
+    /// it from the answering node's authenticated link (the R2-A2 handshake), never from the
+    /// copy's own claim; the simulator, from the holder's current boot. F1's barrier counts a
+    /// proof only from the boot its plan names for that copy (`Member::boot`): a copy that
+    /// restarted has lost what it had not synced, so its new boot's proof does not stand for the
+    /// boot the commit would name.
+    pub boot: BootId,
 }
 
 /// Why a proof set does not establish a barrier (team kernel-b `design.md` §5.6).
@@ -620,6 +627,12 @@ pub enum RecoveryEffect {
     /// Divergence evidence, kept for the operator.
     Quarantine(DivergenceEvidence),
     /// Automatic promotion is blocked, and why.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, rulings A-R204, A-R225):** whether the block lasts is F1's
+    /// phase after the step, not this effect (A-R102, A-R182); a host reads it from there. A
+    /// barrier deadline is retried first: `BarrierIncomplete` is emitted here only after
+    /// [`crate::recovery::BARRIER_ATTEMPTS`] attempts (1x, 2x and 4x the discovery window), so
+    /// writes stay paused for at most 7 windows before it.
     BlockPromotion {
         /// Why.
         reason: BlockReason,

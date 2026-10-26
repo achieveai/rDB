@@ -1699,11 +1699,13 @@ fn h1_scaffolding_the_resume_hold_start_is_traced_when_set_and_when_cleared() {
     support::preamble();
     let mut seed = vec![
         l1_fixture::on_primary(0, l1_fixture::recovered(40)),
-        // A `Lost` edge pauses again, so the resume below is not the generation's first and
-        // holds the full `resume_hold_millis` (ruling A-R165).
-        l1_fixture::on_primary(5, l1_fixture::lost()),
         l1_fixture::on_primary(10, l1_fixture::gained()),
         l1_fixture::on_primary(20, l1_fixture::durable(40)),
+        // The evaluation at 50 starts the first resume; a `Lost` edge interrupts it, so the
+        // resume below is not the generation's first and holds the full `resume_hold_millis`
+        // (ruling A-R165). A `Lost` while still `Paused` would not do (A-R344).
+        l1_fixture::on_primary(60, l1_fixture::lost()),
+        l1_fixture::on_primary(70, l1_fixture::gained()),
     ];
     let reports = (100..=1_000)
         .step_by(100)
@@ -1738,6 +1740,9 @@ fn h1_scaffolding_the_resume_hold_start_is_traced_when_set_and_when_cleared() {
     assert_eq!(
         shape,
         vec![
+            // Paused at recovery; the first resume starts at 50 and the `Lost` at 60 ends it.
+            (ProtectionPhase::Paused, false),
+            (ProtectionPhase::Resuming, false),
             (ProtectionPhase::Paused, false),
             (ProtectionPhase::Resuming, false),
             (ProtectionPhase::Resuming, true),
@@ -1755,13 +1760,13 @@ fn h1_scaffolding_the_resume_hold_start_is_traced_when_set_and_when_cleared() {
             );
         }
     }
-    let restarted = lines[4].2.expect("the second hold's start");
+    let restarted = lines[6].2.expect("the second hold's start");
     assert!(
         restarted >= 1_500,
         "the second hold starts after the silence"
     );
     assert!(
-        lines[5].0 - restarted >= 5_000,
+        lines[7].0 - restarted >= 5_000,
         "Healthy only after resume_hold_millis of the second hold: {lines:?}"
     );
 }
@@ -2193,6 +2198,12 @@ fn fanout_result(revision: u64) -> rdb_core::contracts::recovery::RecoveryResult
         partition: l1_fixture::PARTITION,
         seq: DurableSeq(cutoff.0),
         digest,
+        boot: result
+            .committed
+            .pinned_config
+            .member(CopyId(2))
+            .expect("copy 2 is a member")
+            .boot,
     };
     result.barrier = RecoveryBarrier::try_new(
         &[proof],

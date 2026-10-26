@@ -32,6 +32,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::protection::{AdmissionState, ReplicationLag};
+use rdb_core::contracts::publication::AckFloor;
 use rdb_core::contracts::recovery::{
     CommittedRoot, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap, SelectedLineage,
 };
@@ -43,14 +44,16 @@ use rdb_core::contracts::trace::{CapabilityState, Version};
 use rdb_core::contracts::txn::{
     scoped_key, Condition, Durability, Mutation, Outcome, TxnRequest, TxnResult, KEY_SCOPE_LEN,
 };
+use rdb_core::publication::POST_APPLY_DEADLINE_MILLIS;
 use rdb_core::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
 use rdb_core::transaction::admission::{MAX_CONDITIONS, MAX_REQUEST_MUTATIONS};
 use rdb_core::transaction::dedup::{
-    dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, SEED_PAGE,
+    dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, APP_ID_MIN, DEDUP_KEY_LEN,
+    DEDUP_VALUE_LEN, MAX_PINS, OPEN_BITS, OPEN_MASK, SEED_PAGE,
 };
 use rdb_core::transaction::{
-    deny_error, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode, StartRecord,
-    Transaction, TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX,
+    deny_error, record_len, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode,
+    StartRecord, Transaction, TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX,
     RETENTION_CAP_ENTRIES,
 };
 
@@ -104,6 +107,9 @@ impl Snap {
                 }
                 (Namespace::Dedup, Some(value)) => {
                     self.dedup.insert(write.key.to_vec(), value.clone());
+                }
+                (Namespace::Dedup, None) => {
+                    self.dedup.remove(write.key.as_ref());
                 }
                 _ => {}
             }
@@ -289,6 +295,8 @@ fn put(request: u64, k: &[u8], value: &'static [u8]) -> TxnRequest {
             value: Bytes::from_static(value),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 
@@ -497,6 +505,30 @@ impl H {
         (batch.id, *record_digest, seq)
     }
 
+    /// [`Self::resolve`] for any client, returning the batch T1 shipped.
+    fn resolve_batch(&mut self, req: TxnRequest) -> Batch {
+        let identity = req.identity;
+        let correlation = self.admit(req);
+        let effects = self.step(answer(correlation, 1, Verdict::Admit));
+        let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+            panic!("expected exactly one batch, got {effects:?}");
+        };
+        let batch = batch.clone();
+        let Some(Inflight::Dispatched { record_digest, .. }) = self.k().inflight() else {
+            panic!("expected Dispatched");
+        };
+        let digest = *record_digest;
+        assert_eq!(self.step(committed(batch.id, batch.seq.0)).len(), 2);
+        let published = kernel(KernelEvent::Published {
+            lineage: lineage(),
+            seq: batch.seq,
+            record_digest: digest,
+            request: identity,
+        });
+        assert_eq!(self.step(published), vec![]);
+        batch
+    }
+
     /// Dispatch, complete, publish: one fully resolved transaction.
     fn resolve(&mut self, req: TxnRequest) -> (Digest, u64) {
         let request = req.identity.request.0;
@@ -662,21 +694,12 @@ fn submit_check_batch_apply_publish_then_retry_replays() {
         ),
         (Seq(1), before, digest)
     );
-    assert_eq!(
-        h.k().mode(),
-        &QueueMode::Frozen {
-            cause: FreezeCause::UnresolvedTransaction,
-            unresolved: Some(Seq(1))
-        }
-    );
+    // Applied but not yet published, the queue stays open: a next submit waits behind it
+    // (spec §5.2 step 2; lead ruling A-R252). Only a deadline freezes it, as
+    // `an_unpublished_write_past_its_deadline_freezes_and_drains_the_queue` pins.
+    assert_eq!(h.k().mode(), &QueueMode::Open);
 
-    // While unresolved, the queue is frozen.
-    assert_eq!(
-        failed(&h.step(submit(put(2, b"k", b"w")))),
-        ErrorKind::ProtectionPaused
-    );
-
-    // Published -> [] and the queue reopens; the identity is retained.
+    // Published -> [] and the identity is retained.
     assert_eq!(h.step(published(1, digest, 1)), vec![]);
     assert_eq!(h.k().mode(), &QueueMode::Open);
     assert_eq!(h.k().dedup().len(), 1);
@@ -1427,17 +1450,18 @@ fn a_retry_of_a_published_request_answers_paused_while_l1_pauses_f1() {
 /// of R(1):
 /// - awaiting its `StorageDispatch` check (nothing written);
 /// - dispatched, storage not yet answered;
-/// - applied, not yet published (the queue is frozen on it, so check 7 answers before check 8).
+/// - applied, not yet published (the queue stays open on it, A-R252).
 ///
 /// Every stage answers one `Failed` reply, `PROTECTION_PAUSED`, and leaves R(1)'s in-flight state
-/// and the queue mode as they were. The first two come from check 8, so `paused_after` is L1's
-/// paused prefix (4); the third from check 7, so it is the unresolved seq (1).
+/// and the queue mode as they were. All three come from check 8, so `paused_after` is L1's
+/// paused prefix (4). Before A-R252 an applied R(1) froze the queue, and the third came from
+/// check 7 with the unresolved seq (1).
 #[retcd_test]
 fn a_retry_of_a_request_not_yet_final_answers_paused_while_l1_pauses() {
     for (stage, paused_after) in [
         ("awaiting check", Seq(4)),
         ("dispatched", Seq(4)),
-        ("applied", Seq(1)),
+        ("applied", Seq(4)),
     ] {
         let mut h = H::live();
         match stage {
@@ -1508,20 +1532,26 @@ fn m7a_69_admit_mode_frozen_protection_paused_and_admission_state_reason_passthr
     assert_eq!(h.step(committed(batch, seq)).len(), 2);
     assert_eq!(
         h.k().mode(),
+        &QueueMode::Open,
+        "applied: the queue stays open"
+    );
+    // (a) R(1) passes its own deadline unpublished (A-R252): the step freezes T1 and drains the
+    // queue before check 7 sees R(3). A freeze always drains, so the queue is no longer at its
+    // cap here; what (a) still pins is that check 7 answers, not an L1 or a capacity check.
+    let paused = RdbError::ProtectionPaused {
+        partition: PARTITION,
+        paused_after: Seq(seq),
+    };
+    h.now += 1_000;
+    let mut both = fail(2, paused.clone());
+    both.extend(fail(3, paused));
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), both);
+    assert_eq!(
+        h.k().mode(),
         &QueueMode::Frozen {
             cause: FreezeCause::UnresolvedTransaction,
             unresolved: Some(Seq(seq))
         }
-    );
-    assert_eq!(
-        h.step(submit(put(3, b"c", b"3"))),
-        fail(
-            3,
-            RdbError::ProtectionPaused {
-                partition: PARTITION,
-                paused_after: Seq(seq)
-            }
-        )
     );
 
     let passed_through = [
@@ -4167,12 +4197,16 @@ const EVERY_DENY_REASON: [DenyReason; 16] = [
 /// this compiling until someone decides its code here, and must also join
 /// [`EVERY_DENY_REASON`], whose length is part of its type.
 fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
+    // After apply the batch may have landed, whatever the reason (lead rulings A-R298, A-R342).
+    if boundary == Boundary::PostApply {
+        return ErrorKind::UnknownOutcome;
+    }
     match reason {
         DenyReason::GenerationChanged => ErrorKind::GenerationChanged,
-        DenyReason::LocalStorageFenced => match boundary {
-            Boundary::PreApply => ErrorKind::ProtectionPaused,
-            Boundary::PostApply => ErrorKind::UnknownOutcome,
-        },
+        // Ruling A-R285: control quorum lost while the grant is held, so it is a pause.
+        DenyReason::LocalStorageFenced | DenyReason::ControlUnavailable => {
+            ErrorKind::ProtectionPaused
+        }
         DenyReason::NoGrant
         | DenyReason::Frozen
         | DenyReason::Revoked
@@ -4185,14 +4219,15 @@ fn expected_code(reason: DenyReason, boundary: Boundary) -> ErrorKind {
         | DenyReason::ProcessSuspended
         | DenyReason::BootMismatch
         | DenyReason::AuthorityGenerationChanged
-        | DenyReason::SelfFenced
-        | DenyReason::ControlUnavailable => ErrorKind::LeaseExpired,
+        | DenyReason::SelfFenced => ErrorKind::LeaseExpired,
     }
 }
 
 /// M7A-71. The mapping is total over every `DenyReason` (16 landed; the plan's "15" predates
-/// `ClockModeUnbounded`) at both boundaries, and checkpoint-sensitive only for
-/// `LocalStorageFenced`: `PROTECTION_PAUSED` before apply, `UNKNOWN_OUTCOME` after. No arm
+/// `ClockModeUnbounded`) at both boundaries. After apply every reason answers `UNKNOWN_OUTCOME`
+/// (rulings A-R298, A-R342). Before apply `LocalStorageFenced` and `ControlUnavailable` (ruling
+/// A-R285) answer `PROTECTION_PAUSED`, `GenerationChanged` answers `GENERATION_CHANGED`, and
+/// every other reason `LEASE_EXPIRED`. No arm
 /// produces `DIVERGENCE_REQUIRES_OPERATOR`; that code reaches a client only through L1's
 /// `AdmissionState.reason` (M7A-69 (c)). T1's `deny_error` and the contract's
 /// `client_error_kind` agree everywhere (lead ruling A-R72a).
@@ -4247,6 +4282,99 @@ fn no_deny_reason_after_apply_is_paused_or_proves_no_mutation() {
     for reason in EVERY_DENY_REASON {
         let error = deny_error(reason, Boundary::PostApply, &at);
         assert_ne!(error.kind(), ErrorKind::ProtectionPaused, "{reason:?}");
+        assert!(!error.proves_no_mutation(), "{reason:?}: {error:?}");
+    }
+}
+
+/// Each `Failed` reply in `effects`: its request, its code, and whether it proves no mutation.
+fn proofs(effects: &[EffectKind]) -> Vec<(u64, ErrorKind, bool)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Reply(ReplyEffect::Failed { identity, error }) => {
+                Some((identity.request.0, error.kind(), error.proves_no_mutation()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// M10 S2 (lead rulings A-R296 item 2 and A-R298). A put queued behind an applied write, and
+/// stranded by a recovery to a newer generation on this node, was never admitted: its
+/// `GENERATION_CHANGED` proves it wrote nothing. Before, it answered with no proof, and the
+/// app's ack floor kept it as a pin (`rdb-api`'s drop row b4 met it).
+#[retcd_test]
+fn a_queued_put_stranded_by_a_new_generation_proves_no_mutation() {
+    let (mut h, _, _) = applied_unpublished();
+    let effects = h.step(recovered(Generation(8), 1, NODE_A, PartitionMode::Active));
+    assert_eq!(
+        proofs(&effects),
+        vec![(2, ErrorKind::GenerationChanged, true)],
+        "{effects:?}"
+    );
+    assert!(
+        effects.contains(&fail(2, gen_changed(GEN.0, 8))[0]),
+        "{effects:?}"
+    );
+}
+
+/// M10 S2 (lead ruling A-R298). A write that applied, and then met a generation change before
+/// publish, never answers a proof. A generation deny after apply maps to `UNKNOWN_OUTCOME`, as a
+/// local storage fence's does: the batch may have landed. And the recovery that strands the
+/// queue answers the applied write nothing at all; P1 and a status query settle it.
+#[retcd_test]
+fn a_write_applied_before_a_generation_change_never_proves_no_mutation() {
+    let error = deny_error(
+        DenyReason::GenerationChanged,
+        Boundary::PostApply,
+        &deny_at(),
+    );
+    assert_eq!(
+        error,
+        RdbError::UnknownOutcome {
+            partition: PARTITION,
+            identity: identity(1)
+        }
+    );
+    assert!(!error.proves_no_mutation(), "{error:?}");
+    let (mut h, _, _) = applied_unpublished();
+    let effects = h.step(recovered(Generation(8), 1, NODE_A, PartitionMode::Active));
+    assert!(
+        proofs(&effects).iter().all(|(request, ..)| *request != 1),
+        "the applied write is not answered here: {effects:?}"
+    );
+}
+
+/// M10 S2 (lead rulings A-R342, A-R343; tester-s2 Q3). A put whose `StorageDispatch` check is
+/// denied for a lost grant was never handed to storage: its `LEASE_EXPIRED` proves it wrote
+/// nothing. This is the refusal apps met while an owner waited to abandon a rejoin; it said
+/// "not proven", so each such write needed a status query.
+#[retcd_test]
+fn a_lease_deny_before_apply_proves_no_mutation() {
+    let mut h = H::live();
+    let check = h.admit(put(1, b"a", b"1"));
+    let effects = h.step(answer(check, 1, Verdict::Deny(DenyReason::Expired)));
+    assert_eq!(
+        proofs(&effects),
+        vec![(1, ErrorKind::LeaseExpired, true)],
+        "{effects:?}"
+    );
+}
+
+/// M10 S2 (lead ruling A-R342). A lease deny after apply answers `UNKNOWN_OUTCOME`, never
+/// `LEASE_EXPIRED`: the batch may have landed, and `LEASE_EXPIRED` now proves it did not.
+#[retcd_test]
+fn a_lease_deny_after_apply_answers_unknown_outcome() {
+    for reason in [DenyReason::Expired, DenyReason::ControlUnavailable] {
+        let error = deny_error(reason, Boundary::PostApply, &deny_at());
+        assert_eq!(
+            error,
+            RdbError::UnknownOutcome {
+                partition: PARTITION,
+                identity: identity(1)
+            },
+            "{reason:?}"
+        );
         assert!(!error.proves_no_mutation(), "{reason:?}: {error:?}");
     }
 }
@@ -4432,14 +4560,23 @@ fn applied_unpublished() -> (H, Digest, u64) {
     (h, digest, seq)
 }
 
-/// M7A-161. (a) `Frozen{UnresolvedTransaction, Some(s)}`: `Published{s}` retains R(1), reopens,
-/// and pumps the queue (R(2)'s check is the step's only effect). (b) One fact apart, the cause is
+/// M7A-161. (a) `Frozen{UnresolvedTransaction, Some(s)}`, reached when R(1) passes its own
+/// deadline unpublished (A-R252), which also drained R(2): `Published{s}` retains R(1), reopens,
+/// and the next submit gets its check. (b) One fact apart, the cause is
 /// `AuthorityLost(Expired)`: `Published{s}` still retains, answers `PublishedWhileFrozen`, clears
 /// `unresolved`, keeps the cause, and the next `Submit` is `LEASE_EXPIRED`: the kept cause picks
 /// the code.
 #[retcd_test]
 fn m7a_161_published_while_frozen_reopens_only_for_unresolved_transaction() {
     let (mut h, digest, seq) = applied_unpublished();
+    assert_eq!(h.k().mode(), &QueueMode::Open, "applied: still open");
+    h.now += 1_000;
+    let drained = h.step(submit(put(3, b"c", b"3")));
+    assert_eq!(
+        drained.len(),
+        2,
+        "R(2) drained and R(3) refused: {drained:?}"
+    );
     assert_eq!(
         h.k().mode(),
         &QueueMode::Frozen {
@@ -4447,9 +4584,10 @@ fn m7a_161_published_while_frozen_reopens_only_for_unresolved_transaction() {
             unresolved: Some(Seq(seq))
         }
     );
-    let _ = only_check(&h.step(published(seq, digest, 1)));
+    assert_eq!(h.step(published(seq, digest, 1)), vec![]);
     assert_eq!(h.k().mode(), &QueueMode::Open);
     assert!(h.k().dedup().get(GEN, AFF, identity(1)).is_some());
+    let _ = h.admit(put(4, b"d", b"4"));
 
     let (mut h, digest, seq) = applied_unpublished();
     let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
@@ -4469,6 +4607,74 @@ fn m7a_161_published_while_frozen_reopens_only_for_unresolved_transaction() {
     assert_eq!(
         failed(&h.step(submit(put(3, b"c", b"3")))),
         ErrorKind::LeaseExpired
+    );
+}
+
+/// Lead ruling A-R252 (writer fix). An applied, unpublished R(1) keeps the queue open: R(2) and
+/// R(3) wait behind it with no answer (spec §5.2 step 2). When R(1) passes its own deadline
+/// unpublished, the next step freezes T1 on it and drains the queue with `PROTECTION_PAUSED`,
+/// before that step's own submit reaches check 7.
+#[retcd_test]
+fn an_unpublished_write_past_its_deadline_freezes_and_drains_the_queue() {
+    let (mut h, _, seq) = applied_unpublished();
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), vec![], "R(3) waits");
+    assert_eq!(h.k().queue_len(), 2);
+    let paused = RdbError::ProtectionPaused {
+        partition: PARTITION,
+        paused_after: Seq(seq),
+    };
+    // `put` carries 1,000 ms from `now` 10: R(1) expires at 1,010.
+    h.now = 1_009;
+    assert_eq!(
+        h.step(submit(put(4, b"d", b"4"))),
+        vec![],
+        "R(4) still waits"
+    );
+    h.now = 1_010;
+    let mut drained = fail(2, paused.clone());
+    drained.extend(fail(3, paused.clone()));
+    drained.extend(fail(4, paused.clone()));
+    drained.extend(fail(5, paused));
+    assert_eq!(h.step(submit(put(5, b"e", b"5"))), drained);
+    assert_eq!(h.k().queue_len(), 0);
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::UnresolvedTransaction,
+            unresolved: Some(Seq(seq))
+        }
+    );
+}
+
+/// Lead ruling A-R252 (writer fix). A long deadline does not hold the queue open past P1's own:
+/// `POST_APPLY_DEADLINE_MILLIS` after R(1) applied, T1 freezes on it and drains R(2), whatever
+/// time R(1)'s own deadline has left.
+#[retcd_test]
+fn an_unpublished_write_freezes_at_the_publish_deadline_with_time_left() {
+    let mut h = H::live();
+    let mut long = put(1, b"a", b"1");
+    long.remaining_millis = 30_000;
+    let (batch, _, seq) = h.dispatch(long);
+    assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![]);
+    h.now = 100;
+    assert_eq!(h.step(committed(batch, seq)).len(), 2);
+    h.now = 100 + POST_APPLY_DEADLINE_MILLIS - 1;
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), vec![], "R(3) waits");
+    h.now = 100 + POST_APPLY_DEADLINE_MILLIS;
+    let paused = RdbError::ProtectionPaused {
+        partition: PARTITION,
+        paused_after: Seq(seq),
+    };
+    let mut drained = fail(2, paused.clone());
+    drained.extend(fail(3, paused.clone()));
+    drained.extend(fail(4, paused));
+    assert_eq!(h.step(submit(put(4, b"d", b"4"))), drained);
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::UnresolvedTransaction,
+            unresolved: Some(Seq(seq))
+        }
     );
 }
 
@@ -4539,26 +4745,23 @@ fn modes_a() -> [QueueMode; 3] {
 
 fn modes_b() -> [QueueMode; 3] {
     [
-        frozen_with(FreezeCause::UnresolvedTransaction, Some(1)),
+        QueueMode::Open,
         frozen_with(LOST, Some(1)),
         frozen_with(LOST, None),
     ]
 }
 
 fn modes_c() -> [QueueMode; 3] {
-    [
-        frozen_with(FreezeCause::UnresolvedTransaction, Some(1)),
-        QueueMode::Open,
-        frozen_with(LOST, None),
-    ]
+    [QueueMode::Open, QueueMode::Open, frozen_with(LOST, None)]
 }
 
 /// M7A-168. The three orders of freeze, completion and publication for one dispatched batch,
 /// with the whole mode compared after every event. A: the completion under the freeze sets
-/// `unresolved` and leaves the cause. B: the completion in `Open` writes both, and the freeze
-/// then overwrites the cause and keeps `unresolved`. C: the publication reopens, and the freeze
-/// then writes `unresolved: None`. The final mode is `Frozen{AuthorityLost(Expired), None}` in
-/// all three, and R(1) is retained exactly at the publication in all three.
+/// `unresolved` and leaves the cause. B: the completion in `Open` leaves it open (A-R252), and the
+/// freeze then writes the cause and `unresolved` from the dispatched batch. C: the publication
+/// keeps it open, and the freeze then writes `unresolved: None`. The final mode is
+/// `Frozen{AuthorityLost(Expired), None}` in all three, and R(1) is retained exactly at the
+/// publication in all three.
 #[retcd_test]
 fn m7a_168_freeze_keeps_its_cause_across_the_batch_completion_in_three_orderings() {
     for (events, modes) in [
@@ -5919,6 +6122,239 @@ fn m9_s0_07_admission_refuses_the_start_record_identity() {
     let _ = h.admit(put(1, b"a", b"1"));
 }
 
+/// A-R252 A2, A-R255 (3). Admission check 10 refuses an ack floor outside its scope
+/// `INVALID_ARGUMENT`, naming the field, and queues nothing: the floor record's reserved id, a
+/// floor on an app-chosen id, above the request's own id or in another open, pins with no floor,
+/// more than `MAX_PINS` pins, and a pin at the floor. Twin: the same request in scope, with
+/// `MAX_PINS` pins, is admitted.
+#[retcd_test]
+fn m10_s2_admission_refuses_an_ack_floor_outside_its_scope() {
+    let mut h = H::non_empty();
+    let floor = |request: u64, below: Option<u64>, pinned: Vec<u64>| {
+        let mut req = put(request, b"a", b"1");
+        req.acked_below = below;
+        req.pinned = pinned;
+        req
+    };
+    let nine = (1..=MAX_PINS as u64 + 1).collect::<Vec<_>>();
+    let cases = [
+        (floor(OPEN_MASK, None, vec![]), "request"),
+        (floor(APP_ID_MIN, Some(1), vec![]), "acked_below"),
+        (floor(5, Some(6), vec![]), "acked_below"),
+        (floor((1 << OPEN_BITS) | 5, Some(3), vec![]), "acked_below"),
+        (floor(5, None, vec![1]), "pinned"),
+        (floor(20, Some(10), nine.clone()), "pinned"),
+        (floor(20, Some(10), vec![10]), "pinned"),
+    ];
+    for (req, field) in cases {
+        let identity = req.identity;
+        assert_eq!(
+            h.step(submit(req)),
+            vec![EffectKind::Reply(ReplyEffect::Failed {
+                identity,
+                error: RdbError::InvalidArgument { field },
+            })],
+            "{identity:?}"
+        );
+        assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
+    }
+    let _ = h.admit(floor(20, Some(10), nine[..MAX_PINS].to_vec()));
+}
+
+/// `put(request, b"a", b"1")` carrying an ack floor.
+fn floored(request: u64, acked_below: Option<u64>, pinned: &[u64]) -> TxnRequest {
+    let mut req = put(request, b"a", b"1");
+    req.acked_below = acked_below;
+    req.pinned = pinned.to_vec();
+    req
+}
+
+/// `req` in group `affinity` instead of [`AFF`].
+fn in_group(mut req: TxnRequest, affinity: AffinityId) -> TxnRequest {
+    req.affinity = affinity;
+    for mutation in &mut req.mutations {
+        if let Mutation::Put { key, .. } = mutation {
+            *key = scoped_key(TENANT, affinity, b"a");
+        }
+    }
+    req
+}
+
+/// How many `Dedup` records `batch` deletes, and how many it puts.
+fn dedup_writes(batch: &Batch) -> (usize, usize) {
+    let dedup = batch.writes.iter().filter(|w| w.ns == Namespace::Dedup);
+    let deletes = dedup.clone().filter(|w| w.value.is_none()).count();
+    (deletes, dedup.count() - deletes)
+}
+
+/// Design-ackfloor D1 and D10 (A-R252 M2). A client that holds every answer before its next
+/// write keeps T1's index at its own last entry and one floor record, though it writes two groups
+/// in turn: one floor per open trims across groups. So a dedup cap of 100 never answers
+/// `OVERLOADED` over 1,000 writes, and the durable records stay as flat as the index.
+#[retcd_test]
+fn m10_s2_d1_a_held_floor_keeps_the_index_flat_across_two_groups() {
+    let mut h = H::live_with(Limits {
+        dedup_cap: 100,
+        ..Limits::default()
+    });
+    let other = AffinityId(AFF.0 + 1);
+    for request in 1..=1_000 {
+        let req = floored(request, Some(request), &[]);
+        let req = if request % 2 == 0 {
+            in_group(req, other)
+        } else {
+            req
+        };
+        let _ = h.resolve_batch(req);
+        assert!(
+            h.k().dedup().len() <= 2,
+            "{request}: {}",
+            h.k().dedup().len()
+        );
+        assert!(h.snap.dedup.len() <= 2, "{request}: {}", h.snap.dedup.len());
+    }
+}
+
+/// Design-ackfloor D5 (A-R252 M2). Floor writes use only the room a request leaves under both
+/// of check 10's bounds, and the rest waits for the client's next request. With 200 answers held:
+/// a 255-write request adds nothing; a 254-write one adds the floor record only; one whose value
+/// leaves room for three deletes adds three; a one-put request deletes 64. Every batch ships, and
+/// the backlog drains to the last entry and the floor record.
+#[retcd_test]
+fn m10_s2_d5_floor_writes_use_only_the_room_a_request_leaves() {
+    let mut h = H::live();
+    for request in 1..=200 {
+        let _ = h.resolve(put(request, b"a", b"1"));
+    }
+    let puts = |request: u64, n: usize| {
+        let mut req = floored(request, Some(request), &[]);
+        req.mutations = (0..n)
+            .map(|i| Mutation::Put {
+                key: key(format!("m{i}").as_bytes()),
+                value: Bytes::from_static(b"v"),
+                expected_version: None,
+            })
+            .collect();
+        req
+    };
+    assert_eq!(dedup_writes(&h.resolve_batch(puts(201, 255))), (0, 1));
+    assert_eq!(dedup_writes(&h.resolve_batch(puts(202, 254))), (0, 2));
+    // Room for the floor record, three deletes and five bytes to spare.
+    let dedup_put = 6 + DEDUP_KEY_LEN + 4 + DEDUP_VALUE_LEN;
+    let dedup_delete = 6 + DEDUP_KEY_LEN;
+    let empty = Mutation::Put {
+        key: key(b"a"),
+        value: Bytes::new(),
+        expected_version: None,
+    };
+    let room = dedup_put + 3 * dedup_delete + 5;
+    let mut big = floored(203, Some(203), &[]);
+    big.mutations = vec![Mutation::Put {
+        key: key(b"a"),
+        value: Bytes::from(vec![0; MAX_ENVELOPE_BYTES - record_len(0, &[empty]) - room]),
+        expected_version: None,
+    }];
+    assert_eq!(dedup_writes(&h.resolve_batch(big)), (3, 2));
+    assert_eq!(
+        dedup_writes(&h.resolve_batch(floored(204, Some(204), &[]))),
+        (64, 2)
+    );
+    // 1..=204 less 3 and 64 leaves 137 below the floor: 64, 64, then the last 9 and 205, 206.
+    let drained: Vec<_> = (205..=207)
+        .map(|request| dedup_writes(&h.resolve_batch(floored(request, Some(request), &[]))).0)
+        .collect();
+    assert_eq!(drained, [64, 64, 11]);
+    assert_eq!((h.k().dedup().len(), h.snap.dedup.len()), (2, 2));
+}
+
+/// Design-ackfloor D3 and D4, A-R252 M3. Client 5 writes 1..=10, then 11 with floor 11 and pin 4:
+/// - the candidate carries the floor as sent, for P1 to forget by (A-R255);
+/// - a resend of 3 is `STATUS_EXPIRED` and applies nothing, and the pin's resend replays;
+/// - client 6's id 3 is untouched, and a floor lower than the one held moves nothing;
+/// - after failover the seed holds the floor: 3 is still `STATUS_EXPIRED`.
+#[retcd_test]
+fn m10_s2_d3_a_resend_under_the_floor_is_status_expired_before_and_after_failover() {
+    let mut h = H::live();
+    let other = |request| {
+        let mut req = put(request, b"b", b"1");
+        req.identity.client = ClientId(6);
+        req
+    };
+    for request in 1..=10 {
+        let _ = h.resolve(put(request, b"a", b"1"));
+    }
+    let _ = h.resolve_batch(other(3));
+    let correlation = h.admit(floored(11, Some(11), &[4]));
+    let effects = h.step(answer(correlation, 1, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected exactly one batch, got {effects:?}");
+    };
+    assert_eq!(dedup_writes(batch), (9, 2), "ids 1..=10 but the pin");
+    let batch = batch.clone();
+    let effects = h.step(committed(batch.id, batch.seq.0));
+    let [_, EffectKind::Kernel(KernelEffect::AppliedCandidate(candidate))] = effects.as_slice()
+    else {
+        panic!("expected LocalApplied and a candidate, got {effects:?}");
+    };
+    let mut pinned = [None; MAX_PINS];
+    pinned[0] = Some(4);
+    assert_eq!(candidate.ack_floor, Some(AckFloor { below: 11, pinned }));
+    let digest = candidate.record_digest;
+    // A3: nothing is trimmed until `Published`.
+    let held = |h: &H| h.k().dedup().get(GEN, AFF, identity(3)).is_some();
+    assert!(held(&h));
+    assert_eq!(h.step(published(batch.seq.0, digest, 11)), vec![]);
+    assert!(!held(&h));
+
+    let head = h.k().next_seq();
+    assert_eq!(
+        h.step(submit(put(3, b"a", b"1"))),
+        fail(
+            3,
+            RdbError::StatusExpired {
+                identity: identity(3)
+            }
+        )
+    );
+    assert_eq!(h.k().next_seq(), head, "nothing applied");
+    assert!(matches!(
+        h.step(submit(put(4, b"a", b"1"))).as_slice(),
+        [EffectKind::Reply(ReplyEffect::Transaction { .. })]
+    ));
+    assert!(matches!(
+        h.step(submit(other(3))).as_slice(),
+        [EffectKind::Reply(ReplyEffect::Transaction { .. })]
+    ));
+    let backwards = h.resolve_batch(floored(12, Some(2), &[]));
+    assert_eq!(
+        dedup_writes(&backwards),
+        (0, 1),
+        "a lower floor moves nothing"
+    );
+
+    // Failover to B in g8: the seed loads g7's floor record with what is left.
+    let at = h.snap.at.0;
+    let _ = h.step(recovered(Generation(8), at, NODE_B, PartitionMode::Active));
+    h.node = NODE_B;
+    let _ = h.step(recovered(Generation(8), at, NODE_B, PartitionMode::Active));
+    let _ = h.step(admission(true, None));
+    assert_eq!(
+        h.step(submit(put(3, b"a", b"1"))),
+        fail(
+            3,
+            RdbError::StatusExpired {
+                identity: identity(3)
+            }
+        )
+    );
+    assert_eq!(h.k().seed_pending(), None);
+    assert_eq!(
+        failed(&h.step(submit(put(4, b"a", b"1")))),
+        ErrorKind::GenerationChanged,
+        "the pin was kept, so it reconciles as any older answer does"
+    );
+}
+
 /// M9 S0 rule 1, "T1 `Open`". An empty partition recovered read-only owes the start record but
 /// sends nothing while frozen, even under a newer view, and queues nothing. Once the activation
 /// re-emit lifts read-only, the next newer view sends it.
@@ -6354,4 +6790,28 @@ fn m9_s3k_05_a_second_failure_on_a_trimmed_key_keeps_its_own_window() {
     );
     h.now = t2 + R;
     let _ = h.admit(req);
+}
+
+/// M10 S2 (lead ruling A-R401 F4, critic-d4 Q3). A put refused because the partition recovered
+/// `ReadOnly` was refused at admission, before apply: its `RECOVERY_READ_ONLY` proves it wrote
+/// nothing. Every producer of it is pre-apply (`freeze_error(FreezeCause::RecoveryReadOnly)`:
+/// admission check 7, the frozen queue's dispatch reply, an undispatched check, a drain). It
+/// said "not proven" before, the `LeaseExpired` shape A-R342 closed. Cut: drop it from
+/// `RdbError::proves_no_mutation`, red.
+#[retcd_test]
+fn a_recovery_read_only_refusal_proves_no_mutation() {
+    let mut h = H::live();
+    let _ = h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+        Generation(8),
+        2,
+        u64::MAX,
+    )))));
+    let effects = h.step(submit(put(1, b"k", b"v")));
+    assert_eq!(
+        proofs(&effects),
+        vec![(1, ErrorKind::RecoveryReadOnly, true)],
+        "{effects:?}"
+    );
 }

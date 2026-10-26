@@ -337,6 +337,15 @@ anchor (`base_digest` at `base_seq`). Without that rule `Rebuilding` was unreach
 copies it exists to rebuild. M7 admits one generation back; a target older than that gets
 `SnapshotCatchupRequired` and waits for spec §10.1.
 
+**Amended 2026-10-23 (M10 slice 2, lead ruling A-R223; ADR-0005 §2's amendment of the same
+date): any generation back, below the floor.** A copy that missed one or more writeless reopens
+needs records sealed several generations back, and "one generation back" refused all of them, so
+the copy never caught up and a `Rebuilding` partition waiting on it never activated (#59). The
+historical rule now takes any generation older than the receiver's, at or below the root's
+`base_seq`; the anchor and chain decide it as before. `SnapshotCatchupRequired` no longer waits
+for spec §10.1: its consumer fills the primary's ladder from its own engine once per generation,
+and ordinary catch-up walks the copy.
+
 **`Committed` is not the end state.** Two of the three modes below are explicitly temporary, and the
 phase that ends them is `Rebuilding { required, proofs, cutoff }` → `ActivationProposed` → `Active`.
 It reuses `RecoveryBarrier::try_new` verbatim, because "three validated durable copies" (§8.4) and
@@ -412,6 +421,18 @@ through `CopyCaughtUp` in its existing `Committed` arm, then syncs every require
 new generation and no timer. Still owed to slice 2: a late copy holding past or below the cutoff,
 and a lost `CopyCaughtUp`, which is not re-sent.
 
+**Amended 2026-10-23 (M10 slice 2, rulings A-R224 and A-R254): below the cutoff, and the lost
+answer.** A late copy whose head is **below** the cutoff now links the new generation at its own
+head (`land_at`, arm 3; logged `land_link_behind`) and sends no `CopyCaughtUp`: its `Recovered`
+re-anchors its receiver there, and R1 walks it with the older-stamped records the amendment above
+admits. Rows: host `a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head`,
+simulator `m10_c7_a_late_copy_below_the_cutoff_links_at_its_own_head`. A copy that answers R1 as
+not yet holding the root (`NeedLineage`, `NeedConfig`, `UnknownEpoch`) now draws R1's
+`CopyAheadOnControl`, and its consumer re-sends the committed root to that copy through the
+hold-honouring send (logged `copy_ahead_reposted`), so a lost landing is retried rather than
+stalling (row `h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold`). A copy
+holding **past** the cutoff in its own generation is still refused by name, as before.
+
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
 | Eligible regulars | Mode | Rules |
@@ -441,6 +462,14 @@ else (a tail above `base`, a different digest, a parent at the depth ceiling) fa
 name and writes nothing. This changes no row of the table above, and it does not reopen the K1
 amendment: a copy that is unheard, or that holds less than `base` in its own generation, still
 pauses writes (B-R38).
+
+**Ruling 2026-10-24 (M10 S2, lead ruling A-R406; critic-d4 ADV-1): a secondary restarted while
+every copy is up is handled like a dropped copy.** This records existing behaviour; it changes no
+row of the table above and no other rule.
+- It is re-added as a shadow. Until that shadow is promoted, writes need the primary plus the one
+  remaining regular copy: `DEGRADED_RF2`.
+- A shadow never counts toward an ack or toward durability.
+- A further loss in that window gives `READ_ONLY`, as the table says for one eligible regular.
 
 The mode is **derived, never configured**. rDB has no equivalent of
 `unclean.leader.election.enable` and must not acquire one: the Kafka toggle is a single boolean that

@@ -86,7 +86,17 @@ fn g4_a_newer_build_map_entry_refuses_the_clear_of_a_sound_map() {
         element_key(&root, &text("a")).unwrap(),
         newer_build_record(),
     );
-    assert_newer_build_refused(&k, &root, "sound map root");
+    // The proof reads the members, so the refusal names the entry's key (#59, A-R230).
+    let got = clear_object(&k.snapshot(), &root);
+    assert!(
+        matches!(
+            &got,
+            Err(ValueError::Corrupt(Corrupt::Element { key, error }))
+                if *key == text("a")
+                    && **error == Corrupt::Envelope(EnvelopeError::UnknownCodec(0x02))
+        ),
+        "sound map root: {got:?}"
+    );
 }
 
 /// D9 (A-R141): a root whose envelope opens but whose payload does not decode is checked by

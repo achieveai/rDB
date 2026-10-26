@@ -14,6 +14,7 @@ use crate::contracts::time::Tick;
 use crate::contracts::txn::{key_scope, Condition, TxnRequest};
 use crate::contracts::version::{check_mandatory, VersionedArtifact};
 use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
+use crate::transaction::dedup::check_floor;
 use crate::transaction::{encoded_len, Admitted, FreezeCause, TxnKernel, TxnRejection};
 
 /// Check 9: how many admitted requests may wait behind the one in flight, unless
@@ -56,9 +57,10 @@ pub struct DenyContext {
 ///
 /// Which error is [`DenyReason::client_error_kind`]'s decision, made in the contracts (lead
 /// ruling A-R72a). This only fills in the fields that kind carries. A kind the contract gains
-/// later falls to `LEASE_EXPIRED` here, and `deny_mapping_is_total_and_boundary_sensitive`
-/// fails on it, because it compares this function's kind with the contract's for every reason
-/// at both boundaries.
+/// later falls to `UNKNOWN_OUTCOME` here, which proves nothing, so the fallback can never claim
+/// "not applied" (A-R342); `m7a_71_deny_error_mapping_total_and_checkpoint_sensitive` fails on
+/// it, because it compares this function's kind with the contract's for every reason at both
+/// boundaries.
 #[must_use]
 pub fn deny_error(reason: DenyReason, boundary: Boundary, at: &DenyContext) -> RdbError {
     match reason.client_error_kind(boundary) {
@@ -70,13 +72,13 @@ pub fn deny_error(reason: DenyReason, boundary: Boundary, at: &DenyContext) -> R
             partition: at.partition,
             paused_after: at.paused_after,
         },
-        ErrorKind::UnknownOutcome => RdbError::UnknownOutcome {
-            partition: at.partition,
-            identity: at.identity,
-        },
-        _ => RdbError::LeaseExpired {
+        ErrorKind::LeaseExpired => RdbError::LeaseExpired {
             partition: at.partition,
             grant: at.grant,
+        },
+        _ => RdbError::UnknownOutcome {
+            partition: at.partition,
+            identity: at.identity,
         },
     }
 }
@@ -261,6 +263,13 @@ fn malformed(req: &TxnRequest) -> Option<&'static str> {
     }
     if req.conditions.len() > MAX_CONDITIONS {
         return Some("conditions");
+    }
+    // The ack floor's scope (A-R252 A2): the floor record's reserved id, a floor on an
+    // app-chosen id, above the request's own id or in another open, and more than `MAX_PINS`
+    // pins or a pin outside `[open base, floor)`. Before dedup (11), so a resend that breaks it
+    // is refused as a first send is, and nothing is trimmed.
+    if let Err(refusal) = check_floor(req.identity.request, req.acked_below, &req.pinned) {
+        return Some(refusal.field());
     }
     None
 }

@@ -17,16 +17,29 @@
 //! `on_new_span` before [`ConstFieldsLayer`]'s, which then merges into the map that is already
 //! there instead of being overwritten by it.
 //!
-//! # Why not the non-blocking appender
+//! # Why a bounded background writer (A-R309)
 //!
-//! `tracing_appender::non_blocking` buffers in a worker thread and needs its guard dropped to
-//! flush. The daemon's last line is `msg="shutdown_complete"` and E2E-09 reads it from the
-//! file after the process has exited, so a plain `File` — one `write_all` per line, straight
-//! to the OS — is the behaviour that assertion needs.
+//! Lines go to one `log-writer` thread through a queue of [`QUEUE_LINES`]. A caller never
+//! waits for the file: an append that stalls for seconds (2.2-2.8 s were measured on the dev
+//! host, AGENTS.md) would otherwise stop every task that logs. `@t` is still stamped when the
+//! line is logged. A full queue drops the line and counts it, and the writer logs
+//! `log_lines_dropped {count}` once it has drained. A batch whose write and flush take 500 ms
+//! or more is logged after it lands as `log_write_slow {ms, lines}`, so a stalled append shows
+//! in the log rather than as a gap in it.
+//!
+//! The daemon's last line is `msg="shutdown_complete"` and E2E-09 reads it from the file after
+//! the process has exited, so [`init`] returns a [`LogGuard`]: `start` drops it after that
+//! line, and the drop writes every queued line and joins the thread. Lines still queued when
+//! the process aborts are lost.
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use config_core::ClusterIdentity;
 use config_log::layer::{JsonFields, JsonlLayer};
@@ -61,7 +74,16 @@ pub enum LogSetupError {
     /// A global subscriber was already installed in this process.
     #[error("a global tracing subscriber is already installed")]
     AlreadyInitialized,
+    /// The `log-writer` thread could not be started.
+    #[error("cannot start the log writer thread: {0}")]
+    Writer(#[source] std::io::Error),
 }
+
+/// Lines the background writer holds before a new line is dropped (A-R309).
+const QUEUE_LINES: usize = 8192;
+
+/// A batch whose write and flush take this long is logged as `log_write_slow`.
+const WRITE_SLOW_OVER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Adds constant fields to the process root span.
 ///
@@ -105,11 +127,14 @@ where
 /// harness passes `--log-field testModule=… --log-field testMethod=…`, `JsonlLayer` writes
 /// those lines to `<log_dir>/<module>/<method>.jsonl` as well, which is what the cross-process
 /// DuckDB joins read (test plan §7 Q10/Q12) — with no environment variable involved (TA-11).
+///
+/// Keep the returned [`LogGuard`] until the last line is logged; dropping it writes what is
+/// queued.
 pub fn init(
     log_dir: &Path,
     identity: &ClusterIdentity,
     extra_fields: &[(String, String)],
-) -> Result<(), LogSetupError> {
+) -> Result<LogGuard, LogSetupError> {
     std::fs::create_dir_all(log_dir).map_err(|source| LogSetupError::Io {
         path: log_dir.to_path_buf(),
         source,
@@ -129,7 +154,9 @@ pub fn init(
         .map_err(|e| LogSetupError::Filter(directive.clone(), e.to_string()))?;
 
     let mirror = open_mirror(log_dir, extra_fields)?;
-    let jsonl = JsonlLayer::new("config-server", Box::new(Tee { file, mirror }), None, true);
+    let (writer, guard) =
+        queued(Box::new(Tee { file, mirror }), QUEUE_LINES).map_err(LogSetupError::Writer)?;
+    let jsonl = JsonlLayer::new("config-server", writer, None, true);
 
     let mut fields = BTreeMap::new();
     for (k, v) in extra_fields {
@@ -142,7 +169,161 @@ pub fn init(
         .with(jsonl)
         .with(const_fields)
         .try_init()
-        .map_err(|_| LogSetupError::AlreadyInitialized)
+        .map_err(|_| LogSetupError::AlreadyInitialized)?;
+    Ok(guard)
+}
+
+/// Work for the `log-writer` thread, handled in the order it was sent.
+enum Msg {
+    /// One whole line.
+    Line(Vec<u8>),
+    /// Log `log_lines_dropped` inside this span, through this dispatcher.
+    Attach(tracing::Span, tracing::Dispatch),
+    /// Write what is queued and stop.
+    Stop,
+}
+
+/// The layer's writer: hands each line to the `log-writer` thread and never waits for it.
+/// `JsonlLayer` writes one line per `write_all`, so one `write` is one line.
+struct QueuedWriter {
+    tx: SyncSender<Msg>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Write for QueuedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.tx.try_send(Msg::Line(buf.to_vec())).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Owns the `log-writer` thread. Dropping it writes every line queued before the drop, then
+/// joins the thread.
+pub struct LogGuard {
+    tx: SyncSender<Msg>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl LogGuard {
+    /// Log `log_lines_dropped` inside `span`, through the dispatcher current here, so the line
+    /// carries the process fields. Before this, it goes through the global dispatcher alone.
+    pub fn attach(&self, span: &tracing::Span) {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        // Fails only once the writer has stopped, and then there is nothing to attach to.
+        let _ = self.tx.send(Msg::Attach(span.clone(), dispatch));
+    }
+}
+
+impl Drop for LogGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Stop);
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                eprintln!("config-server: the log writer thread panicked; log lines may be lost");
+            }
+        }
+    }
+}
+
+/// A writer for `sink` that queues up to `capacity` lines for a `log-writer` thread.
+fn queued(
+    sink: Box<dyn Write + Send>,
+    capacity: usize,
+) -> std::io::Result<(Box<dyn Write + Send>, LogGuard)> {
+    let (tx, rx) = mpsc::sync_channel(capacity);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let thread = {
+        let dropped = Arc::clone(&dropped);
+        std::thread::Builder::new()
+            .name("log-writer".into())
+            .spawn(move || run_writer(&rx, sink, &dropped))?
+    };
+    let writer = QueuedWriter {
+        tx: tx.clone(),
+        dropped,
+    };
+    Ok((
+        Box::new(writer),
+        LogGuard {
+            tx,
+            thread: Some(thread),
+        },
+    ))
+}
+
+/// The `log-writer` thread. A write error loses that line, as an inline write did.
+fn run_writer(rx: &Receiver<Msg>, mut sink: Box<dyn Write + Send>, dropped: &AtomicU64) {
+    let mut scope: Option<(tracing::Span, tracing::Dispatch)> = None;
+    while let Ok(first) = rx.recv() {
+        let started = std::time::Instant::now();
+        let mut lines: u64 = 0;
+        let mut next = Some(first);
+        while let Some(msg) = next.take() {
+            match msg {
+                Msg::Line(line) => {
+                    let _ = sink.write_all(&line);
+                    lines += 1;
+                }
+                Msg::Attach(span, dispatch) => scope = Some((span, dispatch)),
+                Msg::Stop => {
+                    // Both reports go through the queue, so drain once more to write them.
+                    let _ = sink.flush();
+                    report_slow(scope.as_ref(), started.elapsed(), lines);
+                    report_dropped(scope.as_ref(), dropped);
+                    while let Ok(Msg::Line(line)) = rx.try_recv() {
+                        let _ = sink.write_all(&line);
+                    }
+                    let _ = sink.flush();
+                    return;
+                }
+            }
+            next = rx.try_recv().ok();
+        }
+        let _ = sink.flush();
+        report_slow(scope.as_ref(), started.elapsed(), lines);
+        report_dropped(scope.as_ref(), dropped);
+    }
+}
+
+/// Log `log_write_slow {ms, lines}` when writing and flushing one batch of `lines` took
+/// [`WRITE_SLOW_OVER`] or more. It is logged after the write, through the queue, so it never
+/// holds a caller up; without it a stalled append shows only as a gap in the log.
+fn report_slow(
+    scope: Option<&(tracing::Span, tracing::Dispatch)>,
+    took: std::time::Duration,
+    lines: u64,
+) {
+    if took < WRITE_SLOW_OVER {
+        return;
+    }
+    let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+    in_scope(scope, || tracing::warn!(ms, lines, "log_write_slow"));
+}
+
+/// Log `log_lines_dropped {count}` when lines were dropped since the last report.
+fn report_dropped(scope: Option<&(tracing::Span, tracing::Dispatch)>, dropped: &AtomicU64) {
+    let count = dropped.swap(0, Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    in_scope(scope, || tracing::warn!(count, "log_lines_dropped"));
+}
+
+/// Run `log` inside the attached span and dispatcher, or through the global one before
+/// [`LogGuard::attach`].
+fn in_scope(scope: Option<&(tracing::Span, tracing::Dispatch)>, log: impl Fn()) {
+    match scope {
+        Some((span, dispatch)) => {
+            tracing::dispatcher::with_default(dispatch, || span.in_scope(log))
+        }
+        None => log(),
+    }
 }
 
 /// Open `<log_dir>/<testModule>/<testMethod>.jsonl` when the harness tagged this process.
@@ -344,5 +525,128 @@ mod tests {
             logged.is_empty(),
             "an ordinary shutdown must not look like a fault: {logged:?}"
         );
+    }
+
+    /// A sink whose first write blocks for `stall`, as a stalled append on the host does.
+    struct Stalling {
+        stall: Option<std::time::Duration>,
+        out: Captured,
+    }
+
+    impl Write for Stalling {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(stall) = self.stall.take() {
+                std::thread::sleep(stall);
+            }
+            self.out.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The daemon's layer over a queued writer for a `Stalling` sink of `capacity` lines.
+    fn stalling_daemon_log(
+        stall: std::time::Duration,
+        capacity: usize,
+    ) -> (tracing::Dispatch, LogGuard, Captured) {
+        let out = Captured::default();
+        let sink = Stalling {
+            stall: Some(stall),
+            out: out.clone(),
+        };
+        let (writer, guard) = queued(Box::new(sink), capacity).expect("the log writer starts");
+        let jsonl = JsonlLayer::new("config-server", writer, None, true);
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(jsonl));
+        (dispatch, guard, out)
+    }
+
+    /// The logged lines whose `@m` is `message`.
+    fn lines_named(text: &str, message: &str) -> Vec<Value> {
+        text.lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("one JSON object per line"))
+            .filter(|line| line["@m"] == message)
+            .collect()
+    }
+
+    /// A-R309 (b): a sink that blocks for 2 s does not delay a caller by more than 50 ms, and
+    /// dropping the guard still writes every line (what E2E-09 needs of `shutdown_complete`).
+    #[test]
+    fn a_stalled_log_sink_does_not_delay_the_caller() {
+        const LINES: usize = 200;
+        let (dispatch, guard, out) =
+            stalling_daemon_log(std::time::Duration::from_secs(2), QUEUE_LINES);
+        let slowest = tracing::dispatcher::with_default(&dispatch, || {
+            (0..LINES)
+                .map(|n| {
+                    let started = std::time::Instant::now();
+                    tracing::info!(n, "queued_line");
+                    started.elapsed()
+                })
+                .max()
+                .expect("lines were logged")
+        });
+        assert!(
+            slowest < std::time::Duration::from_millis(50),
+            "a 2 s stall in the sink must not reach the caller; the slowest call took {slowest:?}"
+        );
+        drop(guard);
+        let text = out.text();
+        assert_eq!(
+            lines_named(&text, "queued_line").len(),
+            LINES,
+            "dropping the guard writes every queued line"
+        );
+        assert!(lines_named(&text, "log_lines_dropped").is_empty(), "{text}");
+    }
+
+    /// A-R309 (b): a full queue drops lines rather than wait, and the writer then says how
+    /// many: lines written plus `log_lines_dropped.count` is every line logged.
+    #[test]
+    fn a_full_queue_drops_lines_and_counts_them() {
+        const LINES: u64 = 50;
+        let (dispatch, guard, out) = stalling_daemon_log(std::time::Duration::from_millis(500), 4);
+        tracing::dispatcher::with_default(&dispatch, || {
+            guard.attach(&tracing::Span::none());
+            for n in 0..LINES {
+                tracing::info!(n, "queued_line");
+            }
+        });
+        drop(guard);
+        let text = out.text();
+        let written = lines_named(&text, "queued_line").len() as u64;
+        let dropped: u64 = lines_named(&text, "log_lines_dropped")
+            .iter()
+            .map(|line| line["count"].as_u64().expect("count is a number"))
+            .sum();
+        assert!(
+            dropped > 0,
+            "a 4-line queue behind a stalled sink drops lines: {text}"
+        );
+        assert_eq!(
+            written + dropped,
+            LINES,
+            "every line is written or counted: {text}"
+        );
+    }
+
+    /// A-R312: a write that blocks for 1 s is logged once, after it lands, as `log_write_slow`
+    /// with `ms` >= 900 and the one line it held. Without it the stall is only a gap.
+    #[test]
+    fn a_slow_write_is_logged_after_it_lands() {
+        let (dispatch, guard, out) =
+            stalling_daemon_log(std::time::Duration::from_secs(1), QUEUE_LINES);
+        tracing::dispatcher::with_default(&dispatch, || {
+            guard.attach(&tracing::Span::none());
+            tracing::info!("queued_line");
+        });
+        drop(guard);
+        let text = out.text();
+        let slow = lines_named(&text, "log_write_slow");
+        assert_eq!(slow.len(), 1, "one slow batch, one line: {text}");
+        let ms = slow[0]["ms"].as_u64().expect("ms is a number");
+        assert!(ms >= 900, "a 1 s stall reports ms >= 900, got {ms}: {text}");
+        assert_eq!(slow[0]["lines"], 1, "{text}");
     }
 }

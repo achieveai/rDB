@@ -2,10 +2,11 @@
 
 The M1 storage seam on real RocksDB. S0: write batches, crash the process, reopen, check what
 survived. S1: generation inheritance (ADR-rdb-0010) — a new generation reads through to the old
-one (linked), or gets a copy of it as of `base` (copied). Format 1
-(`keys::FORMAT_VERSION = 1`); S0's provisional 0 is refused at open (exit 6).
+one (linked), or gets a copy of it as of `base` (copied). Format 2
+(`keys::FORMAT_VERSION = 2`, M10 S2); a format-1 copy still opens. S0's provisional 0 is
+refused at open (exit 6).
 
-## Format 1, in one screen
+## Format 2, in one screen
 
 - Key: `partition u32 BE | generation u64 BE | ns u8 | key`.
 - Value: `kind u8 | version u64 BE | bytes`. Kind 0 value, 1 tombstone (no bytes; only in a
@@ -19,6 +20,16 @@ one (linked), or gets a copy of it as of `base` (copied). Format 1
   `instance_marker=<hex>`.
 - Publish marks (M10 S1-6): `metadata` key `publish` + partition u32 BE, the partition's
   marks (24 B each), synced. Short too, so it needed no format bump either.
+- Epoch revocations (format 2, M10 S2): `metadata` key `revoked` + partition u32 BE, the
+  partition's revoked owner epochs (8 B each, ascending), synced
+  (`persist_epoch_revocation`; `epoch_revocations` for the host's replay at start). `dump`
+  shows `revoked_epochs p=<id> [<epochs>]`. A format-1 copy keeps marker 1 until its first
+  revocation; that batch writes marker 2, so a format-1 build then refuses the copy.
+- Ack floor rows (format 2, M10 S2, A-R252): a floor record is a `dedup` row under affinity 0
+  and a reserved request id, and a floor deletes `dedup` rows early. Both parse in format 1,
+  but a format-1 build would re-execute a resend the floor dropped. So the first `commit`
+  that carries a floor record or a `dedup` delete writes marker 2 in the same batch
+  (review-s2 F-006, A-R411), logged `format_marker_moved_for_ack_floor`.
 - A new key needs a `FORMAT_VERSION` bump. This build refuses a short `metadata` key it
   does not define (A-R184), so a copy holding a newer build's key would not open here.
 - A stored `Meta` record is refused at open; a `Meta` write is refused at commit.
@@ -92,6 +103,8 @@ $B --dir <D> [--log-dir <L>] <command>
 | `write ... --inject commit`, `flush --inject wal-flush|mark-write`, `inherit --inject switch|copy-batch` | **Debug builds only** (usage error in release). That storage call fails as RocksDB would: same error branch, log event and exit 8; nothing is written. `mark-write` fails after the WAL sync, the state a crash between the two leaves. `switch` fails the switch batch; `copy-batch` fails the **last** key batch of a full copy, so a copy needs more than 1024 keys for earlier batches to land. |
 | `verify` | Opens the engine, then checks every lineage (below). Prints `parent= base= mode=root|linked|copied sealed_by= staging=`. Exit 0 only if all pass. |
 | `dump` | Every stored record, every column family, key order. **Read-only**: no lock, no WAL flush. |
+| `revoke --partition P --epoch E [--inject synced-put]` | Persists epoch E of partition P as revoked: one synced write, and a format-1 copy moves to format 2 in the same write (A-R225). Prints `OK revoked=[p<P>e<E> ...]`, every revocation the copy holds, read back. Same epoch again: no change. `--inject synced-put` (debug only) fails the write, exit 8, nothing stored. |
+| `damage [--partition P] [--generation G] --ns NS --key-hex H` | **Debug builds only** (usage error in release). Flips the last byte of one stored record of (P, G), so its next check fails (A-R230). A History record: `verify` then exits 3 with `history record at Seq(N) carries a digest that does not recompute`. No value at that key: `REFUSED`, exit 2, nothing written. |
 
 Data and logs go under `C:/rdb_test_data/m8/...`, never `C:/` root or `%TEMP%`.
 
@@ -155,12 +168,15 @@ invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (t
 | `rdb_storage` | `meta_write_refused`, `sealed_generation_write_refused`, `staging_generation_write_refused` (ERROR) | `partition, generation, seq` + `sealed_by` / `parent, base` |
 | `rdb_storage` | `wal_sync_ancestor` | `partition, generation, durable` |
 | `rdb_storage` | `batch_commit` | `partition, generation, seq, writes, applied` |
+| `rdb_storage` | `format_marker_moved_for_ack_floor` (the commit that first carries an ack floor on a format-1 copy) | `partition, generation, seq, from_format, format` |
 | `rdb_storage` | `dedup_delete_below` / `dedup_delete_unknown_lineage`, `dedup_delete_failed` (ERROR) | `partition, generation` + `levels, end_hex` / `error` |
 | `rdb_storage` | `dedup_trim_deleted` / `dedup_trim_unknown_lineage`, `dedup_trim_value_undecodable`, `dedup_trim_read_failed`, `dedup_trim_delete_failed` (ERROR) | `partition, generation` + `below, scanned, deleted` / `key_hex` / `error` |
 | `rdb_storage` | `wal_sync` (DEBUG; one per captured lineage per flush, so `RUST_LOG=rdb_storage=debug` to see it) | `partition, generation, captured, durable` |
 | `rdb_storage` | `lineage_verified` / `lineage_verify_failed` | `partition, generation, applied, durable` / `fault` |
 | `rdb_storage` | `storage_open_refused_*` (level ERROR, one per refusal, field `error`) | suffix `locked`, `column_families`, `format`, `durable_above_applied`, `corrupt_record`, `no_database`, `backend`. Logged by `open`, `open_existing`, `open_read_only` and `dump` alike. |
 | `rdb_storage` | `dump_open` | `path, records` |
+| `rdb_storage` | `epoch_revocation_persisted` (synced write) / `epoch_revocation_written_unsynced` (staged; durable after the next sync) / `epoch_revocation_write_failed` (ERROR) | `partition, epoch` + `revoked, from_format, format` / `error` |
+| `rdb_storage` | `record_damaged` (WARN, debug builds only) | `partition, generation, ns, key_hex, offset` |
 | `rdb_storage` | `batch_commit_failed`, `wal_sync_failed`, `wal_sync_mark_write_failed` (ERROR) | `error` |
 | `rdb_storage` | `fault_injected` (WARN, debug builds; written when the fault fires, never at arming) | `fault`, `point` (the `--inject` spelling, as `fault_not_reached` uses) |
 | `rocks_scenario` | `fault_not_reached` (WARN; stdout says `inject point <p> not reached`, exit 0) | `point` |

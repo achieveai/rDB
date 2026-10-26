@@ -3182,8 +3182,10 @@ fn tracker_pin(module: &Replication) -> (OwnerEpoch, ConfigVersion, u64) {
 /// config 7 with one predicate. B's ACK at epoch 5 is now `StaleEpoch`, and at epoch 6 is
 /// admitted. The `ConfigChanged` to 8 that follows is still taken, not refused as stale, and
 /// its incarnation reset still runs (M7B-150): B, re-announced at a new boot, is fresh. The
-/// same view again is `OutOfOrder`, and so is a newer one that names config 7 now that the
-/// tracker pins 8: the gate reads the version `ConfigChanged` wrote. Neither changes anything.
+/// same view again is `NotRequired`: it is A1's renewal, which does not bump `authority_seq`, and
+/// not a regress. The same seq naming another epoch is still `OutOfOrder`, and so is a newer one
+/// that names config 7 now that the tracker pins 8: the gate reads the version `ConfigChanged`
+/// wrote. None of them changes anything.
 /// A view touches no cursor: B's catch-up runs through one unchanged.
 #[retcd_test]
 fn m7b_161_a_newer_view_moves_the_primarys_epoch_and_never_its_config() {
@@ -3226,15 +3228,24 @@ fn m7b_161_a_newer_view_moves_the_primarys_epoch_and_never_its_config() {
     );
 
     let before = module.clone();
-    for (stale, case) in [
-        (view(1, NEW_EPOCH, NEW_CONFIG), "the same seq again"),
-        (view(2, OwnerEpoch(7), CONFIG), "a newer seq below config 8"),
+    for (stale, answer, case) in [
+        (
+            view(1, NEW_EPOCH, NEW_CONFIG),
+            ReplicaIgnoreReason::NotRequired,
+            "the same view again, a renewal",
+        ),
+        (
+            view(1, OwnerEpoch(7), NEW_CONFIG),
+            ReplicaIgnoreReason::OutOfOrder,
+            "the same seq naming another epoch",
+        ),
+        (
+            view(2, OwnerEpoch(7), CONFIG),
+            ReplicaIgnoreReason::OutOfOrder,
+            "a newer seq below config 8",
+        ),
     ] {
-        assert_eq!(
-            route(&mut module, stale),
-            vec![replica(ReplicaIgnoreReason::OutOfOrder)],
-            "{case}"
-        );
+        assert_eq!(route(&mut module, stale), vec![replica(answer)], "{case}");
         assert_eq!(module, before, "{case}: a refused view changes nothing");
     }
 
@@ -3403,6 +3414,16 @@ fn m7b_163_the_recovered_view_is_the_floor_the_next_view_must_beat() {
 
 // --- Recovered builds R1's side (lead ruling B-R54) --------------------------------------------
 
+/// The boot `result`'s plan names for `copy`: F1 counts a proof only from it (A-R239a).
+fn named_boot(result: &RecoveryResult, copy: CopyId) -> BootId {
+    result
+        .committed
+        .pinned_config
+        .member(copy)
+        .expect("a required copy is a member")
+        .boot
+}
+
 /// `result` with a barrier over `copies`, each proved durable at the cutoff.
 fn requiring(mut result: RecoveryResult, copies: &[CopyId]) -> RecoveryResult {
     let (cutoff, digest) = (result.selected.cutoff_seq, result.selected.cutoff_digest);
@@ -3413,6 +3434,7 @@ fn requiring(mut result: RecoveryResult, copies: &[CopyId]) -> RecoveryResult {
             partition: P,
             seq: DurableSeq(cutoff.0),
             digest,
+            boot: named_boot(&result, copy),
         })
         .collect();
     let required = copies.iter().copied().collect();
@@ -3955,6 +3977,7 @@ fn p1_candidate(seq: u64) -> AppliedCandidate {
             correlation: CorrelationId(seq),
             verdict: Verdict::Admit,
         },
+        ack_floor: None,
     }
 }
 
@@ -4525,6 +4548,8 @@ fn f1_durable(copy: CopyId) -> RecoveryEvent {
         partition: P,
         seq: DurableSeq(HEAD),
         digest: d(HEAD),
+        // F1 counts a proof only from the boot its plan names (A-R239a).
+        boot: rf3().member(copy).expect("an RF3 member").boot,
     })
 }
 
@@ -7313,6 +7338,7 @@ fn m9_f1_a_tracker_the_proved_floor_never_rises_above_the_selected_cutoff() {
         partition: P,
         seq: DurableSeq(above.0),
         digest: d(above.0),
+        boot: named_boot(&result, COPY_C),
     };
     result.barrier =
         RecoveryBarrier::try_new(&[proof], &[COPY_C].into_iter().collect(), above, d(above.0))

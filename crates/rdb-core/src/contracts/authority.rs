@@ -134,20 +134,27 @@ impl DenyReason {
     /// lead ruling A-R72a).
     ///
     /// The mapping is written **here and nowhere else**, the way [`BlockReason::client_error_kind`]
-    /// is, so T1 and P1 cannot answer one deny two ways. Only a local storage fence depends on the
-    /// boundary: before apply nothing was handed to storage, so the partition is paused; after it
-    /// the batch may have landed, so the outcome is unknown.
+    /// is, so T1 and P1 cannot answer one deny two ways.
     ///
-    /// No wildcard arm on purpose: a variant added to [`DenyReason`] fails this match rather than
-    /// silently becoming `LEASE_EXPIRED`.
+    /// After apply every reason answers `UNKNOWN_OUTCOME`: the batch may have landed, so the
+    /// outcome is unknown and only a status query settles it (lead rulings A-R298, A-R342).
+    /// Before apply nothing was handed to storage, so every answer below proves no mutation by
+    /// this submission ([`crate::contracts::errors::RdbError::proves_no_mutation`]): a local
+    /// storage fence and a lost control quorum (ruling A-R285; the grant is still held and never
+    /// fenced) pause the partition, a generation change answers `GENERATION_CHANGED`, and every
+    /// lost or unprovable grant answers `LEASE_EXPIRED`. A `LEASE_EXPIRED` after apply would be a
+    /// false "definitely not applied" (A-R342).
+    ///
+    /// No wildcard arm before apply on purpose: a variant added to [`DenyReason`] fails this
+    /// match rather than silently becoming `LEASE_EXPIRED`.
     #[must_use]
     pub const fn client_error_kind(&self, boundary: Boundary) -> ErrorKind {
+        if matches!(boundary, Boundary::PostApply) {
+            return ErrorKind::UnknownOutcome;
+        }
         match self {
             Self::GenerationChanged => ErrorKind::GenerationChanged,
-            Self::LocalStorageFenced => match boundary {
-                Boundary::PreApply => ErrorKind::ProtectionPaused,
-                Boundary::PostApply => ErrorKind::UnknownOutcome,
-            },
+            Self::LocalStorageFenced | Self::ControlUnavailable => ErrorKind::ProtectionPaused,
             Self::NoGrant
             | Self::Frozen
             | Self::Revoked
@@ -160,8 +167,7 @@ impl DenyReason {
             | Self::ProcessSuspended
             | Self::BootMismatch
             | Self::AuthorityGenerationChanged
-            | Self::SelfFenced
-            | Self::ControlUnavailable => ErrorKind::LeaseExpired,
+            | Self::SelfFenced => ErrorKind::LeaseExpired,
         }
     }
 }
@@ -369,6 +375,11 @@ impl FencingProof {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Revocation {
     /// Spec §7.3 step 2. Counts only because a restart cannot restore that epoch.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225):** its own route. A live owner heals a
+    /// restarted peer this way: the revocation is persisted
+    /// ([`crate::contracts::storage::StoreEffect::PersistEpochRevocation`]) before the drain
+    /// counts. It needs no copy lock, and it is never folded into [`Self::ExpiryProven`].
     DurableDrain {
         /// The revision at which the drain was acknowledged.
         ack_revision: Revision,
@@ -383,6 +394,11 @@ pub enum Revocation {
     /// [`FencingProof::control_revision`] is the partition record's `mod_revision`, read
     /// linearizably after the delete was acknowledged and at a store revision not below it, as
     /// bootstrap's proof does; the delete's revision is logged, not carried.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225): that heal (case A) is sound only when the
+    /// healing process is the prior owner's node and holds that node's copy lock.** With one
+    /// process per node, the lock it holds is its own node's, not every copy's. The frozen-grant
+    /// form (an operator's promote) needs no lock: the freeze already pins `E`.
     ExpiryProven {
         /// `E` from the frozen grant record, read linearizably at
         /// [`FencingProof::control_revision`].
@@ -430,6 +446,10 @@ pub enum Revocation {
     /// `prior_grant_id = GrantId(0)` ("none held"), the prior boot from the partition record,
     /// and as [`FencingProof::control_revision`] the partition record's `mod_revision`, read
     /// linearizably at a store revision not below `absent_revision`.
+    ///
+    /// **Amended 2026-10-23 (M10 S2, ruling A-R225): sound only when the healing process is
+    /// the prior owner's node and holds that node's copy lock.** With one process per node, the
+    /// lock it holds is its own node's, not every copy's.
     NoGrantHeld {
         /// The store revision of the linearizable read that found the grant record absent.
         absent_revision: Revision,

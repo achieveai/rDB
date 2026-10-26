@@ -598,6 +598,7 @@ fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::K
         partition: PARTITION,
         seq: DurableSeq(BARRIER),
         digest,
+        boot: BOOT,
     };
     KernelEvent::Recovered(Box::new(RecoveryResult {
         fenced_prior: FencingProof {
@@ -1489,6 +1490,8 @@ fn stack_txn(request: u64) -> TxnRequest {
             value: bytes::Bytes::copy_from_slice(&request.to_be_bytes()),
             expected_version: None,
         }],
+        acked_below: None,
+        pinned: Vec::new(),
     }
 }
 
