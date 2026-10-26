@@ -787,6 +787,278 @@ async fn paused_build_outlasting_the_trigger_wait_still_yields_its_id() {
 }
 
 // -------------------------------------------------------------------------------------------
+// #30 — a trigger right after a publish starts a real build, or says it did not
+// -------------------------------------------------------------------------------------------
+
+/// Holds the `nth` (from 1) build that published (or was superseded) on this node at
+/// `FaultInjector::after_snapshot_export`: the store has published, and OpenRaft's core has
+/// not yet been told the build finished. Every other export passes straight through.
+struct HoldAfterExport {
+    nth: u64,
+    seen: std::sync::atomic::AtomicU64,
+    reached_tx: std::sync::mpsc::SyncSender<()>,
+    reached_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    release_tx: std::sync::mpsc::SyncSender<()>,
+    release_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// How long a held build waits for the row to release it before going on alone. Only a row
+/// that has already failed gets near it; it stops a panic from parking a blocking-pool thread
+/// for good, which would hang the runtime's drop.
+const HOLD_PATIENCE: Duration = Duration::from_secs(60);
+
+impl HoldAfterExport {
+    fn new(nth: u64) -> Arc<Self> {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        Arc::new(Self {
+            nth,
+            seen: std::sync::atomic::AtomicU64::new(0),
+            reached_tx,
+            reached_rx: std::sync::Mutex::new(reached_rx),
+            release_tx,
+            release_rx: std::sync::Mutex::new(release_rx),
+        })
+    }
+
+    async fn reached(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            me.reached_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(HOLD_PATIENCE)
+                .expect("the build reaches the hold")
+        })
+        .await
+        .expect("wait task joins");
+    }
+
+    fn release(&self) {
+        let _ = self.release_tx.try_send(());
+    }
+}
+
+impl config_storage::FaultInjector for HoldAfterExport {
+    fn before(&self, _boundary: Boundary) -> config_storage::FaultAction {
+        config_storage::FaultAction::Proceed
+    }
+
+    fn after_snapshot_export(&self) {
+        if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.nth {
+            let _ = self.reached_tx.send(());
+            let _ = self.release_rx.lock().unwrap().recv_timeout(HOLD_PATIENCE);
+        }
+    }
+}
+
+/// How many lines of this test's log hold every one of `needles`.
+fn log_count(method: &str, needles: &[&str]) -> usize {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter(|l| needles.iter().all(|needle| l.contains(needle)))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A formed 3-node Rocks cluster whose node 1 holds its `nth` export, seeded with a few keys.
+/// Node 1 is the node the #30 rows build on; it need not lead.
+async fn held_cluster(nth: u64) -> (Arc<Cluster>, Arc<HoldAfterExport>) {
+    let hold = HoldAfterExport::new(nth);
+    let mut builder = Cluster::builder().nodes(3).storage(StorageKind::ROCKS);
+    for i in 1..=3u64 {
+        let faults: Arc<dyn config_storage::FaultInjector> = if i == 1 {
+            hold.clone()
+        } else {
+            ScriptedInjector::new()
+        };
+        builder = builder.faults(NodeId(i), faults);
+    }
+    let cluster = Arc::new(builder.start().await);
+    cluster
+        .wait_formed(cluster.deadline(10))
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+    let leader = cluster.leader().await;
+    for i in 0..5 {
+        cluster
+            .client(leader)
+            .put(put_req(&format!("/b30/{i}"), "v"))
+            .await
+            .unwrap_or_else(|e| panic!("seed put {i}: {e}"));
+    }
+    (cluster, hold)
+}
+
+/// The #30 contract for one trigger that ran after the held build `held_id` was released: a
+/// build started, and the answer names it (or says it is still running), never `held_id`.
+fn assert_a_build_started(
+    answer: SnapshotTriggered,
+    held_id: &str,
+    calls_before: u64,
+    calls_after: u64,
+) {
+    match answer {
+        SnapshotTriggered::Started {
+            snapshot_id: Some(id),
+            ..
+        } => assert_ne!(
+            id, held_id,
+            "the answer names a new build, not the held one"
+        ),
+        SnapshotTriggered::Started {
+            snapshot_id: None, ..
+        } => assert!(
+            calls_after > calls_before,
+            "Started {{ snapshot_id: None }} with no build started (#30): calls {calls_before} \
+             -> {calls_after}"
+        ),
+        SnapshotTriggered::AlreadyInProgress => panic!(
+            "the trigger sent every try while the core still counted the held build as \
+             running, so no build started (calls {calls_before} -> {calls_after})"
+        ),
+    }
+    assert!(
+        calls_after > calls_before,
+        "a build started: calls {calls_before} -> {calls_after}"
+    );
+}
+
+/// #30: a trigger sent the moment a build has published, while OpenRaft's core still counts that
+/// build as running, must start a real build — or say it did not. It must never answer
+/// `Started { snapshot_id: None }` for a build that never started.
+///
+/// Build A is held after it published and before OpenRaft hears it finished. That is the gap
+/// in which openraft drops a trigger without a word. The row then triggers again at once, with
+/// no wait of its own, and lets A finish only when the trigger shows where it stands:
+///
+/// - it logged `snapshot_trigger_waiting_for_core` (it waits for OpenRaft to take in A first),
+/// - or it logged its second, last `snapshot_trigger_sent` (it sent both tries into the gap),
+/// - or it already answered (the trigger before #30, which never looked).
+///
+/// Only the first lets a build start, so the row is red without the wait before the trigger.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn b30_a_trigger_right_after_a_publish_starts_a_real_build() {
+    const METHOD: &str = "b30_a_trigger_right_after_a_publish_starts_a_real_build";
+    let (cluster, hold) = held_cluster(1).await;
+    let node = NodeId(1);
+
+    let a = trigger_in_background(&cluster, node);
+    hold.reached().await;
+    let a_id = published_id(a).await;
+
+    // Back to back: no wait for OpenRaft between the publish and this trigger.
+    let calls_before = cluster.rocks_store(node).snapshot_build_calls();
+    let second = trigger_in_background(&cluster, node);
+    let waited = cluster
+        .wait_for(
+            "the second trigger to wait for the core, send its last try, or answer",
+            cluster.deadline(10),
+            || {
+                (second.task.is_finished()
+                    || log_count(METHOD, &["snapshot_trigger_waiting_for_core"]) > 0
+                    || log_count(METHOD, &["snapshot_trigger_sent", "\"attempt\":2"]) > 0)
+                    .then_some(())
+            },
+        )
+        .await;
+    hold.release();
+    waited.unwrap_or_else(|t| panic!("{t}"));
+    let answer = second
+        .task
+        .await
+        .expect("the trigger task must not panic")
+        .expect("the trigger must not be refused");
+    let calls_after = cluster.rocks_store(node).snapshot_build_calls();
+    assert_a_build_started(answer, &a_id, calls_before, calls_after);
+}
+
+/// #30, the gap the wait cannot see: a build at an **unchanged** log id leaves OpenRaft's
+/// snapshot log id where it was, so a trigger that waits for the two to meet goes ahead while
+/// the core still counts that build as running, and its first try is dropped. The second try
+/// must start a build.
+///
+/// A is built and heard. B covers the same log id (no writes between) and is held after it
+/// published. The row triggers at once, lets B finish only once that trigger has sent its first
+/// try (or answered), and requires a build to start. Red with one try.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn b30_c_a_dropped_first_try_is_sent_again() {
+    const METHOD: &str = "b30_c_a_dropped_first_try_is_sent_again";
+    let (cluster, hold) = held_cluster(2).await;
+    let node = NodeId(1);
+
+    let a_id = published_id(trigger_in_background(&cluster, node)).await;
+    let a_index = published_log_index(&cluster, node, &a_id);
+    wait_for_openraft_to_finish(&cluster, &a_id, METHOD).await;
+    let b = trigger_in_background(&cluster, node);
+    hold.reached().await;
+    let b_id = published_id(b).await;
+    assert_eq!(
+        published_log_index(&cluster, node, &b_id),
+        a_index,
+        "B covers A's log id, so OpenRaft's snapshot log id cannot show B finishing"
+    );
+
+    let sent_before = log_count(METHOD, &["snapshot_trigger_sent"]);
+    let calls_before = cluster.rocks_store(node).snapshot_build_calls();
+    let third = trigger_in_background(&cluster, node);
+    let waited = cluster
+        .wait_for(
+            "the third trigger to send its first try, or answer",
+            cluster.deadline(10),
+            || {
+                (third.task.is_finished()
+                    || log_count(METHOD, &["snapshot_trigger_sent"]) > sent_before)
+                    .then_some(())
+            },
+        )
+        .await;
+    hold.release();
+    waited.unwrap_or_else(|t| panic!("{t}"));
+    let answer = third
+        .task
+        .await
+        .expect("the trigger task must not panic")
+        .expect("the trigger must not be refused");
+    let calls_after = cluster.rocks_store(node).snapshot_build_calls();
+    assert_a_build_started(answer, &b_id, calls_before, calls_after);
+}
+
+/// #30, unheld: triggers sent back to back, each the moment the one before answered, never
+/// answer `Started { snapshot_id: None }` for a build that did not start.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn b30_back_to_back_triggers_never_report_a_build_that_did_not_start() {
+    let (cluster, _scripts) = seeded_cluster().await;
+    let leader = cluster.leader().await;
+    let store = cluster.rocks_store(leader);
+    for round in 0..4 {
+        let calls_before = store.snapshot_build_calls();
+        let answer = cluster
+            .node(leader)
+            .trigger_snapshot()
+            .await
+            .unwrap_or_else(|e| panic!("trigger {round}: {e}"));
+        let calls_after = store.snapshot_build_calls();
+        if let SnapshotTriggered::Started {
+            snapshot_id: None, ..
+        } = answer
+        {
+            assert!(
+                calls_after > calls_before,
+                "round {round}: Started {{ snapshot_id: None }} with no build started (#30)"
+            );
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
 // M5-17 — a store that purged and then lost its snapshot rebuilds one on the startup path
 // -------------------------------------------------------------------------------------------
 

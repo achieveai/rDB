@@ -1777,6 +1777,7 @@ pub(crate) fn promote_members(
 const PROMOTE: CorrelationId = CorrelationId(4);
 
 /// [`promote_looked`] with no refused look: the entry the tests use.
+#[cfg(test)]
 pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
     promote_looked(ctx, None).await
 }
@@ -1811,8 +1812,9 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
 /// [`PromoteError`].
 ///
 /// `refused` is the caller's refused look at `to` ([`promote_members`]). It is the answer when
-/// `partitions/1` pins no members (layout 3); otherwise `ctx.members` is unused and the
-/// record's members are planned with (bug bash #64, ruling A-R431).
+/// `partitions/1` pins no members (layout 3), or when `to` did not answer at all
+/// ([`PromoteError::PeersUnknown`]). Otherwise `ctx.members` is unused and the record's members
+/// are planned with (bug bash #64, ruling A-R431).
 pub(crate) async fn promote_looked(
     ctx: PromoteCtx,
     refused: Option<PromoteError>,
@@ -1820,6 +1822,11 @@ pub(crate) async fn promote_looked(
     let deadline = tokio::time::Instant::now() + ctx.within;
     let (record, root, stored, mod_revision, _) = read_partition(&*ctx.store).await?;
     let (planned, planned_version) = match (&stored, refused) {
+        // `to` did not answer at all: it is refused before anything is written whatever the
+        // record pins, so no owner is fenced toward a node that is not there (A-R412).
+        (_, Some(refused @ PromoteError::PeersUnknown { .. })) | (None, Some(refused)) => {
+            return Err(refused)
+        }
         (Some(stored), _) => (
             stored
                 .iter()
@@ -1827,7 +1834,6 @@ pub(crate) async fn promote_looked(
                 .collect::<Vec<_>>(),
             record.config_version,
         ),
-        (None, Some(refused)) => return Err(refused),
         (None, None) => (ctx.members.clone(), ctx.members_version),
     };
     tracing::info!(

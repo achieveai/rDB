@@ -252,6 +252,15 @@ pub trait FaultInjector: Send + Sync {
     /// hold a capture open and show what the capture holds while it runs — that state readers
     /// do not wait for it (A-R279).
     fn during_snapshot_capture(&self) {}
+
+    /// Called once per export that published or was superseded, on the store's blocking
+    /// thread, after the state-machine lock is released and before the build opens the file it
+    /// hands OpenRaft. Does nothing by default.
+    ///
+    /// Not a [`Boundary`] either. It exists so a test can hold a build that the store has
+    /// already published but OpenRaft has not yet been told about (#30), or remove the file
+    /// the build is about to open, as a prune would (#68 A-2).
+    fn after_snapshot_export(&self) {}
 }
 
 /// How many times each [`Boundary`] has been crossed.
