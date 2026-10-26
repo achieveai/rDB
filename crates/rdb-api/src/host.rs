@@ -2544,7 +2544,7 @@ impl Host {
                 facts,
                 ..
             } => {
-                match bind_routed_fence(&proof, facts, self.clock.now(), &self.budgets) {
+                match bind_routed_fence(partition, &proof, facts, self.clock.now(), &self.budgets) {
                     Ok(()) => {
                         tracing::info!(
                             node = self.node.0,
@@ -9333,6 +9333,7 @@ pub struct FenceFacts {
 /// stays true until `partitions/1` moves, and that fails the commit CAS. The one refusal that
 /// can be wrong is this node's clock view lagging the promoter's; the promote then times out.
 ///
+/// 0. the proof is for the partition it was routed to (critic-63 A1: F1 is given it there);
 /// 1. `partitions/1` is the proof's partition, at `control_revision`;
 /// 2. it is `Fencing`;
 /// 3. its generation and owner epoch are the proof's prior ones;
@@ -9341,11 +9342,21 @@ pub struct FenceFacts {
 /// 6. the revocation is `ExpiryProven` (a routed `DurableDrain` is refused: only local paths
 ///    send one), and this node's own clock view proves that grant's expiry past.
 pub(crate) fn bind_routed_fence(
+    routed: PartitionId,
     proof: &FencingProof,
     facts: Result<FenceFacts, String>,
     now: Tick,
     budgets: &Budgets,
 ) -> Result<(), (&'static str, String)> {
+    if routed != proof.partition {
+        return Err((
+            "partition",
+            format!(
+                "routed to partition {}, the proof is for partition {}",
+                routed.0, proof.partition.0
+            ),
+        ));
+    }
     let facts = facts.map_err(|error| ("control_read_failed", error))?;
     let record = &facts.record;
     if record.partition != proof.partition || facts.mod_revision != proof.control_revision {

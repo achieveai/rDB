@@ -6314,7 +6314,8 @@ mod routed_fence {
     }
 
     fn bind(proof: &FencingProof, facts: FenceFacts) -> Result<(), &'static str> {
-        bind_routed_fence(proof, Ok(facts), NOW, &test_budgets()).map_err(|(reason, _)| reason)
+        bind_routed_fence(PartitionId(1), proof, Ok(facts), NOW, &test_budgets())
+            .map_err(|(reason, _)| reason)
     }
 
     /// The positive control: a fence every check holds for binds.
@@ -6336,7 +6337,12 @@ mod routed_fence {
         assert_eq!(bind(&proof, facts), Err("revision"));
         let (mut proof, facts) = true_fence();
         proof.partition = PartitionId(2);
-        assert_eq!(bind(&proof, facts), Err("revision"));
+        assert_eq!(
+            bind_routed_fence(PartitionId(2), &proof, Ok(facts), NOW, &test_budgets())
+                .map_err(|(reason, _)| reason),
+            Err("revision"),
+            "routed to partition 2, which partitions/1 is not"
+        );
     }
 
     /// Check 2: a `Serving` or `FencingDrained` record, with every grant fact true.
@@ -6410,14 +6416,34 @@ mod routed_fence {
         assert_eq!(bind(&proof, facts), Err("revocation"));
     }
 
+    /// Check 0 (critic-63 A1): a proof routed to a partition it is not for. Every other fact is
+    /// true of the proof's own partition.
+    /// Cut: check 0 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_0_a_fence_routed_to_another_partition_is_refused() {
+        let (proof, facts) = true_fence();
+        assert_eq!(
+            bind_routed_fence(PartitionId(2), &proof, Ok(facts), NOW, &test_budgets())
+                .map_err(|(reason, _)| reason),
+            Err("partition")
+        );
+    }
+
     /// A control read that failed refuses, never binds.
     /// Unit (<1 ms).
     #[test]
     fn m10_s2_r446_a_fence_whose_reads_failed_is_refused() {
         let (proof, _) = true_fence();
         assert_eq!(
-            bind_routed_fence(&proof, Err("get".to_owned()), NOW, &test_budgets())
-                .map_err(|(reason, _)| reason),
+            bind_routed_fence(
+                PartitionId(1),
+                &proof,
+                Err("get".to_owned()),
+                NOW,
+                &test_budgets()
+            )
+            .map_err(|(reason, _)| reason),
             Err("control_read_failed")
         );
     }
