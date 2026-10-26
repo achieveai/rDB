@@ -71,6 +71,7 @@ async fn m4_99_watch_frames_round_trip_over_the_wire() {
             prefix: Bytes::from_static(b"/app/"),
             start_after_revision: 6,
             progress_interval_ms: Some(250),
+            history: None,
         })
         .await
         .expect("watch opens")
@@ -123,6 +124,7 @@ async fn m4_100_compacted_cursor_maps_to_out_of_range_with_the_minimum() {
             prefix: Bytes::new(),
             start_after_revision: 10,
             progress_interval_ms: None,
+            history: None,
         })
         .await
     else {
@@ -171,6 +173,7 @@ async fn m4_101_resource_exhausted_carries_the_resumable_flag() {
                 prefix: Bytes::new(),
                 start_after_revision: 0,
                 progress_interval_ms: None,
+                history: None,
             })
             .await
         else {
@@ -218,6 +221,7 @@ async fn terminal_error_mid_stream_arrives_as_the_last_item() {
             prefix: Bytes::new(),
             start_after_revision: 0,
             progress_interval_ms: None,
+            history: None,
         })
         .await
         .expect("the stream opens")
@@ -260,6 +264,7 @@ fn zero_progress_interval_is_rejected_not_defaulted() {
         prefix: Bytes::new(),
         start_after_revision: 0,
         progress_interval_ms: None,
+        history: None,
     })
     .expect("an absent interval means the node's default");
     assert_eq!(absent.progress_interval, None);
@@ -268,6 +273,7 @@ fn zero_progress_interval_is_rejected_not_defaulted() {
         prefix: Bytes::new(),
         start_after_revision: 0,
         progress_interval_ms: Some(0),
+        history: None,
     });
     assert!(
         matches!(zero, Err(ConfigError::InvalidArgument { .. })),

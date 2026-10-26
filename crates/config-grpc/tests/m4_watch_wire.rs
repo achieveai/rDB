@@ -184,6 +184,7 @@ async fn m4_50_unauthenticated_watch_rejected() {
                 prefix: Bytes::new(),
                 start_after_revision: 0,
                 progress_interval_ms: None,
+                history: None,
             })
             .await
             .map(|_| ())
@@ -241,6 +242,7 @@ async fn m4_61_compacted_error_maps_to_the_documented_status() {
             prefix: Bytes::new(),
             start_after_revision: 10,
             progress_interval_ms: None,
+            history: None,
         })
         .await
         .expect_err("a compacted cursor must be refused over gRPC too");
@@ -319,6 +321,7 @@ async fn m4_97_grpc_watch_streams_events() {
             prefix: Bytes::new(),
             start_after_revision: 0,
             progress_interval_ms: None,
+            history: None,
         })
         .await
         .expect("watch opens over mTLS")
@@ -363,6 +366,7 @@ async fn m4_102_not_leader_trailers_on_a_stream() {
             prefix: Bytes::new(),
             start_after_revision: 0,
             progress_interval_ms: None,
+            history: None,
         })
         .await
         .expect("the stream opens")
@@ -456,6 +460,7 @@ async fn m4_103_mtls_principal_is_per_stream() {
             prefix: Bytes::new(),
             start_after_revision: 0,
             progress_interval_ms: None,
+            history: None,
         })
         .await
         .expect("svc-a opens a watch")
@@ -480,6 +485,7 @@ async fn m4_103_mtls_principal_is_per_stream() {
             prefix: Bytes::new(),
             start_after_revision: 0,
             progress_interval_ms: None,
+            history: None,
         })
         .await
         .expect("svc-b opens a watch")
@@ -535,6 +541,7 @@ fn m4_109_proto_tags_are_from_the_reserved_block() {
         prefix: Bytes::from_static(b"a"),
         start_after_revision: 6,
         progress_interval_ms: Some(100),
+        history: None,
     };
     const GOLDEN_REQUEST: [u8; 7] = [0x0A, 0x01, 0x61, 0x10, 0x06, 0x18, 0x64];
     assert_eq!(request.encode_to_vec(), GOLDEN_REQUEST);

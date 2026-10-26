@@ -335,7 +335,22 @@ impl From<&WatchRequest> for pb::WatchRequest {
             progress_interval_ms: req
                 .progress_interval
                 .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+            // The core request carries no history (critic-bb M4); a client that resumes adds
+            // it to the wire request itself ([`watch_history_to_pb`]).
+            history: None,
         }
+    }
+}
+
+/// A cursor's history on the wire (#37). The cluster id is written as 32 lowercase hex
+/// characters, as it is everywhere else.
+pub fn watch_history_to_pb(
+    cluster_id: config_core::ClusterId,
+    recovery_epoch: config_core::RecoveryEpoch,
+) -> pb::WatchHistory {
+    pb::WatchHistory {
+        cluster_id: cluster_id.to_string(),
+        recovery_epoch: recovery_epoch.0,
     }
 }
 

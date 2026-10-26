@@ -95,13 +95,15 @@ pub use admin_plane::{
 };
 pub use client_plane::{serve_client_plane, ClientBackend, WatchResponses};
 pub use config_engine::watch::TrackedWatch;
-pub use convert::{watch_item_from_pb, watch_request_from_pb};
+pub use convert::{watch_history_to_pb, watch_item_from_pb, watch_request_from_pb};
 pub use credentials::{CredentialSource, Credentials};
 pub use error::{
-    code_for, error_from_status, is_server_rejection, leader_hint, mark_rejected,
-    status_from_error, GrpcError, HEADER_CONFLICT_EXISTS, HEADER_CONFLICT_MOD_REVISION,
+    code_for, error_from_status, history_mismatch, is_relist_history, is_server_rejection,
+    leader_hint, mark_rejected, status_from_error, watch_history_from_metadata, GrpcError,
+    HEADER_CLUSTER_ID, HEADER_CONFLICT_EXISTS, HEADER_CONFLICT_MOD_REVISION,
     HEADER_LEADER_ENDPOINT, HEADER_LEADER_NODE_ID, HEADER_MIN_REVISION, HEADER_OUTCOME,
-    HEADER_REASON, HEADER_RESUMABLE, OUTCOME_REJECTED,
+    HEADER_REASON, HEADER_RECOVERY_EPOCH, HEADER_RELIST, HEADER_RESUMABLE, HISTORY_MISMATCH_DETAIL,
+    OUTCOME_REJECTED, RELIST_HISTORY,
 };
 pub use limits::{
     client_plane_message_limit, peer_plane_message_limit, MESSAGE_FRAMING_SLACK_BYTES,

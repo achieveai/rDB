@@ -515,6 +515,10 @@ struct RocksShared {
     snapshot_build_failures: AtomicU64,
     /// Captures retried inside `build_snapshot` rather than surfaced as that fatal error.
     snapshot_build_retries: AtomicU64,
+    /// Builds that ended by handing OpenRaft the current snapshot because an install had
+    /// superseded their view: they neither publish nor fail, so a count of builds still running
+    /// that is derived from those two has to subtract these as well (#68).
+    snapshot_builds_superseded: AtomicU64,
     /// `state_meta/current_snapshot` batches committed. The §19.7 ordering oracle.
     snapshot_publications: AtomicU64,
     /// Duration of the most recent successful build, milliseconds.
@@ -1291,6 +1295,7 @@ impl RocksStore {
                 snapshot_builds_in_flight: AtomicU64::new(0),
                 snapshot_build_failures: AtomicU64::new(0),
                 snapshot_build_retries: AtomicU64::new(0),
+                snapshot_builds_superseded: AtomicU64::new(0),
                 snapshot_publications: AtomicU64::new(0),
                 snapshot_build_ms: AtomicU64::new(0),
                 snapshot_installs: AtomicU64::new(0),
@@ -1473,6 +1478,14 @@ impl RocksStore {
     /// plan M2-37: M0-M3 never builds a snapshot).
     pub fn snapshot_build_calls(&self) -> u64 {
         self.shared.snapshot_builds.load(Ordering::SeqCst)
+    }
+
+    /// Builds that ended superseded: an install had already moved the store past their view,
+    /// so they handed OpenRaft the current snapshot and published nothing of their own (#68).
+    pub fn snapshot_builds_superseded(&self) -> u64 {
+        self.shared
+            .snapshot_builds_superseded
+            .load(Ordering::SeqCst)
     }
 
     /// Apply the node's snapshot policy to the parts of it the *store* owns.
@@ -3541,7 +3554,12 @@ impl RaftSnapshotBuilder<TypeConfig> for RocksSnapshotBuilder {
                         "snapshot_build_superseded"
                     );
                     match self.open_built(current, elapsed).await {
-                        Ok(built) => return Ok(built),
+                        Ok(built) => {
+                            self.shared
+                                .snapshot_builds_superseded
+                                .fetch_add(1, Ordering::SeqCst);
+                            return Ok(built);
+                        }
                         // A-2: the current snapshot's file went between the publish check and
                         // this open, as a prune removes it once a newer one is current. Nothing
                         // failed, so no attempt is spent: capture again, which covers the newer

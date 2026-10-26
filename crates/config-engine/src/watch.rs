@@ -38,8 +38,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use config_core::policy::{changed_prefixes, touches_changed_prefix, PolicyDocument};
 use config_core::{
-    Action, Authorizer, ConfigError, LeaderHint, MutationEvent, Principal, WatchItem, WatchLimits,
-    WatchRequest, WatchStream,
+    Action, Authorizer, ClusterId, ConfigError, LeaderHint, MutationEvent, Principal,
+    RecoveryEpoch, WatchItem, WatchLimits, WatchRequest, WatchStream,
 };
 use config_log::TraceContext;
 use config_storage::{AppliedBatch, AppliedBatchSink, StateReader};
@@ -1619,6 +1619,8 @@ pub struct TrackedWatch {
     inner: WatchStream,
     stream_id: Option<StreamId>,
     last_delivered_revision: u64,
+    /// The history the serving node said its revisions belong to (#37).
+    history: Option<(ClusterId, RecoveryEpoch)>,
 }
 
 impl std::fmt::Debug for TrackedWatch {
@@ -1626,6 +1628,7 @@ impl std::fmt::Debug for TrackedWatch {
         f.debug_struct("TrackedWatch")
             .field("stream_id", &self.stream_id)
             .field("last_delivered_revision", &self.last_delivered_revision)
+            .field("history", &self.history)
             .finish_non_exhaustive()
     }
 }
@@ -1637,6 +1640,7 @@ impl TrackedWatch {
             inner,
             stream_id: None,
             last_delivered_revision: 0,
+            history: None,
         }
     }
 
@@ -1646,6 +1650,7 @@ impl TrackedWatch {
             inner,
             stream_id: Some(stream_id),
             last_delivered_revision: 0,
+            history: None,
         }
     }
 
@@ -1657,6 +1662,21 @@ impl TrackedWatch {
     /// The node-local stream id, when the transport reported one.
     pub fn stream_id(&self) -> Option<StreamId> {
         self.stream_id
+    }
+
+    /// Record the history the serving node echoed when the watch opened (#37).
+    pub fn with_history(mut self, history: Option<(ClusterId, RecoveryEpoch)>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// The history this watch's revisions belong to, when the node said (#37).
+    ///
+    /// `None` from a node that predates #37, or from the in-process path, which never sees a
+    /// restore. A caller that resumes passes this back, so a node serving another history
+    /// refuses the cursor instead of reading it against the wrong revisions.
+    pub fn history(&self) -> Option<(ClusterId, RecoveryEpoch)> {
+        self.history
     }
 
     /// Drop the tracking and hand back the plain stream.
