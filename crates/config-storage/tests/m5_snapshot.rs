@@ -1804,7 +1804,7 @@ async fn f001_a_build_inside_an_install_never_publishes_the_mid_install_view() {
         // The checkpoint is mid-install. Wait until the build is done with it.
         let deadline = std::time::Instant::now() + RACE_PATIENCE;
         while build_view_exists(dst_dir.path()) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await; // testkit:allow-sleep: bounded poll for the build to release its view
         }
         let view_released = !build_view_exists(dst_dir.path());
         let published_mid_install = dst.metrics().snapshot_publications;
@@ -2001,7 +2001,7 @@ async fn f001_a_waiting_build_ends_when_the_install_fails() {
         // The build is done with its mid-install checkpoint, so it is waiting on the install.
         let deadline = std::time::Instant::now() + RACE_PATIENCE;
         while build_view_exists(dst_dir.path()) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await; // testkit:allow-sleep: bounded poll for the build to release its view
         }
 
         race.release_all();
