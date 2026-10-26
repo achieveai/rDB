@@ -7116,6 +7116,59 @@ fn m10_s1_5_a_resolving_recovery_cas_blocks_on_any_other_record() {
     }
 }
 
+/// Bug bash #64 (rulings A-R426 M1, A-R430): a bound F1's commit CAS and its activation CAS both
+/// write layout 4 with the plan's members, so a promote after a full restart can read them from
+/// `partitions/1`. A survives alone, commits `ReadOnly`, rebuilds B and activates. Cuts: either
+/// `Cas::new` site passes no members, red (the first or the second assert).
+#[retcd_test]
+fn bb_64_the_commit_and_the_activation_cas_both_pin_the_plans_members() {
+    use rdb_core::authority::partition::RecordMember;
+    let pinned: Vec<RecordMember> = plan(&[])
+        .config
+        .members
+        .iter()
+        .map(RecordMember::of)
+        .collect();
+    let mut f1 = F1 {
+        module: Recovery::bound_to(Some([7; INSTANCE_LEN])),
+        log: Vec::new(),
+        requests: Vec::new(),
+    };
+    f1.rec(0, RecoveryEvent::Plan(Box::new(plan(&[]))));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    f1.report(WINDOW, inv(A, 20));
+    for copy in [B, C] {
+        f1.rec(WINDOW, RecoveryEvent::InventoryFailed { copy });
+    }
+    if f1.phase() != RecoveryPhase::Barrier {
+        f1.step(WINDOW, fired(1));
+    }
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    let commit = proposed_bytes(&f1);
+    assert_eq!(
+        (commit[0], RecordMember::decode_all(&commit)),
+        (4, Some(pinned.clone())),
+        "the commit CAS"
+    );
+    recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    for copy in [A, B, C] {
+        f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    let activation = proposed_bytes(&f1);
+    assert_eq!(
+        PartitionRoot::decode(&activation).map(|root| root.mode),
+        Some(rdb_core::authority::partition::RecordMode::Active),
+        "the activation CAS"
+    );
+    assert_eq!(
+        (activation[0], RecordMember::decode_all(&activation)),
+        (4, Some(pinned)),
+        "the activation CAS"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // M10 S2 W9: the `BarrierIncomplete` retry (arch-s2 "BarrierIncomplete retry"; Rev 3 R2-A1). A
 // pre-commit wait that reaches its deadline is tried again, up to three attempts at 1x, 2x and 4x

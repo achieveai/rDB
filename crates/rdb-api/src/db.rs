@@ -2865,7 +2865,8 @@ impl Db {
     /// the partition already, or is `drop`. `UNAVAILABLE`, nothing changed, from a `Db` a crate
     /// test built by hand, which has no control store. `UNAVAILABLE`, nothing changed, when
     /// `to` does not answer within the read timeout, holds no configuration since its restart
-    /// (a stated limit: retrying will not help), or holds one older than `partitions/1`'s.
+    /// (retrying will not help), or holds one older than `partitions/1`'s; the last two do not
+    /// apply when `partitions/1` pins its members (layout 4, bug bash #64).
     /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
     /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
     /// it again picks up where it stopped.
@@ -2881,10 +2882,18 @@ impl Db {
                 .to_owned(),
                 retry_after: None,
             })?;
-        // The roles come from `to`'s own pinned configuration, read before anything is
-        // written (review-s2 F-004, A-R412).
-        let (members, members_version) =
-            admin::promote_members(to, self.look(to).ok(), self.timeouts.read)?;
+        // The roles come from `partitions/1` when it pins them (layout 4), else from `to`'s own
+        // pinned configuration, read before anything is written (review-s2 F-004, A-R412). A
+        // refused look is the answer only for a layout-3 record (bug bash #64, A-R431).
+        let (members, members_version, refused) =
+            match admin::promote_members(to, self.look(to).ok(), self.timeouts.read) {
+                Ok((members, version)) => (members, version, None),
+                Err(refused) => (
+                    Vec::new(),
+                    rdb_core::contracts::ids::ConfigVersion(0),
+                    Some(refused),
+                ),
+            };
         let (senders, boots): (
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
@@ -2926,7 +2935,7 @@ impl Db {
         let (done, answer) = mpsc::channel();
         rt.spawn(async move {
             // The caller may have given up; then nobody needs the answer.
-            let _ = done.send(admin::promote(ctx).await);
+            let _ = done.send(admin::promote_looked(ctx, refused).await);
         });
         let promoted = match answer.recv_timeout(within + Duration::from_secs(5)) {
             Ok(Ok(promoted)) => promoted,

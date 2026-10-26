@@ -32,7 +32,7 @@ use config_core::{
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
 use rdb_core::authority::partition::{
-    PartitionLifecycle, PartitionRecord, PartitionRoot, INSTANCE_LEN,
+    PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
 };
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
@@ -1726,7 +1726,8 @@ pub(crate) struct PromoteCtx {
     /// How long the whole promote may take, the prior grant's expiry and the commit included.
     pub(crate) within: Duration,
     /// The members partition 1 is pinned to now, with their roles. `Db::promote` reads them from
-    /// `to`'s newest configuration, never from [`members`], which holds no shadow.
+    /// `to`'s newest configuration, never from [`members`], which holds no shadow. Used only
+    /// while `partitions/1` is layout 3: a layout-4 record pins its own (bug bash #64, A-R426).
     pub(crate) members: Vec<Member>,
     /// The version of the configuration `members` comes from. `promote` refuses
     /// [`PromoteError::StaleMembers`] when it is not `partitions/1`'s (A-R415 C-2).
@@ -1775,15 +1776,23 @@ pub(crate) fn promote_members(
 /// The correlation a promote's two events carry.
 const PROMOTE: CorrelationId = CorrelationId(4);
 
+/// [`promote_looked`] with no refused look: the entry the tests use.
+#[cfg(test)]
+pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
+    promote_looked(ctx, None).await
+}
+
 /// Make `ctx.to` the owner of partition 1 while its owner is dead or cut off (arch-s2
 /// "Promote", A-R256). In order:
 ///
-/// 1. Read `partitions/1`; refuse a `to` or `drop` that is not a member, a `Shadow` `to`, the
-///    owner as `to`, and `drop == to`, before anything is written.
+/// 1. Read `partitions/1`. Plan with the members it pins when it is layout 4, else with
+///    `ctx.members` (bug bash #64, ruling A-R426). Refuse a `to` or `drop` that is not a member,
+///    a `Shadow` `to`, the owner as `to`, and `drop == to`, before anything is written.
 /// 2. Pin the boots of the two members kept: every member but `drop` (default: the prior
 ///    owner). A promote always plans two members at a new generation.
-/// 3. CAS `partitions/1` to `Fencing` at the revision read (kept when a promote that stopped
-///    already wrote it).
+/// 3. CAS `partitions/1` to `Fencing` at the revision read, as layout 4 with the members of
+///    step 1 (A-R426 M1), so a promote run again after a full restart finds them. Kept when a
+///    promote that stopped already wrote it.
 /// 4. Freeze `grants/{prior}`, or create it frozen when it is absent (PR #41): no renewal can
 ///    move its expiry `E` after this.
 /// 5. Wait until control time is past `E + epsilon + delta` ([`expiry_proven`]): from then
@@ -1801,16 +1810,43 @@ const PROMOTE: CorrelationId = CorrelationId(4);
 /// # Errors
 ///
 /// [`PromoteError`].
-pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
+///
+/// `refused` is the caller's refused look at `to` ([`promote_members`]). It is the answer when
+/// `partitions/1` pins no members (layout 3), or when `to` did not answer at all
+/// ([`PromoteError::PeersUnknown`]). Otherwise `ctx.members` is unused and the record's members
+/// are planned with (bug bash #64, ruling A-R431).
+pub(crate) async fn promote_looked(
+    ctx: PromoteCtx,
+    refused: Option<PromoteError>,
+) -> Result<Promoted, PromoteError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
-    let (record, root, mod_revision, _) = read_partition(&*ctx.store).await?;
+    let (record, root, stored, mod_revision, _) = read_partition(&*ctx.store).await?;
+    let (planned, planned_version) = match (&stored, refused) {
+        // `to` did not answer at all: it is refused before anything is written whatever the
+        // record pins, so no owner is fenced toward a node that is not there (A-R412).
+        (_, Some(refused @ PromoteError::PeersUnknown { .. })) | (None, Some(refused)) => {
+            return Err(refused)
+        }
+        (Some(stored), _) => (
+            stored
+                .iter()
+                .map(|member| member.at(UNLINKED_BOOT))
+                .collect::<Vec<_>>(),
+            record.config_version,
+        ),
+        (None, None) => (ctx.members.clone(), ctx.members_version),
+    };
+    tracing::info!(
+        from = if stored.is_some() { "record" } else { "live" },
+        members = ?planned.iter().map(|m| (m.copy.0, m.node.0, m.role)).collect::<Vec<_>>(),
+        "promote_members_from"
+    );
     let prior = record.owner;
     let dropped = ctx.drop.unwrap_or(prior);
-    let member = |node: NodeId| ctx.members.iter().find(|member| member.node == node);
+    let member = |node: NodeId| planned.iter().find(|member| member.node == node);
     let target = member(ctx.to).ok_or(PromoteError::NotAMember { node: ctx.to.0 })?;
     if target.role == ReplicaRole::Shadow {
-        let instead = ctx
-            .members
+        let instead = planned
             .iter()
             .find(|member| member.role != ReplicaRole::Shadow && member.node != prior)
             .map_or(prior, |member| member.node);
@@ -1822,10 +1858,10 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
     if ctx.to == prior {
         return Err(PromoteError::AlreadyOwner { node: ctx.to.0 });
     }
-    if ctx.members_version != record.config_version {
+    if planned_version != record.config_version {
         return Err(PromoteError::StaleMembers {
             node: ctx.to.0,
-            held: ctx.members_version.0,
+            held: planned_version.0,
             current: record.config_version.0,
         });
     }
@@ -1841,14 +1877,18 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         lifecycle = ?record.lifecycle,
         "promote_started"
     );
-    let members = kept_boots(&ctx, dropped, deadline).await?;
+    // What the Fencing CAS writes and step 6 expects: every member, the dropped one included,
+    // in its role before this promote (A-R426 M1).
+    let written: Vec<RecordMember> = planned.iter().map(RecordMember::of).collect();
+    let members = kept_boots(&ctx, &planned, dropped, deadline).await?;
     tracing::info!(
         members = ?members.iter().map(|m| (m.node.0, m.boot.0, m.role)).collect::<Vec<_>>(),
         "promote_members_kept"
     );
 
-    // 3. Fencing.
-    if record.lifecycle != PartitionLifecycle::Fencing {
+    // 3. Fencing. A `Fencing` record that pins no members (a layout-3 store) is written again
+    // with them.
+    if record.lifecycle != PartitionLifecycle::Fencing || stored.is_none() {
         let fencing = PartitionRecord {
             lifecycle: PartitionLifecycle::Fencing,
             ..record
@@ -1856,7 +1896,7 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         let revision = cas(
             &*ctx.store,
             &ControlKey::Partition(PARTITION).encode(),
-            fencing.encode_with(&root),
+            fencing.encode_with_members(&root, &written),
             mod_revision,
         )
         .await?;
@@ -1907,7 +1947,7 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         .collect();
 
     // 6. The record again, after the freeze, and the plan.
-    let (fenced, fenced_root, control_revision, read_revision) =
+    let (fenced, fenced_root, fenced_members, control_revision, read_revision) =
         read_partition(&*ctx.store).await?;
     if read_revision < frozen_at.0 {
         return Err(PromoteError::Control(format!(
@@ -1920,7 +1960,7 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         lifecycle: PartitionLifecycle::Fencing,
         ..record
     };
-    if fenced != expected || fenced_root != root {
+    if fenced != expected || fenced_root != root || fenced_members.as_ref() != Some(&written) {
         return Err(PromoteError::Control(format!(
             "partitions/1 changed during the promote (owner {}, generation {}, {:?}); promote \
              again",
@@ -2016,10 +2056,20 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
     }
 }
 
-/// `partitions/1` as a layout-3 record, its `mod_revision` and the read's store revision.
+/// `partitions/1` as a rooted record, the members it pins (`None` for layout 3), its
+/// `mod_revision` and the read's store revision.
 async fn read_partition(
     store: &dyn ConfigStore,
-) -> Result<(PartitionRecord, PartitionRoot, u64, u64), PromoteError> {
+) -> Result<
+    (
+        PartitionRecord,
+        PartitionRoot,
+        Option<Vec<RecordMember>>,
+        u64,
+        u64,
+    ),
+    PromoteError,
+> {
     let read = store
         .get(GetRequest {
             key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
@@ -2035,9 +2085,15 @@ async fn read_partition(
         PartitionRecord::decode(&found.value),
         PartitionRoot::decode(&found.value),
     ) {
-        (Some(record), Some(root)) => Ok((record, root, found.mod_revision, read.read_revision)),
+        (Some(record), Some(root)) => Ok((
+            record,
+            root,
+            RecordMember::decode_all(&found.value),
+            found.mod_revision,
+            read.read_revision,
+        )),
         _ => Err(PromoteError::Record(format!(
-            "partitions/1 at revision {} carries no root (layout 3)",
+            "partitions/1 at revision {} carries no root (layout 3 or 4)",
             found.mod_revision
         ))),
     }
@@ -2098,11 +2154,11 @@ pub(crate) const UNLINKED_BOOT: BootId = BootId(0);
 /// promote that S2-5's lone survivor needs (D4).
 async fn kept_boots(
     ctx: &PromoteCtx,
+    planned: &[Member],
     dropped: NodeId,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<Member>, PromoteError> {
-    let kept: Vec<Member> = ctx
-        .members
+    let kept: Vec<Member> = planned
         .iter()
         .filter(|member| member.node != dropped)
         .map(|member| Member {
@@ -2232,6 +2288,8 @@ async fn freeze(
         }
     }
 }
+
+mod rebuild;
 
 #[cfg(test)]
 mod tests {
