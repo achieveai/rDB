@@ -13,8 +13,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use config_core::{
     Capabilities, ClusterId, ConfigError, ConfigStore, DeleteRequest, GetRequest, GetResponse,
-    Limits, ListRequest, ListResponse, MutationResponse, Principal, PutRequest, WatchItem,
-    WatchRequest, WatchStream,
+    Limits, ListRequest, ListResponse, MutationResponse, Principal, PutRequest, RecoveryEpoch,
+    WatchItem, WatchRequest, WatchStream,
 };
 use config_grpc::{pb, serve_client_plane, ClientBackend, ServerHandle, TlsMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,6 +33,8 @@ struct Script {
     error: Option<ConfigError>,
     mutation: MutationResponse,
     hang: Option<Arc<tokio::sync::Notify>>,
+    /// What a watch delivers before it ends.
+    watch_items: Vec<WatchItem>,
 }
 
 /// A `ConfigStore` that answers with whatever the test scripted.
@@ -48,6 +50,7 @@ impl FakeStore {
                 error: None,
                 mutation: MutationResponse::applied_put(11),
                 hang: None,
+                watch_items: Vec::new(),
             }),
             calls: AtomicU64::new(0),
         })
@@ -64,6 +67,11 @@ impl FakeStore {
     /// Accept the call and never answer, so the caller's deadline is what ends it.
     pub fn hang_forever(&self) {
         self.script.lock().unwrap().hang = Some(Arc::new(tokio::sync::Notify::new()));
+    }
+
+    /// Have every watch deliver `items`, then end.
+    pub fn set_watch_items(&self, items: Vec<WatchItem>) {
+        self.script.lock().unwrap().watch_items = items;
     }
 
     pub fn call_count(&self) -> u64 {
@@ -100,9 +108,10 @@ impl ConfigStore for FakeStore {
     /// and about what the client does with a termination, never about delivery order.
     async fn watch(&self, _request: WatchRequest) -> Result<WatchStream, ConfigError> {
         self.answer().await?;
-        Ok(Box::pin(tokio_stream::iter(Vec::<
-            Result<WatchItem, ConfigError>,
-        >::new())))
+        let items = self.script.lock().unwrap().watch_items.clone();
+        Ok(Box::pin(tokio_stream::iter(
+            items.into_iter().map(Ok::<WatchItem, ConfigError>),
+        )))
     }
 
     async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
@@ -137,11 +146,18 @@ impl ConfigStore for FakeStore {
     }
 }
 
-struct OneStore(Arc<FakeStore>);
+struct OneStore {
+    store: Arc<FakeStore>,
+    history: Option<(ClusterId, RecoveryEpoch)>,
+}
 
 impl ClientBackend for OneStore {
     fn store_for(&self, _principal: Principal) -> Arc<dyn ConfigStore> {
-        self.0.clone()
+        self.store.clone()
+    }
+
+    fn watch_history(&self) -> Option<(ClusterId, RecoveryEpoch)> {
+        self.history
     }
 }
 
@@ -164,6 +180,21 @@ impl Node {
     /// id is the plane's own port: these fakes have no cluster identity, and a made-up
     /// constant would put several unrelated servers under one node.
     pub async fn start_with(tls: TlsMode, cluster_id: ClusterId) -> Node {
+        Node::start_serving(tls, cluster_id, None).await
+    }
+
+    /// Serve insecurely as a node of `history` (#37): it refuses a watch cursor from another
+    /// history and tells every opened watch this one. `None` is a node that predates #37.
+    pub async fn start_with_history(history: Option<(ClusterId, RecoveryEpoch)>) -> Node {
+        let cluster_id = history.map_or_else(cluster, |(id, _)| id);
+        Node::start_serving(TlsMode::Insecure, cluster_id, history).await
+    }
+
+    async fn start_serving(
+        tls: TlsMode,
+        cluster_id: ClusterId,
+        history: Option<(ClusterId, RecoveryEpoch)>,
+    ) -> Node {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral client-plane port");
@@ -173,7 +204,10 @@ impl Node {
         // serving task is spawned, and nothing else (ADR-0013).
         let handle = tracing::info_span!("fake_node", node_id).in_scope(|| {
             serve_client_plane(
-                Arc::new(OneStore(store.clone())),
+                Arc::new(OneStore {
+                    store: store.clone(),
+                    history,
+                }),
                 listener,
                 tls,
                 cluster_id,

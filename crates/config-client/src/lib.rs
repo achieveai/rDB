@@ -72,22 +72,34 @@ use bytes::Bytes;
 use config_core::{
     Authz, Capabilities, ClusterId, ConfigError, ConfigStore, Dedup, DedupKey, DeleteRequest,
     Durability, GetRequest, GetResponse, Limits, ListPage, ListRequest, ListResponse,
-    MutationResponse, NodeId, PageRequest, Pagination, PutRequest, Record, WatchItem, WatchRequest,
-    WatchResumption, WatchStream,
+    MutationResponse, NodeId, PageRequest, Pagination, PutRequest, Record, RecoveryEpoch,
+    WatchItem, WatchRequest, WatchResumption, WatchStream,
 };
 use config_grpc::pb::config_service_client::ConfigServiceClient;
 use config_grpc::{
-    error_from_status, is_server_rejection, pb, peer_server_domain, watch_item_from_pb,
-    TrackedWatch,
+    error_from_status, is_server_rejection, pb, peer_server_domain, watch_history_from_metadata,
+    watch_history_to_pb, watch_item_from_pb, TrackedWatch,
 };
 use config_log::TraceContext;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Status;
 use tracing::Instrument;
 
+/// Whether a watch refusal means "list again": the cursor is from another history (#37).
+pub use config_grpc::is_relist_history;
 /// Re-exported so a client-only embedder can configure transport security without depending on
 /// `config-grpc` directly.
 pub use config_grpc::{MtlsConfig, TlsMode};
+
+/// `request` on the wire, with the history its cursor came from when the caller gave one.
+fn wire_watch_request(
+    request: &WatchRequest,
+    history: Option<(ClusterId, RecoveryEpoch)>,
+) -> pb::WatchRequest {
+    let mut wire = pb::WatchRequest::from(request);
+    wire.history = history.map(|(cluster_id, epoch)| watch_history_to_pb(cluster_id, epoch));
+    wire
+}
 
 /// The gRPC path [`GrpcClient::probe`] calls to prove a fresh mutual-TLS channel is real.
 ///
@@ -426,12 +438,39 @@ impl GrpcClient {
     pub async fn watch_tracked(&self, request: WatchRequest) -> Result<TrackedWatch, ConfigError> {
         let ctx = TraceContext::current_or_root().child();
         let span = ctx.span("watch");
-        self.watch_attempt(request, ctx).instrument(span).await
+        self.watch_attempt(request, None, ctx)
+            .instrument(span)
+            .await
+    }
+
+    /// Resume a watch at `request.start_after_revision`, stating which history that cursor
+    /// came from (#37).
+    ///
+    /// Pass the [`TrackedWatch::history`] of the watch the cursor was read from. A node that
+    /// serves another history, such as one restored from a backup, refuses with an
+    /// `InvalidArgument` that [`is_relist_history`] recognises: list again and watch from the
+    /// list's revision, because this cursor counts revisions that node never had. `None`
+    /// checks nothing, which is [`GrpcClient::watch_tracked`]. Otherwise this is
+    /// [`GrpcClient::watch_tracked`]'s contract: one attempt, one endpoint, no resume.
+    ///
+    /// A cursor seeded by a `List` has no history until a watch has opened and the node said
+    /// which one it serves.
+    pub async fn resume_watch_tracked(
+        &self,
+        request: WatchRequest,
+        history: Option<(ClusterId, RecoveryEpoch)>,
+    ) -> Result<TrackedWatch, ConfigError> {
+        let ctx = TraceContext::current_or_root().child();
+        let span = ctx.span("watch");
+        self.watch_attempt(request, history, ctx)
+            .instrument(span)
+            .await
     }
 
     async fn watch_attempt(
         &self,
         request: WatchRequest,
+        history: Option<(ClusterId, RecoveryEpoch)>,
         ctx: TraceContext,
     ) -> Result<TrackedWatch, ConfigError> {
         let endpoint = self.pinned.clone();
@@ -443,7 +482,7 @@ impl GrpcClient {
             .max_decoding_message_size(cap)
             .max_encoding_message_size(cap);
 
-        let mut wire = tonic::Request::new(pb::WatchRequest::from(&request));
+        let mut wire = tonic::Request::new(wire_watch_request(&request, history));
         for (key, value) in ctx.to_headers() {
             if let Ok(value) = value.parse() {
                 wire.metadata_mut().insert(key, value);
@@ -453,10 +492,14 @@ impl GrpcClient {
         self.counters.sends.fetch_add(1, Ordering::Relaxed);
         self.counters.watch_opens.fetch_add(1, Ordering::Relaxed);
         match client.watch(wire).await {
-            Ok(response) => Ok(TrackedWatch::new(Box::pin(WatchItems {
-                inner: response.into_inner(),
-                endpoint,
-            }))),
+            Ok(response) => {
+                let echoed = watch_history_from_metadata(response.metadata());
+                Ok(TrackedWatch::new(Box::pin(WatchItems {
+                    inner: response.into_inner(),
+                    endpoint,
+                }))
+                .with_history(echoed))
+            }
             Err(status) => {
                 if transport_minted(&status) {
                     self.forget_channel(&endpoint, None);
@@ -483,23 +526,46 @@ impl GrpcClient {
         &self,
         request: WatchRequest,
     ) -> Result<TrackedWatch, ConfigError> {
+        self.leader_watch(request, None).await
+    }
+
+    /// [`GrpcClient::resume_watch_tracked`] at the leader: the open is found as
+    /// [`GrpcClient::watch_leader_tracked`] finds it, and a node serving another history
+    /// refuses the cursor (#37).
+    pub async fn resume_watch_leader_tracked(
+        &self,
+        request: WatchRequest,
+        history: Option<(ClusterId, RecoveryEpoch)>,
+    ) -> Result<TrackedWatch, ConfigError> {
+        self.leader_watch(request, history).await
+    }
+
+    async fn leader_watch(
+        &self,
+        request: WatchRequest,
+        history: Option<(ClusterId, RecoveryEpoch)>,
+    ) -> Result<TrackedWatch, ConfigError> {
         let ctx = TraceContext::current_or_root().child();
         let span = ctx.span("watch_leader");
         self.counters.watch_opens.fetch_add(1, Ordering::Relaxed);
         // `is_mutation: false`: opening a watch writes nothing, so an interrupted attempt has
         // no outcome to be unsure about.
-        let (inner, endpoint) = self
+        let ((inner, echoed), endpoint) = self
             .attempts_at(
                 "watch_leader",
                 false,
                 WireDeadline::Omit,
-                pb::WatchRequest::from(&request),
-                |mut c, r| async move { c.watch(r).await },
+                wire_watch_request(&request, history),
+                |mut c, r| async move {
+                    let response = c.watch(r).await?;
+                    let echoed = watch_history_from_metadata(response.metadata());
+                    Ok(tonic::Response::new((response.into_inner(), echoed)))
+                },
                 &ctx,
             )
             .instrument(span)
             .await?;
-        Ok(TrackedWatch::new(Box::pin(WatchItems { inner, endpoint })))
+        Ok(TrackedWatch::new(Box::pin(WatchItems { inner, endpoint })).with_history(echoed))
     }
 
     /// Send, hint-follow and reconnect counters since construction.
