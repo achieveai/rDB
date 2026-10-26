@@ -354,12 +354,22 @@
 //!                                         Prints `promoted: node n owns partition 1 at
 //!                                         generation G (was node P); node m dropped`.
 //!                                         A refusal prints `err admin promote: <error>`
-//!                                         and the run exits 1. Known gap: under `--nodes`
-//!                                         (`lr promote`) this build answers UNAVAILABLE
-//!                                         "node 2 could not be sent the new plan": the plan
-//!                                         goes as a message that never crosses the wire.
-//!                                         The partition is then left fencing, with no writes
-//! admin rebuild N | admin damage-copy N --seq S
+//!                                         and the run exits 1. Under `--nodes` (`lr
+//!                                         promote`) it runs the same way over the links
+//! admin rebuild <n> [--wipe]              take node n's copy of partition 1 out and back:
+//!                                         the owner drops n first when it is pinned (or
+//!                                         replaces a quarantined recovery without it),
+//!                                         then n restarts and rejoins as a shadow until it
+//!                                         is caught up. --wipe moves n's folder to
+//!                                         <dir>/aside/ first; it is never deleted. Prints
+//!                                         `rebuilt: node n ...` once n is pinned regular
+//!                                         again, naming the copies kept and the aside
+//!                                         folder. Refused, nothing done, for the owner
+//!                                         (promote first), a re-plan running, a partition
+//!                                         on two copies, or a quarantine whose evidence
+//!                                         does not name n. In process only; `lr rebuild n`
+//!                                         for node processes
+//! admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
 //!                                         answers `not built yet: <verb>; nothing was done`,
@@ -1851,12 +1861,28 @@ fn repl<'scope, 'env>(
                     }
                 })
             }
+            ["admin", "rebuild", rest @ ..] => parse_rebuild(rest).map(|(node, wipe)| {
+                say(&format!(
+                    "rebuild: node {} comes out of partition 1 and back{}; this waits for the \
+                     owner to drop it and take it back",
+                    node.0,
+                    if wipe { ", wiped" } else { "" }
+                ));
+                match db.rebuild(node, wipe) {
+                    Ok(line) => say(&line),
+                    Err(error) => {
+                        tracing::warn!(node = node.0, error = %error, "repl_rebuild_refused");
+                        say(&format!("err admin rebuild {}: {error}", node.0));
+                        bad = true;
+                    }
+                }
+            }),
             ["admin", "status"] => {
                 bad |= !answer_all(&admin_status_lines(rt, db, store));
                 Ok(())
             }
             ["admin", ..] => Err(format!(
-                "admin status | {PROMOTE_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
                  clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
@@ -1954,7 +1980,6 @@ fn repl<'scope, 'env>(
 /// command`. Each line leaves this list when its verb is built.
 fn not_built(words: &[&str]) -> Option<&'static str> {
     Some(match words {
-        ["admin", "rebuild", ..] => "admin rebuild N",
         ["admin", "damage-copy", ..] => "admin damage-copy N --seq S",
         ["node", "restart", _, "--wipe"] => "node restart N --wipe",
         ["node", "stop", ..] => "node stop N",
@@ -1982,6 +2007,24 @@ fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
         ));
     }
     Ok((to, drop))
+}
+
+/// `admin rebuild`'s usage (#65).
+const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe]: n is 1, 2 or 3, not the owner";
+
+/// `admin rebuild N [--wipe]`'s words after `rebuild`: the node, and whether to wipe it.
+fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, bool), String> {
+    match rest {
+        [node] => Ok((
+            parse_node(node).map_err(|e| format!("{e}; {REBUILD_USAGE}"))?,
+            false,
+        )),
+        [node, "--wipe"] => Ok((
+            parse_node(node).map_err(|e| format!("{e}; {REBUILD_USAGE}"))?,
+            true,
+        )),
+        _ => Err(REBUILD_USAGE.to_owned()),
+    }
 }
 
 /// `admin promote`'s one line on success (lead, A-R245, A-R256): the new owner, the generation
@@ -6929,7 +6972,6 @@ mod tests {
     #[test]
     fn slice_2_verbs_and_flags_answer_not_built_yet_by_name() {
         for (line, verb) in [
-            ("admin rebuild 1", "admin rebuild N"),
             ("admin damage-copy 2 --seq 4", "admin damage-copy N --seq S"),
             ("node restart 1 --wipe", "node restart N --wipe"),
             ("node stop 3", "node stop N"),
@@ -6941,6 +6983,7 @@ mod tests {
         for line in [
             "node restart 1",
             "admin promote 2 --drop 3",
+            "admin rebuild 3 --wipe",
             "admin clear x",
             "control",
             "link drop 1-2",

@@ -3080,7 +3080,12 @@ impl Db {
         handle.stop();
         self.control.forget_node(node, old_boot);
         let folder = respawn.nodes_dir.join(node.0.to_string());
-        let unmoved = aside.and_then(|aside| move_aside(node, &folder, &aside.to).err());
+        // M5: the record is read after the stop, so nothing can take the node back between the
+        // check and the move.
+        let unmoved = aside.and_then(|aside| match self.wipe_fenced(node, &aside, old_boot) {
+            Some(refused) => Some(refused),
+            None => move_aside(node, &folder, &aside.to).err(),
+        });
         let started = host::spawn_with(
             node,
             folder,
@@ -3130,6 +3135,206 @@ impl Db {
                 handle.start_failed = true;
                 Err(ApiError::host(&detail))
             }
+        }
+    }
+
+    /// Why `node`'s wipe is refused after its stop, or `None` (critic-bb M5): `partitions/1`
+    /// must be at or above `aside.generation` and leave `node` out.
+    fn wipe_fenced(&self, node: NodeId, aside: &Aside, old_boot: BootId) -> Option<String> {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return Some(format!(
+                "node {} not wiped: this Db has no control store to check partitions/1 against",
+                node.0
+            ));
+        };
+        let (done, answer) = mpsc::channel();
+        rt.spawn(async move {
+            let _ = done.send(admin::rebuild::record(&*store).await);
+        });
+        let refused = match answer.recv_timeout(self.timeouts.read) {
+            Ok(Ok((generation, members))) => admin::rebuild::fence_refusal(
+                node,
+                aside.generation,
+                Some(aside.boot),
+                (generation, members.as_deref()),
+                old_boot,
+            )
+            .map(|refused| refused.to_string()),
+            Ok(Err(error)) => Some(format!(
+                "node {} not wiped: {error}; its folder is left in place",
+                node.0
+            )),
+            Err(_) => Some(format!(
+                "node {} not wiped: partitions/1 did not answer in time; its folder is left in \
+                 place",
+                node.0
+            )),
+        };
+        if let Some(refused) = &refused {
+            tracing::warn!(node = node.0, %refused, "node_wipe_refused_fence");
+        }
+        refused
+    }
+
+    /// `admin rebuild <node> [--wipe]` (#65, critic-bb §3): take `node`'s copy of partition 1
+    /// out and bring it back, from an owner this `Db` runs. The owner checks the guards and,
+    /// when `node` is pinned, re-plans without it and waits for that commit; a quarantined owner
+    /// replaces its F1 first, and its rebuild always wipes. Then `node` restarts at a new boot,
+    /// its folder moved aside when wiped (never deleted), and the owner takes it back, first as
+    /// a shadow. Returns the accept line once the owner pins `node` regular again.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
+    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard, an owner
+    /// in another process, or a re-plan that did not commit a serving partition without
+    /// `node`. A wipe the fence refuses restarts `node` on its own folder and says so. An
+    /// `UNAVAILABLE` with `no_mutation` false when `node` restarted but is not pinned regular
+    /// again in time.
+    pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
+        self.rebuild_with(node, wipe).map(|rebuilt| rebuilt.line())
+    }
+
+    /// [`Self::rebuild`], answering what it did.
+    pub(crate) fn rebuild_with(
+        &self,
+        node: NodeId,
+        wipe: bool,
+    ) -> Result<admin::rebuild::Rebuilt, ApiError> {
+        let refused = |refused: admin::rebuild::Refused| {
+            tracing::warn!(node = node.0, guard = refused.guard, detail = %refused.detail, "db_rebuild_refused");
+            if matches!(refused.guard, "G1" | "G2") {
+                ApiError::invalid(refused.to_string())
+            } else {
+                ApiError {
+                    kind: ErrorKind::Unavailable,
+                    retry: RetryRule::NotWired,
+                    no_mutation: true,
+                    detail: refused.to_string(),
+                    retry_after: None,
+                }
+            }
+        };
+        let Some(respawn) = &self.respawn else {
+            return Err(ApiError::invalid(
+                "this Db was built without a data directory, so it cannot rebuild a node",
+            ));
+        };
+        let owner = self.route.owner();
+        if !self.runs(owner) || !self.runs(node) {
+            return Err(refused(admin::rebuild::Refused {
+                guard: "process",
+                detail: format!(
+                    "admin rebuild runs here only when this process runs node {} and the owner \
+                     (node {}); for separate node processes use `lr rebuild {}`",
+                    node.0, owner.0, node.0
+                ),
+            }));
+        }
+        // The boot the wipe is fenced on: a restart of `node` from here on refuses the wipe.
+        let boot = self.boot_of(node);
+        let within = heal_within(&respawn.budgets);
+        let (reply, answer) = mpsc::channel();
+        let asked = Msg::Rebuild {
+            partition: PARTITION,
+            node,
+            within,
+            reply: host::RebuildReply(reply),
+        };
+        if self.send_to(owner, asked).is_err() {
+            return Err(ApiError::host(&format!(
+                "node {} (the owner) stopped before it was asked to rebuild node {}",
+                owner.0, node.0
+            )));
+        }
+        let ready = match answer.recv_timeout(within + Duration::from_secs(5)) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(refusal)) => return Err(refused(refusal)),
+            Err(_) => {
+                return Err(ApiError {
+                    kind: ErrorKind::Unavailable,
+                    retry: RetryRule::NotWired,
+                    no_mutation: false,
+                    detail: format!(
+                        "node {} (the owner) did not answer the rebuild of node {} in time; it \
+                         may still drop it. Node {} was not wiped: restart it to re-add it",
+                        owner.0, node.0, node.0
+                    ),
+                    retry_after: None,
+                })
+            }
+        };
+        let wipe = wipe || ready.mode == admin::rebuild::RebuildMode::Quarantined;
+        let aside = match (wipe, boot) {
+            (false, _) => None,
+            (true, Some(boot)) => Some(Aside {
+                boot,
+                generation: ready.generation,
+                to: aside_path(&respawn.nodes_dir, node, boot),
+            }),
+            (true, None) => {
+                return Err(ApiError::host(&format!(
+                    "node {} has no boot here, so its wipe cannot be fenced; it was left out at \
+                     generation {} and not wiped: restart node {} to re-add it",
+                    node.0, ready.generation.0, node.0
+                )))
+            }
+        };
+        let moved = aside.as_ref().map(|aside| aside.to.clone());
+        let boot = self.restart_node_with(node, aside)?;
+        self.await_regular(node, within)?;
+        let rebuilt = admin::rebuild::Rebuilt {
+            node,
+            mode: ready.mode,
+            generation: ready.generation,
+            kept: ready.kept,
+            boot,
+            aside: moved,
+        };
+        tracing::info!(
+            node = node.0,
+            mode = rebuilt.mode.letter(),
+            generation = rebuilt.generation.0,
+            boot = boot.0,
+            aside = ?rebuilt.aside,
+            "db_rebuilt"
+        );
+        Ok(rebuilt)
+    }
+
+    /// Wait until the owner pins `node` as a regular secondary, at most `within`.
+    fn await_regular(&self, node: NodeId, within: Duration) -> Result<(), ApiError> {
+        let started = Instant::now();
+        loop {
+            let pinned = self.inspect(self.route.owner()).is_some_and(|status| {
+                status.pinned.iter().any(|member| {
+                    member.node == node
+                        && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                })
+            });
+            if pinned {
+                return Ok(());
+            }
+            if started.elapsed() >= within {
+                tracing::warn!(
+                    node = node.0,
+                    within_ms = within.as_millis(),
+                    "db_rebuild_not_regular"
+                );
+                return Err(ApiError {
+                    kind: ErrorKind::Unavailable,
+                    retry: RetryRule::NotWired,
+                    no_mutation: false,
+                    detail: format!(
+                        "node {} restarted but is not pinned regular again within {} s; it may \
+                         still be catching up as a shadow: `nodes` shows when it is back",
+                        node.0,
+                        within.as_secs()
+                    ),
+                    retry_after: None,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -3573,8 +3778,24 @@ fn counter_refused(instance: &[u8; INSTANCE_LEN], error: admin::CounterError) ->
 pub(crate) struct Aside {
     /// The boot the drop named.
     pub(crate) boot: BootId,
+    /// The generation of the commit that left the node out: `partitions/1`, read after the
+    /// stop, must be at or above it and not name the node (M5).
+    pub(crate) generation: Generation,
     /// Where `nodes/<n>` goes. Never deleted (spec §8.4 retention).
     pub(crate) to: PathBuf,
+}
+
+/// Where a wipe moves `nodes/<node>`: `<dir>/aside/node-<n>-boot-<b>-<unix ms>`, beside
+/// `nodes_dir`, kept for the operator (spec §8.4 retention).
+fn aside_path(nodes_dir: &Path, node: NodeId, boot: BootId) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    nodes_dir
+        .parent()
+        .unwrap_or(nodes_dir)
+        .join("aside")
+        .join(format!("node-{}-boot-{}-{millis}", node.0, boot.0))
 }
 
 /// Move `folder` to `to`, creating `to`'s parent. Never deletes (critic-bb G7).

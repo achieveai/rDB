@@ -522,11 +522,39 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<Result<(), rdb_storage::DamageRefused>>,
     },
+    /// #65 (critic-bb §3): rebuild node `node`'s copy of `partition`. Local only, like
+    /// [`Msg::PeerBooted`]: [`crate::db::Db::rebuild`] sends it to an owner in its own process.
+    /// The owner checks the guards; a pinned `node` is dropped first, and a quarantined F1 is
+    /// replaced by a fresh run without it. `reply` hears once a commit leaving `node` out has
+    /// landed, or why not, within `within`.
+    Rebuild {
+        /// The partition.
+        partition: PartitionId,
+        /// The node whose copy is rebuilt.
+        node: NodeId,
+        /// How long the owner waits for the commit that leaves `node` out.
+        within: Duration,
+        /// Where the answer goes.
+        reply: RebuildReply,
+    },
     /// F4 (ruling A-R317): this node's syncer finished the WAL sync it was handed. Local only,
     /// like [`Msg::PeerBooted`]: only the node's own syncer thread posts it.
     Synced(SyncDone),
     /// Stop the thread.
     Stop,
+}
+
+/// Where [`Msg::Rebuild`]'s answer goes. Opaque outside the crate: only `Db::rebuild` sends one.
+#[derive(Debug)]
+pub struct RebuildReply(
+    pub(crate) Sender<Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Refused>>,
+);
+
+impl RebuildReply {
+    fn send(&self, answer: Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Refused>) {
+        // The asker may have given up; then nobody needs the answer.
+        let _ = self.0.send(answer);
+    }
 }
 
 /// What a node's syncer reports when a WAL sync it ran returns ([`Msg::Synced`]).
@@ -1184,6 +1212,19 @@ struct Replan {
     promote: bool,
     /// When the revocation was asked.
     since: Tick,
+}
+
+/// #65: an `admin rebuild` the owner answers once the commit that leaves `node` out lands.
+#[derive(Debug)]
+struct RebuildAsk {
+    node: NodeId,
+    mode: crate::admin::rebuild::RebuildMode,
+    /// The generation committed when it was asked: the answer waits for a newer one.
+    from: Generation,
+    /// The boot `node` ran when it was asked, when linked.
+    boot: Option<BootId>,
+    deadline: Tick,
+    reply: RebuildReply,
 }
 
 /// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
@@ -1881,6 +1922,12 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// #65: per partition, the divergence evidence F1's last `Quarantine` reported, for
+    /// `admin rebuild`'s G6. Kept until a rebuild replaces the quarantined F1.
+    quarantines: BTreeMap<PartitionId, rdb_core::contracts::recovery::DivergenceEvidence>,
+    /// #65: per partition, the `admin rebuild` waiting for the commit that leaves its node out
+    /// ([`Host::rebuild_duty`]).
+    rebuild_asks: BTreeMap<PartitionId, RebuildAsk>,
     /// The epoch of the `EpochRevocationPersisted` being offered, when that is the event in
     /// hand. A1 emits `DrainProof` only for that event, and the proof is for that epoch alone:
     /// a re-asked revocation persists twice, and a late second proof must not plan from a later
@@ -2055,6 +2102,8 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
+            quarantines: BTreeMap::new(),
+            rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
             owner_after_fence: BTreeMap::new(),
             owner_fence: 0,
@@ -2598,6 +2647,15 @@ impl Host {
                 let _ = reply.send(answer);
                 Ok(())
             }
+            Msg::Rebuild {
+                partition,
+                node,
+                within,
+                reply,
+            } => {
+                self.rebuild_asked(partition, node, within, reply);
+                Ok(())
+            }
             Msg::Synced(done) => self.on_synced(done),
             Msg::Stop => Ok(()),
         };
@@ -2757,6 +2815,7 @@ impl Host {
             self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
             self.drop_duty(now);
         }
+        self.rebuild_duty(now);
         self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -5721,6 +5780,218 @@ impl Host {
         );
     }
 
+    /// #65 (critic-bb §3): `admin rebuild node`. Checks the guards on this node's newest
+    /// commit ([`crate::admin::rebuild::decide`]) and answers at once for mode A. Mode B asks a
+    /// re-plan without `node`, as [`Self::drop_copy`] does; mode C first replaces the
+    /// quarantined F1 with a fresh one, then does the same. [`Self::rebuild_duty`] answers
+    /// those. A refusal changes nothing.
+    fn rebuild_asked(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        within: Duration,
+        reply: RebuildReply,
+    ) {
+        use crate::admin::rebuild::{decide, kept, Asked, Ready, RebuildMode, Refused};
+        let refuse = |reply: &RebuildReply, refused: Refused| {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                rebuild = node.0,
+                guard = refused.guard,
+                detail = %refused.detail,
+                "rebuild_refused"
+            );
+            reply.send(Err(refused));
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return refuse(
+                &reply,
+                Refused {
+                    guard: "owner",
+                    detail: format!(
+                        "node {} has committed no recovery of partition {}, so it cannot \
+                         rebuild a copy: ask the node that owns it",
+                        self.node.0, partition.0
+                    ),
+                },
+            );
+        };
+        let members = &committed.committed.pinned_config.members;
+        let primary = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| member.node);
+        if primary != Some(self.node) {
+            return refuse(
+                &reply,
+                Refused {
+                    guard: "owner",
+                    detail: format!(
+                        "node {} does not own partition {} (its newest commit names node {}): \
+                         ask the owner",
+                        self.node.0,
+                        partition.0,
+                        primary.map_or(0, |node| node.0)
+                    ),
+                },
+            );
+        }
+        let quarantined = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined));
+        let known: Vec<NodeId> = crate::admin::members().iter().map(|m| m.node).collect();
+        let asked = Asked {
+            node,
+            owner: self.node,
+            members,
+            known: &known,
+            rejoin: self.rejoins.contains_key(&partition)
+                || self.rebuild_asks.contains_key(&partition),
+            quarantine: quarantined.then(|| self.quarantines.get(&partition)),
+        };
+        let current = |member: &Member| {
+            member.node == self.node
+                || (self.linked(member.node)
+                    && self.links.boot_of(member.node) == Some(member.boot))
+        };
+        let mode = match decide(&asked, current) {
+            Ok(mode) => mode,
+            Err(refused) => return refuse(&reply, refused),
+        };
+        let generation = committed.new_generation;
+        let epoch = committed.selected.root.owner_epoch;
+        let boot = self.links.boot_of(node);
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            rebuild = node.0,
+            mode = mode.letter(),
+            generation = generation.0,
+            boot = ?boot.map(|boot| boot.0),
+            "rebuild_asked"
+        );
+        if mode == RebuildMode::NotPinned {
+            reply.send(Ok(Ready {
+                mode,
+                generation,
+                boot,
+                kept: kept(members, node),
+            }));
+            return;
+        }
+        if mode == RebuildMode::Quarantined {
+            // Phase::Quarantined stays terminal in the kernel: the host drops that F1, and the
+            // plan below makes a fresh one, which inventories only the copies it keeps.
+            self.recoveries.remove(&partition);
+            self.quarantines.remove(&partition);
+            self.rejoins.remove(&partition);
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                rebuild = node.0,
+                "rebuild_quarantine_reset"
+            );
+        }
+        let now = self.clock.now();
+        let within = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
+        self.rebuild_asks.insert(
+            partition,
+            RebuildAsk {
+                node,
+                mode,
+                from: generation,
+                boot,
+                deadline: now.plus_millis(within),
+                reply,
+            },
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(node), None);
+    }
+
+    /// #65: answer each `admin rebuild` waiting on a re-plan without its node: G5 once a newer
+    /// commit lands, a refusal when F1 quarantines again (the kept copies still diverge) or the
+    /// wait runs out. Nothing is wiped here; the answer lets `Db::rebuild` go on. A no-op while
+    /// no rebuild waits.
+    fn rebuild_duty(&mut self, now: Tick) {
+        use crate::admin::rebuild::{drop_landed, kept, Ready, Refused};
+        if self.rebuild_asks.is_empty() {
+            return;
+        }
+        let partitions: Vec<PartitionId> = self.rebuild_asks.keys().copied().collect();
+        for partition in partitions {
+            let Some(ask) = self.rebuild_asks.get(&partition) else {
+                continue;
+            };
+            let node = ask.node;
+            let quarantined = self
+                .recoveries
+                .get(&partition)
+                .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined));
+            let landed = self
+                .committed
+                .get(&partition)
+                .filter(|committed| committed.new_generation > ask.from);
+            let answer = if quarantined {
+                Err(Refused {
+                    guard: "quarantined",
+                    detail: format!(
+                        "the fresh recovery without node {} quarantined again: the copies it \
+                         kept still diverge ({:?}). Node {} was not touched",
+                        node.0,
+                        self.quarantines.get(&partition),
+                        node.0
+                    ),
+                })
+            } else if let Some(committed) = landed {
+                let members = &committed.committed.pinned_config.members;
+                drop_landed(node, &committed.mode, members).map(|()| Ready {
+                    mode: ask.mode,
+                    generation: committed.new_generation,
+                    boot: ask.boot,
+                    kept: kept(members, node),
+                })
+            } else if now >= ask.deadline {
+                Err(Refused {
+                    guard: "timeout",
+                    detail: format!(
+                        "the re-plan without node {} did not commit in time, so node {} was \
+                         not wiped; it may still commit and leave node {} out: restart node {} \
+                         to re-add it",
+                        node.0, node.0, node.0, node.0
+                    ),
+                })
+            } else {
+                continue;
+            };
+            let Some(ask) = self.rebuild_asks.remove(&partition) else {
+                continue;
+            };
+            match &answer {
+                Ok(ready) => tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    rebuild = node.0,
+                    mode = ready.mode.letter(),
+                    generation = ready.generation.0,
+                    kept = ?ready.kept.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    "rebuild_dropped"
+                ),
+                Err(refused) => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    rebuild = node.0,
+                    guard = refused.guard,
+                    detail = %refused.detail,
+                    "rebuild_refused"
+                ),
+            }
+            ask.reply.send(answer);
+        }
+    }
+
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
     /// wait is reported once (`recovery_rebuild_stalled`); once pinned, F1's own deadline names
     /// each copy that has not proved the point (`RebuildStalled`), and the host reports that.
@@ -6711,6 +6982,10 @@ impl Host {
             | RecoveryEffect::CloseWindow
             | RecoveryEffect::Selected(_)
             | RecoveryEffect::Quarantine(_) => {
+                // #65: kept for `admin rebuild`'s G6 only; the arm does what it did.
+                if let RecoveryEffect::Quarantine(evidence) = effect {
+                    self.quarantines.insert(site.partition, evidence.clone());
+                }
                 tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
                 Ok(())
             }
@@ -9372,6 +9647,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::PeerBooted { .. } => "peer_booted",
         #[cfg(debug_assertions)]
         Msg::Damage { .. } => "damage",
+        Msg::Rebuild { .. } => "rebuild",
         Msg::Synced(_) => "synced",
         Msg::Stop => "stop",
     }
