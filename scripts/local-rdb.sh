@@ -559,7 +559,12 @@ admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its e
     if [ "${LR_BUILD:-1}" != 0 ] || [ ! -f "$dev" ]; then
         say "building rdb_dev into $TARGET/$PROFILE"
         # shellcheck disable=SC2086
-        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_dev) >&2
+        # A failed build must stop here, not run an older rdb_dev left in the folder: every
+        # caller sits behind `||`, where `set -e` does not apply (Revobot #73 finding 4).
+        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_dev) >&2 || {
+            say "rdb_dev did not build; nothing was sent"
+            return 1
+        }
         dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
     fi
     [ -f "$dev" ] || die "rdb_dev not found at $dev after building"
