@@ -2696,15 +2696,18 @@ fn m10_s2_adv2_a_restart_beside_an_unlinked_member_is_not_shadowed() {
 /// that has proved nothing is never counted, and the drop clock leaves it out (b7): nodes 1
 /// and 2, `DegradedRf2`.
 /// Cut: `restart_shadowed` returns `None`, red (node 3 is never pinned a shadow).
-/// Integration (~20 s): bootstrap's window, the restart's re-plan, the promote's barrier retries
-/// until F1 gives node 3 up (~14 s since #69: node 3 answered the inventory), the drop clock
-/// while held.
+/// Integration (~5 s): bootstrap's window, the shadow's catch-up one record a step (~1.5 s), the
+/// promote's barrier at the test window (7 windows), the drop clock and its margin while held
+/// (~1.4 s, what the row asserts). At the spec's 2 s window the barrier alone was 14 s.
 #[config_log::retcd_test]
 fn m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two() {
     const METHOD: &str =
         "m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two";
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, _) = started(dir.path(), tuned);
+    // F1 counts its deadlines here: the barrier's three attempts are 7 windows, 14 s at the
+    // spec's 2 s, so the row runs the test window from the bootstrap commit on.
+    trio.short_window_after_commit();
     for request in 1..=20 {
         match trio.ask(put(request)) {
             Answer::Txn { .. } => {}
