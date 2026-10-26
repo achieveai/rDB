@@ -372,6 +372,10 @@
 //!                                         [--wipe]` then stops n, has the fence checked
 //!                                         (`--wipe --fence`), moves the folder aside
 //!                                         and starts n
+//! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
+//!                                         n's head record as a validly chained different
+//!                                         one; `node restart n` then rejoins it and the
+//!                                         owner quarantines; `admin rebuild n` gets out
 //! admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
@@ -1079,6 +1083,12 @@ struct Seen {
     /// While `wait ready` runs: its own `reached ready` line says ready, so the poller does not
     /// (k237, lead ruling on the G4 follow-up: the poller's `ready` printed before it).
     awaiting_ready: bool,
+    /// The node `admin promote` is making the owner, from the promote's start until the owner
+    /// read is that node. Between the two the prior owner is fenced `Frozen` and the new one
+    /// does not hold the newer generation yet, so the owner read said "writes stay stopped"
+    /// (bug bash #65 walk A). The poller says no owner line meanwhile; the promote's own line
+    /// answers. A refused promote clears it.
+    promoting: Option<NodeId>,
 }
 
 impl Progress {
@@ -1096,6 +1106,32 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
         poll_once(db, progress);
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Sets [`Seen::promoting`].
+fn set_promoting(progress: &Progress, promoting: Option<NodeId>) {
+    progress
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .promoting = promoting;
+}
+
+/// The node the poller and notes read as the owner: the `primary` holding the newest
+/// generation, else node 1. After `admin promote` the prior owner still says `primary`, with a
+/// fenced grant, and holds the older generation (its `recovered` ties the new owner's); reading
+/// it printed "writes stay stopped" while the new owner took writes (bug bash #65 walk A).
+fn owner_status(nodes: &[NodeStatus]) -> Option<&NodeStatus> {
+    nodes
+        .iter()
+        .filter(|node| node.role == "primary")
+        .max_by_key(|node| {
+            (
+                node.holds.map(|holds| holds.generation),
+                std::cmp::Reverse(node.node),
+            )
+        })
+        .or_else(|| nodes.iter().find(|node| node.node == NodeId(1)))
 }
 
 /// Print each progress line that changed since it was last printed. The poller calls it every
@@ -1125,7 +1161,13 @@ fn poll_once(db: &Db, progress: &Progress) {
             };
         }
     }
-    if let Some(owner) = nodes.iter().find(|n| n.node == NodeId(1)) {
+    if let Some(to) = seen.promoting {
+        if owner_status(&nodes).map(|owner| owner.node) != Some(to) {
+            return;
+        }
+        seen.promoting = None;
+    }
+    if let Some(owner) = owner_status(&nodes) {
         if owner.recovered.is_some() && owner.recovered != seen.recovered {
             seen.recovered = owner.recovered;
             say(&format!(
@@ -1852,6 +1894,10 @@ fn repl<'scope, 'env>(
                 damage_chunk(db, object, rest).map(|ok| bad |= !ok)
             }
             ["admin", "damage", _, ..] => damage_record(db, &line).map(|ok| bad |= !ok),
+            ["admin", "fork-copy", node] => parse_node(node).map(|node| {
+                bad |= !answer(&fork_copy_line(db, node));
+            }),
+            ["admin", "fork-copy", ..] => Err(FORK_COPY_USAGE.to_owned()),
             ["admin", "clear", object] => {
                 let answer = db.write(object.as_bytes(), Change::Clear, None);
                 bad |= !kind_write_line(
@@ -1865,22 +1911,30 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["admin", "promote", rest @ ..] => {
-                parse_promote(rest).map(|(to, drop)| match promote_line(db, to, drop) {
-                    Ok(line) => say(&line),
-                    Err(line) => {
-                        say(&line);
-                        bad = true;
+                parse_promote(rest).map(|(to, drop)| {
+                    set_promoting(progress, Some(to));
+                    match promote_line(db, to, drop) {
+                        Ok(line) => say(&line),
+                        Err(line) => {
+                            set_promoting(progress, None);
+                            say(&line);
+                            bad = true;
+                        }
                     }
                 })
             }
             ["admin", "rebuild", rest @ ..] => parse_rebuild(rest).map(|(node, ask)| {
                 let answer = match ask {
                     RebuildAsk::Here { wipe } => {
+                        // Said before the owner answers, so it claims nothing a refusal then
+                        // contradicts (bb walk paper cut).
                         say(&format!(
-                            "rebuild: node {} comes out of partition 1 and back{}; this waits \
-                             for the owner to drop it and take it back",
+                            "rebuild: asking the owner to take node {} out of partition 1 and \
+                             back{}; a refusal changes nothing, and an accepted rebuild waits \
+                             until node {} is back",
                             node.0,
-                            if wipe { ", wiped" } else { "" }
+                            if wipe { ", wiped" } else { "" },
+                            node.0
                         ));
                         db.rebuild(node, wipe)
                     }
@@ -2224,7 +2278,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
         "sleep", "quit", "exit", "blob", "client", "put-loop",
     ];
-    const SUBVERBS: [&str; 26] = [
+    const SUBVERBS: [&str; 27] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -2251,6 +2305,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "control cut",
         "client drop-reply",
         "admin repair-element",
+        "admin fork-copy",
     ];
     let mut first = line.split_whitespace();
     let Some(verb) = first
@@ -3269,6 +3324,47 @@ fn root_rewrite(
 const SET_MEMBER_AS: &str = "a set member holds no envelope, so any bytes in it are damage; \
      damage a set member with --as digest, or a newer build's set with the root and --as newer";
 
+/// `admin fork-copy`'s usage (#65 mode C walk).
+const FORK_COPY_USAGE: &str = "admin fork-copy <n>: n is 1, 2 or 3; debug builds only";
+
+/// `admin fork-copy <n>` (#65): a debug-build hook that rewrites node n's head record as a
+/// validly chained different one, so n's copy diverges from the others. A restart of n then
+/// rejoins it, the owner's recovery finds the divergence and quarantines, and `admin rebuild n`
+/// is the way out (mode C). Release builds answer `err` and change nothing.
+fn fork_copy_line(db: &Db, node: NodeId) -> String {
+    #[cfg(debug_assertions)]
+    {
+        let Some(generation) = db
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == node)
+            .and_then(|status| status.holds)
+            .map(|holds| holds.generation)
+        else {
+            return format!(
+                "err admin fork-copy {}: node {} holds no copy of partition 1 to fork",
+                node.0, node.0
+            );
+        };
+        match db.fork_record(node, generation) {
+            Ok(seq) => format!(
+                "forked: node {}'s record at seq {seq} (generation {}) now differs from the other \
+                 copies; `node restart {}` rejoins it and the owner quarantines the partition",
+                node.0, generation.0, node.0
+            ),
+            Err(error) => format!("err admin fork-copy {}: {error}", node.0),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = db;
+        format!(
+            "err admin fork-copy {}: a debug-build hook; this release build changes nothing",
+            node.0
+        )
+    }
+}
+
 const DAMAGE_RECORD_USAGE: &str = "admin damage <object> [--element K | --item P] \
      [--as digest|kind0|newer] [--api-version N]; K is a map key or set member, P a list \
      position, N 0..=65535";
@@ -3997,7 +4093,7 @@ fn labelled_put_line(
 /// the write the partition waits on, nor that healing the links resolves it.
 fn waits_note(db: &Db) -> Option<String> {
     let nodes = db.node_status();
-    let owner = nodes.iter().find(|node| node.node == NodeId(1))?;
+    let owner = owner_status(&nodes)?;
     let links = db.links();
     waits_on_line(owner, &links.held(), &links.dropped()).map(|line| format!("note: {line}"))
 }
@@ -4901,6 +4997,44 @@ mod tests {
             pinned: Vec::new(),
             config_version: None,
         }
+    }
+
+    /// Bug bash #65 walk A: after `admin promote 2`, node 1 still said `primary` with a fenced
+    /// grant at its older generation, and the poller read it and printed "writes stay stopped"
+    /// while node 2 took writes. The owner read is the newest `primary`.
+    #[test]
+    fn owner_status_follows_a_promote() {
+        let holds = |generation| {
+            Some(rdb_api::host::Holding {
+                generation: Generation(generation),
+                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                applied: 1,
+                durable: 1,
+            })
+        };
+        // As `nodes` printed it after `admin promote 2 --drop 3`: both say `primary` and
+        // recovered=2; node 1 is fenced(Frozen) at gen=1, node 2 holds gen=2.
+        let mut old = owner(None, false);
+        old.authority = "fenced(Frozen)".to_owned();
+        old.recovered = Some(Generation(2));
+        old.holds = holds(1);
+        let mut new = owner(None, true);
+        new.node = NodeId(2);
+        new.recovered = Some(Generation(2));
+        new.holds = holds(2);
+        let mut third = owner(None, false);
+        third.node = NodeId(3);
+        third.role = "secondary";
+        third.holds = holds(1);
+        let nodes = [old.clone(), new, third.clone()];
+        assert_eq!(owner_status(&nodes).map(|n| n.node), Some(NodeId(2)));
+        // Before any promote, and with no primary at all, node 1 is read.
+        assert_eq!(
+            owner_status(&[old.clone(), third.clone()]).map(|n| n.node),
+            Some(NodeId(1))
+        );
+        old.role = "none";
+        assert_eq!(owner_status(&[third, old]).map(|n| n.node), Some(NodeId(1)));
     }
 
     /// Walk 1L (M9 S2a): `control stop` of the control leader fenced the owner `Expired` and
