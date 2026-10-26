@@ -23,6 +23,7 @@
 //! * [`authority`], [`transaction`], [`replication`], [`publication`], [`protection`],
 //!   [`recovery`] — the six kernel modules, one per spike §5 package.
 //! * [`route`] — which modules a kernel fact reaches, and in what order. Every host shares it.
+//! * [`placement`] — the M11 placement planner, a pure function over an inventory (model only).
 //!
 //! # State (2026-09-20)
 //!
@@ -39,6 +40,7 @@
 
 pub mod authority;
 pub mod contracts;
+pub mod placement;
 pub mod protection;
 pub mod publication;
 pub mod recovery;

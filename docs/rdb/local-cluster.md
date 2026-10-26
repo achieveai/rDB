@@ -68,6 +68,9 @@ works as written. `--run DIR` picks another run.
 
 `scripts/local-rdb.sh` with no verb lists every verb, including the fault verbs.
 
+To plan copy moves from an inventory file (model only; it applies nothing), see
+[placement-plan.md](placement-plan.md).
+
 ## 3. Your app
 
 Make a crate outside this repository, with the `Cargo.toml` from
