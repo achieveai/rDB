@@ -996,6 +996,12 @@ impl ClientBackend for NodeBackend {
     fn record_authn_rejection(&self, reason: config_engine::AuthnRejectReason) {
         self.node.record_authn_rejection(reason);
     }
+
+    /// This node's history, so a watch cursor from another one is refused (#37).
+    fn watch_history(&self) -> Option<(config_core::ClusterId, config_core::RecoveryEpoch)> {
+        let identity = self.node.identity();
+        Some((identity.cluster_id, identity.recovery_epoch))
+    }
 }
 
 /// The same value behind the admin plane (M5, ADR-0023, OQ-43): every method forwards to the
