@@ -3412,18 +3412,26 @@ fn m10_s2_r446_a_fence_before_the_frozen_grant_is_proven_expired_is_refused() {
     db.shutdown();
 }
 
-/// A-R446b (critic-63 M2): a node whose clock is a little behind the promoter's binds a true
-/// fence after one re-check. The row writes `Fencing` and freezes node 1's grant with an expiry
-/// that node 2's clock proves past about 190 ms after the row routes the pair: inside the 2ε
-/// (200 ms) a node may lag a promoter by. Node 2 logs `routed_fence_recheck` and then
-/// `routed_fence_bound{rechecked=true}`, refuses nothing, and commits: `partitions/1` moves one generation on (the
-/// helper's plan keeps node 1 primary, so the owner it names stays node 1).
-/// Cut: the `FenceBound` arm refuses without the re-check: `routed_fence_refused`, red.
+/// A-R446b (critic-63 M2): a true fence that a node's clock proves only a little after the
+/// promoter's did is bound and committed, through the host. The row writes `Fencing` and freezes
+/// node 1's grant with an expiry that node 2's clock proves past about 190 ms after the freeze,
+/// inside the 2ε (200 ms) a node may lag a promoter by, then routes the pair. Node 2 refuses
+/// nothing, binds once and commits: `partitions/1` moves one generation on (the helper's plan
+/// keeps node 1 primary, so the owner it names stays node 1).
+///
+/// Outcome only, so no wall-clock luck is needed: whether node 2's first check lands inside
+/// those 190 ms is up to scheduling. If it does, node 2 logs `routed_fence_recheck` and then
+/// `routed_fence_bound{rechecked=true}`; if it is late, one `routed_fence_bound{rechecked=false}`.
+/// Both pass. The re-check itself is pinned by the unit rows `routed_fence::m10_s2_r446b_*`,
+/// which fix the shortfall.
+/// Cuts: the `Routed` arm pushes the fence unbound: no `routed_fence_bound`, red on every run.
+/// The re-check branch removed: `routed_fence_refused{expiry_not_proven}`, red whenever the first
+/// check is early.
 /// Integration (~2 s): one fresh open until ready, two CASes, the routed pair.
 #[config_log::retcd_test]
-fn m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_binds_after_one_re_check() {
+fn m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_is_bound_and_committed() {
     const METHOD: &str =
-        "m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_binds_after_one_re_check";
+        "m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_is_bound_and_committed";
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
@@ -3500,7 +3508,13 @@ fn m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_binds_after_one_re_chec
             .into_iter()
             .filter(|line| line["node"] == 2)
             .filter(|line| {
-                line["@m"] == "routed_fence_recheck" || line["@m"] == "routed_fence_bound"
+                [
+                    "routed_fence_recheck",
+                    "routed_fence_bound",
+                    "routed_fence_refused",
+                ]
+                .iter()
+                .any(|message| line["@m"] == *message)
             })
             .map(|line| {
                 (
@@ -3509,13 +3523,11 @@ fn m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_binds_after_one_re_chec
                 )
             })
             .collect();
-    assert_eq!(
-        seen,
-        [
-            ("routed_fence_recheck".to_owned(), false),
-            ("routed_fence_bound".to_owned(), true)
-        ],
-        "one re-check, then the bind"
+    let bound = |rechecked: bool| ("routed_fence_bound".to_owned(), rechecked);
+    let recheck = ("routed_fence_recheck".to_owned(), false);
+    assert!(
+        seen == [bound(false)] || seen == [recheck, bound(true)],
+        "one bind, after at most one re-check: {seen:?}"
     );
     db.shutdown();
 }
@@ -3963,8 +3975,9 @@ mod guide_sample {
 }
 
 /// local-cluster.md section 3's app, compiled here as the guide prints it (critic-w5g A4). Its
-/// `main` needs a running `lr` cluster, so no row runs it; the compile and the byte check below
-/// are what keep the guide's code buildable.
+/// `main` needs a running `lr` cluster, so no row runs it (a gated multi-process walk is
+/// achieveai/rDB#72); the compile and the byte check below are what keep the guide's code
+/// buildable.
 #[allow(dead_code)]
 mod local_cluster_sample {
     use crate as rdb_api;
