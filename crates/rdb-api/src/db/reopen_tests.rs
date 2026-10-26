@@ -274,7 +274,9 @@ enum Fault {
 }
 
 /// A `MemStore` whose puts on `partitions/1` can answer "unknown". Only F1's recovery CAS puts
-/// that key on a reopen, so an armed fault reaches that CAS and nothing else. Hand-written, as
+/// that key on a reopen, so an armed fault reaches that CAS and nothing else. A first open's
+/// bootstrap creates the key first (`expected_mod_revision` 0); a create is never faulted, so an
+/// armed fault reaches the bootstrap's recovery CAS there too (#45). Hand-written, as
 /// `test_store.rs` is, because `async-trait` is not a dependency of this crate.
 struct CasFault {
     inner: config_testkit::MemStore,
@@ -351,6 +353,9 @@ impl ConfigStore for CasFault {
                 return self.inner.put(request).await;
             }
             self.puts.fetch_add(1, Ordering::Relaxed);
+            if request.expected_mod_revision == Some(0) {
+                return self.inner.put(request).await;
+            }
             let fault = self.take();
             if fault == Some(Fault::DropOne) {
                 return Err(config_core::ConfigError::DeadlineExceededUnknownOutcome);
@@ -441,6 +446,53 @@ fn m10_a_reopen_whose_recovery_cas_answers_unknown_settles_by_read_then_cas() {
             faulty.partition_puts() - before
         );
         reads_back_and_writes(&db, case);
+        db.shutdown();
+    }
+}
+
+/// #45 (bug bash B4), the first open: the store answers "unknown" to the bootstrap's recovery
+/// CAS, the one that commits generation 1 over the created generation-0 record. Before M10 that
+/// left F1 `Blocked(ControlUnknown)` and the `Db` never writable. Bound to its instance from the
+/// first open, F1 resolves it as a reopen does: read `partitions/1`, the same CAS again, ready, and
+/// a put lands. Whether the CAS applied (`LoseOne`) or not (`DropOne`).
+/// Integration (~2 s): per case, one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_bb_45_a_first_open_whose_recovery_cas_answers_unknown_is_ready_and_writes() {
+    let rt = runtime();
+    for (case, fault) in [
+        ("applied, reply lost", Fault::LoseOne),
+        ("never applied", Fault::DropOne),
+    ] {
+        let faulty = Arc::new(CasFault::new());
+        let store: Arc<dyn ConfigStore> = faulty.clone();
+        let dir = config_testkit::fs::temp_dir();
+        faulty.arm(Some(fault));
+
+        let mut db = open(&rt, dir.path(), &store).expect("the first open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .unwrap_or_else(|e| panic!("{case}: the first open is ready: {e}"));
+        assert_eq!(*lock(&faulty.fault), None, "{case}: the fault was used");
+        assert!(
+            faulty.partition_puts() >= 3,
+            "{case}: the create, the unknown CAS, then the settling one: {} puts",
+            faulty.partition_puts()
+        );
+        let owner = owner_status(&db, case);
+        assert_eq!(
+            owner.recovery.as_deref(),
+            Some("Committed"),
+            "{case}: {owner:?}"
+        );
+        db.put(b"a", b"1", None)
+            .unwrap_or_else(|e| panic!("{case}: a put after the first open: {e}"));
+        let got = db
+            .get(b"a")
+            .unwrap_or_else(|e| panic!("{case}: read a: {e}"));
+        assert_eq!(
+            got.value.map(|(_, v)| v),
+            Some(Bytes::from_static(b"1")),
+            "{case}"
+        );
         db.shutdown();
     }
 }

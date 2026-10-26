@@ -447,14 +447,14 @@ fn a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head(
     assert_eq!(host.fault, None);
 }
 
-/// review-r185 ADV2 and ADV3: the refusals no row reached, each by name and at its level.
-/// A copy holding no older generation has nothing to link, which is expected on a first
-/// landing, so it logs at info. One already holding the new generation, or one the pin
-/// does not name, logs at warn. None links, installs a receiver or faults the host. Cut
-/// (every reason at warn): red. Unit.
+/// review-r185 ADV2: the refusals no row reached, each by name. A copy already holding the new
+/// generation, or one the pin does not name, logs `land_link_refused` at warn; none links,
+/// installs a receiver or faults the host. #69 changed this row: a copy holding nothing of the
+/// partition used to be refused here at info (`anchor_generation_absent`, ADV3) and now lands
+/// ([`m10_bb_69_a_copy_holding_nothing_lands_as_head_zero_at_the_root`]). Unit.
 #[config_log::retcd_test]
-fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
-    const METHOD: &str = "a_landing_with_nothing_to_link_is_refused_by_name_at_its_level";
+fn a_landing_with_nothing_to_link_is_refused_by_name() {
+    const METHOD: &str = "a_landing_with_nothing_to_link_is_refused_by_name";
     let result = landing_at(0, Digest::ROOT);
     let mut outside = result.clone();
     outside
@@ -483,7 +483,6 @@ fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
             .is_none());
         assert_eq!(host.fault, None);
     };
-    refuses(&mut fresh, &result);
     refuses(&mut holding, &result);
     refuses(&mut fresh, &outside);
     let refused: Vec<_> = logged!(METHOD, "land_link_refused")
@@ -493,7 +492,6 @@ fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
     assert_eq!(
         refused,
         [
-            ("anchor_generation_absent", "Information"),
             ("held_at_or_above_generation", "Warning"),
             ("not_a_member", "Warning"),
         ]
@@ -502,6 +500,119 @@ fn a_landing_with_nothing_to_link_is_refused_by_name_at_its_level() {
             serde_json::Value::from(level)
         ))
     );
+}
+
+/// #69 (critic-w9 option (c)): a copy holding no lineage of the partition, as one missed at
+/// formation does, lands a commit outside its barrier as head 0 at the root, from generation 0.
+/// At cutoff 0 (arm 2) it links at base 0, gets a receiver at the root and answers
+/// `CopyCaughtUp`. Above it (arm 3) it links behind the cutoff at head 0 and answers nothing, so
+/// its `Recovered` asks R1 for the rest. A copy holding any lineage, here only a newer one, is
+/// not empty: `land_at` refuses it by name and links nothing.
+/// Cuts: `land_at` refuses an empty copy, as before #69, red (nothing links); the empty arm
+/// taken whatever the copy holds, red (generation 2 linked under a copy holding generation 3).
+/// Unit, about 2.5 s (the trio's bootstrap window).
+#[config_log::retcd_test]
+fn m10_bb_69_a_copy_holding_nothing_lands_as_head_zero_at_the_root() {
+    const METHOD: &str = "m10_bb_69_a_copy_holding_nothing_lands_as_head_zero_at_the_root";
+    let at_root = landing_at(0, Digest::ROOT);
+    // Arm 3 never reads the cutoff digest (`land_at`), so the root's stands in for one.
+    let mut above = at_root.clone();
+    above.selected.cutoff_seq = Seq(2);
+    let rt = current_thread();
+    let empty = |dir: &std::path::Path| host_over(&dir.join("node"), &rt);
+    let root_dir = config_testkit::fs::temp_dir();
+    let above_dir = config_testkit::fs::temp_dir();
+    let linked_from_root = Some(rdb_storage::Link {
+        parent: Generation(0),
+        base: Seq(0),
+        copied: false,
+    });
+
+    let mut host = empty(root_dir.path());
+    let answered = host.land_link(PartitionId(1), &at_root).expect("no fault");
+    assert!(
+        matches!(
+            answered,
+            Some(RecoveryEvent::CopyCaughtUp { head: Seq(0), digest, .. }) if digest == Digest::ROOT
+        ),
+        "caught up at the root: {answered:?}"
+    );
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(2)),
+        linked_from_root
+    );
+    let receiver = host
+        .replication
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("a receiver at the root");
+    assert_eq!(
+        (
+            receiver.lineage().generation,
+            receiver.applied_head().seq,
+            receiver.applied_head().digest
+        ),
+        (Generation(2), Seq(0), Digest::ROOT)
+    );
+    assert_eq!(host.fault, None);
+
+    let mut host = empty(above_dir.path());
+    assert_eq!(
+        host.land_link(PartitionId(1), &above).expect("no fault"),
+        None,
+        "behind the cutoff, not caught up"
+    );
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(2)),
+        linked_from_root
+    );
+    let behind: Vec<_> = logged!(METHOD, "land_link_behind")
+        .into_iter()
+        .map(|line| (line["head"].clone(), line["base"].clone()))
+        .collect();
+    assert_eq!(behind, [(0, 2)].map(|(h, b)| (h.into(), b.into())));
+    assert_eq!(logged!(METHOD, "land_link_inherited").len(), 1);
+    assert!(logged!(METHOD, "land_link_refused").is_empty());
+
+    let newer = config_testkit::fs::temp_dir();
+    let path = newer.path().join("node");
+    write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(3),
+        1,
+    );
+    let mut host = host_over(&path, &rt);
+    let held = host.engine.lineages();
+    let anchor = LineageAnchor {
+        lineage: at_root.selected.root,
+        base_seq: Seq(0),
+        base_digest: Digest::ROOT,
+    };
+    assert_eq!(
+        host.land_at(PartitionId(1), anchor),
+        Err("anchor_generation_absent")
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing linked");
+
+    // No lineage, but publish marks stored for the partition: not empty (critic-bb M9).
+    let marked = config_testkit::fs::temp_dir();
+    let path = marked.path().join("node");
+    RocksEngine::open(&path)
+        .expect("open engine")
+        .put_publish_marks(
+            PartitionId(1),
+            &[rdb_storage::PublishMark {
+                generation: Generation(1),
+                seq: Seq(1),
+                tick: Tick(1),
+            }],
+        )
+        .expect("put marks");
+    let mut host = host_over(&path, &rt);
+    assert_eq!(
+        host.land_at(PartitionId(1), anchor),
+        Err("publish_marks_held")
+    );
+    assert!(host.engine.lineages().is_empty(), "nothing linked");
 }
 
 /// #59 item 5 (review-r185 ADV2), the receiver arm of a landing outside the barrier. (a) The

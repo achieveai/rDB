@@ -587,14 +587,16 @@ fn m9_d3_09_non_default_hold_writes_published_before_the_re_emit_are_kept() {
 
 /// D4's timeline (lead ruling "S0 D3", defect D4 found on the host walk at 19faa27). B alone
 /// survives empty while C and A are cut off, as in D2; the links heal at [`cases::M9_D2_HEAL_AT`]
-/// and F1 re-emits `Active` at the next sync deadline (t4003 in this trace). The cut below holds
-/// only A's watch of that re-emit: B–A is cut after the re-emit and before the watch fires, and
-/// healed one tick before A1's first wake writes the start record (t4503), so A applies seq 1
-/// and a host flush on A at [`D4_FLUSH_AT`] makes it durable and ACKs that to B. Only then does
-/// the released watch land on A, ten ticks after the heal.
-const D4_CUT_AT: u64 = 4_008;
-const D4_BACK_AT: u64 = 4_502;
-const D4_FLUSH_AT: u64 = 4_505;
+/// and F1 re-emits `Active` once C and A, landing empty, link at the root and report themselves
+/// caught up there (t3010 in this trace; before #69 they landed unlinked and the re-emit waited
+/// for the next sync deadline, t4003, and this timeline sat 993 ticks later). The cut below
+/// holds only A's watch of that re-emit: B–A is cut after the re-emit and before the watch
+/// fires, and healed one tick before A1's first wake writes the start record (t3503), so A
+/// applies seq 1 and a host flush on A at [`D4_FLUSH_AT`] makes it durable and ACKs that to B.
+/// Only then does the released watch land on A, ten ticks after the heal.
+const D4_CUT_AT: u64 = 3_015;
+const D4_BACK_AT: u64 = 3_502;
+const D4_FLUSH_AT: u64 = 3_505;
 const D4_WRITES: [(u64, u64); 2] = [(12_000, 300), (15_000, 301)];
 const D4_MAX_TICKS: u64 = 17_000;
 
@@ -668,6 +670,8 @@ fn m9_d4_00_a_copy_that_hears_the_re_emit_after_flushing_seq_one_keeps_it_and_ta
             _ => None,
         })
         .expect("F1 re-emits the result active once the links heal");
+    tracing::info!(?active, "d4.active");
+    tracing::info!(on_a = ?applied_on(&trace, A_NODE), on_c = ?applied_on(&trace, C_NODE), "d4.applied");
     assert!(
         active.0 > cases::M9_D2_HEAL_AT && active.0 < D4_CUT_AT,
         "the re-emit precedes the cut that holds A's watch of it: {active:?}"
@@ -1442,13 +1446,17 @@ fn k1_heal(heal_at: u64, delay_millis: Option<u64>, writes: &[u64]) -> RunPlan {
 }
 
 /// K1 (host walk A12 at 5c798ca): a copy that returns after a `DegradedRf2` commit at cutoff 0 but
-/// before the start record is shipped takes seq 1 from the stream. R1 runs no catch-up for a copy
-/// that was never behind, so no `CopyCaughtUp` reaches F1, and before the fix nothing pinned the
-/// rebuild: F1 stayed `Rebuilding`, never re-emitted `Active`, and sent no sync, so not even a
-/// deadline reported the stall. Now every commit at cutoff 0 pins `(0, ROOT)` at the commit (K1
-/// ruling), so the deadline after the heal asks A again and the partition activates.
+/// before the start record is shipped takes seq 1 from the stream. Before the K1 fix nothing
+/// pinned the rebuild, so F1 stayed `Rebuilding` for good. Since #69 (option (c), ruling A-R432)
+/// A holds nothing, so it links the new generation at the root when it lands and reports itself
+/// caught up there, at the cutoff: the order is now root catch-up, then the `Active` re-emit,
+/// then seq 1 from the stream with C. Before #69 A landed unlinked and the deadline after the
+/// heal asked it again, so it activated holding the start record. `Active` at point 0 counts
+/// nothing A has not applied: every ACK A sends covers only what A has applied by then.
 #[retcd_test]
 fn m9_k1_00_a_copy_back_before_the_start_record_ships_still_lets_the_degraded_start_activate() {
+    const METHOD: &str =
+        "m9_k1_00_a_copy_back_before_the_start_record_ships_still_lets_the_degraded_start_activate";
     let (replies, trace, violations) = run_judged(&k1_early_heal());
     let recovered = recovered_on_primary(&trace);
     tracing::info!(?recovered, "k1.recovered");
@@ -1471,6 +1479,26 @@ fn m9_k1_00_a_copy_back_before_the_start_record_ships_still_lets_the_degraded_st
         "the precondition: A takes seq 1 from the stream with C, after the heal, never behind it \
          (A at {on_a:?}, C at {on_c:?})"
     );
+    // Root catch-up: A lands after the heal, linked at the root and caught up at cutoff 0.
+    let landed = trace.events.iter().find_map(|event| match &event.kind {
+        TraceKind::KernelNoted {
+            note: KernelNote::RecoveredLanded { member, .. },
+            ..
+        } if *member == A_NODE && event.logical_tick > K1_HEAL_AT => Some(event.logical_tick),
+        _ => None,
+    });
+    let at_root: Vec<_> = config_testkit::logs::lines_for_current_test("m9_start_record", METHOD)
+        .into_iter()
+        .filter(|line| {
+            line["@m"] == "land_link_inherited" && line["node"] == A_NODE.0 && line["base"] == 0
+        })
+        .collect();
+    tracing::info!(?landed, ?at_root, "k1.landed");
+    assert_eq!(
+        at_root.len(),
+        1,
+        "A links once at the root and is caught up there: {at_root:?}"
+    );
     let active = recovered
         .iter()
         .find(|(at, mode, cutoff)| {
@@ -1478,12 +1506,13 @@ fn m9_k1_00_a_copy_back_before_the_start_record_ships_still_lets_the_degraded_st
         })
         .map(|(at, ..)| *at);
     assert!(
-        matches!(active, Some(at) if at < K1_WRITES[0]),
-        "the same result re-emitted active once A holds the prefix, before the first write: \
-         {recovered:?}"
+        matches!((landed, active), (Some(landed), Some(active))
+            if landed <= active && active < K1_WRITES[0]),
+        "A's root catch-up, then the re-emit active, before the first write (landed \
+         t{landed:?}): {recovered:?}"
     );
     // What `Active` rests on here (K1 ruling, critic F7): a proof at point 0 says nothing about
-    // A, so name what A actually held when it activated, the start record.
+    // A, so name what A actually held when it activated: the root, nothing applied.
     let a_at_active = applied_on(&trace, A_NODE)
         .into_iter()
         .filter(|(at, generation, _, outcome)| {
@@ -1494,9 +1523,51 @@ fn m9_k1_00_a_copy_back_before_the_start_record_ships_still_lets_the_degraded_st
         .map(|(_, _, seq, _)| seq)
         .max();
     assert_eq!(
-        a_at_active,
-        Some(Seq(1)),
-        "A held the start record, and nothing more, when the partition went active (t{active:?})"
+        a_at_active, None,
+        "A held the root, and nothing more, when the partition went active (t{active:?})"
+    );
+    // Nothing is counted for A before A has it: each ACK A sends in the new generation covers
+    // only records A has applied by then.
+    let applied_by = |at: u64| {
+        applied_on(&trace, A_NODE)
+            .into_iter()
+            .filter(|(tick, generation, _, outcome)| {
+                *tick <= at && *generation == Generation(2) && *outcome == ApplyOutcome::Applied
+            })
+            .map(|(_, _, seq, _)| seq)
+            .max()
+            .unwrap_or(Seq::ZERO)
+    };
+    let acks: Vec<(u64, Seq, Seq)> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::ReplicationAck {
+                from_node,
+                generation,
+                contiguous_seq,
+                accepted: true,
+                ..
+            } if *from_node == A_NODE && *generation == Generation(2) => Some((
+                event.logical_tick,
+                *contiguous_seq,
+                applied_by(event.logical_tick),
+            )),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?acks, "k1.acks_from_a");
+    assert!(
+        acks.iter().any(|(_, acked, _)| *acked >= Seq(3)),
+        "A acks both writes, so the check below has something to check: {acks:?}"
+    );
+    let early: Vec<_> = acks
+        .iter()
+        .filter(|(_, acked, applied)| acked > applied)
+        .collect();
+    assert!(
+        early.is_empty(),
+        "A acked records it had not applied (tick, acked, applied): {early:?}"
     );
     assert_eq!(
         written(&replies),
