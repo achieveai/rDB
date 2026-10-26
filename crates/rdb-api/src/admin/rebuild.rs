@@ -52,9 +52,6 @@ pub(crate) struct Ready {
     pub(crate) mode: RebuildMode,
     /// The generation of the commit that leaves N out: the wipe is fenced at or above it.
     pub(crate) generation: Generation,
-    /// The boot N ran when the owner dropped it (mode A: when the owner was asked), `None`
-    /// when the owner had no link to N then. The wipe is refused when N runs another.
-    pub(crate) boot: Option<BootId>,
     /// The regular copies the commit keeps, the owner's included: where the data stays.
     pub(crate) kept: Vec<NodeId>,
 }
@@ -262,24 +259,24 @@ pub(crate) fn kept(members: &[Member], node: NodeId) -> Vec<NodeId> {
 }
 
 /// M5: why `node`'s wipe is refused, or `None` when it may go ahead. The wipe was asked at
-/// generation `fenced` and boot `boot`. `record` is `partitions/1`'s generation and its members
-/// (`None`: layout 3, which cannot show N left out), read after N stopped; `last` is the boot
-/// N last ran.
+/// generation `fenced`. `record` is `partitions/1`'s generation and its members (`None`:
+/// layout 3, which cannot show N left out), read after N stopped. `boots` is N's boot when the
+/// wipe was asked and its boot as of the stop, which must be equal. It is `None` only for
+/// `lr`, which has no boot of N's drop and reads the owner's live pin after the stop instead
+/// (A-R441 F2).
 pub(crate) fn fence_refusal(
     node: NodeId,
     fenced: Generation,
-    boot: Option<BootId>,
     record: (Generation, Option<&[RecordMember]>),
-    last: BootId,
+    boots: Option<(BootId, BootId)>,
 ) -> Option<Refused> {
     let n = node.0;
     let (generation, members) = record;
-    let why = if boot.is_some_and(|boot| boot != last) {
+    let why = if let Some((boot, last)) = boots.filter(|(boot, last)| boot != last) {
         format!(
-            "node {n} ran boot {} when the drop was planned and boot {} since: it restarted, \
+            "node {n} ran boot {} when the wipe was asked and boot {} since: it restarted, \
              and may have been taken back",
-            boot.map_or(0, |boot| boot.0),
-            last.0
+            boot.0, last.0
         )
     } else if generation < fenced {
         format!(
@@ -343,7 +340,8 @@ mod tests {
 
     fn member(node: u32, role: ReplicaRole) -> Member {
         Member {
-            copy: CopyId(u8::try_from(node).expect("small node")),
+            // The real map, as `admin::members` builds it: copy id is node - 1 (critic-65 F3).
+            copy: CopyId(u8::try_from(node - 1).expect("small node")),
             node: NodeId(node),
             boot: BootId(10),
             role,
@@ -452,14 +450,57 @@ mod tests {
         );
     }
 
+    /// G6 maps the evidence's copy ids to nodes through the pinned members, on the real map
+    /// (`admin::members`: copy = node - 1). Mixed cases (critic-65 F3): evidence naming copy 2
+    /// is node 3, never node 2, and evidence naming copy 1 is node 2. Cut: compare
+    /// `CopyId(node)` and the mixed asserts go red.
     #[test]
     fn b3_g6_quarantine_rebuilds_only_a_named_copy() {
         let members = rf3();
+        let real: Vec<(CopyId, NodeId)> = crate::admin::members()
+            .iter()
+            .map(|m| (m.copy, m.node))
+            .collect();
+        let fixture: Vec<(CopyId, NodeId)> = members.iter().map(|m| (m.copy, m.node)).collect();
+        assert_eq!(fixture, real, "the fixture uses the real copy ids");
         let pairwise = DivergenceEvidence::Pairwise {
             seq: Seq(5),
-            a: (CopyId(1), Digest::ROOT),
-            b: (CopyId(3), Digest::ROOT),
+            a: (CopyId(0), Digest::ROOT),
+            b: (CopyId(2), Digest::ROOT),
         };
+        let root = |copy| DivergenceEvidence::RootMismatch {
+            copy: CopyId(copy),
+            base_seq: Seq(1),
+            expected: Digest::ROOT,
+            found: None,
+        };
+        let (copy2, copy1) = (root(2), root(1));
+        assert_eq!(
+            decide(&asked(3, &members, false, Some(Some(&copy2))), |_| true),
+            Ok(RebuildMode::Quarantined),
+            "copy 2 is node 3"
+        );
+        assert_eq!(
+            guard(decide(
+                &asked(2, &members, false, Some(Some(&copy2))),
+                |_| true
+            )),
+            "G6",
+            "copy 2 is not node 2"
+        );
+        assert_eq!(
+            decide(&asked(2, &members, false, Some(Some(&copy1))), |_| true),
+            Ok(RebuildMode::Quarantined),
+            "copy 1 is node 2"
+        );
+        assert_eq!(
+            guard(decide(
+                &asked(3, &members, false, Some(Some(&copy1))),
+                |_| true
+            )),
+            "G6",
+            "copy 1 is not node 3"
+        );
         assert_eq!(
             decide(&asked(3, &members, true, Some(Some(&pairwise))), |_| true),
             Ok(RebuildMode::Quarantined)
@@ -474,16 +515,6 @@ mod tests {
         assert_eq!(
             guard(decide(&asked(3, &members, false, Some(None)), |_| true)),
             "G6"
-        );
-        let root = DivergenceEvidence::RootMismatch {
-            copy: CopyId(2),
-            base_seq: Seq(1),
-            expected: Digest::ROOT,
-            found: None,
-        };
-        assert_eq!(
-            decide(&asked(2, &members, false, Some(Some(&root))), |_| true),
-            Ok(RebuildMode::Quarantined)
         );
     }
 
@@ -514,42 +545,25 @@ mod tests {
         let members: Vec<RecordMember> = rf3()[..2].iter().map(RecordMember::of).collect();
         let named: Vec<RecordMember> = rf3().iter().map(RecordMember::of).collect();
         let n = NodeId(3);
-        let ok = fence_refusal(
-            n,
-            Generation(4),
-            Some(BootId(7)),
-            (Generation(4), Some(&members)),
-            BootId(7),
-        );
-        assert_eq!(ok, None);
-        let restarted = fence_refusal(
-            n,
-            Generation(4),
-            Some(BootId(7)),
-            (Generation(4), Some(&members)),
-            BootId(8),
-        );
+        let same = Some((BootId(7), BootId(7)));
+        let fence = |generation, members: Option<&[RecordMember]>, boots| {
+            fence_refusal(n, Generation(4), (Generation(generation), members), boots)
+        };
+        assert_eq!(fence(4, Some(&members), same), None);
+        assert_eq!(fence(4, Some(&members), None), None, "lr: no boot pair");
+        let restarted = fence(4, Some(&members), Some((BootId(7), BootId(8))));
         assert!(restarted.expect("boot").detail.contains("restarted"));
-        let behind = fence_refusal(
-            n,
-            Generation(4),
-            Some(BootId(7)),
-            (Generation(3), Some(&members)),
-            BootId(7),
-        );
+        let behind = fence(3, Some(&members), same);
         assert!(behind.expect("generation").detail.contains("below"));
-        let readded = fence_refusal(
-            n,
-            Generation(4),
-            Some(BootId(7)),
-            (Generation(5), Some(&named)),
-            BootId(7),
-        );
+        let readded = fence(5, Some(&named), same);
         assert!(readded
             .expect("members")
             .detail
             .contains("pins node 3 again"));
-        let layout3 = fence_refusal(n, Generation(4), None, (Generation(4), None), BootId(7));
-        assert_eq!(layout3.expect("layout 3").guard, "M5");
+        assert!(
+            fence(5, Some(&named), None).is_some(),
+            "lr: the record still names 3"
+        );
+        assert_eq!(fence(4, None, same).expect("layout 3").guard, "M5");
     }
 }

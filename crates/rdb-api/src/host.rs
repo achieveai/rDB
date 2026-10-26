@@ -522,6 +522,21 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<Result<(), rdb_storage::DamageRefused>>,
     },
+    /// **Dev tool only**, debug builds (#65, critic-bb §3 mode C): replace the head `History`
+    /// record of lineage `(partition, generation)` in this node's own copy with a different one
+    /// that is still validly chained (same seq and `prev_digest`, another `request_digest`, the
+    /// digest recomputed, the progress record moved with it), so this copy diverges from the
+    /// others the way a split brain would and recovery quarantines rather than finds damage.
+    /// Local only, like [`Msg::Damage`]. Answers the seq it forked.
+    #[cfg(debug_assertions)]
+    Fork {
+        /// The partition.
+        partition: PartitionId,
+        /// The lineage's generation.
+        generation: Generation,
+        /// Where the answer goes.
+        reply: Sender<Result<Seq, String>>,
+    },
     /// #65 (critic-bb §3): rebuild node `node`'s copy of `partition`. Local only, like
     /// [`Msg::PeerBooted`]: [`crate::db::Db::rebuild`] sends it to an owner in its own process.
     /// The owner checks the guards; a pinned `node` is dropped first, and a quarantined F1 is
@@ -1221,8 +1236,6 @@ struct RebuildAsk {
     mode: crate::admin::rebuild::RebuildMode,
     /// The generation committed when it was asked: the answer waits for a newer one.
     from: Generation,
-    /// The boot `node` ran when it was asked, when linked.
-    boot: Option<BootId>,
     deadline: Tick,
     reply: RebuildReply,
 }
@@ -2643,6 +2656,23 @@ impl Host {
                     ?ns,
                     refused = ?answer.as_ref().err(),
                     "host_record_damage"
+                );
+                let _ = reply.send(answer);
+                Ok(())
+            }
+            #[cfg(debug_assertions)]
+            Msg::Fork {
+                partition,
+                generation,
+                reply,
+            } => {
+                let answer = self.fork_head(partition, generation);
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    answer = ?answer,
+                    "host_record_fork"
                 );
                 let _ = reply.send(answer);
                 Ok(())
@@ -5780,6 +5810,68 @@ impl Host {
         );
     }
 
+    /// [`Msg::Fork`]: rewrite this copy's head `History` record of `(partition, generation)`
+    /// as another validly chained record at the same seq, with its progress record, in one
+    /// synced batch. Only the bytes on disk change; this node's kernel still holds the old head
+    /// until it restarts, which is when a row or walk forks a copy (debug builds only).
+    #[cfg(debug_assertions)]
+    fn fork_head(&mut self, partition: PartitionId, generation: Generation) -> Result<Seq, String> {
+        use rdb_core::contracts::storage::{Batch, Write};
+        let seq = Seq(self.engine.buffered_applied(partition, generation).0);
+        if seq.0 == 0 {
+            return Err(format!(
+                "generation {} holds no record to fork",
+                generation.0
+            ));
+        }
+        let (record, _) = self
+            .engine
+            .history_at(partition, generation, seq)
+            .map_err(|fault| format!("history read failed: {fault:?}"))?
+            .ok_or_else(|| format!("no record at seq {}", seq.0))?;
+        let mut envelope = ReplicationEnvelope::decode(&record)
+            .map_err(|error| format!("the head record does not decode: {error:?}"))?;
+        // The node is in the preimage, so two forked copies differ from each other too.
+        envelope.request_digest = Digest::of(
+            Domain::Record,
+            &[
+                b"rebuild fork",
+                &self.node.0.to_le_bytes(),
+                &seq.0.to_le_bytes(),
+            ],
+        );
+        envelope.record_digest = envelope
+            .compute_record_digest()
+            .map_err(|error| format!("digest: {error:?}"))?;
+        let forked = envelope
+            .encode()
+            .map_err(|error| format!("encode: {error:?}"))?;
+        let mut progress = seq.0.to_le_bytes().to_vec();
+        progress.extend_from_slice(&envelope.record_digest.0);
+        let batch = Batch {
+            id: rdb_core::contracts::ids::BatchId(u64::MAX),
+            partition,
+            generation,
+            seq,
+            writes: vec![
+                Write {
+                    ns: Namespace::History,
+                    key: Bytes::copy_from_slice(&seq.0.to_be_bytes()),
+                    value: Some(forked),
+                },
+                Write {
+                    ns: Namespace::Progress,
+                    key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+                    value: Some(Bytes::from(progress)),
+                },
+            ],
+        };
+        self.engine
+            .commit(batch)
+            .map_err(|fault| format!("commit failed: {fault:?}"))?;
+        Ok(seq)
+    }
+
     /// #65 (critic-bb §3): `admin rebuild node`. Checks the guards on this node's newest
     /// commit ([`crate::admin::rebuild::decide`]) and answers at once for mode A. Mode B asks a
     /// re-plan without `node`, as [`Self::drop_copy`] does; mode C first replaces the
@@ -5876,7 +5968,6 @@ impl Host {
             reply.send(Ok(Ready {
                 mode,
                 generation,
-                boot,
                 kept: kept(members, node),
             }));
             return;
@@ -5885,6 +5976,16 @@ impl Host {
             // Phase::Quarantined stays terminal in the kernel: the host drops that F1, and the
             // plan below makes a fresh one, which inventories only the copies it keeps.
             self.recoveries.remove(&partition);
+            // The dropped F1's discovery timer goes with it: the fresh F1 arms the same id from
+            // version 1, which the host refuses over a live higher version.
+            let timer = rdb_core::recovery::DISCOVERY_TIMER;
+            if self
+                .timers
+                .get(&timer)
+                .is_some_and(|(_, _, site)| site.partition == partition)
+            {
+                self.timers.remove(&timer);
+            }
             self.quarantines.remove(&partition);
             self.rejoins.remove(&partition);
             tracing::warn!(
@@ -5902,7 +6003,6 @@ impl Host {
                 node,
                 mode,
                 from: generation,
-                boot,
                 deadline: now.plus_millis(within),
                 reply,
             },
@@ -5950,7 +6050,6 @@ impl Host {
                 drop_landed(node, &committed.mode, members).map(|()| Ready {
                     mode: ask.mode,
                     generation: committed.new_generation,
-                    boot: ask.boot,
                     kept: kept(members, node),
                 })
             } else if now >= ask.deadline {
@@ -9647,6 +9746,8 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::PeerBooted { .. } => "peer_booted",
         #[cfg(debug_assertions)]
         Msg::Damage { .. } => "damage",
+        #[cfg(debug_assertions)]
+        Msg::Fork { .. } => "fork",
         Msg::Rebuild { .. } => "rebuild",
         Msg::Synced(_) => "synced",
         Msg::Stop => "stop",

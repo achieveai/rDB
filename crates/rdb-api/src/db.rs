@@ -2517,6 +2517,49 @@ impl Db {
         }
     }
 
+    /// **Dev tool only**, debug builds (#65 mode C; `rdb_dev admin fork-copy`): make `node`'s
+    /// copy diverge. Its head `History` record of partition 1's lineage `generation` is
+    /// replaced by another validly chained record at the same seq ([`Msg::Fork`]), so the next
+    /// recovery that compares it with the others quarantines. The node's kernel keeps the old
+    /// head until it restarts: restart it to make the fork count. Returns the forked seq.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, or
+    /// not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn fork_record(&self, node: NodeId, generation: Generation) -> Result<u64, String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::Fork {
+            partition: PARTITION,
+            generation,
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: fork its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done
+                .map(|seq| seq.0)
+                .map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
     /// The peer links, to hold and heal.
     #[must_use]
     pub fn links(&self) -> &Arc<Links> {
@@ -3083,7 +3126,7 @@ impl Db {
         // M5: the record is read after the stop, so nothing can take the node back between the
         // check and the move.
         let unmoved = aside.and_then(|aside| {
-            match self.wipe_fenced(node, aside.generation, aside.boot, old_boot) {
+            match self.wipe_fenced(node, aside.generation, Some((aside.boot, old_boot))) {
                 Some(refused) => Some(refused),
                 None => move_aside(node, &folder, &aside.to).err(),
             }
@@ -3141,14 +3184,13 @@ impl Db {
     }
 
     /// Why `node`'s wipe is refused after its stop, or `None` (critic-bb M5): `partitions/1`
-    /// must be at or above `generation` and leave `node` out, and `node` must still be at
-    /// `boot`: `last`, its boot as of the stop, equals it.
+    /// must be at or above `generation` and leave `node` out, and with `boots` (the boot when
+    /// the wipe was asked, the boot as of the stop) `node` must not have restarted between.
     fn wipe_fenced(
         &self,
         node: NodeId,
         generation: Generation,
-        boot: BootId,
-        last: BootId,
+        boots: Option<(BootId, BootId)>,
     ) -> Option<String> {
         let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
             return Some(format!(
@@ -3161,14 +3203,10 @@ impl Db {
             let _ = done.send(admin::rebuild::record(&*store).await);
         });
         let refused = match answer.recv_timeout(self.timeouts.read) {
-            Ok(Ok((record, members))) => admin::rebuild::fence_refusal(
-                node,
-                generation,
-                Some(boot),
-                (record, members.as_deref()),
-                last,
-            )
-            .map(|refused| refused.to_string()),
+            Ok(Ok((record, members))) => {
+                admin::rebuild::fence_refusal(node, generation, (record, members.as_deref()), boots)
+                    .map(|refused| refused.to_string())
+            }
             Ok(Err(error)) => Some(format!(
                 "node {} not wiped: {error}; its folder is left in place",
                 node.0
@@ -3222,19 +3260,21 @@ impl Db {
         self.rebuild_with(node, wipe).map(|rebuilt| rebuilt.line())
     }
 
-    /// `lr rebuild <node> --wipe`'s fence (#65, M5, ruling A-R436), checked by an app with no
-    /// node of its own (`--nodes`) once the script has stopped `node`: the owner still leaves
-    /// `node` out, `partitions/1` is at or above the owner's generation and leaves `node` out,
-    /// and `node`'s boot before the stop, `boot`, equals its boot after it, `last` (it did not
-    /// restart in between). `Ok` is the go-ahead line: the caller moves the folder aside.
+    /// `lr rebuild <node> --wipe`'s fence (#65, M5; the substitute fence of ruling A-R441 F2),
+    /// checked by an app with no node of its own (`--nodes`) once the script has stopped
+    /// `node`. Both reads happen after that stop: the owner's live pin must not name `node` in
+    /// any role, and `partitions/1` must be at or above the owner's generation and leave `node`
+    /// out. No boot is compared: lr has no boot of the drop. It is safe because a restarted
+    /// `node` is pinned again as a shadow before it can count, and one not yet pinned holds no
+    /// counted acks. `Ok` is the go-ahead line: the caller moves the folder aside.
     ///
     /// # Errors
     ///
     /// As [`Self::rebuild`]'s guards, and `UNAVAILABLE` with the fence's reason when it does
     /// not hold. Nothing is moved either way; the folder stays where it is.
-    pub fn rebuild_fence(&self, node: NodeId, boot: u64, last: u64) -> Result<String, ApiError> {
+    pub fn rebuild_fence(&self, node: NodeId) -> Result<String, ApiError> {
         let (owner, generation) = self.left_out(node)?;
-        if let Some(refused) = self.wipe_fenced(node, generation, BootId(boot), BootId(last)) {
+        if let Some(refused) = self.wipe_fenced(node, generation, None) {
             return Err(rebuild_refused(admin::rebuild::Refused {
                 guard: "M5",
                 detail: refused,
@@ -3244,13 +3284,12 @@ impl Db {
             node = node.0,
             owner = owner.0,
             generation = generation.0,
-            boot,
             "db_rebuild_fence_holds"
         );
         Ok(format!(
-            "rebuild: the fence holds for node {}: node {} (the owner) and partitions/1 leave it \
-             out at generation {} and it has not restarted since boot {boot}; its folder may be \
-             moved aside",
+            "rebuild: the fence holds for node {}: read after its stop, node {} (the owner) does \
+             not pin it and partitions/1 leaves it out at generation {} or later; its folder may \
+             be moved aside",
             node.0, owner.0, generation.0
         ))
     }
@@ -3399,8 +3438,20 @@ impl Db {
             }
         };
         let moved = aside.as_ref().map(|aside| aside.to.clone());
-        let boot = self.restart_node_with(node, aside)?;
-        self.await_regular(node, within)?;
+        // A1 (critic-65): once the folder has moved, every later error says where it is.
+        let named = |mut error: ApiError| {
+            if let Some(to) = moved.as_ref().filter(|to| to.exists()) {
+                error.detail = format!(
+                    "{}; node {}'s old folder is kept at {}",
+                    error.detail,
+                    node.0,
+                    to.display()
+                );
+            }
+            error
+        };
+        let boot = self.restart_node_with(node, aside).map_err(named)?;
+        self.await_regular(node, within).map_err(named)?;
         let rebuilt = admin::rebuild::Rebuilt {
             node,
             mode: ready.mode,
