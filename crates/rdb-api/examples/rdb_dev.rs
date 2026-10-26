@@ -1162,6 +1162,10 @@ const PAUSE_AGE_SECS: u64 = Budgets::SPEC_DEFAULTS.pause_age_millis.div_ceil(100
 const STUCK: &str =
     "writes stay stopped for this run: to write again, quit and start rdb_dev again";
 
+/// What a line says while writes are paused on a copy that is out, which M10 ends by itself.
+const RESUMES: &str = "writes are paused and resume by themselves once the owner re-plans \
+                       (the copy rejoins, or is dropped after 10 s out); `wait ready` waits";
+
 /// The reason a `ready` or `not ready` line carries, when a user could act on it wrongly. Each
 /// part is derived from the state that decides it (tester walk 7, W7-D1, W7-D2).
 ///
@@ -1170,8 +1174,8 @@ const STUCK: &str =
 /// latest about [`PAUSE_AGE_SECS`] after the next write, which stays unsafe with a copy out
 /// (tester r3). So the line promises "soon" and that bound, never a pause tied only to the
 /// next write (W7-D1). Once node 1 does not admit, the line says writes stay stopped only when
-/// that holds: L1 paused or reprotecting, which with a copy out nothing in M9 resumes, or the
-/// owner itself restarted. Not admitting because of a fence the poll can lift (FR, tester r3)
+/// that holds: the owner itself restarted. L1 paused or reprotecting with a copy out says writes
+/// resume ([`RESUMES`]): M10 re-plans or drops the copy (bb, #69 r4). Not admitting because of a fence the poll can lift (FR, tester r3)
 /// promises the resume and then the pause (W7-D2).
 ///
 /// A fenced grant. While A1's self-replace poll is live it looks stuck but is not: A1 replaces
@@ -1231,8 +1235,13 @@ fn ready_reason(
     if admits {
         return Some(format!("writes {pause}"));
     }
-    if owner.boot != rdb_api::host::BOOT || l1_rejecting(owner).is_some() {
+    if owner.boot != rdb_api::host::BOOT {
         return Some(format!("{note}; {STUCK}"));
+    }
+    // M10 (bb #65 paper cut, #69 walk r4): a copy out no longer stops writes for the run. The
+    // owner re-plans with the restarted copy, or drops a copy that stays out, and L1 resumes.
+    if let Some(mode) = l1_rejecting(owner) {
+        return Some(format!("{note}; l1={mode}: {RESUMES}"));
     }
     if let Some(line) = gave_up {
         return Some(format!("{line}; {note}"));
@@ -5131,7 +5140,7 @@ mod tests {
         let paused = with("held(grant 2)", "ActivationUnresolved", None);
         assert_eq!(
             reason(&paused, Some(note)),
-            Some(format!("{note}; {STUCK}"))
+            Some(format!("{note}; l1=paused: {RESUMES}"))
         );
         let frozen = with(
             "fenced(Frozen)",
@@ -5554,10 +5563,7 @@ mod tests {
                     "ready for now; writes pause soon, at the latest about 2 s after the next \
                      write, because {note}"
                 ),
-                format!(
-                    "not ready: writes not admitted: {note}; writes stay stopped for this run: \
-                     to write again, quit and start rdb_dev again"
-                ),
+                format!("not ready: writes not admitted: {note}; l1=paused: {RESUMES}"),
             ]
         );
     }
@@ -5565,8 +5571,8 @@ mod tests {
     /// W7-D1, W7-D2: every `ready`/`not ready` reason is derived from the state that decides it,
     /// checked against each state of the tester's walk-7 text matrix (s2b-tester.md, "Text
     /// matrix"). The stuck line ("writes stay stopped for this run") prints only where nothing
-    /// in M9 brings writes back: L1 paused or reprotecting with a copy out, the owner itself
-    /// restarted, or a fence no self-replace lifts. A fence whose poll is live, with a
+    /// brings writes back: the owner itself restarted, or a fence no self-replace lifts. L1
+    /// paused or reprotecting with a copy out says writes resume (bb, #69 r4). A fence whose poll is live, with a
     /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
     #[test]
     fn every_ready_line_matches_the_state_that_decides_it() {
@@ -5631,19 +5637,25 @@ mod tests {
                 "HP",
                 with(false, Some("paused"), None),
                 Some(note),
-                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {note}; l1=paused: {RESUMES}"
+                )),
             ),
             (
                 "HP reprotecting",
                 with(false, Some("reprotecting"), None),
                 Some(note),
-                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {note}; l1=reprotecting: {RESUMES}"
+                )),
             ),
             (
                 "SF paused",
                 with(false, Some("paused"), None),
                 Some(failed),
-                Some(format!("not ready: writes not admitted: {failed}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {failed}; l1=paused: {RESUMES}"
+                )),
             ),
             (
                 "FP",
@@ -5702,7 +5714,9 @@ mod tests {
                 "FR, L1 paused",
                 with(false, Some("paused"), expiring),
                 Some(note),
-                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {note}; l1=paused: {RESUMES}"
+                )),
             ),
             (
                 "FR, poll stopped",
