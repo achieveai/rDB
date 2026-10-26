@@ -5230,7 +5230,11 @@ impl Host {
                 .members
                 .iter()
                 .any(|member| member.node == left.node || member.copy == left.copy);
+            // An `admin rebuild` waiting on this drop is not undone by a re-add: the node
+            // comes back only once restarted on its wiped folder (M11, b3).
+            let rebuilding = self.rebuild_asks.values().any(|ask| ask.node == left.node);
             !pinned
+                && !rebuilding
                 && self
                     .links
                     .boot_of(left.node)
