@@ -1895,7 +1895,7 @@ fn repl<'scope, 'env>(
                         .find(|status| status.node == node)
                         .map_or_else(
                             || missing_node_line(node, db.boot_of(node), db.restart_failed(node)),
-                            node_line,
+                            |status| node_line(status, owner_status(&answered)),
                         ));
                 }
                 Ok(())
@@ -4370,13 +4370,49 @@ fn missing_node_line(node: NodeId, boot: Option<BootId>, failed: bool) -> String
     }
 }
 
+/// The `role=` a `nodes` line shows for `node`. A node that still says `primary` while `owner`
+/// (the [`owner_status`] read) is another node holding a newer generation was promoted away
+/// from: its own word is stale, so the line shows the role the owner's pinned configuration
+/// gives it (`none` when it pins it nowhere), and says the old word and who owns now (bug bash
+/// #65 walk: node 1 showed `gen=1 role=primary` after `admin promote 2` while it served as a
+/// secondary).
+fn shown_role(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
+    use rdb_core::contracts::ids::ReplicaRole;
+    let held = |status: &NodeStatus| status.holds.map(|holds| holds.generation);
+    let Some(owner) = owner.filter(|owner| {
+        owner.node != node.node && node.role == "primary" && held(owner) > held(node)
+    }) else {
+        return node.role.to_owned();
+    };
+    let pinned = owner
+        .pinned
+        .iter()
+        .find(|member| member.node == node.node)
+        .map_or("none", |member| match member.role {
+            ReplicaRole::Primary => "primary",
+            ReplicaRole::RegularSecondary => "secondary",
+            ReplicaRole::Shadow => "shadow",
+        });
+    let generation = |status: &NodeStatus| {
+        status
+            .holds
+            .map_or_else(|| "-".to_owned(), |holds| holds.generation.0.to_string())
+    };
+    format!(
+        "{pinned} (stale: says primary at gen={}; node {} owns partition 1 at gen={})",
+        generation(node),
+        owner.node.0,
+        generation(owner)
+    )
+}
+
 /// One node's line. `published=` is left off a secondary: P1 publishes nothing there, so its
 /// `0@<gen>` would read as a real position (PC12).
 ///
 /// `mode=? roles=?` stands where the partition mode (`ACTIVE`, `DEGRADED_RF2`, ..) and each
 /// copy's pinned role (regular or shadow) go once `NodeStatus` carries them (M10 S2, W5): a `?`
 /// says this build does not report them yet, so a walk reads it as no entry, not as nothing.
-fn node_line(node: &NodeStatus) -> String {
+fn node_line(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
     let published = match node.published {
         _ if node.role == "secondary" => String::new(),
         Some((g, s)) => format!(" published={}@{}", s.0, g.0),
@@ -4392,7 +4428,7 @@ fn node_line(node: &NodeStatus) -> String {
         node.recovery.as_deref().unwrap_or("-"),
         node.recovered
             .map_or_else(|| "-".to_owned(), |g| g.0.to_string()),
-        node.role,
+        shown_role(node, owner),
         node.protection.as_deref().unwrap_or("inert"),
         node.admits
             .map_or_else(|| "-".to_owned(), |a| a.to_string()),
@@ -5058,6 +5094,50 @@ mod tests {
         assert!(!rejoined(&owner, |_| Some(BootId(base))));
         // The owner itself restarted: never dropped.
         assert!(!rejoined(&owner, |_| Some(BootId(base + 1))));
+    }
+
+    /// Bug bash #65 walk (tester, #65 thumbs-up): after `admin promote 2` the `nodes` line still
+    /// read `role=primary` for node 1 at gen=1, which serves as a secondary. A primary that the
+    /// owner read outranks shows the role the owner pins it as, and says it is stale; the owner,
+    /// and a primary that ties it, keep their own word.
+    #[test]
+    fn nodes_marks_a_primary_the_promote_moved_from_as_stale() {
+        use rdb_core::contracts::ids::ReplicaRole;
+        use rdb_core::contracts::membership::{CopyId, Member};
+        let holds = |generation| {
+            Some(rdb_api::host::Holding {
+                generation: Generation(generation),
+                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                applied: 1,
+                durable: 1,
+            })
+        };
+        let mut old = owner(None, false);
+        old.holds = holds(1);
+        let mut new = owner(None, true);
+        new.node = NodeId(2);
+        new.holds = holds(2);
+        new.pinned = vec![Member {
+            copy: CopyId(0),
+            node: NodeId(1),
+            boot: rdb_api::host::BOOT,
+            role: ReplicaRole::RegularSecondary,
+        }];
+        let nodes = [old.clone(), new.clone()];
+        let owner_read = owner_status(&nodes);
+        assert!(
+            node_line(&old, owner_read).contains(
+                " role=secondary (stale: says primary at gen=1; node 2 owns partition 1 at \
+                 gen=2) "
+            ),
+            "{}",
+            node_line(&old, owner_read)
+        );
+        assert!(node_line(&new, owner_read).contains(" role=primary l1="));
+        // Mid-promote, before node 2 holds the newer generation: neither is called stale.
+        new.holds = holds(1);
+        assert!(node_line(&new, Some(&old)).contains(" role=primary l1="));
+        assert!(node_line(&old, Some(&new)).contains(" role=primary l1="));
     }
 
     /// Bug bash #65 walk A: after `admin promote 2`, node 1 still said `primary` with a fenced
