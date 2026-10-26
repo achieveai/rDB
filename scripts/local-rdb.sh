@@ -586,11 +586,17 @@ move_aside() {
 # stopped and rdb_dev checks the fence, read after the stop: the owner's live pin does not name N
 # in any role and partitions/1 leaves it out (A-R441 F2). Only then is N's folder moved aside,
 # never deleted. A refused fence, or a failed move, starts N again on its own folder and exits 1.
+# Each phase prints a numbered line before it starts, so a 15 s rebuild is never silent.
 rebuild() {
-    local n="$ARG" aside
+    local n="$ARG" aside steps=4 step=0
+    if [ "$WIPE" = 1 ]; then steps=5; fi
+    phase() { step=$((step + 1)); say "rebuild $n: step $step/$steps: $*"; }
+    phase "asking the owner whether node $n may be rebuilt (rdb_dev connects to every node first; a few seconds)"
     admin_line "admin rebuild $n" || die "rebuild $n refused; node $n was not touched"
-    stop_node "$n"
+    phase "stopping node $n (a clean stop; a hard kill after 15 s)"
+    stop_node "$n" say
     if [ "$WIPE" = 1 ]; then
+        phase "checking with the owner that node $n is fenced out, then moving its folder aside (a few seconds)"
         if ! admin_line "admin rebuild $n --wipe --fence"; then
             start_node "$n" stopped; await_ready "$n" || not_ready "$n"
             die "rebuild $n refused; its folder is left in place and it runs on it again"
@@ -600,7 +606,10 @@ rebuild() {
             die "node $n's folder could not be moved aside; the folder is left in place and it runs on it again"
         fi
     fi
-    start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+    phase "starting node $n"
+    start_node "$n" stopped
+    phase "waiting for node $n to say ready (up to ${TIMEOUT_SEC}s)"
+    await_ready "$n" || not_ready "$n"
     say "node $n restarted; the owner takes it back as a shadow, then regular (\`status\` shows it)"
 }
 
