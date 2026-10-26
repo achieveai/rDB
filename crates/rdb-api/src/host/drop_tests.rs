@@ -242,9 +242,22 @@ fn m10_s2_b2_with_two_copies_the_owner_never_drops_to_one() {
     tracing::info!(unknown, "b2_puts_unknown_after_node_2_died");
 }
 
+/// When node 1 started counting node 3 unreachable (#67's clock), stepping until it has.
+fn three_unreachable_since(trio: &mut Trio) -> Tick {
+    trio.until("node 1 counts node 3 unreachable", |trio| {
+        trio.nodes[0]
+            .0
+            .unreachable
+            .get(&(PartitionId(1), NodeId(3)))
+            .map(|count| count.since)
+    })
+}
+
 /// b3 (A-R281 M1 flapping): node 3's links are held three times, each time long enough for L1
-/// to pause writes but healed after half the drop clock. An admit starts the clock again, so
-/// no flap drops it. Held past the clock, it is dropped exactly once, and writes resume.
+/// to pause writes but healed 6/10 of the drop clock after node 1 starts counting node 3
+/// unreachable (#67), the earlier of the two clocks. A heal or an admit starts each clock
+/// again, so no flap drops it. Held past the clock, it is dropped exactly once, and writes
+/// resume.
 /// Cut: `drop_duty` keeps the blame while L1 admits, red (a flap drops node 3).
 /// Integration (~7 s): three flaps, then b1's drop.
 #[config_log::retcd_test]
@@ -256,8 +269,19 @@ fn m10_s2_b3_a_flapping_copy_is_dropped_once_and_only_when_down_past_the_clock()
     let mut request = 1;
     for _ in 0..3 {
         hold_three(&trio);
+        // The unreachable clock starts at the hold, the paused clock ~400 ms later at the
+        // pause. Healing a fixed time after the pause left the first clock only its start
+        // lag as margin (8 ms on 2026-10-26, dropped at 1,001 ms), so heal against its start.
+        let since = three_unreachable_since(&mut trio);
         (request, _) = put_until_paused(&mut trio, request);
-        pass(&mut trio, DROP_AFTER_MILLIS * 6 / 10);
+        let heal_at = since.plus_millis(DROP_AFTER_MILLIS * 6 / 10);
+        trio.until("host time to pass the heal", |trio| {
+            (trio.clock.now() >= heal_at).then_some(())
+        });
+        assert!(
+            trio.clock.now() < since.plus_millis(DROP_AFTER_MILLIS),
+            "the harness healed past node 3's unreachable clock, not a flap"
+        );
         trio.links.heal_all();
         trio.ready();
     }

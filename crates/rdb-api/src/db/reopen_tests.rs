@@ -4761,6 +4761,33 @@ mod guide_did_it_land {
         let landed = did_it_land(&app, saved)
             .unwrap_or_else(|error| panic!("never an Err after a generation change: {error}"));
         assert_eq!(landed, Landed::Yes, "z landed across the restarts");
+        // Node 3 came back as a shadow, and the owner re-plans it regular once it caught up:
+        // a commit of its own, fenced while it runs, so a read inside it is refused
+        // `LEASE_EXPIRED` (gate run 2026-10-26). Wait for it to finish before reading.
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+        loop {
+            let owner = nodes
+                .node_status()
+                .into_iter()
+                .find(|status| status.node == NodeId(1))
+                .expect("node 1 answers a look");
+            let three_regular = owner.pinned.iter().any(|member| {
+                member.node == NodeId(3)
+                    && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+            });
+            if three_regular && owner.fence.is_none() && owner.admits == Some(true) {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "node 3 never re-planned regular, or node 1 never served after: pinned {:?}, \
+                 fence {:?}, admits {:?}",
+                owner.pinned,
+                owner.fence,
+                owner.admits
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let (_, value) = nodes.get(b"z").expect("get z").value.expect("z is there");
         assert_eq!(value.as_ref(), b"1");
         app.shutdown();
