@@ -383,25 +383,41 @@ fn m10_s2_b7_a_linked_copy_that_stalls_is_dropped() {
 /// run, then healed. Node 3 catches up while L1's resume hold, longer than what was left of
 /// the clock, keeps writes refused. Its durable sequence advancing starts the clock again, so
 /// it is not dropped, and writes resume with all three.
+/// Re-timed for #67 (A-R435): node 3 is unreachable from the hold on, before the pause, so the
+/// row runs a 2 s clock and heals at 60% of it. Node 3 is then heard about 400 ms before its
+/// unreachable count would reach the clock, and only the paused clock is left to pin.
 /// Cut: the clock from the last admit only (`Blame::next` keeps `since` whatever the copy and
 /// its durable sequence), red (node 3 dropped during the resume hold). Comparing the copy alone
 /// stays green here: once node 3 is heard, keepalives move `stalest_copy` between nodes 2 and
 /// 3, and each move starts the clock again. The durable rule is pinned by
 /// [`m10_s2_b8_the_clock_starts_again_while_the_blamed_copy_advances`].
-/// Integration (~3 s): bootstrap's window, the hold, the resume hold.
+/// Integration (~4 s): bootstrap's window, the hold, the resume hold.
 #[config_log::retcd_test]
 fn m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped() {
     const METHOD: &str = "m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped";
+    const CLOCK: u64 = 2 * DROP_AFTER_MILLIS;
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, before) = started(dir.path(), |host| {
         tuned(host);
-        host.budgets.resume_hold_millis = DROP_AFTER_MILLIS * 6 / 10;
+        host.peer_drop_after_millis = CLOCK;
+        host.budgets.resume_hold_millis = CLOCK * 6 / 10;
     });
+    let held = trio.clock.now();
     hold_three(&trio);
     let (request, _) = put_until_paused(&mut trio, 1);
-    pass(&mut trio, DROP_AFTER_MILLIS * 8 / 10);
+    let paused = trio.clock.now();
+    pass(&mut trio, CLOCK * 6 / 10);
+    let healed = trio.clock.now();
     trio.links.heal_all();
     trio.ready();
+    let resumed = trio.clock.now();
+    // A-R438: past the paused clock, and short of the unreachable one. Both bounds lean against
+    // the row: `paused` is read after L1 paused, and the count starts at a check after the hold.
+    let unreachable_ms = HostClock::millis_until(held, healed);
+    let paused_ms = HostClock::millis_until(paused, resumed);
+    tracing::info!(unreachable_ms, paused_ms, clock = CLOCK, "b8_clocks");
+    assert!(unreachable_ms < CLOCK, "{unreachable_ms} ms unreachable");
+    assert!(paused_ms > CLOCK, "writes paused {paused_ms} ms only");
     assert_eq!(
         logged!(METHOD, "membership_drop_planned").len(),
         0,
@@ -1346,30 +1362,13 @@ struct TwoDown {
 /// on node 1 only, writes stop, and the owner drops one of them: the next generation keeps
 /// node 1 and the other, and commits `ReadOnly`, since that one never answers.
 fn two_down(dir: &std::path::Path) -> TwoDown {
-    let (mut trio, before) = started(dir, tuned);
-    let mut request = 1;
-    for _ in 0..3 {
-        match trio.ask(put(request)) {
-            Answer::Txn { .. } => request += 1,
-            other => panic!("put {request} with all three up: {other:?}"),
-        }
-    }
-    let three = trio.nodes.remove(2);
-    let two = trio.nodes.remove(1);
-    loop {
-        let answer = trio.ask(put_within(request, DROP_AFTER_MILLIS));
-        request += 1;
-        match answer {
-            // The first waits for an ack that never comes. Then L1 pauses, or the grant
-            // lapses around the drop's fence, as the real walk saw (tester-s2 D8).
-            Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {}
-            Answer::Error { error, .. } => {
-                tracing::info!(name = error.name(), "d8_put_refused_with_two_down");
-                break;
-            }
-            other => panic!("put {} with two down: {other:?}", request - 1),
-        }
-    }
+    let BothDown {
+        mut trio,
+        before,
+        two,
+        three,
+        request,
+    } = both_down(dir, DROP_AFTER_MILLIS, tuned);
     let (dropped, mode, members) = trio.until("node 1 drops a copy", |trio| {
         commit_of(trio).filter(|(_, _, members)| members.len() == 2)
     });
@@ -1394,10 +1393,73 @@ fn two_down(dir: &std::path::Path) -> TwoDown {
     }
 }
 
+/// [`both_down`]'s trio, with the two stopped nodes.
+struct BothDown {
+    trio: Trio,
+    /// The bootstrap's generation.
+    before: Generation,
+    two: Dead,
+    three: Dead,
+    /// The next request id.
+    request: u64,
+}
+
+/// Puts land on all three, then nodes 2 and 3 stop ([`Dead`]): their links to node 1 are held,
+/// so node 1 counts them unreachable (#67), and puts are refused. Each put waits
+/// `deadline_millis` for its acks. The
+/// owner's drop clock is running; nothing is planned yet.
+fn both_down(dir: &std::path::Path, deadline_millis: u64, tune: impl Fn(&mut Host)) -> BothDown {
+    let (mut trio, before) = started(dir, tune);
+    let mut request = 1;
+    for _ in 0..3 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => request += 1,
+            other => panic!("put {request} with all three up: {other:?}"),
+        }
+    }
+    let three = trio.nodes.remove(2);
+    let two = trio.nodes.remove(1);
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.hold(NodeId(1), NodeId(3));
+    loop {
+        let answer = trio.ask(put_within(request, deadline_millis));
+        request += 1;
+        match answer {
+            // The first waits for an ack that never comes. Then L1 pauses, or the grant
+            // lapses around the drop's fence, as the real walk saw (tester-s2 D8).
+            Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {}
+            Answer::Error { error, .. } => {
+                tracing::info!(name = error.name(), "d8_put_refused_with_two_down");
+                break;
+            }
+            other => panic!("put {} with two down: {other:?}", request - 1),
+        }
+    }
+    BothDown {
+        trio,
+        before,
+        two,
+        three,
+        request,
+    }
+}
+
 /// The kept member starts again, as `Db::restart_node` restarts a node: a new host opens its
 /// directory at the next boot and takes the mail that waited, in order, and node 1 hears the
 /// new boot. Returns when.
-fn restart_dead(trio: &mut Trio, ((host, tx, rx), node): (Dead, u32)) -> Tick {
+fn restart_dead(trio: &mut Trio, dead: (Dead, u32)) -> Tick {
+    let node = NodeId(dead.1);
+    let reboot = restart_dead_unheard(trio, dead);
+    trio.nodes[0]
+        .1
+        .send(Msg::PeerBooted { node, boot: reboot })
+        .expect("node 1 up");
+    trio.clock.now()
+}
+
+/// [`restart_dead`] before node 1 hears `PeerBooted`: the new host is up and its link reports
+/// the new boot, which it returns.
+fn restart_dead_unheard(trio: &mut Trio, ((host, tx, rx), node): (Dead, u32)) -> BootId {
     let node = NodeId(node);
     let boot = host.boot;
     let reboot = BootId(boot.0 + 1);
@@ -1410,12 +1472,9 @@ fn restart_dead(trio: &mut Trio, ((host, tx, rx), node): (Dead, u32)) -> Tick {
     host.boot = reboot;
     tuned(&mut host);
     trio.links.register(node, tx.clone(), reboot);
+    trio.links.heal(NodeId(1), node);
     trio.nodes.push((host, tx, rx));
-    trio.nodes[0]
-        .1
-        .send(Msg::PeerBooted { node, boot: reboot })
-        .expect("node 1 up");
-    trio.clock.now()
+    reboot
 }
 
 /// D8's second half: after `dropped`, node 1 commits `DegradedRf2` with itself and node `kept`
@@ -1481,6 +1540,9 @@ fn m10_s2_d8_two_down_return_commits_rf2_and_writes_land() {
     const METHOD: &str = "m10_s2_d8_two_down_return_commits_rf2_and_writes_land";
     let dir = config_testkit::fs::temp_dir();
     let mut down = two_down(dir.path());
+    // #67 G5 (A-R435): with both down, no member the drop keeps is linked, so the paused clock
+    // decides. Cut: `unreachable_past_clock` without its linked check, red (`unreachable`).
+    paused_clock_dropped(METHOD);
     // Fix 3 (A-R337 item 3): the ReadOnly commit set up no rebuild, and its stall line says
     // so instead of "never pinned". Asked for directly, as host/tests.rs asks for M27's.
     // Cut: `unpinned_cause` always "never pinned", red.
@@ -1526,10 +1588,14 @@ fn m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy() {
     const METHOD: &str = "m10_s2_d8_a_late_inventory_failed_does_not_drop_the_copy";
     let dir = config_testkit::fs::temp_dir();
     let mut down = two_down(dir.path());
+    // #67 G5 (A-R435): with both down, no member the drop keeps is linked, so the paused clock
+    // decides. Cut: `unreachable_past_clock` without its linked check, red (`unreachable`).
+    paused_clock_dropped(METHOD);
     let kept = down.kept.1;
     let copy = copy_of(&down.trio, kept);
-    down.trio.links.hold(NodeId(1), NodeId(kept));
     let returned = restart_dead(&mut down.trio, down.kept);
+    // After the restart, which heals the hold [`both_down`] set: held from here on.
+    down.trio.links.hold(NodeId(1), NodeId(kept));
     let dropped = down.dropped;
     down.trio.until("node 1 plans the rejoin", |trio| {
         let plan = trio.nodes[0].0.plans.get(&PartitionId(1))?;
@@ -2630,15 +2696,18 @@ fn m10_s2_adv2_a_restart_beside_an_unlinked_member_is_not_shadowed() {
 /// that has proved nothing is never counted, and the drop clock leaves it out (b7): nodes 1
 /// and 2, `DegradedRf2`.
 /// Cut: `restart_shadowed` returns `None`, red (node 3 is never pinned a shadow).
-/// Integration (~20 s): bootstrap's window, the restart's re-plan, the promote's barrier retries
-/// until F1 gives node 3 up (~14 s since #69: node 3 answered the inventory), the drop clock
-/// while held.
+/// Integration (~5 s): bootstrap's window, the shadow's catch-up one record a step (~1.5 s), the
+/// promote's barrier at the test window (7 windows), the drop clock and its margin while held
+/// (~1.4 s, what the row asserts). At the spec's 2 s window the barrier alone was 14 s.
 #[config_log::retcd_test]
 fn m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two() {
     const METHOD: &str =
         "m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two";
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, _) = started(dir.path(), tuned);
+    // F1 counts its deadlines here: the barrier's three attempts are 7 windows, 14 s at the
+    // spec's 2 s, so the row runs the test window from the bootstrap commit on.
+    trio.short_window_after_commit();
     for request in 1..=20 {
         match trio.ask(put(request)) {
             Answer::Txn { .. } => {}
@@ -2826,4 +2895,398 @@ fn m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up() {
         promotes[0]["acked"].as_u64() >= promotes[0]["cutoff"].as_u64(),
         "promoted below the cutoff: {promotes:?}"
     );
+}
+
+/// #67 Wait 2: [`both_down`], then node 1 plans the drop of one stopped node and keeps the
+/// other at the boot it had. Returns while that plan is `Planned` (F1 still collecting), with
+/// the kept node, the plan's generation and `since`.
+struct DropPlanned {
+    trio: Trio,
+    kept: (Dead, u32),
+    _gone: Dead,
+    planned: Generation,
+    since: Tick,
+    request: u64,
+}
+
+fn drop_planned(dir: &std::path::Path) -> DropPlanned {
+    let BothDown {
+        mut trio,
+        two,
+        three,
+        request,
+        ..
+    } = both_down(dir, DROP_AFTER_MILLIS, tuned);
+    let (planned, since, dropped) = trio.until("node 1 plans a drop", |trio| {
+        match trio.nodes[0].0.rejoins.get(&PartitionId(1)) {
+            Some(Rejoin::Planned { generation, replan }) => {
+                replan.drop.map(|node| (*generation, replan.since, node.0))
+            }
+            _ => None,
+        }
+    });
+    let (kept, gone) = match dropped {
+        3 => ((two, 2), three),
+        2 => ((three, 3), two),
+        other => panic!("the plan drops node {other}"),
+    };
+    DropPlanned {
+        trio,
+        kept,
+        _gone: gone,
+        planned,
+        since,
+        request,
+    }
+}
+
+/// Node 1's commit after the drop plan: the kept node at its new boot, and a put lands there.
+fn kept_rejoined(trio: &mut Trio, kept: u32, reboot: BootId, request: u64) {
+    let (generation, members) =
+        until_through_blocks(trio, "node 1 commits with the kept node", |trio| {
+            let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+            let members = &committed.committed.pinned_config.members;
+            members
+                .iter()
+                .any(|member| member.node == NodeId(kept) && member.boot == reboot)
+                .then(|| {
+                    (
+                        committed.new_generation,
+                        members
+                            .iter()
+                            .map(|member| member.node.0)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+        });
+    assert_eq!(members, vec![1, kept], "at {generation:?}");
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert!(result.generation >= generation, "{result:?}"),
+        other => panic!("a put after the kept node rejoined: {other:?}"),
+    }
+}
+
+/// #67 Wait 2 (A-R433, A-R434), boot BEFORE the block, as the walk saw it (o32 run 4): node 1
+/// plans the drop of one stopped node, pinning the other at its old boot. That one restarts,
+/// and node 1 hears `PeerBooted` while the plan is still collecting, before its new process
+/// answers and F1 blocks (`barrier_boot_changed`). The boot is marked against the plan, and
+/// the drop check that finds F1 blocked on it re-plans at once: no `rejoin_retry`, which
+/// would wait `peer_drop_after_millis`.
+/// Cut: `replan_on_boot` ignores the mark, red (`rejoin_retry` after the clock, no
+/// `rejoin_replan_on_boot`).
+/// Integration (~4 s): bootstrap, the drop clock, two re-plans.
+#[config_log::retcd_test]
+fn m10_bb_67_a_restart_heard_before_its_plan_blocks_replans_at_once() {
+    const METHOD: &str = "m10_bb_67_a_restart_heard_before_its_plan_blocks_replans_at_once";
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        planned,
+        request,
+        ..
+    } = drop_planned(dir.path());
+    let node = kept.1;
+    let rebooted = restart_dead(&mut trio, kept);
+    let reboot = trio.links.boot_of(NodeId(node)).expect("registered");
+    kept_rejoined(&mut trio, node, reboot, request);
+
+    let marked = logged!(METHOD, "rejoin_boot_marked");
+    assert!(
+        marked
+            .iter()
+            .any(|line| line["member"] == node && line["generation"] == planned.0),
+        "{marked:?}"
+    );
+    let replans = logged!(METHOD, "rejoin_replan_on_boot");
+    assert_eq!(replans.len(), 1, "{replans:?}");
+    assert_eq!(replans[0]["member"], node);
+    assert_eq!(replans[0]["generation"], planned.0);
+    let retries = logged!(METHOD, "rejoin_retry");
+    assert!(retries.is_empty(), "waited for the retry: {retries:?}");
+    tracing::info!(
+        ms = HostClock::millis_until(rebooted, trio.clock.now()),
+        "m10_bb_67_boot_to_commit_ms"
+    );
+}
+
+/// #67 Wait 2 (A-R433), boot AFTER the block: as above, but node 1 hears `PeerBooted` only once
+/// F1 is blocked on the plan. `rejoin_if_stale` re-plans then and there, with no mark.
+/// Cut: `boot_while_planned` always marks, red (`rejoin_boot_marked`; the re-plan waits for
+/// the next drop check instead).
+/// Integration (~4 s): as above.
+#[config_log::retcd_test]
+fn m10_bb_67_a_restart_heard_after_its_plan_blocks_replans_at_once() {
+    const METHOD: &str = "m10_bb_67_a_restart_heard_after_its_plan_blocks_replans_at_once";
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        planned,
+        request,
+        ..
+    } = drop_planned(dir.path());
+    let node = kept.1;
+    let reboot = restart_dead_unheard(&mut trio, kept);
+    until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        trio.nodes[0].0.f1_blocked(PartitionId(1)).then_some(())
+    });
+    trio.nodes[0]
+        .1
+        .send(Msg::PeerBooted {
+            node: NodeId(node),
+            boot: reboot,
+        })
+        .expect("node 1 up");
+    kept_rejoined(&mut trio, node, reboot, request);
+
+    assert!(logged!(METHOD, "rejoin_boot_marked").is_empty());
+    let replans = logged!(METHOD, "rejoin_replan_on_boot");
+    assert_eq!(replans.len(), 1, "{replans:?}");
+    assert_eq!(replans[0]["member"], node);
+    assert_eq!(replans[0]["generation"], planned.0);
+    assert!(logged!(METHOD, "rejoin_retry").is_empty());
+}
+
+/// #67 Wait 2 (A-R434 condition 1): a mark left from another plan never re-plans. F1 is blocked
+/// as above and node 1 never hears the boot; a mark for the same generation but an older
+/// `since` (a plan since retried) is dropped at the next drop check, and the block waits for
+/// `retry_blocked_rejoin` as before.
+/// Cut: `replan_on_boot` compares the generation only, red (`rejoin_replan_on_boot`).
+/// Integration (~4 s): as above, plus one drop clock for the retry.
+#[config_log::retcd_test]
+fn m10_bb_67_a_boot_mark_from_another_plan_does_not_replan() {
+    const METHOD: &str = "m10_bb_67_a_boot_mark_from_another_plan_does_not_replan";
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        planned,
+        since,
+        ..
+    } = drop_planned(dir.path());
+    let node = kept.1;
+    restart_dead_unheard(&mut trio, kept);
+    until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        trio.nodes[0].0.f1_blocked(PartitionId(1)).then_some(())
+    });
+    trio.nodes[0].0.boot_seen_while_planned.insert(
+        PartitionId(1),
+        BootMark {
+            generation: planned,
+            since: Tick(since.0.saturating_sub(1)),
+            member: NodeId(node),
+        },
+    );
+    until_through_blocks(&mut trio, "node 1 sends the plan again", |trio| {
+        let same = matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Planned { replan, .. }) if replan.since == since
+        );
+        (!same).then_some(())
+    });
+    assert_eq!(logged!(METHOD, "rejoin_retry").len(), 1);
+    let dropped = logged!(METHOD, "rejoin_boot_mark_dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert!(logged!(METHOD, "rejoin_replan_on_boot").is_empty());
+}
+
+/// d8's drop (#67 G5): exactly one `membership_drop_planned`, on the paused clock.
+fn paused_clock_dropped(method: &str) {
+    let planned: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "membership_drop_planned")
+        .collect();
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["clock"], "paused", "{planned:?}");
+}
+
+/// The `membership_drop_planned` lines of `method`.
+fn drops_planned(method: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "membership_drop_planned")
+        .collect()
+}
+
+/// #67 r1 (A-R435): nodes 2 and 3 stop; node `back` starts again at once and the other stays
+/// down. `back`'s rejoin commits keeping the other at its old boot, and the other has been
+/// unreachable for the drop clock by then, so it is dropped on the unreachable clock at the
+/// first check that finds writes paused, not a whole paused clock after the rejoin's commit.
+/// The partition commits `DegradedRf2` with nodes 1 and `back`, and a put lands.
+fn one_back(method: &str, back: u32) {
+    let dir = config_testkit::fs::temp_dir();
+    let BothDown {
+        mut trio,
+        two,
+        three,
+        request,
+        ..
+    } = both_down(dir.path(), 100, tuned);
+    let (returning, _gone) = match back {
+        2 => ((two, 2), three),
+        3 => ((three, 3), two),
+        other => panic!("node {other} is not down"),
+    };
+    let stays = 5 - back;
+    let returned = restart_dead(&mut trio, returning);
+    let (after, mode) = until_through_blocks(&mut trio, "node 1 commits with node back", |trio| {
+        commit_of(trio)
+            .filter(|(_, _, members)| *members == vec![1, back])
+            .map(|(generation, mode, _)| (generation, mode))
+    });
+    let waited = HostClock::millis_until(returned, trio.clock.now());
+    tracing::info!(waited, back, "m10_bb_67_r1_back_to_rf2_ms");
+    assert_eq!(mode, PartitionMode::DegradedRf2);
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+        other => panic!("a put after node {stays} was dropped: {other:?}"),
+    }
+    let planned = drops_planned(method);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["dropped"], stays, "{planned:?}");
+    assert_eq!(planned[0]["clock"], "unreachable", "{planned:?}");
+    // The count began before node `back` came back: neither its rejoin nor that commit
+    // started it again (G6).
+    let since = planned[0]["unreachable_since"]
+        .as_str()
+        .and_then(|text| {
+            text.strip_prefix("Some(")?
+                .strip_suffix(')')?
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no unreachable_since: {planned:?}"));
+    assert!(
+        since < returned.0,
+        "node {stays} counted from {since}, after node {back} came back at {}",
+        returned.0
+    );
+    let rejoin = logged!(method, "rejoin_plan");
+    assert!(
+        rejoin.iter().any(|plan| plan["dropped"] == "None"),
+        "node {back} rejoined before the drop: {rejoin:?}"
+    );
+}
+
+/// #67 r1, node 2 back. Cuts: `count_unreachable` forgets every count while a rejoin runs,
+/// red (`unreachable_since` after the return); G4 off (the unreachable path drops the paused
+/// clock's blamed copy), red here (node 2, the rejoiner, is dropped), green with node 3 back.
+/// Integration (~4 s): bootstrap, the pause, a rejoin, the drop.
+#[config_log::retcd_test]
+fn m10_bb_67_r1_node_2_back_node_3_dropped_on_the_unreachable_clock() {
+    one_back(
+        "m10_bb_67_r1_node_2_back_node_3_dropped_on_the_unreachable_clock",
+        2,
+    );
+}
+
+/// #67 r1, node 3 back. Cut: the rejoin cut above, red.
+/// Integration (~4 s): as above.
+#[config_log::retcd_test]
+fn m10_bb_67_r1_node_3_back_node_2_dropped_on_the_unreachable_clock() {
+    one_back(
+        "m10_bb_67_r1_node_3_back_node_2_dropped_on_the_unreachable_clock",
+        3,
+    );
+}
+
+/// #67 r2 (A-R435 G2): nodes 2 and 3 stop. Node 2 starts again at once; node 3 starts once
+/// it has been unreachable for the drop clock, while node 2's rejoin still runs, so no paused
+/// check has come between. A member linked again is no longer counted, so nobody is dropped:
+/// node 1 ends committed with all three, node 3 at its new boot.
+/// No cut turns this row red: node 3's rejoin takes it in, and writes resume with no paused
+/// check while it is linked, so a count kept after the link (cut tried: `count_unreachable`
+/// keeps a count once started) never reaches a drop here. That half of G2 is pinned by r3,
+/// b8 and the b8 sibling (the link) and r1 node 2 back (a count kept across a restart).
+/// Integration (~5 s): bootstrap, the pause, the rejoins.
+#[config_log::retcd_test]
+fn m10_bb_67_r2_a_member_back_before_its_clock_is_not_dropped() {
+    const METHOD: &str = "m10_bb_67_r2_a_member_back_before_its_clock_is_not_dropped";
+    let dir = config_testkit::fs::temp_dir();
+    let BothDown {
+        mut trio,
+        two,
+        three,
+        request,
+        ..
+    } = both_down(dir.path(), 100, tuned);
+    restart_dead(&mut trio, (two, 2));
+    until_through_blocks(&mut trio, "node 3 unreachable for the clock", |trio| {
+        let host = &trio.nodes[0].0;
+        let count = host.unreachable.get(&(PartitionId(1), NodeId(3)))?;
+        (HostClock::millis_until(count.since, trio.clock.now()) >= DROP_AFTER_MILLIS).then_some(())
+    });
+    assert!(
+        trio.nodes[0].0.rejoins.contains_key(&PartitionId(1)),
+        "node 2's rejoin ended before node 3 was past the clock: {:?}",
+        commit_of(&trio)
+    );
+    restart_dead(&mut trio, (three, 3));
+    let reboot = trio.links.boot_of(NodeId(3)).expect("registered");
+    until_through_blocks(&mut trio, "node 1 commits all three", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+        let members = &committed.committed.pinned_config.members;
+        (members.len() == 3
+            && members
+                .iter()
+                .any(|member| member.node == NodeId(3) && member.boot == reboot))
+        .then_some(())
+    });
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { .. } => {}
+        other => panic!("a put with all three back: {other:?}"),
+    }
+    let planned = drops_planned(METHOD);
+    assert!(planned.is_empty(), "{planned:?}");
+}
+
+/// #67 r3 (A-R435 G1): a half-open member, whose frames to nodes 1 and 2 are lost while it
+/// still hears them, is linked, so it is never counted unreachable. It acks nothing, so the
+/// paused clock drops it, as b7 drops a held one.
+/// Cut: `count_unreachable` counts a member that has not acked as unreachable, here by
+/// treating every member as unlinked, red (`clock=unreachable`).
+/// Integration (~3 s): bootstrap, the pause, the drop.
+#[config_log::retcd_test]
+fn m10_bb_67_r3_a_half_open_member_is_dropped_on_the_paused_clock_only() {
+    const METHOD: &str = "m10_bb_67_r3_a_half_open_member_is_dropped_on_the_paused_clock_only";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.links.drop_direction(NodeId(3), NodeId(1));
+    trio.links.drop_direction(NodeId(3), NodeId(2));
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    let planned = drops_planned(METHOD);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["clock"], "paused", "{planned:?}");
+    assert_eq!(planned[0]["unreachable_ms"], "None", "{planned:?}");
+    assert!(logged!(METHOD, "member_unreachable").is_empty());
+}
+
+/// #67 (A-R438 condition 3): b8 at its timing before A-R435. Node 3 is held from before the
+/// pause through 80% of the paused clock, so it is unreachable for the whole clock while writes
+/// are paused, and it is dropped on the unreachable clock, before its catch-up could count.
+/// Cut: no unreachable clock in `drop_duty`, red (no drop: b8's old outcome).
+/// Integration (~3 s): bootstrap, the hold, the drop.
+#[config_log::retcd_test]
+fn m10_bb_67_b8_at_its_old_timing_drops_on_the_unreachable_clock() {
+    const METHOD: &str = "m10_bb_67_b8_at_its_old_timing_drops_on_the_unreachable_clock";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), |host| {
+        tuned(host);
+        host.budgets.resume_hold_millis = DROP_AFTER_MILLIS * 6 / 10;
+    });
+    hold_three(&trio);
+    put_until_paused(&mut trio, 1);
+    pass(&mut trio, DROP_AFTER_MILLIS * 8 / 10);
+    trio.links.heal_all();
+    dropped_three(&mut trio, before);
+    let planned = drops_planned(METHOD);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["clock"], "unreachable", "{planned:?}");
+    let unreachable_ms = planned[0]["unreachable_ms"].as_str().unwrap_or_default();
+    assert!(unreachable_ms.starts_with("Some("), "{planned:?}");
 }

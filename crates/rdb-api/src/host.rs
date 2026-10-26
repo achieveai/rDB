@@ -203,11 +203,14 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
 /// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
-/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282). The clock
-/// starts at the later of the last admit and the last membership commit, and starts again
-/// whenever the blamed copy changes or its durable sequence advances, so a copy still catching
-/// up is never dropped. Longer than a process restart (2-5 s), which rejoins by `PeerBooted`
-/// instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
+/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282). Two clocks
+/// share it (the host's drop duty). A reachable copy's clock starts at the later of the last
+/// admit and the last membership commit, and starts again whenever the blamed copy changes or
+/// its durable sequence advances, so a copy still catching up is never dropped. A member the
+/// owner has had no link to counts from the first check that found it unreachable, through
+/// rejoins and commits, until it links again or reports another boot (#67, A-R435). Either
+/// drops only while writes are paused. Longer than a process restart (2-5 s), which rejoins by
+/// `PeerBooted` instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
 pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
 
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
@@ -1189,6 +1192,42 @@ struct Replan {
 /// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
 const REJOIN: CorrelationId = CorrelationId(3);
 
+/// #67 (A-R435): since when the owner has had no link to a member, and the boot its link
+/// reported then. Another boot starts the count again.
+#[derive(Debug, Clone, Copy)]
+struct Unreachable {
+    since: Tick,
+    boot: Option<BootId>,
+}
+
+/// Which clock planned a drop ([`Host::drop_duty`]), logged as `clock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropClock {
+    /// The member had no link for `peer_drop_after_millis` (#67, A-R435).
+    Unreachable,
+    /// L1 refused writes on account of the copy for `peer_drop_after_millis` (A-R281).
+    Paused,
+}
+
+impl DropClock {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+/// #67 (A-R434): a member that restarted while a re-plan was planned, and the plan it was seen
+/// under. The plan is named by its generation and its `since`, since a retried plan keeps the
+/// generation and gets a new `since`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootMark {
+    generation: Generation,
+    since: Tick,
+    member: NodeId,
+}
+
 /// The copy the owner holds responsible for L1 refusing writes, and since when (M10 S2 part (b)).
 #[derive(Debug, Clone, Copy)]
 struct Blame {
@@ -1923,6 +1962,18 @@ struct Host {
     /// generation they are for: replaced at each step that names any (A-R426 M8). Unlike
     /// [`RebuildWatch::unproven`], a copy that has since proved is no longer in it.
     latest_stall: BTreeMap<PartitionId, (Generation, BTreeSet<CopyId>)>,
+    /// #67 (A-R433, A-R434): per partition, a member that restarted while its re-plan was
+    /// planned and not yet `Blocked`, keyed on that plan (its generation and `since`). The next
+    /// drop check that finds F1 blocked on that same plan re-plans at once
+    /// ([`Self::replan_on_boot`]); a mark for any other plan is dropped unused.
+    boot_seen_while_planned: BTreeMap<PartitionId, BootMark>,
+    /// #67 (A-R435): per (partition, pinned regular secondary), since when this owner has had
+    /// no link to it ([`Self::count_unreachable`]).
+    unreachable: BTreeMap<(PartitionId, NodeId), Unreachable>,
+    /// Per partition, the planned re-plan F1 was first seen `Blocked` on by a drop check, and
+    /// when: (generation, the plan's `since`, seen at). `blocked_ms` of `rejoin_replan_on_boot`,
+    /// which is `None` when no drop check saw the block before the re-plan.
+    blocked_seen: BTreeMap<PartitionId, (Generation, Tick, Tick)>,
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
@@ -2069,6 +2120,9 @@ impl Host {
             repair_probes: BTreeMap::new(),
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
+            boot_seen_while_planned: BTreeMap::new(),
+            unreachable: BTreeMap::new(),
+            blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
             restart_shadow: true,
@@ -4645,7 +4699,8 @@ impl Host {
         }
         self.acquire_after_link(result, site);
         self.watch_rebuild(result, partition);
-        // A membership commit restarts the drop clock (A-R282 N1).
+        // A membership commit restarts a reachable copy's drop clock (A-R282 N1); a member
+        // counted unreachable keeps its count ([`Self::count_unreachable`], #67).
         self.blamed.remove(&partition);
         self.rejoin_committed(partition, result.new_generation);
         Ok(())
@@ -4691,7 +4746,9 @@ impl Host {
     /// link reports a newer boot than the commit pinned: ask A1 to revoke the committed epoch,
     /// whose `DrainProof` [`Self::drained`] plans from. `Some(why)` when nothing was started.
     /// A re-plan already running is left alone: one still revoking plans at the live boots,
-    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]).
+    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]),
+    /// unless the plan pinned a member at an older boot than its link now reports
+    /// ([`Self::boot_while_planned`], #67).
     fn rejoin_if_stale(&mut self, partition: PartitionId) -> Option<&'static str> {
         let Some(committed) = self.committed.get(&partition) else {
             return Some("no commit for this partition");
@@ -4721,7 +4778,7 @@ impl Host {
         if stale.is_empty() && readd.is_none() {
             return Some("every member's pinned boot is current");
         }
-        if let Some(rejoin) = self.rejoins.get(&partition) {
+        if let Some(rejoin) = self.rejoins.get(&partition).copied() {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -4730,6 +4787,9 @@ impl Host {
                 readd = ?readd.map(|member| member.node.0),
                 "rejoin_pending"
             );
+            if let Rejoin::Planned { generation, replan } = rejoin {
+                self.boot_while_planned(partition, generation, replan);
+            }
             return None;
         }
         let epoch = committed.selected.root.owner_epoch;
@@ -4748,6 +4808,146 @@ impl Host {
             .or(readd.map(|member| member.node));
         self.revoke(partition, epoch, None, rejoiner);
         None
+    }
+
+    /// #67 Wait 2 (A-R433, A-R434): a member the planned re-plan pinned at an older boot than
+    /// its link reports now has restarted, so F1 cannot complete that plan: the member's new
+    /// process answers with a new boot (`barrier_boot_changed`) and F1 blocks naming nobody to
+    /// leave out, which [`Self::retry_blocked_rejoin`] would only send again after
+    /// `peer_drop_after_millis`. F1 already blocked: re-plan now. Not yet blocked (the boot is
+    /// heard first, as the walk saw): mark the plan, and the drop check that finds F1 blocked
+    /// on that same plan re-plans ([`Self::replan_on_boot`]). A re-plan at the live boots, not
+    /// a drop: the plan's own `drop` and `rejoiner` are kept.
+    fn boot_while_planned(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        replan: Replan,
+    ) {
+        let Some(plan) = self.plans.get(&partition) else {
+            return;
+        };
+        let member = plan
+            .config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .find(|member| {
+                self.links
+                    .boot_of(member.node)
+                    .is_some_and(|live| live > member.boot)
+            })
+            .map(|member| member.node);
+        let Some(member) = member else {
+            return;
+        };
+        let mark = BootMark {
+            generation,
+            since: replan.since,
+            member,
+        };
+        if self.f1_blocked(partition) {
+            self.replan_for_boot(partition, mark, replan, self.clock.now());
+            return;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            member = member.0,
+            "rejoin_boot_marked"
+        );
+        self.boot_seen_while_planned.insert(partition, mark);
+    }
+
+    /// Whether F1's run for `partition` ended `Blocked`.
+    fn f1_blocked(&self, partition: PartitionId) -> bool {
+        self.recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Blocked(_)))
+    }
+
+    /// The drop check's half of [`Self::boot_while_planned`]: a mark for the plan still planned
+    /// re-plans once F1 is blocked on it; a mark for any other plan, or with no plan, goes.
+    /// Also notes when F1 was first seen blocked on the planned re-plan, for `blocked_ms`.
+    fn replan_on_boot(&mut self, partition: PartitionId, now: Tick) {
+        let Some(Rejoin::Planned { generation, replan }) = self.rejoins.get(&partition).copied()
+        else {
+            self.boot_seen_while_planned.remove(&partition);
+            self.blocked_seen.remove(&partition);
+            return;
+        };
+        let blocked = self.f1_blocked(partition);
+        let plan = (generation, replan.since);
+        match self.blocked_seen.get(&partition) {
+            Some(&(seen_generation, seen_since, _))
+                if blocked && (seen_generation, seen_since) == plan => {}
+            _ if blocked => {
+                self.blocked_seen
+                    .insert(partition, (generation, replan.since, now));
+            }
+            _ => {
+                self.blocked_seen.remove(&partition);
+            }
+        }
+        let Some(mark) = self.boot_seen_while_planned.get(&partition).copied() else {
+            return;
+        };
+        if (mark.generation, mark.since) != plan {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                marked = mark.generation.0,
+                planned = generation.0,
+                member = mark.member.0,
+                "rejoin_boot_mark_dropped"
+            );
+            self.boot_seen_while_planned.remove(&partition);
+            return;
+        }
+        if blocked {
+            self.replan_for_boot(partition, mark, replan, now);
+        }
+    }
+
+    /// Send the planned re-plan `mark` names again at once, as [`Self::retry_blocked_rejoin`]
+    /// does after its wait: the same `drop` and `rejoiner`, planned at the live boots.
+    fn replan_for_boot(
+        &mut self,
+        partition: PartitionId,
+        mark: BootMark,
+        replan: Replan,
+        now: Tick,
+    ) {
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let epoch = committed.selected.root.owner_epoch;
+        let blocked_ms = self
+            .blocked_seen
+            .get(&partition)
+            .filter(|&&(generation, since, _)| (generation, since) == (mark.generation, mark.since))
+            .map(|&(_, _, at)| HostClock::millis_until(at, now));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = mark.generation.0,
+            member = mark.member.0,
+            blocked_ms = ?blocked_ms,
+            waited_ms = HostClock::millis_until(replan.since, now),
+            dropped = ?replan.drop.map(|node| node.0),
+            "rejoin_replan_on_boot"
+        );
+        self.boot_seen_while_planned.remove(&partition);
+        self.blocked_seen.remove(&partition);
+        self.start_revoke(
+            partition,
+            epoch,
+            Replan {
+                since: now,
+                ..replan
+            },
+        );
     }
 
     /// A-R329: a member a drop left out of `partition` that started again since, while `config`
@@ -5110,27 +5310,130 @@ impl Host {
         }
     }
 
-    /// M10 S2 part (b): re-plan a partition without the copy L1 has refused its writes on
-    /// account of for `peer_drop_after_millis` (rulings A-R281 M1, A-R282 N1). The clock starts
-    /// again on an admit, a membership commit, a different blamed copy, or that copy's durable
-    /// sequence advancing, so a copy still catching up is never dropped.
+    /// M10 S2 part (b): re-plan a partition without a copy while L1 refuses its writes. Two
+    /// clocks, each `peer_drop_after_millis`, and only while writes are paused now
+    /// ([`Self::holding_up`]):
+    /// - Unreachable (#67, A-R435): a regular secondary this owner has had no link to for the
+    ///   clock ([`Self::count_unreachable`]) goes first, when every member the drop keeps is
+    ///   linked ([`Self::unreachable_past_clock`]). A rejoin or a commit does not restart it.
+    /// - Paused (rulings A-R281 M1, A-R282 N1): a reachable copy's clock, for the copy L1
+    ///   refuses writes on account of. It starts again on an admit, a membership commit, a
+    ///   different blamed copy, or that copy's durable sequence advancing, so a copy still
+    ///   catching up is never dropped.
     fn drop_duty(&mut self, now: Tick) {
         let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
         for partition in partitions {
+            self.replan_on_boot(partition, now);
             self.retry_blocked_rejoin(partition, now);
             self.repair_duty(partition, now);
             self.shadow_duty(partition);
+            // G6: counted before the early return, so it runs through a rejoin.
+            self.count_unreachable(partition, now);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
                 self.blamed.remove(&partition);
                 continue;
             };
+            if let Some((blame, unreachable_ms)) = self.unreachable_past_clock(partition, now) {
+                self.drop_copy(partition, blame, unreachable_ms, DropClock::Unreachable);
+                continue;
+            }
             let blame = Blame::next(self.blamed.get(&partition), copy, durable, now);
             self.blamed.insert(partition, blame);
             let blamed_ms = HostClock::millis_until(blame.since, now);
             if blamed_ms >= self.peer_drop_after_millis {
-                self.drop_copy(partition, blame, blamed_ms);
+                self.drop_copy(partition, blame, blamed_ms, DropClock::Paused);
             }
         }
+    }
+
+    /// #67 (A-R435 G1, G2): per pinned regular secondary of a partition this node is the
+    /// pinned primary of, since when this owner has had no link to it ([`Self::linked`]). The
+    /// count starts again when the member is linked at a check or reports another boot, and
+    /// goes when the member leaves the commit or this node stops being its pinned primary. A
+    /// half-open link counts as linked, so such a member keeps the paused clock only.
+    fn count_unreachable(&mut self, partition: PartitionId, now: Tick) {
+        let tracked: Vec<NodeId> = self
+            .committed
+            .get(&partition)
+            .map(|committed| &committed.committed.pinned_config.members)
+            .filter(|members| {
+                members
+                    .iter()
+                    .any(|member| member.node == self.node && member.role == ReplicaRole::Primary)
+            })
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|member| {
+                        member.node != self.node && member.role == ReplicaRole::RegularSecondary
+                    })
+                    .map(|member| member.node)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.unreachable
+            .retain(|(at, node), _| *at != partition || tracked.contains(node));
+        for node in tracked {
+            if self.linked(node) {
+                self.unreachable.remove(&(partition, node));
+                continue;
+            }
+            let boot = self.links.boot_of(node);
+            if self
+                .unreachable
+                .get(&(partition, node))
+                .is_some_and(|count| count.boot == boot)
+            {
+                continue;
+            }
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                member = node.0,
+                boot = ?boot.map(|boot| boot.0),
+                "member_unreachable"
+            );
+            self.unreachable
+                .insert((partition, node), Unreachable { since: now, boot });
+        }
+    }
+
+    /// #67 (A-R435 G3-G5): the copy to drop on the unreachable clock, with how long it has been
+    /// unreachable. Called only while writes are paused. The member unreachable longest past
+    /// `peer_drop_after_millis` (a tie to the lower copy id), and only when every member the
+    /// drop keeps is linked and [`drop_target`] takes it. Otherwise `None`, and the paused
+    /// clock decides as before (two down, say).
+    fn unreachable_past_clock(&self, partition: PartitionId, now: Tick) -> Option<(Blame, u64)> {
+        let committed = self.committed.get(&partition)?;
+        let members = &committed.committed.pinned_config.members;
+        let (since, copy, node) = members
+            .iter()
+            .filter_map(|member| {
+                let count = self.unreachable.get(&(partition, member.node))?;
+                (HostClock::millis_until(count.since, now) >= self.peer_drop_after_millis)
+                    .then_some((count.since, member.copy, member.node))
+            })
+            .min_by_key(|(since, copy, _)| (since.0, copy.0))?;
+        let kept_linked = members
+            .iter()
+            .filter(|member| member.node != self.node && member.node != node)
+            .all(|member| self.linked(member.node));
+        if !kept_linked || drop_target(members, Some(node), self.node).0.is_err() {
+            return None;
+        }
+        let durable = self
+            .replication
+            .primary(self.node, partition)
+            .and_then(|primary| primary.tracker().peer(copy).map(|peer| peer.progress))
+            .unwrap_or(ReplicaProgress::EMPTY)
+            .durable;
+        let blame = Blame {
+            copy,
+            since,
+            durable,
+            refused_logged: false,
+        };
+        Some((blame, HostClock::millis_until(since, now)))
     }
 
     /// M3's repair half (critic-degraded M3, ruling A-R282): a `ReadOnly` commit whose pinned
@@ -5495,7 +5798,15 @@ impl Host {
 
     /// Start the re-plan that drops `blame`'s copy, unless the plan would keep fewer than two
     /// copies: spec §8.3 has no one-copy fallback, so writes stay paused and that is logged once.
-    fn drop_copy(&mut self, partition: PartitionId, blame: Blame, blamed_ms: u64) {
+    /// `blamed_ms` is the age of the `clock` that fired; `unreachable_ms` is logged beside it
+    /// whenever the copy's member is counted unreachable (#67, A-R435).
+    fn drop_copy(
+        &mut self,
+        partition: PartitionId,
+        blame: Blame,
+        blamed_ms: u64,
+        clock: DropClock,
+    ) {
         let Some(committed) = self.committed.get(&partition) else {
             return;
         };
@@ -5526,6 +5837,12 @@ impl Host {
                 return;
             }
         };
+        let unreachable_since = self
+            .unreachable
+            .get(&(partition, dropped))
+            .map(|count| count.since);
+        let unreachable_ms =
+            unreachable_since.map(|since| HostClock::millis_until(since, self.clock.now()));
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -5534,6 +5851,9 @@ impl Host {
             copy = blame.copy.0,
             dropped = dropped.0,
             blamed_ms,
+            clock = clock.name(),
+            unreachable_ms = ?unreachable_ms,
+            unreachable_since = ?unreachable_since.map(|since| since.0),
             durable = blame.durable.0,
             "membership_drop_planned"
         );
