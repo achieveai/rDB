@@ -479,7 +479,7 @@ start_all() { # nodes 1-3, then the wait for each: the tail of `up` and `up --re
         exit 1
     fi
     say "up. control=$CONTROL nodes=$(peers)"
-    say "pilot: $PILOT_BIN --dir $RUN/pilot --control $CONTROL --nodes $(peers) --cert-dir $RUN/certs --put k=v --get k"
+    say "pilot: $(printf %q "$PILOT_BIN") --dir $(printf %q "$RUN/pilot") --control $CONTROL --nodes $(peers) --cert-dir $(printf %q "$RUN/certs") --put k=v --get k"
 }
 
 down() {
