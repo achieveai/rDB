@@ -409,6 +409,9 @@ pub enum Msg {
         proof: Box<FencingProof>,
         /// The records read, or why they could not be.
         facts: Result<FenceFacts, String>,
+        /// Whether this is the one re-read after a refusal by this node's clock alone
+        /// ([`fence_recheck_millis`]; A-R446b).
+        rechecked: bool,
     },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
@@ -2531,6 +2534,7 @@ impl Host {
                         partition,
                         correlation,
                         proof,
+                        None,
                     );
                 } else {
                     self.push(site, EventKind::Kernel(kind), true, None);
@@ -2542,14 +2546,22 @@ impl Host {
                 correlation,
                 proof,
                 facts,
+                rechecked,
                 ..
             } => {
-                match bind_routed_fence(partition, &proof, facts, self.clock.now(), &self.budgets) {
+                let now = self.clock.now();
+                let expiry = facts
+                    .as_ref()
+                    .ok()
+                    .and_then(|facts| facts.grant.as_ref())
+                    .map(|grant| grant.expiry_utc_ms);
+                match bind_routed_fence(partition, &proof, facts, now, &self.budgets) {
                     Ok(()) => {
                         tracing::info!(
                             node = self.node.0,
                             partition = partition.0,
                             control_revision = proof.control_revision.0,
+                            rechecked,
                             "routed_fence_bound"
                         );
                         let site = Site {
@@ -2559,12 +2571,47 @@ impl Host {
                         let kind = KernelEvent::Recovery(RecoveryEvent::FenceProven(proof));
                         self.push(site, EventKind::Kernel(kind), true, None);
                     }
+                    // A-R446b (critic-63 M2): this node's clock may lag the promoter's by up to 2ε
+                    // while both are in bound. Short by no more than that, it reads and checks
+                    // once more when its own clock would prove the expiry; never twice.
+                    Err(("expiry_not_proven", detail)) if !rechecked => {
+                        match expiry.and_then(|at| fence_recheck_millis(at, now, &self.budgets)) {
+                            Some(wait) => {
+                                tracing::info!(
+                                    node = self.node.0,
+                                    partition = partition.0,
+                                    control_revision = proof.control_revision.0,
+                                    wait_millis = wait,
+                                    detail,
+                                    "routed_fence_recheck"
+                                );
+                                self.control.read_fence_facts(
+                                    self.node,
+                                    self.boot,
+                                    partition,
+                                    correlation,
+                                    proof,
+                                    Some(Duration::from_millis(wait)),
+                                );
+                            }
+                            None => tracing::warn!(
+                                node = self.node.0,
+                                partition = partition.0,
+                                control_revision = proof.control_revision.0,
+                                reason = "expiry_not_proven",
+                                detail = format!("{detail}; short by more than 2 clock errors"),
+                                rechecked,
+                                "routed_fence_refused"
+                            ),
+                        }
+                    }
                     Err((reason, detail)) => tracing::warn!(
                         node = self.node.0,
                         partition = partition.0,
                         control_revision = proof.control_revision.0,
                         reason,
                         detail,
+                        rechecked,
                         "routed_fence_refused"
                     ),
                 }
@@ -9331,7 +9378,8 @@ pub struct FenceFacts {
 /// answers `Never` on `frozen`, and `grant::clear_verdict` refuses a frozen record (guard 1) and
 /// one whose partition names the node and is not `Serving` (guard 3). So every fact checked here
 /// stays true until `partitions/1` moves, and that fails the commit CAS. The one refusal that
-/// can be wrong is this node's clock view lagging the promoter's; the promote then times out.
+/// can be wrong is this node's clock view lagging the promoter's; the host then reads and
+/// checks once more ([`fence_recheck_millis`]).
 ///
 /// 0. the proof is for the partition it was routed to (critic-63 A1: F1 is given it there);
 /// 1. `partitions/1` is the proof's partition, at `control_revision`;
@@ -9424,6 +9472,30 @@ pub(crate) fn bind_routed_fence(
         ));
     }
     Ok(())
+}
+
+/// A-R446b (critic-63 M2): how long to wait before reading and checking a routed fence once
+/// more, when [`bind_routed_fence`] refused it only because this node's clock does not yet prove
+/// `expiry_utc_ms` past. Two clocks each within ε of the authority can differ by 2ε, so a node
+/// short by at most 2ε waits until its own clock would prove it: `Some(ms)`. Short by more, the
+/// fence is early on any clock in bound: `None`, refused for good. ε and δ are the ones
+/// [`bind_routed_fence`] uses: `HostClock::control_time`'s fresh sample, error
+/// `clock_error_millis`, plus `dispatch_margin_millis`.
+pub(crate) fn fence_recheck_millis(
+    expiry_utc_ms: i64,
+    now: Tick,
+    budgets: &Budgets,
+) -> Option<u64> {
+    let epsilon = i64::try_from(budgets.clock_error_millis).ok()?;
+    let delta = i64::try_from(budgets.dispatch_margin_millis).ok()?;
+    let now = i64::try_from(now.0).ok()?;
+    // `expiry_proven` holds once now > expiry + ε + δ.
+    let short = expiry_utc_ms
+        .saturating_add(epsilon)
+        .saturating_add(delta)
+        .saturating_add(1)
+        .saturating_sub(now);
+    (short > 0 && short <= epsilon.saturating_mul(2)).then_some(short.unsigned_abs())
 }
 
 fn millis(started: Instant) -> u64 {

@@ -6257,7 +6257,7 @@ fn m10_s2_a_learned_owner_is_forgotten_once_a1_leaves_the_fence_it_was_learned_u
 /// is a fence every check holds for; each row below breaks one fact and leaves the rest true,
 /// so deleting that one check turns its row red.
 mod routed_fence {
-    use super::{bind_routed_fence, test_budgets, FenceFacts};
+    use super::{bind_routed_fence, fence_recheck_millis, test_budgets, FenceFacts};
     use rdb_core::authority::clock::{expiry_proven, ClockView};
     use rdb_core::authority::grant::GrantRecord;
     use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
@@ -6427,6 +6427,66 @@ mod routed_fence {
             bind_routed_fence(PartitionId(2), &proof, Ok(facts), NOW, &test_budgets())
                 .map_err(|(reason, _)| reason),
             Err("partition")
+        );
+    }
+
+    /// An expiry `short` ms from proven past at `NOW` on `test_budgets`: `expiry_proven` holds
+    /// once now > expiry + ε + δ.
+    fn short_of_proven_by(short: i64) -> i64 {
+        let budgets = test_budgets();
+        let edge = budgets.clock_error_millis + budgets.dispatch_margin_millis + 1;
+        i64::try_from(NOW.0 - edge).expect("fits") + short
+    }
+
+    /// A-R446b (critic-63 M2): this node's clock lags the promoter's by 50 ms, less than ε. The
+    /// first check refuses `expiry_not_proven`, `fence_recheck_millis` says wait 50 ms, and the
+    /// same facts checked 50 ms later bind.
+    /// Cut: `fence_recheck_millis` answers `None`, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446b_a_node_clock_behind_by_less_than_epsilon_binds_on_the_re_check() {
+        let budgets = test_budgets();
+        let (proof, mut facts) = true_fence();
+        let expiry = short_of_proven_by(50);
+        facts.grant.as_mut().expect("a grant").expiry_utc_ms = expiry;
+        assert_eq!(
+            bind(&proof, facts.clone()),
+            Err("expiry_not_proven"),
+            "at NOW"
+        );
+        assert_eq!(fence_recheck_millis(expiry, NOW, &budgets), Some(50));
+        let later = Tick(NOW.0 + 50);
+        assert_eq!(
+            bind_routed_fence(PartitionId(1), &proof, Ok(facts), later, &budgets)
+                .map_err(|(reason, _)| reason),
+            Ok(()),
+            "50 ms later"
+        );
+    }
+
+    /// A-R446b: short by up to 2ε (two clocks each within ε of the authority) waits; short by
+    /// more is early on any clock in bound, and is refused with no re-check. The refusal's
+    /// reason is `expiry_not_proven`.
+    /// Cut: the 2ε bound dropped (any shortfall waits), red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446b_a_node_clock_behind_by_more_than_two_epsilon_refuses_without_a_re_check() {
+        let budgets = test_budgets();
+        let two_epsilon = budgets.clock_error_millis * 2;
+        let at_bound = short_of_proven_by(i64::try_from(two_epsilon).expect("fits"));
+        assert_eq!(
+            fence_recheck_millis(at_bound, NOW, &budgets),
+            Some(two_epsilon)
+        );
+        let (proof, mut facts) = true_fence();
+        let past_bound = at_bound + 1;
+        facts.grant.as_mut().expect("a grant").expiry_utc_ms = past_bound;
+        assert_eq!(bind(&proof, facts), Err("expiry_not_proven"));
+        assert_eq!(fence_recheck_millis(past_bound, NOW, &budgets), None);
+        assert_eq!(
+            fence_recheck_millis(EXPIRED, NOW, &budgets),
+            None,
+            "already proven"
         );
     }
 

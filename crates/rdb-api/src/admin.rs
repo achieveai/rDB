@@ -2004,12 +2004,14 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         if tokio::time::Instant::now() >= deadline {
             return Err(PromoteError::Control(format!(
                 "node {} did not commit partition 1 within {} seconds (partitions/1 names owner \
-                 {} at generation {}); partition 1 takes no writes until a promote finishes: \
+                 {} at generation {}); partition 1 takes no writes until a promote finishes. If \
+                 node {} refused the fence, its log has a routed_fence_refused line saying why: \
                  promote again",
                 ctx.to.0,
                 seconds_in_words(ctx.within.as_millis()),
                 now.owner.0,
-                now.generation.0
+                now.generation.0,
+                ctx.to.0
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3334,6 +3336,9 @@ mod tests {
             stopped
                 .to_string()
                 .contains("node 2 did not commit partition 1")
+                && stopped
+                    .to_string()
+                    .contains("node 2 refused the fence, its log has a routed_fence_refused line")
                 && stopped.to_string().ends_with("promote again"),
             "{stopped}"
         );

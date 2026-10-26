@@ -311,7 +311,9 @@ impl ControlAdapter {
 
     /// A-R446: for a routed `FenceProven`, read `partitions/1` and then its owner's grant once,
     /// and answer [`Msg::FenceBound`] with the proof and what was read, or why it could not be.
-    /// No retry: a refused fence fails its promote loud ("promote again"). It never posts a
+    /// With `recheck_after`, it waits that long first and the answer is marked `rechecked`
+    /// (A-R446b: [`crate::host::fence_recheck_millis`]). No other retry: a refused fence fails
+    /// its promote loud ("promote again"). It never posts a
     /// control event, so A1 never hears it. Tracked with the node's calls, so a restart
     /// abandons it.
     pub fn read_fence_facts(
@@ -321,11 +323,15 @@ impl ControlAdapter {
         partition: PartitionId,
         correlation: CorrelationId,
         proof: Box<FencingProof>,
+        recheck_after: Option<std::time::Duration>,
     ) {
         let store = Arc::clone(&self.store);
         let links = Arc::clone(&self.links);
         let task = self.rt.spawn(
             async move {
+                if let Some(wait) = recheck_after {
+                    tokio::time::sleep(wait).await;
+                }
                 let facts = fence_facts(&*store).await;
                 let msg = Msg::FenceBound {
                     boot,
@@ -333,6 +339,7 @@ impl ControlAdapter {
                     correlation,
                     proof,
                     facts,
+                    rechecked: recheck_after.is_some(),
                 };
                 if links.post(node, msg).is_err() {
                     tracing::debug!(node = node.0, "control_completion_unclaimed");
