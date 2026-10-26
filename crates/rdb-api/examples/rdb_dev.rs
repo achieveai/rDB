@@ -361,7 +361,10 @@
 //!                                         replaces a quarantined recovery without it),
 //!                                         then n restarts and rejoins as a shadow until it
 //!                                         is caught up. --wipe moves n's folder to
-//!                                         <dir>/aside/ first; it is never deleted. Prints
+//!                                         <dir>/aside/ first; it is never deleted. A
+//!                                         quarantined partition's copy is always moved
+//!                                         aside, --wipe or not: its history is the one
+//!                                         that disagrees. Prints
 //!                                         `rebuilt: node n ...` once n is pinned regular
 //!                                         again, naming the copies kept and the aside
 //!                                         folder. Refused, nothing done, for the owner
@@ -1108,6 +1111,24 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
     }
 }
 
+/// Whether every node that restarted is back: `owner` did not restart, and its pinned
+/// configuration holds each restarted node at the boot it runs now as a regular secondary. The
+/// poller's "writes pause soon ... because node N restarted" is then stale, so it is not said
+/// (bug bash #65: it stayed the last word after `rebuilt` pinned node 3 again). The refusals'
+/// restart note is the `Db`'s and still names the restart.
+fn rejoined(owner: &NodeStatus, boot_of: impl Fn(NodeId) -> Option<BootId>) -> bool {
+    let restarted = restarted_nodes(&boot_of);
+    !restarted.is_empty()
+        && !restarted.contains(&owner.node)
+        && restarted.iter().all(|&node| {
+            owner.pinned.iter().any(|member| {
+                member.node == node
+                    && Some(member.boot) == boot_of(node)
+                    && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+            })
+        })
+}
+
 /// Sets [`Seen::promoting`].
 fn set_promoting(progress: &Progress, promoting: Option<NodeId>) {
     progress
@@ -1179,7 +1200,9 @@ fn poll_once(db: &Db, progress: &Progress) {
         if let Some(line) = ready_step(
             &mut seen,
             owner,
-            db.restart_note().as_deref(),
+            db.restart_note()
+                .filter(|_| !rejoined(owner, |node| db.boot_of(node)))
+                .as_deref(),
             &db.links().held(),
             &db.links().dropped(),
         ) {
@@ -4997,6 +5020,40 @@ mod tests {
             pinned: Vec::new(),
             config_version: None,
         }
+    }
+
+    /// Bug bash #65: after `rebuilt: node 3 ...` the poller still said "writes pause soon ...
+    /// because node 3 restarted", though the owner had pinned 3 regular at its new boot. The
+    /// note is stale only once every restarted node is pinned at its current boot.
+    #[test]
+    fn rejoined_once_the_owner_pins_each_restarted_node_at_its_boot() {
+        use rdb_core::contracts::ids::ReplicaRole;
+        use rdb_core::contracts::membership::{CopyId, Member};
+        let member = |node: u32, boot: u64, role| Member {
+            copy: CopyId(u8::try_from(node - 1).expect("small")),
+            node: NodeId(node),
+            boot: BootId(boot),
+            role,
+        };
+        let base = rdb_api::host::BOOT.0;
+        let boots = |node: NodeId| Some(BootId(if node == NodeId(3) { base + 1 } else { base }));
+        let mut owner = owner(None, true);
+        // Still pinned at the old boot: the pause note holds.
+        owner.pinned = vec![
+            member(1, base, ReplicaRole::Primary),
+            member(2, base, ReplicaRole::RegularSecondary),
+            member(3, base, ReplicaRole::RegularSecondary),
+        ];
+        assert!(!rejoined(&owner, boots));
+        // Back as a shadow: not yet.
+        owner.pinned[2] = member(3, base + 1, ReplicaRole::Shadow);
+        assert!(!rejoined(&owner, boots));
+        owner.pinned[2] = member(3, base + 1, ReplicaRole::RegularSecondary);
+        assert!(rejoined(&owner, boots));
+        // Nothing restarted: no note to drop.
+        assert!(!rejoined(&owner, |_| Some(BootId(base))));
+        // The owner itself restarted: never dropped.
+        assert!(!rejoined(&owner, |_| Some(BootId(base + 1))));
     }
 
     /// Bug bash #65 walk A: after `admin promote 2`, node 1 still said `primary` with a fenced

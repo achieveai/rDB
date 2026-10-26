@@ -42,7 +42,9 @@ pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this sa
 /// owner's recovery is quarantined ([`super::Db::explained`]). It already says what to do, which
 /// a "wait a few seconds and try again" step would contradict (review-s2 F-003).
 pub(crate) const QUARANTINED_STEP: &str =
-    "do not delete the folder; stop and report it with this message";
+    "do not delete the folder; run `admin rebuild N` (`Db::rebuild`) for a copy whose history \
+     disagrees: it takes that copy out of the partition and back, and a rebuild of a copy the \
+     quarantine does not name is refused, naming the ones it does";
 
 /// The step a damaged object's root (a document, or a map's or set's own root) ends its
 /// `CORRUPT_HISTORY` with ([`corrupt_history`]), in place of the map or set entry's step: no

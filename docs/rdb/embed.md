@@ -713,7 +713,7 @@ report it with the message.
 
 | Error | When | What to do |
 |---|---|---|
-| `ReadyError::Quarantined` | The copies' histories disagree, so the owner (the message names its node) takes no writes. The acknowledged data is kept | Do not delete the folder, and do not keep opening it. This build has no repair command yet: stop and report it with the message. It happens only if two copies hold different valid records at one position, which fencing prevents. The planned way out is `admin rebuild N`, which is not built yet |
+| `ReadyError::Quarantined` | The copies' histories disagree, so the owner (the message names its node) takes no writes. The acknowledged data is kept | Do not delete the folder, and do not keep opening it. Run `admin rebuild N` (`Db::rebuild`) for a copy whose history disagrees: it takes that copy out and back, wiped aside. A rebuild of a copy the quarantine does not name is refused and names the ones it does. A write refused while quarantined carries the same text. It happens only if two copies hold different valid records at one position, which fencing prevents |
 
 **Fix the cause first.** Opening again unchanged gives the same error; the "what to do"
 column says what to change before the next open.

@@ -739,16 +739,16 @@ pub enum ReadyError {
     /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
     /// wait nor a reopen helps (A-R196(2a)).
     ///
-    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator removes the
-    /// diverged copies from membership and fences again. This build has no command for that, so
-    /// the text does not tell the reader to do it (A-R196(2b)); the owner's `recovery_fact` log
-    /// line names the copies. The text ends with [`error::QUARANTINED_STEP`], so a refusal that
-    /// carries it gets no second step (review-s2 F-003).
+    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator takes a
+    /// diverged copy out of membership and back, `admin rebuild N` ([`Db::rebuild`], bug bash
+    /// #65 mode C). The text names it; the owner's `recovery_fact` log line names the copies, and
+    /// a rebuild of a copy the evidence does not name is refused with the evidence. The text
+    /// ends with [`error::QUARANTINED_STEP`], so a refusal that carries it gets no second step
+    /// (review-s2 F-003).
     #[error(
         "the open's recovery found copies whose histories disagree, so node {node} takes no \
-         writes; the acknowledged data is kept. This build has no repair command yet (removing \
-         a copy from membership comes in a later build), so opening the folder again will not \
-         help: {step}",
+         writes; the acknowledged data is kept, and opening the folder again will not help: \
+         {step}",
         node = .owner.0,
         step = error::QUARANTINED_STEP
     )]
@@ -2647,28 +2647,50 @@ impl Db {
     /// the owner found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
     /// proof stay; it only cannot succeed in this open.
     fn explained(&self, mut error: ApiError) -> ApiError {
-        if error.kind == ErrorKind::Unavailable {
-            if let Some(step) = self.stuck_step() {
-                error.detail = format!("{}; {step}", error.detail);
+        // A quarantine also refuses a write `LEASE_EXPIRED` or `PROTECTION_PAUSED`, whose own
+        // step ("call `Db::wait_ready`") cannot end it; the quarantined text names the rebuild
+        // that does. That text ends with its step, so it goes last, after any restart note,
+        // and no generic step follows it (bug bash #65).
+        let quarantined = matches!(
+            *lock(&self.opened.stuck),
+            Some(ReadyError::Quarantined { .. })
+        );
+        let stuck = match error.kind {
+            ErrorKind::Unavailable => self.stuck_step(),
+            ErrorKind::LeaseExpired | ErrorKind::ProtectionPaused if quarantined => {
+                self.stuck_step()
             }
-        }
-        let Some(mut note) = self.restart_note() else {
-            return error;
+            _ => None,
         };
-        if self.owner_restarted() {
-            note = format!("{note}; {REOPEN_STEP}");
+        let (before, after) = if quarantined {
+            (None, stuck)
+        } else {
+            (stuck, None)
+        };
+        if let Some(step) = before {
+            error.detail = format!("{}; {step}", error.detail);
         }
-        match error.kind {
-            ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome => {
-                error.detail = format!("{}; {note}", error.detail);
+        if let Some(mut note) = self.restart_note() {
+            if self.owner_restarted() {
+                note = format!("{note}; {REOPEN_STEP}");
             }
-            ErrorKind::NotPrimary => {
-                error.detail = format!(
-                    "{}; no node becomes primary again in this open: {note}",
-                    error.detail
-                );
+            match error.kind {
+                ErrorKind::ProtectionPaused
+                | ErrorKind::Unavailable
+                | ErrorKind::UnknownOutcome => {
+                    error.detail = format!("{}; {note}", error.detail);
+                }
+                ErrorKind::NotPrimary => {
+                    error.detail = format!(
+                        "{}; no node becomes primary again in this open: {note}",
+                        error.detail
+                    );
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        if let Some(step) = after {
+            error.detail = format!("{}; {step}", error.detail);
         }
         error
     }
@@ -7929,10 +7951,28 @@ mod tests {
         assert_eq!(answer, Err(ReadyError::Quarantined { owner: OWNER }));
         assert_eq!(
             answer.expect_err("quarantined").to_string(),
-            "the open's recovery found copies whose histories disagree, so node 1 takes no \
-             writes; the acknowledged data is kept. This build has no repair command yet \
-             (removing a copy from membership comes in a later build), so opening the folder \
-             again will not help: do not delete the folder; stop and report it with this message"
+            format!(
+                "the open's recovery found copies whose histories disagree, so node 1 takes no \
+                 writes; the acknowledged data is kept, and opening the folder again will not \
+                 help: {}",
+                error::QUARANTINED_STEP
+            )
+        );
+        // Bug bash #65: a write the quarantine refused `LEASE_EXPIRED` said "call
+        // `Db::wait_ready`", which cannot end it. It now ends with the rebuild step and no other.
+        let refused = db.explained(ApiError {
+            kind: ErrorKind::LeaseExpired,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: true,
+            detail: "lease expired for partition 1".to_owned(),
+            retry_after: None,
+        });
+        assert!(
+            refused.detail.ends_with(error::QUARANTINED_STEP)
+                && refused.explain().contains("admin rebuild N")
+                && !refused.explain().contains("wait_ready"),
+            "{}",
+            refused.explain()
         );
         drop(db);
         node_1.join().expect("the stub");
