@@ -586,11 +586,11 @@ pub enum Msg {
 /// Where [`Msg::Rebuild`]'s answer goes. Opaque outside the crate: only `Db::rebuild` sends one.
 #[derive(Debug)]
 pub struct RebuildReply(
-    pub(crate) Sender<Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Refused>>,
+    pub(crate) Sender<Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Unready>>,
 );
 
 impl RebuildReply {
-    fn send(&self, answer: Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Refused>) {
+    fn send(&self, answer: Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Unready>) {
         // The asker may have given up; then nobody needs the answer.
         let _ = self.0.send(answer);
     }
@@ -6354,7 +6354,7 @@ impl Host {
                 detail = %refused.detail,
                 "rebuild_refused"
             );
-            reply.send(Err(refused));
+            reply.send(Err(crate::admin::rebuild::Unready::Refused(refused)));
         };
         let quarantined = self
             .recoveries
@@ -6652,7 +6652,8 @@ impl Host {
                     "rebuild_refused"
                 ),
             }
-            ask.reply.send(answer);
+            ask.reply
+                .send(answer.map_err(crate::admin::rebuild::Unready::Failed));
         }
     }
 

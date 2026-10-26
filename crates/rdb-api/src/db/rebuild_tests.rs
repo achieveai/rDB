@@ -434,6 +434,15 @@ fn b3_mode_c_refuses_when_the_kept_copies_still_diverge() {
         "{}",
         refused.detail
     );
+    // Revobot #73 finding 3: the owner had reset its quarantined F1 and started a fresh run
+    // before this failed, so it never claims nothing changed.
+    assert!(!refused.no_mutation, "{refused:?}");
+    // A guard that refuses before anything starts (G2) still claims it.
+    let owner = db.rebuild_with(NodeId(1), false).expect_err("G2");
+    assert!(
+        owner.detail.contains("(G2)") && owner.no_mutation,
+        "{owner:?}"
+    );
     assert_eq!(db.boot_of(NodeId(3)), boot_3, "3 untouched");
     assert_eq!(
         files_under(&dir.path().join("aside")),

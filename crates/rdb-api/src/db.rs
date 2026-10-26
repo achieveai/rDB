@@ -3277,11 +3277,12 @@ impl Db {
     /// # Errors
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
-    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard, an owner
-    /// in another process, or a re-plan that did not commit a serving partition without
-    /// `node`. A wipe the fence refuses restarts `node` on its own folder and says so. An
-    /// `UNAVAILABLE` with `no_mutation` false when `node` restarted but is not pinned regular
-    /// again in time.
+    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard or an
+    /// owner in another process. `UNAVAILABLE` with `no_mutation` false once the owner started
+    /// the drop: a re-plan that did not commit a serving partition without `node`, quarantined
+    /// again, or did not commit in time. A wipe the fence refuses restarts `node` on its own
+    /// folder and says so. An `UNAVAILABLE` with `no_mutation` false when `node` restarted but
+    /// is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
         if !self.runs(self.route.owner()) && !self.runs(node) {
             if wipe {
@@ -3451,7 +3452,10 @@ impl Db {
         }
         let ready = match answer.recv_timeout(within + Duration::from_secs(5)) {
             Ok(Ok(ready)) => ready,
-            Ok(Err(refusal)) => return Err(refused(refusal)),
+            Ok(Err(admin::rebuild::Unready::Refused(refusal))) => return Err(refused(refusal)),
+            Ok(Err(admin::rebuild::Unready::Failed(failure))) => {
+                return Err(rebuild_failed(failure))
+            }
             Err(_) => {
                 return Err(rebuild_error(
                     RetryRule::NotWired,
@@ -3508,6 +3512,9 @@ impl Db {
         let moved = aside.as_ref().map(|aside| aside.to.clone());
         // A1 (critic-65): once the folder has moved, every later error says where it is.
         let named = |mut error: ApiError| {
+            // Revobot #73 finding 3: past Ready, the owner may have committed the drop (modes B and
+            // C), so nothing after it claims `no_mutation`.
+            error.no_mutation = false;
             if let Some(to) = moved.as_ref().filter(|to| to.exists()) {
                 // Before the tail that ends a rebuild error, so it still ends the detail.
                 let tail = format!("; {}", error::REBUILD_STEP);
@@ -4046,6 +4053,16 @@ fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
             RetryRule::RetryAfterRecovery
         };
         rebuild_error(retry, true, refused.to_string())
+    }
+}
+
+/// Revobot #73 finding 3: the owner failed a rebuild after it started the drop (a revocation
+/// queued, or the quarantined F1 replaced). The kind and retry rule are a refusal's; it never
+/// claims `no_mutation`.
+fn rebuild_failed(failed: admin::rebuild::Refused) -> ApiError {
+    ApiError {
+        no_mutation: false,
+        ..rebuild_refused(failed)
     }
 }
 
