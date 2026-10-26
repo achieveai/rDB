@@ -1642,7 +1642,8 @@ impl NodeInner {
         // say), the tries below still find out whether a build starts.
         self.wait_for_core_to_hear_the_last_build(started + self.cfg.write_timeout / 2)
             .await;
-        let before = self.reader.snapshot_meta().map(|m| m.snapshot_id);
+        // The build's own publication, never an install's (Revobot #73 finding 2).
+        let before = self.storage.built_snapshot_meta().map(|m| m.snapshot_id);
         let calls_before = self.snapshot_build_calls();
         // Two tries. A build at an unchanged log id leaves the core's snapshot log id where it
         // was, so the wait above cannot see that build's finish; a trigger sent in that gap is
@@ -1713,14 +1714,16 @@ impl NodeInner {
 
     /// Wait, until `deadline`, for a build that has started to publish a snapshot other than
     /// `before`. A bounded wait, so the caller gets the snapshot's identity rather than a
-    /// promise; `snapshot_id: None` means the build is still running.
+    /// promise; `snapshot_id: None` means the build is still running. Only a build's own
+    /// publication counts: a snapshot installed from the leader meanwhile is not this build's
+    /// (Revobot #73 finding 2).
     async fn wait_for_publish(
         &self,
         before: Option<&String>,
         deadline: Instant,
     ) -> SnapshotTriggered {
         loop {
-            if let Some(meta) = self.reader.snapshot_meta() {
+            if let Some(meta) = self.storage.built_snapshot_meta() {
                 if Some(&meta.snapshot_id) != before {
                     return SnapshotTriggered::Started {
                         snapshot_id: Some(meta.snapshot_id),

@@ -479,6 +479,10 @@ struct SmInner {
     /// Mirror of `state_meta/install_in_progress`. `Some` only between the marker batch and the
     /// final batch of an install — including across a crash, which is the whole point.
     install_in_progress: Option<StoredSnapshot>,
+    /// The snapshot a build of this open last published, in memory only. An install replaces
+    /// `current_snapshot` and never this, so a backup can tell its own build from a snapshot a
+    /// leader sent (Revobot #73 finding 2, ADR-0024).
+    last_built: Option<StoredSnapshot>,
 }
 
 struct RocksShared {
@@ -1321,6 +1325,7 @@ impl RocksStore {
                     journal: loaded.journal_stats,
                     current_snapshot: loaded.current_snapshot,
                     install_in_progress: loaded.install_in_progress,
+                    last_built: None,
                 }),
             }),
         })
@@ -1513,6 +1518,13 @@ impl RocksStore {
     /// The current snapshot's OpenRaft metadata, or `None` if this node has never published one.
     pub fn snapshot_meta(&self) -> Option<SnapshotMeta<RaftNodeId, RaftNode>> {
         self.shared.sm().current_snapshot.as_ref().map(|s| s.meta())
+    }
+
+    /// The metadata of the snapshot a build of this open last published, or `None` before the
+    /// first. An installed snapshot never shows here: compare it with [`Self::snapshot_meta`] to
+    /// tell whether that build is still the current snapshot (Revobot #73 finding 2).
+    pub fn built_snapshot_meta(&self) -> Option<SnapshotMeta<RaftNodeId, RaftNode>> {
+        self.shared.sm().last_built.as_ref().map(|s| s.meta())
     }
 
     /// Snapshot, purge and backend counters for `/metrics` (D5.5, ADR-0026).
@@ -3869,6 +3881,7 @@ fn export_into_file(
         }
         s.write(batch, true, ErrorSubject::Snapshot(None), ErrorVerb::Write)?;
         sm.current_snapshot = Some(stored.clone());
+        sm.last_built = Some(stored.clone());
     }
     s.snapshot_publications.fetch_add(1, Ordering::SeqCst);
 
