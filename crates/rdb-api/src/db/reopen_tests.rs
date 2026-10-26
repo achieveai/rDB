@@ -3396,20 +3396,15 @@ fn partition_and_grant(
     (record, root, revision, held, grant.mod_revision)
 }
 
-/// A-R446 rows: route node 2 a plan and `fence` as a promote sends them, then wait until node 2
-/// logs `routed_fence_refused` or `partitions/1` leaves `revision`. Answers the reasons node 2
-/// logged, and `partitions/1`'s revision and owner after.
-fn route_fence_to_node_2(
-    rt: &tokio::runtime::Runtime,
+/// A plan over `record` and `root` for `members`, as a promote builds one: config version + 1,
+/// node 2's boot in the authority view.
+fn plan_over(
     db: &Db,
-    store: &Arc<dyn ConfigStore>,
-    method: &str,
     (record, root): (&PartitionRecord, &PartitionRoot),
-    fence: rdb_core::contracts::authority::FencingProof,
-) -> (Vec<String>, u64, NodeId) {
+    members: Vec<rdb_core::contracts::membership::Member>,
+) -> rdb_core::contracts::recovery::RecoveryPlan {
     use rdb_core::contracts::authority::Lineage;
-    use rdb_core::contracts::recovery::{LineageAnchor, RecoveryEvent};
-    let revision = fence.control_revision.0;
+    use rdb_core::contracts::recovery::LineageAnchor;
     let anchor = LineageAnchor {
         lineage: Lineage {
             partition: PARTITION,
@@ -3419,14 +3414,67 @@ fn route_fence_to_node_2(
         base_seq: root.base_seq,
         base_digest: root.base_digest,
     };
-    let plan = admin::recovery_plan(
+    admin::recovery_plan(
         anchor,
         rdb_core::contracts::ids::ConfigVersion(record.config_version.0 + 1),
-        admin::members(),
+        members,
         db.links().boot_of(NodeId(2)).expect("node 2 runs"),
         rdb_core::contracts::ids::GrantId(1),
         rdb_core::contracts::ids::AuthorityGeneration(1),
-    );
+    )
+}
+
+/// A-R447: store `plan` create-only where the promote that fenced at `revision` stores its own.
+fn store_plan_at(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    revision: u64,
+    plan: &rdb_core::contracts::recovery::RecoveryPlan,
+) {
+    let key = admin::promote_operation(rdb_core::contracts::ids::Revision(revision))
+        .expect("in range")
+        .encode();
+    let written = rt
+        .block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(key),
+            value: admin::encode_promote_plan(plan),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put the stored plan");
+    assert_eq!(written.outcome, config_core::MutationOutcome::Applied);
+}
+
+/// The plan stored for the promote that fenced at `revision`, read now.
+fn stored_plan_at(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    revision: u64,
+) -> Option<rdb_core::contracts::recovery::RecoveryPlan> {
+    let key = admin::promote_operation(rdb_core::contracts::ids::Revision(revision))
+        .expect("in range")
+        .encode();
+    rt.block_on(store.get(config_core::GetRequest {
+        key: Bytes::from(key),
+    }))
+    .expect("get the stored plan")
+    .record
+    .map(|found| admin::decode_promote_plan(&found.value).expect("a stored plan"))
+}
+
+/// A-R446 rows: route node 2 `plan` and `fence` as a promote sends them, then wait until node 2
+/// logs `routed_fence_refused` or `partitions/1` leaves `revision`. Answers the reasons node 2
+/// logged, and `partitions/1`'s revision and owner after.
+fn route_fence_to_node_2(
+    rt: &tokio::runtime::Runtime,
+    db: &Db,
+    store: &Arc<dyn ConfigStore>,
+    method: &str,
+    plan: rdb_core::contracts::recovery::RecoveryPlan,
+    fence: rdb_core::contracts::authority::FencingProof,
+) -> (Vec<String>, u64, NodeId) {
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    let revision = fence.control_revision.0;
     for event in [
         RecoveryEvent::Plan(Box::new(plan)),
         RecoveryEvent::FenceProven(Box::new(fence)),
@@ -3503,8 +3551,14 @@ fn m10_s2_r446_a_made_up_fence_over_a_live_grant_is_refused_and_nothing_is_writt
         control_revision: rdb_core::contracts::ids::Revision(revision),
         decision_tick: db.clock.now(),
     };
-    let (reasons, after, owner) =
-        route_fence_to_node_2(&rt, &db, &store, METHOD, (&record, &root), fence);
+    let (reasons, after, owner) = route_fence_to_node_2(
+        &rt,
+        &db,
+        &store,
+        METHOD,
+        plan_over(&db, (&record, &root), admin::members()),
+        fence,
+    );
     assert_eq!(reasons, ["not_fencing"], "node 2 refused the made-up fence");
     assert_eq!(
         (after, owner),
@@ -3583,8 +3637,14 @@ fn m10_s2_r446_a_fence_before_the_frozen_grant_is_proven_expired_is_refused() {
         control_revision: rdb_core::contracts::ids::Revision(revision),
         decision_tick: db.clock.now(),
     };
-    let (reasons, after, owner) =
-        route_fence_to_node_2(&rt, &db, &store, METHOD, (&record, &root), fence);
+    let (reasons, after, owner) = route_fence_to_node_2(
+        &rt,
+        &db,
+        &store,
+        METHOD,
+        plan_over(&db, (&record, &root), admin::members()),
+        fence,
+    );
     assert_eq!(
         reasons,
         ["expiry_not_proven"],
@@ -3601,9 +3661,10 @@ fn m10_s2_r446_a_fence_before_the_frozen_grant_is_proven_expired_is_refused() {
 /// A-R446b (critic-63 M2): a true fence that a node's clock proves only a little after the
 /// promoter's did is bound and committed, through the host. The row writes `Fencing` and freezes
 /// node 1's grant with an expiry that node 2's clock proves past about 190 ms after the freeze,
-/// inside the 2ε (200 ms) a node may lag a promoter by, then routes the pair. Node 2 refuses
-/// nothing, binds once and commits: `partitions/1` moves one generation on (the helper's plan
-/// keeps node 1 primary, so the owner it names stays node 1).
+/// inside the 2ε (200 ms) a node may lag a promoter by, stores the plan at `operations/` as a
+/// promote does (A-R447), then routes the pair. Node 2 refuses nothing, binds once and commits:
+/// `partitions/1` moves one generation on (the helper's plan keeps node 1 primary, so the owner
+/// it names stays node 1).
 ///
 /// Outcome only, so no wall-clock luck is needed: whether node 2's first check lands inside
 /// those 190 ms is up to scheduling. If it does, node 2 logs `routed_fence_recheck` and then
@@ -3680,8 +3741,10 @@ fn m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_is_bound_and_committed(
         control_revision: rdb_core::contracts::ids::Revision(revision),
         decision_tick: db.clock.now(),
     };
-    let (reasons, after, _) =
-        route_fence_to_node_2(&rt, &db, &store, METHOD, (&record, &root), fence);
+    // A-R447: the promote that fenced at `revision` stored its plan, as a real one does.
+    let plan = plan_over(&db, (&record, &root), admin::members());
+    store_plan_at(&rt, &store, revision, &plan);
+    let (reasons, after, _) = route_fence_to_node_2(&rt, &db, &store, METHOD, plan, fence);
     assert!(reasons.is_empty(), "node 2 refused: {reasons:?}");
     let (_, generation) = partition_owner(&rt, &store);
     assert!(
@@ -3716,6 +3779,267 @@ fn m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_is_bound_and_committed(
         "one bind, after at most one re-check: {seen:?}"
     );
     db.shutdown();
+}
+
+/// Members as a promote keeps them: `kept` in order, the first primary, every node at the boot
+/// it runs (or ran) at.
+fn kept_members(
+    kept: &[NodeId],
+    boot: impl Fn(NodeId) -> BootId,
+) -> Vec<rdb_core::contracts::membership::Member> {
+    use rdb_core::contracts::ids::ReplicaRole;
+    admin::members()
+        .into_iter()
+        .filter(|member| kept.contains(&member.node))
+        .map(|member| rdb_core::contracts::membership::Member {
+            role: if member.node == kept[0] {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::RegularSecondary
+            },
+            boot: boot(member.node),
+            ..member
+        })
+        .collect()
+}
+
+/// The nodes node 2 holds partition 1's newest configuration over, sorted.
+fn pinned_on_node_2(db: &Db) -> Vec<u32> {
+    let mut nodes: Vec<u32> = db
+        .node_status()
+        .into_iter()
+        .find(|status| status.node == NodeId(2))
+        .expect("node 2 answers a look")
+        .pinned
+        .iter()
+        .map(|member| member.node.0)
+        .collect();
+    nodes.sort_unstable();
+    nodes
+}
+
+/// A-R447 (issue #70, Revobot r3 C-01), row R2: a stalled promote, finished by an app that
+/// chooses its own members, commits the plan the promoter stored, not the app's. Built by hand
+/// so node 2 has heard nothing from the promoter (critic-63 M1): node 1 is stopped,
+/// `partitions/1` is `Fencing` and node 1's grant frozen and long expired, as a promote's steps
+/// 3 to 5 leave them. A second app then routes node 2 its own plan (node 2 and node 1, so node
+/// 3 is left out) with a fence that is true.
+/// 1. No plan stored yet (the promote stalled before step 6): node 2 logs
+///    `routed_fence_refused{plan_absent}`, and `partitions/1` keeps its revision and owner.
+/// 2. The promoter's plan (node 2 and node 3, node 1 dropped) stored at that revision, and the
+///    app's pair routed again: node 2 commits one generation on, owns partition 1, and holds
+///    nodes 2 and 3, never 1 and 2.
+/// Cut: the `Routed` arm pushes the routed plan and the bind pushes only the proof (as before
+/// A-R447): node 2 holds the app's plan when (2)'s fence binds, and commits nodes 1 and 2,
+/// red. The plan_absent refusal skipped (the proof pushed alone): (1) logs no refusal, red.
+/// Integration (~4 s): one fresh open until ready, a put, two CASes, a stored plan, two routes.
+#[config_log::retcd_test]
+fn m10_s2_r447_a_stalled_promote_finished_by_another_app_commits_only_the_stored_plan() {
+    const METHOD: &str =
+        "m10_s2_r447_a_stalled_promote_finished_by_another_app_commits_only_the_stored_plan";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    db.wait_ready(patience).expect("ready");
+    db.put(b"a", b"1", None).expect("a put");
+    let boots: Vec<(NodeId, BootId)> = [crate::admin::OWNER, NodeId(2), NodeId(3)]
+        .into_iter()
+        .map(|node| (node, db.links().boot_of(node).expect("runs")))
+        .collect();
+    let boot = |node: NodeId| {
+        boots
+            .iter()
+            .find(|(at, _)| *at == node)
+            .map(|(_, boot)| *boot)
+            .expect("a member")
+    };
+    lock(&db.nodes)
+        .iter_mut()
+        .find(|handle| handle.node == crate::admin::OWNER)
+        .expect("node 1 runs here")
+        .stop();
+    let put = |key: ControlKey, value: Bytes, revision: u64| {
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(key.encode()),
+            value,
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        }))
+        .map(|answer| answer.outcome == config_core::MutationOutcome::Applied)
+        .unwrap_or(false)
+    };
+    let (record, root, revision, ..) = partition_and_grant(&rt, &store);
+    let fencing = PartitionRecord {
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Fencing,
+        ..record
+    };
+    assert!(
+        put(
+            ControlKey::Partition(PARTITION),
+            fencing.encode_with(&root),
+            revision
+        ),
+        "the Fencing write"
+    );
+    let budgets = crate::host::test_budgets();
+    let edge = i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis + 1)
+        .expect("fits");
+    let expired = i64::try_from(db.clock.now().0).expect("a tick fits") - 60_000;
+    let frozen = (0..20).find_map(|_| {
+        let (.., grant, at) = partition_and_grant(&rt, &store);
+        let frozen = rdb_core::authority::grant::GrantRecord {
+            frozen: true,
+            expiry_utc_ms: expired,
+            ..grant
+        };
+        put(ControlKey::Grant(crate::admin::OWNER), frozen.encode(), at).then_some(frozen)
+    });
+    let frozen = frozen.expect("the freeze lands within 20 tries");
+    let (record, root, revision, ..) = partition_and_grant(&rt, &store);
+    let fence = rdb_core::contracts::authority::FencingProof {
+        partition: PARTITION,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: frozen.grant,
+        prior_boot_id: root.owner_boot,
+        revocation: rdb_core::contracts::authority::Revocation::ExpiryProven {
+            frozen_expiry_utc_ms: expired,
+            authority_utc_ms: expired + edge,
+            authority_tick: db.clock.now(),
+            epsilon_ms: 100,
+            delta_ms: 100,
+        },
+        control_revision: rdb_core::contracts::ids::Revision(revision),
+        decision_tick: db.clock.now(),
+    };
+    let apps = plan_over(
+        &db,
+        (&record, &root),
+        kept_members(&[NodeId(2), crate::admin::OWNER], boot),
+    );
+
+    // 1. Stalled before step 6: nothing stored.
+    let (reasons, after, owner) =
+        route_fence_to_node_2(&rt, &db, &store, METHOD, apps.clone(), fence.clone());
+    assert_eq!(reasons, ["plan_absent"], "node 2 refused the fence");
+    assert_eq!(
+        (after, owner),
+        (revision, crate::admin::OWNER),
+        "partitions/1 unchanged"
+    );
+
+    // 2. The promoter's plan stored at its revision.
+    let stored = plan_over(
+        &db,
+        (&record, &root),
+        kept_members(&[NodeId(2), NodeId(3)], boot),
+    );
+    store_plan_at(&rt, &store, revision, &stored);
+    route_fence_to_node_2(&rt, &db, &store, METHOD, apps, fence);
+    let deadline = std::time::Instant::now() + patience;
+    let generation = loop {
+        let (owner, generation) = partition_owner(&rt, &store);
+        if owner == NodeId(2) && generation.0 == record.generation.0 + 1 {
+            break generation;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2 did not commit within {patience:?}: owner {}, generation {}",
+            owner.0,
+            generation.0
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let deadline = std::time::Instant::now() + patience;
+    while pinned_on_node_2(&db) != [2, 3] && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        pinned_on_node_2(&db),
+        [2, 3],
+        "node 2 committed the stored plan at generation {}, not the app's",
+        generation.0
+    );
+    db.shutdown();
+}
+
+/// A-R447 row R3: a promote that stopped after storing its plan, then `promote 2 --drop 3`. The
+/// re-run fences again at a revision of its own, stores its own plan there, and commits it:
+/// node 2 owns partition 1 over nodes 1 and 2. Each run's plan is at its own revision. This
+/// is also #66's `admin promote N --drop M` path, and an app-only `Db` runs it (A-R261).
+/// Cut: step 3 skips the CAS when `partitions/1` is already `Fencing` (as before A-R447): the
+/// re-run's create meets the first run's plan at the old revision and is refused, red.
+/// Integration (~10 s): one fresh open, a promote that waits node 1's grant out and cannot
+/// reach node 2, and the re-run.
+#[config_log::retcd_test]
+fn m10_s2_r447_a_rerun_with_another_drop_fences_at_its_own_revision_and_commits_its_own_plan() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut nodes = open(&rt, dir.path(), &store).expect("the fresh open");
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    nodes.put(b"a", b"1", None).expect("a put");
+
+    let boot_links = Arc::clone(nodes.links());
+    let stopped = admin::PromoteCtx {
+        store: Arc::clone(&store),
+        budgets: fast(),
+        clock: nodes.clock,
+        to: NodeId(2),
+        drop: None,
+        within: heal_within(&fast()),
+        members: admin::members(),
+        members_version: partition_version(&rt, &store),
+        member_boot: Arc::new(move |node| boot_links.boot_of(node)),
+        send: Arc::new(|node, _| Err(NodeStopped(node))),
+    };
+    let refused = rt
+        .block_on(admin::promote(stopped))
+        .expect_err("node 2 is not reached");
+    assert!(
+        matches!(refused, admin::PromoteError::Unreachable { node: 2 }),
+        "{refused:?}"
+    );
+    let (_, _, first, ..) = partition_and_grant(&rt, &store);
+    let kept = |plan: Option<rdb_core::contracts::recovery::RecoveryPlan>| -> Vec<u32> {
+        plan.expect("a stored plan")
+            .config
+            .members
+            .iter()
+            .map(|member| member.node.0)
+            .collect()
+    };
+    assert_eq!(kept(stored_plan_at(&rt, &store, first)), [2, 3]);
+
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let promoted = app
+        .promote(NodeId(2), Some(NodeId(3)))
+        .unwrap_or_else(|error| panic!("the re-run is answered: {error}"));
+    assert_eq!(
+        (promoted.owner, promoted.dropped),
+        (NodeId(2), NodeId(3)),
+        "{promoted:?}"
+    );
+    assert!(
+        promoted.control_revision.0 > first,
+        "its own revision: {promoted:?}"
+    );
+    assert_eq!(
+        kept(stored_plan_at(&rt, &store, promoted.control_revision.0)),
+        [1, 2]
+    );
+    assert_eq!(kept(stored_plan_at(&rt, &store, first)), [2, 3], "kept");
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    while pinned_on_node_2(&nodes) != [1, 2] && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(pinned_on_node_2(&nodes), [1, 2], "node 3 dropped");
+    app.shutdown();
+    nodes.shutdown();
 }
 
 /// A-R265/A-R266 (W7's walk G, condition 3): a promote that cannot reach node 2 is refused

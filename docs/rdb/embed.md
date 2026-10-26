@@ -649,13 +649,19 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
-  can promote too. A promote starts with rEtcd writes to `partitions/` and `grants/`, and the
-  node it promotes checks the fence it is sent against those records and refuses one that is
-  not true. The plan sent with the fence, which names the members, is not checked. So while a
-  promote is stalled with partition 1 fencing, any app holding the link cert can finish it with
-  members of its choosing. That is a known gap (issue #70). **The dropped node is added back
-  automatically when it starts again, or at the next reopen heal; membership is fixed at three
-  nodes.**
+  can promote too. A node commits a promote only with the plan the promoter stored in rEtcd
+  (`operations/<tag + revision>`, where the revision is the promote's own `Fencing` write), and
+  only on a fence its own reads of `partitions/1` and the old owner's grant prove true.
+  Starting a promote needs rEtcd write access to `partitions/`, `grants/` and `operations/`.
+  An app holding only an rDB link certificate cannot choose or change a promote's plan. Once a
+  promoter has stored its plan, any node that can read rEtcd can finish that same stored plan,
+  on a node and at a time the sender picks. That is harmless: it is the promoter's own plan.
+  - **Wait for `promote` to answer before running it again.** A rerun while the earlier run is
+    still committing (up to about 15 s) cancels that run's commit. This costs time, not safety.
+  - **Upgrade every node before you use `promote`.** A node built before issue #70 still
+    trusts a plan sent to it directly.
+  - **The dropped node is added back automatically when it starts again, or at the next
+    reopen heal; membership is fixed at three nodes.**
   - **After every node restarts, a promote still works,** even with the owner's copy lost.
     `partitions/1` keeps the member list and each member's role (record layout 4), and a
     promote plans from it.
@@ -665,10 +671,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     restart"). The way round: bring back the owner's node, or promote a node that has not
     restarted since the owner stopped.
   - **The old owner says "moved" within about a second.** While the promote waits out its
-    permission to write, the old owner answers `LEASE_EXPIRED`. Once the promote is done,
-    the old owner answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true. It
-    re-reads the owner record every 250 ms until then. Either answer means nothing was
-    written: send again, as its step says. Its log shows `host_owner_learned`.
+    permission to write, a live old owner can still take writes until it sees the freeze or
+    that permission runs out. After that, and while it is still cut from rEtcd, it answers
+    `LEASE_EXPIRED`. Once the promote is done, the old owner answers `NOT_PRIMARY` naming the
+    new owner (`hint`), with `no_mutation` true. It re-reads the owner record every 250 ms
+    until then. Either answer means nothing was written: send again, as its step says. Its log
+    shows `host_owner_learned`.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry

@@ -2669,18 +2669,21 @@ impl Host {
                     );
                 }
                 // A-R446: a routed fence is bound to this node's own control reads before F1
-                // sees it (`bind_routed_fence`), from whichever process sent it.
-                if let KernelEvent::Recovery(RecoveryEvent::FenceProven(proof)) = kind {
-                    self.control.read_fence_facts(
-                        self.node,
-                        self.boot,
-                        partition,
-                        correlation,
-                        proof,
-                        None,
-                    );
-                } else {
-                    self.push(site, EventKind::Kernel(kind), true, None);
+                // sees it (`bind_routed_fence`), from whichever process sent it. A-R447: a
+                // routed plan is only logged; the bound fence brings the stored one.
+                match kind {
+                    KernelEvent::Recovery(RecoveryEvent::FenceProven(proof)) => {
+                        self.control.read_fence_facts(
+                            self.node,
+                            self.boot,
+                            partition,
+                            correlation,
+                            proof,
+                            None,
+                        );
+                    }
+                    KernelEvent::Recovery(RecoveryEvent::Plan(_)) => {}
+                    kind => self.push(site, EventKind::Kernel(kind), true, None),
                 }
                 Ok(())
             }
@@ -2699,7 +2702,7 @@ impl Host {
                     .and_then(|facts| facts.grant.as_ref())
                     .map(|grant| grant.expiry_utc_ms);
                 match bind_routed_fence(partition, &proof, facts, now, &self.budgets) {
-                    Ok(()) => {
+                    Ok(plan) => {
                         tracing::info!(
                             node = self.node.0,
                             partition = partition.0,
@@ -2711,8 +2714,15 @@ impl Host {
                             partition,
                             correlation,
                         };
-                        let kind = KernelEvent::Recovery(RecoveryEvent::FenceProven(proof));
-                        self.push(site, EventKind::Kernel(kind), true, None);
+                        // A-R447: the stored plan, then the proof, in the order a promote sends
+                        // them.
+                        for event in [
+                            RecoveryEvent::Plan(Box::new(plan)),
+                            RecoveryEvent::FenceProven(proof),
+                        ] {
+                            let kind = KernelEvent::Recovery(event);
+                            self.push(site, EventKind::Kernel(kind), true, None);
+                        }
                     }
                     // A-R446b (critic-63 M2): this node's clock may lag the promoter's by up to 2ε
                     // while both are in bound. Short by no more than that, it reads and checks
@@ -10168,6 +10178,9 @@ pub struct FenceFacts {
     pub mod_revision: Revision,
     /// `grants/{record.owner}`, read after it; `None` when absent.
     pub grant: Option<GrantRecord>,
+    /// The bytes at `operations/{tag + proof.control_revision}`, read last: the plan the
+    /// promote that fenced at that revision stored (A-R447); `None` when absent.
+    pub plan: Option<Bytes>,
 }
 
 /// A-R446 (review of PR #63, option (b)): whether a routed `FenceProven` is true of the control
@@ -10194,14 +10207,21 @@ pub struct FenceFacts {
 /// 4. its root's owner boot is the proof's prior boot;
 /// 5. `grants/{owner}` is present, frozen, and the proof's prior grant;
 /// 6. the revocation is `ExpiryProven` (a routed `DurableDrain` is refused: only local paths
-///    send one), and this node's own clock view proves that grant's expiry past.
+///    send one), and this node's own clock view proves that grant's expiry past;
+/// 7. last (A-R447, issue #70), the promote that fenced at `control_revision` stored its plan
+///    at `operations/` (`plan_absent`), and it reads as one exactly (`plan_unreadable`).
+///
+/// `Ok` is that stored plan: the only plan the host gives F1 with a routed fence. A routed
+/// `Plan` is never pushed, so an app with only the link cert cannot choose the members, roles
+/// or boots a promote commits. The record is created once and never rewritten, and the commit
+/// CAS at `control_revision` pins the key it was read at.
 pub(crate) fn bind_routed_fence(
     routed: PartitionId,
     proof: &FencingProof,
     facts: Result<FenceFacts, String>,
     now: Tick,
     budgets: &Budgets,
-) -> Result<(), (&'static str, String)> {
+) -> Result<RecoveryPlan, (&'static str, String)> {
     if routed != proof.partition {
         return Err((
             "partition",
@@ -10277,7 +10297,16 @@ pub(crate) fn bind_routed_fence(
             ),
         ));
     }
-    Ok(())
+    let Some(stored) = facts.plan else {
+        return Err((
+            "plan_absent",
+            format!(
+                "no plan stored for the promote that fenced at revision {}",
+                proof.control_revision.0
+            ),
+        ));
+    };
+    crate::admin::decode_promote_plan(&stored).map_err(|error| ("plan_unreadable", error))
 }
 
 /// A-R446b (critic-63 M2): how long to wait before reading and checking a routed fence once

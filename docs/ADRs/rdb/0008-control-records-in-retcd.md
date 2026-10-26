@@ -199,6 +199,10 @@ requirements, gate V2's evidence is invalid.
 - Staged-then-flip means orphaned staged records accumulate when an operation abandons. The
   `operations/{id}` record makes cleanup resumable; a reclamation pass is out of scope for M7 and
   must not be forgotten.
+- A-R447 (issue #70): each promote run leaves one small record, its plan, at
+  `operations/{tag + R}`, where R is its own `Fencing` write. Nothing deletes these yet. An app
+  holding only the link certificate still chooses which node runs the stored plan; that node
+  cannot change the members or the owner the promoter chose.
 - The `resumable: false` admission limit (100 streams per principal) bounds how many independent
   rDB watchers one rDB cluster can register against rEtcd. At 50 machines with one control
   principal, a per-node watch per key family would exceed it. **Open design question: rDB should
