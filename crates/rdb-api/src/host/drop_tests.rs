@@ -1037,8 +1037,8 @@ fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
 /// answers, and the commit is repaired to `DegradedRf2` on the same members with node 3 in the
 /// barrier. Only there does the drop clock run, and it drops node 2, the copy really missing.
 ///
-/// Known gap, so ignored: a copy missed at formation never lands. Node 3 holds no generation 0,
-/// so it logs `land_link_refused{reason=anchor_generation_absent}`, its post-commit sync stays
+/// Known gap, so ignored (issue #69): a copy missed at formation never lands. Node 3 holds no
+/// generation 0, so it logs `land_link_refused{reason=anchor_generation_absent}`, its post-commit sync stays
 /// `sync_deferred`, and every repair's inventory fails the same way and commits `ReadOnly`
 /// again. The landing fix (critic-w9 "A-R383 re-plan", option (c)): treat an empty copy as head
 /// 0 at the root, as `inventory_reported_empty` already does. This body is the acceptance row
@@ -1048,7 +1048,7 @@ fn m10_s2_b6_a_read_only_commit_is_repaired_when_its_member_links_again() {
 /// dropped, seen 2026-10-24); the repair skipped whenever the rebuild is pinned, red (no repair).
 /// Integration (~5 s): the held bootstrap, three drop clocks of `ReadOnly`, the repair, the drop.
 #[config_log::retcd_test]
-#[ignore = "known gap: a copy missed at formation never lands; issue pending"]
+#[ignore = "known gap: a copy missed at formation never lands; achieveai/rDB#69"]
 fn m10_s2_b26_a_read_only_commit_drops_nothing_until_repaired() {
     const METHOD: &str = "m10_s2_b26_a_read_only_commit_drops_nothing_until_repaired";
     let dir = config_testkit::fs::temp_dir();
