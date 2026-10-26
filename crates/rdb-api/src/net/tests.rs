@@ -1241,6 +1241,24 @@ async fn a_newer_protocol_version_is_refused_naming_both_sides() {
     assert_eq!(reason, want);
 }
 
+/// M11 (ruling A-R449): a build speaking protocol_version 3, before `Move`/`Moved` were on the
+/// wire, is refused at the handshake naming both versions, never linked to fail on a move.
+/// Cut: `PROTOCOL_VERSION` left at 3 → the link comes up. Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let older = Spec {
+        version: 3,
+        ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 4");
+}
+
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
 /// link: the dialler is refused at once, naming the certificate (arch-s2 S2-1: "wrong cert
 /// refused at handshake"; tester-s2 found it waited, then said "not reachable"). Integration.

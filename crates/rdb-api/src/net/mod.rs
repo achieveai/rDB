@@ -69,7 +69,9 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// handshake, naming both. Move it whenever a type in [`wire`] changes, once a build that speaks
 /// it has been released. `3` came with M10 S2 (41cc012) and no released build speaks it, so
 /// `WireNodeStatus::pinned` (review-s2 F-004, A-R412) was added under `3`, not `4`.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// `4` came with M11: `WireCall::Move` and `WireAnswer::Moved` (ruling A-R449), so a build
+/// speaking `3` is refused at the handshake rather than failing to decode a move.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
