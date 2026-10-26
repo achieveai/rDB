@@ -2391,10 +2391,11 @@ fn m10_s2_a_node_process_before_the_first_open_finishes_is_told_to_wait() {
     );
 }
 
-/// M11 WS A (was A-R328's refusal): a node past the formed members is a spare. Its check
-/// returns the owner and the formed instance, as a member's does, and logs
-/// `db_open_spare_copy` naming it; a member's check logs no spare. Cut: refuse the spare again
-/// (or drop the log) and this goes red. Integration (~1 s): one fresh open until ready.
+/// M11 WS A (was A-R328's refusal; ruling A-R450): a node past the formed members is a spare.
+/// Its check returns the owner and the formed instance, as a member's does, and logs
+/// `db_open_spare_copy` naming it; a member's check logs no spare. What a spare may and may not
+/// do is A-R450's rows `m11_q2_a_*` and `m11_q2_b_*`. Cut: refuse the spare again (or drop the
+/// log) and this goes red. Integration (~1 s): one fresh open until ready.
 #[config_log::retcd_test]
 fn m11_a_node_past_the_members_opens_as_a_spare() {
     const METHOD: &str = "m11_a_node_past_the_members_opens_as_a_spare";
@@ -2426,6 +2427,119 @@ fn m11_a_node_past_the_members_opens_as_a_spare() {
         messages(METHOD).iter().any(|m| m == "db_open_spare_copy"),
         "the spare is logged"
     );
+}
+
+/// M11 ruling A-R450 (a): only a configured node id opens as a spare. Node 9 and node 0 are
+/// refused before anything is created, naming the range. Cut: drop the range check in
+/// `local_nodes`, red (node 9 opens as a spare). Integration (~1 s): one fresh open.
+#[config_log::retcd_test]
+fn m11_q2_a_an_unknown_node_id_is_refused_not_opened_as_a_spare() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    for node in [9, 0] {
+        match open_node(&rt, dir.path(), &store, &[node]) {
+            Err(OpenError::Config(text)) => assert!(
+                text.contains(&format!("each from 1 to {MAX_NODES}")),
+                "node {node}: {text}"
+            ),
+            other => panic!("node {node}: Config, not {:?}", other.map(|_| "Db")),
+        }
+        assert!(
+            !dir.path().join("nodes").join(node.to_string()).exists(),
+            "node {node}: no copy was created"
+        );
+    }
+}
+
+/// M11 ruling A-R450 (b), (c): a spare holds no copy, has no vote and serves nothing until a
+/// commit pins it. Node 4 opens beside a formed database: `partitions/1` is not written by the
+/// open (same revision, nodes 1 to 3), and node 4 holds no lineage, recovered nothing and has
+/// no R1 role, also after a put lands on the members. Membership changes only through the
+/// commit's CAS on `partitions/1`: after `move 3 4` the record, at a later revision, pins
+/// nodes 1, 2 and 4, and node 4 then holds the partition. Cut: `local_nodes` takes node 4's
+/// process for a full open, red (it forms its own database and is refused `Mismatch`).
+/// Integration (~6 s): a fresh open, the spare's open, the move's two re-plans.
+#[config_log::retcd_test]
+fn m11_q2_b_a_spare_holds_no_copy_and_takes_no_part_until_a_commit_pins_it() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let revision = || {
+        rt.block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record
+        .expect("partitions/1")
+        .mod_revision
+    };
+    let links = Arc::new(Links::default());
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the open of nodes 1 to 3");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let formed = revision();
+    let mut spare = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(4)],
+                links: Some(links),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 4's process");
+    put_through_pauses(&db, b"a", b"1", "a put with node 4 a spare");
+    assert_eq!(revision(), formed, "the spare's open wrote partitions/1");
+    assert_eq!(pinned_nodes(&rt, &store), Some(vec![1, 2, 3]));
+    let four = |spare: &Db| {
+        spare
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == NodeId(4))
+            .expect("node 4 answers a status look")
+    };
+    let idle = four(&spare);
+    assert_eq!(
+        (idle.holds.is_some(), idle.recovered, idle.role),
+        (false, None, "none"),
+        "a spare holds no copy and takes no part: {idle:?}"
+    );
+
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let deadline = std::time::Instant::now() + patience;
+    while !db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4").done {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "move 3 4 not done within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        revision() > formed,
+        "the move committed through partitions/1"
+    );
+    assert_eq!(pinned_nodes(&rt, &store), Some(vec![1, 2, 4]));
+    let pinned = four(&spare);
+    assert!(
+        pinned.holds.is_some(),
+        "node 4 holds the partition once pinned: {pinned:?}"
+    );
+    db.shutdown();
+    spare.shutdown();
 }
 
 /// The nodes `partitions/1` pins, in record order, or `None` for a record that names none.
