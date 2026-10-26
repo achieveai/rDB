@@ -3484,6 +3484,27 @@ impl Db {
                 ))
             }
         };
+        // Revobot #73 finding 1: a mode C out of a reopen's quarantine finds this open never
+        // ready, and a restart waits for that. The drop commit just landed, so the owner
+        // admits a moment later: wait for it, as the end of a rebuild does.
+        if !self.ready() {
+            if let Err(error) = self.wait_ready(within) {
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "generation {} left node {} out, but node {} (the owner) did not admit \
+                         writes within {} s ({error}), so node {} was not restarted or wiped: \
+                         restart it to re-add it",
+                        ready.generation.0,
+                        node.0,
+                        owner.0,
+                        within.as_secs(),
+                        node.0
+                    ),
+                ));
+            }
+        }
         let moved = aside.as_ref().map(|aside| aside.to.clone());
         // A1 (critic-65): once the folder has moved, every later error says where it is.
         let named = |mut error: ApiError| {

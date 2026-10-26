@@ -1264,6 +1264,13 @@ struct RebuildAsk {
     reply: RebuildReply,
 }
 
+/// What `admin rebuild` plans the drop from: the owner's newest commit, revoked as any re-plan
+/// is, or, with no commit here, the quarantined run's own plan and fence (Revobot #73 finding 1).
+enum RebuildBasis {
+    Committed(OwnerEpoch),
+    Quarantined(Box<(RecoveryPlan, FencingProof)>),
+}
+
 /// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
 const REJOIN: CorrelationId = CorrelationId(3);
 
@@ -1962,6 +1969,9 @@ struct Host {
     /// The status query whose event is being stepped, until P1's answer takes it.
     answering: Option<(RequestIdentity, Sender<Answer>)>,
     plans: BTreeMap<PartitionId, RecoveryPlan>,
+    /// Revobot #73 finding 1: per partition, the last fence F1 was offered, the one its newest run
+    /// started on. An `admin rebuild` out of a quarantine with no commit here plans from it.
+    fences: BTreeMap<PartitionId, FencingProof>,
     committed: BTreeMap<PartitionId, Box<RecoveryResult>>,
     landed: BTreeSet<(PartitionId, Generation)>,
     /// D7: per lineage, the one post-commit sync a peer asked of a generation this node has
@@ -2174,6 +2184,7 @@ impl Host {
             answer_stamps: BTreeMap::new(),
             answering: None,
             plans: BTreeMap::new(),
+            fences: BTreeMap::new(),
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
             deferred_syncs: BTreeMap::new(),
@@ -4231,6 +4242,11 @@ impl Host {
         };
         if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
             self.plans.insert(event.partition, (**plan).clone());
+        }
+        if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(proof))) =
+            &event.kind
+        {
+            self.fences.insert(event.partition, (**proof).clone());
         }
         // D8 (A-R337): an inventory answer to an older run's ask, which the link held while the
         // copy was down, never reaches F1's current run: as Reported it reads `StaleLineage`,
@@ -6317,8 +6333,10 @@ impl Host {
     /// #65 (critic-bb §3): `admin rebuild node`. Checks the guards on this node's newest
     /// commit ([`crate::admin::rebuild::decide`]) and answers at once for mode A. Mode B asks a
     /// re-plan without `node`, as [`Self::drop_copy`] does; mode C first replaces the
-    /// quarantined F1 with a fresh one, then does the same. [`Self::rebuild_duty`] answers
-    /// those. A refusal changes nothing.
+    /// quarantined F1 with a fresh one, then does the same; with no commit here (a reopen's F1
+    /// quarantined first), the guards read the quarantined run's plan, and the fresh run plans
+    /// from it ([`Self::replan_quarantined`]). [`Self::rebuild_duty`] answers those. A refusal
+    /// changes nothing.
     fn rebuild_asked(
         &mut self,
         partition: PartitionId,
@@ -6338,20 +6356,40 @@ impl Host {
             );
             reply.send(Err(refused));
         };
-        let Some(committed) = self.committed.get(&partition) else {
-            return refuse(
-                &reply,
-                Refused {
-                    guard: "owner",
-                    detail: format!(
-                        "node {} has committed no recovery of partition {}, so it cannot \
-                         rebuild a copy: ask the node that owns it",
-                        self.node.0, partition.0
-                    ),
-                },
-            );
+        let quarantined = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined));
+        // Revobot #73 finding 1: after a reopen, F1 can quarantine before anything commits here.
+        // Mode C then plans from that run's own plan and fence ([`Self::quarantined_basis`]).
+        let (members, generation, basis) = match self.committed.get(&partition) {
+            Some(committed) => (
+                committed.committed.pinned_config.members.clone(),
+                committed.new_generation,
+                RebuildBasis::Committed(committed.selected.root.owner_epoch),
+            ),
+            None => match self.quarantined_basis(partition).filter(|_| quarantined) {
+                Some((plan, fence)) => (
+                    plan.config.members.clone(),
+                    plan.anchor.lineage.generation,
+                    RebuildBasis::Quarantined(Box::new((plan, fence))),
+                ),
+                None => {
+                    return refuse(
+                        &reply,
+                        Refused {
+                            guard: "owner",
+                            detail: format!(
+                                "node {} has committed no recovery of partition {}, so it cannot \
+                                 rebuild a copy: ask the node that owns it",
+                                self.node.0, partition.0
+                            ),
+                        },
+                    )
+                }
+            },
         };
-        let members = &committed.committed.pinned_config.members;
+        let members = &members;
         let primary = members
             .iter()
             .find(|member| member.role == ReplicaRole::Primary)
@@ -6371,10 +6409,6 @@ impl Host {
                 },
             );
         }
-        let quarantined = self
-            .recoveries
-            .get(&partition)
-            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined));
         let known: Vec<NodeId> = crate::admin::members().iter().map(|m| m.node).collect();
         let asked = Asked {
             node,
@@ -6397,8 +6431,6 @@ impl Host {
             Ok(mode) => mode,
             Err(refused) => return refuse(&reply, refused),
         };
-        let generation = committed.new_generation;
-        let epoch = committed.selected.root.owner_epoch;
         let boot = self.links.boot_of(node);
         tracing::info!(
             node = self.node.0,
@@ -6453,7 +6485,95 @@ impl Host {
             },
         );
         self.blamed.remove(&partition);
-        self.revoke(partition, epoch, Some(node), None);
+        match basis {
+            RebuildBasis::Committed(epoch) => self.revoke(partition, epoch, Some(node), None),
+            RebuildBasis::Quarantined(run) => {
+                let (plan, fence) = *run;
+                self.replan_quarantined(partition, node, &plan, fence);
+            }
+        }
+    }
+
+    /// Revobot #73 finding 1: the plan and fence of `partition`'s newest F1 run, when this node
+    /// has no commit of it and that run's fence proves the plan's lineage. A reopen's F1 can
+    /// quarantine before anything commits; the fence still holds then, since nothing committed
+    /// over `partitions/{p}` after it was proved, and a fresh run's CAS checks that again.
+    fn quarantined_basis(&self, partition: PartitionId) -> Option<(RecoveryPlan, FencingProof)> {
+        if self.committed.contains_key(&partition) {
+            return None;
+        }
+        let plan = self.plans.get(&partition)?;
+        let fence = self.fences.get(&partition)?;
+        let fenced = fence.prior_generation == plan.anchor.lineage.generation
+            && fence.prior_owner_epoch == plan.anchor.lineage.owner_epoch;
+        fenced.then(|| (plan.clone(), fence.clone()))
+    }
+
+    /// Revobot #73 finding 1: mode C with no commit here. Offer the fresh F1 the quarantined
+    /// run's plan without `node`, at each kept member's live boot, and the same fence, as the
+    /// heal that started that run did. `node` is noted left out, so its restart is re-added
+    /// as a shadow, as after [`Self::drained`]'s drop. [`Self::rebuild_duty`] answers once the
+    /// commit lands, or when the fresh run quarantines again.
+    fn replan_quarantined(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        plan: &RecoveryPlan,
+        fence: FencingProof,
+    ) {
+        let members: Vec<Member> = plan
+            .config
+            .members
+            .iter()
+            .filter(|member| member.node != node)
+            .map(|member| Member {
+                boot: if member.node == self.node {
+                    self.boot
+                } else {
+                    self.links.boot_of(member.node).unwrap_or(member.boot)
+                },
+                ..*member
+            })
+            .collect();
+        if let Some(left) = plan.config.members.iter().find(|m| m.node == node) {
+            let entry = self.left_out.entry(partition).or_default();
+            entry.retain(|member| member.node != left.node);
+            entry.push(*left);
+        }
+        let version = ConfigVersion(plan.config.config_version.0 + 1);
+        let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
+        let fresh = crate::admin::recovery_plan(
+            plan.anchor,
+            version,
+            members,
+            self.boot,
+            plan.authority_view.grant_id,
+            plan.authority_view.authority_generation,
+        );
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            dropped = node.0,
+            generation = plan.anchor.lineage.generation.0,
+            config_version = version.0,
+            control_revision = fence.control_revision.0,
+            boots = ?boots,
+            "rebuild_quarantine_replan"
+        );
+        for event in [
+            RecoveryEvent::Plan(Box::new(fresh)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ] {
+            self.push(
+                Site {
+                    partition,
+                    correlation: REJOIN,
+                },
+                EventKind::Kernel(KernelEvent::Recovery(event)),
+                false,
+                None,
+            );
+        }
     }
 
     /// #65: answer each `admin rebuild` waiting on a re-plan without its node: G5 once a newer

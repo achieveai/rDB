@@ -441,3 +441,80 @@ fn b3_mode_c_refuses_when_the_kept_copies_still_diverge() {
         "nothing moved aside"
     );
 }
+
+/// Revobot #73 finding 1: node 3's copy is forked, then the whole `Db` shuts down and opens
+/// again. The reopen's F1 quarantines before any recovery commits, so the owner holds no
+/// committed result. `admin rebuild 3` still runs mode C from the quarantined run's plan: 3 is
+/// moved aside, pinned regular again, every acked write reads back and a new one is acked.
+/// Cut: `rebuild_asked` reads only `committed`: refused "has committed no recovery", red.
+/// Integration (~5-15 s): two opens, a fork, a quarantine, a re-plan, a restart, a re-add.
+#[config_log::retcd_test]
+fn b3_mode_c_after_a_reopen_rebuilds_from_the_quarantined_plan() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let mut db = ready(&rt, dir.path(), &store);
+    for i in 0..5 {
+        assert!(
+            put_acked(&db, &format!("pre{i}"), patience).is_some(),
+            "pre{i}"
+        );
+    }
+    let generation = db
+        .inspect(NodeId(3))
+        .and_then(|status| status.holds)
+        .expect("3 holds a lineage")
+        .generation;
+    db.fork_record(NodeId(3), generation).expect("3 forked");
+    db.shutdown();
+    drop(db);
+    let db = rt
+        .block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the reopen");
+    let started = Instant::now();
+    let mut phase = None;
+    while started.elapsed() < patience {
+        phase = db.inspect(NodeId(1)).and_then(|status| status.recovery);
+        if phase.as_deref() == Some("Quarantined") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        phase.as_deref(),
+        Some("Quarantined"),
+        "the reopen quarantines"
+    );
+    assert_eq!(
+        db.inspect(NodeId(1)).and_then(|status| status.recovered),
+        None,
+        "premise: nothing committed since the reopen"
+    );
+    let rebuilt = db.rebuild_with(NodeId(3), false).expect("the rebuild");
+    tracing::info!(line = %rebuilt.line(), "b3_rebuilt");
+    assert_eq!(rebuilt.mode, admin::rebuild::RebuildMode::Quarantined);
+    assert!(
+        rebuilt.kept.contains(&NodeId(1)) && rebuilt.kept.contains(&NodeId(2)),
+        "{rebuilt:?}"
+    );
+    let aside = rebuilt.aside.clone().expect("mode C always wipes");
+    assert!(aside.join("CURRENT").exists(), "{}", aside.display());
+    for key in (0..5).map(|i| format!("pre{i}")) {
+        let got = db.get(key.as_bytes()).expect("a read");
+        assert_eq!(
+            got.value.map(|(_, value)| value),
+            Some(Bytes::from(key.clone())),
+            "acked {key} reads back"
+        );
+    }
+    assert!(
+        put_acked(&db, "after", patience).is_some(),
+        "writes land again"
+    );
+}
