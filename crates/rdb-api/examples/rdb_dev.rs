@@ -8072,8 +8072,9 @@ mod tests {
 
     /// bb #65: `admin rebuild N [--wipe]` runs in process; `lr rebuild N --wipe` adds `--fence`
     /// once it has stopped N, and only after `--wipe` is it the fence check (A-R441 F2).
-    /// M11 T2: any configured node may be named, a spare or a node past 3 (`lr start 4 --wipe`
-    /// was refused as usage); a number outside 1 to `MAX_NODES` is still refused.
+    /// M11 T2: `parse_rebuild` takes any configured node 1 to 8 (`MAX_NODES`), a spare or a
+    /// node past 3; before T2 it took 1 to 3, so `lr start 4 --wipe` was refused as usage and
+    /// this row rejected `4`. The lead accepted the wider contract. 0 and 9 are still refused.
     /// Cut: accept `--fence` without `--wipe` and the `3 --fence` line goes red. Cut: parse
     /// with `parse_node` (1 to 3) and the `4 --wipe` line goes red. Unit.
     #[test]
