@@ -231,8 +231,9 @@
 //!                                         through this Db's store, as `control` prints them,
 //!                                         and the members line (M11): `members 1=owner
 //!                                         2=regular 4=shadow; not pinned 3 (as node 1 pins
-//!                                         them)`, then each `--nodes` link's `link node=N ..`
-//!                                         line
+//!                                         them)`, or `(as partitions/1 names them; ..)` when
+//!                                         the owner does not answer, then each `--nodes`
+//!                                         link's `link node=N ..` line
 //! admin move <from> <to>                  M11: move partition 1's copy from node <from> to
 //!                                         node <to> (a spare, `lr up --nodes K`): <to> joins
 //!                                         as a shadow, catches up from seq 1, then one
@@ -481,7 +482,9 @@ use rdb_core::contracts::authority::DenyReason;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::RetryRule;
 use rdb_core::contracts::event::Budgets;
-use rdb_core::contracts::ids::{AffinityId, BootId, Generation, NodeId, PartitionId, RequestId};
+use rdb_core::contracts::ids::{
+    AffinityId, BootId, Generation, NodeId, PartitionId, ReplicaRole, RequestId,
+};
 use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
 use sha2::{Digest as _, Sha256};
 
@@ -2287,31 +2290,68 @@ fn move_lines(db: &Db, from: NodeId, to: NodeId, say: &dyn Fn(&str)) -> bool {
 }
 
 /// `admin status`'s members line (M11): each node the owner's commit pins, with its role, then
-/// each node this process knows of that it does not pin: a spare or a copy left out.
-fn members_line(db: &Db) -> String {
-    let (owner, pinned) = match db.pinned_members() {
-        Ok(found) => found,
-        Err(error) => return format!("members: unknown: {error}"),
-    };
+/// each node this process knows of that it does not pin: a spare or a copy left out. When the
+/// owner does not answer, as when it is lost and `lr` prints the promote that ends the wait,
+/// the members come from `partitions/1`, which every commit writes through its CAS, and the
+/// line says so (lead ruling on dev-a item 3: `promote_hint` names only a node with a copy).
+fn members_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) -> String {
     let known: Vec<NodeId> = match db.links().net() {
         Some(net) => net.states().keys().copied().collect(),
         None => vec![NodeId(1), NodeId(2), NodeId(3)],
     };
+    let error = match db.pinned_members() {
+        Ok((owner, pinned)) => {
+            let pinned: Vec<(NodeId, ReplicaRole)> = pinned
+                .iter()
+                .map(|member| (member.node, member.role))
+                .collect();
+            return members_text(&pinned, &known, &format!("as node {} pins them", owner.0));
+        }
+        Err(error) => error,
+    };
+    let body = rt
+        .block_on(store.get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .ok()
+        .and_then(|read| read.record)
+        .map(|record| record.value);
+    body.and_then(|body| record_members_line(&body, &known, &error.to_string()))
+        .unwrap_or_else(|| format!("members: unknown: {error}"))
+}
+
+/// The members line from a `partitions/1` body, for an owner that did not answer (`why`).
+/// `None` for a body that names no members (layout 3 and older).
+fn record_members_line(body: &[u8], known: &[NodeId], why: &str) -> Option<String> {
+    let members = rdb_core::authority::partition::RecordMember::decode_all(body)?;
+    let pinned: Vec<(NodeId, ReplicaRole)> = members
+        .iter()
+        .map(|member| (member.node, member.role))
+        .collect();
+    Some(members_text(
+        &pinned,
+        known,
+        &format!("as partitions/1 names them; {why}"),
+    ))
+}
+
+/// `members 1=owner 2=regular 4=shadow; not pinned 3 (<source>)`.
+fn members_text(pinned: &[(NodeId, ReplicaRole)], known: &[NodeId], source: &str) -> String {
     let roles = pinned
         .iter()
-        .map(|member| {
-            let role = match member.role {
-                rdb_core::contracts::ids::ReplicaRole::Primary => "owner",
-                rdb_core::contracts::ids::ReplicaRole::RegularSecondary => "regular",
-                rdb_core::contracts::ids::ReplicaRole::Shadow => "shadow",
+        .map(|(node, role)| {
+            let role = match role {
+                ReplicaRole::Primary => "owner",
+                ReplicaRole::RegularSecondary => "regular",
+                ReplicaRole::Shadow => "shadow",
             };
-            format!("{}={role}", member.node.0)
+            format!("{}={role}", node.0)
         })
         .collect::<Vec<_>>()
         .join(" ");
     let out = known
         .iter()
-        .filter(|node| !pinned.iter().any(|member| member.node == **node))
+        .filter(|node| !pinned.iter().any(|(pinned, _)| pinned == *node))
         .map(|node| node.0.to_string())
         .collect::<Vec<_>>();
     let out = if out.is_empty() {
@@ -2319,10 +2359,7 @@ fn members_line(db: &Db) -> String {
     } else {
         out.join(" ")
     };
-    format!(
-        "members {roles}; not pinned {out} (as node {} pins them)",
-        owner.0
-    )
+    format!("members {roles}; not pinned {out} ({source})")
 }
 
 /// `admin rebuild`'s usage (#65).
@@ -4712,7 +4749,7 @@ fn admin_status_lines(
     store: &dyn ConfigStore,
 ) -> Vec<String> {
     let mut lines = record_lines(rt, store, "admin status");
-    lines.push(members_line(db));
+    lines.push(members_line(db, rt, store));
     match db.links().net() {
         Some(net) => lines.extend(link_lines(&net.states())),
         None => lines.push("links: the three nodes run in this process".to_owned()),
@@ -7639,6 +7676,59 @@ mod tests {
         let plain = partition_body(&record.encode()).expect("decodes");
         assert!(plain.ends_with(" root=-"), "{plain}");
         assert_eq!(partition_body(b"\x09junk"), None);
+    }
+
+    /// Lead ruling on dev-a item 3 (`promote_hint` named a node with no copy): with the owner
+    /// lost, `admin status` said only `members: unknown`, so `lr` had nothing to pick a promote
+    /// target from. The members line now comes from `partitions/1`'s members, says it does,
+    /// and names each known node not pinned. A layout-3 body names none and gives `None`.
+    /// Cut: `record_members_line` answers `None` always, and the first assert goes red. Unit.
+    #[test]
+    fn the_members_line_comes_from_the_record_when_the_owner_does_not_answer() {
+        use rdb_core::authority::partition::{PartitionRoot, RecordMember, RecordMode};
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::ids::{Revision, Seq};
+        use rdb_core::contracts::membership::CopyId;
+        let record = PartitionRecord {
+            partition: PartitionId(1),
+            owner: NodeId(1),
+            generation: Generation(4),
+            ..PartitionRecord::default()
+        };
+        let root = PartitionRoot {
+            mode: RecordMode::Committed,
+            owner_boot: BootId(5),
+            base_seq: Seq(7),
+            base_digest: Digest([0; 32]),
+            predecessor_generation: Generation(3),
+            predecessor_cutoff: Seq(6),
+            instance: [0x11; 16],
+            run: Revision(42),
+        };
+        let member = |copy: u8, node: u32, role: ReplicaRole| RecordMember {
+            copy: CopyId(copy),
+            node: NodeId(node),
+            role,
+        };
+        let members = [
+            member(1, 1, ReplicaRole::Primary),
+            member(3, 3, ReplicaRole::RegularSecondary),
+            member(4, 4, ReplicaRole::RegularSecondary),
+        ];
+        let known = [1, 2, 3, 4].map(NodeId);
+        let why = "node 1 (the owner) did not answer its status look";
+        assert_eq!(
+            record_members_line(&record.encode_with_members(&root, &members), &known, why)
+                .as_deref(),
+            Some(
+                "members 1=owner 3=regular 4=regular; not pinned 2 (as partitions/1 names them; \
+                 node 1 (the owner) did not answer its status look)"
+            )
+        );
+        assert_eq!(
+            record_members_line(&record.encode_with(&root), &known, why),
+            None
+        );
     }
 
     /// tester-s2 paper cut 1: a bare `status` said `usage: unknown command "status"`. It

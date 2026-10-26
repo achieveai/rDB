@@ -306,13 +306,27 @@ await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an ex
 }
 
 promote_hint() { # n line: a node that gave up waiting for an owner no link reaches names the
-    # promote that ends the wait (bug bash #64): the lowest running node but the lost one.
-    local n="$1" gone k
+    # promote that ends the wait (bug bash #64): the lowest running node but the lost one that
+    # holds a regular copy, by `admin status`'s members line, which comes from partitions/1 when
+    # the owner does not answer. A spare or a left-out node is never named: a promote refuses
+    # it (lead ruling on dev-a item 3).
+    local n="$1" gone k members
     gone="$(printf '%s' "$2" | sed -n 's/.*node \([0-9]\) is not reachable from this process.*/\1/p')"
     { [ -n "$gone" ] && [ "$gone" != "$n" ]; } || return 0
+    members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
+    k="$(promote_target "$gone" "$members")"
+    if [ -n "$k" ]; then
+        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
+    else
+        say "node $n waits for node $gone, the owner, and no link reaches it. No running node holds a regular copy to promote (${members:-admin status gave no members line})"
+    fi
+}
+
+promote_target() { # gone members-line: the lowest running node but `gone` the line names regular
+    local k
     for k in $(all_nodes); do
-        if [ "$k" != "$gone" ] && node_alive "$k"; then
-            say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
+        if [ "$k" != "$1" ] && node_alive "$k" && printf '%s' "$2" | grep -Eq " $k=regular[ ;]"; then
+            echo "$k"
             return 0
         fi
     done
