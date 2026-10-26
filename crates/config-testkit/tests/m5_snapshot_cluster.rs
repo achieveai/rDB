@@ -1280,11 +1280,17 @@ const SLOW_LINK: Duration = Duration::from_millis(400);
 /// deadline (`GrpcPeerTransport::send_with_schema`), as a slow transfer would be.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_behind_the_purge_point_rejoins_over_a_slow_link() {
+    // The 40 setup puts run while REPAIR_PROFILE builds a snapshot every 8 entries. On a loaded
+    // host one build's RocksDB checkpoint took 2.6-3.0 s, and a put landing behind it outlived
+    // the testkit's 2 s unscaled `write_timeout` (2 of 2 whole-workspace gates, 2026-10-26).
+    // The row asserts the rejoin, not write latency, so its budget is a scaled deadline.
+    let write_budget = SLOW_LINK_TIMERS.multiple(1);
     let cluster = Cluster::builder()
         .nodes(3)
         .storage(StorageKind::ROCKS)
         .snapshot(REPAIR_PROFILE)
         .timers(SLOW_LINK_TIMERS)
+        .timeouts(write_budget, write_budget)
         .start()
         .await;
     cluster
