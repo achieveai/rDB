@@ -3259,7 +3259,17 @@ fn m10_bb_67_r2_a_member_back_before_its_clock_is_not_dropped() {
                 .any(|member| member.node == NodeId(3) && member.boot == reboot))
         .then_some(())
     });
-    trio.ready();
+    // Node 3 came back as a shadow, and the owner promotes it regular in a second commit,
+    // fenced while it runs. A put inside that commit is denied `GenerationChanged` and answers
+    // `UNKNOWN_OUTCOME` at its deadline. Wait for that commit to finish first, as the
+    // peer_booted row does (71810e8).
+    until_through_blocks(&mut trio, "node 1 pins node 3 regular and admits", |trio| {
+        let status = trio.status(0);
+        (role_of_three(trio) == Some(ReplicaRole::RegularSecondary)
+            && status.fence.is_none()
+            && status.admits == Some(true))
+        .then_some(())
+    });
     match trio.ask(put(request)) {
         Answer::Txn { .. } => {}
         other => panic!("a put with all three back: {other:?}"),
