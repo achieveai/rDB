@@ -234,6 +234,12 @@ pub const DEFAULT_CLIENT: ClientId = ClientId(1);
 /// this process.
 pub const ALL_NODES: [NodeId; 3] = [NodeId(1), NodeId(2), NodeId(3)];
 
+/// The highest node number a node process may run (M11 WS A). Nodes past [`ALL_NODES`] are
+/// spares: a formed database's spare opens an empty copy bound to its instance and holds
+/// nothing until `admin move` pins it. Eight, the most members a `partitions/1` record pins
+/// (`MAX_RECORD_MEMBERS`).
+pub const MAX_NODES: u32 = 8;
+
 impl DbConfig {
     /// The checks [`Db::open`] makes before it starts anything, so a caller can make them
     /// before starting what the open needs, such as the control store.
@@ -664,19 +670,20 @@ async fn formed_member(
              (lr up) to finish, then start node {named} again"
         )));
     };
+    // M11 WS A: a node past the formed members is a spare. Its empty copy binds the instance
+    // and holds nothing until `admin move` pins it; no commit names it, so it takes no part.
     let members: Vec<NodeId> = admin::members().iter().map(|member| member.node).collect();
-    if let Some(stranger) = nodes.iter().find(|node| !members.contains(node)) {
-        return Err(OpenError::Config(format!(
-            "node {} is not a member of partition {} (its members are nodes {}), so it holds \
-             no copy to rebuild",
-            stranger.0,
-            PARTITION.0,
-            members
-                .iter()
-                .map(|node| node.0.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    let spares: Vec<u32> = nodes
+        .iter()
+        .filter(|node| !members.contains(node))
+        .map(|node| node.0)
+        .collect();
+    if !spares.is_empty() {
+        tracing::info!(
+            partition = PARTITION.0,
+            spares = ?spares,
+            "db_open_spare_copy"
+        );
     }
     Ok((record, root.instance))
 }
@@ -4098,20 +4105,21 @@ fn heal_within(budgets: &Budgets) -> Duration {
     )
 }
 
-/// Whether `local` names only some of the three nodes: a node process (ruling A-R231(a)).
+/// Whether `local` is not exactly the three nodes of [`ALL_NODES`]: a node process (ruling
+/// A-R231(a)). A spare past them (M11, up to [`MAX_NODES`]) is a node process too.
 ///
 /// # Errors
 ///
-/// [`OpenError::Config`] when it names a node twice or a node partition 1 does not have.
+/// [`OpenError::Config`] when it names a node twice or a node outside 1 to [`MAX_NODES`].
 fn local_nodes(local: &[NodeId]) -> Result<bool, OpenError> {
     let named: BTreeSet<NodeId> = local.iter().copied().collect();
-    if named.len() != local.len() || !named.iter().all(|node| ALL_NODES.contains(node)) {
+    if named.len() != local.len() || !named.iter().all(|node| (1..=MAX_NODES).contains(&node.0)) {
         return Err(OpenError::Config(format!(
-            "DbConfig::local is {:?}: name each of nodes 1, 2 and 3 at most once",
+            "DbConfig::local is {:?}: name each node at most once, each from 1 to {MAX_NODES}",
             local.iter().map(|node| node.0).collect::<Vec<_>>()
         )));
     }
-    Ok(named.len() < ALL_NODES.len())
+    Ok(named != ALL_NODES.iter().copied().collect::<BTreeSet<NodeId>>())
 }
 
 /// `path` written with one separator: a folder given with `/` and joined with `nodes` and a node

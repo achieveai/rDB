@@ -2391,30 +2391,40 @@ fn m10_s2_a_node_process_before_the_first_open_finishes_is_told_to_wait() {
     );
 }
 
-/// A-R328: a node that is not a member of partition 1 has no copy to rebuild, and the refusal
-/// names the members. `local_nodes` refuses such a node before any open reaches the check, so
-/// this calls the check itself. Integration (~1 s): one fresh open until ready.
+/// M11 WS A (was A-R328's refusal): a node past the formed members is a spare. Its check
+/// returns the owner and the formed instance, as a member's does, and logs
+/// `db_open_spare_copy` naming it; a member's check logs no spare. Cut: refuse the spare again
+/// (or drop the log) and this goes red. Integration (~1 s): one fresh open until ready.
 #[config_log::retcd_test]
-fn m10_s2_a_node_that_is_not_a_member_is_refused_with_the_members() {
+fn m11_a_node_past_the_members_opens_as_a_spare() {
+    const METHOD: &str = "m11_a_node_past_the_members_opens_as_a_spare";
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     written_and_closed(&rt, dir.path(), &store);
-    match rt.block_on(formed_member(&store, &[NodeId(2), NodeId(4)])) {
-        Err(OpenError::Config(text)) => assert_eq!(
-            text,
-            "node 4 is not a member of partition 1 (its members are nodes 1, 2, 3), so it holds \
-             no copy to rebuild"
-        ),
-        other => panic!("Config, not {other:?}"),
-    }
     let (record, instance) = rt
         .block_on(formed_member(&store, &[NodeId(2)]))
         .expect("node 2 is a member");
+    assert!(
+        !messages(METHOD).iter().any(|m| m == "db_open_spare_copy"),
+        "a member is no spare"
+    );
+    let (spare_record, spare_instance) = rt
+        .block_on(formed_member(&store, &[NodeId(4)]))
+        .expect("node 4 opens as a spare");
     assert_eq!(
         (record.owner, Some(instance)),
         (OWNER, marker(dir.path(), 1)),
         "a member's check returns the owner and the formed instance"
+    );
+    assert_eq!(
+        (spare_record.owner, spare_instance),
+        (record.owner, instance),
+        "a spare's check returns the same owner and instance"
+    );
+    assert!(
+        messages(METHOD).iter().any(|m| m == "db_open_spare_copy"),
+        "the spare is logged"
     );
 }
 
@@ -2941,17 +2951,17 @@ fn m10_s2_f009_a_node_process_whose_copy_is_staged_into_the_generation_never_joi
     );
 }
 
-/// A-R231(a): `DbConfig::local` names each of nodes 1-3 at most once, and a `Db` that runs no
-/// node needs `links`. Each is refused before anything opens. Unit (~10 ms).
+/// A-R231(a), M11: `DbConfig::local` names each node (1 to 8) at most once, and a `Db` that
+/// runs no node needs `links`. Each is refused before anything opens. Unit (~10 ms).
 #[config_log::retcd_test]
 fn m10_s2_a_repeated_or_unknown_local_node_and_an_app_open_without_links_are_refused() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    for nodes in [&[2, 2][..], &[4][..]] {
+    for nodes in [&[2, 2][..], &[9][..], &[0][..]] {
         match open_node(&rt, dir.path(), &store, nodes) {
             Err(OpenError::Config(text)) => assert!(
-                text.contains("name each of nodes 1, 2 and 3 at most once"),
+                text.contains("name each node at most once, each from 1 to 8"),
                 "{nodes:?}: {text}"
             ),
             other => panic!("{nodes:?} is Config, not {:?}", other.map(|_| "Db")),

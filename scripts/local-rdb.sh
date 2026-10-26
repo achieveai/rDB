@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run rDB as three real processes with one command (M10 S2, W4): `lr`.
 #
-#   scripts/local-rdb.sh up [--release] [--base-port P] [--root DIR] [--timeout-sec N]
+#   scripts/local-rdb.sh up [--nodes K] [--release] [--base-port P] [--root DIR] [--timeout-sec N]
 #   scripts/local-rdb.sh up --resume                              [--run DIR]
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
 #   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
@@ -11,6 +11,7 @@
 #   scripts/local-rdb.sh cut-control N | uncut-control N          [--run DIR]
 #   scripts/local-rdb.sh promote N [--drop M]                     [--run DIR]
 #   scripts/local-rdb.sh rebuild N [--wipe]                       [--run DIR]
+#   scripts/local-rdb.sh move FROM TO                             [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
@@ -18,6 +19,10 @@
 # each holding only its own copy, and waits for each to say ready. Ctrl-C or a failed step brings
 # everything it started back down. `up --resume` starts a run that is down again (its rEtcd,
 # then nodes 1-3) with its ports and binary paths; nothing is formed anew.
+#
+# `up --nodes K` (3 to 8, default 3) starts nodes 4 to K too, as spares (M11): each opens an
+# empty copy, is a member of nothing, and says ready like the others. `move FROM TO` runs
+# rdb_dev `admin move FROM TO`, which moves FROM's copy of partition 1 onto TO.
 #
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
 # it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
@@ -36,7 +41,7 @@
 #   faults/node-N.txt the fault file node N polls every 50 ms
 #   logs/rdb_node-N.jsonl, out/node-N.out|.err
 #
-# Ports: rEtcd takes P+1..P+24 (local-cluster.sh layout), node N listens on P+40+N. P defaults to
+# Ports: rEtcd takes P+1..P+24 (local-cluster.sh layout), node N listens on P+40+N (N up to K). P defaults to
 # 19800. A range that holds 27021 or 27031 (mongod on this host) is refused, and so is a port
 # something already listens on.
 #
@@ -70,9 +75,11 @@ TIMEOUT_SEC=90
 WIPE=0
 RESUME=0
 ARG=""
+ARG2=""
 FAULT_NODE=1
 DROP=""
 PROFILE=debug
+NODES_ARG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -81,6 +88,10 @@ while [ $# -gt 0 ]; do
         --run) RUN="$2"; shift 2 ;;
         --timeout-sec) TIMEOUT_SEC="$2"; shift 2 ;;
         --wipe) WIPE=1; shift ;;
+        --nodes)
+            [ "$COMMAND" = up ] || { echo "lr: --nodes goes with 'up' only; other verbs use the run's (run.env)" >&2; exit 2; }
+            case "${2:-}" in [3-8]) NODES_ARG="$2" ;; *) echo "lr: --nodes takes 3 to 8, got '${2:-}'" >&2; exit 2 ;; esac
+            shift 2 ;;
         --resume)
             [ "$COMMAND" = up ] || { echo "lr: --resume goes with 'up' only" >&2; exit 2; }
             RESUME=1; shift ;;
@@ -94,13 +105,14 @@ while [ $# -gt 0 ]; do
             PROFILE=release; shift ;;
         -*) echo "lr: unknown option $1" >&2; exit 2 ;;
         *)
+            if [ -n "$ARG" ] && [ "$COMMAND" = move ] && [ -z "$ARG2" ]; then ARG2="$1"; shift; continue; fi
             [ -z "$ARG" ] || { echo "lr: one argument only, got '$ARG' and '$1'" >&2; exit 2; }
             ARG="$1"; shift ;;
     esac
 done
 
 usage() {
-    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -149,12 +161,16 @@ pick_run() {
     [ -d "$RUN" ] || die "run folder $RUN is gone"
     # shellcheck disable=SC1091
     . "$RUN/run.env"
+    NODES="${NODES:-3}" # a run from before M11 has no NODES line: three nodes
 }
+
+NODES="${NODES_ARG:-3}"
+all_nodes() { seq 1 "$NODES"; }
 
 node_port() { echo $((BASE_PORT + 40 + $1)); }
 peers() {
     local n out=""
-    for n in 1 2 3; do out="$out${out:+,}$n=127.0.0.1:$(node_port "$n")"; done
+    for n in $(all_nodes); do out="$out${out:+,}$n=127.0.0.1:$(node_port "$n")"; done
     printf '%s' "$out"
 }
 control_endpoints() {
@@ -163,7 +179,10 @@ control_endpoints() {
 }
 
 check_node_arg() {
-    case "$1" in 1 | 2 | 3) ;; *) die "node must be 1, 2 or 3, got '${1:-}'" ;; esac
+    case "${1:-}" in
+        [1-8]) [ "$1" -le "$NODES" ] || die "node must be 1 to $NODES (this run has $NODES nodes), got '$1'" ;;
+        *) die "node must be 1 to $NODES, got '${1:-}'" ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------------------
@@ -291,7 +310,7 @@ promote_hint() { # n line: a node that gave up waiting for an owner no link reac
     local n="$1" gone k
     gone="$(printf '%s' "$2" | sed -n 's/.*node \([0-9]\) is not reachable from this process.*/\1/p')"
     { [ -n "$gone" ] && [ "$gone" != "$n" ]; } || return 0
-    for k in 1 2 3; do
+    for k in $(all_nodes); do
         if [ "$k" != "$gone" ] && node_alive "$k"; then
             say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
             return 0
@@ -372,7 +391,8 @@ fault_remove() { # n line
 }
 pair() { # A-B -> "A B"
     case "$1" in
-        [123]-[123]) [ "${1%-*}" != "${1#*-}" ] || die "a pair names two nodes, got $1"
+        [1-8]-[1-8]) [ "${1%-*}" != "${1#*-}" ] || die "a pair names two nodes, got $1"
+                     check_node_arg "${1%-*}"; check_node_arg "${1#*-}"
                      echo "${1%-*} ${1#*-}" ;;
         *) die "want a pair like 1-3, got '${1:-}'" ;;
     esac
@@ -410,7 +430,7 @@ up() {
         pick_run
         # A run still up says so before the port checks below, which would otherwise blame
         # the base port: a resume cannot change it, run.env sets it (critic-w5g A1).
-        for n in 1 2 3; do
+        for n in $(all_nodes); do
             node_alive "$n" && die "node $n of $RUN still runs: the run is up; 'lr down' first"
         done
         for role in $(awk '$1 ~ /^retcd-/ { print $1 }' "$RUN/pids" 2>/dev/null); do
@@ -419,7 +439,7 @@ up() {
         done
         fix="stop what holds it: this run's ports are fixed in $RUN/run.env"
     fi
-    lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 43))
+    lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 40 + NODES))
     for p in 27021 27031; do
         [ "$p" -lt "$lo" ] || [ "$p" -gt "$hi" ] || die "ports $lo-$hi hold $p (mongod on this host); pick another --base-port"
     done
@@ -449,6 +469,7 @@ BASE_PORT=$BASE_PORT
 CONTROL=$CONTROL
 SHA=$sha
 PROFILE=$PROFILE
+NODES=$NODES
 NODE_BIN=$(printf '%q' "$NODE_BIN")
 PILOT_BIN=$(printf '%q' "$PILOT_BIN")
 EOF
@@ -475,8 +496,8 @@ start_retcd() { # rEtcd of $RUN, with the trap that takes the run down if `up` s
 }
 
 form_and_start() {
-    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --apps pilot,pilot-a,pilot-b,admin >/dev/null
-    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs-other" --apps pilot >/dev/null
+    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --nodes "$NODES" --apps pilot,pilot-a,pilot-b,admin >/dev/null
+    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs-other" --nodes "$NODES" --apps pilot >/dev/null
     say "certificates in $RUN/certs (a second CA in $RUN/certs-other)"
     "$NODE_BIN" --form --dir "$RUN/db" --control "$CONTROL" --log-dir "$RUN/logs" \
         --ready-secs "$TIMEOUT_SEC" >"$RUN/out/form.out" 2>"$RUN/out/form.err" \
@@ -485,11 +506,11 @@ form_and_start() {
     start_all
 }
 
-start_all() { # nodes 1-3, then the wait for each: the tail of `up` and `up --resume`
+start_all() { # nodes 1 to K, then the wait for each: the tail of `up` and `up --resume`
     local n
-    for n in 1 2 3; do start_node "$n"; done
+    for n in $(all_nodes); do start_node "$n"; done
     local ok=1
-    for n in 1 2 3; do await_ready "$n" || ok=0; done
+    for n in $(all_nodes); do await_ready "$n" || ok=0; done
     UP_DONE=1
     if [ "$ok" != 1 ]; then
         # Left running so it can be looked at; the exit says it is not up.
@@ -502,7 +523,7 @@ start_all() { # nodes 1-3, then the wait for each: the tail of `up` and `up --re
 
 down() {
     local n
-    for n in 1 2 3; do stop_node "$n"; done
+    for n in $(all_nodes); do stop_node "$n"; done
     if [ -d "$RUN/ctl" ]; then
         "$REPO/scripts/local-cluster.sh" down --dir "$RUN/ctl" >"$RUN/out/ctl-down.out" 2>&1 \
             || cat "$RUN/out/ctl-down.out" >&2
@@ -537,7 +558,7 @@ status() {
     local n os state
     echo "run      $RUN"
     echo "control  $CONTROL"
-    for n in 1 2 3; do
+    for n in $(all_nodes); do
         os="$(pid_of "node-$n")"
         if os_pid_is "$os" rdb_node; then state="running pid $os"; else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
@@ -659,6 +680,9 @@ case "$COMMAND" in
         fi
         promote ;;
     rebuild) pick_run; check_node_arg "$ARG"; rebuild ;;
+    move)
+        pick_run; check_node_arg "$ARG"; check_node_arg "$ARG2"
+        admin_line "admin move $ARG $ARG2" ;;
     "") usage ;;
     *) echo "lr: unknown verb '$COMMAND'; the verbs are:" >&2; usage ;;
 esac

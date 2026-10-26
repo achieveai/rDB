@@ -617,7 +617,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                         .trim()
                         .split_once('=')
                         .ok_or_else(|| format!("--nodes: {pair:?} is not N=host:port"))?;
-                    let node = parse_node(node).map_err(|e| format!("--nodes: {e}"))?;
+                    let node = parse_any_node(node).map_err(|e| format!("--nodes: {e}"))?;
                     parsed.nodes.insert(node, addr.trim().to_owned());
                 }
             }
@@ -671,6 +671,16 @@ fn app_only_check(args: &Args) -> Result<(), String> {
 fn is_host_port(text: &str) -> bool {
     text.rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
+}
+
+/// A node of a run with spares (M11 WS A): 1 to [`rdb_api::db::MAX_NODES`]. [`parse_node`]
+/// keeps 1 to 3 for every command that acts on a member.
+fn parse_any_node(text: &str) -> Result<NodeId, String> {
+    let max = rdb_api::db::MAX_NODES;
+    match text.trim().parse::<u32>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(NodeId(n)),
+        _ => Err(format!("{text:?}: a node is 1 to {max}")),
+    }
 }
 
 fn parse_node(text: &str) -> Result<NodeId, String> {
