@@ -2030,6 +2030,9 @@ struct Host {
     left_out: BTreeMap<PartitionId, Vec<Member>>,
     /// M11: per partition, the copy move this owner runs ([`Host::move_step`]).
     moves: BTreeMap<PartitionId, CopyMove>,
+    /// M11 T1: per partition, the last move that committed here, `(from, to)`. Only it is
+    /// answered `already moved`; in memory, so a restarted owner refuses it instead.
+    moved: BTreeMap<PartitionId, (NodeId, NodeId)>,
     /// #65: per partition, the divergence evidence F1's last `Quarantine` reported, for
     /// `admin rebuild`'s G6. Kept until a rebuild replaces the quarantined F1.
     quarantines: BTreeMap<PartitionId, rdb_core::contracts::recovery::DivergenceEvidence>,
@@ -2223,6 +2226,7 @@ impl Host {
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
             moves: BTreeMap::new(),
+            moved: BTreeMap::new(),
             quarantines: BTreeMap::new(),
             rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
@@ -5975,8 +5979,9 @@ impl Host {
             self.moves.remove(&partition);
             return wait(why);
         }
+        let committed_here = self.moved.get(&partition) == Some(&(from, to));
         match (role(from), role(to)) {
-            (None, Some(ReplicaRole::RegularSecondary)) => {
+            (None, Some(ReplicaRole::RegularSecondary)) if committed_here => {
                 if ours {
                     self.moves.remove(&partition);
                 }
@@ -5987,6 +5992,16 @@ impl Host {
                         to.0, generation.0, from.0
                     ),
                 });
+            }
+            // T1: a source with no copy is refused unless this exact move committed here.
+            (None, _) => {
+                return refuse(format!(
+                    "node {} holds no copy of partition {} (members: {}): name a member as the \
+                     source",
+                    from.0,
+                    partition.0,
+                    member_list(&members)
+                ));
             }
             (_, Some(ReplicaRole::Primary)) => {
                 return refuse(format!(
@@ -6000,15 +6015,6 @@ impl Host {
                     "node {} already holds a regular copy of partition {}: name a node with no \
                      copy as the target",
                     to.0, partition.0
-                ));
-            }
-            (None, _) => {
-                return refuse(format!(
-                    "node {} holds no copy of partition {} (members: {}): name a member as the \
-                     source",
-                    from.0,
-                    partition.0,
-                    member_list(&members)
                 ));
             }
             (Some(ReplicaRole::Shadow), _) => {
@@ -6178,6 +6184,7 @@ impl Host {
         };
         if phase == "moved" {
             self.moves.remove(&partition);
+            self.moved.insert(partition, (mv.from, mv.to));
         }
         tracing::info!(
             node = self.node.0,

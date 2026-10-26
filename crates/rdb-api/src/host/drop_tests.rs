@@ -3343,3 +3343,26 @@ fn m11_d1_a_move_onto_a_left_out_node_pins_it_once() {
     });
     assert_eq!(members, vec![1, 2, 3], "node 3 pinned once");
 }
+
+/// M11 defect T1 (tester walk, 2026-10-26): `admin move 5 2` answered `already moved` for a
+/// move that never happened, because node 5 holds no copy and node 2 holds a regular one.
+/// `already moved` is said only for the move that committed here; any other source with no
+/// copy is refused, changing nothing.
+#[config_log::retcd_test]
+fn m11_t1_a_move_that_never_ran_is_not_already_moved() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    let ask = ClientCall::Move {
+        identity: identity(1),
+        from: NodeId(5),
+        to: NodeId(2),
+    };
+    match trio.ask(ask) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}");
+            assert!(error.no_mutation, "{error:?}");
+            assert!(error.detail.contains("node 5 holds no copy"), "{error:?}");
+        }
+        other => panic!("a move from a node with no copy: {other:?}"),
+    }
+}
