@@ -650,6 +650,56 @@ mod tests {
         );
     }
 
+    /// Count `cert_expiring` events on this thread until the returned guards drop.
+    ///
+    /// #43: with one dispatcher registered, tracing-core (0.1.36, `Dispatchers::rebuilder`,
+    /// `has_just_one`) takes a callsite's interest from the default of *whichever thread*
+    /// registers that callsite or rebuilds the cache. A test thread with no subscriber —
+    /// `expiry_follows_the_served_certificate` reaches the same `warn!` — then caches `never`,
+    /// and this thread's warning never reaches the counter ("the crossing warns", 0 counted).
+    /// A second registered dispatcher makes interest come from the whole list, so each event
+    /// is checked against its own thread's subscriber.
+    fn count_expiry_warnings() -> (
+        WarnCounter,
+        (tracing::subscriber::DefaultGuard, tracing::Dispatch),
+    ) {
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let counter = WarnCounter::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            tracing_subscriber::registry().with(counter.clone())
+        };
+        let guard = tracing::subscriber::set_default(subscriber);
+        (counter, (guard, second))
+    }
+
+    /// #43's forced repro for M6-63: after this thread's subscriber is set, a thread with no
+    /// subscriber first reaches the same `warn!` (registering its callsite, as
+    /// `expiry_follows_the_served_certificate` can) and then rebuilds the interest cache, as any
+    /// concurrent test in this binary can. The crossing must still warn here. The row does both
+    /// itself, so it does not depend on which other test ran first.
+    #[test]
+    fn the_expiry_warning_is_counted_after_another_thread_rebuilds_interest() {
+        let fixture = Fixture::new().with_client_plane();
+        let not_after = fixture.rotator.reload("poll").expect("reload")[0].cert_expiry_unix;
+        let inside = not_after - CERT_EXPIRY_WARN_SECONDS + 1;
+
+        let (counter, _counting) = count_expiry_warnings();
+        std::thread::spawn(|| {
+            let other = Fixture::new().with_client_plane();
+            let not_after = other.rotator.reload("poll").expect("reload")[0].cert_expiry_unix;
+            other
+                .rotator
+                .expiry_seconds(not_after - CERT_EXPIRY_WARN_SECONDS + 1);
+            tracing::callsite::rebuild_interest_cache();
+        })
+        .join()
+        .expect("the thread with no subscriber does not panic");
+
+        fixture.rotator.expiry_seconds(inside);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1, "the crossing warns");
+    }
+
     /// M6-63: the warning latches on the crossing and re-arms when a rotation moves it back.
     ///
     /// Asserted by counting the emitted events through [`WarnCounter`], for the reason its own
@@ -662,13 +712,8 @@ mod tests {
         let inside = not_after - CERT_EXPIRY_WARN_SECONDS + 1;
         let outside = not_after - CERT_EXPIRY_WARN_SECONDS - 1;
 
-        let counter = WarnCounter::default();
+        let (counter, _counting) = count_expiry_warnings();
         let warnings = || counter.0.load(Ordering::Relaxed);
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt as _;
-            tracing_subscriber::registry().with(counter.clone())
-        };
-        let _guard = tracing::subscriber::set_default(subscriber);
 
         fixture.rotator.expiry_seconds(outside);
         assert_eq!(warnings(), 0, "a fresh certificate is not near expiry");

@@ -7848,9 +7848,10 @@ mod tests {
     /// `NotASource` from the retired receiver, F1 waited its 14 s out and dropped node 1 again,
     /// writes refused all that while. Now node 2 restores a dormant receiver to source it: no
     /// catch-up is refused, no re-plan is abandoned, and node 1 is promoted back. Node 1
-    /// restarts until one promote needed that catch-up, so the row never passes without one.
-    /// Cut: the source restore keeps a retired receiver (before the fix): `catch_up_refused`,
-    /// red.
+    /// restarts with its link to node 2 held until puts land, so the promote needs that
+    /// catch-up and the row never passes without one (#43: unforced, under load, 20 restarts
+    /// gave none). Cut: the source restore keeps a retired receiver (before the fix):
+    /// `catch_up_refused`, red. Cut: no hold: no catch-up, red.
     /// Integration (~10-60 s): the promote waits node 1's grant out, then each re-add and promote.
     #[config_log::retcd_test]
     fn m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on() {
@@ -7871,65 +7872,69 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let lines = || config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-        // The catch-up is routed only when a put lands between the shadow's last ACK and the
-        // promote's fence, so node 1 restarts until one was (a restart from `Active` is pinned
-        // as a shadow again, D9), at most twenty times. Each restart's writer starts after it: a
-        // put sent across a restart waits its timeout out.
-        let mut routed = 0;
-        let mut request = 1_000;
-        for _ in 0..20 {
-            let before = lines().len();
-            db.restart_node(OWNER).expect("restart node 1");
-            let stop = std::sync::atomic::AtomicBool::new(false);
-            let base = request;
-            let (cycle, sent) = std::thread::scope(|scope| {
-                let writer = scope.spawn(|| {
-                    let mut sent = 0;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let id = app_request_id(base + sent).expect("below 2^63");
-                        let _ = db.put_as(id, format!("w{sent}").as_bytes(), b"v", None);
-                        sent += 1;
-                        std::thread::yield_now();
+        // The catch-up is routed only when node 1 is short of node 2's head at the promote's
+        // fence. Waiting for a put to land in that window by chance failed under load (#43:
+        // 20 restarts, 20 promotes, no catch-up). So node 1 restarts with its link to node 2
+        // held, and puts land on nodes 2 and 3 before the heal: node 1 is provably behind.
+        let before = lines().len();
+        db.links().hold(OWNER, NodeId(2));
+        db.restart_node(OWNER).expect("restart node 1");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let landed = std::sync::atomic::AtomicU64::new(0);
+        let cycle = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut sent = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let id = app_request_id(1_000 + sent).expect("below 2^63");
+                    if db
+                        .put_as(id, format!("w{sent}").as_bytes(), b"v", None)
+                        .is_ok()
+                    {
+                        landed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    sent
-                });
-                let cycle = loop {
-                    let lines = lines();
-                    let cycle = lines[before..].to_vec();
-                    let settled = cycle
-                        .iter()
-                        .position(|line| {
-                            line["@m"] == "shadow_promote"
-                                && line["node"] == 2
-                                && line["shadow"] == 1
-                        })
-                        .is_some_and(|at| {
-                            cycle[at..].iter().any(|line| {
-                                (line["@m"] == "rejoin_committed" && line["node"] == 2)
-                                    || line["@m"] == "rejoin_abandoned"
-                            })
-                        });
-                    if settled {
-                        break cycle;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "node 2 did not promote node 1 back within {patience:?}"
-                    );
-                    std::thread::sleep(Duration::from_millis(50));
-                };
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                (cycle, writer.join().expect("writer"))
+                    sent += 1;
+                    std::thread::yield_now();
+                }
             });
-            request += sent;
-            if cycle
-                .iter()
-                .any(|line| line["@m"] == "catch_up_routed" && line["node"] == 2)
-            {
-                routed += 1;
-                break;
+            while landed.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no put landed on nodes 2 and 3 while node 1's link was held, within \
+                     {patience:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
             }
-        }
+            db.links().heal(OWNER, NodeId(2));
+            let cycle = loop {
+                let lines = lines();
+                let cycle = lines[before..].to_vec();
+                let settled = cycle
+                    .iter()
+                    .position(|line| {
+                        line["@m"] == "shadow_promote" && line["node"] == 2 && line["shadow"] == 1
+                    })
+                    .is_some_and(|at| {
+                        cycle[at..].iter().any(|line| {
+                            (line["@m"] == "rejoin_committed" && line["node"] == 2)
+                                || line["@m"] == "rejoin_abandoned"
+                        })
+                    });
+                if settled {
+                    break cycle;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "node 2 did not promote node 1 back within {patience:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            cycle
+        });
+        let routed = cycle
+            .iter()
+            .filter(|line| line["@m"] == "catch_up_routed" && line["node"] == 2)
+            .count();
         let lines = lines();
         let refused: Vec<_> = lines
             .iter()
