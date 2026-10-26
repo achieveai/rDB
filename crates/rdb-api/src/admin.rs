@@ -1777,6 +1777,7 @@ pub(crate) fn promote_members(
 const PROMOTE: CorrelationId = CorrelationId(4);
 
 /// [`promote_looked`] with no refused look: the entry the tests use.
+#[cfg(test)]
 pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
     promote_looked(ctx, None).await
 }
