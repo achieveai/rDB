@@ -335,6 +335,29 @@ async fn m5_104_client_with_dedup_resubmits_once_after_unknown_outcome() {
     });
 
     pause.reached().await;
+    // #43: isolate only once both survivors have applied the entry. A successor accepts the
+    // resubmit's dedup command only if its own applied state already holds a schema-2 entry:
+    // with the old leader unreachable, its live minimum reads that voter as schema 1
+    // (`schema_gate`, ADR-0030 A7, ruling M6-R15). Isolated at once, the followers may not yet
+    // know the entry is committed, and under load the successor answered the resubmit
+    // `feature_not_activated` before it applied anything (lead gate 07cee02, 2026-10-13).
+    // Followers never log `feature_activated` (only a leader samples it), so the wait is on
+    // the applied revision, which the same reader carries.
+    cluster
+        .wait_for(
+            "both survivors have applied the dedup entry",
+            cluster.deadline(15),
+            || {
+                cluster
+                    .ids()
+                    .into_iter()
+                    .filter(|&id| id != leader)
+                    .all(|id| cluster.metrics(id).cluster_revision > before_revision)
+                    .then_some(())
+            },
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
     cluster.isolate(leader);
     // Do not gate the release on the *real* election: this environment has been observed to
     // need several backed-off election rounds once isolation drops a 3-node cluster to a
