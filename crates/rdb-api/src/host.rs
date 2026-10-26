@@ -6067,6 +6067,17 @@ impl Host {
                     to.0, partition.0
                 ));
             }
+            // T7 paper cut: both still hold copies, so no move between them runs here; one asked
+            // of an earlier owner was lost with it.
+            (Some(_), Some(ReplicaRole::RegularSecondary)) => {
+                return refuse(format!(
+                    "node {} already holds a regular copy of partition {}, and node {} still \
+                     holds its copy: no move between them runs on node {} (the owner); one \
+                     asked of an earlier owner was lost with it. Name a node with no copy as \
+                     the target",
+                    to.0, partition.0, from.0, self.node.0
+                ));
+            }
             (_, Some(ReplicaRole::RegularSecondary)) => {
                 return refuse(format!(
                     "node {} already holds a regular copy of partition {}: name a node with no \

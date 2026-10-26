@@ -3803,6 +3803,29 @@ fn m11_t12_a_rebuild_onto_a_spare_fills_the_free_slot() {
     }
 }
 
+/// M11 T7 paper cut (tester walk): after a promote the new owner holds no move, and `move 4 6`
+/// with both nodes regular said only that node 6 already holds a regular copy. The refusal now
+/// says the source still holds its copy too, so no move between them runs here: one asked of an
+/// earlier owner was lost with it. Here nodes 2 and 3 are both regular and no move was asked.
+/// Unit-sized (~1 s): bootstrap only.
+#[config_log::retcd_test]
+fn m11_t7_b_a_move_between_two_regular_copies_says_none_runs_here() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 2, 3)) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}");
+            assert!(
+                error.detail.contains("node 2 still holds its copy")
+                    && error.detail.contains("lost")
+                    && !error.detail.contains("  "),
+                "{error:?}"
+            );
+        }
+        other => panic!("move 2 3 with both regular: {other:?}"),
+    }
+}
+
 /// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
 /// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
 /// left-out member, and the partition pinned the moved-off copy again on its own. The move's
