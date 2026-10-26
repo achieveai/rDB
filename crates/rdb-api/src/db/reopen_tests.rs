@@ -2633,14 +2633,22 @@ fn m11_t6_a_reopen_pins_the_members_the_record_names_not_nodes_1_to_3() {
         Some(vec![1, 2, 4]),
         "the reopen pins the record's members"
     );
-    assert!(
-        db.get(b"after").is_ok(),
+    assert_eq!(
+        read_bytes(&db, b"after"),
+        Some(b"2".to_vec()),
         "the write after the move reads back"
     );
-    assert!(
-        db.get(b"before").is_ok(),
+    assert_eq!(
+        read_bytes(&db, b"before"),
+        Some(b"1".to_vec()),
         "the write before the move reads back"
     );
+}
+
+/// The bytes `object` reads back as, `None` when absent (critic M3: `is_ok` cannot tell).
+fn read_bytes(db: &Db, object: &[u8]) -> Option<Vec<u8>> {
+    let read = db.get(object).expect("the read is answered");
+    read.value.map(|(_, bytes)| bytes.to_vec())
 }
 
 /// The role `partitions/1` pins `node` as, if it pins it.
@@ -2854,7 +2862,8 @@ fn m11_q4_a_move_resumes_after_the_owner_restarts_with_its_shadow_pinned() {
         Some(vec![1, 2, 4]),
         "the resumed move"
     );
-    assert!(db.get(b"before").is_ok() && db.get(b"after").is_ok());
+    assert_eq!(read_bytes(&db, b"before"), Some(b"1".to_vec()), "before the move");
+    assert_eq!(read_bytes(&db, b"after"), Some(b"2".to_vec()), "after the restart");
 }
 
 /// A-R328: an empty copy already bound to another database's instance does not join this one.
