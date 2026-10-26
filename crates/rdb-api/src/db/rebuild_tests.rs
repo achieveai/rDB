@@ -325,7 +325,8 @@ fn b3_g4_a_rebuild_with_the_other_copy_unreachable_is_refused_untouched() {
 /// G3's second half (critic-65 A2): while the owner works on one rebuild, a second is refused,
 /// and the first still completes. Node 3's rebuild (mode B) is asked on another thread; once
 /// the owner logged it, node 2's is refused G3 and nothing of 2 changes.
-/// Cut: drop `rebuild_asks` from G3's `rejoin` term: 2's rebuild is let through, red.
+/// Cut: G3's `rejoin` term to `false`: 2's ask is let through and times out, red. Dropping only its
+/// `rebuild_asks` half stays green: by the time 2 is asked, the drop re-plan is in `rejoins`.
 /// Integration (~5-15 s): one open, a drop re-plan, a restart, a re-add.
 #[config_log::retcd_test]
 fn b3_g3_a_second_rebuild_while_one_runs_is_refused() {
@@ -362,7 +363,7 @@ fn b3_g3_a_second_rebuild_while_one_runs_is_refused() {
 /// G6 through the owner (critic-65 F3): node 3's fork quarantines with evidence naming copies 0
 /// and 2 (nodes 1 and 3). Rebuilding node 2, whose copy the evidence does not name, is refused
 /// G6 with `no_mutation`, and nothing restarts.
-/// Cut: `names` always true: 2's rebuild is let through, red.
+/// Cut: `names` always true: red, but through G4 (3 is a shadow, so dropping 2 leaves 1 alone).
 /// Integration (~1-3 s): one open, a fork, a quarantine.
 #[config_log::retcd_test]
 fn b3_g6_a_quarantined_rebuild_of_an_unnamed_copy_is_refused() {
