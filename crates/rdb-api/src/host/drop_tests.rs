@@ -3575,6 +3575,69 @@ fn m11_t8_a_caught_up_shadow_with_no_link_is_not_promoted() {
     );
 }
 
+/// M11 defect T11 (tester walk, ruling A-R455): two left-out nodes were re-added for one free
+/// slot, and the extra one stayed a shadow for ever, blocking every move as "still catching
+/// up". A re-add now pins only up to the free slots, shadows counted. Node 3 is dropped, so
+/// the commit pins nodes 1 and 2; node 4 is left out too (as after an earlier drop), and both
+/// are up at a newer boot. One is re-added and promoted; the other stays out, and a move onto
+/// it then runs.
+/// Cut: `readd_candidate` counts regular copies only, red (a fourth member is pinned).
+/// Integration (~6 s): b1's drop, one re-add and its promote, the hold.
+#[config_log::retcd_test]
+fn m11_t11_a_restart_re_add_pins_only_the_free_slots() {
+    const METHOD: &str = "m11_t11_a_restart_re_add_pins_only_the_free_slots";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.nodes[0]
+        .0
+        .left_out
+        .entry(PartitionId(1))
+        .or_default()
+        .push(Member {
+            copy: CopyId(3),
+            node: NodeId(4),
+            boot: BootId(0),
+            role: ReplicaRole::RegularSecondary,
+        });
+    trio.links.heal_all();
+    restart(&mut trio, dir.path(), 3);
+    let (_, _, members) = trio.until("node 1 back at three regular copies", |trio| {
+        let three_regular = trio.nodes[0]
+            .0
+            .committed
+            .get(&PartitionId(1))?
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count()
+            == 3;
+        three_regular.then(|| commit_of(trio)).flatten()
+    });
+    pass(&mut trio, 1_500);
+    let (_, _, after) = commit_of(&trio).expect("a commit");
+    assert_eq!(
+        after, members,
+        "another member was pinned past the free slot"
+    );
+    assert_eq!(after.len(), 3, "{after:?}");
+    let readds: Vec<_> = logged!(METHOD, "rejoin_plan")
+        .into_iter()
+        .filter(|plan| plan["readded"] != "None")
+        .collect();
+    assert_eq!(readds.len(), 1, "one re-add for one slot: {readds:?}");
+    let spare = if after.contains(&3) { 4 } else { 3 };
+    match trio.ask(move_call(10, 2, spare)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 2 {spare} with the slot filled: {other:?}"),
+    }
+}
+
 /// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
 /// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
 /// left-out member, and the partition pinned the moved-off copy again on its own. The move's

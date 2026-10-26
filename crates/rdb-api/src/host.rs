@@ -5217,12 +5217,9 @@ impl Host {
     /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
     /// rejoiner) is re-added at once, and a copy dropped at its live boot waits for a restart.
     fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
-        let copies = config
-            .members
-            .iter()
-            .filter(|member| member.role != ReplicaRole::Shadow)
-            .count();
-        if copies >= crate::admin::members().len() {
+        // A-R455 (T11): a shadow holds a slot too, so a re-add pins only up to the free slots;
+        // an extra left-out node stays out rather than becoming a shadow with no slot to fill.
+        if config.members.len() >= crate::admin::members().len() {
             return None;
         }
         self.left_out.get(&partition)?.iter().copied().find(|left| {
@@ -6086,10 +6083,23 @@ impl Host {
             .iter()
             .find(|member| member.role == ReplicaRole::Shadow && member.node != to)
         {
+            let regular = members
+                .iter()
+                .filter(|member| member.role != ReplicaRole::Shadow)
+                .count();
+            // A-R455: "catching up" names only a shadow that holds a free slot.
+            if regular < crate::admin::members().len() {
+                return wait(format!(
+                    "node {} is pinned as a shadow of partition {} and still catching up: run \
+                     the move again once it is regular",
+                    other.node.0, partition.0
+                ));
+            }
             return wait(format!(
-                "node {} is pinned as a shadow of partition {} and still catching up: run the \
-                 move again once it is regular",
-                other.node.0, partition.0
+                "node {} is pinned as a shadow of partition {} beside all {} regular copies: an \
+                 earlier move onto it was not finished. Finish it with `admin move <source> {}`, \
+                 then run this move",
+                other.node.0, partition.0, regular, other.node.0
             ));
         }
         if role(to) == Some(ReplicaRole::Shadow) && !self.linked(to) {
