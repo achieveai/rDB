@@ -27,7 +27,7 @@
 
 use bytes::Bytes;
 
-use crate::authority::partition::{PartitionRecord, PartitionRoot};
+use crate::authority::partition::{PartitionRecord, PartitionRoot, RecordMember};
 use crate::contracts::authority::BlockReason;
 use crate::contracts::control::{CasOutcome, ControlEffect, ControlKey, ReadOutcome};
 use crate::contracts::ids::{ControlRequestId, OwnerEpoch, PartitionId, Revision};
@@ -84,6 +84,9 @@ pub(crate) struct Cas {
     record: PartitionRecord,
     /// Its layout-3 root, when F1 is bound to an rDB instance (M10, arch R3b).
     root: Option<PartitionRoot>,
+    /// The members the plan pins, written after the root as layout 4 (bug bash #64, ruling
+    /// A-R426). Only with a root: a record with no root stays layout 2.
+    members: Vec<RecordMember>,
     /// The owner epoch this proposal supersedes. A record above it on the re-read is a peer's.
     prior_epoch: OwnerEpoch,
     rereading: bool,
@@ -95,11 +98,12 @@ pub(crate) struct Cas {
 }
 
 impl Cas {
-    /// A proposal of `record`, with `root` when there is one, over ownership at `prior_epoch`,
-    /// sent as `request`, unanswered at `deadline` read as `Unknown`.
+    /// A proposal of `record`, with `root` when there is one, and `members` after it, over
+    /// ownership at `prior_epoch`, sent as `request`, unanswered at `deadline` read as `Unknown`.
     pub(crate) const fn new(
         record: PartitionRecord,
         root: Option<PartitionRoot>,
+        members: Vec<RecordMember>,
         prior_epoch: OwnerEpoch,
         request: ControlRequestId,
         deadline: Tick,
@@ -107,6 +111,7 @@ impl Cas {
         Self {
             record,
             root,
+            members,
             prior_epoch,
             rereading: false,
             request,
@@ -129,28 +134,32 @@ impl Cas {
         }
     }
 
-    /// The bytes this proposal writes: layout 3 with its root, or layout 2 without one.
+    /// The bytes this proposal writes: layout 4 with its root and members (A-R426 M1), or
+    /// layout 2 without a root.
     fn body(&self) -> Bytes {
         self.root.map_or_else(
             || self.record.encode(),
-            |root| self.record.encode_with(&root),
+            |root| self.record.encode_with_members(&root, &self.members),
         )
     }
 
     /// Whether `value` is this proposal's record from the same run. The mode is not compared:
-    /// the activation finds the recovery CAS's `Committed` bytes when it has not landed yet.
+    /// the activation finds the recovery CAS's `Committed` bytes when it has not landed yet. With a
+    /// root, the members must match too (A-R426 M2): a record that pins another set is not ours.
     fn same_run(&self, value: &[u8]) -> bool {
         let record = PartitionRecord::decode(value).is_some_and(|read| read == self.record);
         let root = PartitionRoot::decode(value);
         record
             && match self.root {
                 None => root.is_none(),
-                Some(ours) => root.is_some_and(|read| {
-                    PartitionRoot {
-                        mode: ours.mode,
-                        ..read
-                    } == ours
-                }),
+                Some(ours) => {
+                    root.is_some_and(|read| {
+                        PartitionRoot {
+                            mode: ours.mode,
+                            ..read
+                        } == ours
+                    }) && RecordMember::decode_all(value).as_deref() == Some(&self.members[..])
+                }
             }
     }
 
