@@ -213,9 +213,10 @@ pub struct Step {
 
 impl Step {
     /// The step as `rdb_dev admin plan` prints it, ending `# <why>`. Only a line that is a live
-    /// command starts `rdb_dev`: a copy move prints as `rdb_dev admin move <from> <to>`, with
-    /// `--partition P` when P is not 1 (today's CLI moves partition 1 only). A primary handoff
-    /// has no live command, because an owner move is refused (D3), so it prints as `step:`.
+    /// command starts `rdb_dev`: a copy move of partition 1 prints as
+    /// `rdb_dev admin move <from> <to>`. Two steps have no live command and print as `step:`: a
+    /// copy move of another partition (today's CLI moves partition 1 only, critic A2), and a
+    /// primary handoff, because an owner move is refused (D3).
     #[must_use]
     pub fn line(&self) -> String {
         let action = if self.primary {
@@ -228,8 +229,9 @@ impl Step {
             format!("rdb_dev admin move {} {}", self.from, self.to)
         } else {
             format!(
-                "rdb_dev admin move {} {} --partition {}",
-                self.from, self.to, self.partition
+                "step: move partition {}'s copy from node {} to node {} \
+                 (no live command: today's CLI moves partition 1 only)",
+                self.partition, self.from, self.to
             )
         };
         format!("{action:<40} # {}", self.why.describe())

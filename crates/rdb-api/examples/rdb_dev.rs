@@ -442,10 +442,10 @@
 //!
 //! `rdb_dev admin plan <inventory.json> [--max-moves K]` (M11, model only) starts nothing and
 //! talks to no cluster. It reads an inventory file (nodes, and where each partition's copies and
-//! primary are; format in `docs/rdb/local-cluster.md`), plans at most K steps (no limit without
-//! the flag), prints one `rdb_dev admin move <from> <to> --partition P [--primary]` line per
-//! step with its reason, then `after:` with the skews and one `residual:` line per claim left
-//! unmet. Nothing is applied. A file that does not read, or an inventory that does not add up,
+//! primary are; format in `docs/rdb/placement-plan.md`), plans at most K steps (no limit without
+//! the flag), prints one line per step with its reason (`rdb_dev admin move <from> <to>` for a
+//! copy move of partition 1, a `step:` line for anything no live command takes), then
+//! `after:` with the skews and one `residual:` line per claim left unmet. Nothing is applied. A file that does not read, or an inventory that does not add up,
 //! prints `rdb_dev admin plan: ..` to stderr and exits 2.
 
 #[path = "support/hostile_store.rs"]

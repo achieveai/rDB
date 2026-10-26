@@ -782,7 +782,8 @@ fn a_copy_never_lands_in_a_failure_domain_another_copy_uses_when_spread_is_feasi
 
 /// Node 1 is draining and leads every partition, so the plan hands three primaries off and moves
 /// copies of partition 1 and of others. Only a live command may print as an `rdb_dev` line: an
-/// owner move is refused (D3), so a primary handoff prints as a plain `step:` line.
+/// owner move is refused (D3), so a primary handoff prints as a plain `step:` line, and so does
+/// a copy move of a partition other than 1, which no live command takes.
 #[retcd_test]
 fn a_primary_handoff_never_prints_as_an_rdb_dev_command_line() {
     let mut nodes: Vec<Node> = (1..=6).map(node).collect();
@@ -801,11 +802,13 @@ fn a_primary_handoff_never_prints_as_an_rdb_dev_command_line() {
             assert!(line.starts_with(&command), "{line}");
             assert!(!line.contains("--"), "{line}");
         } else {
-            let command = format!(
-                "rdb_dev admin move {} {} --partition {} ",
-                step.from, step.to, step.partition
+            // Critic A2: no live command moves another partition, so it is a `step:` line.
+            let step_line = format!(
+                "step: move partition {}'s copy from node {} to node {} ",
+                step.partition, step.from, step.to
             );
-            assert!(line.starts_with(&command), "{line}");
+            assert!(line.starts_with(&step_line), "{line}");
+            assert!(!line.contains("rdb_dev"), "{line}");
         }
     }
     let kinds = |primary: bool, first: bool| {
