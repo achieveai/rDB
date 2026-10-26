@@ -45,6 +45,9 @@ residual: copy skew 2 (target 1): no legal move narrows it
 - One line per step, in order, ending `# <why>`. Only a line that starts `rdb_dev` is a command.
 - A copy move prints as `rdb_dev admin move <from> <to>`: the copy on the first node moves to
   the second. A step never moves the primary's own copy.
+- Running a plan again is safe. A copy move that already finished prints `already moved ..`
+  and exits 0, so a replayed plan skips it. This holds while the owner that ran the move is
+  still the owner; a new or restarted owner refuses it and says why.
 - Today's CLI moves partition 1 only. The planner plans every partition, so a copy move of
   another partition prints with `--partition P`. No live command takes that flag yet.
 - A primary handoff prints as `step: hand partition P's primary from node A to node B`. Only
