@@ -9,7 +9,9 @@
 //!   blocked, while the process itself ran.
 //!
 //! Only `runtime_stall` means something blocks the workers; both mean the host suspended the
-//! process; neither, across a silent gap in the log, points at the log path.
+//! process. A silent gap in the log with neither line rules out a process suspension and a
+//! fully blocked runtime, and no more: the timer task can stay on time while one other worker,
+//! or a dependency such as the log path or the store, is blocked.
 //!
 //! Each loop measures its gap before it logs, so the measurement never waits on the log.
 
