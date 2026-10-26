@@ -3803,6 +3803,33 @@ fn m11_t12_a_rebuild_onto_a_spare_fills_the_free_slot() {
     }
 }
 
+/// M11 T12 defect (dev-a read-back, 2026-10-26): `rebuild_spare`'s refusals lost their line
+/// continuations, so each carried a run of 22 spaces mid-sentence. With all three slots full,
+/// a rebuild of spare node 4 is refused with guard `slot`, names `admin move`, and reads as one
+/// sentence. Unit-sized (~1 s): bootstrap only.
+#[config_log::retcd_test]
+fn m11_t12_b_a_rebuild_onto_a_spare_with_no_free_slot_is_refused_in_one_sentence() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let (tx, rx) = mpsc::channel();
+    trio.nodes[0].0.rebuild_asked(
+        PartitionId(1),
+        NodeId(4),
+        Duration::from_secs(10),
+        RebuildReply(tx),
+    );
+    match rx.try_recv() {
+        Ok(Err(refused)) => {
+            assert_eq!(refused.guard, "slot", "{refused:?}");
+            assert!(
+                refused.detail.contains("admin move <source> 4") && !refused.detail.contains("  "),
+                "{refused:?}"
+            );
+        }
+        other => panic!("rebuild 4 with three members: {other:?}"),
+    }
+}
+
 /// M11 T7 paper cut (tester walk): after a promote the new owner holds no move, and `move 4 6`
 /// with both nodes regular said only that node 6 already holds a regular copy. The refusal now
 /// says the source still holds its copy too, so no move between them runs here: one asked of an

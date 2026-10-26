@@ -7177,7 +7177,9 @@ impl Host {
             return Err(crate::admin::rebuild::Refused {
                 guard: "slot",
                 detail: format!(
-                    "partition {} has no free slot for node {} (members: {list}): a rebuild                      onto a spare fills a missing copy; to replace a copy, run `admin move                      <source> {}`",
+                    "partition {} has no free slot for node {} (members: {list}): a rebuild \
+                     onto a spare fills a missing copy; to replace a copy, run `admin move \
+                     <source> {}`",
                     partition.0, node.0, node.0
                 ),
             });
@@ -7187,7 +7189,8 @@ impl Host {
             return Err(crate::admin::rebuild::Refused {
                 guard: "slot",
                 detail: format!(
-                    "node {}'s copy id is taken in partition {} (members: {list}): name another                      spare",
+                    "node {}'s copy id is taken in partition {} (members: {list}): name another \
+                     spare",
                     node.0, partition.0
                 ),
             });
@@ -7196,7 +7199,8 @@ impl Host {
             return Err(crate::admin::rebuild::Refused {
                 guard: "slot",
                 detail: format!(
-                    "node {} is not reachable from node {} (the owner): start it, then rebuild                      it",
+                    "node {} is not reachable from node {} (the owner): start it, then rebuild \
+                     it",
                     node.0, self.node.0
                 ),
             });
