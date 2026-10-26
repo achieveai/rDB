@@ -7812,17 +7812,31 @@ mod tests {
         let (tx, mailbox) = std::sync::mpsc::channel();
         db.links.register(OWNER, tx, host::BOOT);
         let looks = Arc::new(AtomicU64::new(0));
+        // Looks up to this count answer faulted; later ones answer admitting.
+        let faulted_until = Arc::new(AtomicU64::new(u64::MAX));
         let node_1 = {
             let looks = Arc::clone(&looks);
+            let faulted_until = Arc::clone(&faulted_until);
             std::thread::spawn(move || {
                 while let Ok(msg) = mailbox.recv() {
                     if let Msg::Inspect { reply, .. } = msg {
-                        looks.fetch_add(1, Ordering::Relaxed);
-                        let _ = reply.send(faulted.clone());
+                        let look = looks.fetch_add(1, Ordering::Relaxed) + 1;
+                        let status = if look <= faulted_until.load(Ordering::Relaxed) {
+                            faulted.clone()
+                        } else {
+                            NodeStatus {
+                                fault: None,
+                                admits: Some(true),
+                                ..faulted.clone()
+                            }
+                        };
+                        let _ = reply.send(status);
                     }
                 }
             })
         };
+        // Faulted throughout: waited to the bound and answered `TimedOut`. A host stall only
+        // lengthens the wait, so neither check can fail on one.
         let started = std::time::Instant::now();
         let answer = db.wait_ready(Duration::from_millis(300));
         let waited = started.elapsed();
@@ -7835,9 +7849,23 @@ mod tests {
             })
         );
         assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+        // It looks again after a faulted answer: the next look is faulted, the one after admits,
+        // and only a wait that looked again answers `Ok`. This was `looks > 1` inside the 300 ms
+        // above, which a stall of the test thread broke: on 2026-10-26 its first look landed at
+        // the deadline (`ready_owner_faulted` 0.06 ms before `db_shutdown`, against ~320 ms on
+        // the green runs), so one look was all the bound held (bb-b3 gate run 58bcb773).
+        let before = looks.load(Ordering::Relaxed);
+        faulted_until.store(before + 1, Ordering::Relaxed);
+        assert_eq!(
+            db.wait_ready(host::test_patience(Duration::from_secs(5))),
+            Ok(())
+        );
+        assert!(
+            looks.load(Ordering::Relaxed) >= before + 2,
+            "it looked again"
+        );
         drop(db);
         node_1.join().expect("the stub");
-        assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
     }
 
     /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
