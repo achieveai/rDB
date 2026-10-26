@@ -652,7 +652,7 @@ case "$COMMAND" in
             node_alive "$ARG" && die "node $ARG runs; stop it before --wipe"
             # A pinned copy is never wiped before the owner drops it (bb #65, A-R441 A3).
             admin_line "admin rebuild $ARG" ||
-                die "start $ARG --wipe refused: the owner still pins node $ARG, or did not answer; nothing was moved aside. Use \`lr rebuild $ARG --wipe\`"
+                die "start $ARG --wipe refused: rdb_dev's answer above says why; nothing was moved aside and node $ARG was not started"
             # Then the fence, as `rebuild --wipe` checks it, and the folder goes aside, never
             # deleted (A-R445).
             admin_line "admin rebuild $ARG --wipe --fence" ||

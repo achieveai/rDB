@@ -2227,7 +2227,7 @@ fn members_line(db: &Db) -> String {
 }
 
 /// `admin rebuild`'s usage (#65).
-const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is 1, 2 or 3, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
+const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is a node of the cluster, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
 
 /// What `admin rebuild` was asked: in this process, or the fence `lr rebuild N --wipe` checks
 /// once it has stopped N.
@@ -2239,7 +2239,7 @@ enum RebuildAsk {
 
 /// `admin rebuild N [--wipe [--fence]]`'s words after `rebuild`.
 fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, RebuildAsk), String> {
-    let node = |n: &str| parse_node(n).map_err(|e| format!("{e}; {REBUILD_USAGE}"));
+    let node = |n: &str| parse_any_node(n).map_err(|e| format!("{e}; {REBUILD_USAGE}"));
     match rest {
         [n] => Ok((node(n)?, RebuildAsk::Here { wipe: false })),
         [n, "--wipe"] => Ok((node(n)?, RebuildAsk::Here { wipe: true })),
@@ -7975,7 +7975,10 @@ mod tests {
 
     /// bb #65: `admin rebuild N [--wipe]` runs in process; `lr rebuild N --wipe` adds `--fence`
     /// once it has stopped N, and only after `--wipe` is it the fence check (A-R441 F2).
-    /// Cut: accept `--fence` without `--wipe` and the `3 --fence` line goes red. Unit.
+    /// M11 T2: any configured node may be named, a spare or a node past 3 (`lr start 4 --wipe`
+    /// was refused as usage); a number outside 1 to `MAX_NODES` is still refused.
+    /// Cut: accept `--fence` without `--wipe` and the `3 --fence` line goes red. Cut: parse
+    /// with `parse_node` (1 to 3) and the `4 --wipe` line goes red. Unit.
     #[test]
     fn admin_rebuild_reads_its_node_and_the_fence_flag() {
         fn words(line: &str) -> Vec<&str> {
@@ -7993,7 +7996,11 @@ mod tests {
             parse_rebuild(&words("3 --wipe --fence")),
             Ok((NodeId(3), RebuildAsk::Fence))
         );
-        for bad in ["", "4", "3 --fence", "3 --fence --wipe", "3 --wipe x"] {
+        assert_eq!(
+            parse_rebuild(&words("4 --wipe")),
+            Ok((NodeId(4), RebuildAsk::Here { wipe: true }))
+        );
+        for bad in ["", "0", "9", "3 --fence", "3 --fence --wipe", "3 --wipe x"] {
             assert!(parse_rebuild(&words(bad)).is_err(), "{bad:?}");
         }
     }

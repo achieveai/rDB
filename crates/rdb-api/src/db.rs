@@ -3410,10 +3410,14 @@ impl Db {
         let refuse = |guard: &'static str, detail: String| {
             Err(rebuild_refused(admin::rebuild::Refused { guard, detail }))
         };
-        if !ALL_NODES.contains(&node) {
+        // M11 T2: any node of the cluster, a spare or a node past 3, may be named.
+        if !(1..=MAX_NODES).contains(&node.0) {
             return refuse(
                 "G1",
-                format!("node {} holds no copy of partition 1", node.0),
+                format!(
+                    "node {} is not a node of the cluster (1 to {MAX_NODES})",
+                    node.0
+                ),
             );
         }
         if node == owner {
