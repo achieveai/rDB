@@ -3462,6 +3462,62 @@ fn m11_q3_a_move_onto_an_empty_node_pins_its_shadow_in_under_half_a_second() {
     tracing::info!(after_pin_ms = landed_at.0 - pinned.0, "m11_q3_put_landed");
 }
 
+/// M11 defect T4 (tester walk): a move whose target died after it was pinned as a shadow never
+/// ended. The shadow stayed pinned, every later move was refused "still running", and the
+/// refusal said the move did nothing more although the owner finished it on its own once the
+/// target came back. Now, while the target is unreachable, a re-run says the move goes on when
+/// it returns and is given up after the drop clock; past the clock the owner re-plans without
+/// the shadow, the source keeps its copy, and the re-run says why it was given up.
+/// Integration (~4 s): bootstrap's window, the join, the drop clock, the give-up re-plan.
+#[config_log::retcd_test]
+fn m11_t4_a_move_whose_target_is_unreachable_past_the_drop_clock_is_given_up() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    for other in [1, 2, 3] {
+        trio.links.hold(NodeId(other), NodeId(4));
+    }
+    match trio.ask(move_call(2, 3, 4)) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(
+                error.detail.contains("pinned as this move's shadow")
+                    && error.detail.contains("given up"),
+                "{error:?}"
+            );
+        }
+        other => panic!("move 3 4 with node 4 unreachable: {other:?}"),
+    }
+    let (_, _, members) = trio.until("node 1 left node 4 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&4))
+    });
+    assert_eq!(members, vec![1, 2, 3], "node 3 keeps its copy");
+    assert_eq!(pinned_role(&trio, 3), Some(ReplicaRole::RegularSecondary));
+    match trio.ask(move_call(3, 3, 4)) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(
+                error.detail.contains("given up") && error.detail.contains("unreachable"),
+                "{error:?}"
+            );
+        }
+        other => panic!("move 3 4 after the give-up: {other:?}"),
+    }
+    match trio.ask(move_call(4, 2, 4)) {
+        Answer::Error { error, .. } => assert!(
+            error.detail.contains("node 4 is not reachable"),
+            "another move is not refused as still running: {error:?}"
+        ),
+        other => panic!("move 2 4 with node 4 unreachable: {other:?}"),
+    }
+}
+
 /// M11 defect T3 (tester walk, critic M4): the copy a move took off a node is not that node's
 /// to take back. After `move 3 4` and a drop of node 4, node 3 restarting was re-added as a
 /// left-out member, and the partition pinned the moved-off copy again on its own. The move's

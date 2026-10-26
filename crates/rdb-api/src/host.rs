@@ -2088,6 +2088,9 @@ struct Host {
     /// #67 (A-R435): per (partition, pinned regular secondary), since when this owner has had
     /// no link to it ([`Self::count_unreachable`]).
     unreachable: BTreeMap<(PartitionId, NodeId), Unreachable>,
+    /// M11 T4: per partition, the shadow a move pinned and since when this owner has had no
+    /// link to it ([`Self::shadow_give_up_duty`]).
+    shadow_unreachable: BTreeMap<PartitionId, (NodeId, Tick)>,
     /// Per partition, the planned re-plan F1 was first seen `Blocked` on by a drop check, and
     /// when: (generation, the plan's `since`, seen at). `blocked_ms` of `rejoin_replan_on_boot`,
     /// which is `None` when no drop check saw the block before the re-plan.
@@ -2243,6 +2246,7 @@ impl Host {
             latest_stall: BTreeMap::new(),
             boot_seen_while_planned: BTreeMap::new(),
             unreachable: BTreeMap::new(),
+            shadow_unreachable: BTreeMap::new(),
             blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
@@ -5584,6 +5588,7 @@ impl Host {
             self.retry_blocked_rejoin(partition, now);
             self.repair_duty(partition, now);
             self.shadow_duty(partition);
+            self.shadow_give_up_duty(partition, now);
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
@@ -6066,6 +6071,18 @@ impl Host {
                 other.node.0, partition.0
             ));
         }
+        if role(to) == Some(ReplicaRole::Shadow) && !self.linked(to) {
+            // T4: the pin stays, so the move goes on by itself once the target is back.
+            return wait(format!(
+                "node {} is pinned as this move's shadow but is not reachable from node {} (the                  owner): start it (`lr start {}`) and the move goes on; unreachable for {} ms                  in all, the move is given up, node {} is left out and node {} keeps its copy",
+                to.0,
+                self.node.0,
+                to.0,
+                self.peer_drop_after_millis,
+                to.0,
+                from.0
+            ));
+        }
         if !self.linked(to) || self.links.boot_of(to).is_none() {
             return wait(format!(
                 "node {} is not reachable from node {} (the owner): start it (`lr start {}`), or \
@@ -6252,6 +6269,87 @@ impl Host {
         self.blamed.remove(&partition);
         self.revoke(partition, epoch, pinned.map(|member| member.node), None);
         true
+    }
+
+    /// M11 T4: a move's shadow (one pinned beside every rf3 regular copy) this owner has had no
+    /// link to for `peer_drop_after_millis` is given up: the owner re-plans without it, as
+    /// [`Self::move_blocked`] does, and the source keeps its copy. A move this owner holds for it
+    /// is marked given up, so its next ask says why. Without the bound a dead target held the
+    /// pin, and every other move, for good. Logged `move_shadow_unreachable` when the clock
+    /// starts and `move_given_up` when it ends.
+    fn shadow_give_up_duty(&mut self, partition: PartitionId, now: Tick) {
+        let target = self
+            .committed
+            .get(&partition)
+            .filter(|_| !self.rejoins.contains_key(&partition))
+            .and_then(|committed| {
+                let members = &committed.committed.pinned_config.members;
+                let owner = members
+                    .iter()
+                    .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+                let regular = members
+                    .iter()
+                    .filter(|member| member.role != ReplicaRole::Shadow)
+                    .count();
+                if !owner || regular < crate::admin::members().len() {
+                    return None;
+                }
+                members
+                    .iter()
+                    .find(|member| member.role == ReplicaRole::Shadow)
+                    .map(|member| (member.node, committed.selected.root.owner_epoch))
+            })
+            .filter(|(node, _)| !self.linked(*node));
+        let Some((node, epoch)) = target else {
+            self.shadow_unreachable.remove(&partition);
+            return;
+        };
+        let since = match self.shadow_unreachable.get(&partition) {
+            Some((counted, since)) if *counted == node => *since,
+            _ => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    shadow = node.0,
+                    "move_shadow_unreachable"
+                );
+                self.shadow_unreachable.insert(partition, (node, now));
+                return;
+            }
+        };
+        let waited_ms = HostClock::millis_until(since, now);
+        if waited_ms < self.peer_drop_after_millis {
+            return;
+        }
+        self.shadow_unreachable.remove(&partition);
+        let held = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.to == node && mv.abandoned.is_none())
+            .cloned();
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            shadow = node.0,
+            from = ?held.as_ref().map(|mv| mv.from.0),
+            waited_ms,
+            "move_given_up"
+        );
+        if let Some(mv) = held {
+            let why = format!(
+                "the move of node {} to node {} was given up: node {} was unreachable from node                  {} (the owner) for {waited_ms} ms; node {} keeps its copy. Start node {} and                  run the move again",
+                mv.from.0, mv.to.0, mv.to.0, self.node.0, mv.from.0, mv.to.0
+            );
+            self.moves.insert(
+                partition,
+                CopyMove {
+                    abandoned: Some(why),
+                    ..mv
+                },
+            );
+        }
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(node), None);
     }
 
     /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
