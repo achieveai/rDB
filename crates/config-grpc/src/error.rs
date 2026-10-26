@@ -22,7 +22,7 @@
 //! connection, a proxy) and the client must assume the worst. See
 //! [`is_server_rejection`].
 
-use config_core::{ConfigError, LeaderHint, NodeId, StatusClass};
+use config_core::{ClusterId, ConfigError, LeaderHint, NodeId, RecoveryEpoch, StatusClass};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::{Code, Status};
 
@@ -65,6 +65,25 @@ pub const HEADER_RESUMABLE: &str = "retcd-resumable";
 /// set the `page_token_rejected` log line and the pin registry's counters use, so a client's
 /// branch, an operator's alert and a test assertion cannot drift apart (test plan Q-30).
 pub const HEADER_REASON: &str = "retcd-reason";
+
+/// Metadata key on a refused watch: the caller must list again before it watches (#37).
+///
+/// Its only defined value is [`RELIST_HISTORY`]. It rides on `INVALID_ARGUMENT`, never on
+/// `OUT_OF_RANGE` + [`HEADER_MIN_REVISION`]: resuming from a minimum revision of another
+/// history would mix two histories, which is the fault this refusal exists to stop.
+pub const HEADER_RELIST: &str = "retcd-relist";
+/// The one value of [`HEADER_RELIST`]: the cursor counts revisions of another history.
+pub const RELIST_HISTORY: &str = "history";
+/// Initial watch response metadata: the cluster id of the history this node serves (#37).
+///
+/// Sent as metadata, never in a response body, so a client that predates it still decodes
+/// every response (critic-bb B1).
+pub const HEADER_CLUSTER_ID: &str = "retcd-cluster-id";
+/// Initial watch response metadata: the recovery epoch of the history this node serves.
+pub const HEADER_RECOVERY_EPOCH: &str = "retcd-recovery-epoch";
+/// The text every history refusal carries, so a client that only has the
+/// [`ConfigError`] can still tell it from any other `InvalidArgument` ([`is_relist_history`]).
+pub const HISTORY_MISMATCH_DETAIL: &str = "watch cursor is from another history";
 
 /// Failures of the transport itself, as opposed to a semantic [`ConfigError`].
 #[derive(Debug, thiserror::Error)]
@@ -345,6 +364,56 @@ pub fn leader_hint(status: &Status) -> Option<LeaderHint> {
             None
         }
     }
+}
+
+/// The history a server echoed in a watch's initial response metadata (#37).
+///
+/// `None` when the server sent none: a server that predates #37 does not echo, and the client
+/// treats that as "unchecked", never as an error (critic-bb compat). Half an echo, or one that
+/// does not parse, is dropped the way a half leader hint is, and logged for the same reason.
+pub fn watch_history_from_metadata(
+    meta: &tonic::metadata::MetadataMap,
+) -> Option<(ClusterId, RecoveryEpoch)> {
+    let get = |key: &str| meta.get(key).and_then(|v| v.to_str().ok());
+    let raw_cluster = get(HEADER_CLUSTER_ID);
+    let raw_epoch = get(HEADER_RECOVERY_EPOCH);
+    if raw_cluster.is_none() && raw_epoch.is_none() {
+        return None;
+    }
+    let cluster = raw_cluster.and_then(|c| c.parse::<ClusterId>().ok());
+    let epoch = raw_epoch.and_then(|e| e.parse::<u32>().ok());
+    match cluster.zip(epoch) {
+        Some((cluster, epoch)) => Some((cluster, RecoveryEpoch(epoch))),
+        None => {
+            tracing::warn!(
+                cluster_id = raw_cluster.unwrap_or("<absent>"),
+                recovery_epoch = raw_epoch.unwrap_or("<absent>"),
+                "discarding an unparsable watch history echo"
+            );
+            None
+        }
+    }
+}
+
+/// The refusal for a watch whose cursor came from another history (#37, critic-bb M3).
+///
+/// `cluster_id` and `recovery_epoch` are the cursor's, as the caller sent them.
+pub fn history_mismatch(cluster_id: ClusterId, recovery_epoch: RecoveryEpoch) -> ConfigError {
+    ConfigError::InvalidArgument {
+        detail: format!(
+            "{HISTORY_MISMATCH_DETAIL} (cluster {cluster_id} epoch {}); relist",
+            recovery_epoch.0
+        ),
+    }
+}
+
+/// Whether `err` is a history refusal: the caller must list again, not resume (#37).
+///
+/// Reads the detail, because a [`ConfigError`] carries no metadata and the refusal has no
+/// variant of its own (critic-bb M3). `contains`, not `starts_with`: across the wire the
+/// detail is the status message, which begins with the error's own prefix. A caller holding the raw status reads [`HEADER_RELIST`].
+pub fn is_relist_history(err: &ConfigError) -> bool {
+    matches!(err, ConfigError::InvalidArgument { detail } if detail.contains(HISTORY_MISMATCH_DETAIL))
 }
 
 #[cfg(test)]

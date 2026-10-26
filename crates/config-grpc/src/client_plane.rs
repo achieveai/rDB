@@ -21,16 +21,20 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use config_core::{ClusterId, ConfigError, ConfigStore, Limits, Principal};
+use config_core::{ClusterId, ConfigError, ConfigStore, Limits, Principal, RecoveryEpoch};
 use config_engine::AuthnRejectReason;
 use config_log::TraceContext;
 use tokio::net::TcpListener;
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::admin_plane::AdminSvc;
 use crate::convert::watch_request_from_pb;
-use crate::error::{mark_rejected, status_from_error, GrpcError};
+use crate::error::{
+    history_mismatch, mark_rejected, status_from_error, GrpcError, HEADER_CLUSTER_ID,
+    HEADER_RECOVERY_EPOCH, HEADER_RELIST, RELIST_HISTORY,
+};
 use crate::limits::client_plane_message_limit;
 use crate::pb;
 use crate::pb::admin_service_server::AdminServiceServer;
@@ -66,6 +70,17 @@ pub trait ClientBackend: Send + Sync {
     /// new time series every time the message is reworded.
     fn record_authn_rejection(&self, reason: AuthnRejectReason) {
         let _ = reason;
+    }
+
+    /// The history this node's revisions belong to: its cluster id and recovery epoch (#37).
+    ///
+    /// A watch whose cursor names another history is refused, and every opened watch is told
+    /// this one in its initial response metadata. `None`, the default, checks nothing and
+    /// echoes nothing, which is what a backend with no bound identity, such as a test double,
+    /// should do. A node backend returns its `ClusterIdentity`'s pair; a restore always
+    /// changes both (ADR-0024).
+    fn watch_history(&self) -> Option<(ClusterId, RecoveryEpoch)> {
+        None
     }
 }
 
@@ -264,12 +279,75 @@ impl ConfigService for ConfigSvc {
         &self,
         request: Request<pb::WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        self.dispatch("watch", request, |store, req| async move {
-            let req = watch_request_from_pb(req)?;
-            store.watch(req).await.map(|inner| WatchResponses { inner })
-        })
-        .await
+        let served = self.backend.watch_history();
+        let refusal = history_refusal(request.get_ref().history.as_ref(), served);
+        let refused = refusal.is_some();
+        let outcome = self
+            .dispatch("watch", request, |store, req| async move {
+                // Checked inside the call, after identity: an unauthenticated caller learns
+                // nothing about this node's history.
+                if let Some(refusal) = refusal {
+                    return Err(refusal);
+                }
+                let req = watch_request_from_pb(req)?;
+                store.watch(req).await.map(|inner| WatchResponses { inner })
+            })
+            .await;
+        match outcome {
+            Err(mut status) => {
+                if refused && status.code() == tonic::Code::InvalidArgument {
+                    status
+                        .metadata_mut()
+                        .insert(HEADER_RELIST, MetadataValue::from_static(RELIST_HISTORY));
+                }
+                Err(status)
+            }
+            Ok(mut response) => {
+                // Metadata, never a body: a client that predates #37 maps a body-less
+                // response to an error (critic-bb B1).
+                if let Some((cluster_id, recovery_epoch)) = served {
+                    let meta = response.metadata_mut();
+                    if let Ok(value) = cluster_id.to_string().parse() {
+                        meta.insert(HEADER_CLUSTER_ID, value);
+                    }
+                    meta.insert(HEADER_RECOVERY_EPOCH, MetadataValue::from(recovery_epoch.0));
+                }
+                Ok(response)
+            }
+        }
     }
+}
+
+/// Whether a watch must be refused because its cursor came from another history (#37).
+///
+/// Absent on either side checks nothing: an old client sends no history, and a backend with
+/// no bound identity has none to compare. Both fields are compared; a restore changes both,
+/// but a cursor that differs in either one counts revisions of another history.
+fn history_refusal(
+    asked: Option<&pb::WatchHistory>,
+    served: Option<(ClusterId, RecoveryEpoch)>,
+) -> Option<ConfigError> {
+    let (asked, (cluster_id, recovery_epoch)) = asked.zip(served)?;
+    let Ok(asked_cluster) = asked.cluster_id.parse::<ClusterId>() else {
+        return Some(ConfigError::InvalidArgument {
+            detail: format!(
+                "history.cluster_id {:?} is not a cluster id: expected 32 hex characters",
+                asked.cluster_id
+            ),
+        });
+    };
+    let asked_epoch = RecoveryEpoch(asked.recovery_epoch);
+    if asked_cluster == cluster_id && asked_epoch == recovery_epoch {
+        return None;
+    }
+    tracing::info!(
+        cursor_cluster_id = %asked_cluster,
+        cursor_recovery_epoch = asked_epoch.0,
+        cluster_id = %cluster_id,
+        recovery_epoch = recovery_epoch.0,
+        "watch_refused_other_history"
+    );
+    Some(history_mismatch(asked_cluster, asked_epoch))
 }
 
 /// One watch stream, translated onto the wire.
