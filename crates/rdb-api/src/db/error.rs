@@ -33,11 +33,18 @@ const OPEN_AGAIN: &str = "open the folder again";
 /// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
 const RUN_AGAIN: &str = "run it again to read where it stands";
 
+/// The tail every `admin rebuild` error ends with (#65): its detail already names the step
+/// (stop it, send a write, promote first, restart it), which "retrying will not help" would
+/// contradict (bb walk paper cut).
+pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this says";
+
 /// The tail of [`super::ReadyError::Quarantined`]'s text, which a refusal carries while the
 /// owner's recovery is quarantined ([`super::Db::explained`]). It already says what to do, which
 /// a "wait a few seconds and try again" step would contradict (review-s2 F-003).
 pub(crate) const QUARANTINED_STEP: &str =
-    "do not delete the folder; stop and report it with this message";
+    "do not delete the folder; run `admin rebuild N` (`Db::rebuild`) for a copy whose history \
+     disagrees: it takes that copy out of the partition and back, and a rebuild of a copy the \
+     quarantine does not name is refused, naming the ones it does";
 
 /// The step a damaged object's root (a document, or a map's or set's own root) ends its
 /// `CORRUPT_HISTORY` with ([`corrupt_history`]), in place of the map or set entry's step: no
@@ -247,6 +254,7 @@ impl ApiError {
         let reopen = self.detail.ends_with(OPEN_AGAIN) && !write_unknown;
         if reopen
             || self.detail.ends_with(RUN_AGAIN)
+            || self.detail.ends_with(REBUILD_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
         {

@@ -739,16 +739,16 @@ pub enum ReadyError {
     /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
     /// wait nor a reopen helps (A-R196(2a)).
     ///
-    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator removes the
-    /// diverged copies from membership and fences again. This build has no command for that, so
-    /// the text does not tell the reader to do it (A-R196(2b)); the owner's `recovery_fact` log
-    /// line names the copies. The text ends with [`error::QUARANTINED_STEP`], so a refusal that
-    /// carries it gets no second step (review-s2 F-003).
+    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator takes a
+    /// diverged copy out of membership and back, `admin rebuild N` ([`Db::rebuild`], bug bash
+    /// #65 mode C). The text names it; the owner's `recovery_fact` log line names the copies, and
+    /// a rebuild of a copy the evidence does not name is refused with the evidence. The text
+    /// ends with [`error::QUARANTINED_STEP`], so a refusal that carries it gets no second step
+    /// (review-s2 F-003).
     #[error(
         "the open's recovery found copies whose histories disagree, so node {node} takes no \
-         writes; the acknowledged data is kept. This build has no repair command yet (removing \
-         a copy from membership comes in a later build), so opening the folder again will not \
-         help: {step}",
+         writes; the acknowledged data is kept, and opening the folder again will not help: \
+         {step}",
         node = .owner.0,
         step = error::QUARANTINED_STEP
     )]
@@ -2521,6 +2521,49 @@ impl Db {
         }
     }
 
+    /// **Dev tool only**, debug builds (#65 mode C; `rdb_dev admin fork-copy`): make `node`'s
+    /// copy diverge. Its head `History` record of partition 1's lineage `generation` is
+    /// replaced by another validly chained record at the same seq ([`Msg::Fork`]), so the next
+    /// recovery that compares it with the others quarantines. The node's kernel keeps the old
+    /// head until it restarts: restart it to make the fork count. Returns the forked seq.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, or
+    /// not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn fork_record(&self, node: NodeId, generation: Generation) -> Result<u64, String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::Fork {
+            partition: PARTITION,
+            generation,
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: fork its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done
+                .map(|seq| seq.0)
+                .map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
     /// The peer links, to hold and heal.
     #[must_use]
     pub fn links(&self) -> &Arc<Links> {
@@ -2608,28 +2651,50 @@ impl Db {
     /// the owner found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
     /// proof stay; it only cannot succeed in this open.
     fn explained(&self, mut error: ApiError) -> ApiError {
-        if error.kind == ErrorKind::Unavailable {
-            if let Some(step) = self.stuck_step() {
-                error.detail = format!("{}; {step}", error.detail);
+        // A quarantine also refuses a write `LEASE_EXPIRED` or `PROTECTION_PAUSED`, whose own
+        // step ("call `Db::wait_ready`") cannot end it; the quarantined text names the rebuild
+        // that does. That text ends with its step, so it goes last, after any restart note,
+        // and no generic step follows it (bug bash #65).
+        let quarantined = matches!(
+            *lock(&self.opened.stuck),
+            Some(ReadyError::Quarantined { .. })
+        );
+        let stuck = match error.kind {
+            ErrorKind::Unavailable => self.stuck_step(),
+            ErrorKind::LeaseExpired | ErrorKind::ProtectionPaused if quarantined => {
+                self.stuck_step()
             }
-        }
-        let Some(mut note) = self.restart_note() else {
-            return error;
+            _ => None,
         };
-        if self.owner_restarted() {
-            note = format!("{note}; {REOPEN_STEP}");
+        let (before, after) = if quarantined {
+            (None, stuck)
+        } else {
+            (stuck, None)
+        };
+        if let Some(step) = before {
+            error.detail = format!("{}; {step}", error.detail);
         }
-        match error.kind {
-            ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome => {
-                error.detail = format!("{}; {note}", error.detail);
+        if let Some(mut note) = self.restart_note() {
+            if self.owner_restarted() {
+                note = format!("{note}; {REOPEN_STEP}");
             }
-            ErrorKind::NotPrimary => {
-                error.detail = format!(
-                    "{}; no node becomes primary again in this open: {note}",
-                    error.detail
-                );
+            match error.kind {
+                ErrorKind::ProtectionPaused
+                | ErrorKind::Unavailable
+                | ErrorKind::UnknownOutcome => {
+                    error.detail = format!("{}; {note}", error.detail);
+                }
+                ErrorKind::NotPrimary => {
+                    error.detail = format!(
+                        "{}; no node becomes primary again in this open: {note}",
+                        error.detail
+                    );
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        if let Some(step) = after {
+            error.detail = format!("{}; {step}", error.detail);
         }
         error
     }
@@ -3012,6 +3077,19 @@ impl Db {
     /// when the node does not start again: it then stays stopped, [`Self::boot_of`] names the
     /// boot it was given, and [`Self::restart_note`] says the restart failed (F-013).
     pub fn restart_node(&self, node: NodeId) -> Result<BootId, ApiError> {
+        self.restart_node_with(node, None)
+    }
+
+    /// [`Self::restart_node`], moving `nodes/<n>` to `aside.to` between the stop and the start
+    /// when `aside` is given (#65, `admin rebuild N --wipe`): the node then starts on an empty
+    /// folder. Under the node lock, before anything is stopped, the node's boot must still be
+    /// `aside.boot`; otherwise nothing is stopped or moved (critic-bb M5). A move that fails
+    /// starts the node again on its own folder and answers the failure.
+    pub(crate) fn restart_node_with(
+        &self,
+        node: NodeId,
+        aside: Option<Aside>,
+    ) -> Result<BootId, ApiError> {
         let Some(respawn) = &self.respawn else {
             return Err(ApiError::invalid(
                 "this Db was built without a data directory, so it cannot restart a node",
@@ -3041,6 +3119,23 @@ impl Db {
             )));
         };
         let old_boot = handle.boot;
+        if let Some(aside) = aside.as_ref().filter(|aside| aside.boot != old_boot) {
+            tracing::warn!(
+                node = node.0,
+                boot = old_boot.0,
+                drop_boot = aside.boot.0,
+                "node_wipe_refused_boot"
+            );
+            return Err(rebuild_error(
+                RetryRule::NotWired,
+                true,
+                format!(
+                    "node {} not wiped: it runs boot {}, not boot {} the drop named; it restarted \
+                     since, and may be counted again. Nothing was stopped or moved",
+                    node.0, old_boot.0, aside.boot.0
+                ),
+            ));
+        }
         let boot = match &respawn.boots {
             // A node process's boots come from its folder, so they stay fresh across processes
             // as well as restarts (ruling A-R227).
@@ -3065,9 +3160,18 @@ impl Db {
         };
         handle.stop();
         self.control.forget_node(node, old_boot);
+        let folder = respawn.nodes_dir.join(node.0.to_string());
+        // M5: the record is read after the stop, so nothing can take the node back between the
+        // check and the move.
+        let unmoved = aside.and_then(|aside| {
+            match self.wipe_fenced(node, aside.generation, Some((aside.boot, old_boot))) {
+                Some(refused) => Some(refused),
+                None => move_aside(node, &folder, &aside.to).err(),
+            }
+        });
         let started = host::spawn_with(
             node,
-            respawn.nodes_dir.join(node.0.to_string()),
+            folder,
             Arc::clone(&self.links),
             Arc::clone(&self.control),
             self.clock,
@@ -3092,7 +3196,19 @@ impl Db {
                         tracing::warn!(node = node.0, peer = other.node.0, "peer_booted_unsent");
                     }
                 }
-                Ok(boot)
+                match unmoved {
+                    None => Ok(boot),
+                    // A fence refusal, not a host fault (bb walk paper cut): the detail names
+                    // why, and the node runs on its own folder again.
+                    Some(detail) => Err(rebuild_error(
+                        RetryRule::NotWired,
+                        false,
+                        format!(
+                            "node {} restarted at boot {} on its own folder, not wiped: {detail}",
+                            node.0, boot.0
+                        ),
+                    )),
+                }
             }
             Err(detail) => {
                 tracing::error!(
@@ -3108,6 +3224,340 @@ impl Db {
                 handle.start_failed = true;
                 Err(ApiError::host(&detail))
             }
+        }
+    }
+
+    /// Why `node`'s wipe is refused after its stop, or `None` (critic-bb M5): `partitions/1`
+    /// must be at or above `generation` and leave `node` out, and with `boots` (the boot when
+    /// the wipe was asked, the boot as of the stop) `node` must not have restarted between.
+    fn wipe_fenced(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        boots: Option<(BootId, BootId)>,
+    ) -> Option<String> {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return Some(format!(
+                "node {} not wiped: this Db has no control store to check partitions/1 against",
+                node.0
+            ));
+        };
+        let (done, answer) = mpsc::channel();
+        rt.spawn(async move {
+            let _ = done.send(admin::rebuild::record(&*store).await);
+        });
+        let refused = match answer.recv_timeout(self.timeouts.read) {
+            Ok(Ok((record, members))) => {
+                admin::rebuild::fence_refusal(node, generation, (record, members.as_deref()), boots)
+                    .map(|refused| refused.to_string())
+            }
+            Ok(Err(error)) => Some(format!(
+                "node {} not wiped: {error}; its folder is left in place",
+                node.0
+            )),
+            Err(_) => Some(format!(
+                "node {} not wiped: partitions/1 did not answer in time; its folder is left in \
+                 place",
+                node.0
+            )),
+        };
+        if let Some(refused) = &refused {
+            tracing::warn!(node = node.0, %refused, "node_wipe_refused_fence");
+        }
+        refused
+    }
+
+    /// `admin rebuild <node> [--wipe]` (#65, critic-bb §3): take `node`'s copy of partition 1
+    /// out and bring it back, from an owner this `Db` runs. The owner checks the guards and,
+    /// when `node` is pinned, re-plans without it and waits for that commit; a quarantined owner
+    /// replaces its F1 first, and its rebuild always wipes. Then `node` restarts at a new boot,
+    /// its folder moved aside when wiped (never deleted), and the owner takes it back, first as
+    /// a shadow. Returns the accept line once the owner pins `node` regular again.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
+    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard, an owner
+    /// in another process, or a re-plan that did not commit a serving partition without
+    /// `node`. A wipe the fence refuses restarts `node` on its own folder and says so. An
+    /// `UNAVAILABLE` with `no_mutation` false when `node` restarted but is not pinned regular
+    /// again in time.
+    pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
+        if !self.runs(self.route.owner()) && !self.runs(node) {
+            if wipe {
+                return Err(rebuild_refused(admin::rebuild::Refused {
+                    guard: "process",
+                    detail: format!(
+                        "under --nodes the wipe of node {} runs as `lr rebuild {} --wipe`, which \
+                         stops it before the fence is checked; nothing was done",
+                        node.0, node.0
+                    ),
+                }));
+            }
+            let (owner, generation) = self.left_out(node)?;
+            return Ok(format!(
+                "rebuild: node {} is left out by node {} (the owner) at generation {} (mode A); \
+                 restart it and the owner takes it back",
+                node.0, owner.0, generation.0
+            ));
+        }
+        self.rebuild_with(node, wipe).map(|rebuilt| rebuilt.line())
+    }
+
+    /// `lr rebuild <node> --wipe`'s fence (#65, M5; the substitute fence of ruling A-R441 F2),
+    /// checked by an app with no node of its own (`--nodes`) once the script has stopped
+    /// `node`. Both reads happen after that stop: the owner's live pin must not name `node` in
+    /// any role, and `partitions/1` must be at or above the owner's generation and leave `node`
+    /// out. No boot is compared: lr has no boot of the drop. It is safe because a restarted
+    /// `node` is pinned again as a shadow before it can count, and one not yet pinned holds no
+    /// counted acks. `Ok` is the go-ahead line: the caller moves the folder aside.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rebuild`]'s guards, and `UNAVAILABLE` with the fence's reason when it does
+    /// not hold. Nothing is moved either way; the folder stays where it is.
+    pub fn rebuild_fence(&self, node: NodeId) -> Result<String, ApiError> {
+        let (owner, generation) = self.left_out(node)?;
+        if let Some(refused) = self.wipe_fenced(node, generation, None) {
+            return Err(rebuild_refused(admin::rebuild::Refused {
+                guard: "M5",
+                detail: refused,
+            }));
+        }
+        tracing::info!(
+            node = node.0,
+            owner = owner.0,
+            generation = generation.0,
+            "db_rebuild_fence_holds"
+        );
+        Ok(format!(
+            "rebuild: the fence holds for node {}: read after its stop, node {} (the owner) does \
+             not pin it and partitions/1 leaves it out at generation {} or later; its folder may \
+             be moved aside",
+            node.0, owner.0, generation.0
+        ))
+    }
+
+    /// The guards an app with no node of its own can check against the owner's status: `node`
+    /// holds a copy (G1), is not the owner (G2), the owner is not quarantined (mode C needs the
+    /// owner's process) and already leaves `node` out (mode A). Returns the owner and the
+    /// generation it landed last.
+    fn left_out(&self, node: NodeId) -> Result<(NodeId, Generation), ApiError> {
+        let owner = self.route.owner();
+        let refuse = |guard: &'static str, detail: String| {
+            Err(rebuild_refused(admin::rebuild::Refused { guard, detail }))
+        };
+        if !ALL_NODES.contains(&node) {
+            return refuse(
+                "G1",
+                format!("node {} holds no copy of partition 1", node.0),
+            );
+        }
+        if node == owner {
+            return refuse(
+                "G2",
+                format!(
+                    "node {} owns partition 1; move the ownership first with `admin promote \
+                     <other node> --drop {}`",
+                    node.0, node.0
+                ),
+            );
+        }
+        let Ok(status) = self.look(owner) else {
+            return refuse(
+                "owner",
+                format!(
+                    "node {} (the owner) did not answer; nothing was done",
+                    owner.0
+                ),
+            );
+        };
+        if status
+            .recovery
+            .as_deref()
+            .is_some_and(|phase| phase.starts_with("Quarantined"))
+        {
+            return refuse(
+                "process",
+                format!(
+                    "node {} (the owner) is quarantined; rebuilding out of a quarantine needs the \
+                     owner's own process (`admin rebuild {}` there); nothing was done",
+                    owner.0, node.0
+                ),
+            );
+        }
+        if status.pinned.iter().any(|member| member.node == node) {
+            return refuse(
+                "process",
+                format!(
+                    "node {} is still pinned; under --nodes the owner cannot be asked to drop it: \
+                     stop it (`lr stop {}`), then send one write: the owner drops a stopped copy \
+                     about 10 s after a write finds it gone, and with no writes it stays pinned; \
+                     then rebuild it; nothing was done",
+                    node.0, node.0
+                ),
+            );
+        }
+        let Some(generation) = status.recovered else {
+            return refuse(
+                "owner",
+                format!(
+                    "node {} (the owner) has landed no generation yet; nothing was done",
+                    owner.0
+                ),
+            );
+        };
+        Ok((owner, generation))
+    }
+
+    /// [`Self::rebuild`], answering what it did.
+    pub(crate) fn rebuild_with(
+        &self,
+        node: NodeId,
+        wipe: bool,
+    ) -> Result<admin::rebuild::Rebuilt, ApiError> {
+        let refused = rebuild_refused;
+        let Some(respawn) = &self.respawn else {
+            return Err(ApiError::invalid(
+                "this Db was built without a data directory, so it cannot rebuild a node",
+            ));
+        };
+        let owner = self.route.owner();
+        if !self.runs(owner) || !self.runs(node) {
+            return Err(refused(admin::rebuild::Refused {
+                guard: "process",
+                detail: format!(
+                    "admin rebuild runs here only when this process runs node {} and the owner \
+                     (node {}); for separate node processes use `lr rebuild {}`",
+                    node.0, owner.0, node.0
+                ),
+            }));
+        }
+        // The boot the wipe is fenced on: a restart of `node` from here on refuses the wipe.
+        let boot = self.boot_of(node);
+        let within = heal_within(&respawn.budgets);
+        let (reply, answer) = mpsc::channel();
+        let asked = Msg::Rebuild {
+            partition: PARTITION,
+            node,
+            within,
+            reply: host::RebuildReply(reply),
+        };
+        if self.send_to(owner, asked).is_err() {
+            return Err(ApiError::host(&format!(
+                "node {} (the owner) stopped before it was asked to rebuild node {}",
+                owner.0, node.0
+            )));
+        }
+        let ready = match answer.recv_timeout(within + Duration::from_secs(5)) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(refusal)) => return Err(refused(refusal)),
+            Err(_) => {
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "node {} (the owner) did not answer the rebuild of node {} in time; it \
+                         may still drop it. Node {} was not wiped: restart it to re-add it",
+                        owner.0, node.0, node.0
+                    ),
+                ))
+            }
+        };
+        let wipe = wipe || ready.mode == admin::rebuild::RebuildMode::Quarantined;
+        let aside = match (wipe, boot) {
+            (false, _) => None,
+            (true, Some(boot)) => Some(Aside {
+                boot,
+                generation: ready.generation,
+                to: aside_path(&respawn.nodes_dir, node, boot),
+            }),
+            (true, None) => {
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "node {} has no boot here, so its wipe cannot be fenced; it was left out \
+                         at generation {} and not wiped: restart node {} to re-add it",
+                        node.0, ready.generation.0, node.0
+                    ),
+                ))
+            }
+        };
+        let moved = aside.as_ref().map(|aside| aside.to.clone());
+        // A1 (critic-65): once the folder has moved, every later error says where it is.
+        let named = |mut error: ApiError| {
+            if let Some(to) = moved.as_ref().filter(|to| to.exists()) {
+                // Before the tail that ends a rebuild error, so it still ends the detail.
+                let tail = format!("; {}", error::REBUILD_STEP);
+                let head = error.detail.strip_suffix(&tail).map(str::to_owned);
+                error.detail = format!(
+                    "{}; node {}'s old folder is kept at {}{}",
+                    head.as_deref().unwrap_or(&error.detail),
+                    node.0,
+                    to.display(),
+                    if head.is_some() { tail.as_str() } else { "" }
+                );
+            }
+            error
+        };
+        let boot = self.restart_node_with(node, aside).map_err(named)?;
+        self.await_regular(node, within).map_err(named)?;
+        // Pinned regular is not yet admitting: the owner's L1 resumes writes a moment later
+        // (bb walk: ~50 ms). Wait for that, so the next write is not refused right after
+        // "rebuilt"; when it does not come, the line says why instead.
+        let writes_wait = self.wait_ready(within).err().map(|error| error.to_string());
+        let rebuilt = admin::rebuild::Rebuilt {
+            node,
+            mode: ready.mode,
+            generation: ready.generation,
+            kept: ready.kept,
+            boot,
+            aside: moved,
+            writes_wait,
+        };
+        tracing::info!(
+            node = node.0,
+            mode = rebuilt.mode.letter(),
+            generation = rebuilt.generation.0,
+            boot = boot.0,
+            aside = ?rebuilt.aside,
+            "db_rebuilt"
+        );
+        Ok(rebuilt)
+    }
+
+    /// Wait until the owner pins `node` as a regular secondary, at most `within`.
+    fn await_regular(&self, node: NodeId, within: Duration) -> Result<(), ApiError> {
+        let started = Instant::now();
+        loop {
+            let pinned = self.inspect(self.route.owner()).is_some_and(|status| {
+                status.pinned.iter().any(|member| {
+                    member.node == node
+                        && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                })
+            });
+            if pinned {
+                return Ok(());
+            }
+            if started.elapsed() >= within {
+                tracing::warn!(
+                    node = node.0,
+                    within_ms = within.as_millis(),
+                    "db_rebuild_not_regular"
+                );
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "node {} restarted but is not pinned regular again within {} s; it may \
+                         still be catching up as a shadow: `nodes` shows when it is back",
+                        node.0,
+                        within.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -3545,6 +3995,97 @@ fn counter_refused(instance: &[u8; INSTANCE_LEN], error: admin::CounterError) ->
     }
 }
 
+/// Where [`Db::restart_node_with`] moves a node's folder, and the boot the node must still run
+/// for the move to happen (#65, critic-bb G7 and M5).
+#[derive(Debug, Clone)]
+pub(crate) struct Aside {
+    /// The boot the drop named.
+    pub(crate) boot: BootId,
+    /// The generation of the commit that left the node out: `partitions/1`, read after the
+    /// stop, must be at or above it and not name the node (M5).
+    pub(crate) generation: Generation,
+    /// Where `nodes/<n>` goes. Never deleted (spec §8.4 retention).
+    pub(crate) to: PathBuf,
+}
+
+/// A rebuild guard's refusal as the caller sees it: `INVALID_ARGUMENT` for a node that holds no
+/// copy or owns the partition (G1, G2), else `UNAVAILABLE`; nothing was done either way. A
+/// refusal on the cluster's state (a re-plan running, a copy still pinned, a quarantine) can
+/// pass once that changes, so it is `RetryAfterRecovery`; only "process" (this process cannot
+/// run it) is `NotWired`. Each ends with [`error::REBUILD_STEP`], since its detail names the
+/// step.
+fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
+    tracing::warn!(guard = refused.guard, detail = %refused.detail, "db_rebuild_refused");
+    if matches!(refused.guard, "G1" | "G2") {
+        ApiError::invalid(refused.to_string())
+    } else {
+        let retry = if refused.guard == "process" {
+            RetryRule::NotWired
+        } else {
+            RetryRule::RetryAfterRecovery
+        };
+        rebuild_error(retry, true, refused.to_string())
+    }
+}
+
+/// An `UNAVAILABLE` from `admin rebuild` whose `detail` names its own step: it ends with
+/// [`error::REBUILD_STEP`], so no generic step is added after it.
+fn rebuild_error(retry: RetryRule, no_mutation: bool, detail: String) -> ApiError {
+    ApiError {
+        kind: ErrorKind::Unavailable,
+        retry,
+        no_mutation,
+        detail: format!("{detail}; {}", error::REBUILD_STEP),
+        retry_after: None,
+    }
+}
+
+/// Where a wipe moves `nodes/<node>`: `<dir>/aside/node-<n>-boot-<b>-<unix ms>`, beside
+/// `nodes_dir`, kept for the operator (spec §8.4 retention).
+fn aside_path(nodes_dir: &Path, node: NodeId, boot: BootId) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    nodes_dir
+        .parent()
+        .unwrap_or(nodes_dir)
+        .join("aside")
+        .join(format!("node-{}-boot-{}-{millis}", node.0, boot.0))
+}
+
+/// Move `folder` to `to`, creating `to`'s parent. Never deletes (critic-bb G7).
+fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
+    let moved = to
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::rename(folder, to));
+    match moved {
+        Ok(()) => {
+            tracing::warn!(
+                node = node.0,
+                from = %folder.display(),
+                to = %to.display(),
+                "node_folder_moved_aside"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(
+                node = node.0,
+                from = %folder.display(),
+                to = %to.display(),
+                %error,
+                "node_folder_move_failed"
+            );
+            Err(format!(
+                "moving {} to {}: {error}",
+                folder.display(),
+                to.display()
+            ))
+        }
+    }
+}
+
 /// How long the heal may wait for old grants to clear: a whole grant, its clock error and
 /// dispatch margin, and 10 s of slack for the store.
 fn heal_within(budgets: &Budgets) -> Duration {
@@ -3931,6 +4472,9 @@ fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
 
 #[cfg(test)]
 mod reopen_tests;
+
+#[cfg(test)]
+mod rebuild_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7299,17 +7843,31 @@ mod tests {
         let (tx, mailbox) = std::sync::mpsc::channel();
         db.links.register(OWNER, tx, host::BOOT);
         let looks = Arc::new(AtomicU64::new(0));
+        // Looks up to this count answer faulted; later ones answer admitting.
+        let faulted_until = Arc::new(AtomicU64::new(u64::MAX));
         let node_1 = {
             let looks = Arc::clone(&looks);
+            let faulted_until = Arc::clone(&faulted_until);
             std::thread::spawn(move || {
                 while let Ok(msg) = mailbox.recv() {
                     if let Msg::Inspect { reply, .. } = msg {
-                        looks.fetch_add(1, Ordering::Relaxed);
-                        let _ = reply.send(faulted.clone());
+                        let look = looks.fetch_add(1, Ordering::Relaxed) + 1;
+                        let status = if look <= faulted_until.load(Ordering::Relaxed) {
+                            faulted.clone()
+                        } else {
+                            NodeStatus {
+                                fault: None,
+                                admits: Some(true),
+                                ..faulted.clone()
+                            }
+                        };
+                        let _ = reply.send(status);
                     }
                 }
             })
         };
+        // Faulted throughout: waited to the bound and answered `TimedOut`. A host stall only
+        // lengthens the wait, so neither check can fail on one.
         let started = std::time::Instant::now();
         let answer = db.wait_ready(Duration::from_millis(300));
         let waited = started.elapsed();
@@ -7322,9 +7880,23 @@ mod tests {
             })
         );
         assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+        // It looks again after a faulted answer: the next look is faulted, the one after admits,
+        // and only a wait that looked again answers `Ok`. This was `looks > 1` inside the 300 ms
+        // above, which a stall of the test thread broke: on 2026-10-26 its first look landed at
+        // the deadline (`ready_owner_faulted` 0.06 ms before `db_shutdown`, against ~320 ms on
+        // the green runs), so one look was all the bound held (bb-b3 gate run 58bcb773).
+        let before = looks.load(Ordering::Relaxed);
+        faulted_until.store(before + 1, Ordering::Relaxed);
+        assert_eq!(
+            db.wait_ready(host::test_patience(Duration::from_secs(5))),
+            Ok(())
+        );
+        assert!(
+            looks.load(Ordering::Relaxed) >= before + 2,
+            "it looked again"
+        );
         drop(db);
         node_1.join().expect("the stub");
-        assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
     }
 
     /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
@@ -7388,10 +7960,28 @@ mod tests {
         assert_eq!(answer, Err(ReadyError::Quarantined { owner: OWNER }));
         assert_eq!(
             answer.expect_err("quarantined").to_string(),
-            "the open's recovery found copies whose histories disagree, so node 1 takes no \
-             writes; the acknowledged data is kept. This build has no repair command yet \
-             (removing a copy from membership comes in a later build), so opening the folder \
-             again will not help: do not delete the folder; stop and report it with this message"
+            format!(
+                "the open's recovery found copies whose histories disagree, so node 1 takes no \
+                 writes; the acknowledged data is kept, and opening the folder again will not \
+                 help: {}",
+                error::QUARANTINED_STEP
+            )
+        );
+        // Bug bash #65: a write the quarantine refused `LEASE_EXPIRED` said "call
+        // `Db::wait_ready`", which cannot end it. It now ends with the rebuild step and no other.
+        let refused = db.explained(ApiError {
+            kind: ErrorKind::LeaseExpired,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: true,
+            detail: "lease expired for partition 1".to_owned(),
+            retry_after: None,
+        });
+        assert!(
+            refused.detail.ends_with(error::QUARANTINED_STEP)
+                && refused.explain().contains("admin rebuild N")
+                && !refused.explain().contains("wait_ready"),
+            "{}",
+            refused.explain()
         );
         drop(db);
         node_1.join().expect("the stub");
