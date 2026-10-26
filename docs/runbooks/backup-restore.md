@@ -130,6 +130,12 @@ Restore sets `compact_revision = revision`, so a watch resuming below it gets
 fence a cursor at the restored revision (served since 2026-10-10, ADR-0020), nor one above it.
 Restore does not promise watch continuity.
 
+A client that resumes a watch with the history its last watch reported is refused by the
+restored cluster with `INVALID_ARGUMENT` and the metadata `retcd-relist: history` (#37,
+ADR-0024). That client relists on its own. Clients that do not send a history, older ones
+included, are not checked, and a cursor taken from `List` has no history until its first watch
+answers; tell those clients to relist.
+
 **10. Record RPO, RTO, revision, operator, reviewer.**
 
 ## What the restored store looks like

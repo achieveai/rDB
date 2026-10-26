@@ -290,3 +290,34 @@ any revision; that predates this change and is tracked in issue #37. Spec §14 s
 instruction is unchanged, and it now works: a relist right after restore reports `R`, and the
 watch at `R` is served instead of refused until the first write. This supersedes the step-9 row
 and the `compact_revision = revision` bullet above where they say storage enforces the relist.
+
+### 2026-10-26 — a watch cursor carries its history (#37, ruling A-R426)
+
+A cursor is a revision, and a revision only means something inside one history. A restore
+starts a new history: it always mints a new cluster id **and** a new recovery epoch (the refusal
+matrix above), so that pair names a history exactly. Before this change a cursor from the old
+history was fenced only below the restored revision; at or above it, the restored cluster
+served events from a different past as if they followed the client's.
+
+- `WatchRequest` gains `optional WatchHistory history = 4 { cluster_id, recovery_epoch }`.
+- A server that knows its identity refuses a watch whose history differs in either field, at
+  any revision, with `INVALID_ARGUMENT`, the detail "watch cursor is from another history
+  (cluster X epoch E); relist", and the metadata `retcd-relist: history`. Not `OUT_OF_RANGE`:
+  a client may resume from `retcd-min-revision`, which would mix two histories. Not
+  `FAILED_PRECONDITION`: that reads as "not leader" and the client would loop.
+- A server echoes its history as initial response metadata, `retcd-cluster-id` and
+  `retcd-recovery-epoch`, never in a response body. Every response still has a body, so an
+  older client decodes every response.
+- The history stays out of `config_core::WatchRequest`. It lives in the gRPC layer and in the
+  client's `TrackedWatch`, which records the echoed history (`TrackedWatch::history`). The
+  client sends it back through `GrpcClient::resume_watch_tracked` or
+  `resume_watch_leader_tracked`, and `config_client::is_relist_history` recognises the refusal.
+  The in-process path never crosses a restore, so it never checks.
+
+Compatibility. An old client sends no history and is never checked: today's exposure stays,
+and step 9 (relist) stays. A new client against an old server gets no echo, keeps watching,
+and treats the missing echo as "unchecked", never as an error.
+
+Limit. A cursor seeded by `List` carries no history until the first watch on it answers. A
+client that lists, loses the cluster to a restore, then opens its first watch is not checked.
+Get and List do not echo the history; widening them is not part of #37.
