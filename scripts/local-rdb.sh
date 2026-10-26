@@ -442,13 +442,15 @@ up() {
     RUN="$ROOT/$sha-$BASE_PORT-$stamp"
     mkdir -p "$RUN"/{out,stop,faults,logs}
     CONTROL="$(control_endpoints)"
+    # pick_run sources this file, so the paths are shell-quoted: a target dir with a space
+    # in it broke every later verb (PR #63 review).
     cat > "$RUN/run.env" <<EOF
 BASE_PORT=$BASE_PORT
 CONTROL=$CONTROL
 SHA=$sha
 PROFILE=$PROFILE
-NODE_BIN=$NODE_BIN
-PILOT_BIN=$PILOT_BIN
+NODE_BIN=$(printf '%q' "$NODE_BIN")
+PILOT_BIN=$(printf '%q' "$PILOT_BIN")
 EOF
     : > "$RUN/pids"
     echo "$RUN" > "$ROOT/current"
@@ -495,7 +497,7 @@ start_all() { # nodes 1-3, then the wait for each: the tail of `up` and `up --re
         exit 1
     fi
     say "up. control=$CONTROL nodes=$(peers)"
-    say "pilot: $PILOT_BIN --dir $RUN/pilot --control $CONTROL --nodes $(peers) --cert-dir $RUN/certs --put k=v --get k"
+    say "pilot: $(printf %q "$PILOT_BIN") --dir $(printf %q "$RUN/pilot") --control $CONTROL --nodes $(peers) --cert-dir $(printf %q "$RUN/certs") --put k=v --get k"
 }
 
 down() {

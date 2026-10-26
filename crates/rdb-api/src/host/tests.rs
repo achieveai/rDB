@@ -6346,3 +6346,259 @@ fn m10_s2_a_learned_owner_is_forgotten_once_a1_leaves_the_fence_it_was_learned_u
         host.owner_after_fence
     );
 }
+
+/// A-R446 (PR #63 review, option (b)): `bind_routed_fence`, one check at a time. `true_fence`
+/// is a fence every check holds for; each row below breaks one fact and leaves the rest true,
+/// so deleting that one check turns its row red.
+mod routed_fence {
+    use super::{bind_routed_fence, fence_recheck_millis, test_budgets, FenceFacts};
+    use rdb_core::authority::clock::{expiry_proven, ClockView};
+    use rdb_core::authority::grant::GrantRecord;
+    use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+    use rdb_core::contracts::authority::{FencingProof, Revocation};
+    use rdb_core::contracts::ids::{
+        AuthorityGeneration, BootId, ConfigVersion, Generation, GrantId, NodeId, OwnerEpoch,
+        PartitionId, Revision,
+    };
+    use rdb_core::contracts::time::Tick;
+
+    use crate::clock::HostClock;
+
+    const NOW: Tick = Tick(1_000_000);
+    /// One minute before `NOW`: proven past on `test_budgets`.
+    const EXPIRED: i64 = 940_000;
+
+    fn true_fence() -> (FencingProof, FenceFacts) {
+        let budgets = test_budgets();
+        let mut view = ClockView::new();
+        view.accept(HostClock::control_time(NOW, &budgets));
+        let revocation =
+            expiry_proven(&view, EXPIRED, NOW, &budgets).expect("an expiry a minute ago");
+        let facts = FenceFacts {
+            record: PartitionRecord {
+                partition: PartitionId(1),
+                owner: NodeId(1),
+                generation: Generation(3),
+                owner_epoch: OwnerEpoch(2),
+                config_version: ConfigVersion(4),
+                lifecycle: PartitionLifecycle::Fencing,
+            },
+            owner_boot: BootId(7),
+            mod_revision: Revision(40),
+            grant: Some(GrantRecord {
+                grant: GrantId(5),
+                node: NodeId(1),
+                boot: BootId(7),
+                authority_generation: AuthorityGeneration::default(),
+                expiry_utc_ms: EXPIRED,
+                frozen: true,
+            }),
+        };
+        let proof = FencingProof {
+            partition: PartitionId(1),
+            prior_generation: Generation(3),
+            prior_owner_epoch: OwnerEpoch(2),
+            prior_grant_id: GrantId(5),
+            prior_boot_id: BootId(7),
+            revocation,
+            control_revision: Revision(40),
+            decision_tick: NOW,
+        };
+        (proof, facts)
+    }
+
+    fn bind(proof: &FencingProof, facts: FenceFacts) -> Result<(), &'static str> {
+        bind_routed_fence(PartitionId(1), proof, Ok(facts), NOW, &test_budgets())
+            .map_err(|(reason, _)| reason)
+    }
+
+    /// The positive control: a fence every check holds for binds.
+    /// Cut: any check refuses a true fence, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_a_true_routed_fence_binds() {
+        let (proof, facts) = true_fence();
+        assert_eq!(bind(&proof, facts), Ok(()));
+    }
+
+    /// Check 1: a fence for another revision of `partitions/1`, or another partition.
+    /// Cut: check 1 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_1_a_fence_at_another_revision_is_refused() {
+        let (proof, mut facts) = true_fence();
+        facts.mod_revision = Revision(41);
+        assert_eq!(bind(&proof, facts), Err("revision"));
+        let (mut proof, facts) = true_fence();
+        proof.partition = PartitionId(2);
+        assert_eq!(
+            bind_routed_fence(PartitionId(2), &proof, Ok(facts), NOW, &test_budgets())
+                .map_err(|(reason, _)| reason),
+            Err("revision"),
+            "routed to partition 2, which partitions/1 is not"
+        );
+    }
+
+    /// Check 2: a `Serving` or `FencingDrained` record, with every grant fact true.
+    /// Cut: check 2 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_2_a_fence_over_a_record_not_fencing_is_refused() {
+        for lifecycle in [
+            PartitionLifecycle::Serving,
+            PartitionLifecycle::FencingDrained,
+        ] {
+            let (proof, mut facts) = true_fence();
+            facts.record.lifecycle = lifecycle;
+            assert_eq!(bind(&proof, facts), Err("not_fencing"), "{lifecycle:?}");
+        }
+    }
+
+    /// Check 3: the proof's prior generation or owner epoch is not the record's.
+    /// Cut: check 3 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_3_a_fence_for_another_lineage_is_refused() {
+        let (mut proof, facts) = true_fence();
+        proof.prior_generation = Generation(2);
+        assert_eq!(bind(&proof, facts), Err("lineage"));
+        let (mut proof, facts) = true_fence();
+        proof.prior_owner_epoch = OwnerEpoch(1);
+        assert_eq!(bind(&proof, facts), Err("lineage"));
+    }
+
+    /// Check 4: the proof's prior boot is not the one the record's root names.
+    /// Cut: check 4 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_4_a_fence_naming_another_owner_boot_is_refused() {
+        let (mut proof, facts) = true_fence();
+        proof.prior_boot_id = BootId(8);
+        assert_eq!(bind(&proof, facts), Err("owner_boot"));
+    }
+
+    /// Check 5: the owner's grant is not frozen, is another grant, or is absent; its expiry is
+    /// past in each case, so only check 5 can refuse.
+    /// Cut: check 5 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_5_a_fence_over_a_grant_not_frozen_or_not_the_proofs_is_refused() {
+        let (proof, mut facts) = true_fence();
+        facts.grant.as_mut().expect("a grant").frozen = false;
+        assert_eq!(bind(&proof, facts), Err("grant"), "not frozen");
+        let (mut proof, facts) = true_fence();
+        proof.prior_grant_id = GrantId(4);
+        assert_eq!(bind(&proof, facts), Err("grant"), "another grant");
+        let (proof, mut facts) = true_fence();
+        facts.grant = None;
+        assert_eq!(bind(&proof, facts), Err("grant"), "absent");
+    }
+
+    /// Check 6: the grant's expiry is not yet proven past on this node's clock, though the
+    /// proof says it is; and a routed `DurableDrain`, which only local paths send.
+    /// Cut: check 6 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_6_a_fence_before_the_expiry_is_proven_or_by_drain_is_refused() {
+        let (proof, mut facts) = true_fence();
+        facts.grant.as_mut().expect("a grant").expiry_utc_ms = 1_000_500;
+        assert_eq!(bind(&proof, facts), Err("expiry_not_proven"));
+        let (mut proof, facts) = true_fence();
+        proof.revocation = Revocation::DurableDrain {
+            ack_revision: Revision(39),
+        };
+        assert_eq!(bind(&proof, facts), Err("revocation"));
+    }
+
+    /// Check 0 (critic-63 A1): a proof routed to a partition it is not for. Every other fact is
+    /// true of the proof's own partition.
+    /// Cut: check 0 deleted, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_0_a_fence_routed_to_another_partition_is_refused() {
+        let (proof, facts) = true_fence();
+        assert_eq!(
+            bind_routed_fence(PartitionId(2), &proof, Ok(facts), NOW, &test_budgets())
+                .map_err(|(reason, _)| reason),
+            Err("partition")
+        );
+    }
+
+    /// An expiry `short` ms from proven past at `NOW` on `test_budgets`: `expiry_proven` holds
+    /// once now > expiry + ε + δ.
+    fn short_of_proven_by(short: i64) -> i64 {
+        let budgets = test_budgets();
+        let edge = budgets.clock_error_millis + budgets.dispatch_margin_millis + 1;
+        i64::try_from(NOW.0 - edge).expect("fits") + short
+    }
+
+    /// A-R446b (critic-63 M2): this node's clock lags the promoter's by 50 ms, less than ε. The
+    /// first check refuses `expiry_not_proven`, `fence_recheck_millis` says wait 50 ms, and the
+    /// same facts checked 50 ms later bind.
+    /// Cut: `fence_recheck_millis` answers `None`, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446b_a_node_clock_behind_by_less_than_epsilon_binds_on_the_re_check() {
+        let budgets = test_budgets();
+        let (proof, mut facts) = true_fence();
+        let expiry = short_of_proven_by(50);
+        facts.grant.as_mut().expect("a grant").expiry_utc_ms = expiry;
+        assert_eq!(
+            bind(&proof, facts.clone()),
+            Err("expiry_not_proven"),
+            "at NOW"
+        );
+        assert_eq!(fence_recheck_millis(expiry, NOW, &budgets), Some(50));
+        let later = Tick(NOW.0 + 50);
+        assert_eq!(
+            bind_routed_fence(PartitionId(1), &proof, Ok(facts), later, &budgets)
+                .map_err(|(reason, _)| reason),
+            Ok(()),
+            "50 ms later"
+        );
+    }
+
+    /// A-R446b: short by up to 2ε (two clocks each within ε of the authority) waits; short by
+    /// more is early on any clock in bound, and is refused with no re-check. The refusal's
+    /// reason is `expiry_not_proven`.
+    /// Cut: the 2ε bound dropped (any shortfall waits), red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446b_a_node_clock_behind_by_more_than_two_epsilon_refuses_without_a_re_check() {
+        let budgets = test_budgets();
+        let two_epsilon = budgets.clock_error_millis * 2;
+        let at_bound = short_of_proven_by(i64::try_from(two_epsilon).expect("fits"));
+        assert_eq!(
+            fence_recheck_millis(at_bound, NOW, &budgets),
+            Some(two_epsilon)
+        );
+        let (proof, mut facts) = true_fence();
+        let past_bound = at_bound + 1;
+        facts.grant.as_mut().expect("a grant").expiry_utc_ms = past_bound;
+        assert_eq!(bind(&proof, facts), Err("expiry_not_proven"));
+        assert_eq!(fence_recheck_millis(past_bound, NOW, &budgets), None);
+        assert_eq!(
+            fence_recheck_millis(EXPIRED, NOW, &budgets),
+            None,
+            "already proven"
+        );
+    }
+
+    /// A control read that failed refuses, never binds.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r446_a_fence_whose_reads_failed_is_refused() {
+        let (proof, _) = true_fence();
+        assert_eq!(
+            bind_routed_fence(
+                PartitionId(1),
+                &proof,
+                Err("get".to_owned()),
+                NOW,
+                &test_budgets()
+            )
+            .map_err(|(reason, _)| reason),
+            Err("control_read_failed")
+        );
+    }
+}

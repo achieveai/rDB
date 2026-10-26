@@ -649,8 +649,13 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
-  can promote too. **The dropped node is added back automatically when it starts again, or at
-  the next reopen heal; membership is fixed at three nodes.**
+  can promote too. A promote starts with rEtcd writes to `partitions/` and `grants/`, and the
+  node it promotes checks the fence it is sent against those records and refuses one that is
+  not true. The plan sent with the fence, which names the members, is not checked. So while a
+  promote is stalled with partition 1 fencing, any app holding the link cert can finish it with
+  members of its choosing. That is a known gap (issue #70). **The dropped node is added back
+  automatically when it starts again, or at the next reopen heal; membership is fixed at three
+  nodes.**
   - **After every node restarts, a promote still works,** even with the owner's copy lost.
     `partitions/1` keeps the member list and each member's role (record layout 4), and a
     promote plans from it.

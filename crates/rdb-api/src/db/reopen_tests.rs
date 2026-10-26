@@ -3370,6 +3370,354 @@ fn partition_owner(
     (record.owner, record.generation)
 }
 
+/// `partitions/1` and `grants/1` as a promote reads them: the record, its root, its revision,
+/// and node 1's grant with its revision.
+fn partition_and_grant(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+) -> (
+    PartitionRecord,
+    PartitionRoot,
+    u64,
+    rdb_core::authority::grant::GrantRecord,
+    u64,
+) {
+    let (record, root, _, revision, _) = rt
+        .block_on(admin::read_partition(&**store))
+        .expect("partitions/1");
+    let grant = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(crate::admin::OWNER).encode()),
+        }))
+        .expect("get grants/1")
+        .record
+        .expect("grants/1");
+    let held = rdb_core::authority::grant::GrantRecord::decode(&grant.value).expect("a grant");
+    (record, root, revision, held, grant.mod_revision)
+}
+
+/// A-R446 rows: route node 2 a plan and `fence` as a promote sends them, then wait until node 2
+/// logs `routed_fence_refused` or `partitions/1` leaves `revision`. Answers the reasons node 2
+/// logged, and `partitions/1`'s revision and owner after.
+fn route_fence_to_node_2(
+    rt: &tokio::runtime::Runtime,
+    db: &Db,
+    store: &Arc<dyn ConfigStore>,
+    method: &str,
+    (record, root): (&PartitionRecord, &PartitionRoot),
+    fence: rdb_core::contracts::authority::FencingProof,
+) -> (Vec<String>, u64, NodeId) {
+    use rdb_core::contracts::authority::Lineage;
+    use rdb_core::contracts::recovery::{LineageAnchor, RecoveryEvent};
+    let revision = fence.control_revision.0;
+    let anchor = LineageAnchor {
+        lineage: Lineage {
+            partition: PARTITION,
+            generation: record.generation,
+            owner_epoch: record.owner_epoch,
+        },
+        base_seq: root.base_seq,
+        base_digest: root.base_digest,
+    };
+    let plan = admin::recovery_plan(
+        anchor,
+        rdb_core::contracts::ids::ConfigVersion(record.config_version.0 + 1),
+        admin::members(),
+        db.links().boot_of(NodeId(2)).expect("node 2 runs"),
+        rdb_core::contracts::ids::GrantId(1),
+        rdb_core::contracts::ids::AuthorityGeneration(1),
+    );
+    for event in [
+        RecoveryEvent::Plan(Box::new(plan)),
+        RecoveryEvent::FenceProven(Box::new(fence)),
+    ] {
+        db.links()
+            .post(
+                NodeId(2),
+                Msg::Routed {
+                    partition: PARTITION,
+                    correlation: CorrelationId(9),
+                    kind: KernelEvent::Recovery(event),
+                },
+            )
+            .expect("node 2 runs");
+    }
+    let refused = || -> Vec<String> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "routed_fence_refused" && line["node"] == 2)
+            .map(|line| line["reason"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        let (now, _, at, ..) = partition_and_grant(rt, store);
+        let reasons = refused();
+        if !reasons.is_empty() || at != revision || std::time::Instant::now() >= deadline {
+            return (reasons, at, now.owner);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A-R446 (PR #63 review, option (b)): a fence an app made up is refused by the node it is routed
+/// to. `partitions/1` is `Serving` and node 1's grant is live and not frozen. A plan for node 2
+/// and a `FenceProven` naming that grant, at `partitions/1`'s own revision, are routed to node 2
+/// as a promote sends them. Node 2 logs `routed_fence_refused{reason=not_fencing}`, F1 never
+/// sees the proof, and `partitions/1` keeps its revision and still names node 1: no CAS.
+/// Cut: the `Routed` arm pushes a `FenceProven` without binding it: no refusal, red.
+/// Integration (~2 s): one fresh open until ready, a put, the routed pair.
+#[config_log::retcd_test]
+fn m10_s2_r446_a_made_up_fence_over_a_live_grant_is_refused_and_nothing_is_written() {
+    const METHOD: &str =
+        "m10_s2_r446_a_made_up_fence_over_a_live_grant_is_refused_and_nothing_is_written";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db.put(b"a", b"1", None).expect("a put");
+    let (record, root, revision, grant, _) = partition_and_grant(&rt, &store);
+    assert_eq!(
+        (record.lifecycle, grant.frozen),
+        (
+            rdb_core::authority::partition::PartitionLifecycle::Serving,
+            false
+        ),
+        "the setup: node 1 serves on a live grant"
+    );
+    let fence = rdb_core::contracts::authority::FencingProof {
+        partition: PARTITION,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: grant.grant,
+        prior_boot_id: root.owner_boot,
+        revocation: rdb_core::contracts::authority::Revocation::ExpiryProven {
+            frozen_expiry_utc_ms: grant.expiry_utc_ms,
+            authority_utc_ms: grant.expiry_utc_ms + 1,
+            authority_tick: db.clock.now(),
+            epsilon_ms: 0,
+            delta_ms: 0,
+        },
+        control_revision: rdb_core::contracts::ids::Revision(revision),
+        decision_tick: db.clock.now(),
+    };
+    let (reasons, after, owner) =
+        route_fence_to_node_2(&rt, &db, &store, METHOD, (&record, &root), fence);
+    assert_eq!(reasons, ["not_fencing"], "node 2 refused the made-up fence");
+    assert_eq!(
+        (after, owner),
+        (revision, crate::admin::OWNER),
+        "partitions/1 unchanged"
+    );
+    db.put(b"b", b"2", None).expect("node 1 still takes writes");
+    db.shutdown();
+}
+
+/// A-R446 clause 2: a fence over a `Fencing` record and a frozen grant whose expiry is not yet
+/// proven past is refused too. The row writes `Fencing` and freezes node 1's grant with an
+/// expiry 10 minutes ahead, as a promote's steps 3 and 4 would on a slow clock, then routes the
+/// pair at the `Fencing` revision. Node 2 logs `routed_fence_refused{reason=expiry_not_proven}`
+/// and `partitions/1` keeps that revision.
+/// Cut: `bind_routed_fence` skips the expiry check: node 2 binds it, red.
+/// Integration (~2 s): one fresh open until ready, two CASes, the routed pair.
+#[config_log::retcd_test]
+fn m10_s2_r446_a_fence_before_the_frozen_grant_is_proven_expired_is_refused() {
+    const METHOD: &str = "m10_s2_r446_a_fence_before_the_frozen_grant_is_proven_expired_is_refused";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let put = |key: ControlKey, value: Bytes, revision: u64| {
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(key.encode()),
+            value,
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        }))
+        .map(|answer| answer.outcome == config_core::MutationOutcome::Applied)
+        .unwrap_or(false)
+    };
+    let (record, root, revision, ..) = partition_and_grant(&rt, &store);
+    let fencing = PartitionRecord {
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Fencing,
+        ..record
+    };
+    assert!(
+        put(
+            ControlKey::Partition(PARTITION),
+            fencing.encode_with(&root),
+            revision
+        ),
+        "the Fencing write"
+    );
+    // A renewal can land between the read and the freeze, as for a promote: read again.
+    let ahead = i64::try_from(db.clock.now().0).expect("a tick fits") + 600_000;
+    let frozen = (0..20).find_map(|_| {
+        let (.., grant, at) = partition_and_grant(&rt, &store);
+        let frozen = rdb_core::authority::grant::GrantRecord {
+            frozen: true,
+            expiry_utc_ms: ahead,
+            ..grant
+        };
+        put(ControlKey::Grant(crate::admin::OWNER), frozen.encode(), at).then_some(frozen)
+    });
+    let frozen = frozen.expect("the freeze lands within 20 tries");
+    let (record, root, revision, ..) = partition_and_grant(&rt, &store);
+    let fence = rdb_core::contracts::authority::FencingProof {
+        partition: PARTITION,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: frozen.grant,
+        prior_boot_id: root.owner_boot,
+        revocation: rdb_core::contracts::authority::Revocation::ExpiryProven {
+            frozen_expiry_utc_ms: ahead,
+            authority_utc_ms: ahead + 1,
+            authority_tick: db.clock.now(),
+            epsilon_ms: 0,
+            delta_ms: 0,
+        },
+        control_revision: rdb_core::contracts::ids::Revision(revision),
+        decision_tick: db.clock.now(),
+    };
+    let (reasons, after, owner) =
+        route_fence_to_node_2(&rt, &db, &store, METHOD, (&record, &root), fence);
+    assert_eq!(
+        reasons,
+        ["expiry_not_proven"],
+        "node 2 refused the early fence"
+    );
+    assert_eq!(
+        (after, owner),
+        (revision, crate::admin::OWNER),
+        "partitions/1 unchanged"
+    );
+    db.shutdown();
+}
+
+/// A-R446b (critic-63 M2): a true fence that a node's clock proves only a little after the
+/// promoter's did is bound and committed, through the host. The row writes `Fencing` and freezes
+/// node 1's grant with an expiry that node 2's clock proves past about 190 ms after the freeze,
+/// inside the 2ε (200 ms) a node may lag a promoter by, then routes the pair. Node 2 refuses
+/// nothing, binds once and commits: `partitions/1` moves one generation on (the helper's plan
+/// keeps node 1 primary, so the owner it names stays node 1).
+///
+/// Outcome only, so no wall-clock luck is needed: whether node 2's first check lands inside
+/// those 190 ms is up to scheduling. If it does, node 2 logs `routed_fence_recheck` and then
+/// `routed_fence_bound{rechecked=true}`; if it is late, one `routed_fence_bound{rechecked=false}`.
+/// Both pass. The re-check itself is pinned by the unit rows `routed_fence::m10_s2_r446b_*`,
+/// which fix the shortfall.
+/// Cuts: the `Routed` arm pushes the fence unbound: no `routed_fence_bound`, red on every run.
+/// The re-check branch removed: `routed_fence_refused{expiry_not_proven}`, red whenever the first
+/// check is early.
+/// Integration (~2 s): one fresh open until ready, two CASes, the routed pair.
+#[config_log::retcd_test]
+fn m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_is_bound_and_committed() {
+    const METHOD: &str =
+        "m10_s2_r446b_a_fence_a_node_proves_within_two_epsilon_is_bound_and_committed";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let put = |key: ControlKey, value: Bytes, revision: u64| {
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(key.encode()),
+            value,
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        }))
+        .map(|answer| answer.outcome == config_core::MutationOutcome::Applied)
+        .unwrap_or(false)
+    };
+    let (record, root, revision, ..) = partition_and_grant(&rt, &store);
+    let fencing = PartitionRecord {
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Fencing,
+        ..record
+    };
+    assert!(
+        put(
+            ControlKey::Partition(PARTITION),
+            fencing.encode_with(&root),
+            revision
+        ),
+        "the Fencing write"
+    );
+    let budgets = crate::host::test_budgets();
+    let edge = i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis + 1)
+        .expect("fits");
+    let short_of_proven_now =
+        |short: i64| i64::try_from(db.clock.now().0).expect("a tick fits") - edge + short;
+    // A renewal can land between the read and the freeze, as for a promote: read again.
+    let frozen = (0..20).find_map(|_| {
+        let (.., grant, at) = partition_and_grant(&rt, &store);
+        let frozen = rdb_core::authority::grant::GrantRecord {
+            frozen: true,
+            expiry_utc_ms: short_of_proven_now(190),
+            ..grant
+        };
+        put(ControlKey::Grant(crate::admin::OWNER), frozen.encode(), at).then_some(frozen)
+    });
+    let frozen = frozen.expect("the freeze lands within 20 tries");
+    let (record, root, revision, ..) = partition_and_grant(&rt, &store);
+    let fence = rdb_core::contracts::authority::FencingProof {
+        partition: PARTITION,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: frozen.grant,
+        prior_boot_id: root.owner_boot,
+        revocation: rdb_core::contracts::authority::Revocation::ExpiryProven {
+            frozen_expiry_utc_ms: frozen.expiry_utc_ms,
+            authority_utc_ms: frozen.expiry_utc_ms + edge,
+            authority_tick: db.clock.now(),
+            epsilon_ms: 100,
+            delta_ms: 100,
+        },
+        control_revision: rdb_core::contracts::ids::Revision(revision),
+        decision_tick: db.clock.now(),
+    };
+    let (reasons, after, _) =
+        route_fence_to_node_2(&rt, &db, &store, METHOD, (&record, &root), fence);
+    assert!(reasons.is_empty(), "node 2 refused: {reasons:?}");
+    let (_, generation) = partition_owner(&rt, &store);
+    assert!(
+        after != revision && generation.0 == record.generation.0 + 1,
+        "node 2 committed: partitions/1 at {after}, generation {}",
+        generation.0
+    );
+    let seen: Vec<(String, bool)> =
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["node"] == 2)
+            .filter(|line| {
+                [
+                    "routed_fence_recheck",
+                    "routed_fence_bound",
+                    "routed_fence_refused",
+                ]
+                .iter()
+                .any(|message| line["@m"] == *message)
+            })
+            .map(|line| {
+                (
+                    line["@m"].as_str().unwrap_or_default().to_owned(),
+                    line["rechecked"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+    let bound = |rechecked: bool| ("routed_fence_bound".to_owned(), rechecked);
+    let recheck = ("routed_fence_recheck".to_owned(), false);
+    assert!(
+        seen == [bound(false)] || seen == [recheck, bound(true)],
+        "one bind, after at most one re-check: {seen:?}"
+    );
+    db.shutdown();
+}
+
 /// A-R265/A-R266 (W7's walk G, condition 3): a promote that cannot reach node 2 is refused
 /// `UNAVAILABLE`, and says to promote again. Since review-s2 F-004 (A-R412) it is refused before
 /// it writes: it reads node 2's roles first, and node 2 does not answer. The refusal after a
@@ -3824,8 +4172,9 @@ mod guide_sample {
 }
 
 /// local-cluster.md section 3's app, compiled here as the guide prints it (critic-w5g A4). Its
-/// `main` needs a running `lr` cluster, so no row runs it; the compile and the byte check below
-/// are what keep the guide's code buildable.
+/// `main` needs a running `lr` cluster, so no row runs it (a gated multi-process walk is
+/// achieveai/rDB#72); the compile and the byte check below are what keep the guide's code
+/// buildable.
 #[allow(dead_code)]
 mod local_cluster_sample {
     use crate as rdb_api;
