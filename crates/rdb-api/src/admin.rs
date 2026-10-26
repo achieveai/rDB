@@ -923,7 +923,7 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // them since is not the one the plan describes.
     if pinned_of(&found.value)?.is_some_and(|now| now != pinned) {
         return Err(HealError::Record(format!(
-            "the members partitions/1 pins changed at revision {} while this open waited for              their nodes: open again",
+            "the members partitions/1 pins changed at revision {} while this open waited for their nodes: open again",
             found.mod_revision
         )));
     }
