@@ -542,6 +542,18 @@ admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its e
 
 promote() { admin_line "admin promote $ARG${DROP:+ --drop $DROP}"; }
 
+# Moves stopped node $1's folder to $RUN/db/aside/node-<n>-<UTC stamp> and says where; it is
+# never deleted (A-R441, A-R445). Returns 1, folder left in place, when the move fails.
+move_aside() {
+    local n="$1" aside
+    aside="$RUN/db/aside/node-$n-$(date -u +%Y%m%dT%H%M%SZ)"
+    if ! { mkdir -p "$RUN/db/aside" && mv "$RUN/db/nodes/$n" "$aside"; }; then
+        say "node $n's folder could not be moved aside to $aside"
+        return 1
+    fi
+    say "node $n's old folder moved aside to $aside"
+}
+
 # bb #65 over processes: only mode A (node N already left out by the owner) runs here, since
 # dropping N needs the owner's own process. rdb_dev checks the guards against the owner first,
 # before anything is stopped, so a refusal touches nothing (A-R441 F1). With --wipe, N is then
@@ -557,12 +569,10 @@ rebuild() {
             start_node "$n" stopped; await_ready "$n" || not_ready "$n"
             die "rebuild $n refused; its folder is left in place and it runs on it again"
         fi
-        aside="$RUN/db/aside/node-$n-$(date -u +%Y%m%dT%H%M%SZ)"
-        if ! { mkdir -p "$RUN/db/aside" && mv "$RUN/db/nodes/$n" "$aside"; }; then
+        if ! move_aside "$n"; then
             start_node "$n" stopped; await_ready "$n" || not_ready "$n"
-            die "node $n's folder could not be moved aside to $aside; the folder is left in place and it runs on it again"
+            die "node $n's folder could not be moved aside; the folder is left in place and it runs on it again"
         fi
-        say "node $n's old folder moved aside to $aside"
     fi
     start_node "$n" stopped; await_ready "$n" || not_ready "$n"
     say "node $n restarted; the owner takes it back as a shadow, then regular (\`status\` shows it)"
@@ -584,9 +594,13 @@ case "$COMMAND" in
             node_alive "$ARG" && die "node $ARG runs; stop it before --wipe"
             # A pinned copy is never wiped before the owner drops it (bb #65, A-R441 A3).
             admin_line "admin rebuild $ARG" ||
-                die "start $ARG --wipe refused: the owner still pins node $ARG, or did not answer; nothing was wiped. Use \`lr rebuild $ARG --wipe\`"
-            rm -rf "$RUN/db/nodes/$ARG"
-            say "node $ARG wiped"
+                die "start $ARG --wipe refused: the owner still pins node $ARG, or did not answer; nothing was moved aside. Use \`lr rebuild $ARG --wipe\`"
+            # Then the fence, as `rebuild --wipe` checks it, and the folder goes aside, never
+            # deleted (A-R445).
+            admin_line "admin rebuild $ARG --wipe --fence" ||
+                die "start $ARG --wipe refused: the fence check failed; nothing was moved and node $ARG was not started"
+            move_aside "$ARG" ||
+                die "start $ARG --wipe: the folder is left in place and node $ARG was not started"
         fi
         start_node "$ARG"; await_ready "$ARG" || not_ready "$ARG" ;;
     restart) pick_run; check_node_arg "$ARG"; stop_node "$ARG"; start_node "$ARG" stopped; await_ready "$ARG" || not_ready "$ARG" ;;
