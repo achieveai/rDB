@@ -3279,7 +3279,10 @@ impl Db {
     /// when `node` is pinned, re-plans without it and waits for that commit; a quarantined owner
     /// replaces its F1 first, and its rebuild always wipes. Then `node` restarts at a new boot,
     /// its folder moved aside when wiped (never deleted), and the owner takes it back, first as
-    /// a shadow. Returns the accept line once the owner pins `node` regular again.
+    /// a shadow. Returns the accept line once the owner pins `node` regular again. With the owner
+    /// in another process (`--nodes`) the owner is asked over its link and takes only a node it
+    /// does not pin (M11 T12): one already left out, or a spare it notes for a free slot. The
+    /// line then says to restart `node`; `lr rebuild` does that.
     ///
     /// # Errors
     ///
@@ -3301,12 +3304,28 @@ impl Db {
                     ),
                 }));
             }
-            let (owner, generation) = self.left_out(node)?;
-            return Ok(format!(
-                "rebuild: node {} is left out by node {} (the owner) at generation {} (mode A); \
-                 restart it and the owner takes it back",
-                node.0, owner.0, generation.0
-            ));
+            // The guards a status look answers are checked here first; then the owner itself is
+            // asked over its link (M11 T12, tester T13): it notes a spare for the free slot, or
+            // says the copy is already left out. The status look alone could not note a spare,
+            // and said "restart it" for one the owner would never take back.
+            self.left_out(node)?;
+            return match self.call(
+                ClientCall::Rebuild {
+                    identity: self.identity(),
+                    node,
+                },
+                self.timeouts.read,
+            ) {
+                Some(Answer::Rebuilt(line)) => Ok(line),
+                Some(Answer::Error { error, .. }) => Err(error),
+                Some(other) => Err(ApiError::host(&format!(
+                    "a rebuild was answered with {other:?}"
+                ))),
+                None => Err(ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!("no answer to the rebuild in {:?}", self.timeouts.read),
+                )),
+            };
         }
         self.rebuild_with(node, wipe).map(|rebuilt| rebuilt.line())
     }
@@ -4081,7 +4100,7 @@ pub(crate) struct Aside {
 /// pass once that changes, so it is `RetryAfterRecovery`; only "process" (this process cannot
 /// run it) is `NotWired`. Each ends with [`error::REBUILD_STEP`], since its detail names the
 /// step.
-fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
+pub(crate) fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
     tracing::warn!(guard = refused.guard, detail = %refused.detail, "db_rebuild_refused");
     if matches!(refused.guard, "G1" | "G2") {
         ApiError::invalid(refused.to_string())
@@ -4435,7 +4454,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Compile { .. }
         | ClientCall::Resend { .. }
         | ClientCall::Status { .. }
-        | ClientCall::Move { .. } => return None,
+        | ClientCall::Move { .. }
+        | ClientCall::Rebuild { .. } => return None,
     };
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {

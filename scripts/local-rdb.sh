@@ -603,8 +603,8 @@ move_aside() {
     say "node $n's old folder moved aside to $aside"
 }
 
-# bb #65 over processes: only mode A (node N already left out by the owner) runs here, since
-# dropping N needs the owner's own process. rdb_dev checks the guards against the owner first,
+# bb #65 over processes: only mode A (node N already left out by the owner, or a spare it notes
+# for a free slot, M11) runs here, since dropping N needs the owner's own process. rdb_dev checks the guards against the owner first,
 # before anything is stopped, so a refusal touches nothing (A-R441 F1). With --wipe, N is then
 # stopped and rdb_dev checks the fence, read after the stop: the owner's live pin does not name N
 # in any role and partitions/1 leaves it out (A-R441 F2). Only then is N's folder moved aside,

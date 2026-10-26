@@ -256,6 +256,10 @@ fn calls() -> Vec<ClientCall> {
         identity: identity(4, 32),
         generation: Some(zero()),
     });
+    calls.push(ClientCall::Rebuild {
+        identity: identity(4, 33),
+        node: NodeId(4),
+    });
     calls
 }
 
@@ -346,6 +350,7 @@ fn answers() -> Vec<Answer> {
         Answer::Compiled(zero()),
         Answer::Unchanged,
         Answer::Status(zero()),
+        Answer::Rebuilt("rebuild: node 4 is a spare".to_owned()),
         Answer::Error {
             error,
             request: Some(zero()),
@@ -1505,8 +1510,8 @@ struct NodeProcess {
 }
 
 /// Start node `node`'s process on the formed folder `dir`, as `rdb_node` does: the links first
-/// (serving on `listener`, dialling the lower nodes in `addrs`), then its `Db` on its own copy at
-/// `next_boot(dir)`.
+/// (serving on `listener`, linking every node in `addrs` and dialling the lower ones), then
+/// its `Db` on its own copy at `next_boot(dir)`.
 fn node_process(
     rt: &tokio::runtime::Runtime,
     dir: &FsPath,
@@ -1526,11 +1531,7 @@ fn node_process(
                 label: Label::Node(me),
                 boot,
                 tls: certs::load(certs_dir, &Label::Node(me)).expect("certs"),
-                peers: crate::db::ALL_NODES
-                    .iter()
-                    .copied()
-                    .filter(|n| *n != me)
-                    .collect(),
+                peers: addrs.keys().copied().filter(|n| *n != me).collect(),
                 dial: NetConfig::dial_lower(me, addrs),
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
@@ -1781,6 +1782,179 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     again.db.shutdown();
     one.db.shutdown();
     two.db.shutdown();
+}
+
+/// M11 T12 over processes (lead ruling on dev-a's open item 1): `admin rebuild 4` from an app
+/// with no node of its own (`rdb_dev --nodes`, as `lr rebuild 4` runs it) reaches the owner in
+/// its own process, and the owner notes spare node 4 for the free slot. Nodes 1 and 2 serve
+/// with node 3 never started, so the owner's commit pins two copies; node 4 runs as a spare.
+/// The app's rebuild answers that node 4 is noted; node 4's process restarts, as lr does, and
+/// the owner pins it as a shadow and then regular: nodes 1, 2 and 4, and a put lands. Cut: the
+/// app answers mode A from the owner's status look and asks the owner nothing (the route #65
+/// had), red: node 4 is never pinned.
+/// Integration (~10 s): a formation, three node opens, the app's open, one process restart,
+/// the re-add's re-plan and the shadow's promote, real TLS on loopback.
+#[config_log::retcd_test]
+fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    let certs_dir = dir.path().join("certs");
+    let app_label = Label::App("admin".to_owned());
+    let mut labels: Vec<Label> = (1..=4).map(|n| Label::Node(NodeId(n))).collect();
+    labels.push(app_label.clone());
+    certs::generate(&certs_dir, &labels).expect("certs generate");
+    let data = dir.path().join("db");
+    let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    {
+        let mut formed = rt
+            .block_on(crate::db::Db::open(
+                db_config(&data),
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("formation opens");
+        formed.wait_ready(patience).expect("formation is ready");
+        formed.shutdown();
+    }
+
+    const PEERS: [u32; 4] = [1, 2, 3, 4];
+    let mut listeners: BTreeMap<NodeId, tokio::net::TcpListener> = BTreeMap::new();
+    let mut addrs = BTreeMap::new();
+    for node in PEERS {
+        let (listener, addr) = rt.block_on(config_testkit::ports::ephemeral_listener());
+        listeners.insert(NodeId(node), listener);
+        addrs.insert(NodeId(node), addr.to_string());
+    }
+    let start = |node: u32, listener: tokio::net::TcpListener| {
+        node_process(&rt, &data, &certs_dir, &store, node, listener, &addrs)
+    };
+    // The copies open before the owner heals, so its plan finds them up (A-R165).
+    let mut four = start(4, listeners.remove(&NodeId(4)).expect("a listener"));
+    let mut three = start(3, listeners.remove(&NodeId(3)).expect("a listener"));
+    let mut two = start(2, listeners.remove(&NodeId(2)).expect("a listener"));
+    let mut one = start(1, listeners.remove(&NodeId(1)).expect("a listener"));
+    one.db
+        .wait_ready(patience)
+        .expect("node 1's process heals and is ready");
+    // Node 3's process stops for good; a write finds it gone and the owner drops it about
+    // `PEER_DROP_AFTER_MILLIS` later, leaving two copies pinned.
+    three.db.shutdown();
+    drop(three);
+    let paused_by = std::time::Instant::now() + patience;
+    let mut landed = 0u32;
+    loop {
+        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+            Ok(_) => landed += 1,
+            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
+            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
+        }
+        assert!(
+            std::time::Instant::now() < paused_by,
+            "writes never paused with node 3 away: {landed} landed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let owner_pins = |one: &NodeProcess| -> Vec<(u32, rdb_core::contracts::ids::ReplicaRole)> {
+        one.db
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == NodeId(1))
+            .map(|status| {
+                status
+                    .pinned
+                    .iter()
+                    .map(|member| (member.node.0, member.role))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let pinned_by = std::time::Instant::now() + patience;
+    while owner_pins(&one).len() != 2 {
+        assert!(
+            std::time::Instant::now() < pinned_by,
+            "node 1 did not pin two copies with node 3 down: {:?}",
+            owner_pins(&one)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let app_links = Links::new();
+    let app_net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label: app_label.clone(),
+                boot: BootId(0),
+                tls: certs::load(&certs_dir, &app_label).expect("app certs"),
+                peers: PEERS.iter().map(|n| NodeId(*n)).collect(),
+                dial: addrs.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+            },
+            &app_links,
+            None,
+        )
+        .expect("the app's net starts")
+    };
+    let up: Vec<NodeId> = [1, 2, 4].map(NodeId).to_vec();
+    rt.block_on(app_net.wait_up(&up, patience))
+        .expect("the app links nodes 1, 2 and 4");
+    let app_dir = config_testkit::fs::temp_dir();
+    let mut app = rt
+        .block_on(crate::db::Db::open(
+            crate::db::DbConfig {
+                local: Vec::new(),
+                links: Some(app_links),
+                client: ClientId(9),
+                ..db_config(app_dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+        ))
+        .expect("the app-only open");
+    let line = app
+        .rebuild(NodeId(4), false)
+        .expect("rebuild 4 onto the spare");
+
+    // As `lr rebuild 4` does: node 4's process stops and starts again on its own folder.
+    four.db.shutdown();
+    drop(four);
+    let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
+    let mut four = start(4, relisten);
+    let regular_by = std::time::Instant::now() + patience;
+    loop {
+        let pins = owner_pins(&one);
+        let nodes: Vec<u32> = pins.iter().map(|(node, _)| *node).collect();
+        let four_regular =
+            pins.contains(&(4, rdb_core::contracts::ids::ReplicaRole::RegularSecondary));
+        if four_regular {
+            assert_eq!(nodes, vec![1, 2, 4], "{pins:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < regular_by,
+            "node 4 was not pinned regular within {patience:?}: {pins:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    one.db
+        .wait_ready(patience)
+        .expect("node 1 serves with node 4 regular");
+    one.db
+        .put(b"after", b"1", None)
+        .expect("a put with node 4 regular");
+    assert!(line.contains("spare"), "{line}");
+
+    app.shutdown();
+    drop(app_net);
+    four.db.shutdown();
+    two.db.shutdown();
+    one.db.shutdown();
 }
 
 /// A-R313, the hang in the row above (L5-3, killed at 900 s): node 2 dialled node 1 while node

@@ -742,6 +742,16 @@ pub enum ClientCall {
         /// The node that takes it, first as a shadow.
         to: NodeId,
     },
+    /// M11 T12 over processes: `admin rebuild node` from an app with no node of its own
+    /// ([`Answer::Rebuilt`]). Only the pinned primary takes it, and only for a node it does not
+    /// pin: a spare is noted for the free slot, a copy already left out is answered as it is.
+    /// Dropping a pinned copy needs the owner's own process.
+    Rebuild {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The node to take back.
+        node: NodeId,
+    },
 }
 
 /// One write of a [`ClientCall::Compile`]: apply `change` to `object` in affinity group
@@ -965,6 +975,8 @@ pub enum Answer {
     Status(TxnStatus),
     /// Where a [`ClientCall::Move`] stands.
     Moved(MoveAnswer),
+    /// A [`ClientCall::Rebuild`] was taken: the operator's line.
+    Rebuilt(String),
     /// The call failed.
     Error {
         /// Why.
@@ -7160,6 +7172,83 @@ impl Host {
         self.revoke(partition, epoch, Some(node), None);
     }
 
+    /// M11 T12 over processes (lead ruling on dev-a item 1, tester T13): `admin rebuild node`
+    /// sent by an app with no node of its own. Only the pinned primary answers, as a move. A node
+    /// this commit pins is refused with nothing changed: dropping it is mode B or C, which needs
+    /// the owner's own process. Otherwise [`Self::rebuild_asked`] answers in this step (mode A):
+    /// a spare is noted for the free slot ([`Self::rebuild_spare`]), and a copy already left out
+    /// is answered as it is. Each answer names what the operator does next.
+    fn rebuild_from_app(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+    ) -> Result<String, ApiError> {
+        let process = |detail: String| {
+            Err(crate::db::rebuild_refused(crate::admin::rebuild::Refused {
+                guard: "process",
+                detail,
+            }))
+        };
+        if let Some(committed) = self.committed.get(&partition) {
+            let members = &committed.committed.pinned_config.members;
+            let owner = members
+                .iter()
+                .find(|member| member.role == ReplicaRole::Primary)
+                .map(|member| member.node);
+            if owner != Some(self.node) {
+                let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+                    partition,
+                    hint: owner,
+                });
+                error.no_mutation = true;
+                return Err(error);
+            }
+            if members.iter().any(|member| member.node == node) {
+                return process(format!(
+                    "node {} is still pinned; under --nodes the owner cannot be asked to drop it: \
+                     stop it (`lr stop {}`), then send one write: the owner drops a stopped copy \
+                     about 10 s after a write finds it gone; then rebuild it; nothing was done",
+                    node.0, node.0
+                ));
+            }
+        }
+        if self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined))
+        {
+            return process(format!(
+                "node {} (the owner) is quarantined; rebuilding out of a quarantine needs the \
+                 owner's own process (`admin rebuild {}` there); nothing was done",
+                self.node.0, node.0
+            ));
+        }
+        let left = self
+            .left_out
+            .get(&partition)
+            .is_some_and(|left| left.iter().any(|member| member.node == node));
+        let (tx, answer) = mpsc::channel();
+        self.rebuild_asked(partition, node, Duration::ZERO, RebuildReply(tx));
+        match answer.try_recv() {
+            Ok(Ok(ready)) if left => Ok(format!(
+                "rebuild: node {} is left out by node {} (the owner) at generation {} (mode A); \
+                 restart it and the owner takes it back",
+                node.0, self.node.0, ready.generation.0
+            )),
+            Ok(Ok(ready)) => Ok(format!(
+                "rebuild: node {} is a spare; node {} (the owner) noted it for the free slot at \
+                 generation {} (mode A); restart it and the owner takes it back, first as a \
+                 shadow, then regular",
+                node.0, self.node.0, ready.generation.0
+            )),
+            Ok(Err(refused)) => Err(crate::db::rebuild_refused(refused)),
+            Err(_) => Err(ApiError::host(&format!(
+                "node {}'s rebuild of node {} was not answered in its step",
+                self.node.0, node.0
+            ))),
+        }
+    }
+
     /// M11 A-R456 (T12): `admin rebuild node` onto a spare, a node no commit pins and no drop
     /// left out, is the way back from two copies. With a free slot (fewer members than rf3,
     /// shadows counted, A-R455) and its copy id free, `node` is noted as left out at its live
@@ -9515,9 +9604,10 @@ impl Host {
         // nothing, so it never queues. Nor does a status query (F-014): P1 answers it in the
         // step that takes it, and it is how a caller resolves a put that may never be answered.
         let identity = match &client.call {
-            ClientCall::Compile { .. } | ClientCall::Status { .. } | ClientCall::Move { .. } => {
-                None
-            }
+            ClientCall::Compile { .. }
+            | ClientCall::Status { .. }
+            | ClientCall::Move { .. }
+            | ClientCall::Rebuild { .. } => None,
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
             | ClientCall::GetPrevious { identity, .. } => Some(*identity),
@@ -9654,6 +9744,18 @@ impl Host {
             ClientCall::Move { from, to, .. } => {
                 let answer = match self.move_step(partition, from, to) {
                     Ok(moved) => Answer::Moved(moved),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
+            // M11 T12 over processes: answered in this step, as a move is.
+            ClientCall::Rebuild { node, .. } => {
+                let answer = match self.rebuild_from_app(partition, node) {
+                    Ok(line) => Answer::Rebuilt(line),
                     Err(error) => Answer::Error {
                         error,
                         request: None,

@@ -71,6 +71,8 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireNodeStatus::pinned` (review-s2 F-004, A-R412) was added under `3`, not `4`.
 /// `4` came with M11: `WireCall::Move` and `WireAnswer::Moved` (ruling A-R449), so a build
 /// speaking `3` is refused at the handshake rather than failing to decode a move.
+/// `WireCall::Rebuild` and `WireAnswer::Rebuilt` (M11 T12 over processes) were added under `4`
+/// too: no released build speaks it.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.

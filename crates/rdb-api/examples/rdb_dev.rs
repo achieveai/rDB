@@ -384,8 +384,10 @@
 //!                                         folder. Refused, nothing done, for the owner
 //!                                         (promote first), a re-plan running, a partition
 //!                                         on two copies, or a quarantine whose evidence
-//!                                         does not name n. Under `--nodes` it only checks
-//!                                         that n is already left out; `lr rebuild n
+//!                                         does not name n. Under `--nodes` it asks the
+//!                                         owner, which takes only a node it does not pin:
+//!                                         one already left out, or a spare (M11), which
+//!                                         it notes for a free slot; `lr rebuild n
 //!                                         [--wipe]` then stops n, has the fence checked
 //!                                         (`--wipe --fence`), moves the folder aside
 //!                                         and starts n

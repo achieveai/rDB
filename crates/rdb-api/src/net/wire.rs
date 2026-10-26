@@ -734,6 +734,10 @@ pub enum WireCall {
         from: NodeId,
         to: NodeId,
     },
+    Rebuild {
+        identity: RequestIdentity,
+        node: NodeId,
+    },
 }
 
 impl WireCall {
@@ -746,7 +750,8 @@ impl WireCall {
             | Self::Get { identity, .. }
             | Self::GetPrevious { identity, .. }
             | Self::Status { identity, .. }
-            | Self::Move { identity, .. } => *identity,
+            | Self::Move { identity, .. }
+            | Self::Rebuild { identity, .. } => *identity,
             Self::Resend { request } => request.identity,
         }
     }
@@ -762,6 +767,7 @@ impl WireCall {
             Self::GetPrevious { .. } => "get_previous",
             Self::Status { .. } => "status",
             Self::Move { .. } => "move",
+            Self::Rebuild { .. } => "rebuild",
         }
     }
 }
@@ -824,6 +830,10 @@ impl TryFrom<&ClientCall> for WireCall {
                 from: *from,
                 to: *to,
             },
+            ClientCall::Rebuild { identity, node } => Self::Rebuild {
+                identity: *identity,
+                node: *node,
+            },
         })
     }
 }
@@ -877,6 +887,7 @@ impl TryFrom<WireCall> for ClientCall {
                 generation,
             },
             WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
+            WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
         })
     }
 }
@@ -1529,6 +1540,9 @@ pub enum WireAnswer {
         done: bool,
         line: String,
     },
+    Rebuilt {
+        line: String,
+    },
     Error {
         error: WireApiError,
         request: Option<TxnRequest>,
@@ -1571,6 +1585,7 @@ impl WireAnswer {
                 done: moved.done,
                 line: moved.line.clone(),
             },
+            Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
                 request: request.clone(),
@@ -1607,6 +1622,7 @@ impl WireAnswer {
             Self::Unchanged => Answer::Unchanged,
             Self::Status(status) => Answer::Status(status),
             Self::Moved { done, line } => Answer::Moved(MoveAnswer { done, line }),
+            Self::Rebuilt { line } => Answer::Rebuilt(line),
             Self::Error { error, request } => Answer::Error {
                 error: error.into(),
                 request,
