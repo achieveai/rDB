@@ -2935,28 +2935,17 @@ impl Dispatcher {
         let digest = result.selected.cutoff_digest;
         // A-R185c: on a refusal the host stalls here until reopen; the sim walks up (slice-2
         // residual). The caller lands the copy empty and R1 copies from the root.
-        // A copy that holds no older generation has nothing to link: expected, so info, not
-        // warn, as the host (review-r185 ADV3). Every other reason is a copy that cannot catch up.
+        // Every reason is a copy that cannot catch up here, so warn. An empty copy links (#69),
+        // so the info-level `anchor_generation_absent` of review-r185 ADV3 is gone, as the host.
         let refused = |reason: &str| {
-            if reason == "anchor_generation_absent" {
-                tracing::info!(
-                    node = member.0,
-                    partition = partition.0,
-                    generation = generation.0,
-                    cutoff = cutoff.0,
-                    reason,
-                    "land_link_refused"
-                );
-            } else {
-                tracing::warn!(
-                    node = member.0,
-                    partition = partition.0,
-                    generation = generation.0,
-                    cutoff = cutoff.0,
-                    reason,
-                    "land_link_refused"
-                );
-            }
+            tracing::warn!(
+                node = member.0,
+                partition = partition.0,
+                generation = generation.0,
+                cutoff = cutoff.0,
+                reason,
+                "land_link_refused"
+            );
             None
         };
         let Some(copy) = result
@@ -2978,9 +2967,10 @@ impl Dispatcher {
         if held.iter().any(|g| *g >= generation) {
             return refused("held_at_or_above_generation");
         }
-        let Some(from) = held.into_iter().filter(|g| *g < generation).max() else {
-            return refused("anchor_generation_absent");
-        };
+        // #69 (option (c)), as the host's `land_at`: a copy holding no lineage of the partition
+        // links as head 0 at the root from generation 0, and R1 catches it up from seq 1. After
+        // the check above every held generation is older, so none older means none held.
+        let from = held.into_iter().max().unwrap_or(Generation(0));
         let head = Seq(engine.buffered_applied(partition, from).0);
         if head > cutoff {
             return refused("held_past_base");

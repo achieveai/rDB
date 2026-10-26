@@ -230,8 +230,11 @@ impl ControlAdapter {
     }
 
     /// A-R399 (tester-final D3): after a node fence, read who `partitions/{partition}` names as
-    /// owner, for the host's refusals only. Retries at [`retry_backoff`] of the attempt while
-    /// the store does not answer (a [`transient`] error: the node may still be cut from rEtcd);
+    /// owner, for the host's refusals only. Waits `after` first: zero at the fence, and
+    /// [`OWNER_REREAD_AFTER`] when the host asks again because the last answer named the node
+    /// itself (#66: a promote freezes the grant, so the fence and its read come before the
+    /// promote names the new owner). Retries at [`retry_backoff`] of the attempt while the
+    /// store does not answer (a [`transient`] error: the node may still be cut from rEtcd);
     /// any other error is logged once as a warning and answers `None`. Stops at the first
     /// answer: [`Msg::OwnerLearned`] with the owner, or `None` when the record is absent or does
     /// not decode. It never posts a control event, so A1 never hears it. Tracked with the
@@ -242,11 +245,13 @@ impl ControlAdapter {
         boot: BootId,
         partition: PartitionId,
         fence: u64,
+        after: std::time::Duration,
     ) {
         let store = Arc::clone(&self.store);
         let links = Arc::clone(&self.links);
         let task = self.rt.spawn(
             async move {
+                tokio::time::sleep(after).await;
                 let key = ControlKey::Partition(partition).encode();
                 let mut attempt = 0_u32;
                 let owner = loop {
@@ -524,6 +529,13 @@ async fn call(
         ControlEffect::Watch { .. } => Err(("control_watch_misrouted", String::new())),
     }
 }
+
+/// #66: how long a fenced node waits before it reads `partitions/{p}` again, while the last
+/// read named the node itself. A promote names the new owner only after it has waited out the
+/// old grant, so the read at the fence names the old owner; reading again at this pace lets the
+/// old owner refuse `NOT_PRIMARY` naming the new one within about this long of the promote.
+/// One read per fenced partition per period, and only while the same fence holds.
+pub(crate) const OWNER_REREAD_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The first wait before a reload's list, or a watch after one that served nothing, is sent
 /// again, doubled per attempt.
