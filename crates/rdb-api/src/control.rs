@@ -332,7 +332,7 @@ impl ControlAdapter {
                 if let Some(wait) = recheck_after {
                     tokio::time::sleep(wait).await;
                 }
-                let facts = fence_facts(&*store).await;
+                let facts = fence_facts(&*store, proof.control_revision).await;
                 let msg = Msg::FenceBound {
                     boot,
                     partition,
@@ -577,9 +577,10 @@ const RETRY_BACKOFF_BASE_MILLIS: u64 = 50;
 /// The longest wait between two attempts (M9 S2a ruling, critic A3).
 const RETRY_BACKOFF_CAP_MILLIS: u64 = 2_000;
 
-/// [`ControlAdapter::read_fence_facts`]'s two reads: `partitions/1` (as a promote reads it),
-/// then `grants/{owner}` of the owner it names.
-async fn fence_facts(store: &dyn ConfigStore) -> Result<FenceFacts, String> {
+/// [`ControlAdapter::read_fence_facts`]'s three reads: `partitions/1` (as a promote reads it),
+/// then `grants/{owner}` of the owner it names, then the plan stored for the proof's
+/// `control_revision` (A-R447: [`crate::admin::promote_operation`]).
+async fn fence_facts(store: &dyn ConfigStore, revision: Revision) -> Result<FenceFacts, String> {
     let (record, root, mod_revision, _) = crate::admin::read_partition(store)
         .await
         .map_err(|error| error.to_string())?;
@@ -599,11 +600,21 @@ async fn fence_facts(store: &dyn ConfigStore) -> Result<FenceFacts, String> {
             )
         })?),
     };
+    let key = crate::admin::promote_operation(revision)?.encode();
+    let plan = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| format!("get {key}: {error}"))?
+        .record
+        .map(|found| found.value);
     Ok(FenceFacts {
         record,
         owner_boot: root.owner_boot,
         mod_revision: Revision(mod_revision),
         grant,
+        plan,
     })
 }
 

@@ -6261,11 +6261,14 @@ mod routed_fence {
     use rdb_core::authority::clock::{expiry_proven, ClockView};
     use rdb_core::authority::grant::GrantRecord;
     use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
-    use rdb_core::contracts::authority::{FencingProof, Revocation};
+    use rdb_core::contracts::authority::{FencingProof, Lineage, Revocation};
+    use rdb_core::contracts::digest::Digest;
     use rdb_core::contracts::ids::{
         AuthorityGeneration, BootId, ConfigVersion, Generation, GrantId, NodeId, OwnerEpoch,
-        PartitionId, Revision,
+        PartitionId, ReplicaRole, Revision, Seq,
     };
+    use rdb_core::contracts::membership::Member;
+    use rdb_core::contracts::recovery::{LineageAnchor, RecoveryPlan};
     use rdb_core::contracts::time::Tick;
 
     use crate::clock::HostClock;
@@ -6275,11 +6278,17 @@ mod routed_fence {
     const EXPIRED: i64 = 940_000;
 
     fn true_fence() -> (FencingProof, FenceFacts) {
+        true_fence_at(NOW)
+    }
+
+    /// `true_fence` on a clock at `now`: the grant expired a minute before it.
+    pub(super) fn true_fence_at(now: Tick) -> (FencingProof, FenceFacts) {
+        let expired = i64::try_from(now.0).expect("a tick fits") - 60_000;
         let budgets = test_budgets();
         let mut view = ClockView::new();
-        view.accept(HostClock::control_time(NOW, &budgets));
+        view.accept(HostClock::control_time(now, &budgets));
         let revocation =
-            expiry_proven(&view, EXPIRED, NOW, &budgets).expect("an expiry a minute ago");
+            expiry_proven(&view, expired, now, &budgets).expect("an expiry a minute ago");
         let facts = FenceFacts {
             record: PartitionRecord {
                 partition: PartitionId(1),
@@ -6296,9 +6305,10 @@ mod routed_fence {
                 node: NodeId(1),
                 boot: BootId(7),
                 authority_generation: AuthorityGeneration::default(),
-                expiry_utc_ms: EXPIRED,
+                expiry_utc_ms: expired,
                 frozen: true,
             }),
+            plan: Some(crate::admin::encode_promote_plan(&stored_plan())),
         };
         let proof = FencingProof {
             partition: PartitionId(1),
@@ -6308,13 +6318,53 @@ mod routed_fence {
             prior_boot_id: BootId(7),
             revocation,
             control_revision: Revision(40),
-            decision_tick: NOW,
+            decision_tick: now,
         };
         (proof, facts)
     }
 
+    /// The plan `true_fence`'s promote stored: nodes 2 and 3, node 2 primary, at config
+    /// version 5.
+    pub(super) fn stored_plan() -> RecoveryPlan {
+        stored_plan_of(&[NodeId(2), NodeId(3)])
+    }
+
+    /// A promote plan for `kept`, the first primary, as `admin::promote` builds one.
+    pub(super) fn stored_plan_of(kept: &[NodeId]) -> RecoveryPlan {
+        let lineage = Lineage {
+            partition: PartitionId(1),
+            generation: Generation(3),
+            owner_epoch: OwnerEpoch(2),
+        };
+        let members = crate::admin::members()
+            .into_iter()
+            .filter(|member| kept.contains(&member.node))
+            .map(|member| Member {
+                role: if member.node == kept[0] {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::RegularSecondary
+                },
+                ..member
+            })
+            .collect();
+        crate::admin::recovery_plan(
+            LineageAnchor {
+                lineage,
+                base_seq: Seq(9),
+                base_digest: Digest::ROOT,
+            },
+            ConfigVersion(5),
+            members,
+            BootId(7),
+            GrantId(1),
+            AuthorityGeneration(1),
+        )
+    }
+
     fn bind(proof: &FencingProof, facts: FenceFacts) -> Result<(), &'static str> {
         bind_routed_fence(PartitionId(1), proof, Ok(facts), NOW, &test_budgets())
+            .map(|_| ())
             .map_err(|(reason, _)| reason)
     }
 
@@ -6458,6 +6508,7 @@ mod routed_fence {
         let later = Tick(NOW.0 + 50);
         assert_eq!(
             bind_routed_fence(PartitionId(1), &proof, Ok(facts), later, &budgets)
+                .map(|_| ())
                 .map_err(|(reason, _)| reason),
             Ok(()),
             "50 ms later"
@@ -6507,4 +6558,147 @@ mod routed_fence {
             Err("control_read_failed")
         );
     }
+
+    /// A-R447 check 7 (issue #70): a fence every other check holds for binds to the plan its
+    /// promote stored, and is refused `plan_absent` when that promote stored none. The plan
+    /// check runs last: a fence that is also early is refused `expiry_not_proven`, so the
+    /// A-R446b re-check still runs for it.
+    /// Cut: check 7 skipped (any plan, or none, binds), red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r447_7_a_true_fence_binds_only_with_the_plan_its_promote_stored() {
+        let (proof, facts) = true_fence();
+        assert_eq!(
+            bind_routed_fence(PartitionId(1), &proof, Ok(facts), NOW, &test_budgets())
+                .map_err(|(reason, _)| reason),
+            Ok(stored_plan())
+        );
+        let (proof, mut facts) = true_fence();
+        facts.plan = None;
+        assert_eq!(bind(&proof, facts), Err("plan_absent"));
+        let (proof, mut facts) = true_fence();
+        facts.plan = None;
+        facts.grant.as_mut().expect("a grant").expiry_utc_ms = 1_000_500;
+        assert_eq!(
+            bind(&proof, facts),
+            Err("expiry_not_proven"),
+            "checked last"
+        );
+    }
+
+    /// A-R447 (critic-63 A3): a stored plan this build cannot read exactly is refused
+    /// `plan_unreadable`, never read in part: another version byte, bytes after the plan, an
+    /// empty record, and a body that is not a plan.
+    /// Cuts: the version byte not checked, red; leftover bytes allowed, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r447_7_a_stored_plan_of_another_version_or_with_bytes_left_over_is_unreadable() {
+        let good = crate::admin::encode_promote_plan(&stored_plan()).to_vec();
+        let mut other_version = good.clone();
+        other_version[0] = crate::admin::PROMOTE_PLAN_VERSION + 1;
+        let mut trailing = good.clone();
+        trailing.push(0);
+        for (what, bytes) in [
+            ("another version", other_version),
+            ("a byte left over", trailing),
+            ("empty", Vec::new()),
+            ("not a plan", vec![crate::admin::PROMOTE_PLAN_VERSION, 0xff]),
+        ] {
+            let (proof, mut facts) = true_fence();
+            facts.plan = Some(bytes::Bytes::from(bytes));
+            assert_eq!(bind(&proof, facts), Err("plan_unreadable"), "{what}");
+        }
+    }
+
+    /// A-R447: the stored plan's key is tagged in bits 48..64, and a revision that would reach
+    /// the tag is refused rather than wrapped into another operation's key.
+    /// Cut: no range check, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn m10_s2_r447_the_stored_plan_key_is_tagged_and_refuses_a_revision_past_the_range() {
+        use rdb_core::contracts::control::ControlKey;
+        use rdb_core::contracts::ids::OperationId;
+        assert_eq!(
+            crate::admin::promote_operation(Revision(40)),
+            Ok(ControlKey::Operation(OperationId(
+                crate::admin::PROMOTE_OPERATION_BASE + 40
+            )))
+        );
+        assert!(crate::admin::promote_operation(Revision((1 << 48) - 1)).is_ok());
+        assert!(crate::admin::promote_operation(Revision(1 << 48)).is_err());
+    }
+}
+
+/// A-R447 (issue #70), row R1: a node gives F1 the plan its promote stored in rEtcd, never a
+/// routed one. A routed `Plan` (here one keeping node 1 and leaving node 3 out) is logged and
+/// pushed nowhere. A bound fence pushes the stored plan, then the proof. Bound with no stored
+/// plan, nothing is pushed at all.
+/// Cut: the `Routed` arm pushes the routed plan as before, red.
+/// Unit (~10 ms): one host, no thread; messages handled directly and the queue read.
+#[test]
+fn m10_s2_r447_a_node_pushes_the_stored_plan_never_the_routed_one() {
+    use config_core::ConfigStore;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+
+    let dir = config_testkit::fs::temp_dir();
+    let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+    let rt = current_thread();
+    let links = Links::new();
+    let (tx, _completions) = mpsc::channel();
+    links.register(NodeId(2), tx, crate::host::BOOT);
+    let store = Arc::new(config_testkit::MemStore::new());
+    let control = ControlAdapter::new(
+        Arc::clone(&store) as Arc<dyn ConfigStore>,
+        rt.handle().clone(),
+        Arc::clone(&links),
+    );
+    let mut host = Host::new(NodeId(2), engine, links, control, HostClock::start());
+    let site = (PartitionId(1), CorrelationId(4));
+    let routed = |plan: RecoveryPlan| Msg::Routed {
+        partition: site.0,
+        correlation: site.1,
+        kind: KernelEvent::Recovery(RecoveryEvent::Plan(Box::new(plan))),
+    };
+    let pushed = |host: &mut Host| -> Vec<EventKind> {
+        host.queue
+            .drain(..)
+            .map(|queued| queued.event.kind)
+            .collect()
+    };
+
+    host.handle(routed(routed_fence::stored_plan_of(&[
+        NodeId(2),
+        NodeId(1),
+    ])));
+    assert_eq!(pushed(&mut host), [], "a routed plan is pushed nowhere");
+
+    let (proof, facts) = routed_fence::true_fence_at(host.clock.now());
+    let boot = host.boot;
+    let bound = |facts| Msg::FenceBound {
+        boot,
+        partition: site.0,
+        correlation: site.1,
+        proof: Box::new(proof.clone()),
+        facts: Ok(facts),
+        rechecked: false,
+    };
+    host.handle(bound(facts.clone()));
+    assert_eq!(
+        pushed(&mut host),
+        [
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(Box::new(
+                routed_fence::stored_plan()
+            )))),
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(Box::new(
+                proof.clone()
+            )))),
+        ],
+        "the stored plan, then the proof"
+    );
+
+    host.handle(bound(FenceFacts {
+        plan: None,
+        ..facts
+    }));
+    assert_eq!(pushed(&mut host), [], "no stored plan: nothing pushed");
 }

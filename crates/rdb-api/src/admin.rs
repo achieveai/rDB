@@ -43,7 +43,7 @@ use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::{Budgets, EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
     AuthorityGeneration, BootId, ConfigVersion, CorrelationId, Generation, GrantId, NodeId,
-    OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
+    OperationId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
@@ -1782,15 +1782,19 @@ const PROMOTE: CorrelationId = CorrelationId(4);
 ///    owner as `to`, and `drop == to`, before anything is written.
 /// 2. Pin the boots of the two members kept: every member but `drop` (default: the prior
 ///    owner). A promote always plans two members at a new generation.
-/// 3. CAS `partitions/1` to `Fencing` at the revision read (kept when a promote that stopped
-///    already wrote it).
+/// 3. CAS `partitions/1` to `Fencing` at the revision read, always: a promote that stopped may
+///    have written it already, and the write still gives this run a revision `R` of its own
+///    (A-R447).
 /// 4. Freeze `grants/{prior}`, or create it frozen when it is absent (PR #41): no renewal can
 ///    move its expiry `E` after this.
 /// 5. Wait until control time is past `E + epsilon + delta` ([`expiry_proven`]): from then
 ///    the prior owner admits nowhere.
-/// 6. Read `partitions/1` again, at a store revision not below the freeze, and hand `to`'s F1
-///    the plan and a fence whose revocation is that `ExpiryProven` and whose
-///    `control_revision` is the record's `mod_revision`. F1's commit is a CAS there.
+/// 6. Read `partitions/1` again, at a store revision not below the freeze, and refuse unless it
+///    is still at `R`. Store the plan, create-only, at [`promote_operation`]`(R)`
+///    ([`store_plan`]), then hand `to` the plan and a fence whose revocation is that
+///    `ExpiryProven` and whose `control_revision` is `R`. F1's commit is a CAS there. The node
+///    commits only the stored plan, never the one sent (A-R447, issue #70); the plan is sent
+///    too only so a node logs it arriving.
 /// 7. Wait until `partitions/1` names `to` as owner at a newer generation.
 ///
 /// Running it again after it stopped picks up from the record and grant it left. Logged as
@@ -1847,21 +1851,21 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         "promote_members_kept"
     );
 
-    // 3. Fencing.
-    if record.lifecycle != PartitionLifecycle::Fencing {
-        let fencing = PartitionRecord {
-            lifecycle: PartitionLifecycle::Fencing,
-            ..record
-        };
-        let revision = cas(
-            &*ctx.store,
-            &ControlKey::Partition(PARTITION).encode(),
-            fencing.encode_with(&root),
-            mod_revision,
-        )
-        .await?;
-        tracing::info!(revision = revision.0, "promote_fencing");
-    }
+    // 3. Fencing, written by this run even when a stopped run already wrote it (A-R447): the
+    // identical bytes still move `mod_revision`, so each run fences at a revision of its own,
+    // and its plan at `operations/` is keyed by it.
+    let fencing = PartitionRecord {
+        lifecycle: PartitionLifecycle::Fencing,
+        ..record
+    };
+    let fenced_at = cas(
+        &*ctx.store,
+        &ControlKey::Partition(PARTITION).encode(),
+        fencing.encode_with(&root),
+        mod_revision,
+    )
+    .await?;
+    tracing::info!(revision = fenced_at.0, "promote_fencing");
 
     // 4. Freeze the prior owner's grant.
     let (frozen, frozen_at) = freeze(&ctx, prior, root.owner_boot, deadline).await?;
@@ -1927,6 +1931,13 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
             fenced.owner.0, fenced.generation.0, fenced.lifecycle
         )));
     }
+    if control_revision != fenced_at.0 {
+        return Err(PromoteError::Control(format!(
+            "partitions/1 was fenced again at revision {control_revision} after this promote \
+             fenced it at {}: another promote is running; promote again",
+            fenced_at.0
+        )));
+    }
     let lineage = Lineage {
         partition: PARTITION,
         generation: record.generation,
@@ -1955,6 +1966,7 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
         GrantId(1),
         AuthorityGeneration(1),
     );
+    store_plan(&*ctx.store, fenced_at, &plan).await?;
     let fence = FencingProof {
         partition: PARTITION,
         prior_generation: record.generation,
@@ -2069,6 +2081,125 @@ async fn cas(
         ))),
         Err(error) => Err(PromoteError::Control(format!(
             "put {key} at revision {revision}: {error}; promote again"
+        ))),
+    }
+}
+
+/// The first [`OperationId`] a promote's stored plan takes: the promote tag in bits 48..64, as
+/// [`rdb_core::recovery::RECOVERY_CONTROL_REQUEST_BASE`] tags F1's requests, so
+/// `operations/` stays free below it for other operations (A-R447).
+pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
+
+/// The first byte of a stored promote plan: the layout of the postcard bytes after it. A build
+/// that reads another refuses it (`plan_unreadable`) instead of guessing at its fields.
+pub(crate) const PROMOTE_PLAN_VERSION: u8 = 1;
+
+/// The `operations/` key of the plan the promote that fenced `partitions/1` at `revision` stored
+/// (A-R447): `operations/{PROMOTE_OPERATION_BASE + revision}`.
+///
+/// # Errors
+///
+/// A text, when `revision` does not fit below the tag.
+pub(crate) fn promote_operation(revision: Revision) -> Result<ControlKey, String> {
+    if revision.0 >= 1 << 48 {
+        return Err(format!(
+            "revision {} is past the promote operation range",
+            revision.0
+        ));
+    }
+    Ok(ControlKey::Operation(OperationId(
+        PROMOTE_OPERATION_BASE + revision.0,
+    )))
+}
+
+/// A promote plan as stored: [`PROMOTE_PLAN_VERSION`], then the plan in postcard, the codec the
+/// links already use.
+pub(crate) fn encode_promote_plan(plan: &RecoveryPlan) -> Bytes {
+    let mut bytes = vec![PROMOTE_PLAN_VERSION];
+    bytes.extend(postcard::to_stdvec(plan).expect("a recovery plan serialises"));
+    Bytes::from(bytes)
+}
+
+/// The inverse of [`encode_promote_plan`], exactly: another version byte, or bytes left over
+/// after the plan, is refused.
+///
+/// # Errors
+///
+/// A text saying which.
+pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> {
+    let Some((&version, body)) = bytes.split_first() else {
+        return Err("the record is empty".to_owned());
+    };
+    if version != PROMOTE_PLAN_VERSION {
+        return Err(format!(
+            "plan version {version}, this build reads {PROMOTE_PLAN_VERSION}"
+        ));
+    }
+    let (plan, rest) =
+        postcard::take_from_bytes::<RecoveryPlan>(body).map_err(|error| error.to_string())?;
+    if !rest.is_empty() {
+        return Err(format!("{} bytes after the plan", rest.len()));
+    }
+    Ok(plan)
+}
+
+/// Promote step 6 (A-R447): create `plan` at [`promote_operation`]`(fenced_at)`. When the create
+/// is not reported applied (it conflicts, or its reply is lost), read it back and go on only when
+/// it holds exactly these bytes. Anything else is refused: promote again, which fences at a new
+/// revision. The node that commits reads its plan from here.
+async fn store_plan(
+    store: &dyn ConfigStore,
+    fenced_at: Revision,
+    plan: &RecoveryPlan,
+) -> Result<(), PromoteError> {
+    let key = promote_operation(fenced_at)
+        .map_err(|error| PromoteError::Control(format!("{error}; promote again")))?
+        .encode();
+    let value = encode_promote_plan(plan);
+    let created = store
+        .put(PutRequest {
+            key: Bytes::from(key.clone()),
+            value: value.clone(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        })
+        .await;
+    match created {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            tracing::info!(key = %key, revision = response.revision, "promote_plan_stored");
+            return Ok(());
+        }
+        Ok(_) | Err(ConfigError::Conflict { .. } | ConfigError::DeadlineExceededUnknownOutcome) => {
+        }
+        Err(error) => {
+            return Err(PromoteError::Control(format!(
+                "create {key}: {error}; partition 1 is fencing and takes no writes until a \
+                 promote finishes. A promote needs rEtcd write access to operations/ as well as \
+                 partitions/ and grants/: grant it, then promote again"
+            )))
+        }
+    }
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| {
+            PromoteError::Control(format!(
+                "get {key} after a create that was not reported applied: {error}; promote again"
+            ))
+        })?;
+    match read.record {
+        Some(found) if found.value == value => {
+            tracing::info!(key = %key, revision = found.mod_revision, "promote_plan_adopted");
+            Ok(())
+        }
+        Some(found) => Err(PromoteError::Control(format!(
+            "{key} holds another plan (revision {}); promote again",
+            found.mod_revision
+        ))),
+        None => Err(PromoteError::Control(format!(
+            "{key} is absent after a create that was not reported applied; promote again"
         ))),
     }
 }
@@ -3295,8 +3426,9 @@ mod tests {
     /// `Fencing`, creates `grants/1` frozen with `GrantId(0)` ("none held"), waits
     /// `E + epsilon + delta` out, and hands node 2 the plan (nodes 2 and 3, node 2 primary, config
     /// version + 1) and an `ExpiryProven` fence whose `control_revision` is the `Fencing`
-    /// record's. Nothing commits here, so it ends saying to promote again; doing so picks up the
-    /// record and grant it left and sends the same fence. Cut: the created grant is not frozen.
+    /// record's. Nothing commits here, so it ends saying to promote again; doing so keeps the
+    /// grant it left and fences again at a revision of its own (A-R447), and each run stores the
+    /// plan it sent at `operations/` under its own revision. Cut: the created grant is not frozen.
     /// Unit (~1 s): `MemStore`.
     #[test]
     fn m10_s2_a_promote_of_an_owner_with_no_grant_freezes_a_new_one_and_fences_on_it() {
@@ -3415,11 +3547,21 @@ mod tests {
         let (again, resent) =
             promote_once(&store, &rt, NodeId(2), None, members(), all_known(), within);
         again.expect_err("still nothing commits");
-        let (refenced, _) = fenced_on(resent);
+        let (refenced, replanned) = fenced_on(resent);
+        // A-R447: the second run fences again, so it has a revision of its own, and keeps the
+        // grant the first froze.
+        assert!(
+            refenced.control_revision > fence.control_revision
+                && refenced.prior_grant_id == GrantId(0),
+            "the second run fences at its own revision on the grant the first left: {refenced:?}"
+        );
         assert_eq!(
-            (refenced.control_revision, refenced.prior_grant_id),
-            (fence.control_revision, GrantId(0)),
-            "the second run picks up the record and grant the first left"
+            (
+                stored_plan_at(&*store, &rt, fence.control_revision),
+                stored_plan_at(&*store, &rt, refenced.control_revision)
+            ),
+            (Some(plan), Some(replanned)),
+            "each run stored the plan it sent, at its own revision"
         );
     }
 
@@ -3682,5 +3824,207 @@ mod tests {
              check that its nodes and its rEtcd are running (on a local run, \
              `scripts/local-rdb.sh status`))"
         );
+    }
+
+    // ---- A-R447: the plan a promote stores (issue #70) ----
+
+    /// The plan stored for the promote that fenced at `revision`, read now.
+    fn stored_plan_at(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+        revision: Revision,
+    ) -> Option<RecoveryPlan> {
+        let key = promote_operation(revision).expect("in range").encode();
+        rt.block_on(store.get(GetRequest {
+            key: Bytes::from(key),
+        }))
+        .expect("get")
+        .record
+        .map(|found| decode_promote_plan(&found.value).expect("a stored plan"))
+    }
+
+    /// The fence and plan a promote sent node 2, Plan first.
+    fn sent_pair(sent: &[(NodeId, Msg)]) -> (FencingProof, RecoveryPlan) {
+        match sent {
+            [(
+                NodeId(2),
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::Plan(plan)),
+                    ..
+                },
+            ), (
+                NodeId(2),
+                Msg::Routed {
+                    kind: KernelEvent::Recovery(RecoveryEvent::FenceProven(fence)),
+                    ..
+                },
+            )] => ((**fence).clone(), (**plan).clone()),
+            other => panic!("Plan then FenceProven to node 2: {other:?}"),
+        }
+    }
+
+    /// A-R447 step 6 (critic-63 A4): the create of the stored plan applies but its reply is
+    /// lost. The promote reads it back, finds exactly its own plan, and carries on: node 2 is
+    /// sent the plan and fence, and the record at the fence's revision holds the plan sent.
+    /// Cut: a create not reported applied is refused, red (nothing sent).
+    /// Unit (~1 s): `Scripted` over `MemStore`, a 600 ms promote that nothing commits.
+    #[test]
+    fn m10_s2_r447_a_promote_whose_plan_create_reply_was_lost_adopts_its_own_plan() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            lose_put_replies: 1,
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*store, &rt, BootId(5));
+        let within = Duration::from_millis(600);
+        let (answer, sent) =
+            promote_once(&store, &rt, NodeId(2), None, members(), all_known(), within);
+        let stopped = answer.expect_err("nothing commits here");
+        assert!(
+            stopped.to_string().contains("node 2 did not commit"),
+            "{stopped}"
+        );
+        let (fence, plan) = sent_pair(&sent);
+        assert_eq!(
+            stored_plan_at(&*store, &rt, fence.control_revision),
+            Some(plan)
+        );
+    }
+
+    /// A-R447 step 6: a stored plan the promote cannot stand behind is refused, and node 2 is
+    /// sent nothing. (a) The create never applied and the read-back finds nothing. (b) The key
+    /// already holds another plan. (c) The promoter may not write `operations/` (critic-63 A4):
+    /// partition 1 is already fencing and frozen, so the text says so and names the access.
+    /// Cuts: absent on read-back carries on, red; another plan adopted, red; the text loses
+    /// `operations/`, red.
+    /// Unit (~3 s): three 600 ms promotes over `Scripted`/`MemStore`.
+    #[test]
+    fn m10_s2_r447_a_plan_that_did_not_land_or_is_not_this_runs_refuses_and_sends_nothing() {
+        let rt = runtime();
+        let within = Duration::from_millis(600);
+        let run = |store: Arc<dyn ConfigStore>| {
+            let (answer, sent) =
+                promote_once(&store, &rt, NodeId(2), None, members(), all_known(), within);
+            assert!(sent.is_empty(), "sent {sent:?}");
+            let refused = answer.expect_err("refused").to_string();
+            assert!(refused.ends_with("promote again"), "{refused}");
+            refused
+        };
+
+        let dropped: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            drop_puts: 1,
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*dropped, &rt, BootId(5));
+        let refused = run(dropped);
+        assert!(
+            refused.contains("is absent after a create that was not reported applied"),
+            "(a) {refused}"
+        );
+
+        // (b) `rooted` wrote revision 1 and this put writes 2, so the Fencing CAS lands at 3.
+        let taken: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*taken, &rt, BootId(5));
+        let other = encode_promote_plan(&recovery_plan(
+            LineageAnchor {
+                lineage: Lineage {
+                    partition: PARTITION,
+                    generation: Generation(3),
+                    owner_epoch: OwnerEpoch(3),
+                },
+                base_seq: Seq(7),
+                base_digest: Digest::ROOT,
+            },
+            ConfigVersion(CONFIG_VERSION.0 + 1),
+            members(),
+            OPEN_2,
+            GrantId(1),
+            AuthorityGeneration(1),
+        ));
+        let written = rt
+            .block_on(taken.put(PutRequest {
+                key: Bytes::from(promote_operation(Revision(3)).expect("in range").encode()),
+                value: other,
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("put the other plan");
+        assert_eq!(written.revision, 2);
+        let refused = run(taken);
+        assert!(refused.contains("holds another plan"), "(b) {refused}");
+
+        let denied: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_put_with: Some(ConfigError::PermissionDenied {
+                detail: "no grant for operations/".to_owned(),
+            }),
+            only_prefix: Some(b"operations/".to_vec()),
+            ..Script::default()
+        }));
+        rooted(&*denied, &rt, BootId(5));
+        let refused = run(denied);
+        assert!(
+            refused.contains("partition 1 is fencing and takes no writes")
+                && refused.contains("rEtcd write access to operations/"),
+            "(c) {refused}"
+        );
+    }
+
+    /// A-R447 step 6: another promote fences `partitions/1` again while this one waits out the
+    /// grant. The record's bytes are the same, but its revision is not this run's, so this run
+    /// refuses and sends nothing: the newer run owns the fence.
+    /// Cut: the revision check removed: this run sends its fence at the other run's revision,
+    /// red.
+    /// Unit (~1.5 s): `MemStore`, node 1's grant live 1 s more, the second CAS 300 ms in.
+    #[test]
+    fn m10_s2_r447_a_promote_fenced_over_by_another_run_refuses_and_sends_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let live = GrantRecord {
+            grant: GrantId(4),
+            node: OWNER,
+            boot: BootId(5),
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: i64::try_from(HostClock::start().now().0).expect("fits") + 1_000,
+            frozen: false,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            value: live.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/1");
+        let other = Arc::clone(&store);
+        let rerun = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let rt = runtime();
+            let found = rt
+                .block_on(other.get(GetRequest {
+                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                }))
+                .expect("get")
+                .record
+                .expect("partitions/1");
+            put(&other, &rt, found.value, found.mod_revision);
+        });
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            all_known(),
+            Duration::from_secs(3),
+        );
+        rerun.join().expect("the other run's CAS");
+        let refused = answer.expect_err("fenced over").to_string();
+        assert!(
+            refused.contains("another promote is running; promote again"),
+            "{refused}"
+        );
+        assert!(sent.is_empty(), "sent {sent:?}");
     }
 }

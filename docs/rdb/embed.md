@@ -645,11 +645,13 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **Moving ownership off a dead node: `db.promote(NodeId(2), None)`** (`lr promote 2`, rdb_dev
   `admin promote 2`). Node 2 becomes the owner and keeps two copies, its own and node 3's.
   It first waits out node 1's permission to write, so it takes a few seconds. An app-only `Db`
-  can promote too. A promote starts with rEtcd writes to `partitions/` and `grants/`, and the
-  node it promotes checks the fence it is sent against those records and refuses one that is
-  not true. The plan sent with the fence, which names the members, is not checked. So while a
-  promote is stalled with partition 1 fencing, any app holding the link cert can finish it with
-  members of its choosing. That is a known gap (issue #70). **The dropped node is added back
+  can promote too. A node commits a promote only with the plan the promoter stored in rEtcd
+  (`operations/<revision>`), and only on a fence its own reads of `partitions/1` and the old
+  owner's grant prove true. So running `promote`, or finishing a stopped one, needs rEtcd write
+  access to `partitions/`, `grants/` and `operations/`; an rDB link certificate alone is not
+  enough. An app with the link certificate still chooses which node it sends the fence to; that
+  node then runs the stored plan, so it cannot change the members or the owner the promoter
+  chose. **The dropped node is added back
   automatically when it starts again, or at the next reopen heal; membership is fixed at three
   nodes.**
   - **After every node restarts, a promote can be refused.** If the owner's copy is lost too,
@@ -659,7 +661,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - **It also fires when only the node you promote has restarted** while the owner is down.
     The way round: promote a node that has not restarted since the owner stopped.
   - **The old owner says "moved" once it learns the new owner.** While the promote waits out
-    its permission to write, and while it is still cut from rEtcd, the old owner answers
+    its permission to write, a live old owner can still take writes until it sees the freeze or
+    that permission runs out. After that, and while it is still cut from rEtcd, it answers
     `LEASE_EXPIRED`. Once it is fenced and reads an owner record naming the new owner, it
     answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true. That can take
     10 s or more after the promote (issue #66). Either answer means nothing was written: send
