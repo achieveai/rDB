@@ -673,9 +673,11 @@ mod tests {
         (counter, (guard, second))
     }
 
-    /// #43's forced repro for M6-63: a thread with no subscriber rebuilds the interest cache
-    /// after this thread's subscriber is set, as a concurrent test in this binary can. The
-    /// crossing must still warn here.
+    /// #43's forced repro for M6-63: after this thread's subscriber is set, a thread with no
+    /// subscriber first reaches the same `warn!` (registering its callsite, as
+    /// `expiry_follows_the_served_certificate` can) and then rebuilds the interest cache, as any
+    /// concurrent test in this binary can. The crossing must still warn here. The row does both
+    /// itself, so it does not depend on which other test ran first.
     #[test]
     fn the_expiry_warning_is_counted_after_another_thread_rebuilds_interest() {
         let fixture = Fixture::new().with_client_plane();
@@ -683,9 +685,16 @@ mod tests {
         let inside = not_after - CERT_EXPIRY_WARN_SECONDS + 1;
 
         let (counter, _counting) = count_expiry_warnings();
-        std::thread::spawn(tracing::callsite::rebuild_interest_cache)
-            .join()
-            .expect("the rebuild thread does not panic");
+        std::thread::spawn(|| {
+            let other = Fixture::new().with_client_plane();
+            let not_after = other.rotator.reload("poll").expect("reload")[0].cert_expiry_unix;
+            other
+                .rotator
+                .expiry_seconds(not_after - CERT_EXPIRY_WARN_SECONDS + 1);
+            tracing::callsite::rebuild_interest_cache();
+        })
+        .join()
+        .expect("the thread with no subscriber does not panic");
 
         fixture.rotator.expiry_seconds(inside);
         assert_eq!(counter.0.load(Ordering::Relaxed), 1, "the crossing warns");
