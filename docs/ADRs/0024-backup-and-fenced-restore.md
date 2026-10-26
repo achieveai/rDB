@@ -291,7 +291,7 @@ instruction is unchanged, and it now works: a relist right after restore reports
 watch at `R` is served instead of refused until the first write. This supersedes the step-9 row
 and the `compact_revision = revision` bullet above where they say storage enforces the relist.
 
-### 2026-10-26 — a watch cursor carries its history (#37, ruling A-R426)
+### 2026-10-26 — a watch cursor carries its history (#37, ruling A-R440)
 
 A cursor is a revision, and a revision only means something inside one history. A restore
 starts a new history: it always mints a new cluster id **and** a new recovery epoch (the refusal

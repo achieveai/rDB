@@ -1,4 +1,4 @@
-//! A watch cursor carries the history it was read from (#37, ruling A-R426).
+//! A watch cursor carries the history it was read from (#37, ruling A-R440).
 //!
 //! A restore mints a new cluster id and a new recovery epoch (ADR-0024). Revisions on the
 //! restored cluster are a different count from the ones a client's cursor holds, so resuming
