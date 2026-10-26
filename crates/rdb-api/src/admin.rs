@@ -3976,18 +3976,23 @@ mod tests {
     /// refuses and sends nothing: the newer run owns the fence.
     /// Cut: the revision check removed: this run sends its fence at the other run's revision,
     /// red.
-    /// Unit (~1.5 s): `MemStore`, node 1's grant live 1 s more, the second CAS 300 ms in.
+    /// The other run waits for this run's own `Fencing` write (a revision past the rooted one)
+    /// and only then CASes over it, so the order is a condition, not a sleep. Node 1's grant
+    /// stays live for a scaled second, which keeps this run in its expiry wait meanwhile.
+    /// Unit (~1 s at scale 1): `MemStore`.
     #[test]
     fn m10_s2_r447_a_promote_fenced_over_by_another_run_refuses_and_sends_nothing() {
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        rooted(&*store, &rt, BootId(5));
+        let rooted_at = rooted(&*store, &rt, BootId(5));
+        let window = crate::host::test_patience(Duration::from_secs(1));
         let live = GrantRecord {
             grant: GrantId(4),
             node: OWNER,
             boot: BootId(5),
             authority_generation: AuthorityGeneration(0),
-            expiry_utc_ms: i64::try_from(HostClock::start().now().0).expect("fits") + 1_000,
+            expiry_utc_ms: i64::try_from(HostClock::start().now().0).expect("fits")
+                + i64::try_from(window.as_millis()).expect("fits"),
             frozen: false,
         };
         rt.block_on(store.put(PutRequest {
@@ -3999,15 +4004,27 @@ mod tests {
         .expect("put grants/1");
         let other = Arc::clone(&store);
         let rerun = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
             let rt = runtime();
+            let read = || async {
+                let found = other
+                    .get(GetRequest {
+                        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                    })
+                    .await
+                    .expect("get")
+                    .record
+                    .expect("partitions/1");
+                let fencing = PartitionRecord::decode(&found.value)
+                    .is_some_and(|record| record.lifecycle == PartitionLifecycle::Fencing);
+                (fencing && found.mod_revision > rooted_at).then_some(found)
+            };
             let found = rt
-                .block_on(other.get(GetRequest {
-                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-                }))
-                .expect("get")
-                .record
-                .expect("partitions/1");
+                .block_on(config_testkit::poll::poll_until_async(
+                    crate::host::test_patience(Duration::from_secs(2)),
+                    Duration::from_millis(5),
+                    read,
+                ))
+                .expect("this run's own Fencing write");
             put(&other, &rt, found.value, found.mod_revision);
         });
         let (answer, sent) = promote_once(
@@ -4017,7 +4034,7 @@ mod tests {
             None,
             members(),
             all_known(),
-            Duration::from_secs(3),
+            window + crate::host::test_patience(Duration::from_secs(2)),
         );
         rerun.join().expect("the other run's CAS");
         let refused = answer.expect_err("fenced over").to_string();
