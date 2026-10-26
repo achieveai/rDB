@@ -1189,6 +1189,16 @@ struct Replan {
 /// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
 const REJOIN: CorrelationId = CorrelationId(3);
 
+/// #67 (A-R434): a member that restarted while a re-plan was planned, and the plan it was seen
+/// under. The plan is named by its generation and its `since`, since a retried plan keeps the
+/// generation and gets a new `since`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootMark {
+    generation: Generation,
+    since: Tick,
+    member: NodeId,
+}
+
 /// The copy the owner holds responsible for L1 refusing writes, and since when (M10 S2 part (b)).
 #[derive(Debug, Clone, Copy)]
 struct Blame {
@@ -1923,6 +1933,15 @@ struct Host {
     /// generation they are for: replaced at each step that names any (A-R426 M8). Unlike
     /// [`RebuildWatch::unproven`], a copy that has since proved is no longer in it.
     latest_stall: BTreeMap<PartitionId, (Generation, BTreeSet<CopyId>)>,
+    /// #67 (A-R433, A-R434): per partition, a member that restarted while its re-plan was
+    /// planned and not yet `Blocked`, keyed on that plan (its generation and `since`). The next
+    /// drop check that finds F1 blocked on that same plan re-plans at once
+    /// ([`Self::replan_on_boot`]); a mark for any other plan is dropped unused.
+    boot_seen_while_planned: BTreeMap<PartitionId, BootMark>,
+    /// Per partition, the planned re-plan F1 was first seen `Blocked` on by a drop check, and
+    /// when: (generation, the plan's `since`, seen at). `blocked_ms` of `rejoin_replan_on_boot`,
+    /// which is `None` when no drop check saw the block before the re-plan.
+    blocked_seen: BTreeMap<PartitionId, (Generation, Tick, Tick)>,
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
@@ -2069,6 +2088,8 @@ impl Host {
             repair_probes: BTreeMap::new(),
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
+            boot_seen_while_planned: BTreeMap::new(),
+            blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
             restart_shadow: true,
@@ -4691,7 +4712,9 @@ impl Host {
     /// link reports a newer boot than the commit pinned: ask A1 to revoke the committed epoch,
     /// whose `DrainProof` [`Self::drained`] plans from. `Some(why)` when nothing was started.
     /// A re-plan already running is left alone: one still revoking plans at the live boots,
-    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]).
+    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]),
+    /// unless the plan pinned a member at an older boot than its link now reports
+    /// ([`Self::boot_while_planned`], #67).
     fn rejoin_if_stale(&mut self, partition: PartitionId) -> Option<&'static str> {
         let Some(committed) = self.committed.get(&partition) else {
             return Some("no commit for this partition");
@@ -4721,7 +4744,7 @@ impl Host {
         if stale.is_empty() && readd.is_none() {
             return Some("every member's pinned boot is current");
         }
-        if let Some(rejoin) = self.rejoins.get(&partition) {
+        if let Some(rejoin) = self.rejoins.get(&partition).copied() {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -4730,6 +4753,9 @@ impl Host {
                 readd = ?readd.map(|member| member.node.0),
                 "rejoin_pending"
             );
+            if let Rejoin::Planned { generation, replan } = rejoin {
+                self.boot_while_planned(partition, generation, replan);
+            }
             return None;
         }
         let epoch = committed.selected.root.owner_epoch;
@@ -4748,6 +4774,146 @@ impl Host {
             .or(readd.map(|member| member.node));
         self.revoke(partition, epoch, None, rejoiner);
         None
+    }
+
+    /// #67 Wait 2 (A-R433, A-R434): a member the planned re-plan pinned at an older boot than
+    /// its link reports now has restarted, so F1 cannot complete that plan: the member's new
+    /// process answers with a new boot (`barrier_boot_changed`) and F1 blocks naming nobody to
+    /// leave out, which [`Self::retry_blocked_rejoin`] would only send again after
+    /// `peer_drop_after_millis`. F1 already blocked: re-plan now. Not yet blocked (the boot is
+    /// heard first, as the walk saw): mark the plan, and the drop check that finds F1 blocked
+    /// on that same plan re-plans ([`Self::replan_on_boot`]). A re-plan at the live boots, not
+    /// a drop: the plan's own `drop` and `rejoiner` are kept.
+    fn boot_while_planned(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        replan: Replan,
+    ) {
+        let Some(plan) = self.plans.get(&partition) else {
+            return;
+        };
+        let member = plan
+            .config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .find(|member| {
+                self.links
+                    .boot_of(member.node)
+                    .is_some_and(|live| live > member.boot)
+            })
+            .map(|member| member.node);
+        let Some(member) = member else {
+            return;
+        };
+        let mark = BootMark {
+            generation,
+            since: replan.since,
+            member,
+        };
+        if self.f1_blocked(partition) {
+            self.replan_for_boot(partition, mark, replan, self.clock.now());
+            return;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            member = member.0,
+            "rejoin_boot_marked"
+        );
+        self.boot_seen_while_planned.insert(partition, mark);
+    }
+
+    /// Whether F1's run for `partition` ended `Blocked`.
+    fn f1_blocked(&self, partition: PartitionId) -> bool {
+        self.recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Blocked(_)))
+    }
+
+    /// The drop check's half of [`Self::boot_while_planned`]: a mark for the plan still planned
+    /// re-plans once F1 is blocked on it; a mark for any other plan, or with no plan, goes.
+    /// Also notes when F1 was first seen blocked on the planned re-plan, for `blocked_ms`.
+    fn replan_on_boot(&mut self, partition: PartitionId, now: Tick) {
+        let Some(Rejoin::Planned { generation, replan }) = self.rejoins.get(&partition).copied()
+        else {
+            self.boot_seen_while_planned.remove(&partition);
+            self.blocked_seen.remove(&partition);
+            return;
+        };
+        let blocked = self.f1_blocked(partition);
+        let plan = (generation, replan.since);
+        match self.blocked_seen.get(&partition) {
+            Some(&(seen_generation, seen_since, _))
+                if blocked && (seen_generation, seen_since) == plan => {}
+            _ if blocked => {
+                self.blocked_seen
+                    .insert(partition, (generation, replan.since, now));
+            }
+            _ => {
+                self.blocked_seen.remove(&partition);
+            }
+        }
+        let Some(mark) = self.boot_seen_while_planned.get(&partition).copied() else {
+            return;
+        };
+        if (mark.generation, mark.since) != plan {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                marked = mark.generation.0,
+                planned = generation.0,
+                member = mark.member.0,
+                "rejoin_boot_mark_dropped"
+            );
+            self.boot_seen_while_planned.remove(&partition);
+            return;
+        }
+        if blocked {
+            self.replan_for_boot(partition, mark, replan, now);
+        }
+    }
+
+    /// Send the planned re-plan `mark` names again at once, as [`Self::retry_blocked_rejoin`]
+    /// does after its wait: the same `drop` and `rejoiner`, planned at the live boots.
+    fn replan_for_boot(
+        &mut self,
+        partition: PartitionId,
+        mark: BootMark,
+        replan: Replan,
+        now: Tick,
+    ) {
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let epoch = committed.selected.root.owner_epoch;
+        let blocked_ms = self
+            .blocked_seen
+            .get(&partition)
+            .filter(|&&(generation, since, _)| (generation, since) == (mark.generation, mark.since))
+            .map(|&(_, _, at)| HostClock::millis_until(at, now));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = mark.generation.0,
+            member = mark.member.0,
+            blocked_ms = ?blocked_ms,
+            waited_ms = HostClock::millis_until(replan.since, now),
+            dropped = ?replan.drop.map(|node| node.0),
+            "rejoin_replan_on_boot"
+        );
+        self.boot_seen_while_planned.remove(&partition);
+        self.blocked_seen.remove(&partition);
+        self.start_revoke(
+            partition,
+            epoch,
+            Replan {
+                since: now,
+                ..replan
+            },
+        );
     }
 
     /// A-R329: a member a drop left out of `partition` that started again since, while `config`
@@ -5117,6 +5283,7 @@ impl Host {
     fn drop_duty(&mut self, now: Tick) {
         let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
         for partition in partitions {
+            self.replan_on_boot(partition, now);
             self.retry_blocked_rejoin(partition, now);
             self.repair_duty(partition, now);
             self.shadow_duty(partition);

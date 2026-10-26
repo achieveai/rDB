@@ -1346,30 +1346,13 @@ struct TwoDown {
 /// on node 1 only, writes stop, and the owner drops one of them: the next generation keeps
 /// node 1 and the other, and commits `ReadOnly`, since that one never answers.
 fn two_down(dir: &std::path::Path) -> TwoDown {
-    let (mut trio, before) = started(dir, tuned);
-    let mut request = 1;
-    for _ in 0..3 {
-        match trio.ask(put(request)) {
-            Answer::Txn { .. } => request += 1,
-            other => panic!("put {request} with all three up: {other:?}"),
-        }
-    }
-    let three = trio.nodes.remove(2);
-    let two = trio.nodes.remove(1);
-    loop {
-        let answer = trio.ask(put_within(request, DROP_AFTER_MILLIS));
-        request += 1;
-        match answer {
-            // The first waits for an ack that never comes. Then L1 pauses, or the grant
-            // lapses around the drop's fence, as the real walk saw (tester-s2 D8).
-            Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {}
-            Answer::Error { error, .. } => {
-                tracing::info!(name = error.name(), "d8_put_refused_with_two_down");
-                break;
-            }
-            other => panic!("put {} with two down: {other:?}", request - 1),
-        }
-    }
+    let BothDown {
+        mut trio,
+        before,
+        two,
+        three,
+        request,
+    } = both_down(dir);
     let (dropped, mode, members) = trio.until("node 1 drops a copy", |trio| {
         commit_of(trio).filter(|(_, _, members)| members.len() == 2)
     });
@@ -1394,10 +1377,69 @@ fn two_down(dir: &std::path::Path) -> TwoDown {
     }
 }
 
+/// [`both_down`]'s trio, with the two stopped nodes.
+struct BothDown {
+    trio: Trio,
+    /// The bootstrap's generation.
+    before: Generation,
+    two: Dead,
+    three: Dead,
+    /// The next request id.
+    request: u64,
+}
+
+/// Puts land on all three, then nodes 2 and 3 stop ([`Dead`]) and puts are refused. The
+/// owner's drop clock is running; nothing is planned yet.
+fn both_down(dir: &std::path::Path) -> BothDown {
+    let (mut trio, before) = started(dir, tuned);
+    let mut request = 1;
+    for _ in 0..3 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => request += 1,
+            other => panic!("put {request} with all three up: {other:?}"),
+        }
+    }
+    let three = trio.nodes.remove(2);
+    let two = trio.nodes.remove(1);
+    loop {
+        let answer = trio.ask(put_within(request, DROP_AFTER_MILLIS));
+        request += 1;
+        match answer {
+            // The first waits for an ack that never comes. Then L1 pauses, or the grant
+            // lapses around the drop's fence, as the real walk saw (tester-s2 D8).
+            Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {}
+            Answer::Error { error, .. } => {
+                tracing::info!(name = error.name(), "d8_put_refused_with_two_down");
+                break;
+            }
+            other => panic!("put {} with two down: {other:?}", request - 1),
+        }
+    }
+    BothDown {
+        trio,
+        before,
+        two,
+        three,
+        request,
+    }
+}
+
 /// The kept member starts again, as `Db::restart_node` restarts a node: a new host opens its
 /// directory at the next boot and takes the mail that waited, in order, and node 1 hears the
 /// new boot. Returns when.
-fn restart_dead(trio: &mut Trio, ((host, tx, rx), node): (Dead, u32)) -> Tick {
+fn restart_dead(trio: &mut Trio, dead: (Dead, u32)) -> Tick {
+    let node = NodeId(dead.1);
+    let reboot = restart_dead_unheard(trio, dead);
+    trio.nodes[0]
+        .1
+        .send(Msg::PeerBooted { node, boot: reboot })
+        .expect("node 1 up");
+    trio.clock.now()
+}
+
+/// [`restart_dead`] before node 1 hears `PeerBooted`: the new host is up and its link reports
+/// the new boot, which it returns.
+fn restart_dead_unheard(trio: &mut Trio, ((host, tx, rx), node): (Dead, u32)) -> BootId {
     let node = NodeId(node);
     let boot = host.boot;
     let reboot = BootId(boot.0 + 1);
@@ -1411,11 +1453,7 @@ fn restart_dead(trio: &mut Trio, ((host, tx, rx), node): (Dead, u32)) -> Tick {
     tuned(&mut host);
     trio.links.register(node, tx.clone(), reboot);
     trio.nodes.push((host, tx, rx));
-    trio.nodes[0]
-        .1
-        .send(Msg::PeerBooted { node, boot: reboot })
-        .expect("node 1 up");
-    trio.clock.now()
+    reboot
 }
 
 /// D8's second half: after `dropped`, node 1 commits `DegradedRf2` with itself and node `kept`
@@ -2826,4 +2864,199 @@ fn m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up() {
         promotes[0]["acked"].as_u64() >= promotes[0]["cutoff"].as_u64(),
         "promoted below the cutoff: {promotes:?}"
     );
+}
+
+/// #67 Wait 2: [`both_down`], then node 1 plans the drop of one stopped node and keeps the
+/// other at the boot it had. Returns while that plan is `Planned` (F1 still collecting), with
+/// the kept node, the plan's generation and `since`.
+struct DropPlanned {
+    trio: Trio,
+    kept: (Dead, u32),
+    _gone: Dead,
+    planned: Generation,
+    since: Tick,
+    request: u64,
+}
+
+fn drop_planned(dir: &std::path::Path) -> DropPlanned {
+    let BothDown {
+        mut trio,
+        two,
+        three,
+        request,
+        ..
+    } = both_down(dir);
+    let (planned, since, dropped) = trio.until("node 1 plans a drop", |trio| {
+        match trio.nodes[0].0.rejoins.get(&PartitionId(1)) {
+            Some(Rejoin::Planned { generation, replan }) => {
+                replan.drop.map(|node| (*generation, replan.since, node.0))
+            }
+            _ => None,
+        }
+    });
+    let (kept, gone) = match dropped {
+        3 => ((two, 2), three),
+        2 => ((three, 3), two),
+        other => panic!("the plan drops node {other}"),
+    };
+    DropPlanned {
+        trio,
+        kept,
+        _gone: gone,
+        planned,
+        since,
+        request,
+    }
+}
+
+/// Node 1's commit after the drop plan: the kept node at its new boot, and a put lands there.
+fn kept_rejoined(trio: &mut Trio, kept: u32, reboot: BootId, request: u64) {
+    let (generation, members) =
+        until_through_blocks(trio, "node 1 commits with the kept node", |trio| {
+            let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+            let members = &committed.committed.pinned_config.members;
+            members
+                .iter()
+                .any(|member| member.node == NodeId(kept) && member.boot == reboot)
+                .then(|| {
+                    (
+                        committed.new_generation,
+                        members
+                            .iter()
+                            .map(|member| member.node.0)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+        });
+    assert_eq!(members, vec![1, kept], "at {generation:?}");
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert!(result.generation >= generation, "{result:?}"),
+        other => panic!("a put after the kept node rejoined: {other:?}"),
+    }
+}
+
+/// #67 Wait 2 (A-R433, A-R434), boot BEFORE the block, as the walk saw it (o32 run 4): node 1
+/// plans the drop of one stopped node, pinning the other at its old boot. That one restarts,
+/// and node 1 hears `PeerBooted` while the plan is still collecting, before its new process
+/// answers and F1 blocks (`barrier_boot_changed`). The boot is marked against the plan, and
+/// the drop check that finds F1 blocked on it re-plans at once: no `rejoin_retry`, which
+/// would wait `peer_drop_after_millis`.
+/// Cut: `replan_on_boot` ignores the mark, red (`rejoin_retry` after the clock, no
+/// `rejoin_replan_on_boot`).
+/// Integration (~4 s): bootstrap, the drop clock, two re-plans.
+#[config_log::retcd_test]
+fn m10_bb_67_a_restart_heard_before_its_plan_blocks_replans_at_once() {
+    const METHOD: &str = "m10_bb_67_a_restart_heard_before_its_plan_blocks_replans_at_once";
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        planned,
+        request,
+        ..
+    } = drop_planned(dir.path());
+    let node = kept.1;
+    let rebooted = restart_dead(&mut trio, kept);
+    let reboot = trio.links.boot_of(NodeId(node)).expect("registered");
+    kept_rejoined(&mut trio, node, reboot, request);
+
+    let marked = logged!(METHOD, "rejoin_boot_marked");
+    assert!(
+        marked
+            .iter()
+            .any(|line| line["member"] == node && line["generation"] == planned.0),
+        "{marked:?}"
+    );
+    let replans = logged!(METHOD, "rejoin_replan_on_boot");
+    assert_eq!(replans.len(), 1, "{replans:?}");
+    assert_eq!(replans[0]["member"], node);
+    assert_eq!(replans[0]["generation"], planned.0);
+    let retries = logged!(METHOD, "rejoin_retry");
+    assert!(retries.is_empty(), "waited for the retry: {retries:?}");
+    tracing::info!(
+        ms = HostClock::millis_until(rebooted, trio.clock.now()),
+        "m10_bb_67_boot_to_commit_ms"
+    );
+}
+
+/// #67 Wait 2 (A-R433), boot AFTER the block: as above, but node 1 hears `PeerBooted` only once
+/// F1 is blocked on the plan. `rejoin_if_stale` re-plans then and there, with no mark.
+/// Cut: `boot_while_planned` always marks, red (`rejoin_boot_marked`; the re-plan waits for
+/// the next drop check instead).
+/// Integration (~4 s): as above.
+#[config_log::retcd_test]
+fn m10_bb_67_a_restart_heard_after_its_plan_blocks_replans_at_once() {
+    const METHOD: &str = "m10_bb_67_a_restart_heard_after_its_plan_blocks_replans_at_once";
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        planned,
+        request,
+        ..
+    } = drop_planned(dir.path());
+    let node = kept.1;
+    let reboot = restart_dead_unheard(&mut trio, kept);
+    until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        trio.nodes[0].0.f1_blocked(PartitionId(1)).then_some(())
+    });
+    trio.nodes[0]
+        .1
+        .send(Msg::PeerBooted {
+            node: NodeId(node),
+            boot: reboot,
+        })
+        .expect("node 1 up");
+    kept_rejoined(&mut trio, node, reboot, request);
+
+    assert!(logged!(METHOD, "rejoin_boot_marked").is_empty());
+    let replans = logged!(METHOD, "rejoin_replan_on_boot");
+    assert_eq!(replans.len(), 1, "{replans:?}");
+    assert_eq!(replans[0]["member"], node);
+    assert_eq!(replans[0]["generation"], planned.0);
+    assert!(logged!(METHOD, "rejoin_retry").is_empty());
+}
+
+/// #67 Wait 2 (A-R434 condition 1): a mark left from another plan never re-plans. F1 is blocked
+/// as above and node 1 never hears the boot; a mark for the same generation but an older
+/// `since` (a plan since retried) is dropped at the next drop check, and the block waits for
+/// `retry_blocked_rejoin` as before.
+/// Cut: `replan_on_boot` compares the generation only, red (`rejoin_replan_on_boot`).
+/// Integration (~4 s): as above, plus one drop clock for the retry.
+#[config_log::retcd_test]
+fn m10_bb_67_a_boot_mark_from_another_plan_does_not_replan() {
+    const METHOD: &str = "m10_bb_67_a_boot_mark_from_another_plan_does_not_replan";
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        planned,
+        since,
+        ..
+    } = drop_planned(dir.path());
+    let node = kept.1;
+    restart_dead_unheard(&mut trio, kept);
+    until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        trio.nodes[0].0.f1_blocked(PartitionId(1)).then_some(())
+    });
+    trio.nodes[0].0.boot_seen_while_planned.insert(
+        PartitionId(1),
+        BootMark {
+            generation: planned,
+            since: Tick(since.0.saturating_sub(1)),
+            member: NodeId(node),
+        },
+    );
+    until_through_blocks(&mut trio, "node 1 sends the plan again", |trio| {
+        let same = matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Planned { replan, .. }) if replan.since == since
+        );
+        (!same).then_some(())
+    });
+    assert_eq!(logged!(METHOD, "rejoin_retry").len(), 1);
+    let dropped = logged!(METHOD, "rejoin_boot_mark_dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert!(logged!(METHOD, "rejoin_replan_on_boot").is_empty());
 }
