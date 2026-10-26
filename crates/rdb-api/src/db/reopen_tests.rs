@@ -2428,6 +2428,107 @@ fn m11_a_node_past_the_members_opens_as_a_spare() {
     );
 }
 
+/// The nodes `partitions/1` pins, in record order, or `None` for a record that names none.
+fn pinned_nodes(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> Option<Vec<u32>> {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record
+        .expect("partitions/1");
+    rdb_core::authority::partition::RecordMember::decode_all(&read.value)
+        .map(|members| members.iter().map(|m| m.node.0).collect())
+}
+
+/// M11 defect T6 (tester walk, scenario 6): after `admin move 3 4`, a reopen pinned nodes 1, 2
+/// and 3 again and dropped node 4, the member the record named. The heal built its plan from
+/// the fixed rf3 set instead of the record's members. If node 1's copy had been lost, the
+/// recovery would have read from node 3, which stopped at the move: acked writes gone. Here
+/// four nodes run in one process, node 3's copy moves to node 4, and the database reopens:
+/// the record still pins nodes 1, 2 and 4, and the write made after the move reads back.
+/// Integration (~6 s): a fresh open, the move's two re-plans, a reopen until ready.
+#[config_log::retcd_test]
+fn m11_t6_a_reopen_pins_the_members_the_record_names_not_nodes_1_to_3() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    // Nodes 1 to 3 form the database; node 4 runs as a node process on the same links.
+    // On the fresh open node 4 starts once the database is formed; on the reopen it starts
+    // with the rest, since the heal waits for every member the record pins.
+    let opened = |rt: &tokio::runtime::Runtime, fresh: bool| {
+        let links = Arc::new(Links::default());
+        let db = rt
+            .block_on(Db::open_with(
+                DbConfig {
+                    links: Some(Arc::clone(&links)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("the open of nodes 1 to 3");
+        let ready = |db: &Db| {
+            db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+                .expect("ready");
+        };
+        if fresh {
+            ready(&db);
+        }
+        let spare = rt
+            .block_on(Db::open_with(
+                DbConfig {
+                    local: vec![NodeId(4)],
+                    links: Some(links),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("node 4's process");
+        if !fresh {
+            ready(&db);
+        }
+        (db, spare)
+    };
+    let (mut db, mut spare) = opened(&rt, true);
+    put_through_pauses(&db, b"before", b"1", "a put before the move");
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4");
+        if answer.done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "move 3 4 not done within {patience:?}: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(pinned_nodes(&rt, &store), Some(vec![1, 2, 4]), "the move");
+    put_through_pauses(&db, b"after", b"2", "a put after the move");
+    db.shutdown();
+    spare.shutdown();
+
+    let (db, _spare) = opened(&rt, false);
+    assert_eq!(
+        pinned_nodes(&rt, &store),
+        Some(vec![1, 2, 4]),
+        "the reopen pins the record's members"
+    );
+    assert!(
+        db.get(b"after").is_ok(),
+        "the write after the move reads back"
+    );
+    assert!(
+        db.get(b"before").is_ok(),
+        "the write before the move reads back"
+    );
+}
+
 /// A-R328: an empty copy already bound to another database's instance does not join this one.
 /// The open is refused `Mismatch` and the copy keeps its own binding. Integration (~1 s): one
 /// fresh open until ready, one refused node-process open.

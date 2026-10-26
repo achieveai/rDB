@@ -874,9 +874,12 @@ const HEAL: CorrelationId = CorrelationId(2);
 /// [`HealError`]. Nothing is sent to node 1 unless every step held.
 pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
+    // M11 T6: the members are the ones `partitions/1` pins, not nodes 1 to 3. A move may have
+    // put a copy on node 4; re-pinning node 3 would recover from a copy the move left behind.
+    let pinned = pinned_members(&ctx).await?;
     // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
     // fence's reads and decision tick as fresh as they were.
-    let members = member_boots(&ctx, deadline).await?;
+    let members = member_boots(&ctx, &pinned, deadline).await?;
     // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
     // promote that moved the partition off it, which only that promote may settle.
     let gone = clear_until(&ctx, ctx.owner_node, deadline).await?;
@@ -916,6 +919,14 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
             found.mod_revision
         )));
     };
+    // T6: the plan pins the members read before the boots were awaited; a record that changed
+    // them since is not the one the plan describes.
+    if pinned_of(&found.value)?.is_some_and(|now| now != pinned) {
+        return Err(HealError::Record(format!(
+            "the members partitions/1 pins changed at revision {} while this open waited for              their nodes: open again",
+            found.mod_revision
+        )));
+    }
     // B2: the grant cleared above must be the owner's this record names.
     if record.owner != ctx.owner_node {
         return Err(HealError::Record(format!(
@@ -1073,39 +1084,87 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
     }
 }
 
-/// The rf3 members of [`members`], each at the boot `ctx.member_boot` names for its node, once
-/// every one is known. Polls until `deadline`: a peer's boot arrives with its handshake.
-async fn member_boots(
-    ctx: &HealCtx,
-    deadline: tokio::time::Instant,
-) -> Result<Vec<Member>, HealError> {
-    loop {
-        let found: Vec<(Member, Option<BootId>)> = members()
-            .into_iter()
-            .map(|member| Member {
+/// The members `partitions/1` pins (M11 T6): a layout-4 record's own, in record order. A layout
+/// 2 or 3 record predates members in the record (bug bash #64), when every database was nodes
+/// 1 to 3, so it gets [`members`] with this open's owner primary, as every heal did before.
+async fn pinned_members(ctx: &HealCtx) -> Result<Vec<RecordMember>, HealError> {
+    let read = ctx
+        .store
+        .get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        })
+        .await
+        .map_err(|error| HealError::Control(format!("get partitions/1: {error}")))?;
+    let found = read
+        .record
+        .ok_or_else(|| HealError::Record("absent".to_owned()))?;
+    let pinned = pinned_of(&found.value)?;
+    let fixed = pinned.is_none();
+    let pinned = pinned.unwrap_or_else(|| {
+        members()
+            .iter()
+            .map(|member| RecordMember {
                 role: if member.node == ctx.owner_node {
                     ReplicaRole::Primary
                 } else {
                     ReplicaRole::RegularSecondary
                 },
-                ..member
+                ..RecordMember::of(member)
             })
-            .map(|member| (member, (ctx.member_boot)(member.node)))
+            .collect()
+    });
+    tracing::info!(
+        source = if fixed { "rf3_before_layout_4" } else { "record" },
+        members = ?pinned.iter().map(|m| (m.node.0, m.copy.0)).collect::<Vec<_>>(),
+        "heal_members"
+    );
+    Ok(pinned)
+}
+
+/// The members a record body pins: `None` for a layout 2 or 3 body, an error for a layout-4
+/// body that pins none.
+fn pinned_of(body: &[u8]) -> Result<Option<Vec<RecordMember>>, HealError> {
+    match RecordMember::decode_all(body) {
+        Some(members) if members.is_empty() => {
+            Err(HealError::Record("partitions/1 pins no members".to_owned()))
+        }
+        found => Ok(found),
+    }
+}
+
+/// `pinned`, each at the boot `ctx.member_boot` names for its node, once every regular one is
+/// known. Polls until `deadline`: a peer's boot arrives with its handshake. A `Shadow` whose
+/// node is still unknown at the deadline is left out rather than waited for (A-R451): the plan
+/// commits without it, and a re-run of its move starts it again.
+async fn member_boots(
+    ctx: &HealCtx,
+    pinned: &[RecordMember],
+    deadline: tokio::time::Instant,
+) -> Result<Vec<Member>, HealError> {
+    loop {
+        let found: Vec<(RecordMember, Option<BootId>)> = pinned
+            .iter()
+            .map(|member| (*member, (ctx.member_boot)(member.node)))
             .collect();
+        let late = tokio::time::Instant::now() >= deadline;
         let missing: Vec<u32> = found
             .iter()
-            .filter(|(_, boot)| boot.is_none())
+            .filter(|(member, boot)| {
+                boot.is_none() && !(late && member.role == ReplicaRole::Shadow)
+            })
             .map(|(member, _)| member.node.0)
             .collect();
         if missing.is_empty() {
+            for (member, _) in found.iter().filter(|(_, boot)| boot.is_none()) {
+                tracing::warn!(
+                    node = member.node.0,
+                    copy = member.copy.0,
+                    "heal_shadow_left_out"
+                );
+            }
             let members: Vec<Member> = found
                 .into_iter()
-                .filter_map(|(member, boot)| {
-                    Some(Member {
-                        boot: boot?,
-                        ..member
-                    })
-                })
+                .filter_map(|(member, boot)| Some(member.at(boot?)))
                 .collect();
             tracing::info!(
                 boots = ?members.iter().map(|m| (m.node.0, m.boot.0)).collect::<Vec<_>>(),
@@ -1113,7 +1172,7 @@ async fn member_boots(
             );
             return Ok(members);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if late {
             tracing::warn!(missing = ?missing, "heal_peers_unknown");
             return Err(HealError::PeersUnknown {
                 nodes: missing,
