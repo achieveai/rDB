@@ -370,7 +370,7 @@
 //!                                         does not name n. Under `--nodes` it only checks
 //!                                         that n is already left out; `lr rebuild n
 //!                                         [--wipe]` then stops n, has the fence checked
-//!                                         (`--boot B --last L`), moves the folder aside
+//!                                         (`--wipe --fence`), moves the folder aside
 //!                                         and starts n
 //! admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
@@ -1884,7 +1884,7 @@ fn repl<'scope, 'env>(
                         ));
                         db.rebuild(node, wipe)
                     }
-                    RebuildAsk::Fence { boot, last } => db.rebuild_fence(node, boot, last),
+                    RebuildAsk::Fence => db.rebuild_fence(node),
                 };
                 match answer {
                     Ok(line) => say(&line),
@@ -2028,33 +2028,23 @@ fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
 }
 
 /// `admin rebuild`'s usage (#65).
-const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--boot B --last L]]: n is 1, 2 or 3, not the owner; `lr rebuild n --wipe` adds the boots";
+const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is 1, 2 or 3, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
 
 /// What `admin rebuild` was asked: in this process, or the fence `lr rebuild N --wipe` checks
-/// once it has stopped N (`--boot` before the stop, `--last` after it).
+/// once it has stopped N.
 #[derive(Debug, PartialEq, Eq)]
 enum RebuildAsk {
     Here { wipe: bool },
-    Fence { boot: u64, last: u64 },
+    Fence,
 }
 
-/// `admin rebuild N [--wipe [--boot B --last L]]`'s words after `rebuild`.
+/// `admin rebuild N [--wipe [--fence]]`'s words after `rebuild`.
 fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, RebuildAsk), String> {
     let node = |n: &str| parse_node(n).map_err(|e| format!("{e}; {REBUILD_USAGE}"));
-    let boot = |b: &str| {
-        b.parse::<u64>()
-            .map_err(|_| format!("'{b}' is not a boot; {REBUILD_USAGE}"))
-    };
     match rest {
         [n] => Ok((node(n)?, RebuildAsk::Here { wipe: false })),
         [n, "--wipe"] => Ok((node(n)?, RebuildAsk::Here { wipe: true })),
-        [n, "--wipe", "--boot", b, "--last", l] => Ok((
-            node(n)?,
-            RebuildAsk::Fence {
-                boot: boot(b)?,
-                last: boot(l)?,
-            },
-        )),
+        [n, "--wipe", "--fence"] => Ok((node(n)?, RebuildAsk::Fence)),
         _ => Err(REBUILD_USAGE.to_owned()),
     }
 }
@@ -7581,11 +7571,11 @@ mod tests {
         );
     }
 
-    /// bb #65: `admin rebuild N [--wipe]` runs in process; `lr rebuild N --wipe` adds the boots
-    /// before and after its stop, and only with both is it the fence check. Cut: accept
-    /// `--boot` without `--last` and the `3 --wipe --boot 7` line goes red. Unit.
+    /// bb #65: `admin rebuild N [--wipe]` runs in process; `lr rebuild N --wipe` adds `--fence`
+    /// once it has stopped N, and only after `--wipe` is it the fence check (A-R441 F2).
+    /// Cut: accept `--fence` without `--wipe` and the `3 --fence` line goes red. Unit.
     #[test]
-    fn admin_rebuild_reads_its_node_and_the_fence_boots() {
+    fn admin_rebuild_reads_its_node_and_the_fence_flag() {
         fn words(line: &str) -> Vec<&str> {
             line.split_whitespace().collect()
         }
@@ -7598,17 +7588,10 @@ mod tests {
             Ok((NodeId(3), RebuildAsk::Here { wipe: true }))
         );
         assert_eq!(
-            parse_rebuild(&words("3 --wipe --boot 7 --last 7")),
-            Ok((NodeId(3), RebuildAsk::Fence { boot: 7, last: 7 }))
+            parse_rebuild(&words("3 --wipe --fence")),
+            Ok((NodeId(3), RebuildAsk::Fence))
         );
-        for bad in [
-            "",
-            "4",
-            "3 --boot 7 --last 7",
-            "3 --wipe --boot 7",
-            "3 --wipe --boot x --last 7",
-            "3 --wipe x",
-        ] {
+        for bad in ["", "4", "3 --fence", "3 --fence --wipe", "3 --wipe x"] {
             assert!(parse_rebuild(&words(bad)).is_err(), "{bad:?}");
         }
     }

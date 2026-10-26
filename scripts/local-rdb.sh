@@ -542,36 +542,30 @@ admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its e
 
 promote() { admin_line "admin promote $ARG${DROP:+ --drop $DROP}"; }
 
-node_boot() { # n: the boot node n's last start printed (`rdb_node listening ... boot=B`)
-    sed -n 's/^rdb_node listening .* boot=\([0-9][0-9]*\).*/\1/p' "$RUN/out/node-$1.out" 2>/dev/null | head -n1
-}
-
 # bb #65 over processes: only mode A (node N already left out by the owner) runs here, since
-# dropping N needs the owner's own process. rdb_dev checks the guards against the owner first.
-# With --wipe, N is stopped first; rdb_dev then checks the fence against the owner's record,
-# read after N is down: the record leaves N out and N has not restarted since the check (its boot
-# before the stop equals its boot after). Only then is N's folder moved aside, never deleted.
-# A refused fence starts N again on its own folder and exits 1.
+# dropping N needs the owner's own process. rdb_dev checks the guards against the owner first,
+# before anything is stopped, so a refusal touches nothing (A-R441 F1). With --wipe, N is then
+# stopped and rdb_dev checks the fence, read after the stop: the owner's live pin does not name N
+# in any role and partitions/1 leaves it out (A-R441 F2). Only then is N's folder moved aside,
+# never deleted. A refused fence, or a failed move, starts N again on its own folder and exits 1.
 rebuild() {
-    local n="$ARG" before after aside
-    before="$(node_boot "$n")"
-    [ -n "$before" ] || die "node $n has printed no boot in $RUN/out/node-$n.out; start it first"
-    if [ "$WIPE" != 1 ]; then
-        admin_line "admin rebuild $n" || die "rebuild $n refused; node $n was not touched"
-        stop_node "$n"; start_node "$n" stopped; await_ready "$n" || not_ready "$n"
-        return 0
-    fi
+    local n="$ARG" aside
+    admin_line "admin rebuild $n" || die "rebuild $n refused; node $n was not touched"
     stop_node "$n"
-    after="$(node_boot "$n")"
-    if ! admin_line "admin rebuild $n --wipe --boot $before --last ${after:-0}"; then
-        start_node "$n" stopped; await_ready "$n" || not_ready "$n"
-        die "rebuild $n refused; its folder is left in place and it runs on it again"
+    if [ "$WIPE" = 1 ]; then
+        if ! admin_line "admin rebuild $n --wipe --fence"; then
+            start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+            die "rebuild $n refused; its folder is left in place and it runs on it again"
+        fi
+        aside="$RUN/db/aside/node-$n-$(date +%Y%m%d-%H%M%S)"
+        if ! { mkdir -p "$RUN/db/aside" && mv "$RUN/db/nodes/$n" "$aside"; }; then
+            start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+            die "node $n's folder could not be moved aside to $aside; the folder is left in place and it runs on it again"
+        fi
+        say "node $n's old folder moved aside to $aside"
     fi
-    aside="$RUN/db/aside/node-$n-boot-$before-$(date +%s)"
-    mkdir -p "$RUN/db/aside"
-    mv "$RUN/db/nodes/$n" "$aside"
-    say "node $n's old folder moved aside to $aside"
     start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+    say "node $n restarted; the owner takes it back as a shadow, then regular (\`status\` shows it)"
 }
 
 case "$COMMAND" in
@@ -588,6 +582,9 @@ case "$COMMAND" in
         pick_run; check_node_arg "$ARG"
         if [ "$WIPE" = 1 ]; then
             node_alive "$ARG" && die "node $ARG runs; stop it before --wipe"
+            # A pinned copy is never wiped before the owner drops it (bb #65, A-R441 A3).
+            admin_line "admin rebuild $ARG" ||
+                die "start $ARG --wipe refused: the owner still pins node $ARG, or did not answer; nothing was wiped. Use \`lr rebuild $ARG --wipe\`"
             rm -rf "$RUN/db/nodes/$ARG"
             say "node $ARG wiped"
         fi
