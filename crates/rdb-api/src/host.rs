@@ -5939,6 +5939,9 @@ impl Host {
             owner: self.node,
             members,
             known: &known,
+            // G3. The `rebuild_asks` half is defence in depth (A-R441 closure): a second ask
+            // normally meets the first's drop re-plan in `rejoins`; this half covers only the
+            // tick between that commit and `rebuild_duty`'s answer, and no row reaches it.
             rejoin: self.rejoins.contains_key(&partition)
                 || self.rebuild_asks.contains_key(&partition),
             quarantine: quarantined.then(|| self.quarantines.get(&partition)),
