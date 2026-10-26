@@ -2994,6 +2994,19 @@ impl Db {
     /// when the node does not start again: it then stays stopped, [`Self::boot_of`] names the
     /// boot it was given, and [`Self::restart_note`] says the restart failed (F-013).
     pub fn restart_node(&self, node: NodeId) -> Result<BootId, ApiError> {
+        self.restart_node_with(node, None)
+    }
+
+    /// [`Self::restart_node`], moving `nodes/<n>` to `aside.to` between the stop and the start
+    /// when `aside` is given (#65, `admin rebuild N --wipe`): the node then starts on an empty
+    /// folder. Under the node lock, before anything is stopped, the node's boot must still be
+    /// `aside.boot`; otherwise nothing is stopped or moved (critic-bb M5). A move that fails
+    /// starts the node again on its own folder and answers the failure.
+    pub(crate) fn restart_node_with(
+        &self,
+        node: NodeId,
+        aside: Option<Aside>,
+    ) -> Result<BootId, ApiError> {
         let Some(respawn) = &self.respawn else {
             return Err(ApiError::invalid(
                 "this Db was built without a data directory, so it cannot restart a node",
@@ -3023,6 +3036,25 @@ impl Db {
             )));
         };
         let old_boot = handle.boot;
+        if let Some(aside) = aside.as_ref().filter(|aside| aside.boot != old_boot) {
+            tracing::warn!(
+                node = node.0,
+                boot = old_boot.0,
+                drop_boot = aside.boot.0,
+                "node_wipe_refused_boot"
+            );
+            return Err(ApiError {
+                kind: ErrorKind::Unavailable,
+                retry: RetryRule::NotWired,
+                no_mutation: true,
+                detail: format!(
+                    "node {} not wiped: it runs boot {}, not boot {} the drop named; it restarted \
+                     since, and may be counted again. Nothing was stopped or moved",
+                    node.0, old_boot.0, aside.boot.0
+                ),
+                retry_after: None,
+            });
+        }
         let boot = match &respawn.boots {
             // A node process's boots come from its folder, so they stay fresh across processes
             // as well as restarts (ruling A-R227).
@@ -3047,9 +3079,11 @@ impl Db {
         };
         handle.stop();
         self.control.forget_node(node, old_boot);
+        let folder = respawn.nodes_dir.join(node.0.to_string());
+        let unmoved = aside.and_then(|aside| move_aside(node, &folder, &aside.to).err());
         let started = host::spawn_with(
             node,
-            respawn.nodes_dir.join(node.0.to_string()),
+            folder,
             Arc::clone(&self.links),
             Arc::clone(&self.control),
             self.clock,
@@ -3074,7 +3108,13 @@ impl Db {
                         tracing::warn!(node = node.0, peer = other.node.0, "peer_booted_unsent");
                     }
                 }
-                Ok(boot)
+                match unmoved {
+                    None => Ok(boot),
+                    Some(detail) => Err(ApiError::host(&format!(
+                        "node {} restarted at boot {} on its own folder, not wiped: {detail}",
+                        node.0, boot.0
+                    ))),
+                }
             }
             Err(detail) => {
                 tracing::error!(
@@ -3524,6 +3564,49 @@ fn counter_refused(instance: &[u8; INSTANCE_LEN], error: admin::CounterError) ->
             OpenError::Control(format!("open counter: {detail}{RETCD_STEP}"))
         }
         other => OpenError::Counter(other),
+    }
+}
+
+/// Where [`Db::restart_node_with`] moves a node's folder, and the boot the node must still run
+/// for the move to happen (#65, critic-bb G7 and M5).
+#[derive(Debug, Clone)]
+pub(crate) struct Aside {
+    /// The boot the drop named.
+    pub(crate) boot: BootId,
+    /// Where `nodes/<n>` goes. Never deleted (spec §8.4 retention).
+    pub(crate) to: PathBuf,
+}
+
+/// Move `folder` to `to`, creating `to`'s parent. Never deletes (critic-bb G7).
+fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
+    let moved = to
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::rename(folder, to));
+    match moved {
+        Ok(()) => {
+            tracing::warn!(
+                node = node.0,
+                from = %folder.display(),
+                to = %to.display(),
+                "node_folder_moved_aside"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(
+                node = node.0,
+                from = %folder.display(),
+                to = %to.display(),
+                %error,
+                "node_folder_move_failed"
+            );
+            Err(format!(
+                "moving {} to {}: {error}",
+                folder.display(),
+                to.display()
+            ))
+        }
     }
 }
 
