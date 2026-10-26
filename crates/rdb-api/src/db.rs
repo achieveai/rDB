@@ -3347,7 +3347,9 @@ impl Db {
 
     /// M11: ask the owner to move partition 1's copy on node `from` to node `to`, or say where
     /// that move stands. Asking again resumes it and answers `done` once `to` is pinned
-    /// regular and `from` is left out. The answer comes at once; the move runs on the owner.
+    /// regular and `from` is left out. The move that last finished is answered `done` each
+    /// time it is asked again, so a replayed plan passes, while the owner that ran it serves.
+    /// The answer comes at once; the move runs on the owner.
     ///
     /// # Errors
     ///

@@ -239,7 +239,9 @@
 //!                                         commit pins it regular and leaves <from> out.
 //!                                         Prints `moving: ..` lines until `moved: node <to>
 //!                                         regular at generation G; node <from> left out`.
-//!                                         Asking again resumes, or says `already moved`.
+//!                                         Asking again resumes. A finished move asked
+//!                                         again (a replayed plan) says `already moved ..`
+//!                                         and exits 0, while the owner that ran it serves.
 //!                                         The owner's copy is refused (promote first); a
 //!                                         refusal prints `err admin move ..`, exits 1
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it

@@ -2032,6 +2032,10 @@ struct Host {
     /// done ([`Host::move_step`]). Only the ask: where the move stands is read from the
     /// commit's pinned members each time (D2, A-R452).
     moves: BTreeMap<PartitionId, CopyMove>,
+    /// M11 (A-R452 amendment): per partition, the last move that committed here, `(from, to)`.
+    /// While the commit still shows it done it is answered `moved` on every ask, so a replayed
+    /// plan passes. In memory only: a restarted owner, or a new one, refuses the replay (T1).
+    moved: BTreeMap<PartitionId, (NodeId, NodeId)>,
     /// #65: per partition, the divergence evidence F1's last `Quarantine` reported, for
     /// `admin rebuild`'s G6. Kept until a rebuild replaces the quarantined F1.
     quarantines: BTreeMap<PartitionId, rdb_core::contracts::recovery::DivergenceEvidence>,
@@ -2236,6 +2240,7 @@ impl Host {
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
             moves: BTreeMap::new(),
+            moved: BTreeMap::new(),
             quarantines: BTreeMap::new(),
             rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
@@ -6028,10 +6033,15 @@ impl Host {
             ours = false;
         }
         match (role(from), role(to)) {
-            // A-R452: `moved` answers the ask this owner ran. The record cannot tell a source a
-            // move left out from one that never held a copy (T1), so any other ask is refused.
-            (None, Some(ReplicaRole::RegularSecondary)) if ours => {
-                self.moves.remove(&partition);
+            // A-R452: `moved` answers the ask this owner ran, or replays the move that last
+            // committed here (amendment). The record cannot tell a source a move left out from
+            // one that never held a copy (T1), so any other ask is refused.
+            (None, Some(ReplicaRole::RegularSecondary))
+                if ours || self.moved.get(&partition) == Some(&(from, to)) =>
+            {
+                if ours {
+                    self.moves.remove(&partition);
+                }
                 return Ok(MoveAnswer {
                     done: true,
                     line: format!(
@@ -6253,6 +6263,7 @@ impl Host {
             _ => "other",
         };
         if phase == "moved" {
+            self.moved.insert(partition, (mv.from, mv.to));
             // T3 (critic M4): the copy moved away; the source is a spare now, not a member a
             // drop left out, so its restart re-adds nothing.
             if let Some(left) = self.left_out.get_mut(&partition) {
