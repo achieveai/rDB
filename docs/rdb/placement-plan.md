@@ -32,17 +32,24 @@ JSON. Every field is required; an unknown field is refused.
 ```text
 plan: 7 nodes, 6 partitions, max moves none; model only, nothing is applied
 before: copy skew 3, primary skew 0
-rdb_dev admin move 2 3 --partition 1 --primary       # repair: the node is draining
-rdb_dev admin move 2 4 --partition 1                 # repair: the node is draining
+step: hand partition 1's primary from node 2 to node 3 (no live command: an owner move is refused today) # repair: the node is draining
+rdb_dev admin move 2 4                   # repair: the node is draining
+step: hand partition 2's primary from node 2 to node 3 (no live command: an owner move is refused today) # repair: the node is draining
+rdb_dev admin move 2 7 --partition 2     # repair: the node is draining
 after: 15 moves, copy skew 2, primary skew 1
 after: copies per node 1=4 3=4 4=4 5=2 7=4
 after: primaries per node 1=1 3=2 4=1 5=1 7=1
 residual: copy skew 2 (target 1): no legal move narrows it
 ```
 
-- One `move` line per step, in order. Without `--primary`, the copy on the first node moves to
-  the second. With `--primary`, only the primary role moves, to a node that already has a copy.
-  A step never moves the primary's own copy.
+- One line per step, in order, ending `# <why>`. Only a line that starts `rdb_dev` is a command.
+- A copy move prints as `rdb_dev admin move <from> <to>`: the copy on the first node moves to
+  the second. A step never moves the primary's own copy.
+- Today's CLI moves partition 1 only. The planner plans every partition, so a copy move of
+  another partition prints with `--partition P`. No live command takes that flag yet.
+- A primary handoff prints as `step: hand partition P's primary from node A to node B`. Only
+  the primary role moves, to a node that already has a copy. It has no live command: an owner
+  move is refused today. (`admin promote` names an owner only while the old owner is dead.)
 - `residual:` lines name each goal the plan could not meet, and why. `residual: none` means
   every goal was met.
 - A file that does not read, or does not add up (an unknown node, a primary that is not a copy),

@@ -211,6 +211,31 @@ pub struct Step {
     pub why: Why,
 }
 
+impl Step {
+    /// The step as `rdb_dev admin plan` prints it, ending `# <why>`. Only a line that is a live
+    /// command starts `rdb_dev`: a copy move prints as `rdb_dev admin move <from> <to>`, with
+    /// `--partition P` when P is not 1 (today's CLI moves partition 1 only). A primary handoff
+    /// has no live command, because an owner move is refused (D3), so it prints as `step:`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let action = if self.primary {
+            format!(
+                "step: hand partition {}'s primary from node {} to node {} \
+                 (no live command: an owner move is refused today)",
+                self.partition, self.from, self.to
+            )
+        } else if self.partition == 1 {
+            format!("rdb_dev admin move {} {}", self.from, self.to)
+        } else {
+            format!(
+                "rdb_dev admin move {} {} --partition {}",
+                self.from, self.to, self.partition
+            )
+        };
+        format!("{action:<40} # {}", self.why.describe())
+    }
+}
+
 /// Why a skew claim was left unmet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cause {

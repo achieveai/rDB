@@ -779,3 +779,43 @@ fn a_copy_never_lands_in_a_failure_domain_another_copy_uses_when_spread_is_feasi
         .collect();
     assert!(into_5.iter().all(|s| s.from == 1), "{into_5:?}");
 }
+
+/// Node 1 is draining and leads every partition, so the plan hands three primaries off and moves
+/// copies of partition 1 and of others. Only a live command may print as an `rdb_dev` line: an
+/// owner move is refused (D3), so a primary handoff prints as a plain `step:` line.
+#[retcd_test]
+fn a_primary_handoff_never_prints_as_an_rdb_dev_command_line() {
+    let mut nodes: Vec<Node> = (1..=6).map(node).collect();
+    nodes[0].state = NodeState::Draining;
+    let input = inv(nodes, (1..=3).map(|p| part(p, &[1, 2, 3], 1)).collect());
+    let (plan, _) = checked(&input, usize::MAX, "printed lines");
+    for step in &plan.steps {
+        let line = step.line();
+        let why = format!("# {}", step.why.describe());
+        assert!(line.ends_with(&why), "{line}");
+        if step.primary {
+            assert!(line.starts_with("step: "), "{line}");
+            assert!(!line.contains("rdb_dev"), "{line}");
+        } else if step.partition == 1 {
+            let command = format!("rdb_dev admin move {} {} ", step.from, step.to);
+            assert!(line.starts_with(&command), "{line}");
+            assert!(!line.contains("--"), "{line}");
+        } else {
+            let command = format!(
+                "rdb_dev admin move {} {} --partition {} ",
+                step.from, step.to, step.partition
+            );
+            assert!(line.starts_with(&command), "{line}");
+        }
+    }
+    let kinds = |primary: bool, first: bool| {
+        plan.steps
+            .iter()
+            .any(|s| s.primary == primary && (s.partition == 1) == first)
+    };
+    assert!(
+        kinds(true, true) && kinds(false, true) && kinds(false, false),
+        "{:?}",
+        plan.steps
+    );
+}

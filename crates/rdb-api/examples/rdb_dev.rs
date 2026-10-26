@@ -762,14 +762,7 @@ fn admin_plan(rest: &[String]) -> ExitCode {
         placement::primary_skew(&inventory)
     );
     for step in &plan.steps {
-        let command = format!(
-            "rdb_dev admin move {} {} --partition {}{}",
-            step.from,
-            step.to,
-            step.partition,
-            if step.primary { " --primary" } else { "" }
-        );
-        println!("{command:<52} # {}", step.why.describe());
+        println!("{}", step.line());
     }
     println!(
         "after: {} moves, copy skew {}, primary skew {}",
