@@ -72,6 +72,10 @@ BASE_PORT=19800
 ROOT="${RDB_LR_ROOT:-C:/rdb_test_data/lr}"
 RUN=""
 TIMEOUT_SEC=90
+# A node prints its first `not-ready ... (retrying)` line after this many seconds and keeps
+# waiting; `await_ready` reads that line for the promote hint, so the hint comes then, not after
+# TIMEOUT_SEC (tester paper cut, 7913fb8). `rdb_node` alone waits 60 s.
+FIRST_WAIT_SEC=15
 WIPE=0
 RESUME=0
 ARG=""
@@ -259,7 +263,7 @@ start_node() { # n [stopped]: `stopped` skips the running check when the caller 
     "$NODE_BIN" --node "$n" --dir "$RUN/db" --listen "127.0.0.1:$(node_port "$n")" \
         --peers "$(peers)" --control "$CONTROL" --cert-dir "${LR_CERT_DIR:-$RUN/certs}" \
         --faults "$RUN/faults/node-$n.txt" --stop-file "$RUN/stop/node-$n" \
-        --log-dir "$RUN/logs" ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
+        --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
     pid=$!
     os="$(os_pid_of_child "$pid" rdb_node)" || { cat "$err" >&2; die "node $n exited at start"; }
     record_pid "node-$n" "$os"
@@ -278,13 +282,21 @@ settled_line() { # file: the last ready or final not-ready line. A not-ready lin
 }
 
 await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an exit or a timeout is 1
-    local n="$1" os line deadline out
+    local n="$1" os line deadline out hinted=""
     out="$RUN/out/node-$n.out"
     os="$(pid_of "node-$n")"
     deadline=$(( $(date +%s) + TIMEOUT_SEC ))
     while [ "$(date +%s)" -lt "$deadline" ] && os_pid_is "$os" rdb_node; do
         line="$(settled_line "$out")"
         [ -n "$line" ] && break
+        if [ -z "$hinted" ]; then # once, at the first retrying line naming an unreachable owner
+            hinted="$(owner_lost_line "$out")"
+            if [ -n "$hinted" ]; then
+                say "node $n: $hinted"
+                promote_hint "$n" "$hinted"
+                say "node $n: still waiting for ready (up to ${TIMEOUT_SEC}s in all)"
+            fi
+        fi
         sleep 0.2
     done
     line="$(settled_line "$out")"
@@ -298,11 +310,16 @@ await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an ex
     line="$(grep "^rdb_node not-ready" "$out" 2>/dev/null | tail -n1 || true)"
     if os_pid_is "$os" rdb_node; then
         say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
-        promote_hint "$n" "$line"
+        [ -n "$hinted" ] || promote_hint "$n" "$line"
     else
         say "node $n: exited before it was ready${line:+; last: $line} (see $RUN/out/node-$n.err)"
     fi
     return 1
+}
+
+owner_lost_line() { # file: the first `(retrying)` not-ready line that names an owner no link reaches
+    { grep "^rdb_node not-ready.*is not reachable from this process.*(retrying)$" "$1" 2>/dev/null || true; } \
+        | head -n1
 }
 
 promote_hint() { # n line: a node that gave up waiting for an owner no link reaches names the
@@ -603,7 +620,31 @@ admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its e
         --control "$CONTROL" --nodes "$(peers)" --cert-dir "$RUN/certs" --app admin
 }
 
-promote() { admin_line "admin promote $ARG${DROP:+ --drop $DROP}"; }
+promote() {
+    admin_line "admin promote $ARG${DROP:+ --drop $DROP}" || exit $?
+    spare_hint
+}
+
+spare_hint() { # after a promote: the owner does not pin a running spare by itself (tester paper
+    # cut, 7913fb8). With fewer than 3 copies pinned, name the rebuild that fills the free slot.
+    local members k
+    members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
+    k="$(spare_target "$members")"
+    [ -n "$k" ] || return 0
+    say "partition 1 has $(copies_of "$members") copies and node $k runs unpinned; to make it the third copy, run: scripts/local-rdb.sh rebuild $k --run $RUN"
+}
+
+copies_of() { printf '%s' "$1" | sed -n 's/^members \([^;]*\);.*/\1/p' | { grep -o '[0-9]*=' || true; } | wc -l | tr -d ' '; }
+
+spare_target() { # members-line: the lowest running node the line leaves unpinned, while fewer
+    # than 3 copies are pinned; nothing when the line is missing or the slots are full
+    local k unpinned
+    [ -n "$1" ] && [ "$(copies_of "$1")" -lt 3 ] || return 0
+    unpinned=" $(printf '%s' "$1" | sed -n 's/.*; not pinned \([0-9 ]*\) (.*/\1/p') "
+    for k in $(all_nodes); do
+        case "$unpinned" in *" $k "*) node_alive "$k" && { echo "$k"; return 0; } ;; esac
+    done
+}
 
 # Moves stopped node $1's folder to $RUN/db/aside/node-<n>-<UTC stamp> and says where; it is
 # never deleted (A-R441, A-R445). Returns 1, folder left in place, when the move fails.
