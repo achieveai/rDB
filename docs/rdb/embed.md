@@ -576,6 +576,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 
 ### Known limits in this release
 
+- **A move under heavy write load is given up after 90 s.** A move's new copy catches up one
+  record per round trip. If writes arrive faster than that, it never gets within 32 records of
+  the head, so the owner gives the move up and the old copy stays. `admin move` then says
+  "writes are arriving faster than the copy catches up". Run the move again when the load
+  drops. Faster, batched catch-up is a follow-up for workstream C (snapshot transfer).
 - **A three-process database runs on one machine only, for now.** It is formed once, in one
   process, on one machine. Each node process then opens its own `nodes/<n>` in that shared
   folder. Forming a new database over the network is not supported yet. A node process started

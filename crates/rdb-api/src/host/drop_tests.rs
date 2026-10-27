@@ -3335,6 +3335,7 @@ fn m11_d1_a_move_onto_a_left_out_node_pins_it_once() {
             to: NodeId(3),
             abandoned: None,
             filled: false,
+            lagged: false,
         },
     );
     trio.links.heal_all();
@@ -3882,6 +3883,7 @@ fn m11_t3_a_moved_off_source_is_not_added_back_by_its_restart() {
             to: NodeId(2),
             abandoned: None,
             filled: false,
+            lagged: false,
         },
     );
     dropped_three(&mut trio, before);
@@ -4353,6 +4355,80 @@ fn m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms() {
         Some(true),
         "node 1's kept ladder differs from a full read"
     );
+}
+
+/// A-R459 (M2's liveness): a shadow that never gets within [`PROMOTE_LAG_RECORDS`] of the head
+/// held the move, and every other one, for good. Here node 1's catch-up deadline is 3 s, the
+/// move pins node 4, and node 1's stream to it is cut while 100 records land, so node 4 stays
+/// that far behind. Past the deadline the move is given up: node 4 is left out, node 3 keeps
+/// its copy, a put lands, the next ask says writes are arriving faster than the copy catches up
+/// and to run the move again when the load drops, and the ask after that starts it afresh.
+/// Cut: `move_lag_duty` never gives up, red (node 4 is never left out).
+/// Integration (~6 s): bootstrap's window, the join, the deadline, the give-up re-plan.
+#[config_log::retcd_test]
+fn m11_m2_c_a_move_whose_shadow_cannot_keep_up_is_given_up_at_its_deadline() {
+    const METHOD: &str = "m11_m2_c_a_move_whose_shadow_cannot_keep_up_is_given_up_at_its_deadline";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    trio.nodes[0].0.move_catch_up_millis = 3_000;
+    match trio.ask(move_call(10_000, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            trio.links.drop_direction(NodeId(1), NodeId(4));
+        }
+        pinned.then_some(())
+    });
+    trio.until("the pin's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.ready();
+    for request in 1..=100 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request}: {other:?}"),
+        }
+    }
+    let (_, _, members) = trio.until("node 4 left out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&4))
+    });
+    assert_eq!(members, vec![1, 2, 3], "node 3 keeps its copy");
+    let given_up = logged!(METHOD, "move_catch_up_given_up");
+    assert_eq!(given_up.len(), 1, "{given_up:?}");
+    assert!(
+        given_up[0]["behind"].as_u64().expect("behind") > PROMOTE_LAG_RECORDS,
+        "{given_up:?}"
+    );
+    assert!(
+        given_up[0]["waited_ms"].as_u64().expect("waited_ms") >= 3_000,
+        "{given_up:?}"
+    );
+    trio.links.heal(NodeId(1), NodeId(4));
+    trio.ready();
+    match trio.ask(put(101)) {
+        Answer::Txn { .. } => {}
+        other => panic!("a put after the move was given up: {other:?}"),
+    }
+    match trio.ask(move_call(10_001, 3, 4)) {
+        Answer::Error { error, .. } => assert!(
+            error
+                .detail
+                .contains("writes are arriving faster than the copy catches up")
+                && error.detail.contains("Node 3 keeps its copy")
+                && error
+                    .detail
+                    .contains("Run the move again when the write load drops"),
+            "{error:?}"
+        ),
+        other => panic!("move 3 4 after the give-up: {other:?}"),
+    }
+    match trio.ask(move_call(10_002, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "the move starts afresh: {answer:?}"),
+        other => panic!("move 3 4 asked again: {other:?}"),
+    }
 }
 
 /// Critic A6 (b3's guard): while an `admin rebuild` of node 3 waits on its drop, node 3's

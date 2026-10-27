@@ -230,6 +230,14 @@ pub const PROMOTE_LAG_RECORDS: u64 = 32;
 /// catch-up, outside it.
 pub const WARM_RUNGS: u64 = 1_000;
 
+/// A-R459: how long a move's shadow may stay further than [`PROMOTE_LAG_RECORDS`] behind the
+/// owner's head before the owner gives the move up and keeps the source. The catch-up sends one
+/// record a round trip, so a shadow under a write load faster than that never gets within the
+/// bound; without a deadline the move, and every other one, waited for good. 90 s holds a 20k
+/// catch-up (about 13 s on the dev host, 2026-10-26) several times over and answers inside
+/// `admin move`'s 120 s follow. Batched catch-up is the follow-up (workstream C).
+pub const MOVE_CATCH_UP_MILLIS: u64 = 90_000;
+
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
 const DROP_CHECK_EVERY_MILLIS: u64 = 200;
 
@@ -1319,6 +1327,10 @@ struct CopyMove {
     /// [`MOVE_ENDED`]: crate::db::error::MOVE_ENDED
     /// [`MOVE_STEP`]: crate::db::error::MOVE_STEP
     filled: bool,
+    /// A-R459: the move was given up because its shadow stayed too far behind the head. Its
+    /// next ask says why even with the target reachable (T9 would start it afresh), and the ask
+    /// after that starts it afresh.
+    lagged: bool,
 }
 
 /// A-R458: the ladder this node last gave a dormant receiver of one partition, kept across
@@ -2150,6 +2162,9 @@ struct Host {
     /// M11 T4: per partition, the shadow a move pinned and since when this owner has had no
     /// link to it ([`Self::shadow_give_up_duty`]).
     shadow_unreachable: BTreeMap<PartitionId, (NodeId, Tick)>,
+    /// A-R459: per partition, the shadow a move this owner holds pinned, and since when it has
+    /// been further than [`PROMOTE_LAG_RECORDS`] behind the head ([`Self::move_lag_duty`]).
+    move_catching_up: BTreeMap<PartitionId, (NodeId, Tick)>,
     /// M11 T10: per partition, the promote re-plan (its generation and `since`) whose move
     /// target this owner told F1 was lost ([`Self::move_target_lost_duty`]); told once a plan.
     target_lost_told: BTreeMap<PartitionId, (Generation, Tick)>,
@@ -2165,6 +2180,8 @@ struct Host {
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
+    /// [`MOVE_CATCH_UP_MILLIS`]; crate tests set it directly.
+    move_catch_up_millis: u64,
     /// D9 (A-R398): a restart re-plan from an `Active` commit pins the restarted secondary as a
     /// shadow ([`Self::restart_shadowed`]). Crate rows of the regular rejoin path (F1 routes the
     /// catch-up, as it still does from any other commit) set it false.
@@ -2317,11 +2334,13 @@ impl Host {
             boot_seen_while_planned: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             shadow_unreachable: BTreeMap::new(),
+            move_catching_up: BTreeMap::new(),
             target_lost_told: BTreeMap::new(),
             revoke_unheld: BTreeSet::new(),
             blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
+            move_catch_up_millis: MOVE_CATCH_UP_MILLIS,
             restart_shadow: true,
             instance: engine_instance,
             activation: BTreeMap::new(),
@@ -5671,7 +5690,7 @@ impl Host {
             self.replan_on_boot(partition, now);
             self.retry_blocked_rejoin(partition, now);
             self.repair_duty(partition, now);
-            self.shadow_duty(partition);
+            self.shadow_duty(partition, now);
             self.shadow_give_up_duty(partition, now);
             self.move_target_lost_duty(partition);
             // G6: counted before the early return, so it runs through a rejoin.
@@ -6057,10 +6076,10 @@ impl Host {
         let mut ours = asked
             .as_ref()
             .is_some_and(|mv| (mv.from, mv.to) == (from, to));
-        if let Some((why, filled)) = asked
+        if let Some((why, filled, lagged)) = asked
             .as_ref()
             .filter(|_| ours)
-            .and_then(|mv| mv.abandoned.clone().map(|why| (why, mv.filled)))
+            .and_then(|mv| mv.abandoned.clone().map(|why| (why, mv.filled, mv.lagged)))
         {
             self.moves.remove(&partition);
             if filled {
@@ -6079,7 +6098,10 @@ impl Host {
                 && !self.rejoins.contains_key(&partition)
                 && self.linked(to)
                 && self.links.boot_of(to).is_some();
-            if !back {
+            // A-R459: a move given up for lag had its target reachable throughout, so `back`
+            // would hold at once and the reason would never be said. It is said once; the entry
+            // is gone, so the next ask starts the move afresh.
+            if lagged || !back {
                 return wait(why);
             }
             tracing::info!(
@@ -6277,6 +6299,7 @@ impl Host {
                 to,
                 abandoned: None,
                 filled: false,
+                lagged: false,
             },
         );
         if shadow {
@@ -6609,7 +6632,9 @@ impl Host {
     /// as the rejoiner, and [`Self::drained`] pins it as a regular secondary. That run's F1
     /// catches up what it still lacks and syncs it in the barrier before L1 counts it. Nothing
     /// while a re-plan runs, or on a node that is not the commit's pinned primary.
-    fn shadow_duty(&mut self, partition: PartitionId) {
+    fn shadow_duty(&mut self, partition: PartitionId, now: Tick) {
+        // A-R459: the lag clock runs only while each duty finds the move's shadow behind.
+        let lagging = self.move_catching_up.remove(&partition);
         if self.rejoins.contains_key(&partition) {
             return;
         }
@@ -6673,10 +6698,14 @@ impl Host {
         // within PROMOTE_LAG_RECORDS of the head: the pause is bounded by that, not by how
         // many writes landed while it caught up.
         let head = primary.tracker().head().0;
-        if acked < cutoff.0 || head.saturating_sub(acked) > PROMOTE_LAG_RECORDS {
+        let epoch = committed.selected.root.owner_epoch;
+        let behind = head.saturating_sub(acked);
+        if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
+            if moving.is_some() {
+                self.move_lag_duty(partition, shadow.node, lagging, behind, epoch, now);
+            }
             return;
         }
-        let epoch = committed.selected.root.owner_epoch;
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -6696,6 +6725,66 @@ impl Host {
             since: self.clock.now(),
         };
         self.start_revoke(partition, epoch, replan);
+    }
+
+    /// A-R459: a move's shadow `to` that this owner found `behind` its head, further than
+    /// [`PROMOTE_LAG_RECORDS`]. The clock starts at the first such duty and runs while every
+    /// duty finds it so (`lagging` is the entry this duty took). Past `move_catch_up_millis` the
+    /// move is given up as [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without
+    /// the shadow and the source keeps its copy, and the move's next ask says writes are
+    /// arriving faster than the copy catches up. Logged `move_catch_up_given_up` (warn).
+    fn move_lag_duty(
+        &mut self,
+        partition: PartitionId,
+        to: NodeId,
+        lagging: Option<(NodeId, Tick)>,
+        behind: u64,
+        epoch: OwnerEpoch,
+        now: Tick,
+    ) {
+        let since = match lagging {
+            Some((node, since)) if node == to => since,
+            _ => now,
+        };
+        let waited_ms = HostClock::millis_until(since, now);
+        if waited_ms < self.move_catch_up_millis {
+            self.move_catching_up.insert(partition, (to, since));
+            return;
+        }
+        let Some(mv) = self.moves.get(&partition).cloned() else {
+            return;
+        };
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            from = mv.from.0,
+            to = to.0,
+            behind,
+            waited_ms,
+            "move_catch_up_given_up"
+        );
+        let why = format!(
+            "the move of node {} to node {} was given up: after {} s node {} was still {behind} \
+             records behind node {}'s head, and it is promoted only within {PROMOTE_LAG_RECORDS}: \
+             writes are arriving faster than the copy catches up. Node {} keeps its copy. Run \
+             the move again when the write load drops",
+            mv.from.0,
+            to.0,
+            waited_ms / 1_000,
+            to.0,
+            self.node.0,
+            mv.from.0
+        );
+        self.moves.insert(
+            partition,
+            CopyMove {
+                abandoned: Some(why),
+                lagged: true,
+                ..mv
+            },
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(to), None);
     }
 
     /// The regular secondaries `partition`'s commit pins, while that commit is `ReadOnly`, this
