@@ -4017,16 +4017,22 @@ fn m11_m1_a_a_shadow_below_three_regular_copies_fills_the_slot_and_keeps_the_sou
     kill(&trio, 2, &[1, 3, 4]);
     let (mut request, _) = put_until_paused(&mut trio, 100);
     let (_, _, members) = trio.until("node 1 committed without node 2", |trio| {
-        commit_of(trio).filter(|(generation, _, members)| {
-            *generation > before && !members.contains(&2)
-        })
+        commit_of(trio)
+            .filter(|(generation, _, members)| *generation > before && !members.contains(&2))
     });
-    assert_eq!(members, vec![1, 3, 4], "node 2 dropped, node 4 still a shadow");
+    assert_eq!(
+        members,
+        vec![1, 3, 4],
+        "node 2 dropped, node 4 still a shadow"
+    );
     assert_eq!(pinned_role(&trio, 4), Some(ReplicaRole::Shadow));
     trio.until("the drop's re-plan ended", |trio| {
         (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
     });
-    match trio.nodes[0].0.move_step(PartitionId(1), NodeId(3), NodeId(4)) {
+    match trio.nodes[0]
+        .0
+        .move_step(PartitionId(1), NodeId(3), NodeId(4))
+    {
         Ok(answer) => assert!(
             !answer.done
                 && answer.line.contains("node 3 keeps its copy")
