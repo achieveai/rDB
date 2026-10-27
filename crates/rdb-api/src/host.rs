@@ -5975,14 +5975,7 @@ impl Host {
             .iter()
             .find(|member| member.role == ReplicaRole::Primary)
             .map(|member| member.node);
-        if owner != Some(self.node) {
-            let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
-                partition,
-                hint: owner,
-            });
-            error.no_mutation = true;
-            return Err(error);
-        }
+        self.answers_as_owner(partition, owner)?;
         if from == to {
             return refuse(format!(
                 "node {} is both the source and the target: name two different nodes",
@@ -7172,6 +7165,26 @@ impl Host {
         self.revoke(partition, epoch, Some(node), None);
     }
 
+    /// M11 critic A4: an admin call (`move_step`, `rebuild_from_app`) is answered only by the
+    /// owner its last commit names, and only while it holds the grant. A deposed owner's commit
+    /// is stale: it is refused `NotPrimary`, naming no node, changing nothing.
+    fn answers_as_owner(
+        &self,
+        partition: PartitionId,
+        owner: Option<NodeId>,
+    ) -> Result<(), ApiError> {
+        let held = self.authority.state().is_held();
+        if owner == Some(self.node) && held {
+            return Ok(());
+        }
+        let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+            partition,
+            hint: if held { owner } else { None },
+        });
+        error.no_mutation = true;
+        Err(error)
+    }
+
     /// M11 T12 over processes (lead ruling on dev-a item 1, tester T13): `admin rebuild node`
     /// sent by an app with no node of its own. Only the pinned primary answers, as a move. A node
     /// this commit pins is refused with nothing changed: dropping it is mode B or C, which needs
@@ -7195,14 +7208,7 @@ impl Host {
                 .iter()
                 .find(|member| member.role == ReplicaRole::Primary)
                 .map(|member| member.node);
-            if owner != Some(self.node) {
-                let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
-                    partition,
-                    hint: owner,
-                });
-                error.no_mutation = true;
-                return Err(error);
-            }
+            self.answers_as_owner(partition, owner)?;
             if members.iter().any(|member| member.node == node) {
                 return process(format!(
                     "node {} is still pinned; under --nodes the owner cannot be asked to drop it: \

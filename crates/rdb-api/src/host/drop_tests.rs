@@ -3896,3 +3896,38 @@ fn m11_t3_a_moved_off_source_is_not_added_back_by_its_restart() {
         trio.nodes[0].0.left_out
     );
 }
+
+/// Critic A4 (slice-1 review): a deposed owner still answered `admin move` and `admin rebuild`
+/// from its last commit: `already moved` for a move done, "moving .." for one that can never
+/// commit. Now each answers only while node 1 holds the grant. Here the control store fails
+/// until node 1's grant lapses; both asks are then refused `NotPrimary`, changing nothing.
+/// Cut: no grant check in `move_step` / `rebuild_from_app`, red (a move is answered).
+/// Integration (~4 s): bootstrap, the grant's lapse.
+#[config_log::retcd_test]
+fn m11_a4_a_deposed_owner_answers_no_move_and_no_rebuild() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    until_through_blocks(&mut trio, "node 1's grant lapsed", |trio| {
+        (!trio.nodes[0].0.authority.state().is_held()).then_some(())
+    });
+    let owner = &mut trio.nodes[0].0;
+    let not_primary = |what: &str, error: &ApiError| {
+        assert_eq!(error.name(), "NOT_PRIMARY", "{what}: {error:?}");
+        assert!(error.no_mutation, "{what}: {error:?}");
+    };
+    match owner.move_step(PartitionId(1), NodeId(3), NodeId(4)) {
+        Err(error) => not_primary("move 3 4", &error),
+        Ok(answer) => panic!("a deposed owner answered move 3 4: {answer:?}"),
+    }
+    assert!(owner.moves.is_empty(), "{:?}", owner.moves);
+    match owner.rebuild_from_app(PartitionId(1), NodeId(4)) {
+        Err(error) => not_primary("rebuild 4", &error),
+        Ok(line) => panic!("a deposed owner answered rebuild 4: {line}"),
+    }
+    assert!(owner.left_out.is_empty(), "{:?}", owner.left_out);
+    trio.mem.stop_failing();
+}
