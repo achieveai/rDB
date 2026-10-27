@@ -130,7 +130,8 @@ fn pass(trio: &mut Trio, millis: u64) {
 /// batches; `request` is the last id used. A refusal that wrote nothing (`no_mutation`, such as
 /// `PROTECTION_PAUSED` or `DEADLINE_BEFORE_ADMISSION` on a starved host) is sent again under a
 /// fresh id after a short pause, as a client would; anything else fails the row, and so does
-/// not landing them all within the patience (lead ruling, 4-CPU cap).
+/// not landing them all within the patience (lead ruling, 4-CPU cap). Each refusal is logged at
+/// info, `land_retrying_refused` with its code (`error`), so a re-plan mid-preload shows.
 fn land_retrying(trio: &mut Trio, request: &mut u64, n: u64) {
     let deadline = Instant::now() + test_patience(Duration::from_secs(120));
     let mut left = n;
@@ -147,7 +148,7 @@ fn land_retrying(trio: &mut Trio, request: &mut u64, n: u64) {
                 Answer::Txn { .. } => left -= 1,
                 Answer::Error { error, .. } if error.no_mutation => {
                     refused += 1;
-                    tracing::debug!(sent, error = %error.name(), "land_retrying_refused");
+                    tracing::info!(sent, error = %error.name(), "land_retrying_refused");
                 }
                 other => panic!("put {sent}: {other:?}"),
             }
@@ -4644,6 +4645,7 @@ fn m11_m2_c_a_move_whose_shadow_cannot_keep_up_is_given_up_at_its_deadline() {
             error
                 .detail
                 .contains("writes are arriving faster than the copy catches up")
+                && error.detail.contains("node 4 made no progress for ")
                 && error.detail.contains("or its link from node 1 is slow")
                 && error.detail.contains("Node 3 keeps its copy")
                 && error
@@ -4707,5 +4709,211 @@ fn m11_a6_a_a_pending_rebuild_keeps_its_node_from_being_re_added() {
             .map(|m| m.node),
         Some(NodeId(3)),
         "control: with no rebuild pending, the restarted node is re-added"
+    );
+}
+
+/// The boot node 1's last commit pins `node` at, with its role, if it pins it.
+fn pinned_at(trio: &Trio, node: u32) -> Option<(BootId, ReplicaRole)> {
+    trio.nodes[0]
+        .0
+        .committed
+        .get(&PartitionId(1))
+        .and_then(|result| {
+            result
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.node == NodeId(node))
+                .map(|member| (member.boot, member.role))
+        })
+}
+
+/// Critic-s1b F1 (ruling A-R462): a finished move's `moves` entry stayed until someone asked
+/// `admin move` again, and two duties read it as a live move. Here the move from node 3 to node
+/// 4 finishes and nobody asks again; node 4, now regular, restarts and is pinned as a shadow.
+/// Its inventory is still asked (no `inventory_not_waited` for it), so B3 can see a fork, and
+/// the owner never gives up a move for it (no `move_catch_up_given_up`): it is promoted back.
+/// Cut: the `moves` entry kept at the `moved` commit, red (node 4's inventory not waited on).
+/// Integration (~5 s): bootstrap's window, the move's two re-plans, the restart's two.
+#[config_log::retcd_test]
+fn m11_r462_a_a_finished_move_s_target_restarted_is_still_asked_for_its_inventory() {
+    const METHOD: &str =
+        "m11_r462_a_a_finished_move_s_target_restarted_is_still_asked_for_its_inventory";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    let (_, _, members) = trio.until("node 4 regular and node 3 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&3))
+    });
+    assert_eq!(members, vec![1, 2, 4]);
+    let held = |node| move |line: &serde_json::Value| line["holder"] == node;
+    // The move's join fails its target's inventory at once (A-R460); that one is expected.
+    let before = logged!(METHOD, "inventory_not_waited")
+        .into_iter()
+        .filter(held(4))
+        .count();
+    let boot = restart(&mut trio, dir.path(), 4);
+    trio.until("node 1 pinned node 4 regular at its new boot", |trio| {
+        (pinned_at(trio, 4) == Some((boot, ReplicaRole::RegularSecondary))).then_some(())
+    });
+    let shadowed: Vec<_> = logged!(METHOD, "inventory_not_waited")
+        .into_iter()
+        .filter(held(4))
+        .collect();
+    assert_eq!(
+        shadowed.len(),
+        before,
+        "the restarted node 4 was not asked for its inventory: {shadowed:?}"
+    );
+    let given_up = logged!(METHOD, "move_catch_up_given_up");
+    assert!(given_up.is_empty(), "{given_up:?}");
+}
+
+/// Critic-s1b F2 (ruling A-R463): the catch-up give-up counted from the pin, so the bulk copy
+/// of the history spent the deadline and a partition too big to copy within it could never
+/// move. The deadline now counts only time in which the shadow made no progress. Here the
+/// deadline is shortened to [`R463_DEADLINE_MILLIS`] and [`R463_RECORDS`] records are preloaded,
+/// which take longer than one deadline to copy: the move still ends with node 4 regular and
+/// node 3 out, given up never. A shadow that truly stalls is still given up (`m11_m2_c`).
+/// Cut: the clock not restarted on a new low, red (the move given up mid-copy).
+/// Integration (~7 s): the preload, the join, the copy, the promote.
+#[config_log::retcd_test]
+fn m11_r463_a_a_history_longer_than_one_deadline_to_copy_still_moves() {
+    const METHOD: &str = "m11_r463_a_a_history_longer_than_one_deadline_to_copy_still_moves";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    trio.nodes[0].0.move_catch_up_millis = R463_DEADLINE_MILLIS;
+    let mut request = 0;
+    land_retrying(&mut trio, &mut request, R463_RECORDS);
+    match trio.ask(move_call(100_000, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    let pinned = trio.clock.now();
+    let (_, _, members) = trio.until(
+        "node 4 regular and node 3 out, or node 4 left out",
+        |trio| {
+            commit_of(trio).filter(|(_, _, members)| !members.contains(&3) || !members.contains(&4))
+        },
+    );
+    let copied_ms = trio.clock.now().0 - pinned.0;
+    let given_up = logged!(METHOD, "move_catch_up_given_up");
+    tracing::info!(copied_ms, ?members, "m11_r463_move_ended");
+    assert!(given_up.is_empty(), "{given_up:?}");
+    assert_eq!(members, vec![1, 2, 4]);
+    // The control: the copy really took longer than one deadline.
+    assert!(
+        copied_ms > R463_DEADLINE_MILLIS,
+        "the copy took {copied_ms} ms, within one {R463_DEADLINE_MILLIS} ms deadline"
+    );
+}
+
+/// [`m11_r463_a_a_history_longer_than_one_deadline_to_copy_still_moves`]'s deadline: above the
+/// 200 ms duty period, so each check can see progress.
+const R463_DEADLINE_MILLIS: u64 = 500;
+
+/// Its preload: enough records that copying them takes several of its deadlines (500 took about
+/// 3 s of host time here, 2,000 about 12 s, 2026-10-27).
+const R463_RECORDS: u64 = 500;
+
+/// Critic-s1b F1 (ruling A-R462), the two guards beside the cleared entry. A move pins node 4
+/// as a shadow, and node 1's `unwaited_shadows` for the commit's members names node 4 (the
+/// control: a live move's target is not waited on). Once the entry is given up it names no
+/// one. And with no committed record (a reopen, before `Recovered`) it names no one even for a
+/// live entry, so every shadow is asked.
+/// Cuts: the given-up filter, red (node 4 named); the empty set with no record, red (node 4
+/// named).
+/// Integration (~3 s): bootstrap's window, the move's join.
+#[config_log::retcd_test]
+fn m11_r462_b_unwaited_shadows_names_only_a_live_move_s_target() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    let owner = &mut trio.nodes[0].0;
+    let p = PartitionId(1);
+    let members = owner.committed[&p].committed.pinned_config.members.clone();
+    let four = BTreeSet::from([NodeId(4)]);
+    assert_eq!(owner.unwaited_shadows(p, &members), four, "control");
+    let live = owner.moves[&p].clone();
+    owner.moves.insert(
+        p,
+        CopyMove {
+            abandoned: Some("given up".to_owned()),
+            ..live.clone()
+        },
+    );
+    assert_eq!(
+        owner.unwaited_shadows(p, &members),
+        BTreeSet::new(),
+        "given up"
+    );
+    owner.moves.insert(p, live);
+    let committed = owner.committed.remove(&p).expect("a commit");
+    assert_eq!(
+        owner.unwaited_shadows(p, &members),
+        BTreeSet::new(),
+        "no record"
+    );
+    owner.committed.insert(p, committed);
+    assert_eq!(owner.unwaited_shadows(p, &members), four, "control again");
+}
+
+/// Critic-s1b F2 (ruling A-R463), the clock itself: `move_lag_duty` given the last duty's
+/// clock and this duty's sighting, with the pin's cutoff at 500 and a 1 s deadline. A new low
+/// past the cutoff starts the clock again, and so does the bulk copy advancing below the cutoff
+/// however far behind it is; with neither, the clock keeps running, and past the deadline the
+/// move is given up (this host holds no move, so it only lets the clock go).
+/// Cuts: no new-low reset, red (first case keeps since 0); no bulk-copy reset, red (second).
+#[test]
+fn m11_r463_b_the_catch_up_clock_starts_again_only_on_progress() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    host.move_catch_up_millis = 1_000;
+    let p = PartitionId(1);
+    let clock = |since, low, acked| CatchUp {
+        to: NodeId(4),
+        since: Tick(since),
+        low,
+        acked,
+    };
+    let mut duty = |last: CatchUp, seen: CatchUp| {
+        host.move_lag_duty(p, Some(last), seen, 500, OwnerEpoch(1));
+        host.move_catching_up
+            .remove(&p)
+            .map(|kept| (kept.since.0, kept.low))
+    };
+    assert_eq!(
+        duty(clock(0, 100, 600), clock(2_000, 50, 650)),
+        Some((2_000, 50)),
+        "a new low past the cutoff"
+    );
+    assert_eq!(
+        duty(clock(0, 100, 10), clock(2_000, 120, 20)),
+        Some((2_000, 100)),
+        "the bulk copy advancing below the cutoff"
+    );
+    assert_eq!(
+        duty(clock(0, 100, 600), clock(500, 120, 650)),
+        Some((0, 100)),
+        "no progress, within the deadline"
+    );
+    assert_eq!(
+        duty(clock(0, 100, 600), clock(2_000, 120, 650)),
+        None,
+        "no progress past the deadline"
     );
 }

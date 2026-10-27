@@ -26,6 +26,17 @@ pub(super) fn write_chain(engine: &mut RocksEngine, generation: Generation, n: u
 pub(super) fn write_chain_after(
     engine: &mut RocksEngine,
     generation: Generation,
+    digests: Vec<Digest>,
+    n: u64,
+) -> Vec<Digest> {
+    write_chain_in(engine, PartitionId(1), generation, digests, n)
+}
+
+/// [`write_chain_after`] in `partition`.
+pub(super) fn write_chain_in(
+    engine: &mut RocksEngine,
+    partition: PartitionId,
+    generation: Generation,
     mut digests: Vec<Digest>,
     n: u64,
 ) -> Vec<Digest> {
@@ -40,7 +51,7 @@ pub(super) fn write_chain_after(
         let mut env = ReplicationEnvelope {
             header: EnvelopeHeader {
                 protocol_version: ENVELOPE_VERSION,
-                partition: PartitionId(1),
+                partition,
                 generation,
                 config_version: ConfigVersion(1),
                 owner_epoch: OwnerEpoch(generation.0),
@@ -82,7 +93,7 @@ pub(super) fn write_chain_after(
         engine
             .commit(Batch {
                 id: BatchId(seq),
-                partition: PartitionId(1),
+                partition,
                 generation,
                 seq: Seq(seq),
                 writes,

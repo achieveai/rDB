@@ -231,12 +231,13 @@ pub const PROMOTE_LAG_RECORDS: u64 = 32;
 /// outside it.
 pub const WARM_RUNGS: u64 = 1_000;
 
-/// A-R459: how long a move's shadow may stay further than [`PROMOTE_LAG_RECORDS`] behind the
-/// owner's head before the owner gives the move up and keeps the source. The catch-up sends one
-/// record a round trip, so a shadow under a write load faster than that never gets within the
-/// bound; without a deadline the move, and every other one, waited for good. 90 s holds a 20k
-/// catch-up (about 13 s on the dev host, 2026-10-26) several times over and answers inside
-/// `admin move`'s 120 s follow. Batched catch-up is the follow-up (workstream C).
+/// A-R459, A-R463: how long a move's shadow may stay further than [`PROMOTE_LAG_RECORDS`]
+/// behind the owner's head with no progress before the owner gives the move up and keeps the
+/// source. Progress is a lag below every one seen since the clock began, or the bulk copy below
+/// the pin's cutoff advancing; either starts the clock again, so a history of any size moves.
+/// The catch-up sends one record a round trip, so a shadow under a write load faster than that,
+/// or on a slow link, never gets within the bound; without a deadline the move, and every other
+/// one, waited for good. Batched catch-up is the follow-up (workstream C).
 pub const MOVE_CATCH_UP_MILLIS: u64 = 90_000;
 
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
@@ -1334,6 +1335,18 @@ struct CopyMove {
     lagged: bool,
 }
 
+/// A-R463: a move's shadow found behind the head, and since when it has made no progress:
+/// its lag reached no new low, and the bulk copy below the pin's cutoff did not advance.
+#[derive(Debug, Clone, Copy)]
+struct CatchUp {
+    to: NodeId,
+    since: Tick,
+    /// The least the shadow was behind at any duty since the clock began.
+    low: u64,
+    /// What the shadow had acknowledged at the last duty.
+    acked: u64,
+}
+
 /// A-R458, A-R461: a ladder of verified digests this node keeps for one partition across
 /// re-plans, so a re-plan extends it by the records that arrived since instead of reading every
 /// record again. Two are kept: the one last given a dormant receiver (R1 drops the dormant
@@ -1346,7 +1359,8 @@ struct KeptLadder {
     /// The plan's primary, node and boot, when a dormant ladder was read; `None` for an
     /// inventory ladder.
     owner: Option<(NodeId, BootId)>,
-    /// Every verified digest `(0, ROOT)` through the tip, dense.
+    /// Every verified digest from the first rung through the tip, dense: `(0, ROOT)` for a
+    /// dormant ladder, the generation's base for an inventory ladder read cold (critic-s1b A1).
     rungs: Vec<(Seq, Digest)>,
 }
 
@@ -2077,6 +2091,9 @@ struct Host {
     /// A-R461: each partition's survivor-inventory ladder, warmed by [`Self::ladder_duty`] and
     /// extended by [`Self::survivor`], so a join's inventory reads only what arrived since.
     inventory_ladders: BTreeMap<PartitionId, KeptLadder>,
+    /// Critic-s1b A2: how many passes [`Self::ladder_duty`] has made. Each starts one partition
+    /// further on, so a write rate above its budget cannot starve the partitions at the end.
+    ladder_passes: usize,
     /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
     /// once by the first `SnapshotCatchupRequired` served at that generation.
     primary_ladders: BTreeSet<(PartitionId, Generation)>,
@@ -2168,9 +2185,10 @@ struct Host {
     /// M11 T4: per partition, the shadow a move pinned and since when this owner has had no
     /// link to it ([`Self::shadow_give_up_duty`]).
     shadow_unreachable: BTreeMap<PartitionId, (NodeId, Tick)>,
-    /// A-R459: per partition, the shadow a move this owner holds pinned, and since when it has
-    /// been further than [`PROMOTE_LAG_RECORDS`] behind the head ([`Self::move_lag_duty`]).
-    move_catching_up: BTreeMap<PartitionId, (NodeId, Tick)>,
+    /// A-R459, A-R463: per partition, the shadow a move this owner holds pinned while it is
+    /// further than [`PROMOTE_LAG_RECORDS`] behind the head, and its progress clock
+    /// ([`Self::move_lag_duty`]).
+    move_catching_up: BTreeMap<PartitionId, CatchUp>,
     /// M11 T10: per partition, the promote re-plan (its generation and `since`) whose move
     /// target this owner told F1 was lost ([`Self::move_target_lost_duty`]); told once a plan.
     target_lost_told: BTreeMap<PartitionId, (Generation, Tick)>,
@@ -2311,6 +2329,7 @@ impl Host {
             ladders: BTreeSet::new(),
             dormant_ladders: BTreeMap::new(),
             inventory_ladders: BTreeMap::new(),
+            ladder_passes: 0,
             primary_ladders: BTreeSet::new(),
             snapshots_served: BTreeSet::new(),
             committed_correlation: BTreeMap::new(),
@@ -6423,6 +6442,10 @@ impl Host {
             );
         }
         if phase == "moved" {
+            // A-R462 (critic-s1b F1): the move is over; `moved` answers every later ask, so the
+            // entry goes now. Kept, it read as a live move to `unwaited_shadows` and
+            // `shadow_duty` once its target restarted as a shadow.
+            self.moves.remove(&partition);
             self.moved.insert(partition, (mv.from, mv.to));
             // T3 (critic M4): the copy moved away; the source is a spare now, not a member a
             // drop left out, so its restart re-adds nothing.
@@ -6712,7 +6735,13 @@ impl Host {
         let behind = head.saturating_sub(acked);
         if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
             if moving.is_some() {
-                self.move_lag_duty(partition, shadow.node, lagging, behind, epoch, now);
+                let seen = CatchUp {
+                    to: shadow.node,
+                    since: now,
+                    low: behind,
+                    acked,
+                };
+                self.move_lag_duty(partition, lagging, seen, cutoff.0, epoch);
             }
             return;
         }
@@ -6737,28 +6766,39 @@ impl Host {
         self.start_revoke(partition, epoch, replan);
     }
 
-    /// A-R459: a move's shadow `to` that this owner found `behind` its head, further than
-    /// [`PROMOTE_LAG_RECORDS`]. The clock starts at the first such duty and runs while every
-    /// duty finds it so (`lagging` is the entry this duty took). Past `move_catch_up_millis` the
-    /// move is given up as [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without
-    /// the shadow and the source keeps its copy, and the move's next ask says writes are
-    /// arriving faster than the copy catches up. Logged `move_catch_up_given_up` (warn).
+    /// A-R459, A-R463: a move's shadow (`seen.to`) that this owner found `seen.low` records
+    /// behind its head, further than [`PROMOTE_LAG_RECORDS`], having acknowledged `seen.acked`.
+    /// The clock starts at the first such duty and runs while no duty sees progress: a lag below
+    /// every one seen since the clock began, or, below the pin's `cutoff`, the bulk copy
+    /// advancing (`lagging` is the entry this duty took). Either starts it again. Past
+    /// `move_catch_up_millis` with no progress the move is given up as
+    /// [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without the shadow and the
+    /// source keeps its copy, and the move's next ask says the copy made no progress. Logged
+    /// `move_catch_up_given_up` (warn).
     fn move_lag_duty(
         &mut self,
         partition: PartitionId,
-        to: NodeId,
-        lagging: Option<(NodeId, Tick)>,
-        behind: u64,
+        lagging: Option<CatchUp>,
+        seen: CatchUp,
+        cutoff: u64,
         epoch: OwnerEpoch,
-        now: Tick,
     ) {
-        let since = match lagging {
-            Some((node, since)) if node == to => since,
-            _ => now,
+        let (to, behind, now) = (seen.to, seen.low, seen.since);
+        let clock = match lagging {
+            Some(last) if last.to == to => {
+                let progress =
+                    behind < last.low || (last.acked < cutoff && seen.acked > last.acked);
+                CatchUp {
+                    since: if progress { now } else { last.since },
+                    low: last.low.min(behind),
+                    ..seen
+                }
+            }
+            _ => seen,
         };
-        let waited_ms = HostClock::millis_until(since, now);
+        let waited_ms = HostClock::millis_until(clock.since, now);
         if waited_ms < self.move_catch_up_millis {
-            self.move_catching_up.insert(partition, (to, since));
+            self.move_catching_up.insert(partition, clock);
             return;
         }
         let Some(mv) = self.moves.get(&partition).cloned() else {
@@ -6774,15 +6814,15 @@ impl Host {
             "move_catch_up_given_up"
         );
         let why = format!(
-            "the move of node {} to node {} was given up: after {} s node {} was still {behind} \
-             records behind node {}'s head, and it is promoted only within {PROMOTE_LAG_RECORDS}: \
-             writes are arriving faster than the copy catches up, or its link from node {} is \
-             slow. Node {} keeps its copy. Run the move again when the write load drops or the \
-             link recovers",
+            "the move of node {} to node {} was given up: node {} made no progress for {} s and \
+             was still {behind} records behind node {}'s head, and it is promoted only within \
+             {PROMOTE_LAG_RECORDS}: writes are arriving faster than the copy catches up, or its \
+             link from node {} is slow. Node {} keeps its copy. Run the move again when the \
+             write load drops or the link recovers",
             mv.from.0,
             to.0,
-            waited_ms / 1_000,
             to.0,
+            waited_ms / 1_000,
             self.node.0,
             self.node.0,
             mv.from.0
@@ -6847,13 +6887,18 @@ impl Host {
     /// a shadow never counts, and the owner holds everything the shadow could have been sent.
     /// A shadow the plan keeps from the committed configuration that is not a move's target,
     /// a restarted regular among them, is still asked: its report can name a divergence (B3).
+    /// A-R462: a given-up move's entry names no target, and with no committed record yet (a
+    /// reopen, before `Recovered`) nothing is known to be new, so every shadow is asked.
     fn unwaited_shadows(&self, partition: PartitionId, members: &[Member]) -> BTreeSet<NodeId> {
-        let pinned = self
-            .committed
+        let Some(committed) = self.committed.get(&partition) else {
+            return BTreeSet::new();
+        };
+        let pinned = committed.committed.pinned_config.members.as_slice();
+        let target = self
+            .moves
             .get(&partition)
-            .map(|committed| committed.committed.pinned_config.members.as_slice())
-            .unwrap_or_default();
-        let target = self.moves.get(&partition).map(|mv| mv.to);
+            .filter(|mv| mv.abandoned.is_none())
+            .map(|mv| mv.to);
         members
             .iter()
             .filter(|member| member.role == ReplicaRole::Shadow)
@@ -9240,14 +9285,27 @@ impl Host {
                     ..ladder
                 },
             ),
-            None => (
-                "rebuilt",
-                KeptLadder {
-                    generation,
-                    owner: None,
-                    rungs: vec![(Seq::ZERO, Digest::ROOT)],
-                },
-            ),
+            // Critic-s1b A1: a cold ladder (every one after a reopen) starts at the generation's
+            // base, as the inventory reads from there; below it is never asked for.
+            None => {
+                let base = self
+                    .engine
+                    .link(partition, generation)
+                    .map_or(Seq::ZERO, |link| link.base);
+                let digest = if base == Seq::ZERO {
+                    Digest::ROOT
+                } else {
+                    self.checked(partition, generation, base)?.1
+                };
+                (
+                    "rebuilt",
+                    KeptLadder {
+                        generation,
+                        owner: None,
+                        rungs: vec![(base, digest)],
+                    },
+                )
+            }
         };
         let tip = ladder.rungs.len();
         self.extend_rungs(partition, generation, &mut ladder.rungs, most)?;
@@ -9259,7 +9317,8 @@ impl Host {
     /// records a duty across all of them, so the inventory a join asks of every member reads
     /// only what arrived since instead of every record while writes are fenced. Each partition's
     /// newest held generation is read. A refused read drops that ladder and is logged
-    /// `inventory_ladder_unwarmed{reason}`; the inventory then reads it whole, as before.
+    /// `inventory_ladder_unwarmed{reason}`; the inventory then reads it whole, as before. Each
+    /// pass starts one partition further on (critic-s1b A2), so none starves.
     fn ladder_duty(&mut self) {
         let mut newest: BTreeMap<PartitionId, Generation> = BTreeMap::new();
         for (partition, generation) in self.engine.lineages() {
@@ -9268,8 +9327,14 @@ impl Host {
         }
         self.inventory_ladders
             .retain(|partition, _| newest.contains_key(partition));
+        let mut order: Vec<_> = newest.into_iter().collect();
+        if !order.is_empty() {
+            let by = self.ladder_passes % order.len();
+            order.rotate_left(by);
+        }
+        self.ladder_passes = self.ladder_passes.wrapping_add(1);
         let mut budget = WARM_RUNGS;
-        for (partition, generation) in newest {
+        for (partition, generation) in order {
             if budget == 0 {
                 break;
             }
@@ -9369,8 +9434,10 @@ impl Host {
             .dormant_rungs(partition, ladder.generation)
             .expect("a full read of the ladder's generation");
         let tip = ladder.rungs.last().map_or(Seq::ZERO, |(seq, _)| *seq);
+        let first = ladder.rungs.first().map_or(0, |(seq, _)| seq.0);
+        let first = usize::try_from(first).expect("a ladder index");
         Some((
-            full.get(..ladder.rungs.len()) == Some(ladder.rungs.as_slice()),
+            full.get(first..first + ladder.rungs.len()) == Some(ladder.rungs.as_slice()),
             tip,
         ))
     }
@@ -9834,7 +9901,13 @@ impl Host {
         // A-R461: the kept ladder, extended through the head, not a fresh read of every record.
         let started = Instant::now();
         let (how, kept, read) = self.inventory_ladder(partition, generation, u64::MAX)?;
-        let from = usize::try_from(anchor.base_seq.0).map_err(|_| "base_out_of_range")?;
+        let first = kept.rungs.first().map_or(0, |(seq, _)| seq.0);
+        let from = anchor
+            .base_seq
+            .0
+            .checked_sub(first)
+            .and_then(|from| usize::try_from(from).ok())
+            .ok_or("base_out_of_range")?;
         let ladder = match kept.rungs.get(from..) {
             Some(rungs) if rungs.last().map(|(seq, _)| *seq) == Some(head) => rungs.to_vec(),
             _ => return Err("ladder_short_of_head"),

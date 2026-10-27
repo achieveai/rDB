@@ -576,21 +576,31 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 
 ### Known limits in this release
 
-- **A move under heavy write load is given up after 90 s.** A move's new copy catches up one
-  record per round trip. If writes arrive faster than that, it never gets within 32 records of
-  the head, so the owner gives the move up and the old copy stays. `admin move` then says
-  "writes are arriving faster than the copy catches up". Run the move again when the load
-  drops. Faster, batched catch-up is a follow-up for workstream C (snapshot transfer).
+- **A move whose new copy makes no progress for 90 s is given up.** A move's new copy catches
+  up one record per round trip. Copying a long history is progress, however long it takes.
+  The clock counts only time in which the copy gets no closer to the head. That happens when
+  writes arrive faster than one record per round trip, or when the link to the new copy is
+  slow. The owner then gives the move up and the old copy stays. `admin move` says the new
+  copy "made no progress for 90 s", and names write load or a slow link. Run the move again
+  when the load drops or the link recovers. Faster, batched catch-up is a follow-up for
+  workstream C (snapshot transfer).
 - **A silent standby that was already kept can pause writes for up to 2 s at a join.** A
   move's new copy, or a standby just added, is never waited on: if it cannot be reached, the
   join goes on without it (A-R460). A standby that was already in the partition, for example
   a node that restarted and came back as a standby, is still asked, because its answer is how
   a copy that went its own way is caught (B3). If it goes silent, the join waits for it until
   its 2 s window ends, and writes pause until then.
-- **Each node keeps about 40 bytes per record of each partition it holds in memory.** That is
-  about 40 MB for 1 million records, on every node. It is the checksum list a join reads, kept
-  up to date so a join pauses writes for well under 0.3 s at 20,000 records instead of reading
-  every record (A-R461). It is not yet trimmed or bounded.
+- **Each node keeps up to about 80 bytes per record of each partition it holds in memory.**
+  There are two checksum lists, about 40 bytes per record each:
+  - Every node keeps one for each partition it holds. A join reads it, so a join pauses
+    writes for well under 0.3 s at 20,000 records instead of reading every record (A-R461).
+    After a restart it starts at the current generation's first record, not at seq 1.
+  - A node that has been the source of a catch-up, such as an owner during a move, keeps a
+    second one for that partition, so the last step pauses writes briefly too (A-R458). It
+    stays after the catch-up.
+
+  So plan for about 80 MB per 1 million records on each node.
+  Neither list is trimmed or bounded yet.
 - **A three-process database runs on one machine only, for now.** It is formed once, in one
   process, on one machine. Each node process then opens its own `nodes/<n>` in that shared
   folder. Forming a new database over the network is not supported yet. A node process started
