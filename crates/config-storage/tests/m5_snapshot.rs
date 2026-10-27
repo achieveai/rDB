@@ -1627,13 +1627,16 @@ impl Handshake {
 }
 
 /// Drives an install and a build against each other (F-001). Optionally parks the first
-/// crossing of `pause` (an install boundary), and signals — optionally holding — the first
-/// snapshot capture right after its checkpoint exists.
+/// crossing of `pause` (an install boundary), and signals — optionally holding — one snapshot
+/// capture right after its checkpoint exists: the first, unless built with
+/// [`InstallRace::at_capture`].
 struct InstallRace {
     pause: Option<Boundary>,
     /// Fails every crossing of this boundary (with `FaultAction::Fail`, which does not poison).
     fail: Option<Boundary>,
     hold_capture: bool,
+    /// The capture that is signalled, counting from 0.
+    signal_capture: u64,
     boundary_seen: AtomicU64,
     capture_seen: AtomicU64,
     install: Handshake,
@@ -1642,10 +1645,22 @@ struct InstallRace {
 
 impl InstallRace {
     fn new(pause: Option<Boundary>, fail: Option<Boundary>, hold_capture: bool) -> Arc<Self> {
+        Self::at_capture(pause, fail, hold_capture, 0)
+    }
+
+    /// As [`InstallRace::new`], but signals capture number `signal_capture` (from 0), so the
+    /// builds before it run freely.
+    fn at_capture(
+        pause: Option<Boundary>,
+        fail: Option<Boundary>,
+        hold_capture: bool,
+        signal_capture: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pause,
             fail,
             hold_capture,
+            signal_capture,
             boundary_seen: AtomicU64::new(0),
             capture_seen: AtomicU64::new(0),
             install: Handshake::new(),
@@ -1687,7 +1702,7 @@ impl FaultInjector for InstallRace {
     }
 
     fn during_snapshot_capture(&self) {
-        if self.capture_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.capture_seen.fetch_add(1, Ordering::SeqCst) == self.signal_capture {
             self.capture.arrive(self.hold_capture);
         }
     }
@@ -1854,6 +1869,10 @@ async fn f001_a_build_inside_an_install_never_publishes_the_mid_install_view() {
 /// move this node's current snapshot back to index 3 under an applied state of 6: it would serve
 /// lagging followers the old state, and OpenRaft, whose own snapshot meta never moves backwards,
 /// may already have purged the log entries the older snapshot needs.
+///
+/// Revobot #73 round 2: `built_snapshot_meta`, which a backup reads to find its own build, names
+/// the local build published before the race, stays on it through the install and through the
+/// superseded build that published nothing, and moves only at the next local publication.
 #[retcd_test]
 async fn f001_a_build_never_replaces_a_newer_installed_snapshot() {
     let src_dir = tempfile::tempdir().unwrap();
@@ -1863,9 +1882,19 @@ async fn f001_a_build_never_replaces_a_newer_installed_snapshot() {
         seed(&src, 6).await;
         let meta = build(&src).await.expect("source build succeeds");
 
-        let race = InstallRace::new(None, None, true);
+        // Capture 0 is the local build below; capture 1, the racing build, is held.
+        let race = InstallRace::at_capture(None, None, true, 1);
         let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
         seed(&dst, 3).await;
+        let id_of = |m: Option<SnapshotMeta<RaftNodeId, RaftNode>>| m.map(|m| m.snapshot_id);
+        assert_eq!(id_of(dst.built_snapshot_meta()), None, "nothing built yet");
+        let local = build(&dst).await.expect("the local build succeeds");
+        assert_eq!(
+            id_of(dst.built_snapshot_meta()),
+            Some(local.snapshot_id.clone()),
+            "a local build is what this node built"
+        );
+        let publications_before = dst.metrics().snapshot_publications;
 
         let building = {
             let dst = dst.clone();
@@ -1875,6 +1904,11 @@ async fn f001_a_build_never_replaces_a_newer_installed_snapshot() {
 
         // The checkpoint holds index 3. Install index 6 while it is held.
         let installed = transfer(&src, &dst, &meta, |_| {}).await;
+        assert_eq!(
+            id_of(dst.built_snapshot_meta()),
+            Some(local.snapshot_id.clone()),
+            "an install is not this node's build"
+        );
 
         race.release_all();
         let built = building
@@ -1893,9 +1927,32 @@ async fn f001_a_build_never_replaces_a_newer_installed_snapshot() {
             "the build hands OpenRaft the current snapshot, not the older view"
         );
         assert_eq!(
-            dst.metrics().snapshot_publications,
+            dst.metrics().snapshot_publications - publications_before,
             1,
             "only the install published; the older view did not"
+        );
+        assert_eq!(
+            id_of(dst.built_snapshot_meta()),
+            Some(local.snapshot_id.clone()),
+            "a superseded build that published nothing is not this node's build"
+        );
+
+        // The next local publication, of the installed state, is what this node built.
+        let next = build(&dst).await.expect("the next local build succeeds");
+        assert_ne!(next.snapshot_id, local.snapshot_id);
+        assert_ne!(
+            next.snapshot_id, meta.snapshot_id,
+            "a local build, not the installed file"
+        );
+        assert_eq!(
+            id_of(dst.built_snapshot_meta()),
+            Some(next.snapshot_id.clone()),
+            "the next local publication is this node's build"
+        );
+        assert_eq!(
+            id_of(dst.snapshot_meta()),
+            Some(next.snapshot_id),
+            "and it is the current snapshot"
         );
         assert_headers_match_bodies(dst_dir.path());
     }
