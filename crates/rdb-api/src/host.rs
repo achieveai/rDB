@@ -6839,6 +6839,31 @@ impl Host {
         !self.links.held().contains(&pair)
     }
 
+    /// A-R460: the shadows of `partition`'s plan whose inventory F1 is told failed at once
+    /// instead of asked for: a move's target, and a copy this plan adds that the committed
+    /// configuration does not pin (a join or a rebuild's re-add). F1 waits for every copy it
+    /// asks until its window's deadline, so a held or slow target paused writes for the whole
+    /// 2 s at a join (tester walk at 6c93326). Such a copy holds nothing a write was acked on:
+    /// a shadow never counts, and the owner holds everything the shadow could have been sent.
+    /// A shadow the plan keeps from the committed configuration that is not a move's target,
+    /// a restarted regular among them, is still asked: its report can name a divergence (B3).
+    fn unwaited_shadows(&self, partition: PartitionId, members: &[Member]) -> BTreeSet<NodeId> {
+        let pinned = self
+            .committed
+            .get(&partition)
+            .map(|committed| committed.committed.pinned_config.members.as_slice())
+            .unwrap_or_default();
+        let target = self.moves.get(&partition).map(|mv| mv.to);
+        members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::Shadow)
+            .filter(|member| {
+                Some(member.node) == target || !pinned.iter().any(|kept| kept.node == member.node)
+            })
+            .map(|member| member.node)
+            .collect()
+    }
+
     /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
     /// sequence, while this node is the partition's pinned primary and runs no re-plan for it:
     /// the regular copy with the lowest durable sequence below L1's resume barrier, else L1's
@@ -8721,8 +8746,19 @@ impl Host {
                     .iter()
                     .map(|copy| (*copy, holder_of(&plan.config.members, *copy)))
                     .collect();
+                let unwaited = self.unwaited_shadows(site.partition, &plan.config.members);
                 for (copy, holder) in holders {
                     match holder {
+                        Some(holder) if unwaited.contains(&holder) => {
+                            tracing::info!(
+                                node,
+                                partition = site.partition.0,
+                                copy = copy.0,
+                                holder = holder.0,
+                                "inventory_not_waited"
+                            );
+                            self.answer_here(site, RecoveryEvent::InventoryFailed { copy });
+                        }
                         Some(holder) => self.ask(holder, site, PeerAsk::Inventory { copy, anchor }),
                         None => self.answer_here(site, RecoveryEvent::InventoryFailed { copy }),
                     }

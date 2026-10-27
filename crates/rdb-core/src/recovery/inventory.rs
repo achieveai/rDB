@@ -71,8 +71,7 @@ pub(crate) struct Collecting {
     pub(crate) window: Window,
     queried: BTreeSet<CopyId>,
     /// The queried copies the plan pins as `Shadow`. Asked, since one may hold the longest
-    /// prefix (M7B-97), but one that fails (A-R451) or stays silent (A-R460) never holds the
-    /// window.
+    /// prefix (M7B-97), but one that fails never holds the window (A-R451).
     shadows: BTreeSet<CopyId>,
     verified: BTreeMap<CopyId, VerifiedInventory>,
     lost: BTreeMap<CopyId, InventoryOutcome>,
@@ -295,12 +294,9 @@ impl Collecting {
 
     /// Close the open window before its deadline (ruling A-R165), when every queried copy has
     /// answered, verified or ineligible; a copy still transferring has not. A copy that failed
-    /// keeps the window open to its deadline. A copy the plan pins as a `Shadow` never holds
-    /// it, failed (A-R451: a move's empty target fails) or silent (A-R460: a shadow held or slow
-    /// at a join): waiting on either paused writes for the whole window, and a shadow never
-    /// counts. Its report still counts when it arrives first (M7B-97). `true` when it closed:
-    /// the answer's own `Recorded` is withdrawn, and `CloseWindow` is the last effect this
-    /// pushes, as on a deadline's close.
+    /// keeps the window open to its deadline, unless the plan pins it as a `Shadow` (A-R451):
+    /// a move's empty target fails, and waiting on it paused writes for the whole window. `true` when it closed: the answer's own `Recorded`
+    /// is withdrawn, and `CloseWindow` is the last effect this pushes, as on a deadline's close.
     pub(crate) fn close_if_all_answered(&mut self, emit: &mut Emit<'_>) -> bool {
         let answered = matches!(self.window, Window::Open { .. })
             && !self.lost.values().any(|outcome| match outcome {
@@ -310,7 +306,6 @@ impl Collecting {
             && self
                 .queried
                 .iter()
-                .filter(|copy| !self.shadows.contains(copy))
                 .all(|copy| self.verified.contains_key(copy) || self.lost.contains_key(copy));
         if answered {
             emit.retract_ignored();

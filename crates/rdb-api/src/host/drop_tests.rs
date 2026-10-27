@@ -3474,11 +3474,11 @@ fn m11_q3_a_move_onto_an_empty_node_pins_its_shadow_in_under_half_a_second() {
 /// M11 ruling A-R460 (tester walk at 6c93326): a move whose shadow's link from the owner was
 /// held at the join paused writes for 2.36 s, 15 refused `LEASE_EXPIRED`. F1 asks the shadow
 /// for its inventory, and a shadow that never answers held the discovery window to its 2 s
-/// deadline; A-R451 had exempted only a shadow that answers `InventoryFailed`. A shadow never
-/// counts, so it never holds the window: the join commits as soon as every regular has
-/// answered, and writes go on as at any join.
-/// Cut: drop the shadow exemption for a silent copy in `Collecting::close_if_all_answered`,
-/// red (pinned after the 2 s window, puts refused `LEASE_EXPIRED`).
+/// deadline. The host now fails a move target's or newly added shadow's inventory at once
+/// (`unwaited_shadows`, logged `inventory_not_waited`), so the join commits as soon as every
+/// regular has answered. A kept shadow is still asked: B3 needs a restarted rejoiner's report.
+/// Cut: `unwaited_shadows` returns nothing, red (pinned 2016 ms after the ask, puts refused
+/// `LEASE_EXPIRED`).
 /// Integration (~3 s): bootstrap's window, the join with everything node 4 sends node 1 lost.
 #[config_log::retcd_test]
 fn m11_r460_a_join_whose_shadow_is_held_pins_it_without_pausing_writes() {
