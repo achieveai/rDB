@@ -4203,6 +4203,158 @@ fn m11_m2_a_promote_waits_until_the_shadow_is_near_the_head() {
     assert!(paused < 500, "writes paused {paused} ms at the promote");
 }
 
+/// A log line's wall time, in milliseconds since its day began (`@t`'s `HH:MM:SS.fffffff`).
+fn wall_millis(line: &serde_json::Value) -> i64 {
+    let at = line["@t"].as_str().expect("@t");
+    let time = at.split('T').nth(1).expect("a time").trim_end_matches('Z');
+    let mut parts = time.split(':');
+    let mut next = || parts.next().expect("hh:mm:ss");
+    let (hours, minutes, seconds): (i64, i64, f64) = (
+        next().parse().expect("hours"),
+        next().parse().expect("minutes"),
+        next().parse().expect("seconds"),
+    );
+    #[allow(clippy::cast_possible_truncation)]
+    let millis = (seconds * 1_000.0) as i64;
+    (hours * 60 + minutes) * 60_000 + millis
+}
+
+/// A-R458 (M2's pause at scale): R1 drops the dormant receiver at each `Recovered`, so the
+/// promote re-plan restores a new one on the owner, and it used to read its ladder from every
+/// record inside the fence: 0.87 s of paused writes at the promote with 20k records held. Here
+/// 20,000 records are preloaded, the move pins node 4, node 1's stream to it is cut while 300
+/// more land, and then it catches up with a writer running, so the promote sources a catch-up.
+/// The owner read its ladder ahead while the shadow caught up, so the restore only extends it:
+/// the wall time from `shadow_promote` to the commit stays under 300 ms, a restore logs
+/// `how = extended`, and node 1's kept ladder equals a full read of its engine at the same tip.
+/// Cut: `dormant_ladder` drops the kept ladder (a full read at the promote), red (~460 ms).
+/// Integration (~2.5 min): 20,300 puts, the join, a one-record-a-trip catch-up, the promote.
+#[config_log::retcd_test]
+fn m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms() {
+    const METHOD: &str = "m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let mut request = 0;
+    // Puts are sent 500 at a time and then answered, so their records commit in batches.
+    let mut land = |trio: &mut Trio, n: u64| {
+        let mut left = n;
+        while left > 0 {
+            let chunk = left.min(500);
+            left -= chunk;
+            let answers: Vec<_> = (0..chunk)
+                .map(|_| {
+                    request += 1;
+                    (request, trio.call(put(request)))
+                })
+                .collect();
+            for (sent, answer) in answers {
+                match trio.answer(&answer) {
+                    Answer::Txn { .. } => {}
+                    other => panic!("put {sent}: {other:?}"),
+                }
+            }
+        }
+    };
+    let started = Instant::now();
+    land(&mut trio, 20_000);
+    tracing::info!(
+        millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "m11_m2_b_preloaded"
+    );
+    match trio.ask(move_call(100_000, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            trio.links.drop_direction(NodeId(1), NodeId(4));
+        }
+        pinned.then_some(())
+    });
+    trio.until("the pin's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.ready();
+    land(&mut trio, 300);
+    trio.links.heal(NodeId(1), NodeId(4));
+    // The catch-up walks 20,300 records one a trip: longer than `until`'s patience. Once the
+    // shadow is near the head, a writer keeps one put in flight, as the manual walk's did, so
+    // the promote finds the shadow a few records short and its re-plan sources a catch-up from
+    // node 1's ladder.
+    let near = |trio: &Trio| {
+        let owner = &trio.nodes[0].0;
+        let shadow = owner.committed[&PartitionId(1)]
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(4))
+            .map(|member| member.copy);
+        let primary = owner.replication.primary(NodeId(1), PartitionId(1));
+        match (shadow, primary) {
+            (Some(copy), Some(primary)) => {
+                let acked = primary
+                    .tracker()
+                    .peer(copy)
+                    .map_or(0, |peer| peer.progress.buffered_applied.0);
+                primary.tracker().head().0.saturating_sub(acked) <= 2 * PROMOTE_LAG_RECORDS
+            }
+            _ => false,
+        }
+    };
+    let deadline = Instant::now() + test_patience(Duration::from_secs(120));
+    let mut writer = 1_000_000;
+    let mut in_flight: Option<mpsc::Receiver<Answer>> = None;
+    let members = loop {
+        trio.step();
+        let answered = in_flight
+            .as_ref()
+            .is_none_or(|answer| !matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        if answered && near(&trio) {
+            writer += 1;
+            in_flight = Some(trio.call(put(writer)));
+        }
+        if let Some((_, _, members)) =
+            commit_of(&trio).filter(|(_, _, members)| !members.contains(&3))
+        {
+            break members;
+        }
+        assert!(Instant::now() < deadline, "node 4 was never promoted");
+    };
+    assert_eq!(members, vec![1, 2, 4]);
+    let moved: Vec<_> = logged!(METHOD, "move_committed")
+        .into_iter()
+        .filter(|line| line["phase"] == "moved")
+        .collect();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    // Wall time from the promote to the commit that ends it. The re-plan's own `waited_ms` is
+    // on the trio's capped clock, which caps one slow step, so it hides a long ladder read.
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "{promotes:?}");
+    let paused = wall_millis(&moved[0]) - wall_millis(&promotes[0]);
+    let built: Vec<_> = logged!(METHOD, "dormant_ladder_built")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .collect();
+    tracing::info!(paused_ms = paused, ladders = ?built, "m11_m2_b_promote_pause");
+    assert!(
+        paused < 300,
+        "writes paused {paused} ms at the promote: {built:?}"
+    );
+    assert!(
+        built.iter().any(|line| line["how"] == "extended"),
+        "no restore extended the kept ladder: {built:?}"
+    );
+    assert_eq!(
+        trio.nodes[0]
+            .0
+            .dormant_ladder_matches_rebuild(PartitionId(1)),
+        Some(true),
+        "node 1's kept ladder differs from a full read"
+    );
+}
+
 /// Critic A6 (b3's guard): while an `admin rebuild` of node 3 waits on its drop, node 3's
 /// restart must not re-add it: it comes back only once restarted on its wiped folder. The old
 /// cut of this guard was caught 3 times in 5, because b3's rows reach it only when a restart

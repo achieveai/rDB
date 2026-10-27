@@ -224,6 +224,12 @@ pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
 /// and waits. If writes land faster than it catches up, it waits until they slow.
 pub const PROMOTE_LAG_RECORDS: u64 = 32;
 
+/// A-R458: the most records an owner reads ahead into its dormant ladder in one duty while a
+/// move's shadow catches up (`Host::warm_dormant_ladder`). A full read of 20k records took
+/// 475-595 ms inside the promote's fence (2026-10-26); a thousand a duty spreads that over the
+/// catch-up, outside it.
+pub const WARM_RUNGS: u64 = 1_000;
+
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
 const DROP_CHECK_EVERY_MILLIS: u64 = 200;
 
@@ -1315,6 +1321,20 @@ struct CopyMove {
     filled: bool,
 }
 
+/// A-R458: the ladder this node last gave a dormant receiver of one partition, kept across
+/// re-plans. R1 drops the dormant receiver at each `Recovered`, so a re-plan restores a new one;
+/// it is given these rungs, extended by the records that arrived since, instead of a fresh read
+/// of every record. Read again whole when its base no longer matches: another generation,
+/// another owner, or a tip this engine no longer holds. A reopen starts with none.
+#[derive(Debug)]
+struct DormantLadder {
+    generation: Generation,
+    /// The plan's primary, node and boot, when the ladder was read.
+    owner: Option<(NodeId, BootId)>,
+    /// Every verified digest `(0, ROOT)` through the tip, dense.
+    rungs: Vec<(Seq, Digest)>,
+}
+
 /// #65: an `admin rebuild` the owner answers once the commit that leaves `node` out lands.
 #[derive(Debug)]
 struct RebuildAsk {
@@ -2037,6 +2057,8 @@ struct Host {
     /// Partitions whose dormant receiver holds its full ladder (A-R173, critic-d7 F2): built
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
+    /// A-R458: each partition's last dormant ladder, extended on the next source restore.
+    dormant_ladders: BTreeMap<PartitionId, DormantLadder>,
     /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
     /// once by the first `SnapshotCatchupRequired` served at that generation.
     primary_ladders: BTreeSet<(PartitionId, Generation)>,
@@ -2264,6 +2286,7 @@ impl Host {
             deferred_syncs: BTreeMap::new(),
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
+            dormant_ladders: BTreeMap::new(),
             primary_ladders: BTreeSet::new(),
             snapshots_served: BTreeSet::new(),
             committed_correlation: BTreeMap::new(),
@@ -6631,6 +6654,12 @@ impl Host {
         let rf = crate::admin::members().len();
         let drop = moving
             .filter(|from| regular >= rf && members.iter().any(|member| member.node == *from));
+        let generation = committed.new_generation;
+        let ladder_owner = Self::ladder_owner(&committed.committed.pinned_config);
+        self.warm_dormant_ladder(partition, generation, ladder_owner);
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
         let Some(primary) = self.replication.primary(self.node, partition) else {
             return;
         };
@@ -8884,21 +8913,14 @@ impl Host {
         }
         if with_history && !self.ladders.contains(&partition) {
             let started = Instant::now();
-            let built = self
-                .dormant_rungs(partition, seed.lineage.generation)
-                .and_then(|rungs| {
-                    self.replication
-                        .restore_history(node, partition, &rungs)
-                        .map(|()| rungs.len())
-                        .map_err(|_| "ladder_refused")
-                });
-            match built {
-                Ok(rungs) => {
+            match self.dormant_ladder(partition, seed) {
+                Ok((how, rungs)) => {
                     self.ladders.insert(partition);
                     tracing::info!(
                         node = node.0,
                         partition = partition.0,
                         rungs,
+                        how,
                         millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "dormant_ladder_built"
                     );
@@ -8963,14 +8985,135 @@ impl Host {
         partition: PartitionId,
         generation: Generation,
     ) -> Result<Vec<(Seq, Digest)>, &'static str> {
-        let head = self.engine.buffered_applied(partition, generation).0;
-        let mut rungs = Vec::with_capacity(usize::try_from(head + 1).unwrap_or(0));
-        rungs.push((Seq::ZERO, Digest::ROOT));
-        for seq in 1..=head {
+        let mut rungs = vec![(Seq::ZERO, Digest::ROOT)];
+        self.extend_rungs(partition, generation, &mut rungs, u64::MAX)?;
+        Ok(rungs)
+    }
+
+    /// Append to `rungs`, whose last rung is its tip, the verified digests after the tip
+    /// through this copy's head of `generation`, at most `most` of them.
+    fn extend_rungs(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        rungs: &mut Vec<(Seq, Digest)>,
+        most: u64,
+    ) -> Result<(), &'static str> {
+        let tip = rungs.last().map_or(0, |(seq, _)| seq.0);
+        let head = self
+            .engine
+            .buffered_applied(partition, generation)
+            .0
+            .min(tip.saturating_add(most));
+        rungs.reserve(usize::try_from(head.saturating_sub(tip)).unwrap_or(0));
+        for seq in tip + 1..=head {
             let (_, digest) = self.checked(partition, generation, Seq(seq))?;
             rungs.push((Seq(seq), digest));
         }
-        Ok(rungs)
+        Ok(())
+    }
+
+    /// A-R458: the kept dormant ladder of `partition` when its base still matches, or a new one
+    /// holding only `(0, ROOT)`, with which it is. The base is the generation, the plan's
+    /// primary (node and boot), and a tip whose digest this engine still holds; anything else
+    /// reads every record again.
+    fn kept_ladder(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        owner: Option<(NodeId, BootId)>,
+    ) -> (&'static str, DormantLadder) {
+        let head = self.engine.buffered_applied(partition, generation).0;
+        let kept = self.dormant_ladders.remove(&partition).filter(|ladder| {
+            ladder.generation == generation
+                && ladder.owner == owner
+                && ladder.rungs.last().is_some_and(|&(seq, digest)| {
+                    seq.0 <= head
+                        && (seq == Seq::ZERO
+                            || self
+                                .checked(partition, generation, seq)
+                                .is_ok_and(|(_, held)| held == digest))
+                })
+        });
+        match kept {
+            Some(ladder) => ("extended", ladder),
+            None => (
+                "rebuilt",
+                DormantLadder {
+                    generation,
+                    owner,
+                    rungs: vec![(Seq::ZERO, Digest::ROOT)],
+                },
+            ),
+        }
+    }
+
+    /// The primary a configuration pins, node and boot: a kept ladder's owner.
+    fn ladder_owner(config: &PartitionConfig) -> Option<(NodeId, BootId)> {
+        config
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| (member.node, member.boot))
+    }
+
+    /// A-R458: give this node's dormant receiver of `partition` its ladder, and say whether the
+    /// kept one was `extended` or the ladder `rebuilt` from `(0, ROOT)` ([`Self::kept_ladder`]).
+    /// The ladder is dropped when a read or the receiver refuses it, so the next restore
+    /// rebuilds.
+    fn dormant_ladder(
+        &mut self,
+        partition: PartitionId,
+        seed: &DormantSeed,
+    ) -> Result<(&'static str, usize), &'static str> {
+        let generation = seed.lineage.generation;
+        let (how, mut ladder) =
+            self.kept_ladder(partition, generation, Self::ladder_owner(&seed.config));
+        self.extend_rungs(partition, generation, &mut ladder.rungs, u64::MAX)?;
+        self.replication
+            .restore_history(self.node, partition, &ladder.rungs)
+            .map_err(|_| "ladder_refused")?;
+        let rungs = ladder.rungs.len();
+        self.dormant_ladders.insert(partition, ladder);
+        Ok((how, rungs))
+    }
+
+    /// A-R458: while a move's shadow catches up, the owner reads its dormant ladder ahead, at
+    /// most [`WARM_RUNGS`] records a duty, so the promote re-plan's source restore reads only
+    /// what arrived since instead of every record inside the fence. The promote's seed names
+    /// this generation and this plan's primary, so the restore keeps what is read here. A
+    /// refused read drops the ladder and is logged `dormant_ladder_unwarmed{reason}`; the
+    /// restore then reads it whole, as before.
+    fn warm_dormant_ladder(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        owner: Option<(NodeId, BootId)>,
+    ) {
+        let (_, mut ladder) = self.kept_ladder(partition, generation, owner);
+        match self.extend_rungs(partition, generation, &mut ladder.rungs, WARM_RUNGS) {
+            Ok(()) => {
+                self.dormant_ladders.insert(partition, ladder);
+            }
+            Err(reason) => tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                reason,
+                "dormant_ladder_unwarmed"
+            ),
+        }
+    }
+
+    /// A-R458's proof, for the rows: whether the kept dormant ladder of `partition` equals a
+    /// full read of this engine at the same tip. `None` when no ladder is kept.
+    #[cfg(test)]
+    pub(crate) fn dormant_ladder_matches_rebuild(&self, partition: PartitionId) -> Option<bool> {
+        let ladder = self.dormant_ladders.get(&partition)?;
+        let full = self
+            .dormant_rungs(partition, ladder.generation)
+            .expect("a full read of the ladder's generation");
+        Some(full.get(..ladder.rungs.len()) == Some(ladder.rungs.as_slice()))
     }
 
     /// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired`. The primary here met a record it
