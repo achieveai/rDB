@@ -4070,6 +4070,46 @@ fn m11_m1_a_a_shadow_below_three_regular_copies_fills_the_slot_and_keeps_the_sou
     }
 }
 
+/// Tester walk at d6483cc: `lr rebuild 2 --wipe` of a node the drop clock left out, after a
+/// spare filled its slot, ran all five steps and said the owner takes node 2 back, but with every
+/// slot full the owner re-adds nothing, so node 2 stayed out. Here node 3 is dropped, spare
+/// node 4 is rebuilt into the free slot and promoted, and a rebuild of node 3 from an app is
+/// refused at once: every slot is full, and the way to use node 3 is `admin move`.
+/// Cut: the full-slot refusal removed from `rebuild_from_app`, red (it answers "takes it back").
+/// Integration (~5 s): b1's drop, the re-add and its promote.
+#[config_log::retcd_test]
+fn m11_r1_a_rebuild_of_a_left_out_node_with_every_slot_full_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    kill(&trio, 3, &[1, 2, 4]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    let (tx, rx) = mpsc::channel();
+    trio.nodes[0].0.rebuild_asked(
+        PartitionId(1),
+        NodeId(4),
+        Duration::from_secs(10),
+        RebuildReply(tx),
+    );
+    assert!(matches!(rx.try_recv(), Ok(Ok(_))), "rebuild 4 onto a spare");
+    restart(&mut trio, dir.path(), 4);
+    trio.until("node 1 pinned node 4 regular", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::RegularSecondary)).then_some(())
+    });
+    match trio.nodes[0].0.rebuild_from_app(PartitionId(1), NodeId(3)) {
+        Err(error) => assert!(
+            error.detail.contains("every slot is full")
+                && error.detail.contains("`admin move <source> 3`")
+                && error.detail.contains("nothing was done")
+                && !error.detail.contains("takes it back"),
+            "{error:?}"
+        ),
+        Ok(line) => panic!("rebuild 3 with every slot full: {line}"),
+    }
+}
+
 /// Critic M1 (b), ruling A-R457: a shadow in a free slot that died for good held the slot. The
 /// give-up clock ran only beside rf regular copies, so at two copies a dead spare's shadow was
 /// never left out, and every rebuild and move was refused until it came back. Here node 3 is

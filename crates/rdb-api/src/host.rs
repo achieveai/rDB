@@ -7461,6 +7461,25 @@ impl Host {
                 .left_out
                 .get(&partition)
                 .is_some_and(|left| left.iter().any(|member| member.node == node));
+        // Tester walk at d6483cc: the owner re-adds a left-out copy only into a free slot
+        // (shadows counted, A-R455). With every slot full a rebuild would wipe it for nothing
+        // and say it comes back, so it is refused before anything is stopped.
+        let full = self.committed.get(&partition).and_then(|committed| {
+            let members = &committed.committed.pinned_config.members;
+            (members.len() >= crate::admin::members().len()).then(|| member_list(members))
+        });
+        if let Some(list) = full.filter(|_| left) {
+            return Err(crate::db::rebuild_refused(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "node {} is left out and every slot is full (members: {list}): the owner \
+                     takes a left-out copy back only into a free slot, so a rebuild would not \
+                     bring it back. To use node {}, move a copy onto it: `admin move <source> \
+                     {}`; nothing was done",
+                    node.0, node.0, node.0
+                ),
+            }));
+        }
         let (tx, answer) = mpsc::channel();
         self.rebuild_asked(partition, node, Duration::ZERO, RebuildReply(tx));
         match answer.try_recv() {
