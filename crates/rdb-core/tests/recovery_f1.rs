@@ -817,9 +817,10 @@ fn the_last_answer_closes_the_window_unless_a_copy_failed() {
 
 /// M11 M2 (ruling A-R451): a copy the plan pins as `Shadow` that fails never holds the window.
 /// A move's empty target answers `InventoryFailed`, and holding the window for it paused
-/// writes for the whole 2 s. Whichever arrives last, the shadow's failure or the last regular's
-/// report, closes the window at once. The same copy pinned regular still holds it (A-R165).
-/// Cut: drop the shadow exemption in `Collecting::close_if_all_answered`, red (no close).
+/// writes for the whole 2 s. The last regular's report closes the window at once, whether the
+/// shadow failed before it or has not answered (A-R460). The same copy pinned regular still
+/// holds it (A-R165).
+/// Cut: drop the shadow exemptions in `Collecting::close_if_all_answered`, red (no close).
 #[retcd_test]
 fn m11_q3_a_failed_shadow_never_holds_the_window() {
     let shadow = [member(D, ReplicaRole::Shadow)];
@@ -835,18 +836,21 @@ fn m11_q3_a_failed_shadow_never_holds_the_window() {
     );
     assert!(has_selected(&close), "{close:?}");
 
+    // A-R460: a shadow that has not answered never holds the window either. The last regular's
+    // report closes it, and the shadow's failure after that changes nothing.
     let mut last = fenced(&shadow);
-    for (at, copy) in [(10, A), (11, B), (12, C)] {
-        last.report(at, inv(copy, 20));
-    }
+    last.report(10, inv(A, 20));
+    last.report(11, inv(B, 20));
+    let close = last.report(12, inv(C, 20));
     assert_eq!(
-        last.phase(),
-        RecoveryPhase::Collecting,
-        "the shadow is still asked"
+        close.first(),
+        Some(&r(RecoveryEffect::CloseWindow)),
+        "{close:?}"
     );
-    let close = last.rec(13, RecoveryEvent::InventoryFailed { copy: D });
-    assert!(close.contains(&r(RecoveryEffect::CloseWindow)), "{close:?}");
     assert!(has_selected(&close), "{close:?}");
+    let late = last.rec(13, RecoveryEvent::InventoryFailed { copy: D });
+    assert!(!late.contains(&r(RecoveryEffect::CloseWindow)), "{late:?}");
+    assert!(!has_selected(&late), "{late:?}");
 
     let mut regular = fenced(&[member(D, ReplicaRole::RegularSecondary)]);
     regular.rec(10, RecoveryEvent::InventoryFailed { copy: D });
@@ -1253,13 +1257,14 @@ fn a_returning_owner_before_commit_is_an_inventory() {
 // ---------------------------------------------------------------------------------------------
 
 /// Scaffolds M7B-97/98: a shadow may hold the longest prefix, but never leads and never counts;
+/// its report counts when it arrives before the window closes (A-R460: it never holds it open);
 /// the leader that lags is caught up before its grant.
 #[retcd_test]
 fn a_shadow_never_leads_and_a_lagging_leader_catches_up_before_grant() {
     let shadow = [member(D, ReplicaRole::Shadow)];
     let (_, close) = closed(
         &shadow,
-        vec![inv(A, 18), inv(B, 18), inv(C, 18), inv(D, 25)],
+        vec![inv(D, 25), inv(A, 18), inv(B, 18), inv(C, 18)],
         &[],
     );
     assert_eq!(
@@ -3853,11 +3858,12 @@ fn result_carries_bounds_mode_and_status_map(
 
 /// M7B-118 (D §5.2 shadows never recover, §5.4 `select_leader`, ADR 0009 §5): shadow D holds the
 /// longest verified prefix and every candidate flag is set. The prefix is D's; the leader is a
-/// regular, and D sends the prefix to it before its grant.
+/// regular, and D sends the prefix to it before its grant. D answers first: a shadow never holds
+/// the window open (A-R460), so a report after the last regular's would arrive too late.
 #[retcd_test]
 fn m7b_118_verified_shadow_source_is_never_leader() {
     let shadow = [member(D, ReplicaRole::Shadow)];
-    let reports = vec![inv(A, 18), inv(B, 18), inv(C, 18), inv(D, 25)];
+    let reports = vec![inv(D, 25), inv(A, 18), inv(B, 18), inv(C, 18)];
     let SelectionOutcome::Selected(chosen) = select_prefix(&verified(&reports), root()) else {
         panic!("four compatible histories select");
     };

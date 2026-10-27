@@ -3471,6 +3471,82 @@ fn m11_q3_a_move_onto_an_empty_node_pins_its_shadow_in_under_half_a_second() {
     tracing::info!(after_pin_ms = landed_at.0 - pinned.0, "m11_q3_put_landed");
 }
 
+/// M11 ruling A-R460 (tester walk at 6c93326): a move whose shadow's link from the owner was
+/// held at the join paused writes for 2.36 s, 15 refused `LEASE_EXPIRED`. F1 asks the shadow
+/// for its inventory, and a shadow that never answers held the discovery window to its 2 s
+/// deadline; A-R451 had exempted only a shadow that answers `InventoryFailed`. A shadow never
+/// counts, so it never holds the window: the join commits as soon as every regular has
+/// answered, and writes go on as at any join.
+/// Cut: drop the shadow exemption for a silent copy in `Collecting::close_if_all_answered`,
+/// red (pinned after the 2 s window, puts refused `LEASE_EXPIRED`).
+/// Integration (~3 s): bootstrap's window, the join with everything node 4 sends node 1 lost.
+#[config_log::retcd_test]
+fn m11_r460_a_join_whose_shadow_is_held_pins_it_without_pausing_writes() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    // Node 4 stays linked to the owner, so the move starts, but nothing it sends reaches it:
+    // a shadow held or slow at the join, as `lr hold 1-6` left node 6 on the walk.
+    trio.links.drop_direction(NodeId(4), NodeId(1));
+    let asked = trio.clock.now();
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    let mut request = 100;
+    let mut refused = Vec::new();
+    while pinned_role(&trio, 4) != Some(ReplicaRole::Shadow) {
+        assert!(
+            trio.clock.now().0 - asked.0 < 10_000,
+            "node 4 not pinned as a shadow 10 s after the ask; refused: {refused:?}"
+        );
+        request += 1;
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            Answer::Error { error, .. } if error.no_mutation => {
+                refused.push(error.name());
+                pass(&mut trio, 20);
+            }
+            other => panic!("a put during the join: {other:?}"),
+        }
+    }
+    let waited = trio.clock.now().0 - asked.0;
+    tracing::info!(waited_ms = waited, refused = ?refused, "m11_r460_shadow_pinned");
+    assert!(
+        waited < 500,
+        "the held shadow was pinned {waited} ms after the ask; refused: {refused:?}"
+    );
+    // Any join's revoke refuses the put it lands under `LEASE_EXPIRED`, changing nothing: with
+    // node 4 answering, the same row is refused once. Held, it was refused 26 times.
+    let expired = refused
+        .iter()
+        .filter(|name| *name == "LEASE_EXPIRED")
+        .count();
+    assert!(
+        expired <= 1,
+        "{expired} puts refused LEASE_EXPIRED at the join: {refused:?}"
+    );
+    // The commit pauses L1 until it re-protects, as at any join; node 4 is not waited on.
+    let pinned = trio.clock.now();
+    loop {
+        request += 1;
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => break,
+            Answer::Error { error, .. }
+                if error.no_mutation && error.name() == "PROTECTION_PAUSED" =>
+            {
+                pass(&mut trio, 20);
+            }
+            other => panic!("a put after the join: {other:?}"),
+        }
+    }
+    let resumed = trio.clock.now().0 - pinned.0;
+    tracing::info!(resumed_ms = resumed, "m11_r460_put_landed");
+    assert!(
+        resumed < 500,
+        "writes resumed {resumed} ms after node 4 was pinned"
+    );
+}
+
 /// M11 defect T4 (tester walk): a move whose target died after it was pinned as a shadow never
 /// ended. The shadow stayed pinned, every later move was refused "still running", and the
 /// refusal said the move did nothing more although the owner finished it on its own once the
