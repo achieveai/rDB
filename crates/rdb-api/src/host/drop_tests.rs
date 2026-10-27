@@ -4473,6 +4473,97 @@ fn m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms() {
     );
 }
 
+/// A-R461 (the join's pause at scale; tester walk at 6c93326): the join that pins a move's
+/// shadow paused writes 587 ms with 20k records held. 472 ms of it was one step on each member:
+/// the survivor inventory read and verified every record's digest from the anchor's base to
+/// the head, inside the fence. Every node now keeps that ladder, reads it ahead in its duty,
+/// and the inventory extends it. Here 20,000 records are preloaded, every member's kept ladder
+/// reaches the head, and the move pins node 4: the wall time from node 1's `rejoin_plan` to the
+/// commit that pins it stays under 300 ms, every member's inventory logs `how = extended`, and
+/// node 1's kept ladder equals a full read of its engine at the same tip.
+/// Cut: `survivor` drops the kept ladder before it reads (a full read at the join), red (1155 ms).
+/// Integration (~2 min): 20,000 puts, the warm, the join.
+#[config_log::retcd_test]
+fn m11_r461_a_join_over_20k_records_pauses_under_300_ms() {
+    const METHOD: &str = "m11_r461_a_join_over_20k_records_pauses_under_300_ms";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let mut request = 0;
+    // Puts are sent 500 at a time and then answered, so their records commit in batches.
+    while request < 20_000 {
+        let answers: Vec<_> = (0..500)
+            .map(|_| {
+                request += 1;
+                (request, trio.call(put(request)))
+            })
+            .collect();
+        for (sent, answer) in answers {
+            match trio.answer(&answer) {
+                Answer::Txn { .. } => {}
+                other => panic!("put {sent}: {other:?}"),
+            }
+        }
+    }
+    let head = |trio: &Trio| {
+        trio.nodes[0]
+            .0
+            .engine
+            .buffered_applied(PartitionId(1), commit_of(trio).expect("a commit").0)
+    };
+    trio.until("every member's ladder reached the head", |trio| {
+        let head = Seq(head(trio).0);
+        trio.nodes[..3]
+            .iter()
+            .all(|(node, ..)| {
+                node.inventory_ladder_matches_rebuild(PartitionId(1))
+                    .is_some_and(|(_, tip)| tip >= head)
+            })
+            .then_some(())
+    });
+    match trio.ask(move_call(100_000, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    // Wall time from the plan to the commit: the re-plan's own `waited_ms` is on the trio's
+    // capped clock, which caps one slow step, so it hides a long ladder read.
+    let plans: Vec<_> = logged!(METHOD, "rejoin_plan")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .collect();
+    let pinned: Vec<_> = logged!(METHOD, "move_committed")
+        .into_iter()
+        .filter(|line| line["phase"] == "shadow_pinned")
+        .collect();
+    assert_eq!(pinned.len(), 1, "{pinned:?}");
+    let plan = plans.last().expect("node 1 planned the join");
+    let paused = wall_millis(&pinned[0]) - wall_millis(plan);
+    let ladders: Vec<_> = logged!(METHOD, "inventory_ladder")
+        .into_iter()
+        .filter(|line| wall_millis(line) >= wall_millis(plan))
+        .collect();
+    tracing::info!(paused_ms = paused, ladders = ?ladders, "m11_r461_join_pause");
+    assert!(
+        paused < 300,
+        "writes paused {paused} ms at the join: {ladders:?}"
+    );
+    for node in [1, 2, 3] {
+        assert!(
+            ladders
+                .iter()
+                .any(|line| line["node"] == node && line["how"] == "extended"),
+            "node {node}'s inventory did not extend its kept ladder: {ladders:?}"
+        );
+    }
+    let (matches, _) = trio.nodes[0]
+        .0
+        .inventory_ladder_matches_rebuild(PartitionId(1))
+        .expect("node 1 keeps a ladder");
+    assert!(matches, "node 1's kept ladder differs from a full read");
+}
+
 /// A-R459 (M2's liveness): a shadow that never gets within [`PROMOTE_LAG_RECORDS`] of the head
 /// held the move, and every other one, for good. Here node 1's catch-up deadline is 3 s, the
 /// move pins node 4, and node 1's stream to it is cut while 100 records land, so node 4 stays

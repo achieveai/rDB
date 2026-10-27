@@ -224,10 +224,11 @@ pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
 /// and waits. If writes land faster than it catches up, it waits until they slow.
 pub const PROMOTE_LAG_RECORDS: u64 = 32;
 
-/// A-R458: the most records an owner reads ahead into its dormant ladder in one duty while a
-/// move's shadow catches up (`Host::warm_dormant_ladder`). A full read of 20k records took
-/// 475-595 ms inside the promote's fence (2026-10-26); a thousand a duty spreads that over the
-/// catch-up, outside it.
+/// A-R458, A-R461: the most records a node reads ahead into its kept ladders in one duty: an
+/// owner's dormant ladder while a move's shadow catches up (`Host::warm_dormant_ladder`), and
+/// every held partition's inventory ladder (`Host::ladder_duty`). A full read of 20k records
+/// took 475-595 ms inside a re-plan's fence (2026-10-26); a thousand a duty spreads that
+/// outside it.
 pub const WARM_RUNGS: u64 = 1_000;
 
 /// A-R459: how long a move's shadow may stay further than [`PROMOTE_LAG_RECORDS`] behind the
@@ -1333,15 +1334,17 @@ struct CopyMove {
     lagged: bool,
 }
 
-/// A-R458: the ladder this node last gave a dormant receiver of one partition, kept across
-/// re-plans. R1 drops the dormant receiver at each `Recovered`, so a re-plan restores a new one;
-/// it is given these rungs, extended by the records that arrived since, instead of a fresh read
-/// of every record. Read again whole when its base no longer matches: another generation,
-/// another owner, or a tip this engine no longer holds. A reopen starts with none.
+/// A-R458, A-R461: a ladder of verified digests this node keeps for one partition across
+/// re-plans, so a re-plan extends it by the records that arrived since instead of reading every
+/// record again. Two are kept: the one last given a dormant receiver (R1 drops the dormant
+/// receiver at each `Recovered`, so a re-plan restores a new one), and the one a survivor
+/// inventory reports. The digests chain, so a tip this engine still holds at the same digest
+/// proves every rung below it. A reopen starts with none.
 #[derive(Debug)]
-struct DormantLadder {
+struct KeptLadder {
     generation: Generation,
-    /// The plan's primary, node and boot, when the ladder was read.
+    /// The plan's primary, node and boot, when a dormant ladder was read; `None` for an
+    /// inventory ladder.
     owner: Option<(NodeId, BootId)>,
     /// Every verified digest `(0, ROOT)` through the tip, dense.
     rungs: Vec<(Seq, Digest)>,
@@ -2070,7 +2073,10 @@ struct Host {
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
     /// A-R458: each partition's last dormant ladder, extended on the next source restore.
-    dormant_ladders: BTreeMap<PartitionId, DormantLadder>,
+    dormant_ladders: BTreeMap<PartitionId, KeptLadder>,
+    /// A-R461: each partition's survivor-inventory ladder, warmed by [`Self::ladder_duty`] and
+    /// extended by [`Self::survivor`], so a join's inventory reads only what arrived since.
+    inventory_ladders: BTreeMap<PartitionId, KeptLadder>,
     /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
     /// once by the first `SnapshotCatchupRequired` served at that generation.
     primary_ladders: BTreeSet<(PartitionId, Generation)>,
@@ -2304,6 +2310,7 @@ impl Host {
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
             dormant_ladders: BTreeMap::new(),
+            inventory_ladders: BTreeMap::new(),
             primary_ladders: BTreeSet::new(),
             snapshots_served: BTreeSet::new(),
             committed_correlation: BTreeMap::new(),
@@ -3153,6 +3160,9 @@ impl Host {
         if self.next_drop_check <= now {
             self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
             self.drop_duty(now);
+            let started = Instant::now();
+            self.ladder_duty();
+            self.slow_step("duty", || "ladder".to_owned(), started);
         }
         self.rebuild_duty(now);
         self.resend_caught_up(now);
@@ -9132,29 +9142,114 @@ impl Host {
         partition: PartitionId,
         generation: Generation,
         owner: Option<(NodeId, BootId)>,
-    ) -> (&'static str, DormantLadder) {
-        let head = self.engine.buffered_applied(partition, generation).0;
+    ) -> (&'static str, KeptLadder) {
         let kept = self.dormant_ladders.remove(&partition).filter(|ladder| {
             ladder.generation == generation
                 && ladder.owner == owner
-                && ladder.rungs.last().is_some_and(|&(seq, digest)| {
-                    seq.0 <= head
-                        && (seq == Seq::ZERO
-                            || self
-                                .checked(partition, generation, seq)
-                                .is_ok_and(|(_, held)| held == digest))
-                })
+                && self.holds_tip(partition, generation, ladder)
         });
         match kept {
             Some(ladder) => ("extended", ladder),
             None => (
                 "rebuilt",
-                DormantLadder {
+                KeptLadder {
                     generation,
                     owner,
                     rungs: vec![(Seq::ZERO, Digest::ROOT)],
                 },
             ),
+        }
+    }
+
+    /// Whether this engine holds `ladder`'s tip in `generation`, at or below its head and at the
+    /// same digest. The digests chain, so that proves every rung below the tip too.
+    fn holds_tip(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        ladder: &KeptLadder,
+    ) -> bool {
+        let head = self.engine.buffered_applied(partition, generation).0;
+        ladder.rungs.last().is_some_and(|&(seq, digest)| {
+            seq.0 <= head
+                && (seq == Seq::ZERO
+                    || self
+                        .checked(partition, generation, seq)
+                        .is_ok_and(|(_, held)| held == digest))
+        })
+    }
+
+    /// A-R461: the kept inventory ladder of `partition`, extended through this copy's head of
+    /// `generation` by at most `most` records, whether it was `extended` or `rebuilt` from
+    /// `(0, ROOT)`, and how many records it read. Kept across generations: a new generation links
+    /// the old one at its base, and the tip check ([`Self::holds_tip`]) reads through that link,
+    /// so the ladder of the generation a commit replaced is extended, not read again. Not put
+    /// back: the caller does that once it has used it, so a refused read drops it and the next
+    /// one rebuilds.
+    fn inventory_ladder(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        most: u64,
+    ) -> Result<(&'static str, KeptLadder, u64), &'static str> {
+        let kept = self
+            .inventory_ladders
+            .remove(&partition)
+            .filter(|ladder| self.holds_tip(partition, generation, ladder));
+        let (how, mut ladder) = match kept {
+            Some(ladder) => (
+                "extended",
+                KeptLadder {
+                    generation,
+                    ..ladder
+                },
+            ),
+            None => (
+                "rebuilt",
+                KeptLadder {
+                    generation,
+                    owner: None,
+                    rungs: vec![(Seq::ZERO, Digest::ROOT)],
+                },
+            ),
+        };
+        let tip = ladder.rungs.len();
+        self.extend_rungs(partition, generation, &mut ladder.rungs, most)?;
+        let read = u64::try_from(ladder.rungs.len() - tip).unwrap_or(u64::MAX);
+        Ok((how, ladder, read))
+    }
+
+    /// A-R461: read each held partition's inventory ladder ahead, at most [`WARM_RUNGS`]
+    /// records a duty across all of them, so the inventory a join asks of every member reads
+    /// only what arrived since instead of every record while writes are fenced. Each partition's
+    /// newest held generation is read. A refused read drops that ladder and is logged
+    /// `inventory_ladder_unwarmed{reason}`; the inventory then reads it whole, as before.
+    fn ladder_duty(&mut self) {
+        let mut newest: BTreeMap<PartitionId, Generation> = BTreeMap::new();
+        for (partition, generation) in self.engine.lineages() {
+            let at = newest.entry(partition).or_insert(generation);
+            *at = (*at).max(generation);
+        }
+        self.inventory_ladders
+            .retain(|partition, _| newest.contains_key(partition));
+        let mut budget = WARM_RUNGS;
+        for (partition, generation) in newest {
+            if budget == 0 {
+                break;
+            }
+            match self.inventory_ladder(partition, generation, budget) {
+                Ok((_, ladder, read)) => {
+                    budget = budget.saturating_sub(read);
+                    self.inventory_ladders.insert(partition, ladder);
+                }
+                Err(reason) => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    reason,
+                    "inventory_ladder_unwarmed"
+                ),
+            }
         }
     }
 
@@ -9224,6 +9319,24 @@ impl Host {
             .dormant_rungs(partition, ladder.generation)
             .expect("a full read of the ladder's generation");
         Some(full.get(..ladder.rungs.len()) == Some(ladder.rungs.as_slice()))
+    }
+
+    /// A-R461's proof, for the rows: whether the kept inventory ladder of `partition` equals a
+    /// full read of this engine at the same tip, and that tip. `None` when no ladder is kept.
+    #[cfg(test)]
+    pub(crate) fn inventory_ladder_matches_rebuild(
+        &self,
+        partition: PartitionId,
+    ) -> Option<(bool, Seq)> {
+        let ladder = self.inventory_ladders.get(&partition)?;
+        let full = self
+            .dormant_rungs(partition, ladder.generation)
+            .expect("a full read of the ladder's generation");
+        let tip = ladder.rungs.last().map_or(Seq::ZERO, |(seq, _)| *seq);
+        Some((
+            full.get(..ladder.rungs.len()) == Some(ladder.rungs.as_slice()),
+            tip,
+        ))
     }
 
     /// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired`. The primary here met a record it
@@ -9634,7 +9747,8 @@ impl Host {
     /// A-R337). A link above the base has no producer and is refused. A copy holding a newer
     /// generation of the
     /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
-    /// plan is made, never here.
+    /// plan is made, never here. Its ladder is the kept one, extended through the head
+    /// ([`Self::inventory_ladder`], A-R461), cut at the base.
     fn survivor(
         &mut self,
         partition: PartitionId,
@@ -9681,9 +9795,25 @@ impl Host {
         if head < anchor.base_seq {
             return Err("head_below_base");
         }
-        let ladder = (anchor.base_seq.0..=head.0)
-            .map(|seq| digest_at(Seq(seq)).map(|digest| (Seq(seq), digest)))
-            .collect::<Result<Vec<_>, _>>()?;
+        // A-R461: the kept ladder, extended through the head, not a fresh read of every record.
+        let started = Instant::now();
+        let (how, kept, read) = self.inventory_ladder(partition, generation, u64::MAX)?;
+        let from = usize::try_from(anchor.base_seq.0).map_err(|_| "base_out_of_range")?;
+        let ladder = match kept.rungs.get(from..) {
+            Some(rungs) if rungs.last().map(|(seq, _)| *seq) == Some(head) => rungs.to_vec(),
+            _ => return Err("ladder_short_of_head"),
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            how,
+            read,
+            rungs = ladder.len(),
+            millis = millis(started),
+            "inventory_ladder"
+        );
+        self.inventory_ladders.insert(partition, kept);
         let head_digest = ladder.last().map_or(anchor.base_digest, |(_, d)| *d);
         Ok(SurvivorInventory {
             copy,
