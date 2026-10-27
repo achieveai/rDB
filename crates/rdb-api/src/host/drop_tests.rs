@@ -3931,3 +3931,51 @@ fn m11_a4_a_deposed_owner_answers_no_move_and_no_rebuild() {
     assert!(owner.left_out.is_empty(), "{:?}", owner.left_out);
     trio.mem.stop_failing();
 }
+
+/// Critic A5 (slice-1 review): every `admin rebuild` onto a spare was "noted for the free slot",
+/// even with one slot free and a spare already noted, and the note lives only in this owner's
+/// memory. Now a slot takes one note: with node 3 dropped, rebuild 4 is noted, asking it again
+/// is answered the same (a re-run is safe), and rebuild 5 is refused, naming node 4's note and
+/// what to do. The answer says the note lasts only while node 1 stays the owner.
+/// Cut: `rebuild_spare` counts no notes, red (rebuild 5 is noted too).
+/// Integration (~4 s): b1's drop, three asks.
+#[config_log::retcd_test]
+fn m11_a5_a_free_slot_takes_one_spare_note() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::with_nodes(dir.path(), tuned, 5);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    kill(&trio, 3, &[1, 2, 4, 5]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    let owner = &mut trio.nodes[0].0;
+    for ask in ["rebuild 4", "rebuild 4 again"] {
+        match owner.rebuild_from_app(PartitionId(1), NodeId(4)) {
+            Ok(line) => assert!(
+                line.contains("node 4 is a spare")
+                    && line.contains("while node 1 stays the owner")
+                    && !line.contains("  "),
+                "{ask}: {line}"
+            ),
+            Err(error) => panic!("{ask}: {error:?}"),
+        }
+    }
+    match owner.rebuild_from_app(PartitionId(1), NodeId(5)) {
+        Err(error) => assert!(
+            error.no_mutation
+                && error.detail.contains("(slot)")
+                && error.detail.contains("node 4 is already noted")
+                && error.detail.contains("restart node 4")
+                && !error.detail.contains("  "),
+            "{error:?}"
+        ),
+        Ok(line) => panic!("rebuild 5 with the one free slot noted for node 4: {line}"),
+    }
+    let noted: Vec<u32> = owner.left_out[&PartitionId(1)]
+        .iter()
+        .map(|member| member.node.0)
+        .collect();
+    assert!(!noted.contains(&5), "{noted:?}");
+}

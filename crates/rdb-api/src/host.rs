@@ -2040,6 +2040,10 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// Per partition, the spares `admin rebuild` noted in `left_out` for a free slot (M11
+    /// A-R456, critic A5). A slot takes one note; a note is pending while its node is still left
+    /// out. Memory only: a new owner starts with none, so the operator re-runs the rebuild.
+    spare_notes: BTreeMap<PartitionId, BTreeSet<NodeId>>,
     /// M11: per partition, the copy move this owner was asked for and has not yet answered
     /// done ([`Host::move_step`]). Only the ask: where the move stands is read from the
     /// commit's pinned members each time (D2, A-R452).
@@ -2251,6 +2255,7 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
+            spare_notes: BTreeMap::new(),
             moves: BTreeMap::new(),
             moved: BTreeMap::new(),
             quarantines: BTreeMap::new(),
@@ -7229,10 +7234,16 @@ impl Host {
                 self.node.0, node.0
             ));
         }
-        let left = self
-            .left_out
+        // A spare this owner noted is answered as a spare again: a re-run is safe (critic A5).
+        let noted = self
+            .spare_notes
             .get(&partition)
-            .is_some_and(|left| left.iter().any(|member| member.node == node));
+            .is_some_and(|notes| notes.contains(&node));
+        let left = !noted
+            && self
+                .left_out
+                .get(&partition)
+                .is_some_and(|left| left.iter().any(|member| member.node == node));
         let (tx, answer) = mpsc::channel();
         self.rebuild_asked(partition, node, Duration::ZERO, RebuildReply(tx));
         match answer.try_recv() {
@@ -7243,9 +7254,10 @@ impl Host {
             )),
             Ok(Ok(ready)) => Ok(format!(
                 "rebuild: node {} is a spare; node {} (the owner) noted it for the free slot at \
-                 generation {} (mode A); restart it and the owner takes it back, first as a \
-                 shadow, then regular",
-                node.0, self.node.0, ready.generation.0
+                 generation {} (mode A), while node {} stays the owner (a new owner forgets the \
+                 note: run the rebuild again); restart it and the owner takes it back, first \
+                 as a shadow, then regular",
+                node.0, self.node.0, ready.generation.0, self.node.0
             )),
             Ok(Err(refused)) => Err(crate::db::rebuild_refused(refused)),
             Err(_) => Err(ApiError::host(&format!(
@@ -7276,6 +7288,31 @@ impl Host {
                      onto a spare fills a missing copy; to replace a copy, run `admin move \
                      <source> {}`",
                     partition.0, node.0, node.0
+                ),
+            });
+        }
+        // Critic A5: one note per free slot. A note is pending while its node is left out.
+        let left = self.left_out.get(&partition);
+        let pending: Vec<NodeId> = self
+            .spare_notes
+            .get(&partition)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|noted| *noted != node)
+            .filter(|noted| left.is_some_and(|left| left.iter().any(|m| m.node == *noted)))
+            .collect();
+        if let Some(noted) = pending
+            .first()
+            .filter(|_| members.len() + pending.len() >= rf)
+        {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "partition {}'s free slot is taken: node {} is already noted for it \
+                     (members: {list}); restart node {} and the owner pins it, then run \
+                     `admin move <source> {}` to replace a copy",
+                    partition.0, noted.0, noted.0, node.0
                 ),
             });
         }
@@ -7314,6 +7351,7 @@ impl Host {
             boot,
             role: ReplicaRole::RegularSecondary,
         });
+        self.spare_notes.entry(partition).or_default().insert(node);
         Ok(())
     }
 
