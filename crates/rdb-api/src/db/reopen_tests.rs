@@ -2782,40 +2782,39 @@ fn m11_q4_a_move_resumes_after_the_owner_restarts_with_its_shadow_pinned() {
     let dir = config_testkit::fs::temp_dir();
     let opened = |rt: &tokio::runtime::Runtime, fresh: bool| {
         let links = Arc::new(Links::default());
-        let db = rt
-            .block_on(Db::open_with(
-                DbConfig {
-                    links: Some(Arc::clone(&links)),
-                    ..config(dir.path())
-                },
+        let open = |local: Vec<NodeId>, what: &str| {
+            let mut db_config = DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            };
+            if !local.is_empty() {
+                db_config.local = local;
+            }
+            rt.block_on(Db::open_with(
+                db_config,
                 Arc::clone(&store),
                 rt.handle().clone(),
                 fast(),
             ))
-            .expect("the open of nodes 1 to 3");
+            .expect(what)
+        };
         let ready = |db: &Db| {
             db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
                 .expect("ready");
         };
+        // Critic A3: the reopen's heal leaves out a shadow whose node it does not know yet, so
+        // on the restart node 4's process is up before nodes 1 to 3 open and heal.
         if fresh {
+            let db = open(Vec::new(), "the open of nodes 1 to 3");
             ready(&db);
-        }
-        let spare = rt
-            .block_on(Db::open_with(
-                DbConfig {
-                    local: vec![NodeId(4)],
-                    links: Some(Arc::clone(&links)),
-                    ..config(dir.path())
-                },
-                Arc::clone(&store),
-                rt.handle().clone(),
-                fast(),
-            ))
-            .expect("node 4's process");
-        if !fresh {
+            let spare = open(vec![NodeId(4)], "node 4's process");
+            (db, spare, links)
+        } else {
+            let spare = open(vec![NodeId(4)], "node 4's process");
+            let db = open(Vec::new(), "the open of nodes 1 to 3");
             ready(&db);
+            (db, spare, links)
         }
-        (db, spare, links)
     };
     let (mut db, mut spare, links) = opened(&rt, true);
     put_through_pauses(&db, b"before", b"1", "a put before the move");

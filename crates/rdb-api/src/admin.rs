@@ -1134,8 +1134,8 @@ fn pinned_of(body: &[u8]) -> Result<Option<Vec<RecordMember>>, HealError> {
 
 /// `pinned`, each at the boot `ctx.member_boot` names for its node, once every regular one is
 /// known. Polls until `deadline`: a peer's boot arrives with its handshake. A `Shadow` whose
-/// node is still unknown at the deadline is left out rather than waited for (A-R451): the plan
-/// commits without it, and a re-run of its move starts it again.
+/// node is unknown is left out at once, never waited for (A-R451, critic A3): the plan commits
+/// without it, and a re-run of its move starts it again.
 async fn member_boots(
     ctx: &HealCtx,
     pinned: &[RecordMember],
@@ -1149,9 +1149,9 @@ async fn member_boots(
         let late = tokio::time::Instant::now() >= deadline;
         let missing: Vec<u32> = found
             .iter()
-            .filter(|(member, boot)| {
-                boot.is_none() && !(late && member.role == ReplicaRole::Shadow)
-            })
+            // Critic A3: a shadow serves no write, so the heal never waits on one that is
+            // down; it is left out at once. Copying from a shadow that answers is still fine.
+            .filter(|(member, boot)| boot.is_none() && member.role != ReplicaRole::Shadow)
             .map(|(member, _)| member.node.0)
             .collect();
         if missing.is_empty() {
@@ -4684,5 +4684,58 @@ mod tests {
         .expect("get")
         .record
         .expect("partitions/1")
+    }
+
+    /// Critic A3: a heal waited the whole heal deadline for a pinned shadow that was down
+    /// before it left it out, so a reopen with a dead move target stalled every write for that
+    /// long. Now a shadow with no boot is left out at once; regular members are still waited
+    /// for. Paused tokio time: the wait is read off the virtual clock, so nothing sleeps.
+    /// Cut: shadows waited for until the deadline again, red (10 s waited).
+    #[test]
+    fn m11_a3_a_heal_does_not_wait_on_a_down_shadow() {
+        use rdb_core::contracts::membership::CopyId;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let (owner, _mailbox) = std::sync::mpsc::channel();
+        let within = Duration::from_secs(10);
+        let ctx = HealCtx {
+            store: Arc::new(config_testkit::MemStore::new()),
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within,
+            member_boot: Arc::new(|node| (node != NodeId(4)).then_some(OPEN_2)),
+            owner_node: OWNER,
+        };
+        let pinned = [
+            (1, ReplicaRole::Primary),
+            (2, ReplicaRole::RegularSecondary),
+            (3, ReplicaRole::RegularSecondary),
+            (4, ReplicaRole::Shadow),
+        ]
+        .map(|(node, role)| RecordMember {
+            copy: CopyId(node),
+            node: NodeId(u32::from(node)),
+            role,
+        });
+        let (members, waited) = rt.block_on(async {
+            let start = tokio::time::Instant::now();
+            let members = member_boots(&ctx, &pinned, start + within).await;
+            (members, start.elapsed())
+        });
+        let nodes: Vec<u32> = members
+            .expect("the regular members are known")
+            .iter()
+            .map(|member| member.node.0)
+            .collect();
+        assert_eq!(nodes, vec![1, 2, 3], "the down shadow is left out");
+        assert!(
+            waited < Duration::from_millis(100),
+            "the heal waited {waited:?} for a down shadow"
+        );
     }
 }
