@@ -3525,14 +3525,19 @@ fn m11_r460_a_join_whose_shadow_is_held_pins_it_without_pausing_writes() {
         expired <= 1,
         "{expired} puts refused LEASE_EXPIRED at the join: {refused:?}"
     );
-    // The commit pauses L1 until it re-protects, as at any join; node 4 is not waited on.
+    // The commit pauses L1 until it re-protects, as at any join; node 4 is not waited on. The
+    // pin's commit can land under a queued put as `GENERATION_CHANGED`: `Db` reconciles.
     let pinned = trio.clock.now();
     loop {
         request += 1;
         match trio.ask(put(request)) {
             Answer::Txn { .. } => break,
             Answer::Error { error, .. }
-                if error.no_mutation && error.name() == "PROTECTION_PAUSED" =>
+                if error.no_mutation
+                    && matches!(
+                        error.name().as_str(),
+                        "PROTECTION_PAUSED" | "GENERATION_CHANGED"
+                    ) =>
             {
                 pass(&mut trio, 20);
             }
