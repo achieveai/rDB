@@ -1296,6 +1296,14 @@ struct CopyMove {
     to: NodeId,
     /// Set when the move was given up; the next ask answers it once and clears the entry.
     abandoned: Option<String>,
+    /// A-R457 (a): the move ended by filling a free slot. Its promote found fewer than rf
+    /// regular copies, so the target was pinned regular and the source kept its copy.
+    /// `abandoned` says so, and the next ask answers it with [`MOVE_ENDED`], not with
+    /// [`MOVE_STEP`]'s claim that the move did nothing.
+    ///
+    /// [`MOVE_ENDED`]: crate::db::error::MOVE_ENDED
+    /// [`MOVE_STEP`]: crate::db::error::MOVE_STEP
+    filled: bool,
 }
 
 /// #65: an `admin rebuild` the owner answers once the commit that leaves `node` out lands.
@@ -6017,12 +6025,22 @@ impl Host {
         let mut ours = asked
             .as_ref()
             .is_some_and(|mv| (mv.from, mv.to) == (from, to));
-        if let Some(why) = asked
+        if let Some((why, filled)) = asked
             .as_ref()
             .filter(|_| ours)
-            .and_then(|mv| mv.abandoned.clone())
+            .and_then(|mv| mv.abandoned.clone().map(|why| (why, mv.filled)))
         {
             self.moves.remove(&partition);
+            if filled {
+                // A-R457 (a): the move pinned the target regular in a free slot and kept the
+                // source; that is what it did, so the answer does not say it did nothing.
+                let mut error = ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!("{why}; {}", crate::db::error::MOVE_ENDED),
+                );
+                error.no_mutation = true;
+                return Err(error);
+            }
             // T9: once the give-up has committed and the target is reachable again, the re-run
             // starts the move afresh instead of repeating why the last one was given up.
             let back = role(to).is_none()
@@ -6098,8 +6116,29 @@ impl Host {
             _ => {}
         }
         let shadow = role(to) == Some(ReplicaRole::Shadow);
+        let regular = members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        let rf = crate::admin::members().len();
+        // A-R457 (a): below rf regular copies the promote fills the free slot and keeps the
+        // source, so the line says that instead of "leaving node N out".
+        let fills = regular < rf;
         let progress = |replanning: bool| {
             let line = match (shadow, replanning) {
+                (true, _) if fills => format!(
+                    "moving: node {} catching up as a shadow; only {regular} of {rf} copies are \
+                     regular (members: {}), so once it is caught up node {} fills the free slot \
+                     and node {} keeps its copy; run `admin move {} {}` again afterwards to \
+                     move node {}'s copy",
+                    to.0,
+                    member_list(&members),
+                    to.0,
+                    from.0,
+                    from.0,
+                    to.0,
+                    from.0
+                ),
                 (false, _) => format!("moving: node {} joining as a shadow", to.0),
                 (true, false) => format!("moving: node {} catching up as a shadow", to.0),
                 (true, true) => format!(
@@ -6157,6 +6196,9 @@ impl Host {
                 to.0, self.node.0, to.0, self.peer_drop_after_millis, to.0, from.0
             ));
         }
+        if ours && shadow && fills {
+            return progress(false);
+        }
         if !self.linked(to) || self.links.boot_of(to).is_none() {
             return wait(format!(
                 "node {} is not reachable from node {} (the owner): start it (`lr start {}`), or \
@@ -6164,11 +6206,6 @@ impl Host {
                 to.0, self.node.0, to.0
             ));
         }
-        let regular = members
-            .iter()
-            .filter(|member| member.role != ReplicaRole::Shadow)
-            .count();
-        let rf = crate::admin::members().len();
         if regular < rf && members.len() < rf {
             // A-R456: a copy is missing and a slot is free; the way back is a rebuild onto a
             // spare, which `to` is.
@@ -6206,6 +6243,7 @@ impl Host {
                 from,
                 to,
                 abandoned: None,
+                filled: false,
             },
         );
         if shadow {
@@ -6287,8 +6325,38 @@ impl Host {
         let phase = match (role(mv.from), role(mv.to)) {
             (None, Some(ReplicaRole::RegularSecondary)) => "moved",
             (_, Some(ReplicaRole::Shadow)) => "shadow_pinned",
+            (Some(_), Some(ReplicaRole::RegularSecondary)) if mv.abandoned.is_none() => "filled",
             _ => "other",
         };
+        if phase == "filled" {
+            // A-R457 (a): the promote found fewer than rf regular copies, so `shadow_duty` kept
+            // the source: the target filled the free slot and the move ends here.
+            let why = format!(
+                "the move of node {} to node {} ended without leaving node {} out: when node {} \
+                 caught up, too few copies were regular, so node {} filled the free slot at \
+                 generation {} and node {} kept its copy (members: {}). Run `admin move {} {}` \
+                 again to move node {}'s copy",
+                mv.from.0,
+                mv.to.0,
+                mv.from.0,
+                mv.to.0,
+                mv.to.0,
+                generation.0,
+                mv.from.0,
+                member_list(members),
+                mv.from.0,
+                mv.to.0,
+                mv.from.0
+            );
+            self.moves.insert(
+                partition,
+                CopyMove {
+                    abandoned: Some(why),
+                    filled: true,
+                    ..mv.clone()
+                },
+            );
+        }
         if phase == "moved" {
             self.moved.insert(partition, (mv.from, mv.to));
             // T3 (critic M4): the copy moved away; the source is a spare now, not a member a
@@ -6550,7 +6618,11 @@ impl Host {
         if moving.is_none() && regular >= crate::admin::members().len() {
             return;
         }
-        let drop = moving.filter(|from| members.iter().any(|member| member.node == *from));
+        // A-R457 (a): below rf regular copies the shadow fills the free slot and the source
+        // keeps its copy; dropping it would leave fewer copies than were reachable.
+        let rf = crate::admin::members().len();
+        let drop = moving
+            .filter(|from| regular >= rf && members.iter().any(|member| member.node == *from));
         let Some(primary) = self.replication.primary(self.node, partition) else {
             return;
         };

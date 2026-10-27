@@ -3334,6 +3334,7 @@ fn m11_d1_a_move_onto_a_left_out_node_pins_it_once() {
             from: NodeId(2),
             to: NodeId(3),
             abandoned: None,
+            filled: false,
         },
     );
     trio.links.heal_all();
@@ -3880,6 +3881,7 @@ fn m11_t3_a_moved_off_source_is_not_added_back_by_its_restart() {
             from: NodeId(3),
             to: NodeId(2),
             abandoned: None,
+            filled: false,
         },
     );
     dropped_three(&mut trio, before);
@@ -3978,4 +3980,81 @@ fn m11_a5_a_free_slot_takes_one_spare_note() {
         .map(|member| member.node.0)
         .collect();
     assert!(!noted.contains(&5), "{noted:?}");
+}
+
+/// Critic M1 (a), ruling A-R457: a move whose shadow caught up after a regular copy was dropped
+/// left the source out too, so the partition went from {1, 3, 4 shadow} to two copies, {1, 4},
+/// with node 3's full copy reachable. And the re-run meanwhile said the move "did nothing
+/// more" while the owner went on. Here move 3 4 pins node 4 as a shadow, node 1's stream to it
+/// is cut so it cannot catch up, node 2 dies and is dropped. The re-run says node 3 keeps its
+/// copy; once node 4 catches up it is made regular with node 3 kept: nodes 1, 3 and 4. The
+/// next re-run says what happened.
+/// Cut: `shadow_duty` drops the source whatever the regular count, red (members 1 and 4).
+/// Integration (~6 s): the join, b1's drop of node 2, the catch-up, the promote.
+#[config_log::retcd_test]
+fn m11_m1_a_a_shadow_below_three_regular_copies_fills_the_slot_and_keeps_the_source() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    // Cut node 1's stream to node 4 in the step that pins it, before it can catch up. The link
+    // stays up, so node 4 is still reachable and its shadow is not given up.
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            trio.links.drop_direction(NodeId(1), NodeId(4));
+        }
+        pinned.then_some(())
+    });
+    // The pin's commit lands under a queued put as GENERATION_CHANGED: let it end first.
+    trio.until("the pin's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.ready();
+    kill(&trio, 2, &[1, 3, 4]);
+    let (mut request, _) = put_until_paused(&mut trio, 100);
+    let (_, _, members) = trio.until("node 1 committed without node 2", |trio| {
+        commit_of(trio).filter(|(generation, _, members)| {
+            *generation > before && !members.contains(&2)
+        })
+    });
+    assert_eq!(members, vec![1, 3, 4], "node 2 dropped, node 4 still a shadow");
+    assert_eq!(pinned_role(&trio, 4), Some(ReplicaRole::Shadow));
+    trio.until("the drop's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    match trio.nodes[0].0.move_step(PartitionId(1), NodeId(3), NodeId(4)) {
+        Ok(answer) => assert!(
+            !answer.done
+                && answer.line.contains("node 3 keeps its copy")
+                && !answer.line.contains("  "),
+            "{answer:?}"
+        ),
+        Err(error) => panic!("move 3 4 at two regular copies: {error:?}"),
+    }
+    trio.links.heal(NodeId(1), NodeId(4));
+    let (_, _, members) = trio.until("node 4 regular", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::RegularSecondary))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert_eq!(members, vec![1, 3, 4], "node 3 kept its copy");
+    match trio.ask(move_call(200, 3, 4)) {
+        Answer::Error { error, .. } => assert!(
+            error.detail.contains("node 3 kept its copy")
+                && !error.detail.contains("did nothing more than this says")
+                && !error.detail.contains("  "),
+            "{error:?}"
+        ),
+        other => panic!("move 3 4 after the fill: {other:?}"),
+    }
+    trio.ready();
+    request += 1;
+    match trio.ask(put(request)) {
+        Answer::Txn { .. } => {}
+        other => panic!("a put after the fill: {other:?}"),
+    }
 }

@@ -41,6 +41,10 @@ pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this sa
 /// The tail every `admin move` refusal ends with (M11): its detail names the step.
 pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
 
+/// The tail of a move's answer when the move ended by filling a free slot (A-R457 (a)): its
+/// detail says what the move did and the step to move the source's copy.
+pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
+
 /// The tail of [`super::ReadyError::Quarantined`]'s text, which a refusal carries while the
 /// owner's recovery is quarantined ([`super::Db::explained`]). It already says what to do, which
 /// a "wait a few seconds and try again" step would contradict (review-s2 F-003).
@@ -259,6 +263,7 @@ impl ApiError {
             || self.detail.ends_with(RUN_AGAIN)
             || self.detail.ends_with(REBUILD_STEP)
             || self.detail.ends_with(MOVE_STEP)
+            || self.detail.ends_with(MOVE_ENDED)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
         {
