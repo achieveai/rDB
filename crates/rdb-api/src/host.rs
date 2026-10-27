@@ -6138,14 +6138,15 @@ impl Host {
                 (true, _) if fills => format!(
                     "moving: node {} catching up as a shadow; only {regular} of {rf} copies are \
                      regular (members: {}), so once it is caught up node {} fills the free slot \
-                     and node {} keeps its copy; run `admin move {} {}` again afterwards to \
-                     move node {}'s copy",
+                     and node {} keeps its copy; node {} then holds a regular copy too, so to \
+                     move node {}'s copy afterwards, name a node with no copy: `admin move {} \
+                     <node with no copy>`",
                     to.0,
                     member_list(&members),
                     to.0,
                     from.0,
-                    from.0,
                     to.0,
+                    from.0,
                     from.0
                 ),
                 (false, _) => format!("moving: node {} joining as a shadow", to.0),
@@ -6343,8 +6344,8 @@ impl Host {
             let why = format!(
                 "the move of node {} to node {} ended without leaving node {} out: when node {} \
                  caught up, too few copies were regular, so node {} filled the free slot at \
-                 generation {} and node {} kept its copy (members: {}). Run `admin move {} {}` \
-                 again to move node {}'s copy",
+                 generation {} and node {} kept its copy (members: {}). To move node {}'s copy \
+                 now, name a node with no copy: `admin move {} <node with no copy>`",
                 mv.from.0,
                 mv.to.0,
                 mv.from.0,
@@ -6354,7 +6355,6 @@ impl Host {
                 mv.from.0,
                 member_list(members),
                 mv.from.0,
-                mv.to.0,
                 mv.from.0
             );
             self.moves.insert(

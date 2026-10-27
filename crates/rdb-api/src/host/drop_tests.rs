@@ -4036,6 +4036,7 @@ fn m11_m1_a_a_shadow_below_three_regular_copies_fills_the_slot_and_keeps_the_sou
         Ok(answer) => assert!(
             !answer.done
                 && answer.line.contains("node 3 keeps its copy")
+                && !answer.line.contains("`admin move 3 4`")
                 && !answer.line.contains("  "),
             "{answer:?}"
         ),
@@ -4051,6 +4052,8 @@ fn m11_m1_a_a_shadow_below_three_regular_copies_fills_the_slot_and_keeps_the_sou
     match trio.ask(move_call(200, 3, 4)) {
         Answer::Error { error, .. } => assert!(
             error.detail.contains("node 3 kept its copy")
+                && error.detail.contains("`admin move 3 <node with no copy>`")
+                && !error.detail.contains("`admin move 3 4`")
                 && !error.detail.contains("did nothing more than this says")
                 && !error.detail.contains("  "),
             "{error:?}"
