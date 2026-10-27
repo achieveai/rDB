@@ -4457,6 +4457,7 @@ fn m11_m2_c_a_move_whose_shadow_cannot_keep_up_is_given_up_at_its_deadline() {
             error
                 .detail
                 .contains("writes are arriving faster than the copy catches up")
+                && error.detail.contains("or its link from node 1 is slow")
                 && error.detail.contains("Node 3 keeps its copy")
                 && error
                     .detail

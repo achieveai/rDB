@@ -6766,12 +6766,14 @@ impl Host {
         let why = format!(
             "the move of node {} to node {} was given up: after {} s node {} was still {behind} \
              records behind node {}'s head, and it is promoted only within {PROMOTE_LAG_RECORDS}: \
-             writes are arriving faster than the copy catches up. Node {} keeps its copy. Run \
-             the move again when the write load drops",
+             writes are arriving faster than the copy catches up, or its link from node {} is \
+             slow. Node {} keeps its copy. Run the move again when the write load drops or the \
+             link recovers",
             mv.from.0,
             to.0,
             waited_ms / 1_000,
             to.0,
+            self.node.0,
             self.node.0,
             mv.from.0
         );
