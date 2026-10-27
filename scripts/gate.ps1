@@ -55,7 +55,7 @@
 # parameters, and then cargo's `-p` is refused as ambiguous (-ProgressAction, -PipelineVariable).
 # Unbound arguments land in $args instead, in the order given.
 param(
-    [ValidateSet('fmt', 'deps', 'drift', 'purity', 'lint', 'test', 'all')]
+    [ValidateSet('fmt', 'deps', 'drift', 'purity', 'lint', 'test', 'perf', 'all')]
     [string]$Stage = 'all'
 )
 $CargoArgs = [string[]]$args
@@ -168,6 +168,14 @@ if ($Stage -in 'test', 'all') {
     # Reached only when cargo passed. Every test process has exited by now, so no file under
     # the root is open, and this takes what a dropped `Cluster` could not remove before its
     # process ended. A failing run keeps its data for inspection.
+    if ($gateOwnsData -and (Test-Path $env:RETCD_TEST_DATA_DIR)) { Remove-Item -Recurse -Force $env:RETCD_TEST_DATA_DIR }
+}
+
+# The wall-clock perf rows, alone and one thread at a time; not part of 'all'. Same rule as
+# gate.sh's perf stage.
+if ($Stage -eq 'perf') {
+    Write-Host '== perf'
+    Invoke-Cargo (@('test', '-p', 'rdb-api', '--lib', '--no-fail-fast') + $CargoArgs + @('--', '--ignored', '--test-threads=1'))
     if ($gateOwnsData -and (Test-Path $env:RETCD_TEST_DATA_DIR)) { Remove-Item -Recurse -Force $env:RETCD_TEST_DATA_DIR }
 }
 

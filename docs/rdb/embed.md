@@ -581,6 +581,16 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   the head, so the owner gives the move up and the old copy stays. `admin move` then says
   "writes are arriving faster than the copy catches up". Run the move again when the load
   drops. Faster, batched catch-up is a follow-up for workstream C (snapshot transfer).
+- **A silent standby that was already kept can pause writes for up to 2 s at a join.** A
+  move's new copy, or a standby just added, is never waited on: if it cannot be reached, the
+  join goes on without it (A-R460). A standby that was already in the partition, for example
+  a node that restarted and came back as a standby, is still asked, because its answer is how
+  a copy that went its own way is caught (B3). If it goes silent, the join waits for it until
+  its 2 s window ends, and writes pause until then.
+- **Each node keeps about 40 bytes per record of each partition it holds in memory.** That is
+  about 40 MB for 1 million records, on every node. It is the checksum list a join reads, kept
+  up to date so a join pauses writes for well under 0.3 s at 20,000 records instead of reading
+  every record (A-R461). It is not yet trimmed or bounded.
 - **A three-process database runs on one machine only, for now.** It is formed once, in one
   process, on one machine. Each node process then opens its own `nodes/<n>` in that shared
   folder. Forming a new database over the network is not supported yet. A node process started

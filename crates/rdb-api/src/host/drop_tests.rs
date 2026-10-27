@@ -126,6 +126,42 @@ fn pass(trio: &mut Trio, millis: u64) {
     });
 }
 
+/// Lands `n` puts, sent up to 500 at a time and then answered, so their records commit in
+/// batches; `request` is the last id used. A refusal that wrote nothing (`no_mutation`, such as
+/// `PROTECTION_PAUSED` or `DEADLINE_BEFORE_ADMISSION` on a starved host) is sent again under a
+/// fresh id after a short pause, as a client would; anything else fails the row, and so does
+/// not landing them all within the patience (lead ruling, 4-CPU cap).
+fn land_retrying(trio: &mut Trio, request: &mut u64, n: u64) {
+    let deadline = Instant::now() + test_patience(Duration::from_secs(120));
+    let mut left = n;
+    while left > 0 {
+        let answers: Vec<_> = (0..left.min(500))
+            .map(|_| {
+                *request += 1;
+                (*request, trio.call(put(*request)))
+            })
+            .collect();
+        let mut refused = 0;
+        for (sent, answer) in answers {
+            match trio.answer(&answer) {
+                Answer::Txn { .. } => left -= 1,
+                Answer::Error { error, .. } if error.no_mutation => {
+                    refused += 1;
+                    tracing::debug!(sent, error = %error.name(), "land_retrying_refused");
+                }
+                other => panic!("put {sent}: {other:?}"),
+            }
+        }
+        if refused > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "{left} puts still unlanded at the patience; last batch refused {refused}"
+            );
+            pass(trio, 20);
+        }
+    }
+}
+
 /// Bootstrapped, admitting, and committed with all three.
 fn started(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> (Trio, Generation) {
     let mut trio = Trio::new(dir, tune);
@@ -3516,13 +3552,15 @@ fn m11_r460_a_join_whose_shadow_is_held_pins_it_without_pausing_writes() {
         "the held shadow was pinned {waited} ms after the ask; refused: {refused:?}"
     );
     // Any join's revoke refuses the put it lands under `LEASE_EXPIRED`, changing nothing: with
-    // node 4 answering, the same row is refused once. Held, it was refused 26 times.
+    // node 4 answering (the control), the same row is refused once. The defect refused 15 on
+    // the tester's walk and 26 here. The bound is 3, so a starved host's extra one or two pass
+    // and the defect does not (lead ruling, 4-CPU cap).
     let expired = refused
         .iter()
         .filter(|name| *name == "LEASE_EXPIRED")
         .count();
     assert!(
-        expired <= 1,
+        expired <= 3,
         "{expired} puts refused LEASE_EXPIRED at the join: {refused:?}"
     );
     // The commit pauses L1 until it re-protects, as at any join; node 4 is not waited on. The
@@ -4321,8 +4359,17 @@ fn m11_m2_a_promote_waits_until_the_shadow_is_near_the_head() {
         .filter(|line| line["phase"] == "moved")
         .collect();
     assert_eq!(moved.len(), 1, "{moved:?}");
+    // Reported as wall time from the promote to its commit (`wall_ms`). The bound stays on the
+    // re-plan's `waited_ms`, on the trio's clock, so the row is deterministic under the 4-CPU
+    // cap; the wall bound at scale is `m11_m2_b`'s, in the `perf` stage.
     let paused = moved[0]["waited_ms"].as_u64().expect("waited_ms");
-    tracing::info!(paused_ms = paused, behind, "m11_m2_promote_pause");
+    let wall = wall_millis(&moved[0]) - wall_millis(&promotes[0]);
+    tracing::info!(
+        wall_ms = wall,
+        waited_ms = paused,
+        behind,
+        "m11_m2_promote_pause"
+    );
     assert!(paused < 500, "writes paused {paused} ms at the promote");
 }
 
@@ -4353,33 +4400,14 @@ fn wall_millis(line: &serde_json::Value) -> i64 {
 /// Cut: `dormant_ladder` drops the kept ladder (a full read at the promote), red (~460 ms).
 /// Integration (~2.5 min): 20,300 puts, the join, a one-record-a-trip catch-up, the promote.
 #[config_log::retcd_test]
+#[ignore = "perf: run alone, scripts/gate.sh perf"]
 fn m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms() {
     const METHOD: &str = "m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms";
     let dir = config_testkit::fs::temp_dir();
     let mut trio = started_four(dir.path());
     let mut request = 0;
-    // Puts are sent 500 at a time and then answered, so their records commit in batches.
-    let mut land = |trio: &mut Trio, n: u64| {
-        let mut left = n;
-        while left > 0 {
-            let chunk = left.min(500);
-            left -= chunk;
-            let answers: Vec<_> = (0..chunk)
-                .map(|_| {
-                    request += 1;
-                    (request, trio.call(put(request)))
-                })
-                .collect();
-            for (sent, answer) in answers {
-                match trio.answer(&answer) {
-                    Answer::Txn { .. } => {}
-                    other => panic!("put {sent}: {other:?}"),
-                }
-            }
-        }
-    };
     let started = Instant::now();
-    land(&mut trio, 20_000);
+    land_retrying(&mut trio, &mut request, 20_000);
     tracing::info!(
         millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "m11_m2_b_preloaded"
@@ -4399,7 +4427,7 @@ fn m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms() {
         (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
     });
     trio.ready();
-    land(&mut trio, 300);
+    land_retrying(&mut trio, &mut request, 300);
     trio.links.heal(NodeId(1), NodeId(4));
     // The catch-up walks 20,300 records one a trip: longer than `until`'s patience. Once the
     // shadow is near the head, a writer keeps one put in flight, as the manual walk's did, so
@@ -4489,26 +4517,13 @@ fn m11_m2_b_a_promote_over_20k_records_pauses_under_300_ms() {
 /// Cut: `survivor` drops the kept ladder before it reads (a full read at the join), red (1155 ms).
 /// Integration (~2 min): 20,000 puts, the warm, the join.
 #[config_log::retcd_test]
+#[ignore = "perf: run alone, scripts/gate.sh perf"]
 fn m11_r461_a_join_over_20k_records_pauses_under_300_ms() {
     const METHOD: &str = "m11_r461_a_join_over_20k_records_pauses_under_300_ms";
     let dir = config_testkit::fs::temp_dir();
     let mut trio = started_four(dir.path());
     let mut request = 0;
-    // Puts are sent 500 at a time and then answered, so their records commit in batches.
-    while request < 20_000 {
-        let answers: Vec<_> = (0..500)
-            .map(|_| {
-                request += 1;
-                (request, trio.call(put(request)))
-            })
-            .collect();
-        for (sent, answer) in answers {
-            match trio.answer(&answer) {
-                Answer::Txn { .. } => {}
-                other => panic!("put {sent}: {other:?}"),
-            }
-        }
-    }
+    land_retrying(&mut trio, &mut request, 20_000);
     let head = |trio: &Trio| {
         trio.nodes[0]
             .0

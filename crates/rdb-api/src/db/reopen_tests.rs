@@ -2645,10 +2645,25 @@ fn m11_t6_a_reopen_pins_the_members_the_record_names_not_nodes_1_to_3() {
     );
 }
 
-/// The bytes `object` reads back as, `None` when absent (critic M3: `is_ok` cannot tell).
+/// The bytes `object` reads back as, `None` when absent (critic M3: `is_ok` cannot tell). A read
+/// that lands under a re-plan's commit is refused `GENERATION_CHANGED` (`Reconcile`, nothing
+/// done), and an app reconciles by reading again: so does this, within the patience. Seen in
+/// gate9 under the 4-CPU cap, `m11_q4`'s read straight after the resumed move's promote.
 fn read_bytes(db: &Db, object: &[u8]) -> Option<Vec<u8>> {
-    let read = db.get(object).expect("the read is answered");
-    read.value.map(|(_, bytes)| bytes.to_vec())
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        match db.get(object) {
+            Ok(read) => return read.value.map(|(_, bytes)| bytes.to_vec()),
+            Err(refused)
+                if refused.kind == ErrorKind::GenerationChanged
+                    && refused.no_mutation
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(refused) => panic!("the read is answered: {refused:?}"),
+        }
+    }
 }
 
 /// The role `partitions/1` pins `node` as, if it pins it.
