@@ -80,8 +80,17 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
             "pre{i}"
         );
     }
+    /// Sets the writer's `stop` when dropped, so a panic in the scope below ends the writer
+    /// instead of leaving the scope waiting on it for ever (as the d10 row's, Revobot #73).
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let stop = AtomicBool::new(false);
     let (rebuilt, acked, longest) = std::thread::scope(|scope| {
+        let stopping = StopOnDrop(&stop);
         let writer = scope.spawn(|| {
             let mut acked = Vec::new();
             let mut longest = Duration::ZERO;
@@ -97,7 +106,7 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
             (acked, longest)
         });
         let rebuilt = db.rebuild_with(NodeId(3), true);
-        stop.store(true, Ordering::Relaxed);
+        drop(stopping);
         let (acked, longest) = writer.join().expect("the writer");
         (rebuilt, acked, longest)
     });
