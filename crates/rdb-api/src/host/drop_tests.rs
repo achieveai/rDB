@@ -4136,3 +4136,66 @@ fn m11_m1_b_a_dead_shadow_in_a_free_slot_is_given_up_after_the_drop_clock() {
         "a rebuild of node 4 is answered again"
     );
 }
+
+/// Critic M2 (A-R442): the promote's barrier replays what the shadow lacks inside the fence, so
+/// a shadow promoted as soon as it passed the pin's cutoff paused writes for every record that
+/// landed while it caught up. Here 300 records are preloaded, the move pins node 4, node 1's
+/// stream to it is cut while 300 more land, and then it catches up. The owner promotes it only
+/// within [`PROMOTE_LAG_RECORDS`] of the head, and the pause at promote is measured: the
+/// promote re-plan's `waited_ms`, logged and held under 500 ms.
+/// Cut: no lag bound (promote at the cutoff), red (promoted ~300 records behind the head).
+/// Integration (~6 s): 600 puts, the join, a one-record-a-trip catch-up, the promote.
+#[config_log::retcd_test]
+fn m11_m2_a_promote_waits_until_the_shadow_is_near_the_head() {
+    const METHOD: &str = "m11_m2_a_promote_waits_until_the_shadow_is_near_the_head";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let mut request = 0;
+    let mut land = |trio: &mut Trio, n: u64| {
+        for _ in 0..n {
+            request += 1;
+            match trio.ask(put(request)) {
+                Answer::Txn { .. } => {}
+                other => panic!("put {request}: {other:?}"),
+            }
+        }
+    };
+    land(&mut trio, 300);
+    match trio.ask(move_call(10_000, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            trio.links.drop_direction(NodeId(1), NodeId(4));
+        }
+        pinned.then_some(())
+    });
+    trio.until("the pin's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.ready();
+    land(&mut trio, 300);
+    trio.links.heal(NodeId(1), NodeId(4));
+    let (_, _, members) = trio.until("node 4 regular and node 3 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&3))
+    });
+    assert_eq!(members, vec![1, 2, 4]);
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "{promotes:?}");
+    let behind =
+        promotes[0]["head"].as_u64().expect("head") - promotes[0]["acked"].as_u64().expect("acked");
+    assert!(
+        behind <= PROMOTE_LAG_RECORDS,
+        "promoted {behind} records behind the head: {promotes:?}"
+    );
+    let moved: Vec<_> = logged!(METHOD, "move_committed")
+        .into_iter()
+        .filter(|line| line["phase"] == "moved")
+        .collect();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    let paused = moved[0]["waited_ms"].as_u64().expect("waited_ms");
+    tracing::info!(paused_ms = paused, behind, "m11_m2_promote_pause");
+    assert!(paused < 500, "writes paused {paused} ms at the promote");
+}

@@ -215,6 +215,15 @@ pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 /// `PeerBooted` instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
 pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
 
+/// Critic M2 (A-R442): how many records behind the primary's head a shadow may be when the owner
+/// promotes it. The promote's barrier replays the rest inside the fence, where writes pause, so
+/// this bounds the pause at promote: the catch-up cursor sends one record a round trip, and in the
+/// host rows 123 records behind paused writes 717 ms; at 32 the pause measured 133-193 ms
+/// (2026-10-26), under the 0.5 s goal with the re-plan's own cost. A shadow that keeps up
+/// trails by the records in flight, far below this; one that trails more is still catching up,
+/// and waits. If writes land faster than it catches up, it waits until they slow.
+pub const PROMOTE_LAG_RECORDS: u64 = 32;
+
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
 const DROP_CHECK_EVERY_MILLIS: u64 = 200;
 
@@ -6630,7 +6639,12 @@ impl Host {
             .peer(shadow.copy)
             .map_or(0, |peer| peer.progress.buffered_applied.0);
         let cutoff = committed.selected.cutoff_seq;
-        if acked < cutoff.0 {
+        // Critic M2 (A-R442): the promote's barrier replays what the shadow still lacks inside
+        // the fence, so writes pause for as long as that takes. Promote only once the shadow is
+        // within PROMOTE_LAG_RECORDS of the head: the pause is bounded by that, not by how
+        // many writes landed while it caught up.
+        let head = primary.tracker().head().0;
+        if acked < cutoff.0 || head.saturating_sub(acked) > PROMOTE_LAG_RECORDS {
             return;
         }
         let epoch = committed.selected.root.owner_epoch;
@@ -6642,6 +6656,7 @@ impl Host {
             copy = shadow.copy.0,
             acked,
             cutoff = cutoff.0,
+            head,
             dropped = ?drop.map(|node| node.0),
             "shadow_promote"
         );
