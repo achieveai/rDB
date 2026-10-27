@@ -6427,8 +6427,8 @@ impl Host {
         true
     }
 
-    /// M11 T4: a move's shadow (one pinned beside every rf3 regular copy) this owner has had no
-    /// link to for `peer_drop_after_millis` is given up: the owner re-plans without it, as
+    /// M11 T4, A-R457 (b): a shadow this owner has had no link to for `peer_drop_after_millis`
+    /// is given up, whatever the regular count: the owner re-plans without it, as
     /// [`Self::move_blocked`] does, and the source keeps its copy. A move this owner holds for it
     /// is marked given up, so its next ask says why. Without the bound a dead target held the
     /// pin, and every other move, for good. Logged `move_shadow_unreachable` when the clock
@@ -6443,11 +6443,10 @@ impl Host {
                 let owner = members
                     .iter()
                     .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
-                let regular = members
-                    .iter()
-                    .filter(|member| member.role != ReplicaRole::Shadow)
-                    .count();
-                if !owner || regular < crate::admin::members().len() {
+                // A-R457 (b): whatever the regular count. A shadow in a free slot (a spare's
+                // rebuild, a re-add) that died for good held that slot, and so every rebuild
+                // and move, until it came back.
+                if !owner {
                     return None;
                 }
                 members
@@ -7286,6 +7285,19 @@ impl Host {
                 .find(|member| member.role == ReplicaRole::Primary)
                 .map(|member| member.node);
             self.answers_as_owner(partition, owner)?;
+            // A-R457 (c): a shadow is given up by the drop clock alone, not by a write.
+            if members
+                .iter()
+                .any(|member| member.node == node && member.role == ReplicaRole::Shadow)
+            {
+                return process(format!(
+                    "node {} is pinned as a shadow, catching up into a free slot: wait until it \
+                     is regular (`admin status` shows it). If node {} is lost, stop it (`lr stop \
+                     {}`): the owner gives up a shadow it cannot reach after {} ms, with no write \
+                     needed; then rebuild it; nothing was done",
+                    node.0, node.0, node.0, self.peer_drop_after_millis
+                ));
+            }
             if members.iter().any(|member| member.node == node) {
                 return process(format!(
                     "node {} is still pinned; under --nodes the owner cannot be asked to drop it: \

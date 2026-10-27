@@ -4064,3 +4064,75 @@ fn m11_m1_a_a_shadow_below_three_regular_copies_fills_the_slot_and_keeps_the_sou
         other => panic!("a put after the fill: {other:?}"),
     }
 }
+
+/// Critic M1 (b), ruling A-R457: a shadow in a free slot that died for good held the slot. The
+/// give-up clock ran only beside rf regular copies, so at two copies a dead spare's shadow was
+/// never left out, and every rebuild and move was refused until it came back. Here node 3 is
+/// dropped, spare node 4 is rebuilt into the free slot, and every link to node 4 is held in the
+/// step that pins it. Past the drop clock the owner leaves node 4 out: nodes 1 and 2, a put
+/// lands, and a rebuild of node 4 is answered again. While pinned, a rebuild of node 4 says the
+/// owner gives a shadow up by the drop clock, with no write needed (A-R457 (c)).
+/// Cut: `shadow_give_up_duty` skips below rf regular copies again, red (node 4 never left out).
+/// Integration (~5 s): b1's drop, the re-add, the drop clock, the give-up re-plan.
+#[config_log::retcd_test]
+fn m11_m1_b_a_dead_shadow_in_a_free_slot_is_given_up_after_the_drop_clock() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    kill(&trio, 3, &[1, 2, 4]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    let (tx, rx) = mpsc::channel();
+    trio.nodes[0].0.rebuild_asked(
+        PartitionId(1),
+        NodeId(4),
+        Duration::from_secs(10),
+        RebuildReply(tx),
+    );
+    assert!(matches!(rx.try_recv(), Ok(Ok(_))), "rebuild 4 onto a spare");
+    restart(&mut trio, dir.path(), 4);
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            for other in [1, 2, 3] {
+                trio.links.hold(NodeId(other), NodeId(4));
+            }
+        }
+        pinned.then_some(())
+    });
+    // A-R457 (c): the next step for a pinned shadow names the drop clock, not a write.
+    match trio.nodes[0].0.rebuild_from_app(PartitionId(1), NodeId(4)) {
+        Err(error) => assert!(
+            error.detail.contains("pinned as a shadow")
+                && error.detail.contains("no write needed")
+                && !error.detail.contains("  "),
+            "{error:?}"
+        ),
+        Ok(line) => panic!("rebuild 4 while pinned as a shadow: {line}"),
+    }
+    let (_, _, members) = trio.until("node 1 left node 4 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&4))
+    });
+    assert_eq!(
+        members,
+        vec![1, 2],
+        "the dead shadow no longer holds the slot"
+    );
+    trio.ready();
+    match trio.ask(put(5_001)) {
+        Answer::Txn { .. } => {}
+        other => panic!("a put after the give-up: {other:?}"),
+    }
+    let (tx, rx) = mpsc::channel();
+    trio.nodes[0].0.rebuild_asked(
+        PartitionId(1),
+        NodeId(4),
+        Duration::from_secs(10),
+        RebuildReply(tx),
+    );
+    assert!(
+        matches!(rx.try_recv(), Ok(Ok(_))),
+        "a rebuild of node 4 is answered again"
+    );
+}

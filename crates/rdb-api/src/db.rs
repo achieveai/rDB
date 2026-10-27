@@ -3472,6 +3472,21 @@ impl Db {
                 ),
             );
         }
+        // A-R457 (c): a shadow is given up by the owner's drop clock alone, not by a write.
+        if status.pinned.iter().any(|member| {
+            member.node == node && member.role == rdb_core::contracts::ids::ReplicaRole::Shadow
+        }) {
+            return refuse(
+                "process",
+                format!(
+                    "node {} is pinned as a shadow, catching up into a free slot: wait until it \
+                     is regular (`admin status` shows it). If node {} is lost, stop it (`lr stop \
+                     {}`): the owner gives up a shadow it cannot reach after about 10 s, with no \
+                     write needed; then rebuild it; nothing was done",
+                    node.0, node.0, node.0
+                ),
+            );
+        }
         if status.pinned.iter().any(|member| member.node == node) {
             return refuse(
                 "process",
