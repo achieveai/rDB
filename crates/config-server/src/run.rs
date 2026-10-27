@@ -317,10 +317,11 @@ where
             BACKUP_BUILD_DEADLINE.as_secs()
         ),
     };
-    // Set once an install replaced a build this backup started, so the deadline says so.
+    // Set once an install replaced or pre-empted a build this backup started, so the deadline
+    // says so.
     let mut superseded = false;
     'capture: loop {
-        let before = loop {
+        let (before, current_before) = loop {
             while in_flight() > 0 {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(timed_out("a snapshot build already running did not finish"));
@@ -328,8 +329,9 @@ where
                 tokio::time::sleep(poll).await;
             }
             let before = built().map(|m| id_of(&m));
+            let current_before = current().map(|m| id_of(&m));
             match trigger().await? {
-                config_engine::SnapshotTriggered::Started { .. } => break before,
+                config_engine::SnapshotTriggered::Started { .. } => break (before, current_before),
                 config_engine::SnapshotTriggered::AlreadyInProgress => {
                     tracing::info!("backup_trigger_found_a_build_running");
                     if tokio::time::Instant::now() >= deadline {
@@ -359,9 +361,13 @@ where
                     }
                 }
             }
-            // Our build ended without publishing (an install pre-empted it): capture again.
+            // Our build ended without publishing: capture again. The current snapshot moved
+            // while this node built nothing, so an install pre-empted it, and the deadline
+            // error names the install (Revobot #73 round 2).
             if in_flight() == 0 && built().map(|m| id_of(&m)) == before {
-                tracing::info!("backup_build_ended_unpublished");
+                let installed = current().map(|m| id_of(&m)) != current_before;
+                tracing::info!(installed, "backup_build_ended_unpublished");
+                superseded |= installed;
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1718,8 +1724,10 @@ mod tests {
 
     /// Revobot #73 finding 2: when every build the backup starts is replaced by an install
     /// before it can be shipped, the backup captures again until its deadline, then fails and
-    /// names the install. It never ships the installed snapshot.
-    #[tokio::test]
+    /// names the install. It never ships the installed snapshot. Paused time: the 50 ms
+    /// deadline passes only through the backup's own 1 ms sleeps, so a descheduled thread
+    /// cannot end the wait before the second capture (Revobot #73 round 2).
+    #[tokio::test(start_paused = true)]
     async fn backup_fails_when_installs_keep_replacing_its_build() {
         use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
         let triggers = AtomicU32::new(0);
@@ -1752,6 +1760,43 @@ mod tests {
         .await
         .expect("the backup's own deadline ends the wait")
         .expect_err("an installed snapshot is never shipped");
+        let config_engine::AdminError::Unavailable { reason } = err else {
+            panic!("expected Unavailable, got {err:?}");
+        };
+        assert!(
+            reason.starts_with("every snapshot this backup built was replaced by an installed one"),
+            "the error names the install: {reason}"
+        );
+        assert!(triggers.load(SeqCst) >= 2, "the backup captured again");
+    }
+
+    /// Revobot #73 round 2, finding 1: the same, when each install pre-empts the build before it
+    /// publishes. Every build ends unpublished, so the backup captures again until its deadline,
+    /// and the error still names the install rather than saying only that nothing published.
+    /// Paused time: the deadline passes only through the backup's own sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn backup_names_the_install_when_installs_keep_pre_empting_its_build() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let triggers = AtomicU32::new(0);
+        let err = await_fresh_snapshot(
+            || {
+                triggers.fetch_add(1, SeqCst);
+                std::future::ready(Ok(config_engine::SnapshotTriggered::Started {
+                    snapshot_id: None,
+                    last_log_id: None,
+                }))
+            },
+            // Each build is pre-empted at once: none is running and none ever publishes.
+            || 0,
+            || Some("built".to_string()),
+            // Each trigger's build is pre-empted by a new installed snapshot.
+            || Some(format!("installed-{}", triggers.load(SeqCst))),
+            |id: &String| id.clone(),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a build that never publishes is never shipped");
         let config_engine::AdminError::Unavailable { reason } = err else {
             panic!("expected Unavailable, got {err:?}");
         };
