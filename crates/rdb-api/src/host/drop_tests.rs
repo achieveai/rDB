@@ -4199,3 +4199,54 @@ fn m11_m2_a_promote_waits_until_the_shadow_is_near_the_head() {
     tracing::info!(paused_ms = paused, behind, "m11_m2_promote_pause");
     assert!(paused < 500, "writes paused {paused} ms at the promote");
 }
+
+/// Critic A6 (b3's guard): while an `admin rebuild` of node 3 waits on its drop, node 3's
+/// restart must not re-add it: it comes back only once restarted on its wiped folder. The old
+/// cut of this guard was caught 3 times in 5, because b3's rows reach it only when a restart
+/// races the rebuild. Here node 3 is dropped, a rebuild ask for it is pending, and node 3
+/// restarts with no step taken, so no duty has run: `readd_candidate` is asked directly. With
+/// the ask it names no one; with the ask gone it names node 3 (the control).
+/// Cut: the `rebuilding` guard dropped, red every run (node 3 named).
+/// Unit-sized (~2 s): b1's drop only.
+#[config_log::retcd_test]
+fn m11_a6_a_a_pending_rebuild_keeps_its_node_from_being_re_added() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    let (tx, _rx) = mpsc::channel();
+    let owner = &mut trio.nodes[0].0;
+    let deadline = owner.clock.now().plus_millis(60_000);
+    owner.rebuild_asks.insert(
+        PartitionId(1),
+        RebuildAsk {
+            node: NodeId(3),
+            mode: crate::admin::rebuild::RebuildMode::Pinned,
+            from: after,
+            deadline,
+            reply: RebuildReply(tx),
+        },
+    );
+    restart(&mut trio, dir.path(), 3);
+    let owner = &mut trio.nodes[0].0;
+    let config = owner.committed[&PartitionId(1)]
+        .committed
+        .pinned_config
+        .clone();
+    assert_eq!(
+        owner
+            .readd_candidate(PartitionId(1), &config)
+            .map(|m| m.node),
+        None,
+        "a node with a rebuild pending is not re-added"
+    );
+    owner.rebuild_asks.clear();
+    assert_eq!(
+        owner
+            .readd_candidate(PartitionId(1), &config)
+            .map(|m| m.node),
+        Some(NodeId(3)),
+        "control: with no rebuild pending, the restarted node is re-added"
+    );
+}
