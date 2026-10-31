@@ -895,6 +895,7 @@ impl Recovery {
                 let cas = Cas::new(
                     decided.record,
                     decided.root,
+                    crate::authority::partition::RecordMember::pinned(&decided.plan.config),
                     decided.proof.prior_owner_epoch,
                     self.requests.mint(),
                     deadline,
@@ -1193,6 +1194,9 @@ impl Recovery {
                             mode: RecordMode::Active,
                             ..root
                         }),
+                        crate::authority::partition::RecordMember::pinned(
+                            &committed.result.committed.pinned_config,
+                        ),
                         committed.record.owner_epoch,
                         self.requests.mint(),
                         deadline,

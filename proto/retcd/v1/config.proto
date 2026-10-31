@@ -137,6 +137,22 @@ message WatchRequest {
   // Absent takes the node's configured default. An explicit 0, or a value outside the node's
   // accepted range, is INVALID_ARGUMENT.
   optional uint32 progress_interval_ms = 3;
+  // The history `start_after_revision` was read from (#37). A server whose cluster id or
+  // recovery epoch differs refuses the watch at any revision with INVALID_ARGUMENT and the
+  // metadata `retcd-relist: history`: the cursor counts revisions of another history, so the
+  // caller must list again. Absent means unchecked, as before. A server echoes its own history
+  // in the initial response metadata (`retcd-cluster-id`, `retcd-recovery-epoch`), never in a
+  // response body, so an older client that does not know this field still decodes every
+  // response.
+  optional WatchHistory history = 4;
+}
+
+// Which history a watch cursor belongs to. A restore always mints a new cluster id and a new
+// recovery epoch (ADR-0024).
+message WatchHistory {
+  // 32 lowercase hex characters, as the cluster id is written everywhere else.
+  string cluster_id = 1;
+  uint32 recovery_epoch = 2;
 }
 
 message WatchResponse {

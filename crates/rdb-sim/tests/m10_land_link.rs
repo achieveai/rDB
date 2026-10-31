@@ -72,6 +72,8 @@ enum Held {
     /// Generation 0 through the cutoff: A missed the prior generation, whose records it never
     /// held, so its record at the cutoff is not B's and C's.
     Forked,
+    /// Nothing of the partition at any generation: a copy missed at formation (#69).
+    Nothing,
 }
 
 /// B and C survive through [`CUTOFF`]; A holds `held` and is cut off until [`BACK_AT`]. One
@@ -101,6 +103,7 @@ fn plan(held: Held) -> RunPlan {
             };
             (missed.generation, history(missed, CUTOFF.0))
         }
+        Held::Nothing => (PRIOR, Vec::new()),
     };
     // Durable no further than the cutoff at the start; A's own flushes then sync what it holds,
     // which for `Past` is the prior generation past the cutoff (A-R185d). What A applied is what
@@ -113,8 +116,11 @@ fn plan(held: Held) -> RunPlan {
         .min(CUTOFF.0);
     plan.preloads
         .extend(batches.into_iter().map(|batch| (A_NODE, batch)));
-    plan.preload_durable
-        .push((A_NODE, PARTITION, generation, DurableSeq(durable)));
+    // A copy holding nothing has no lineage to mark durable.
+    if !matches!(held, Held::Nothing) {
+        plan.preload_durable
+            .push((A_NODE, PARTITION, generation, DurableSeq(durable)));
+    }
     for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
         plan.network_ops.push(NetworkOp::SetLink {
             a,
@@ -399,5 +405,45 @@ fn m10_c7_a_late_copy_with_another_record_at_the_cutoff_links_nothing() {
         Held::Forked,
         "m10_c7_a_late_copy_with_another_record_at_the_cutoff_links_nothing",
         "base_digest_differs",
+    );
+}
+
+/// #69 (option (c)): A holds nothing of the partition, as a copy missed at formation. It links
+/// the new generation at its own head 0, at the root, logged `land_link_behind` once, and R1
+/// walks it from seq 1. The partition goes `Active` and A applies the write. Before #69 the sim
+/// refused this copy (`anchor_generation_absent`) and the host left it unlinked for good.
+#[retcd_test]
+fn m10_bb_69_a_copy_holding_nothing_links_at_the_root_and_catches_up() {
+    let method = "m10_bb_69_a_copy_holding_nothing_links_at_the_root_and_catches_up";
+    let ran = run(&plan(Held::Nothing));
+    assert_eq!(
+        ran.link.1,
+        Seq::ZERO,
+        "A links the new generation at the root: {:?}",
+        ran.link
+    );
+    let behind = logged(method, "land_link_behind");
+    assert_eq!(behind.len(), 1, "one link, logged once: {behind:?}");
+    assert_eq!(
+        (
+            behind[0].get("from").and_then(serde_json::Value::as_u64),
+            behind[0].get("head").and_then(serde_json::Value::as_u64),
+            behind[0].get("base").and_then(serde_json::Value::as_u64),
+        ),
+        (Some(0), Some(0), Some(CUTOFF.0)),
+        "{behind:?}"
+    );
+    assert_eq!(logged(method, "land_link_refused").len(), 0);
+    let recovered = recovered_on_primary(&ran.trace);
+    assert!(
+        recovered
+            .iter()
+            .any(|(at, mode, _)| *at > BACK_AT && *mode == PartitionMode::Active),
+        "the partition goes active once A is back: {recovered:?}"
+    );
+    assert!(
+        ran.applied > CUTOFF.0,
+        "A applies the write: applied {}",
+        ran.applied
     );
 }

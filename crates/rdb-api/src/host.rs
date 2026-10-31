@@ -205,11 +205,14 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
 /// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
-/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282). The clock
-/// starts at the later of the last admit and the last membership commit, and starts again
-/// whenever the blamed copy changes or its durable sequence advances, so a copy still catching
-/// up is never dropped. Longer than a process restart (2-5 s), which rejoins by `PeerBooted`
-/// instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
+/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282). Two clocks
+/// share it (the host's drop duty). A reachable copy's clock starts at the later of the last
+/// admit and the last membership commit, and starts again whenever the blamed copy changes or
+/// its durable sequence advances, so a copy still catching up is never dropped. A member the
+/// owner has had no link to counts from the first check that found it unreachable, through
+/// rejoins and commits, until it links again or reports another boot (#67, A-R435). Either
+/// drops only while writes are paused. Longer than a process restart (2-5 s), which rejoins by
+/// `PeerBooted` instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
 pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
 
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
@@ -543,11 +546,54 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<Result<(), rdb_storage::DamageRefused>>,
     },
+    /// **Dev tool only**, debug builds (#65, critic-bb §3 mode C): replace the head `History`
+    /// record of lineage `(partition, generation)` in this node's own copy with a different one
+    /// that is still validly chained (same seq and `prev_digest`, another `request_digest`, the
+    /// digest recomputed, the progress record moved with it), so this copy diverges from the
+    /// others the way a split brain would and recovery quarantines rather than finds damage.
+    /// Local only, like [`Msg::Damage`]. Answers the seq it forked.
+    #[cfg(debug_assertions)]
+    Fork {
+        /// The partition.
+        partition: PartitionId,
+        /// The lineage's generation.
+        generation: Generation,
+        /// Where the answer goes.
+        reply: Sender<Result<Seq, String>>,
+    },
+    /// #65 (critic-bb §3): rebuild node `node`'s copy of `partition`. Local only, like
+    /// [`Msg::PeerBooted`]: [`crate::db::Db::rebuild`] sends it to an owner in its own process.
+    /// The owner checks the guards; a pinned `node` is dropped first, and a quarantined F1 is
+    /// replaced by a fresh run without it. `reply` hears once a commit leaving `node` out has
+    /// landed, or why not, within `within`.
+    Rebuild {
+        /// The partition.
+        partition: PartitionId,
+        /// The node whose copy is rebuilt.
+        node: NodeId,
+        /// How long the owner waits for the commit that leaves `node` out.
+        within: Duration,
+        /// Where the answer goes.
+        reply: RebuildReply,
+    },
     /// F4 (ruling A-R317): this node's syncer finished the WAL sync it was handed. Local only,
     /// like [`Msg::PeerBooted`]: only the node's own syncer thread posts it.
     Synced(SyncDone),
     /// Stop the thread.
     Stop,
+}
+
+/// Where [`Msg::Rebuild`]'s answer goes. Opaque outside the crate: only `Db::rebuild` sends one.
+#[derive(Debug)]
+pub struct RebuildReply(
+    pub(crate) Sender<Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Unready>>,
+);
+
+impl RebuildReply {
+    fn send(&self, answer: Result<crate::admin::rebuild::Ready, crate::admin::rebuild::Unready>) {
+        // The asker may have given up; then nobody needs the answer.
+        let _ = self.0.send(answer);
+    }
 }
 
 /// What a node's syncer reports when a WAL sync it ran returns ([`Msg::Synced`]).
@@ -1207,8 +1253,62 @@ struct Replan {
     since: Tick,
 }
 
+/// #65: an `admin rebuild` the owner answers once the commit that leaves `node` out lands.
+#[derive(Debug)]
+struct RebuildAsk {
+    node: NodeId,
+    mode: crate::admin::rebuild::RebuildMode,
+    /// The generation committed when it was asked: the answer waits for a newer one.
+    from: Generation,
+    deadline: Tick,
+    reply: RebuildReply,
+}
+
+/// What `admin rebuild` plans the drop from: the owner's newest commit, revoked as any re-plan
+/// is, or, with no commit here, the quarantined run's own plan and fence (Revobot #73 finding 1).
+enum RebuildBasis {
+    Committed(OwnerEpoch),
+    Quarantined(Box<(RecoveryPlan, FencingProof)>),
+}
+
 /// The correlation of the owner's restart re-plan: its revocation, plan and fence (#42).
 const REJOIN: CorrelationId = CorrelationId(3);
+
+/// #67 (A-R435): since when the owner has had no link to a member, and the boot its link
+/// reported then. Another boot starts the count again.
+#[derive(Debug, Clone, Copy)]
+struct Unreachable {
+    since: Tick,
+    boot: Option<BootId>,
+}
+
+/// Which clock planned a drop ([`Host::drop_duty`]), logged as `clock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropClock {
+    /// The member had no link for `peer_drop_after_millis` (#67, A-R435).
+    Unreachable,
+    /// L1 refused writes on account of the copy for `peer_drop_after_millis` (A-R281).
+    Paused,
+}
+
+impl DropClock {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+/// #67 (A-R434): a member that restarted while a re-plan was planned, and the plan it was seen
+/// under. The plan is named by its generation and its `since`, since a retried plan keeps the
+/// generation and gets a new `since`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootMark {
+    generation: Generation,
+    since: Tick,
+    member: NodeId,
+}
 
 /// The copy the owner holds responsible for L1 refusing writes, and since when (M10 S2 part (b)).
 #[derive(Debug, Clone, Copy)]
@@ -1869,6 +1969,9 @@ struct Host {
     /// The status query whose event is being stepped, until P1's answer takes it.
     answering: Option<(RequestIdentity, Sender<Answer>)>,
     plans: BTreeMap<PartitionId, RecoveryPlan>,
+    /// Revobot #73 finding 1: per partition, the last fence F1 was offered, the one its newest run
+    /// started on. An `admin rebuild` out of a quarantine with no commit here plans from it.
+    fences: BTreeMap<PartitionId, FencingProof>,
     committed: BTreeMap<PartitionId, Box<RecoveryResult>>,
     landed: BTreeSet<(PartitionId, Generation)>,
     /// D7: per lineage, the one post-commit sync a peer asked of a generation this node has
@@ -1902,6 +2005,12 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// #65: per partition, the divergence evidence F1's last `Quarantine` reported, for
+    /// `admin rebuild`'s G6. Kept until a rebuild replaces the quarantined F1.
+    quarantines: BTreeMap<PartitionId, rdb_core::contracts::recovery::DivergenceEvidence>,
+    /// #65: per partition, the `admin rebuild` waiting for the commit that leaves its node out
+    /// ([`Host::rebuild_duty`]).
+    rebuild_asks: BTreeMap<PartitionId, RebuildAsk>,
     /// The epoch of the `EpochRevocationPersisted` being offered, when that is the event in
     /// hand. A1 emits `DrainProof` only for that event, and the proof is for that epoch alone:
     /// a re-asked revocation persists twice, and a late second proof must not plan from a later
@@ -1938,6 +2047,24 @@ struct Host {
     /// Per partition, the `Inspect` probes the last repair check sent to the members it would
     /// repair for, and when (A-R350): a repair runs only for a member that answered one.
     repair_probes: BTreeMap<PartitionId, (Tick, Vec<RepairProbe>)>,
+    /// The copies F1 named in `RebuildStalled` during the step being run, per partition.
+    stall_step: BTreeMap<PartitionId, BTreeSet<CopyId>>,
+    /// Per partition, the copies F1's latest `RebuildStalled` step named, with the watched
+    /// generation they are for: replaced at each step that names any (A-R426 M8). Unlike
+    /// [`RebuildWatch::unproven`], a copy that has since proved is no longer in it.
+    latest_stall: BTreeMap<PartitionId, (Generation, BTreeSet<CopyId>)>,
+    /// #67 (A-R433, A-R434): per partition, a member that restarted while its re-plan was
+    /// planned and not yet `Blocked`, keyed on that plan (its generation and `since`). The next
+    /// drop check that finds F1 blocked on that same plan re-plans at once
+    /// ([`Self::replan_on_boot`]); a mark for any other plan is dropped unused.
+    boot_seen_while_planned: BTreeMap<PartitionId, BootMark>,
+    /// #67 (A-R435): per (partition, pinned regular secondary), since when this owner has had
+    /// no link to it ([`Self::count_unreachable`]).
+    unreachable: BTreeMap<(PartitionId, NodeId), Unreachable>,
+    /// Per partition, the planned re-plan F1 was first seen `Blocked` on by a drop check, and
+    /// when: (generation, the plan's `since`, seen at). `blocked_ms` of `rejoin_replan_on_boot`,
+    /// which is `None` when no drop check saw the block before the re-plan.
+    blocked_seen: BTreeMap<PartitionId, (Generation, Tick, Tick)>,
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
@@ -2057,6 +2184,7 @@ impl Host {
             answer_stamps: BTreeMap::new(),
             answering: None,
             plans: BTreeMap::new(),
+            fences: BTreeMap::new(),
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
             deferred_syncs: BTreeMap::new(),
@@ -2070,6 +2198,8 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
+            quarantines: BTreeMap::new(),
+            rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
             owner_after_fence: BTreeMap::new(),
             owner_fence: 0,
@@ -2082,6 +2212,11 @@ impl Host {
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
+            stall_step: BTreeMap::new(),
+            latest_stall: BTreeMap::new(),
+            boot_seen_while_planned: BTreeMap::new(),
+            unreachable: BTreeMap::new(),
+            blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
             restart_shadow: true,
@@ -2417,6 +2552,25 @@ impl Host {
                         current = self.owner_fence,
                         "host_owner_learned_stale"
                     );
+                } else if owner == Some(self.node) {
+                    // #66: a promote freezes this node's grant before it names the new owner,
+                    // so the read at the fence names this node. Read again while the same fence
+                    // holds; a later fence or a regained grant drops the answer above and ends
+                    // it. Debug: it repeats for as long as the fence lasts.
+                    tracing::debug!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        fence,
+                        "host_owner_still_self"
+                    );
+                    self.owner_after_fence.insert(partition, owner);
+                    self.control.read_owner_after_fence(
+                        self.node,
+                        self.boot,
+                        partition,
+                        fence,
+                        crate::control::OWNER_REREAD_AFTER,
+                    );
                 } else {
                     tracing::info!(
                         node = self.node.0,
@@ -2693,6 +2847,32 @@ impl Host {
                 let _ = reply.send(answer);
                 Ok(())
             }
+            #[cfg(debug_assertions)]
+            Msg::Fork {
+                partition,
+                generation,
+                reply,
+            } => {
+                let answer = self.fork_head(partition, generation);
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    answer = ?answer,
+                    "host_record_fork"
+                );
+                let _ = reply.send(answer);
+                Ok(())
+            }
+            Msg::Rebuild {
+                partition,
+                node,
+                within,
+                reply,
+            } => {
+                self.rebuild_asked(partition, node, within, reply);
+                Ok(())
+            }
             Msg::Synced(done) => self.on_synced(done),
             Msg::Stop => Ok(()),
         };
@@ -2852,6 +3032,7 @@ impl Host {
             self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
             self.drop_duty(now);
         }
+        self.rebuild_duty(now);
         self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -4062,6 +4243,11 @@ impl Host {
         if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
             self.plans.insert(event.partition, (**plan).clone());
         }
+        if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(proof))) =
+            &event.kind
+        {
+            self.fences.insert(event.partition, (**proof).clone());
+        }
         // D8 (A-R337): an inventory answer to an older run's ask, which the link held while the
         // copy was down, never reaches F1's current run: as Reported it reads `StaleLineage`,
         // as Failed it drops the copy, and either shuts out a copy the current ask may admit.
@@ -4529,6 +4715,7 @@ impl Host {
                             self.boot,
                             partition,
                             self.owner_fence,
+                            std::time::Duration::ZERO,
                         );
                     }
                 }
@@ -4739,7 +4926,8 @@ impl Host {
         }
         self.acquire_after_link(result, site);
         self.watch_rebuild(result, partition);
-        // A membership commit restarts the drop clock (A-R282 N1).
+        // A membership commit restarts a reachable copy's drop clock (A-R282 N1); a member
+        // counted unreachable keeps its count ([`Self::count_unreachable`], #67).
         self.blamed.remove(&partition);
         self.rejoin_committed(partition, result.new_generation);
         Ok(())
@@ -4785,7 +4973,9 @@ impl Host {
     /// link reports a newer boot than the commit pinned: ask A1 to revoke the committed epoch,
     /// whose `DrainProof` [`Self::drained`] plans from. `Some(why)` when nothing was started.
     /// A re-plan already running is left alone: one still revoking plans at the live boots,
-    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]).
+    /// and one already planned is checked again at its commit ([`Self::rejoin_committed`]),
+    /// unless the plan pinned a member at an older boot than its link now reports
+    /// ([`Self::boot_while_planned`], #67).
     fn rejoin_if_stale(&mut self, partition: PartitionId) -> Option<&'static str> {
         let Some(committed) = self.committed.get(&partition) else {
             return Some("no commit for this partition");
@@ -4815,7 +5005,7 @@ impl Host {
         if stale.is_empty() && readd.is_none() {
             return Some("every member's pinned boot is current");
         }
-        if let Some(rejoin) = self.rejoins.get(&partition) {
+        if let Some(rejoin) = self.rejoins.get(&partition).copied() {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -4824,6 +5014,9 @@ impl Host {
                 readd = ?readd.map(|member| member.node.0),
                 "rejoin_pending"
             );
+            if let Rejoin::Planned { generation, replan } = rejoin {
+                self.boot_while_planned(partition, generation, replan);
+            }
             return None;
         }
         let epoch = committed.selected.root.owner_epoch;
@@ -4842,6 +5035,146 @@ impl Host {
             .or(readd.map(|member| member.node));
         self.revoke(partition, epoch, None, rejoiner);
         None
+    }
+
+    /// #67 Wait 2 (A-R433, A-R434): a member the planned re-plan pinned at an older boot than
+    /// its link reports now has restarted, so F1 cannot complete that plan: the member's new
+    /// process answers with a new boot (`barrier_boot_changed`) and F1 blocks naming nobody to
+    /// leave out, which [`Self::retry_blocked_rejoin`] would only send again after
+    /// `peer_drop_after_millis`. F1 already blocked: re-plan now. Not yet blocked (the boot is
+    /// heard first, as the walk saw): mark the plan, and the drop check that finds F1 blocked
+    /// on that same plan re-plans ([`Self::replan_on_boot`]). A re-plan at the live boots, not
+    /// a drop: the plan's own `drop` and `rejoiner` are kept.
+    fn boot_while_planned(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        replan: Replan,
+    ) {
+        let Some(plan) = self.plans.get(&partition) else {
+            return;
+        };
+        let member = plan
+            .config
+            .members
+            .iter()
+            .filter(|member| member.node != self.node)
+            .find(|member| {
+                self.links
+                    .boot_of(member.node)
+                    .is_some_and(|live| live > member.boot)
+            })
+            .map(|member| member.node);
+        let Some(member) = member else {
+            return;
+        };
+        let mark = BootMark {
+            generation,
+            since: replan.since,
+            member,
+        };
+        if self.f1_blocked(partition) {
+            self.replan_for_boot(partition, mark, replan, self.clock.now());
+            return;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            member = member.0,
+            "rejoin_boot_marked"
+        );
+        self.boot_seen_while_planned.insert(partition, mark);
+    }
+
+    /// Whether F1's run for `partition` ended `Blocked`.
+    fn f1_blocked(&self, partition: PartitionId) -> bool {
+        self.recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Blocked(_)))
+    }
+
+    /// The drop check's half of [`Self::boot_while_planned`]: a mark for the plan still planned
+    /// re-plans once F1 is blocked on it; a mark for any other plan, or with no plan, goes.
+    /// Also notes when F1 was first seen blocked on the planned re-plan, for `blocked_ms`.
+    fn replan_on_boot(&mut self, partition: PartitionId, now: Tick) {
+        let Some(Rejoin::Planned { generation, replan }) = self.rejoins.get(&partition).copied()
+        else {
+            self.boot_seen_while_planned.remove(&partition);
+            self.blocked_seen.remove(&partition);
+            return;
+        };
+        let blocked = self.f1_blocked(partition);
+        let plan = (generation, replan.since);
+        match self.blocked_seen.get(&partition) {
+            Some(&(seen_generation, seen_since, _))
+                if blocked && (seen_generation, seen_since) == plan => {}
+            _ if blocked => {
+                self.blocked_seen
+                    .insert(partition, (generation, replan.since, now));
+            }
+            _ => {
+                self.blocked_seen.remove(&partition);
+            }
+        }
+        let Some(mark) = self.boot_seen_while_planned.get(&partition).copied() else {
+            return;
+        };
+        if (mark.generation, mark.since) != plan {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                marked = mark.generation.0,
+                planned = generation.0,
+                member = mark.member.0,
+                "rejoin_boot_mark_dropped"
+            );
+            self.boot_seen_while_planned.remove(&partition);
+            return;
+        }
+        if blocked {
+            self.replan_for_boot(partition, mark, replan, now);
+        }
+    }
+
+    /// Send the planned re-plan `mark` names again at once, as [`Self::retry_blocked_rejoin`]
+    /// does after its wait: the same `drop` and `rejoiner`, planned at the live boots.
+    fn replan_for_boot(
+        &mut self,
+        partition: PartitionId,
+        mark: BootMark,
+        replan: Replan,
+        now: Tick,
+    ) {
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let epoch = committed.selected.root.owner_epoch;
+        let blocked_ms = self
+            .blocked_seen
+            .get(&partition)
+            .filter(|&&(generation, since, _)| (generation, since) == (mark.generation, mark.since))
+            .map(|&(_, _, at)| HostClock::millis_until(at, now));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = mark.generation.0,
+            member = mark.member.0,
+            blocked_ms = ?blocked_ms,
+            waited_ms = HostClock::millis_until(replan.since, now),
+            dropped = ?replan.drop.map(|node| node.0),
+            "rejoin_replan_on_boot"
+        );
+        self.boot_seen_while_planned.remove(&partition);
+        self.blocked_seen.remove(&partition);
+        self.start_revoke(
+            partition,
+            epoch,
+            Replan {
+                since: now,
+                ..replan
+            },
+        );
     }
 
     /// A-R329: a member a drop left out of `partition` that started again since, while `config`
@@ -5204,27 +5537,130 @@ impl Host {
         }
     }
 
-    /// M10 S2 part (b): re-plan a partition without the copy L1 has refused its writes on
-    /// account of for `peer_drop_after_millis` (rulings A-R281 M1, A-R282 N1). The clock starts
-    /// again on an admit, a membership commit, a different blamed copy, or that copy's durable
-    /// sequence advancing, so a copy still catching up is never dropped.
+    /// M10 S2 part (b): re-plan a partition without a copy while L1 refuses its writes. Two
+    /// clocks, each `peer_drop_after_millis`, and only while writes are paused now
+    /// ([`Self::holding_up`]):
+    /// - Unreachable (#67, A-R435): a regular secondary this owner has had no link to for the
+    ///   clock ([`Self::count_unreachable`]) goes first, when every member the drop keeps is
+    ///   linked ([`Self::unreachable_past_clock`]). A rejoin or a commit does not restart it.
+    /// - Paused (rulings A-R281 M1, A-R282 N1): a reachable copy's clock, for the copy L1
+    ///   refuses writes on account of. It starts again on an admit, a membership commit, a
+    ///   different blamed copy, or that copy's durable sequence advancing, so a copy still
+    ///   catching up is never dropped.
     fn drop_duty(&mut self, now: Tick) {
         let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
         for partition in partitions {
+            self.replan_on_boot(partition, now);
             self.retry_blocked_rejoin(partition, now);
             self.repair_duty(partition, now);
             self.shadow_duty(partition);
+            // G6: counted before the early return, so it runs through a rejoin.
+            self.count_unreachable(partition, now);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
                 self.blamed.remove(&partition);
                 continue;
             };
+            if let Some((blame, unreachable_ms)) = self.unreachable_past_clock(partition, now) {
+                self.drop_copy(partition, blame, unreachable_ms, DropClock::Unreachable);
+                continue;
+            }
             let blame = Blame::next(self.blamed.get(&partition), copy, durable, now);
             self.blamed.insert(partition, blame);
             let blamed_ms = HostClock::millis_until(blame.since, now);
             if blamed_ms >= self.peer_drop_after_millis {
-                self.drop_copy(partition, blame, blamed_ms);
+                self.drop_copy(partition, blame, blamed_ms, DropClock::Paused);
             }
         }
+    }
+
+    /// #67 (A-R435 G1, G2): per pinned regular secondary of a partition this node is the
+    /// pinned primary of, since when this owner has had no link to it ([`Self::linked`]). The
+    /// count starts again when the member is linked at a check or reports another boot, and
+    /// goes when the member leaves the commit or this node stops being its pinned primary. A
+    /// half-open link counts as linked, so such a member keeps the paused clock only.
+    fn count_unreachable(&mut self, partition: PartitionId, now: Tick) {
+        let tracked: Vec<NodeId> = self
+            .committed
+            .get(&partition)
+            .map(|committed| &committed.committed.pinned_config.members)
+            .filter(|members| {
+                members
+                    .iter()
+                    .any(|member| member.node == self.node && member.role == ReplicaRole::Primary)
+            })
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|member| {
+                        member.node != self.node && member.role == ReplicaRole::RegularSecondary
+                    })
+                    .map(|member| member.node)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.unreachable
+            .retain(|(at, node), _| *at != partition || tracked.contains(node));
+        for node in tracked {
+            if self.linked(node) {
+                self.unreachable.remove(&(partition, node));
+                continue;
+            }
+            let boot = self.links.boot_of(node);
+            if self
+                .unreachable
+                .get(&(partition, node))
+                .is_some_and(|count| count.boot == boot)
+            {
+                continue;
+            }
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                member = node.0,
+                boot = ?boot.map(|boot| boot.0),
+                "member_unreachable"
+            );
+            self.unreachable
+                .insert((partition, node), Unreachable { since: now, boot });
+        }
+    }
+
+    /// #67 (A-R435 G3-G5): the copy to drop on the unreachable clock, with how long it has been
+    /// unreachable. Called only while writes are paused. The member unreachable longest past
+    /// `peer_drop_after_millis` (a tie to the lower copy id), and only when every member the
+    /// drop keeps is linked and [`drop_target`] takes it. Otherwise `None`, and the paused
+    /// clock decides as before (two down, say).
+    fn unreachable_past_clock(&self, partition: PartitionId, now: Tick) -> Option<(Blame, u64)> {
+        let committed = self.committed.get(&partition)?;
+        let members = &committed.committed.pinned_config.members;
+        let (since, copy, node) = members
+            .iter()
+            .filter_map(|member| {
+                let count = self.unreachable.get(&(partition, member.node))?;
+                (HostClock::millis_until(count.since, now) >= self.peer_drop_after_millis)
+                    .then_some((count.since, member.copy, member.node))
+            })
+            .min_by_key(|(since, copy, _)| (since.0, copy.0))?;
+        let kept_linked = members
+            .iter()
+            .filter(|member| member.node != self.node && member.node != node)
+            .all(|member| self.linked(member.node));
+        if !kept_linked || drop_target(members, Some(node), self.node).0.is_err() {
+            return None;
+        }
+        let durable = self
+            .replication
+            .primary(self.node, partition)
+            .and_then(|primary| primary.tracker().peer(copy).map(|peer| peer.progress))
+            .unwrap_or(ReplicaProgress::EMPTY)
+            .durable;
+        let blame = Blame {
+            copy,
+            since,
+            durable,
+            refused_logged: false,
+        };
+        Some((blame, HostClock::millis_until(since, now)))
     }
 
     /// M3's repair half (critic-degraded M3, ruling A-R282): a `ReadOnly` commit whose pinned
@@ -5242,8 +5678,10 @@ impl Host {
     /// a reason that passes (a late inventory), and a bound with no retry would then keep the
     /// partition read-only for good. A movement or a commit that is not `ReadOnly` starts the
     /// wait again from the first. A held repair is logged once per wait,
-    /// `membership_repair_held`. Nothing runs while F1's rebuild is pinned, which F1's own
-    /// deadline bounds.
+    /// `membership_repair_held`. While F1's rebuild is pinned nothing runs until F1's deadline
+    /// reports a stall, and then only when no copy that latest stall named answers (A-R383,
+    /// A-R426 M8): at cutoff 0 the pin is set on every commit, so a dead copy would otherwise
+    /// hold a `ReadOnly` partition for good.
     ///
     /// Answered (A-R350). Once the hold has passed, a check sends each linked member an
     /// `Inspect` and the next check reads the answers: an answer must arrive within one check.
@@ -5258,12 +5696,21 @@ impl Host {
             self.repaired.remove(&partition);
         }
         let outside = self.read_only_outside(partition);
-        if outside.is_empty()
-            || self
-                .rebuilds
-                .get(&partition)
-                .is_some_and(|watch| watch.pinned)
-        {
+        // A-R383 as ruled by critic-bb (A-R426 M8): while F1's rebuild is pinned and F1 has
+        // reported no stall for it, nothing repairs and nothing is probed
+        // ([`rebuild_holds_repair`] with no answers).
+        let pinned = self
+            .rebuilds
+            .get(&partition)
+            .filter(|watch| watch.pinned)
+            .map(|watch| watch.generation);
+        let members: Vec<Member> = self
+            .committed
+            .get(&partition)
+            .map(|committed| committed.committed.pinned_config.members.clone())
+            .unwrap_or_default();
+        let latest = self.latest_stall.get(&partition);
+        if outside.is_empty() || rebuild_holds_repair(pinned, latest, &[], &members) {
             self.repair_since.remove(&partition);
             self.repair_probes.remove(&partition);
             return;
@@ -5355,6 +5802,21 @@ impl Host {
                 "membership_repair_probed"
             );
             self.repair_probes.insert(partition, (now, probes));
+            return;
+        }
+        if rebuild_holds_repair(
+            pinned,
+            self.latest_stall.get(&partition),
+            &answered,
+            &members,
+        ) {
+            tracing::debug!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                answered = ?answered.iter().map(|node| node.0).collect::<Vec<_>>(),
+                "membership_repair_waits_on_rebuild"
+            );
             return;
         }
         self.repair_since.remove(&partition);
@@ -5515,9 +5977,15 @@ impl Host {
         if self.rejoins.contains_key(&partition) {
             return None;
         }
-        let owner = self
-            .committed
-            .get(&partition)?
+        let committed = self.committed.get(&partition)?;
+        // A-R381 (critic-w9r "Q read-only drop"): no drop clock while the commit is `ReadOnly`.
+        // Every regular copy is outside its barrier there, so a blame picks a copy close to
+        // arbitrarily, the healthy one included, and the mode refuses every write anyway. The
+        // repair ([`Self::repair_duty`]) ends it; the clock runs again from `DegradedRf2`.
+        if committed.mode == PartitionMode::ReadOnly {
+            return None;
+        }
+        let owner = committed
             .committed
             .pinned_config
             .members
@@ -5557,7 +6025,15 @@ impl Host {
 
     /// Start the re-plan that drops `blame`'s copy, unless the plan would keep fewer than two
     /// copies: spec §8.3 has no one-copy fallback, so writes stay paused and that is logged once.
-    fn drop_copy(&mut self, partition: PartitionId, blame: Blame, blamed_ms: u64) {
+    /// `blamed_ms` is the age of the `clock` that fired; `unreachable_ms` is logged beside it
+    /// whenever the copy's member is counted unreachable (#67, A-R435).
+    fn drop_copy(
+        &mut self,
+        partition: PartitionId,
+        blame: Blame,
+        blamed_ms: u64,
+        clock: DropClock,
+    ) {
         let Some(committed) = self.committed.get(&partition) else {
             return;
         };
@@ -5588,6 +6064,12 @@ impl Host {
                 return;
             }
         };
+        let unreachable_since = self
+            .unreachable
+            .get(&(partition, dropped))
+            .map(|count| count.since);
+        let unreachable_ms =
+            unreachable_since.map(|since| HostClock::millis_until(since, self.clock.now()));
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -5596,6 +6078,9 @@ impl Host {
             copy = blame.copy.0,
             dropped = dropped.0,
             blamed_ms,
+            clock = clock.name(),
+            unreachable_ms = ?unreachable_ms,
+            unreachable_since = ?unreachable_since.map(|since| since.0),
             durable = blame.durable.0,
             "membership_drop_planned"
         );
@@ -5783,6 +6268,395 @@ impl Host {
         );
     }
 
+    /// [`Msg::Fork`]: rewrite this copy's head `History` record of `(partition, generation)`
+    /// as another validly chained record at the same seq, with its progress record, in one
+    /// synced batch. Only the bytes on disk change; this node's kernel still holds the old head
+    /// until it restarts, which is when a row or walk forks a copy (debug builds only).
+    #[cfg(debug_assertions)]
+    fn fork_head(&mut self, partition: PartitionId, generation: Generation) -> Result<Seq, String> {
+        use rdb_core::contracts::storage::{Batch, Write};
+        let seq = Seq(self.engine.buffered_applied(partition, generation).0);
+        if seq.0 == 0 {
+            return Err(format!(
+                "generation {} holds no record to fork",
+                generation.0
+            ));
+        }
+        let (record, _) = self
+            .engine
+            .history_at(partition, generation, seq)
+            .map_err(|fault| format!("history read failed: {fault:?}"))?
+            .ok_or_else(|| format!("no record at seq {}", seq.0))?;
+        let mut envelope = ReplicationEnvelope::decode(&record)
+            .map_err(|error| format!("the head record does not decode: {error:?}"))?;
+        // The node is in the preimage, so two forked copies differ from each other too.
+        envelope.request_digest = Digest::of(
+            Domain::Record,
+            &[
+                b"rebuild fork",
+                &self.node.0.to_le_bytes(),
+                &seq.0.to_le_bytes(),
+            ],
+        );
+        envelope.record_digest = envelope
+            .compute_record_digest()
+            .map_err(|error| format!("digest: {error:?}"))?;
+        let forked = envelope
+            .encode()
+            .map_err(|error| format!("encode: {error:?}"))?;
+        let mut progress = seq.0.to_le_bytes().to_vec();
+        progress.extend_from_slice(&envelope.record_digest.0);
+        let batch = Batch {
+            id: rdb_core::contracts::ids::BatchId(u64::MAX),
+            partition,
+            generation,
+            seq,
+            writes: vec![
+                Write {
+                    ns: Namespace::History,
+                    key: Bytes::copy_from_slice(&seq.0.to_be_bytes()),
+                    value: Some(forked),
+                },
+                Write {
+                    ns: Namespace::Progress,
+                    key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+                    value: Some(Bytes::from(progress)),
+                },
+            ],
+        };
+        self.engine
+            .commit(batch)
+            .map_err(|fault| format!("commit failed: {fault:?}"))?;
+        Ok(seq)
+    }
+
+    /// #65 (critic-bb §3): `admin rebuild node`. Checks the guards on this node's newest
+    /// commit ([`crate::admin::rebuild::decide`]) and answers at once for mode A. Mode B asks a
+    /// re-plan without `node`, as [`Self::drop_copy`] does; mode C first replaces the
+    /// quarantined F1 with a fresh one, then does the same; with no commit here (a reopen's F1
+    /// quarantined first), the guards read the quarantined run's plan, and the fresh run plans
+    /// from it ([`Self::replan_quarantined`]). [`Self::rebuild_duty`] answers those. A refusal
+    /// changes nothing.
+    fn rebuild_asked(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        within: Duration,
+        reply: RebuildReply,
+    ) {
+        use crate::admin::rebuild::{decide, kept, Asked, Ready, RebuildMode, Refused};
+        let refuse = |reply: &RebuildReply, refused: Refused| {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                rebuild = node.0,
+                guard = refused.guard,
+                detail = %refused.detail,
+                "rebuild_refused"
+            );
+            reply.send(Err(crate::admin::rebuild::Unready::Refused(refused)));
+        };
+        let quarantined = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined));
+        // Revobot #73 finding 1: after a reopen, F1 can quarantine before anything commits here.
+        // Mode C then plans from that run's own plan and fence ([`Self::quarantined_basis`]).
+        let (members, generation, basis) = match self.committed.get(&partition) {
+            Some(committed) => (
+                committed.committed.pinned_config.members.clone(),
+                committed.new_generation,
+                RebuildBasis::Committed(committed.selected.root.owner_epoch),
+            ),
+            None => match self.quarantined_basis(partition).filter(|_| quarantined) {
+                Some((plan, fence)) => (
+                    plan.config.members.clone(),
+                    plan.anchor.lineage.generation,
+                    RebuildBasis::Quarantined(Box::new((plan, fence))),
+                ),
+                None => {
+                    return refuse(
+                        &reply,
+                        Refused {
+                            guard: "owner",
+                            detail: format!(
+                                "node {} has committed no recovery of partition {}, so it cannot \
+                                 rebuild a copy: ask the node that owns it",
+                                self.node.0, partition.0
+                            ),
+                        },
+                    )
+                }
+            },
+        };
+        let members = &members;
+        let primary = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| member.node);
+        if primary != Some(self.node) {
+            return refuse(
+                &reply,
+                Refused {
+                    guard: "owner",
+                    detail: format!(
+                        "node {} does not own partition {} (its newest commit names node {}): \
+                         ask the owner",
+                        self.node.0,
+                        partition.0,
+                        primary.map_or(0, |node| node.0)
+                    ),
+                },
+            );
+        }
+        let known: Vec<NodeId> = crate::admin::members().iter().map(|m| m.node).collect();
+        let asked = Asked {
+            node,
+            owner: self.node,
+            members,
+            known: &known,
+            // G3. The `rebuild_asks` half is defence in depth (A-R441 closure): a second ask
+            // normally meets the first's drop re-plan in `rejoins`; this half covers only the
+            // tick between that commit and `rebuild_duty`'s answer, and no row reaches it.
+            rejoin: self.rejoins.contains_key(&partition)
+                || self.rebuild_asks.contains_key(&partition),
+            quarantine: quarantined.then(|| self.quarantines.get(&partition)),
+        };
+        let current = |member: &Member| {
+            member.node == self.node
+                || (self.linked(member.node)
+                    && self.links.boot_of(member.node) == Some(member.boot))
+        };
+        let mode = match decide(&asked, current) {
+            Ok(mode) => mode,
+            Err(refused) => return refuse(&reply, refused),
+        };
+        let boot = self.links.boot_of(node);
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            rebuild = node.0,
+            mode = mode.letter(),
+            generation = generation.0,
+            boot = ?boot.map(|boot| boot.0),
+            "rebuild_asked"
+        );
+        if mode == RebuildMode::NotPinned {
+            reply.send(Ok(Ready {
+                mode,
+                generation,
+                kept: kept(members, node),
+            }));
+            return;
+        }
+        if mode == RebuildMode::Quarantined {
+            // Phase::Quarantined stays terminal in the kernel: the host drops that F1, and the
+            // plan below makes a fresh one, which inventories only the copies it keeps.
+            self.recoveries.remove(&partition);
+            // The dropped F1's discovery timer goes with it: the fresh F1 arms the same id from
+            // version 1, which the host refuses over a live higher version.
+            let timer = rdb_core::recovery::DISCOVERY_TIMER;
+            if self
+                .timers
+                .get(&timer)
+                .is_some_and(|(_, _, site)| site.partition == partition)
+            {
+                self.timers.remove(&timer);
+            }
+            self.quarantines.remove(&partition);
+            self.rejoins.remove(&partition);
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                rebuild = node.0,
+                "rebuild_quarantine_reset"
+            );
+        }
+        let now = self.clock.now();
+        let within = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
+        self.rebuild_asks.insert(
+            partition,
+            RebuildAsk {
+                node,
+                mode,
+                from: generation,
+                deadline: now.plus_millis(within),
+                reply,
+            },
+        );
+        self.blamed.remove(&partition);
+        match basis {
+            RebuildBasis::Committed(epoch) => self.revoke(partition, epoch, Some(node), None),
+            RebuildBasis::Quarantined(run) => {
+                let (plan, fence) = *run;
+                self.replan_quarantined(partition, node, &plan, fence);
+            }
+        }
+    }
+
+    /// Revobot #73 finding 1: the plan and fence of `partition`'s newest F1 run, when this node
+    /// has no commit of it and that run's fence proves the plan's lineage. A reopen's F1 can
+    /// quarantine before anything commits; the fence still holds then, since nothing committed
+    /// over `partitions/{p}` after it was proved, and a fresh run's CAS checks that again.
+    fn quarantined_basis(&self, partition: PartitionId) -> Option<(RecoveryPlan, FencingProof)> {
+        if self.committed.contains_key(&partition) {
+            return None;
+        }
+        let plan = self.plans.get(&partition)?;
+        let fence = self.fences.get(&partition)?;
+        let fenced = fence.prior_generation == plan.anchor.lineage.generation
+            && fence.prior_owner_epoch == plan.anchor.lineage.owner_epoch;
+        fenced.then(|| (plan.clone(), fence.clone()))
+    }
+
+    /// Revobot #73 finding 1: mode C with no commit here. Offer the fresh F1 the quarantined
+    /// run's plan without `node`, at each kept member's live boot, and the same fence, as the
+    /// heal that started that run did. `node` is noted left out, so its restart is re-added
+    /// as a shadow, as after [`Self::drained`]'s drop. [`Self::rebuild_duty`] answers once the
+    /// commit lands, or when the fresh run quarantines again.
+    fn replan_quarantined(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        plan: &RecoveryPlan,
+        fence: FencingProof,
+    ) {
+        let members: Vec<Member> = plan
+            .config
+            .members
+            .iter()
+            .filter(|member| member.node != node)
+            .map(|member| Member {
+                boot: if member.node == self.node {
+                    self.boot
+                } else {
+                    self.links.boot_of(member.node).unwrap_or(member.boot)
+                },
+                ..*member
+            })
+            .collect();
+        if let Some(left) = plan.config.members.iter().find(|m| m.node == node) {
+            let entry = self.left_out.entry(partition).or_default();
+            entry.retain(|member| member.node != left.node);
+            entry.push(*left);
+        }
+        let version = ConfigVersion(plan.config.config_version.0 + 1);
+        let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
+        let fresh = crate::admin::recovery_plan(
+            plan.anchor,
+            version,
+            members,
+            self.boot,
+            plan.authority_view.grant_id,
+            plan.authority_view.authority_generation,
+        );
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            dropped = node.0,
+            generation = plan.anchor.lineage.generation.0,
+            config_version = version.0,
+            control_revision = fence.control_revision.0,
+            boots = ?boots,
+            "rebuild_quarantine_replan"
+        );
+        for event in [
+            RecoveryEvent::Plan(Box::new(fresh)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ] {
+            self.push(
+                Site {
+                    partition,
+                    correlation: REJOIN,
+                },
+                EventKind::Kernel(KernelEvent::Recovery(event)),
+                false,
+                None,
+            );
+        }
+    }
+
+    /// #65: answer each `admin rebuild` waiting on a re-plan without its node: G5 once a newer
+    /// commit lands, a refusal when F1 quarantines again (the kept copies still diverge) or the
+    /// wait runs out. Nothing is wiped here; the answer lets `Db::rebuild` go on. A no-op while
+    /// no rebuild waits.
+    fn rebuild_duty(&mut self, now: Tick) {
+        use crate::admin::rebuild::{drop_landed, kept, Ready, Refused};
+        if self.rebuild_asks.is_empty() {
+            return;
+        }
+        let partitions: Vec<PartitionId> = self.rebuild_asks.keys().copied().collect();
+        for partition in partitions {
+            let Some(ask) = self.rebuild_asks.get(&partition) else {
+                continue;
+            };
+            let node = ask.node;
+            let quarantined = self
+                .recoveries
+                .get(&partition)
+                .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined));
+            let landed = self
+                .committed
+                .get(&partition)
+                .filter(|committed| committed.new_generation > ask.from);
+            let answer = if quarantined {
+                Err(Refused {
+                    guard: "quarantined",
+                    detail: format!(
+                        "the fresh recovery without node {} quarantined again: the copies it \
+                         kept still diverge ({:?}). Node {} was not touched",
+                        node.0,
+                        self.quarantines.get(&partition),
+                        node.0
+                    ),
+                })
+            } else if let Some(committed) = landed {
+                let members = &committed.committed.pinned_config.members;
+                drop_landed(node, &committed.mode, members).map(|()| Ready {
+                    mode: ask.mode,
+                    generation: committed.new_generation,
+                    kept: kept(members, node),
+                })
+            } else if now >= ask.deadline {
+                Err(Refused {
+                    guard: "timeout",
+                    detail: format!(
+                        "the re-plan without node {} did not commit in time, so node {} was \
+                         not wiped; it may still commit and leave node {} out: restart node {} \
+                         to re-add it",
+                        node.0, node.0, node.0, node.0
+                    ),
+                })
+            } else {
+                continue;
+            };
+            let Some(ask) = self.rebuild_asks.remove(&partition) else {
+                continue;
+            };
+            match &answer {
+                Ok(ready) => tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    rebuild = node.0,
+                    mode = ready.mode.letter(),
+                    generation = ready.generation.0,
+                    kept = ?ready.kept.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    "rebuild_dropped"
+                ),
+                Err(refused) => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    rebuild = node.0,
+                    guard = refused.guard,
+                    detail = %refused.detail,
+                    "rebuild_refused"
+                ),
+            }
+            ask.reply
+                .send(answer.map_err(crate::admin::rebuild::Unready::Failed));
+        }
+    }
+
     /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
     /// wait is reported once (`recovery_rebuild_stalled`); once pinned, F1's own deadline names
     /// each copy that has not proved the point (`RebuildStalled`), and the host reports that.
@@ -5903,11 +6777,18 @@ impl Host {
         if watch.unproven.insert(copy) {
             watch.unreported = true;
         }
+        self.stall_step.entry(partition).or_default().insert(copy);
     }
 
     /// PC15: F1 names every unproven copy at one deadline, in one step, so the stall line is
     /// written after the step with all of them, once, instead of once per copy.
     fn report_unproven(&mut self) {
+        for (partition, copies) in std::mem::take(&mut self.stall_step) {
+            if let Some(watch) = self.rebuilds.get(&partition) {
+                self.latest_stall
+                    .insert(partition, (watch.generation, copies));
+            }
+        }
         let due: Vec<PartitionId> = self
             .rebuilds
             .iter()
@@ -6104,28 +6985,18 @@ impl Host {
         let cutoff = result.selected.cutoff_seq;
         let digest = result.selected.cutoff_digest;
         let node = self.node.0;
-        // A copy that holds no older generation has nothing to link: expected, so info, not
-        // warn (review-r185 ADV3). Every other reason is a copy that cannot catch up here.
+        // Every reason is a copy that cannot catch up here, so warn. A copy holding no lineage
+        // of the partition links as an empty one (#69, `land_at`), so review-r185 ADV3's
+        // info-level `anchor_generation_absent` no longer reaches this.
         let refused = |reason: &str| {
-            if reason == "anchor_generation_absent" {
-                tracing::info!(
-                    node,
-                    partition = partition.0,
-                    generation = generation.0,
-                    cutoff = cutoff.0,
-                    reason,
-                    "land_link_refused"
-                );
-            } else {
-                tracing::warn!(
-                    node,
-                    partition = partition.0,
-                    generation = generation.0,
-                    cutoff = cutoff.0,
-                    reason,
-                    "land_link_refused"
-                );
-            }
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                generation = generation.0,
+                cutoff = cutoff.0,
+                reason,
+                "land_link_refused"
+            );
             Ok(None)
         };
         let Some(copy) = result
@@ -6776,6 +7647,10 @@ impl Host {
             | RecoveryEffect::CloseWindow
             | RecoveryEffect::Selected(_)
             | RecoveryEffect::Quarantine(_) => {
+                // #65: kept for `admin rebuild`'s G6 only; the arm does what it did.
+                if let RecoveryEffect::Quarantine(evidence) = effect {
+                    self.quarantines.insert(site.partition, *evidence);
+                }
                 tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
                 Ok(())
             }
@@ -7760,14 +8635,40 @@ impl Host {
     ) -> Result<(Generation, Seq, Digest), &'static str> {
         let to = anchor.lineage.generation;
         let base = anchor.base_seq;
-        let from = self
+        let held: Vec<Generation> = self
             .engine
             .lineages()
             .into_iter()
-            .filter(|(p, g)| *p == partition && *g < to)
+            .filter(|(p, _)| *p == partition)
             .map(|(_, g)| g)
-            .max()
-            .ok_or("anchor_generation_absent")?;
+            .collect();
+        // #69 (critic-w9 "A-R383 re-plan" option (c)): a copy missed at formation holds no
+        // lineage of the partition at all, so it holds no generation 0 to link from. It links
+        // as head 0 at the root from generation 0, as the bootstrap's own inherit does and as
+        // `inventory_reported_empty` reports it: arm 2 at base 0, arm 3 above it, where R1
+        // catches it up from seq 1. Empty is (critic-bb M9, A-R426): no lineage of the partition
+        // at any generation, which also rules out a staged copy (the engine keeps `staging` on
+        // the lineage's marks), and no publish marks stored for it. A copy holding either is
+        // refused. The instance guard is `Db::check`'s `another_database` refusal at open
+        // (A-R424, critic-bb A2): this engine is bound to the instance the node serves before
+        // the host starts, and `bind_instance` never rebinds.
+        let from = match held.iter().filter(|g| **g < to).max() {
+            Some(from) => *from,
+            None if held.is_empty() => {
+                let marks = self
+                    .engine
+                    .publish_marks(partition)
+                    .map_err(|_| "publish_marks_unreadable")?;
+                if !marks.is_empty() {
+                    return Err("publish_marks_held");
+                }
+                if let (Some(served), Some(bound)) = (self.instance, self.engine.instance()) {
+                    debug_assert_eq!(served, bound, "an empty copy of another instance");
+                }
+                Generation(0)
+            }
+            None => return Err("anchor_generation_absent"),
+        };
         let head = Seq(self.engine.buffered_applied(partition, from).0);
         if head > base {
             return Err("held_past_base");
@@ -8939,6 +9840,32 @@ fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
         .collect()
 }
 
+/// A-R383 as critic-bb rules it (A-R426 M8): whether F1's pinned rebuild of generation `pinned`
+/// holds a `ReadOnly` commit's repair back. Not pinned: never. Pinned with no stall F1 reported
+/// for that generation (`latest`, the copies its latest `RebuildStalled` step named): always,
+/// the rebuild may still finish. Pinned and stalled: while a node in `answered` holds one of
+/// the stalled copies, since an answering copy can still prove the point. A stalled copy that
+/// does not answer (dead, half-open) holds nothing: at cutoff 0 the pin is set on every commit,
+/// so it would otherwise keep the partition `ReadOnly` for good.
+fn rebuild_holds_repair(
+    pinned: Option<Generation>,
+    latest: Option<&(Generation, BTreeSet<CopyId>)>,
+    answered: &[NodeId],
+    members: &[Member],
+) -> bool {
+    let Some(generation) = pinned else {
+        return false;
+    };
+    let Some((_, stalled)) = latest.filter(|(at, _)| *at == generation) else {
+        return true;
+    };
+    answered.iter().any(|node| {
+        members
+            .iter()
+            .any(|member| member.node == *node && stalled.contains(&member.copy))
+    })
+}
+
 /// Whether a rebuild check that found F1 unpinned stays quiet. K1 ruling, condition 6: a
 /// rebuild that never pinned while L1 admits writes is not a stall anyone waits on. A
 /// `ReadOnly` commit takes no write whatever L1 says, so it is never quiet (A-R319, W5's probe:
@@ -9552,6 +10479,9 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::PeerBooted { .. } => "peer_booted",
         #[cfg(debug_assertions)]
         Msg::Damage { .. } => "damage",
+        #[cfg(debug_assertions)]
+        Msg::Fork { .. } => "fork",
+        Msg::Rebuild { .. } => "rebuild",
         Msg::Synced(_) => "synced",
         Msg::Stop => "stop",
     }

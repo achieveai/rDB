@@ -2345,7 +2345,12 @@ fn fanout_assert_paired(heard: &[Heard]) {
 
 /// B-R56: a three-node recovery reaches each secondary exactly once, after the watch delay, and
 /// the emitter only through its own routing. A member whose copy the recovery's barrier names
-/// inherits when it lands; one outside the barrier lands empty (lead ruling B-R58c).
+/// inherits when it lands. One outside the barrier that holds nothing of the partition links
+/// the new generation at the root from generation 0 (#69 option (c), ruling A-R432, which
+/// supersedes B-R58c's "lands empty" for a copy that passes the empty gate). A copy outside the
+/// barrier that holds something it cannot link is still refused and links nothing: the
+/// `m10_land_link` rows `m10_c7_a_late_copy_past_the_cutoff_links_nothing` and
+/// `m10_c7_a_late_copy_with_another_record_at_the_cutoff_links_nothing` pin that guard.
 #[retcd_test]
 fn fanout_each_other_member_hears_a_recovery_once_after_the_watch_delay() {
     use rdb_sim::harness::dispatch::CONTROL_WATCH_MILLIS;
@@ -2354,10 +2359,12 @@ fn fanout_each_other_member_hears_a_recovery_once_after_the_watch_delay() {
     let mut dispatcher = fanout_dispatcher();
     let mut scheduler = rdb_sim::sim::scheduler::Scheduler::new();
     fanout_emit(&mut dispatcher, &mut scheduler, &fanout_result(2));
-    assert!(
-        dispatcher.engine(NodeId(2)).is_none(),
-        "nothing reaches a member at emission"
-    );
+    for node in [2, 3] {
+        assert!(
+            dispatcher.engine(NodeId(node)).is_none(),
+            "nothing reaches a member at emission, and node {node} holds nothing"
+        );
+    }
 
     let heard = fanout_run(&mut dispatcher, &mut scheduler, u64::MAX);
     assert!(delay > 0, "a watch is never instant");
@@ -2392,8 +2399,8 @@ fn fanout_each_other_member_hears_a_recovery_once_after_the_watch_delay() {
     );
     assert_eq!(
         parent(3),
-        None,
-        "node 3's copy is not: it landed empty (B-R58c)"
+        Some(Generation(0)),
+        "node 3's copy is not, and held nothing: it linked at the root when it landed (#69)"
     );
     assert_eq!(dispatcher.next_deadline(), None);
 }

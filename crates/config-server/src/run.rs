@@ -257,6 +257,12 @@ impl ClientBackend for NodeBackend {
     fn record_authn_rejection(&self, reason: config_engine::AuthnRejectReason) {
         self.node.record_authn_rejection(reason);
     }
+
+    /// This node's history, so a watch cursor from another one is refused (#37).
+    fn watch_history(&self) -> Option<(config_core::ClusterId, config_core::RecoveryEpoch)> {
+        let identity = self.node.identity();
+        Some((identity.cluster_id, identity.recovery_epoch))
+    }
 }
 
 /// How long the admin-plane `Backup` RPC waits for the snapshot it triggered to be published.
@@ -272,6 +278,114 @@ const BACKUP_BUILD_DEADLINE: Duration = Duration::from_secs(300);
 /// build task — so this polls. The interval is small enough to be invisible next to the build
 /// it is waiting on and large enough to cost nothing.
 const BACKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Wait for a snapshot that a build **started after this call** published, and return it.
+///
+/// `trigger` asks for a build, `in_flight` says how many builds are running, `built` reads the
+/// snapshot this node's own builds last published, and `current` reads the published snapshot,
+/// which an install from the leader can also replace. Every wait is bounded by `deadline`.
+///
+/// Only `built` decides which snapshot is ours, so an install landing during the wait is never
+/// shipped (Revobot #73 finding 2). If an install replaces our build, or pre-empts it so it
+/// publishes nothing, this captures again; past the deadline it fails and says so.
+///
+/// A trigger that answers `AlreadyInProgress` started nothing: a build that began before this
+/// call is still running. Taking the next snapshot that build publishes would ship state
+/// captured before the call, without writes the caller saw acknowledged. So this waits until
+/// no build is running, reads the published id, and triggers again. Only after a `Started`
+/// does a change of id count, and it can then only come from a build that started after the
+/// running ones ended (#68 finding, ruling A-R440). Comparing ids rather than indexes is what
+/// makes an idle cluster work: a build at an unchanged last_log_id still gets a fresh id
+/// (ADR-0022), so two backups of a quiet cluster give two fresh exports rather than a hang.
+async fn await_fresh_snapshot<M, Fut>(
+    mut trigger: impl FnMut() -> Fut,
+    in_flight: impl Fn() -> u64,
+    built: impl Fn() -> Option<M>,
+    current: impl Fn() -> Option<M>,
+    id_of: impl Fn(&M) -> String,
+    deadline: tokio::time::Instant,
+    poll: Duration,
+) -> Result<M, config_engine::AdminError>
+where
+    Fut: std::future::Future<
+        Output = Result<config_engine::SnapshotTriggered, config_engine::AdminError>,
+    >,
+{
+    let timed_out = |what: &str| config_engine::AdminError::Unavailable {
+        reason: format!(
+            "{what} within {}s of the backup request",
+            BACKUP_BUILD_DEADLINE.as_secs()
+        ),
+    };
+    // Set once an install replaced or pre-empted a build this backup started, so the deadline
+    // says so.
+    let mut superseded = false;
+    'capture: loop {
+        let (before, current_before) = loop {
+            while in_flight() > 0 {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(timed_out("a snapshot build already running did not finish"));
+                }
+                tokio::time::sleep(poll).await;
+            }
+            let before = built().map(|m| id_of(&m));
+            let current_before = current().map(|m| id_of(&m));
+            match trigger().await? {
+                config_engine::SnapshotTriggered::Started { .. } => break (before, current_before),
+                config_engine::SnapshotTriggered::AlreadyInProgress => {
+                    tracing::info!("backup_trigger_found_a_build_running");
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(timed_out("no snapshot build could be started"));
+                    }
+                    tokio::time::sleep(poll).await;
+                }
+            }
+        };
+        loop {
+            let ours = built()
+                .map(|m| id_of(&m))
+                .filter(|id| Some(id) != before.as_ref());
+            if let Some(ours) = ours {
+                match current() {
+                    Some(meta) if id_of(&meta) == ours => return Ok(meta),
+                    // An install replaced our build after it published: its file may already
+                    // be pruned, and the installed one is not this backup's (ADR-0024).
+                    other => {
+                        tracing::info!(
+                            built = %ours,
+                            current = ?other.as_ref().map(&id_of),
+                            "backup_build_superseded_by_install"
+                        );
+                        superseded = true;
+                        break;
+                    }
+                }
+            }
+            // Our build ended without publishing: capture again. The current snapshot moved
+            // while this node built nothing, so an install pre-empted it, and the deadline
+            // error names the install (Revobot #73 round 2).
+            if in_flight() == 0 && built().map(|m| id_of(&m)) == before {
+                let installed = current().map(|m| id_of(&m)) != current_before;
+                tracing::info!(installed, "backup_build_ended_unpublished");
+                superseded |= installed;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break 'capture;
+            }
+            tokio::time::sleep(poll).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break 'capture;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    Err(timed_out(if superseded {
+        "every snapshot this backup built was replaced by an installed one"
+    } else {
+        "no snapshot was published"
+    }))
+}
 
 #[async_trait::async_trait]
 impl config_grpc::AdminBackend for NodeBackend {
@@ -367,29 +481,16 @@ impl config_grpc::AdminBackend for NodeBackend {
             trust_key: None,
         };
 
-        // Trigger, then wait for a *newer* snapshot than the one that was current when the
-        // call arrived. Comparing ids rather than indexes is what makes an idle cluster work:
-        // a build at an unchanged last_log_id still gets a fresh id (ADR-0022), so an operator
-        // taking two backups of a quiet cluster gets two fresh exports rather than a hang.
-        let capture = async {
-            let before = store.snapshot_meta().map(|m| m.snapshot_id);
-            self.node.trigger_snapshot().await?;
-            let deadline = tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE;
-            loop {
-                match store.snapshot_meta() {
-                    Some(meta) if Some(&meta.snapshot_id) != before.as_ref() => break Ok(meta),
-                    _ if tokio::time::Instant::now() >= deadline => {
-                        break Err(config_engine::AdminError::Unavailable {
-                            reason: format!(
-                                "no snapshot was published within {}s of the trigger",
-                                BACKUP_BUILD_DEADLINE.as_secs()
-                            ),
-                        })
-                    }
-                    _ => tokio::time::sleep(BACKUP_POLL_INTERVAL).await,
-                }
-            }
-        };
+        // A snapshot built after this call arrived ([`await_fresh_snapshot`]).
+        let capture = await_fresh_snapshot(
+            || self.node.trigger_snapshot(),
+            || self.storage.snapshot_builds_in_flight(),
+            || store.built_snapshot_meta(),
+            || store.snapshot_meta(),
+            |m| m.snapshot_id.clone(),
+            tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE,
+            BACKUP_POLL_INTERVAL,
+        );
         // M6-33: the policy version the artifact names. Sampled before the trigger and again
         // after publication, by `PolicyLoader::version_across`: it is `Some` only when no
         // adoption landed in between, so the version named was in force for the whole
@@ -1493,6 +1594,306 @@ async fn shutdown(running: Running) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the scripted node in [`backup_never_ships_a_build_started_before_the_call`] holds.
+    struct Scripted {
+        triggers: u32,
+        in_flight: u64,
+        /// A build from before the call is running; it publishes when the node next looks.
+        old_build_running: bool,
+        current: &'static str,
+        /// Published at the next read of the current snapshot.
+        next: Option<&'static str>,
+    }
+
+    impl Scripted {
+        /// The build from before the call publishes `old`, if it is still running.
+        fn old_build_publishes(&mut self) {
+            if self.old_build_running {
+                self.old_build_running = false;
+                self.in_flight = 0;
+                self.current = "old";
+            }
+        }
+    }
+
+    /// #68 finding (ruling A-R440): a backup ships a snapshot from a build that started after
+    /// the request, never one that was already running.
+    ///
+    /// The first trigger answers `AlreadyInProgress`: a build from before the call is running.
+    /// It publishes `old` while the backup waits, just before the second trigger starts a
+    /// build that publishes `fresh`. A backup that took the next new id would ship `old`, which
+    /// can miss writes acknowledged before the request. It must return `fresh`.
+    #[tokio::test]
+    async fn backup_never_ships_a_build_started_before_the_call() {
+        let node = std::sync::Mutex::new(Scripted {
+            triggers: 0,
+            in_flight: 0,
+            old_build_running: false,
+            current: "before",
+            next: None,
+        });
+        // No install here, so this node's builds publish everything the store shows.
+        let read = || {
+            let mut n = node.lock().unwrap();
+            let seen = n.current;
+            if let Some(next) = n.next.take() {
+                n.current = next;
+            }
+            Some(seen)
+        };
+        let got = await_fresh_snapshot(
+            || {
+                let mut n = node.lock().unwrap();
+                n.triggers += 1;
+                let answer = if n.triggers == 1 {
+                    n.in_flight = 1;
+                    n.old_build_running = true;
+                    config_engine::SnapshotTriggered::AlreadyInProgress
+                } else {
+                    // The build from before the call ends here, so this one starts; it
+                    // publishes `fresh` only after `old` has been seen.
+                    n.old_build_publishes();
+                    n.next = Some("fresh");
+                    config_engine::SnapshotTriggered::Started {
+                        snapshot_id: None,
+                        last_log_id: None,
+                    }
+                };
+                std::future::ready(Ok(answer))
+            },
+            || {
+                let mut n = node.lock().unwrap();
+                let running = n.in_flight;
+                n.old_build_publishes();
+                running
+            },
+            &read,
+            &read,
+            |id: &&str| id.to_string(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("a fresh snapshot is published");
+        assert_eq!(got, "fresh", "the backup ships the build it started");
+        assert_eq!(node.lock().unwrap().triggers, 2);
+    }
+
+    /// Revobot #73 finding 2 (ADR-0024: a backup ships the build it started): the backup's
+    /// build is started, and while it waits a snapshot from the leader is installed. The
+    /// install changes the published id first; the backup must ship its own build's `fresh`,
+    /// never `installed`.
+    #[tokio::test]
+    async fn backup_never_ships_a_snapshot_installed_while_it_waits() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+        let triggered = AtomicBool::new(false);
+        // The backup's build publishes `fresh` at the 4th read of what this node built.
+        let built_reads = AtomicU32::new(0);
+        let published = || built_reads.load(SeqCst) >= 4;
+        let got = await_fresh_snapshot(
+            || {
+                triggered.store(true, SeqCst);
+                std::future::ready(Ok(config_engine::SnapshotTriggered::Started {
+                    snapshot_id: None,
+                    last_log_id: None,
+                }))
+            },
+            || u64::from(triggered.load(SeqCst) && !published()),
+            || {
+                built_reads.fetch_add(1, SeqCst);
+                Some(if published() { "fresh" } else { "before" })
+            },
+            // The install lands as soon as the build starts and stays current until the
+            // build publishes over it.
+            || {
+                Some(match (triggered.load(SeqCst), published()) {
+                    (false, _) => "before",
+                    (true, false) => "installed",
+                    (true, true) => "fresh",
+                })
+            },
+            |id: &&str| id.to_string(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("a snapshot is published");
+        assert_eq!(got, "fresh", "the backup ships the build it started");
+    }
+
+    /// Revobot #73 finding 2: when every build the backup starts is replaced by an install
+    /// before it can be shipped, the backup captures again until its deadline, then fails and
+    /// names the install. It never ships the installed snapshot. Paused time: the 50 ms
+    /// deadline passes only through the backup's own 1 ms sleeps, so a descheduled thread
+    /// cannot end the wait before the second capture (Revobot #73 round 2).
+    #[tokio::test(start_paused = true)]
+    async fn backup_fails_when_installs_keep_replacing_its_build() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let triggers = AtomicU32::new(0);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_fresh_snapshot(
+                || {
+                    triggers.fetch_add(1, SeqCst);
+                    std::future::ready(Ok(config_engine::SnapshotTriggered::Started {
+                        snapshot_id: None,
+                        last_log_id: None,
+                    }))
+                },
+                || 0,
+                // Each trigger's build publishes a new id at once.
+                || {
+                    Some(match triggers.load(SeqCst) {
+                        0 => "b0",
+                        1 => "b1",
+                        2 => "b2",
+                        _ => "b3",
+                    })
+                },
+                || Some("installed"),
+                |id: &&str| id.to_string(),
+                tokio::time::Instant::now() + Duration::from_millis(50),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the backup's own deadline ends the wait")
+        .expect_err("an installed snapshot is never shipped");
+        let config_engine::AdminError::Unavailable { reason } = err else {
+            panic!("expected Unavailable, got {err:?}");
+        };
+        assert!(
+            reason.starts_with("every snapshot this backup built was replaced by an installed one"),
+            "the error names the install: {reason}"
+        );
+        assert!(triggers.load(SeqCst) >= 2, "the backup captured again");
+    }
+
+    /// Revobot #73 round 2, finding 1: the same, when each install pre-empts the build before it
+    /// publishes. Every build ends unpublished, so the backup captures again until its deadline,
+    /// and the error still names the install rather than saying only that nothing published.
+    /// Paused time: the deadline passes only through the backup's own sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn backup_names_the_install_when_installs_keep_pre_empting_its_build() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let triggers = AtomicU32::new(0);
+        let err = await_fresh_snapshot(
+            || {
+                triggers.fetch_add(1, SeqCst);
+                std::future::ready(Ok(config_engine::SnapshotTriggered::Started {
+                    snapshot_id: None,
+                    last_log_id: None,
+                }))
+            },
+            // Each build is pre-empted at once: none is running and none ever publishes.
+            || 0,
+            || Some("built".to_string()),
+            // Each trigger's build is pre-empted by a new installed snapshot.
+            || Some(format!("installed-{}", triggers.load(SeqCst))),
+            |id: &String| id.clone(),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a build that never publishes is never shipped");
+        let config_engine::AdminError::Unavailable { reason } = err else {
+            panic!("expected Unavailable, got {err:?}");
+        };
+        assert!(
+            reason.starts_with("every snapshot this backup built was replaced by an installed one"),
+            "the error names the install: {reason}"
+        );
+        assert!(triggers.load(SeqCst) >= 2, "the backup captured again");
+    }
+
+    /// #68 finding: under back-to-back builds from other triggers, each wait of a backup ends
+    /// at the backup's deadline with an error that names the step that ran out.
+    #[tokio::test]
+    async fn backup_wait_is_bounded_and_names_the_step_that_timed_out() {
+        // Far past the 50 ms deadline: a wait that ignores the deadline fails here, not hangs.
+        const BOUND: Duration = Duration::from_secs(5);
+        let deadline = || tokio::time::Instant::now() + Duration::from_millis(50);
+        let reason = |e: config_engine::AdminError| match e {
+            config_engine::AdminError::Unavailable { reason } => reason,
+            other => panic!("expected Unavailable, got {other:?}"),
+        };
+        let started = || {
+            std::future::ready(Ok(config_engine::SnapshotTriggered::Started {
+                snapshot_id: None,
+                last_log_id: None,
+            }))
+        };
+        let busy = || std::future::ready(Ok(config_engine::SnapshotTriggered::AlreadyInProgress));
+
+        // One build after another is always running: the backup never gets to trigger.
+        let triggers = std::sync::atomic::AtomicU32::new(0);
+        let err = tokio::time::timeout(
+            BOUND,
+            await_fresh_snapshot(
+                || {
+                    triggers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    started()
+                },
+                || 1,
+                || Some("old"),
+                || Some("old"),
+                |id: &&str| id.to_string(),
+                deadline(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the backup's own deadline ends the wait")
+        .expect_err("a build that never ends cannot be waited on for ever");
+        assert!(
+            reason(err).starts_with("a snapshot build already running did not finish"),
+            "the error names the in-flight wait"
+        );
+        assert_eq!(triggers.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Another trigger's build starts between each look and each trigger.
+        let err = tokio::time::timeout(
+            BOUND,
+            await_fresh_snapshot(
+                busy,
+                || 0,
+                || Some("old"),
+                || Some("old"),
+                |id: &&str| id.to_string(),
+                deadline(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the backup's own deadline ends the wait")
+        .expect_err("a trigger that never starts a build gives up");
+        assert!(
+            reason(err).starts_with("no snapshot build could be started"),
+            "the error names the trigger step"
+        );
+
+        // The backup's own build started but never publishes.
+        let err = tokio::time::timeout(
+            BOUND,
+            await_fresh_snapshot(
+                started,
+                || 0,
+                || Some("old"),
+                || Some("old"),
+                |id: &&str| id.to_string(),
+                deadline(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the backup's own deadline ends the wait")
+        .expect_err("a build that never publishes gives up");
+        assert!(
+            reason(err).starts_with("no snapshot was published"),
+            "the error names the publish wait"
+        );
+    }
 
     /// M6-87, the `--capabilities` half: the schema triple is an added *top-level* key.
     ///

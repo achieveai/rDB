@@ -278,7 +278,9 @@ pub struct PutOk {
     pub seq: Seq,
     /// `Published`, or `RecoveredApplied` for an answer from retained history.
     pub outcome: Outcome,
-    /// What was true when the reply was sent.
+    /// The v1 success class (spec §5.1). For `Published`, what was true when the reply was
+    /// sent. For `RecoveredApplied`, not a live copy count: the partition's mode says how many
+    /// copies hold it (bug bash #68-A3, A-R426).
     pub durability: Durability,
     /// The request as sent, so the caller can [`Db::resend`] it.
     pub sent: Box<TxnRequest>,
@@ -737,16 +739,16 @@ pub enum ReadyError {
     /// final: nothing in this open leaves it, and a reopen keeps the same members, so neither a
     /// wait nor a reopen helps (A-R196(2a)).
     ///
-    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator removes the
-    /// diverged copies from membership and fences again. This build has no command for that, so
-    /// the text does not tell the reader to do it (A-R196(2b)); the owner's `recovery_fact` log
-    /// line names the copies. The text ends with [`error::QUARANTINED_STEP`], so a refusal that
-    /// carries it gets no second step (review-s2 F-003).
+    /// The exit is ADR-rdb-0004's for `DIVERGENCE_REQUIRES_OPERATOR`: an operator takes a
+    /// diverged copy out of membership and back, `admin rebuild N` ([`Db::rebuild`], bug bash
+    /// #65 mode C). The text names it; the owner's `recovery_fact` log line names the copies, and
+    /// a rebuild of a copy the evidence does not name is refused with the evidence. The text
+    /// ends with [`error::QUARANTINED_STEP`], so a refusal that carries it gets no second step
+    /// (review-s2 F-003).
     #[error(
         "the open's recovery found copies whose histories disagree, so node {node} takes no \
-         writes; the acknowledged data is kept. This build has no repair command yet (removing \
-         a copy from membership comes in a later build), so opening the folder again will not \
-         help: {step}",
+         writes; the acknowledged data is kept, and opening the folder again will not help: \
+         {step}",
         node = .owner.0,
         step = error::QUARANTINED_STEP
     )]
@@ -1143,6 +1145,14 @@ impl Db {
                     other => refused(other),
                 })?;
                 for node in &roll.copies {
+                    // #62: a crash part way through the roll-forward, in one process.
+                    #[cfg(test)]
+                    if roll_stops_before(&config.dir, *node) {
+                        return Err(OpenError::Node(format!(
+                            "test hook: roll forward stopped before node {}",
+                            node.0
+                        )));
+                    }
                     claim
                         .engines
                         .get_mut(node)
@@ -1571,6 +1581,10 @@ impl Db {
             if looked == Err(Unlooked::NoLink) {
                 // What is known now: the owner is not reachable, whatever an earlier look saw.
                 NO_LINK.clone_into(&mut phase);
+                // A promote may have moved the partition away from it (bug bash #64): read the
+                // owner again, at most once per `OWNER_REREAD_GAP`, so the next look asks the
+                // owner `partitions/1` names now.
+                self.refresh_owner();
             }
             if let Ok(owner) = looked {
                 if owner.admits == Some(true) {
@@ -2507,6 +2521,49 @@ impl Db {
         }
     }
 
+    /// **Dev tool only**, debug builds (#65 mode C; `rdb_dev admin fork-copy`): make `node`'s
+    /// copy diverge. Its head `History` record of partition 1's lineage `generation` is
+    /// replaced by another validly chained record at the same seq ([`Msg::Fork`]), so the next
+    /// recovery that compares it with the others quarantines. The node's kernel keeps the old
+    /// head until it restarts: restart it to make the fork count. Returns the forked seq.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, or
+    /// not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn fork_record(&self, node: NodeId, generation: Generation) -> Result<u64, String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::Fork {
+            partition: PARTITION,
+            generation,
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: fork its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done
+                .map(|seq| seq.0)
+                .map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
     /// The peer links, to hold and heal.
     #[must_use]
     pub fn links(&self) -> &Arc<Links> {
@@ -2594,28 +2651,50 @@ impl Db {
     /// the owner found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
     /// proof stay; it only cannot succeed in this open.
     fn explained(&self, mut error: ApiError) -> ApiError {
-        if error.kind == ErrorKind::Unavailable {
-            if let Some(step) = self.stuck_step() {
-                error.detail = format!("{}; {step}", error.detail);
+        // A quarantine also refuses a write `LEASE_EXPIRED` or `PROTECTION_PAUSED`, whose own
+        // step ("call `Db::wait_ready`") cannot end it; the quarantined text names the rebuild
+        // that does. That text ends with its step, so it goes last, after any restart note,
+        // and no generic step follows it (bug bash #65).
+        let quarantined = matches!(
+            *lock(&self.opened.stuck),
+            Some(ReadyError::Quarantined { .. })
+        );
+        let stuck = match error.kind {
+            ErrorKind::Unavailable => self.stuck_step(),
+            ErrorKind::LeaseExpired | ErrorKind::ProtectionPaused if quarantined => {
+                self.stuck_step()
             }
-        }
-        let Some(mut note) = self.restart_note() else {
-            return error;
+            _ => None,
         };
-        if self.owner_restarted() {
-            note = format!("{note}; {REOPEN_STEP}");
+        let (before, after) = if quarantined {
+            (None, stuck)
+        } else {
+            (stuck, None)
+        };
+        if let Some(step) = before {
+            error.detail = format!("{}; {step}", error.detail);
         }
-        match error.kind {
-            ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome => {
-                error.detail = format!("{}; {note}", error.detail);
+        if let Some(mut note) = self.restart_note() {
+            if self.owner_restarted() {
+                note = format!("{note}; {REOPEN_STEP}");
             }
-            ErrorKind::NotPrimary => {
-                error.detail = format!(
-                    "{}; no node becomes primary again in this open: {note}",
-                    error.detail
-                );
+            match error.kind {
+                ErrorKind::ProtectionPaused
+                | ErrorKind::Unavailable
+                | ErrorKind::UnknownOutcome => {
+                    error.detail = format!("{}; {note}", error.detail);
+                }
+                ErrorKind::NotPrimary => {
+                    error.detail = format!(
+                        "{}; no node becomes primary again in this open: {note}",
+                        error.detail
+                    );
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        if let Some(step) = after {
+            error.detail = format!("{}; {step}", error.detail);
         }
         error
     }
@@ -2855,7 +2934,8 @@ impl Db {
     /// the partition already, or is `drop`. `UNAVAILABLE`, nothing changed, from a `Db` a crate
     /// test built by hand, which has no control store. `UNAVAILABLE`, nothing changed, when
     /// `to` does not answer within the read timeout, holds no configuration since its restart
-    /// (a stated limit: retrying will not help), or holds one older than `partitions/1`'s.
+    /// (retrying will not help), or holds one older than `partitions/1`'s; the last two do not
+    /// apply when `partitions/1` pins its members (layout 4, bug bash #64).
     /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
     /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
     /// it again picks up where it stopped.
@@ -2871,10 +2951,18 @@ impl Db {
                 .to_owned(),
                 retry_after: None,
             })?;
-        // The roles come from `to`'s own pinned configuration, read before anything is
-        // written (review-s2 F-004, A-R412).
-        let (members, members_version) =
-            admin::promote_members(to, self.look(to).ok(), self.timeouts.read)?;
+        // The roles come from `partitions/1` when it pins them (layout 4), else from `to`'s own
+        // pinned configuration, read before anything is written (review-s2 F-004, A-R412). A
+        // refused look is the answer only for a layout-3 record (bug bash #64, A-R431).
+        let (members, members_version, refused) =
+            match admin::promote_members(to, self.look(to).ok(), self.timeouts.read) {
+                Ok((members, version)) => (members, version, None),
+                Err(refused) => (
+                    Vec::new(),
+                    rdb_core::contracts::ids::ConfigVersion(0),
+                    Some(refused),
+                ),
+            };
         let (senders, boots): (
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
@@ -2916,12 +3004,17 @@ impl Db {
         let (done, answer) = mpsc::channel();
         rt.spawn(async move {
             // The caller may have given up; then nobody needs the answer.
-            let _ = done.send(admin::promote(ctx).await);
+            let _ = done.send(admin::promote_looked(ctx, refused).await);
         });
         let promoted = match answer.recv_timeout(within + Duration::from_secs(5)) {
             Ok(Ok(promoted)) => promoted,
             Ok(Err(error)) => {
-                tracing::warn!(to = to.0, %error, "db_promote_failed");
+                tracing::warn!(
+                    to = to.0,
+                    %error,
+                    no_mutation = error.no_mutation(),
+                    "db_promote_failed"
+                );
                 return Err(error.into());
             }
             Err(_) => {
@@ -2984,6 +3077,19 @@ impl Db {
     /// when the node does not start again: it then stays stopped, [`Self::boot_of`] names the
     /// boot it was given, and [`Self::restart_note`] says the restart failed (F-013).
     pub fn restart_node(&self, node: NodeId) -> Result<BootId, ApiError> {
+        self.restart_node_with(node, None)
+    }
+
+    /// [`Self::restart_node`], moving `nodes/<n>` to `aside.to` between the stop and the start
+    /// when `aside` is given (#65, `admin rebuild N --wipe`): the node then starts on an empty
+    /// folder. Under the node lock, before anything is stopped, the node's boot must still be
+    /// `aside.boot`; otherwise nothing is stopped or moved (critic-bb M5). A move that fails
+    /// starts the node again on its own folder and answers the failure.
+    pub(crate) fn restart_node_with(
+        &self,
+        node: NodeId,
+        aside: Option<Aside>,
+    ) -> Result<BootId, ApiError> {
         let Some(respawn) = &self.respawn else {
             return Err(ApiError::invalid(
                 "this Db was built without a data directory, so it cannot restart a node",
@@ -3013,6 +3119,23 @@ impl Db {
             )));
         };
         let old_boot = handle.boot;
+        if let Some(aside) = aside.as_ref().filter(|aside| aside.boot != old_boot) {
+            tracing::warn!(
+                node = node.0,
+                boot = old_boot.0,
+                drop_boot = aside.boot.0,
+                "node_wipe_refused_boot"
+            );
+            return Err(rebuild_error(
+                RetryRule::NotWired,
+                true,
+                format!(
+                    "node {} not wiped: it runs boot {}, not boot {} the drop named; it restarted \
+                     since, and may be counted again. Nothing was stopped or moved",
+                    node.0, old_boot.0, aside.boot.0
+                ),
+            ));
+        }
         let boot = match &respawn.boots {
             // A node process's boots come from its folder, so they stay fresh across processes
             // as well as restarts (ruling A-R227).
@@ -3037,9 +3160,18 @@ impl Db {
         };
         handle.stop();
         self.control.forget_node(node, old_boot);
+        let folder = respawn.nodes_dir.join(node.0.to_string());
+        // M5: the record is read after the stop, so nothing can take the node back between the
+        // check and the move.
+        let unmoved = aside.and_then(|aside| {
+            match self.wipe_fenced(node, aside.generation, Some((aside.boot, old_boot))) {
+                Some(refused) => Some(refused),
+                None => move_aside(node, &folder, &aside.to).err(),
+            }
+        });
         let started = host::spawn_with(
             node,
-            respawn.nodes_dir.join(node.0.to_string()),
+            folder,
             Arc::clone(&self.links),
             Arc::clone(&self.control),
             self.clock,
@@ -3064,7 +3196,19 @@ impl Db {
                         tracing::warn!(node = node.0, peer = other.node.0, "peer_booted_unsent");
                     }
                 }
-                Ok(boot)
+                match unmoved {
+                    None => Ok(boot),
+                    // A fence refusal, not a host fault (bb walk paper cut): the detail names
+                    // why, and the node runs on its own folder again.
+                    Some(detail) => Err(rebuild_error(
+                        RetryRule::NotWired,
+                        false,
+                        format!(
+                            "node {} restarted at boot {} on its own folder, not wiped: {detail}",
+                            node.0, boot.0
+                        ),
+                    )),
+                }
             }
             Err(detail) => {
                 tracing::error!(
@@ -3080,6 +3224,368 @@ impl Db {
                 handle.start_failed = true;
                 Err(ApiError::host(&detail))
             }
+        }
+    }
+
+    /// Why `node`'s wipe is refused after its stop, or `None` (critic-bb M5): `partitions/1`
+    /// must be at or above `generation` and leave `node` out, and with `boots` (the boot when
+    /// the wipe was asked, the boot as of the stop) `node` must not have restarted between.
+    fn wipe_fenced(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        boots: Option<(BootId, BootId)>,
+    ) -> Option<String> {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return Some(format!(
+                "node {} not wiped: this Db has no control store to check partitions/1 against",
+                node.0
+            ));
+        };
+        let (done, answer) = mpsc::channel();
+        rt.spawn(async move {
+            let _ = done.send(admin::rebuild::record(&*store).await);
+        });
+        let refused = match answer.recv_timeout(self.timeouts.read) {
+            Ok(Ok((record, members))) => {
+                admin::rebuild::fence_refusal(node, generation, (record, members.as_deref()), boots)
+                    .map(|refused| refused.to_string())
+            }
+            Ok(Err(error)) => Some(format!(
+                "node {} not wiped: {error}; its folder is left in place",
+                node.0
+            )),
+            Err(_) => Some(format!(
+                "node {} not wiped: partitions/1 did not answer in time; its folder is left in \
+                 place",
+                node.0
+            )),
+        };
+        if let Some(refused) = &refused {
+            tracing::warn!(node = node.0, %refused, "node_wipe_refused_fence");
+        }
+        refused
+    }
+
+    /// `admin rebuild <node> [--wipe]` (#65, critic-bb §3): take `node`'s copy of partition 1
+    /// out and bring it back, from an owner this `Db` runs. The owner checks the guards and,
+    /// when `node` is pinned, re-plans without it and waits for that commit; a quarantined owner
+    /// replaces its F1 first, and its rebuild always wipes. Then `node` restarts at a new boot,
+    /// its folder moved aside when wiped (never deleted), and the owner takes it back, first as
+    /// a shadow. Returns the accept line once the owner pins `node` regular again.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
+    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard or an
+    /// owner in another process. `UNAVAILABLE` with `no_mutation` false once the owner started
+    /// the drop: a re-plan that did not commit a serving partition without `node`, quarantined
+    /// again, or did not commit in time. A wipe the fence refuses restarts `node` on its own
+    /// folder and says so. An `UNAVAILABLE` with `no_mutation` false when `node` restarted but
+    /// is not pinned regular again in time.
+    pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
+        if !self.runs(self.route.owner()) && !self.runs(node) {
+            if wipe {
+                return Err(rebuild_refused(admin::rebuild::Refused {
+                    guard: "process",
+                    detail: format!(
+                        "under --nodes the wipe of node {} runs as `lr rebuild {} --wipe`, which \
+                         stops it before the fence is checked; nothing was done",
+                        node.0, node.0
+                    ),
+                }));
+            }
+            let (owner, generation) = self.left_out(node)?;
+            return Ok(format!(
+                "rebuild: node {} is left out by node {} (the owner) at generation {} (mode A); \
+                 restart it and the owner takes it back",
+                node.0, owner.0, generation.0
+            ));
+        }
+        self.rebuild_with(node, wipe).map(|rebuilt| rebuilt.line())
+    }
+
+    /// `lr rebuild <node> --wipe`'s fence (#65, M5; the substitute fence of ruling A-R441 F2),
+    /// checked by an app with no node of its own (`--nodes`) once the script has stopped
+    /// `node`. Both reads happen after that stop: the owner's live pin must not name `node` in
+    /// any role, and `partitions/1` must be at or above the owner's generation and leave `node`
+    /// out. No boot is compared: lr has no boot of the drop. It is safe because a restarted
+    /// `node` is pinned again as a shadow before it can count, and one not yet pinned holds no
+    /// counted acks. `Ok` is the go-ahead line: the caller moves the folder aside.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rebuild`]'s guards, and `UNAVAILABLE` with the fence's reason when it does
+    /// not hold. Nothing is moved either way; the folder stays where it is.
+    pub fn rebuild_fence(&self, node: NodeId) -> Result<String, ApiError> {
+        let (owner, generation) = self.left_out(node)?;
+        if let Some(refused) = self.wipe_fenced(node, generation, None) {
+            return Err(rebuild_refused(admin::rebuild::Refused {
+                guard: "M5",
+                detail: refused,
+            }));
+        }
+        tracing::info!(
+            node = node.0,
+            owner = owner.0,
+            generation = generation.0,
+            "db_rebuild_fence_holds"
+        );
+        Ok(format!(
+            "rebuild: the fence holds for node {}: read after its stop, node {} (the owner) does \
+             not pin it and partitions/1 leaves it out at generation {} or later; its folder may \
+             be moved aside",
+            node.0, owner.0, generation.0
+        ))
+    }
+
+    /// The guards an app with no node of its own can check against the owner's status: `node`
+    /// holds a copy (G1), is not the owner (G2), the owner is not quarantined (mode C needs the
+    /// owner's process) and already leaves `node` out (mode A). Returns the owner and the
+    /// generation it landed last.
+    fn left_out(&self, node: NodeId) -> Result<(NodeId, Generation), ApiError> {
+        let owner = self.route.owner();
+        let refuse = |guard: &'static str, detail: String| {
+            Err(rebuild_refused(admin::rebuild::Refused { guard, detail }))
+        };
+        if !ALL_NODES.contains(&node) {
+            return refuse(
+                "G1",
+                format!("node {} holds no copy of partition 1", node.0),
+            );
+        }
+        if node == owner {
+            return refuse(
+                "G2",
+                format!(
+                    "node {} owns partition 1; move the ownership first with `admin promote \
+                     <other node> --drop {}`",
+                    node.0, node.0
+                ),
+            );
+        }
+        let Ok(status) = self.look(owner) else {
+            return refuse(
+                "owner",
+                format!(
+                    "node {} (the owner) did not answer; nothing was done",
+                    owner.0
+                ),
+            );
+        };
+        if status
+            .recovery
+            .as_deref()
+            .is_some_and(|phase| phase.starts_with("Quarantined"))
+        {
+            return refuse(
+                "process",
+                format!(
+                    "node {} (the owner) is quarantined; rebuilding out of a quarantine needs the \
+                     owner's own process (`admin rebuild {}` there); nothing was done",
+                    owner.0, node.0
+                ),
+            );
+        }
+        if status.pinned.iter().any(|member| member.node == node) {
+            return refuse(
+                "process",
+                format!(
+                    "node {} is still pinned; under --nodes the owner cannot be asked to drop it: \
+                     stop it (`lr stop {}`), then send one write: the owner drops a stopped copy \
+                     about 10 s after a write finds it gone, and with no writes it stays pinned; \
+                     then rebuild it; nothing was done",
+                    node.0, node.0
+                ),
+            );
+        }
+        let Some(generation) = status.recovered else {
+            return refuse(
+                "owner",
+                format!(
+                    "node {} (the owner) has landed no generation yet; nothing was done",
+                    owner.0
+                ),
+            );
+        };
+        Ok((owner, generation))
+    }
+
+    /// [`Self::rebuild`], answering what it did.
+    pub(crate) fn rebuild_with(
+        &self,
+        node: NodeId,
+        wipe: bool,
+    ) -> Result<admin::rebuild::Rebuilt, ApiError> {
+        let refused = rebuild_refused;
+        let Some(respawn) = &self.respawn else {
+            return Err(ApiError::invalid(
+                "this Db was built without a data directory, so it cannot rebuild a node",
+            ));
+        };
+        let owner = self.route.owner();
+        if !self.runs(owner) || !self.runs(node) {
+            return Err(refused(admin::rebuild::Refused {
+                guard: "process",
+                detail: format!(
+                    "admin rebuild runs here only when this process runs node {} and the owner \
+                     (node {}); for separate node processes use `lr rebuild {}`",
+                    node.0, owner.0, node.0
+                ),
+            }));
+        }
+        // The boot the wipe is fenced on: a restart of `node` from here on refuses the wipe.
+        let boot = self.boot_of(node);
+        let within = heal_within(&respawn.budgets);
+        let (reply, answer) = mpsc::channel();
+        let asked = Msg::Rebuild {
+            partition: PARTITION,
+            node,
+            within,
+            reply: host::RebuildReply(reply),
+        };
+        if self.send_to(owner, asked).is_err() {
+            return Err(ApiError::host(&format!(
+                "node {} (the owner) stopped before it was asked to rebuild node {}",
+                owner.0, node.0
+            )));
+        }
+        let ready = match answer.recv_timeout(within + Duration::from_secs(5)) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(admin::rebuild::Unready::Refused(refusal))) => return Err(refused(refusal)),
+            Ok(Err(admin::rebuild::Unready::Failed(failure))) => {
+                return Err(rebuild_failed(failure))
+            }
+            Err(_) => {
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "node {} (the owner) did not answer the rebuild of node {} in time; it \
+                         may still drop it. Node {} was not wiped: restart it to re-add it",
+                        owner.0, node.0, node.0
+                    ),
+                ))
+            }
+        };
+        let wipe = wipe || ready.mode == admin::rebuild::RebuildMode::Quarantined;
+        let aside = match (wipe, boot) {
+            (false, _) => None,
+            (true, Some(boot)) => Some(Aside {
+                boot,
+                generation: ready.generation,
+                to: aside_path(&respawn.nodes_dir, node, boot),
+            }),
+            (true, None) => {
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "node {} has no boot here, so its wipe cannot be fenced; it was left out \
+                         at generation {} and not wiped: restart node {} to re-add it",
+                        node.0, ready.generation.0, node.0
+                    ),
+                ))
+            }
+        };
+        // Revobot #73 finding 1: a mode C out of a reopen's quarantine finds this open never
+        // ready, and a restart waits for that. The drop commit just landed, so the owner
+        // admits a moment later: wait for it, as the end of a rebuild does.
+        if !self.ready() {
+            if let Err(error) = self.wait_ready(within) {
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "generation {} left node {} out, but node {} (the owner) did not admit \
+                         writes within {} s ({error}), so node {} was not restarted or wiped: \
+                         restart it to re-add it",
+                        ready.generation.0,
+                        node.0,
+                        owner.0,
+                        within.as_secs(),
+                        node.0
+                    ),
+                ));
+            }
+        }
+        let moved = aside.as_ref().map(|aside| aside.to.clone());
+        // A1 (critic-65): once the folder has moved, every later error says where it is.
+        let named = |mut error: ApiError| {
+            // Revobot #73 finding 3: past Ready, the owner may have committed the drop (modes B and
+            // C), so nothing after it claims `no_mutation`.
+            error.no_mutation = false;
+            if let Some(to) = moved.as_ref().filter(|to| to.exists()) {
+                // Before the tail that ends a rebuild error, so it still ends the detail.
+                let tail = format!("; {}", error::REBUILD_STEP);
+                let head = error.detail.strip_suffix(&tail).map(str::to_owned);
+                error.detail = format!(
+                    "{}; node {}'s old folder is kept at {}{}",
+                    head.as_deref().unwrap_or(&error.detail),
+                    node.0,
+                    to.display(),
+                    if head.is_some() { tail.as_str() } else { "" }
+                );
+            }
+            error
+        };
+        let boot = self.restart_node_with(node, aside).map_err(named)?;
+        self.await_regular(node, within).map_err(named)?;
+        // Pinned regular is not yet admitting: the owner's L1 resumes writes a moment later
+        // (bb walk: ~50 ms). Wait for that, so the next write is not refused right after
+        // "rebuilt"; when it does not come, the line says why instead.
+        let writes_wait = self.wait_ready(within).err().map(|error| error.to_string());
+        let rebuilt = admin::rebuild::Rebuilt {
+            node,
+            mode: ready.mode,
+            generation: ready.generation,
+            kept: ready.kept,
+            boot,
+            aside: moved,
+            writes_wait,
+        };
+        tracing::info!(
+            node = node.0,
+            mode = rebuilt.mode.letter(),
+            generation = rebuilt.generation.0,
+            boot = boot.0,
+            aside = ?rebuilt.aside,
+            "db_rebuilt"
+        );
+        Ok(rebuilt)
+    }
+
+    /// Wait until the owner pins `node` as a regular secondary, at most `within`.
+    fn await_regular(&self, node: NodeId, within: Duration) -> Result<(), ApiError> {
+        let started = Instant::now();
+        loop {
+            let pinned = self.inspect(self.route.owner()).is_some_and(|status| {
+                status.pinned.iter().any(|member| {
+                    member.node == node
+                        && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                })
+            });
+            if pinned {
+                return Ok(());
+            }
+            if started.elapsed() >= within {
+                tracing::warn!(
+                    node = node.0,
+                    within_ms = within.as_millis(),
+                    "db_rebuild_not_regular"
+                );
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "node {} restarted but is not pinned regular again within {} s; it may \
+                         still be catching up as a shadow: `nodes` shows when it is back",
+                        node.0,
+                        within.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -3517,6 +4023,107 @@ fn counter_refused(instance: &[u8; INSTANCE_LEN], error: admin::CounterError) ->
     }
 }
 
+/// Where [`Db::restart_node_with`] moves a node's folder, and the boot the node must still run
+/// for the move to happen (#65, critic-bb G7 and M5).
+#[derive(Debug, Clone)]
+pub(crate) struct Aside {
+    /// The boot the drop named.
+    pub(crate) boot: BootId,
+    /// The generation of the commit that left the node out: `partitions/1`, read after the
+    /// stop, must be at or above it and not name the node (M5).
+    pub(crate) generation: Generation,
+    /// Where `nodes/<n>` goes. Never deleted (spec §8.4 retention).
+    pub(crate) to: PathBuf,
+}
+
+/// A rebuild guard's refusal as the caller sees it: `INVALID_ARGUMENT` for a node that holds no
+/// copy or owns the partition (G1, G2), else `UNAVAILABLE`; nothing was done either way. A
+/// refusal on the cluster's state (a re-plan running, a copy still pinned, a quarantine) can
+/// pass once that changes, so it is `RetryAfterRecovery`; only "process" (this process cannot
+/// run it) is `NotWired`. Each ends with [`error::REBUILD_STEP`], since its detail names the
+/// step.
+fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
+    tracing::warn!(guard = refused.guard, detail = %refused.detail, "db_rebuild_refused");
+    if matches!(refused.guard, "G1" | "G2") {
+        ApiError::invalid(refused.to_string())
+    } else {
+        let retry = if refused.guard == "process" {
+            RetryRule::NotWired
+        } else {
+            RetryRule::RetryAfterRecovery
+        };
+        rebuild_error(retry, true, refused.to_string())
+    }
+}
+
+/// Revobot #73 finding 3: the owner failed a rebuild after it started the drop (a revocation
+/// queued, or the quarantined F1 replaced). The kind and retry rule are a refusal's; it never
+/// claims `no_mutation`.
+fn rebuild_failed(failed: admin::rebuild::Refused) -> ApiError {
+    ApiError {
+        no_mutation: false,
+        ..rebuild_refused(failed)
+    }
+}
+
+/// An `UNAVAILABLE` from `admin rebuild` whose `detail` names its own step: it ends with
+/// [`error::REBUILD_STEP`], so no generic step is added after it.
+fn rebuild_error(retry: RetryRule, no_mutation: bool, detail: String) -> ApiError {
+    ApiError {
+        kind: ErrorKind::Unavailable,
+        retry,
+        no_mutation,
+        detail: format!("{detail}; {}", error::REBUILD_STEP),
+        retry_after: None,
+    }
+}
+
+/// Where a wipe moves `nodes/<node>`: `<dir>/aside/node-<n>-boot-<b>-<unix ms>`, beside
+/// `nodes_dir`, kept for the operator (spec §8.4 retention).
+fn aside_path(nodes_dir: &Path, node: NodeId, boot: BootId) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    nodes_dir
+        .parent()
+        .unwrap_or(nodes_dir)
+        .join("aside")
+        .join(format!("node-{}-boot-{}-{millis}", node.0, boot.0))
+}
+
+/// Move `folder` to `to`, creating `to`'s parent. Never deletes (critic-bb G7).
+fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
+    let moved = to
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::rename(folder, to));
+    match moved {
+        Ok(()) => {
+            tracing::warn!(
+                node = node.0,
+                from = %folder.display(),
+                to = %to.display(),
+                "node_folder_moved_aside"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(
+                node = node.0,
+                from = %folder.display(),
+                to = %to.display(),
+                %error,
+                "node_folder_move_failed"
+            );
+            Err(format!(
+                "moving {} to {}: {error}",
+                folder.display(),
+                to.display()
+            ))
+        }
+    }
+}
+
 /// How long the heal may wait for old grants to clear: a whole grant, its clock error and
 /// dispatch margin, and 10 s of slack for the store.
 fn heal_within(budgets: &Budgets) -> Duration {
@@ -3881,8 +4488,31 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Test-only (#62): open directories whose next roll-forward stops before it links the named
+/// node's copy, as a process that crashed part way through the loop would. Used once.
+#[cfg(test)]
+static ROLL_STOP: Mutex<Vec<(PathBuf, NodeId)>> = Mutex::new(Vec::new());
+
+/// Test-only: the next roll-forward of the open of `dir` stops before node `node`'s copy.
+#[cfg(test)]
+fn stop_roll_before(dir: &Path, node: NodeId) {
+    lock(&ROLL_STOP).push((dir.to_path_buf(), node));
+}
+
+/// Whether the roll-forward of the open of `dir` stops here; a hit disarms the hook.
+#[cfg(test)]
+fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
+    let mut stops = lock(&ROLL_STOP);
+    let before = stops.len();
+    stops.retain(|(at, stop)| !(at == dir && *stop == node));
+    stops.len() != before
+}
+
 #[cfg(test)]
 mod reopen_tests;
+
+#[cfg(test)]
+mod rebuild_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7251,17 +7881,31 @@ mod tests {
         let (tx, mailbox) = std::sync::mpsc::channel();
         db.links.register(OWNER, tx, host::BOOT);
         let looks = Arc::new(AtomicU64::new(0));
+        // Looks up to this count answer faulted; later ones answer admitting.
+        let faulted_until = Arc::new(AtomicU64::new(u64::MAX));
         let node_1 = {
             let looks = Arc::clone(&looks);
+            let faulted_until = Arc::clone(&faulted_until);
             std::thread::spawn(move || {
                 while let Ok(msg) = mailbox.recv() {
                     if let Msg::Inspect { reply, .. } = msg {
-                        looks.fetch_add(1, Ordering::Relaxed);
-                        let _ = reply.send(faulted.clone());
+                        let look = looks.fetch_add(1, Ordering::Relaxed) + 1;
+                        let status = if look <= faulted_until.load(Ordering::Relaxed) {
+                            faulted.clone()
+                        } else {
+                            NodeStatus {
+                                fault: None,
+                                admits: Some(true),
+                                ..faulted.clone()
+                            }
+                        };
+                        let _ = reply.send(status);
                     }
                 }
             })
         };
+        // Faulted throughout: waited to the bound and answered `TimedOut`. A host stall only
+        // lengthens the wait, so neither check can fail on one.
         let started = std::time::Instant::now();
         let answer = db.wait_ready(Duration::from_millis(300));
         let waited = started.elapsed();
@@ -7274,9 +7918,23 @@ mod tests {
             })
         );
         assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+        // It looks again after a faulted answer: the next look is faulted, the one after admits,
+        // and only a wait that looked again answers `Ok`. This was `looks > 1` inside the 300 ms
+        // above, which a stall of the test thread broke: on 2026-10-26 its first look landed at
+        // the deadline (`ready_owner_faulted` 0.06 ms before `db_shutdown`, against ~320 ms on
+        // the green runs), so one look was all the bound held (bb-b3 gate run 58bcb773).
+        let before = looks.load(Ordering::Relaxed);
+        faulted_until.store(before + 1, Ordering::Relaxed);
+        assert_eq!(
+            db.wait_ready(host::test_patience(Duration::from_secs(5))),
+            Ok(())
+        );
+        assert!(
+            looks.load(Ordering::Relaxed) >= before + 2,
+            "it looked again"
+        );
         drop(db);
         node_1.join().expect("the stub");
-        assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
     }
 
     /// Ruling A-R196(2a): node 1's recovery quarantined diverged copies, which nothing in an
@@ -7340,10 +7998,28 @@ mod tests {
         assert_eq!(answer, Err(ReadyError::Quarantined { owner: OWNER }));
         assert_eq!(
             answer.expect_err("quarantined").to_string(),
-            "the open's recovery found copies whose histories disagree, so node 1 takes no \
-             writes; the acknowledged data is kept. This build has no repair command yet \
-             (removing a copy from membership comes in a later build), so opening the folder \
-             again will not help: do not delete the folder; stop and report it with this message"
+            format!(
+                "the open's recovery found copies whose histories disagree, so node 1 takes no \
+                 writes; the acknowledged data is kept, and opening the folder again will not \
+                 help: {}",
+                error::QUARANTINED_STEP
+            )
+        );
+        // Bug bash #65: a write the quarantine refused `LEASE_EXPIRED` said "call
+        // `Db::wait_ready`", which cannot end it. It now ends with the rebuild step and no other.
+        let refused = db.explained(ApiError {
+            kind: ErrorKind::LeaseExpired,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: true,
+            detail: "lease expired for partition 1".to_owned(),
+            retry_after: None,
+        });
+        assert!(
+            refused.detail.ends_with(error::QUARANTINED_STEP)
+                && refused.explain().contains("admin rebuild N")
+                && !refused.explain().contains("wait_ready"),
+            "{}",
+            refused.explain()
         );
         drop(db);
         node_1.join().expect("the stub");
@@ -7554,7 +8230,8 @@ mod tests {
     /// arch-s2 "Promote", A-R256 (S2-3 walk): `admin promote 2` while node 1 is alive. Node 2
     /// commits a new generation with nodes 2 and 3, node 2 primary, and the `Db`'s calls go to
     /// node 2. Node 1's grant is frozen, so node 1 is fenced `Frozen` and refuses a put sent to
-    /// it. A put then lands on node 2 at the new generation, and the write made before reads
+    /// it; within about a second of the promote that refusal is `NOT_PRIMARY` naming node 2
+    /// (#66). A put then lands on node 2 at the new generation, and the write made before reads
     /// back there. Node 1's refusal proves it wrote nothing and its held head stays (review-s2
     /// F-012); a resend there never claims `no_mutation` and, redirected, says only that this
     /// send wrote nothing (F-014). A fault of node 2, the owner now, is named as node 2's
@@ -7562,6 +8239,8 @@ mod tests {
     /// Cuts: no freeze (the promote leaves `grants/1` as it is): node 1 is never fenced. Node 2
     /// refuses `CopyAheadOnControl` again (before A-R254): no put lands on node 2. Redirect's
     /// text back to "nothing was sent", or `Faulted` with no owner ("node 1 stopped"): red.
+    /// #66: the `OwnerLearned` arm stops at the first answer: node 1 still answers
+    /// `LEASE_EXPIRED` a second after the promote, red.
     /// Integration (~5 s: the promote waits node 1's grant out).
     #[config_log::retcd_test]
     fn m10_s2_a_promote_moves_the_owner_to_node_2_and_node_1_writes_no_more() {
@@ -7610,22 +8289,38 @@ mod tests {
                 .map(|held| (held.generation, held.applied))
         };
         let held = head(&db);
-        db.route.owner.store(OWNER.0, Ordering::Relaxed);
-        let old = db.put(b"c", b"3", None);
-        db.route.owner.store(2, Ordering::Relaxed);
-        let old = old.expect_err("node 1 took a put after the promote");
-        assert!(
-            matches!(
-                old.error.kind,
-                ErrorKind::NotPrimary | ErrorKind::LeaseExpired
-            ) && old.error.no_mutation,
-            "node 1 refused at admission, writing nothing: {old:?}"
-        );
+        // #66: node 1 was fenced by the freeze before `partitions/1` moved, so its read at the
+        // fence named itself. It reads again every 250 ms while it does, so within about a
+        // second of the promote it refuses `NOT_PRIMARY` naming node 2. Until then it may
+        // still refuse `LEASE_EXPIRED`; every refusal writes nothing.
+        let within = crate::host::test_patience(Duration::from_secs(1));
+        let promoted_at = std::time::Instant::now();
+        let old = loop {
+            db.route.owner.store(OWNER.0, Ordering::Relaxed);
+            let old = db.put(b"c", b"3", None);
+            db.route.owner.store(2, Ordering::Relaxed);
+            let old = old.expect_err("node 1 took a put after the promote");
+            assert!(
+                matches!(
+                    old.error.kind,
+                    ErrorKind::NotPrimary | ErrorKind::LeaseExpired
+                ) && old.error.no_mutation,
+                "node 1 refused at admission, writing nothing: {old:?}"
+            );
+            if old.error.kind == ErrorKind::NotPrimary {
+                break old;
+            }
+            assert!(
+                promoted_at.elapsed() < within,
+                "node 1 still answers LEASE_EXPIRED {within:?} after the promote: {old:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(old.error.detail.contains("names node 2"), "{old:?}");
 
         // review-s2 F-014: a resend to node 1 may have applied on an earlier send, so its
-        // answer never claims `no_mutation`, and its text never says nothing was sent. Node 1
-        // was fenced by the freeze before `partitions/1` moved, so it still answers
-        // `LEASE_EXPIRED` here; the redirect's own text is pinned in host/tests.rs
+        // answer never claims `no_mutation`, and its text never says nothing was sent. The
+        // redirect's own text is pinned in host/tests.rs
         // (`m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner`).
         let request = old.request.expect("a refused put keeps its request");
         db.route.owner.store(OWNER.0, Ordering::Relaxed);
@@ -7781,9 +8476,12 @@ mod tests {
     /// `NotASource` from the retired receiver, F1 waited its 14 s out and dropped node 1 again,
     /// writes refused all that while. Now node 2 restores a dormant receiver to source it: no
     /// catch-up is refused, no re-plan is abandoned, and node 1 is promoted back. Node 1
-    /// restarts until one promote needed that catch-up, so the row never passes without one.
-    /// Cut: the source restore keeps a retired receiver (before the fix): `catch_up_refused`,
-    /// red.
+    /// restarts with its link to node 2 held until puts land, so it is behind at the heal (#43:
+    /// unforced, under load, 20 restarts gave no catch-up). After the heal it catches up by the
+    /// routed catch-up from node 2, or first through node 2's shadow cursor; the row asserts the
+    /// outcome, not the route (lead ruling, PR #73; the cursor route failed it 1 in 11): node 1
+    /// is promoted back, holds node 2's head, and writes go on. Cut: the source restore keeps a
+    /// retired receiver (before the fix): `catch_up_refused`, red.
     /// Integration (~10-60 s): the promote waits node 1's grant out, then each re-add and promote.
     #[config_log::retcd_test]
     fn m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on() {
@@ -7804,72 +8502,108 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let lines = || config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-        // The catch-up is routed only when a put lands between the shadow's last ACK and the
-        // promote's fence, so node 1 restarts until one was (a restart from `Active` is pinned
-        // as a shadow again, D9), at most twenty times. Each restart's writer starts after it: a
-        // put sent across a restart waits its timeout out.
-        let mut routed = 0;
-        let mut request = 1_000;
-        for _ in 0..20 {
-            let before = lines().len();
-            db.restart_node(OWNER).expect("restart node 1");
-            let stop = std::sync::atomic::AtomicBool::new(false);
-            let base = request;
-            let (cycle, sent) = std::thread::scope(|scope| {
-                let writer = scope.spawn(|| {
-                    let mut sent = 0;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let id = app_request_id(base + sent).expect("below 2^63");
-                        let _ = db.put_as(id, format!("w{sent}").as_bytes(), b"v", None);
-                        sent += 1;
-                        std::thread::yield_now();
-                    }
-                    sent
-                });
-                let cycle = loop {
-                    let lines = lines();
-                    let cycle = lines[before..].to_vec();
-                    let settled = cycle
-                        .iter()
-                        .position(|line| {
-                            line["@m"] == "shadow_promote"
-                                && line["node"] == 2
-                                && line["shadow"] == 1
-                        })
-                        .is_some_and(|at| {
-                            cycle[at..].iter().any(|line| {
-                                (line["@m"] == "rejoin_committed" && line["node"] == 2)
-                                    || line["@m"] == "rejoin_abandoned"
-                            })
-                        });
-                    if settled {
-                        break cycle;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "node 2 did not promote node 1 back within {patience:?}"
-                    );
-                    std::thread::sleep(Duration::from_millis(50));
-                };
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                (cycle, writer.join().expect("writer"))
-            });
-            request += sent;
-            if cycle
-                .iter()
-                .any(|line| line["@m"] == "catch_up_routed" && line["node"] == 2)
-            {
-                routed += 1;
-                break;
+        // The catch-up is routed only when node 1 is short of node 2's head at the promote's
+        // fence. Waiting for a put to land in that window by chance failed under load (#43:
+        // 20 restarts, 20 promotes, no catch-up). So node 1 restarts with its link to node 2
+        // held, and puts land on nodes 2 and 3 before the heal: node 1 is provably behind.
+        let before = lines().len();
+        db.links().hold(OWNER, NodeId(2));
+        db.restart_node(OWNER).expect("restart node 1");
+        /// Sets the writer's `stop` when dropped, so a failed assertion in the scope below ends
+        /// the writer instead of leaving the scope waiting on it for ever (Revobot #73 finding 5).
+        struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        let lines = lines();
-        let refused: Vec<_> = lines
-            .iter()
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let landed = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&stop);
+            scope.spawn(|| {
+                let mut sent = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let id = app_request_id(1_000 + sent).expect("below 2^63");
+                    if db
+                        .put_as(id, format!("w{sent}").as_bytes(), b"v", None)
+                        .is_ok()
+                    {
+                        landed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    sent += 1;
+                    std::thread::yield_now();
+                }
+            });
+            while landed.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no put landed on nodes 2 and 3 while node 1's link was held, within \
+                     {patience:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            db.links().heal(OWNER, NodeId(2));
+            loop {
+                let lines = lines();
+                let cycle = lines[before..].to_vec();
+                let settled = cycle
+                    .iter()
+                    .position(|line| {
+                        line["@m"] == "shadow_promote" && line["node"] == 2 && line["shadow"] == 1
+                    })
+                    .is_some_and(|at| {
+                        cycle[at..].iter().any(|line| {
+                            (line["@m"] == "rejoin_committed" && line["node"] == 2)
+                                || line["@m"] == "rejoin_abandoned"
+                        })
+                    });
+                if settled {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "node 2 did not promote node 1 back within {patience:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Writes go on after the re-add: more puts land once node 1 is promoted back.
+            let promoted_at = landed.load(std::sync::atomic::Ordering::Relaxed);
+            while landed.load(std::sync::atomic::Ordering::Relaxed) < promoted_at + 3 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writes stopped after node 1 was promoted back, within {patience:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        // Node 1 caught up, by either route: it holds node 2's generation through node 2's
+        // head. Read after the writer stopped, so the head stands still.
+        let holds = |node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .and_then(|status| status.holds)
+        };
+        let head = holds(NodeId(2)).expect("node 2 holds");
+        loop {
+            let held = holds(OWNER);
+            if held.is_some_and(|held| {
+                held.generation >= head.generation && held.durable >= head.applied
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 holds {held:?}, not node 2's {head:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let refused: Vec<_> = lines()
+            .into_iter()
             .filter(|line| line["@m"] == "catch_up_refused" || line["@m"] == "rejoin_abandoned")
             .collect();
         assert!(refused.is_empty(), "{refused:?}");
-        assert_eq!(routed, 1, "no restart needed a catch-up from node 2");
         db.shutdown();
     }
 
@@ -11013,6 +11747,106 @@ mod tests {
         );
         ready_and_reads_back(&db, "after the cut flatten");
         db.shutdown();
+    }
+
+    /// Generation 2 committed and its process died before linking it (`AfterCommit::Fault`);
+    /// then the open that rolls it forward stopped after `k` of the 3 copies (#62). Returns
+    /// with `k` copies at generation 2 and the rest at generation 1.
+    fn rolled_forward_part_way(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+        k: u32,
+    ) {
+        wrote_a_and_quit(rt, dir, store);
+        crate::host::set_after_commit(dir, Some(crate::host::AfterCommit::Fault));
+        let mut db = open_fast(rt, dir, store).expect("the reopen cut short");
+        until_stored(rt, store, 2);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir, None);
+        stop_roll_before(dir, NodeId(k + 1));
+        match open_fast(rt, dir, store) {
+            Err(OpenError::Node(text)) if text.starts_with("test hook") => {}
+            other => panic!(
+                "k={k}: the roll-forward stops part way, not {:?}",
+                other.map(|_| "Db")
+            ),
+        }
+        for n in 1..=3u32 {
+            let engine = RocksEngine::open_existing(dir.join("nodes").join(n.to_string()))
+                .expect("open a copy");
+            assert_eq!(
+                engine.lineages().contains(&(PARTITION, Generation(2))),
+                n <= k,
+                "k={k}: node {n}"
+            );
+        }
+    }
+
+    /// #62 (A-R426): a process crashed part way through an open's roll-forward, after k of the
+    /// 3 copies were linked to generation 2. The next open finishes it: a copy serves the
+    /// record's generation, so `check` takes the heal path (no second roll-forward), F1 commits
+    /// mode `Active` (the issue predicted `ReadOnly`), a=1 reads back, a put lands, and every
+    /// copy holds the generation N this open commits. For k = 1 and k = 2. Cut: `check` counts the generation held only
+    /// when every copy serves it; the mix goes to `roll_forward_copies`, which refuses it
+    /// `Stale` ("a copy holds generation 2"), red.
+    /// Integration (~4 s per k): a fresh open, a reopen cut at its commit, a roll-forward cut
+    /// part way, an open until ready.
+    #[config_log::retcd_test]
+    fn m10_bb_62_an_open_after_a_roll_forward_cut_part_way_finishes_it_and_writes() {
+        const METHOD: &str =
+            "m10_bb_62_an_open_after_a_roll_forward_cut_part_way_finishes_it_and_writes";
+        let rt = runtime();
+        for k in 1..=2u32 {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let dir = config_testkit::fs::temp_dir();
+            rolled_forward_part_way(&rt, dir.path(), &store, k);
+            let mut db = open_fast(&rt, dir.path(), &store)
+                .unwrap_or_else(|error| panic!("k={k}: the open: {error}"));
+            // A copy serves generation 2, so `check` heals instead of rolling forward again.
+            assert!(rolled_forward(METHOD).is_empty(), "k={k}");
+            ready_and_reads_back(&db, &format!("k={k}"));
+            let owner = owner_status(&db, &format!("k={k}"));
+            assert_eq!(
+                owner.recovery.as_deref(),
+                Some("Committed"),
+                "k={k}: {owner:?}"
+            );
+            let n = owner.recovered.expect("node 1 recovered a generation");
+            // The issue predicted `ReadOnly`; F1 commits this open's generation `Active`.
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+            let last = lines
+                .iter()
+                .rev()
+                .find(|line| line["@m"] == "recovered")
+                .expect("a recovered line");
+            assert_eq!(
+                (last["generation"].as_u64(), last["mode"].as_str()),
+                (Some(n.0), Some("Active")),
+                "k={k}: {last}"
+            );
+            // Every copy ends at generation N.
+            let patience = crate::host::test_patience(Duration::from_secs(10));
+            let deadline = std::time::Instant::now() + patience;
+            loop {
+                let held: Vec<_> = db
+                    .node_status()
+                    .into_iter()
+                    .map(|status| (status.node, status.holds.map(|held| held.generation)))
+                    .collect();
+                if held.len() == 3 && held.iter().all(|(_, at)| *at == Some(n)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "k={k}: not every copy at generation {} within {patience:?}: {held:?}",
+                    n.0
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            db.shutdown();
+        }
     }
 
     /// Ruling A-R184 (critic-rollfwd row 3, F2): once a host marked a generation activated, it

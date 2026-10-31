@@ -1130,7 +1130,9 @@ impl ConfigNode {
     /// Answers [`SnapshotTriggered::AlreadyInProgress`] rather than a silent `Ok` when a
     /// build is already running: openraft's own trigger returns `false` and does nothing in
     /// that case (trap T13), and an admin plane that passed that silence on would be telling
-    /// an operator a snapshot had been requested when none had.
+    /// an operator a snapshot had been requested when none had. The same answer comes back when
+    /// openraft dropped both tries because its core still counted the last build as running
+    /// (#30): `Started` always means a build started.
     pub async fn trigger_snapshot(&self) -> Result<SnapshotTriggered, AdminError> {
         self.inner.trigger_snapshot().await
     }
@@ -1631,32 +1633,119 @@ impl NodeInner {
         if self.storage.snapshot_builds_in_flight() > 0 {
             return Ok(SnapshotTriggered::AlreadyInProgress);
         }
-        let before = self.reader.snapshot_meta().map(|m| m.snapshot_id);
-        self.raft
-            .trigger()
-            .snapshot()
-            .await
-            .map_err(|e| AdminError::Fatal(e.to_string()))?;
-        // A bounded wait for the build to publish, so the caller gets the snapshot's identity
-        // rather than a promise. Timing out is not a failure: the build is still running, and
-        // `GetMembership`/`/health` will show it when it lands.
-        let deadline = Instant::now() + self.cfg.write_timeout;
+        let started = Instant::now();
+        let deadline = started + self.cfg.write_timeout;
+        // The store publishes a build before openraft's core hears that it finished, and until
+        // the core does, it drops a trigger without a word (#30). The core's snapshot log id
+        // reaching the store's published one is the moment it has heard. Half the time at
+        // most: if the two never meet (a published file the core could not open at startup,
+        // say), the tries below still find out whether a build starts.
+        self.wait_for_core_to_hear_the_last_build(started + self.cfg.write_timeout / 2)
+            .await;
+        // The build's own publication, never an install's (Revobot #73 finding 2).
+        let before = self.storage.built_snapshot_meta().map(|m| m.snapshot_id);
+        let calls_before = self.snapshot_build_calls();
+        // Two tries. A build at an unchanged log id leaves the core's snapshot log id where it
+        // was, so the wait above cannot see that build's finish; a trigger sent in that gap is
+        // dropped, and the second try, half the remaining time later, is heard.
+        for attempt in 1..=2u32 {
+            self.raft
+                .trigger()
+                .snapshot()
+                .await
+                .map_err(|e| AdminError::Fatal(e.to_string()))?;
+            tracing::info!(attempt, "snapshot_trigger_sent");
+            let now = Instant::now();
+            let try_until = if attempt == 1 {
+                now + deadline.saturating_duration_since(now) / 2
+            } else {
+                deadline
+            };
+            loop {
+                if self.snapshot_build_calls() > calls_before {
+                    // A build started. Timing out from here is not a failure: the build is
+                    // still running, and `GetMembership`/`/health` will show it when it lands.
+                    return Ok(self.wait_for_publish(before.as_ref(), deadline).await);
+                }
+                if Instant::now() >= try_until {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+        tracing::warn!(
+            write_timeout_ms =
+                u64::try_from(self.cfg.write_timeout.as_millis()).unwrap_or(u64::MAX),
+            "snapshot_trigger_not_started"
+        );
+        Ok(SnapshotTriggered::AlreadyInProgress)
+    }
+
+    /// Wait, until `deadline`, for openraft's core to have taken in the build this store last
+    /// published. Logs when the deadline passes first: the core may still count that build as
+    /// running, and a trigger now may be dropped.
+    async fn wait_for_core_to_hear_the_last_build(&self, deadline: Instant) {
+        let mut logged = false;
         loop {
-            if let Some(meta) = self.reader.snapshot_meta() {
-                if Some(&meta.snapshot_id) != before.as_ref() {
-                    return Ok(SnapshotTriggered::Started {
+            let published = self.reader.snapshot_meta().and_then(|m| m.last_log_id);
+            let heard = self.raft.metrics().borrow().snapshot;
+            if heard >= published {
+                return;
+            }
+            if !logged {
+                tracing::info!(
+                    published = ?published,
+                    heard = ?heard,
+                    "snapshot_trigger_waiting_for_core"
+                );
+                logged = true;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    published = ?published,
+                    heard = ?heard,
+                    "snapshot_trigger_core_still_building"
+                );
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Wait, until `deadline`, for a build that has started to publish a snapshot other than
+    /// `before`. A bounded wait, so the caller gets the snapshot's identity rather than a
+    /// promise; `snapshot_id: None` means the build is still running. Only a build's own
+    /// publication counts: a snapshot installed from the leader meanwhile is not this build's
+    /// (Revobot #73 finding 2).
+    async fn wait_for_publish(
+        &self,
+        before: Option<&String>,
+        deadline: Instant,
+    ) -> SnapshotTriggered {
+        loop {
+            if let Some(meta) = self.storage.built_snapshot_meta() {
+                if Some(&meta.snapshot_id) != before {
+                    return SnapshotTriggered::Started {
                         snapshot_id: Some(meta.snapshot_id),
                         last_log_id: meta.last_log_id.map(view),
-                    });
+                    };
                 }
             }
             if Instant::now() >= deadline {
-                return Ok(SnapshotTriggered::Started {
+                return SnapshotTriggered::Started {
                     snapshot_id: None,
                     last_log_id: None,
-                });
+                };
             }
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// How many builds the store has started since it opened. An ephemeral store never builds.
+    fn snapshot_build_calls(&self) -> u64 {
+        match &self.storage {
+            StorageHandle::Ephemeral(_) => 0,
+            StorageHandle::Rocks(s) => s.snapshot_build_calls(),
         }
     }
 

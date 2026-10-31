@@ -274,7 +274,9 @@ enum Fault {
 }
 
 /// A `MemStore` whose puts on `partitions/1` can answer "unknown". Only F1's recovery CAS puts
-/// that key on a reopen, so an armed fault reaches that CAS and nothing else. Hand-written, as
+/// that key on a reopen, so an armed fault reaches that CAS and nothing else. A first open's
+/// bootstrap creates the key first (`expected_mod_revision` 0); a create is never faulted, so an
+/// armed fault reaches the bootstrap's recovery CAS there too (#45). Hand-written, as
 /// `test_store.rs` is, because `async-trait` is not a dependency of this crate.
 struct CasFault {
     inner: config_testkit::MemStore,
@@ -351,6 +353,9 @@ impl ConfigStore for CasFault {
                 return self.inner.put(request).await;
             }
             self.puts.fetch_add(1, Ordering::Relaxed);
+            if request.expected_mod_revision == Some(0) {
+                return self.inner.put(request).await;
+            }
             let fault = self.take();
             if fault == Some(Fault::DropOne) {
                 return Err(config_core::ConfigError::DeadlineExceededUnknownOutcome);
@@ -441,6 +446,53 @@ fn m10_a_reopen_whose_recovery_cas_answers_unknown_settles_by_read_then_cas() {
             faulty.partition_puts() - before
         );
         reads_back_and_writes(&db, case);
+        db.shutdown();
+    }
+}
+
+/// #45 (bug bash B4), the first open: the store answers "unknown" to the bootstrap's recovery
+/// CAS, the one that commits generation 1 over the created generation-0 record. Before M10 that
+/// left F1 `Blocked(ControlUnknown)` and the `Db` never writable. Bound to its instance from the
+/// first open, F1 resolves it as a reopen does: read `partitions/1`, the same CAS again, ready, and
+/// a put lands. Whether the CAS applied (`LoseOne`) or not (`DropOne`).
+/// Integration (~2 s): per case, one fresh open until ready.
+#[config_log::retcd_test]
+fn m10_bb_45_a_first_open_whose_recovery_cas_answers_unknown_is_ready_and_writes() {
+    let rt = runtime();
+    for (case, fault) in [
+        ("applied, reply lost", Fault::LoseOne),
+        ("never applied", Fault::DropOne),
+    ] {
+        let faulty = Arc::new(CasFault::new());
+        let store: Arc<dyn ConfigStore> = faulty.clone();
+        let dir = config_testkit::fs::temp_dir();
+        faulty.arm(Some(fault));
+
+        let mut db = open(&rt, dir.path(), &store).expect("the first open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .unwrap_or_else(|e| panic!("{case}: the first open is ready: {e}"));
+        assert_eq!(*lock(&faulty.fault), None, "{case}: the fault was used");
+        assert!(
+            faulty.partition_puts() >= 3,
+            "{case}: the create, the unknown CAS, then the settling one: {} puts",
+            faulty.partition_puts()
+        );
+        let owner = owner_status(&db, case);
+        assert_eq!(
+            owner.recovery.as_deref(),
+            Some("Committed"),
+            "{case}: {owner:?}"
+        );
+        db.put(b"a", b"1", None)
+            .unwrap_or_else(|e| panic!("{case}: a put after the first open: {e}"));
+        let got = db
+            .get(b"a")
+            .unwrap_or_else(|e| panic!("{case}: read a: {e}"));
+        assert_eq!(
+            got.value.map(|(_, v)| v),
+            Some(Bytes::from_static(b"1")),
+            "{case}"
+        );
         db.shutdown();
     }
 }
@@ -2080,6 +2132,39 @@ fn m10_s2_an_undecodable_partition_record_is_refused_by_its_key_and_changes_noth
     );
 }
 
+/// Bug bash #64, ruling A-R426 row (d): `partitions/1` stamped with a layout this build does not
+/// know (5: a newer build's record) is `Undecodable`, never a forming or an empty store. The
+/// body is this build's own layout-4 record with only its first byte changed, so every other
+/// byte would decode. Cut: `PartitionRecord::decode` takes any byte above 3 as layout 4, red.
+/// Integration (~1 s): one fresh open until ready, one refused reopen.
+#[config_log::retcd_test]
+fn bb_64_an_unknown_partition_layout_is_undecodable() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let key = Bytes::from(ControlKey::Partition(PARTITION).encode());
+    let found = rt
+        .block_on(store.get(config_core::GetRequest { key: key.clone() }))
+        .expect("read partitions/1")
+        .record
+        .expect("partitions/1 exists");
+    assert_eq!(found.value[0], 4, "F1 wrote layout 4");
+    let mut newer = found.value.to_vec();
+    newer[0] = 5;
+    rt.block_on(store.put(config_core::PutRequest {
+        key,
+        value: Bytes::from(newer),
+        expected_mod_revision: Some(found.mod_revision),
+        dedup: None,
+    }))
+    .expect("stamp partitions/1 layout 5");
+    match open(&rt, dir.path(), &store) {
+        Err(OpenError::Undecodable { .. }) => {}
+        other => panic!("layout 5 is Undecodable, not {:?}", other.map(|_| "Db")),
+    }
+}
+
 /// #59 (tester-s2), A-R230 Q3: a folder opened against a store that does not hold its records
 /// is refused with what was found and the step: point the open at the rEtcd it was made with.
 /// Folder A against an empty store finds no `partitions/1`; against folder B's store it finds
@@ -2389,55 +2474,156 @@ fn m10_s2_the_owners_wiped_copy_is_refused_with_a_promote_hint() {
     assert_eq!(marker(dir.path(), 1), None, "the empty copy stays unbound");
 }
 
-/// A-R415 C-1, A-R416 (the critic's row): after a full restart with node 1's copy lost, nodes
-/// 2 and 3 open as node processes and land no configuration, since only the owner heals. A
-/// promote of node 2 cannot tell their roles, so it is refused `UNAVAILABLE`/`NotWired` with
-/// nothing written, saying node 2 holds no configuration since its restart, never "promote
-/// again". This is the stated limit until the member list is stored. Cut: `promote_members`
-/// takes an answer with no configuration as `PeersUnknown`, red (the text says "promote
-/// again"). Integration (~2 s): one fresh open until ready, one two-node open, one app open.
+/// A-R415 C-1, bug bash #64 (ruling A-R426 row (a)): after a full restart with node 1's copy
+/// lost, nodes 2 and 3 open as node processes and land no configuration, since only the owner
+/// heals. `partitions/1` is layout 4, so the promote of node 2 takes the members from the
+/// record instead of node 2's empty status: it commits node 2 at a newer generation, the record
+/// still pins three members, and a put through the app lands. Before #64 this was refused
+/// `Unconfigured`. Cut: F1's commit writes no members (layout 3), red (`Unconfigured`); or
+/// `promote_looked` ignores the record's members, red (`Unconfigured`). Integration (~3 s): one
+/// fresh open until ready, one two-node open, one app open.
 #[config_log::retcd_test]
-fn m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_names_the_limit() {
+fn m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_takes_the_members_from_the_record() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     written_and_closed(&rt, dir.path(), &store);
+    let stored = || {
+        let read = rt
+            .block_on(store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+            }))
+            .expect("get partitions/1")
+            .record
+            .expect("partitions/1");
+        rdb_core::authority::partition::RecordMember::decode_all(&read.value)
+    };
+    let pinned = stored().expect("F1's commit wrote layout 4");
+    assert_eq!(
+        pinned.iter().map(|m| m.node.0).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "{pinned:?}"
+    );
     std::fs::remove_dir_all(dir.path().join("nodes").join("1")).expect("wipe node 1's copy");
     let mut nodes = open_node(&rt, dir.path(), &store, &[2, 3]).expect("nodes 2 and 3 open");
-    let before = partition_revision(&rt, &store);
 
     let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
-    let refused = app
-        .promote(NodeId(2), None)
-        .expect_err("node 2 holds no configuration");
+    let promoted = app
+        .promote(NodeId(2), Some(NodeId(1)))
+        .expect("the record pins the members");
     assert_eq!(
-        (refused.kind, refused.retry, refused.no_mutation),
-        (ErrorKind::Unavailable, RetryRule::NotWired, true),
-        "{refused:?}"
+        (promoted.owner, promoted.prior_owner, promoted.dropped),
+        (NodeId(2), NodeId(1), NodeId(1)),
+        "{promoted:?}"
     );
+    // Bug bash #64 leftover: the look the record overrides is not logged as a warning.
+    let warned: Vec<_> = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "m10_s2_c1_a_promote_after_a_full_restart_without_the_owner_takes_the_members_from_the_record",
+    )
+    .into_iter()
+    .filter(|line| line["@m"] == "promote_members_unknown" && line["@l"] != "Debug")
+    .collect();
     assert!(
-        refused
-            .detail
-            .starts_with("node 2 holds no configuration since its restart"),
-        "{}",
-        refused.detail
+        warned.is_empty(),
+        "a promote that succeeds warns nothing: {warned:?}"
     );
-    assert!(
-        !refused.detail.contains("promote again"),
-        "{}",
-        refused.detail
-    );
-    assert!(
-        refused
-            .detail
-            .ends_with("or promote a node that has not restarted since that node stopped"),
-        "the step names the way round (review-s2 Q-R2): {}",
-        refused.detail
-    );
+    let after = stored().expect("the new owner's commit wrote layout 4 too");
     assert_eq!(
-        partition_revision(&rt, &store),
-        before,
-        "nothing was written"
+        after.iter().map(|m| m.node.0).collect::<Vec<_>>(),
+        vec![2, 3],
+        "the new configuration pins the two kept members: {after:?}"
+    );
+    // Node 2 adopts the new generation just after the commit; until then a put is refused
+    // `UNAVAILABLE` with nothing sent, and its retry rule says to send again.
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        match app.put(b"b", b"2", None) {
+            Ok(_) => break,
+            Err(refused)
+                if refused.error.no_mutation
+                    && matches!(
+                        refused.error.kind,
+                        ErrorKind::Unavailable | ErrorKind::ProtectionPaused
+                    )
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(refused) => panic!("a put after the promote: {refused:?}"),
+        }
+    }
+    // Bug bash #64 leftover: the node process that waited for node 1 since its open sees node 2
+    // own the partition now, so its ready wait ends instead of asking node 1 forever.
+    nodes
+        .wait_ready(crate::host::test_patience(Duration::from_secs(5)))
+        .expect("nodes 2 and 3 are ready once node 2 owns the partition");
+    app.shutdown();
+    nodes.shutdown();
+}
+
+/// Bug bash #64, ruling A-R426 M1 (row (b)): a promote that stops after its Fencing CAS keeps
+/// the members in `partitions/1`. The first promote reaches nobody (`Unreachable`), so it stops
+/// after it wrote `Fencing`; then node 1's copy is lost and nodes 2 and 3 restart with no
+/// configuration. The re-run plans from the record's members and commits node 2. Cut: the
+/// Fencing CAS writes layout 3 (`encode_with`), red (`Unconfigured`). Integration (~3 s): one
+/// fresh open until ready, one stopped promote, one two-node open, one app open.
+#[config_log::retcd_test]
+fn bb_64_a_promote_stopped_after_fencing_keeps_the_members_for_the_re_run() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let before = partition_revision(&rt, &store);
+    let ctx = admin::PromoteCtx {
+        store: Arc::clone(&store),
+        budgets: fast(),
+        clock: crate::clock::HostClock::start(),
+        to: NodeId(2),
+        drop: Some(NodeId(1)),
+        within: heal_within(&fast()),
+        members: admin::members(),
+        members_version: partition_version(&rt, &store),
+        member_boot: Arc::new(|_| Some(BootId(1))),
+        send: Arc::new(|node, _| Err(NodeStopped(node))),
+    };
+    let stopped = rt
+        .block_on(admin::promote(ctx))
+        .expect_err("node 2 is reached by nobody");
+    assert!(
+        matches!(stopped, admin::PromoteError::Unreachable { node: 2 }),
+        "{stopped:?}"
+    );
+    assert!(
+        partition_revision(&rt, &store) > before,
+        "Fencing was written"
+    );
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record
+        .expect("partitions/1");
+    let fencing = PartitionRecord::decode(&read.value).expect("a partition record");
+    assert_eq!(
+        fencing.lifecycle,
+        rdb_core::authority::partition::PartitionLifecycle::Fencing
+    );
+    let kept = rdb_core::authority::partition::RecordMember::decode_all(&read.value)
+        .expect("the Fencing CAS kept the members");
+    assert_eq!(kept.len(), 3, "{kept:?}");
+
+    std::fs::remove_dir_all(dir.path().join("nodes").join("1")).expect("wipe node 1's copy");
+    let mut nodes = open_node(&rt, dir.path(), &store, &[2, 3]).expect("nodes 2 and 3 open");
+    let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
+    let promoted = app
+        .promote(NodeId(2), Some(NodeId(1)))
+        .expect("the re-run plans from the record");
+    assert_eq!(
+        (promoted.owner, promoted.dropped),
+        (NodeId(2), NodeId(1)),
+        "{promoted:?}"
     );
     app.shutdown();
     nodes.shutdown();
@@ -2600,7 +2786,7 @@ fn m10_s2_59_a_copy_behind_two_writeless_reopens_catches_up_through_a_real_open(
         .expect("node 1 publishes");
     assert_eq!(published.0, newest, "{published:?}");
 
-    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
     loop {
         let held = nodes[2]
             .node_status()
@@ -3196,7 +3382,7 @@ fn partition_and_grant(
     rdb_core::authority::grant::GrantRecord,
     u64,
 ) {
-    let (record, root, revision, _) = rt
+    let (record, root, _, revision, _) = rt
         .block_on(admin::read_partition(&**store))
         .expect("partitions/1");
     let grant = rt
@@ -3838,12 +4024,26 @@ fn m10_s2_r447_a_rerun_with_another_drop_fences_at_its_own_revision_and_commits_
         (NodeId(2), NodeId(3)),
         "{promoted:?}"
     );
+    // A-R448: the answer names the commit's revision, after this run's own `Fencing` write,
+    // which keyed the newest stored plan.
+    let plans = rt
+        .block_on(store.list(config_core::ListRequest {
+            prefix: Bytes::from_static(b"operations/"),
+            max_items: 0,
+            max_bytes: 0,
+        }))
+        .expect("list the stored plans")
+        .records;
+    let newest = plans.last().expect("the re-run's stored plan");
     assert!(
-        promoted.control_revision.0 > first,
-        "its own revision: {promoted:?}"
+        plans.len() == 2 && promoted.control_revision.0 > newest.mod_revision,
+        "the commit is after the re-run's own plan: {promoted:?}, {} plans",
+        plans.len()
     );
     assert_eq!(
-        kept(stored_plan_at(&rt, &store, promoted.control_revision.0)),
+        kept(Some(
+            admin::decode_promote_plan(&newest.value).expect("a stored plan")
+        )),
         [1, 2]
     );
     assert_eq!(kept(stored_plan_at(&rt, &store, first)), [2, 3], "kept");
@@ -3900,6 +4100,17 @@ fn m10_s2_a_promote_that_could_not_reach_node_2_finishes_when_run_again_and_rede
         "{refused:?}"
     );
     assert_eq!(partition_owner(&rt, &store), (crate::admin::OWNER, before));
+    // Bug bash #64 leftover: the refusal's log line says nothing changed.
+    let failed: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "db_promote_failed")
+        .map(|line| line["no_mutation"].as_bool())
+        .collect();
+    assert_eq!(
+        failed,
+        [Some(true)],
+        "one db_promote_failed with no_mutation=true"
+    );
 
     assert_eq!(
         nodes.restart_node(NodeId(2)).expect("node 2 runs again"),
@@ -4564,6 +4775,33 @@ mod guide_did_it_land {
         let landed = did_it_land(&app, saved)
             .unwrap_or_else(|error| panic!("never an Err after a generation change: {error}"));
         assert_eq!(landed, Landed::Yes, "z landed across the restarts");
+        // Node 3 came back as a shadow, and the owner re-plans it regular once it caught up:
+        // a commit of its own, fenced while it runs, so a read inside it is refused
+        // `LEASE_EXPIRED` (gate run 2026-10-26). Wait for it to finish before reading.
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+        loop {
+            let owner = nodes
+                .node_status()
+                .into_iter()
+                .find(|status| status.node == NodeId(1))
+                .expect("node 1 answers a look");
+            let three_regular = owner.pinned.iter().any(|member| {
+                member.node == NodeId(3)
+                    && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+            });
+            if three_regular && owner.fence.is_none() && owner.admits == Some(true) {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "node 3 never re-planned regular, or node 1 never served after: pinned {:?}, \
+                 fence {:?}, admits {:?}",
+                owner.pinned,
+                owner.fence,
+                owner.admits
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let (_, value) = nodes.get(b"z").expect("get z").value.expect("z is there");
         assert_eq!(value.as_ref(), b"1");
         app.shutdown();

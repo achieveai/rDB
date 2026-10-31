@@ -10,6 +10,7 @@
 #   scripts/local-rdb.sh drop-request N [--node M] | drop-reply N [--node M]   [--run DIR]
 #   scripts/local-rdb.sh cut-control N | uncut-control N          [--run DIR]
 #   scripts/local-rdb.sh promote N [--drop M]                     [--run DIR]
+#   scripts/local-rdb.sh rebuild N [--wipe]                       [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
@@ -21,6 +22,7 @@
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
 # it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
 # each node; when it does not, they print its last not-ready line and exit 1, leaving it running.
+# When that line says no link reaches the owner, they also print the `promote` that ends the wait.
 # Any other verb is refused with the list of verbs, exit 2.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
@@ -50,10 +52,10 @@
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
 # config-server. Every `up` builds them first (cargo skips what is fresh); `LR_BUILD=0` skips the
-# build and uses them as they are. `promote` builds rdb_dev only when it is missing, or with
-# `LR_BUILD=1`. `up --release` uses and builds them under .../release instead, cargo's own
-# folder, so a debug and a release binary are never mixed up. The run records its binaries in
-# run.env, so `start`, `restart` and every other verb use the profile the run was started
+# build and uses them as they are. `promote` builds rdb_dev first too, so it never runs a stale
+# one against newer nodes (bug bash #64); `LR_BUILD=0` skips that build too. `up --release` uses
+# and builds them under .../release instead, cargo's own folder, so a debug and a release binary
+# are never mixed up. The run records its binaries in run.env, so `start`, `restart` and every other verb use the profile the run was started
 # with; `--release` is refused on any verb but `up`.
 
 set -euo pipefail
@@ -98,7 +100,7 @@ while [ $# -gt 0 ]; do
 done
 
 usage() {
-    sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -269,16 +271,32 @@ await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an ex
     line="$(settled_line "$out")"
     if [ -n "$line" ]; then
         say "node $n: $line"
-        case "$line" in "rdb_node ready"*) return 0 ;; *) return 1 ;; esac
+        case "$line" in "rdb_node ready"*) return 0 ;; esac
+        promote_hint "$n" "$line"
+        return 1
     fi
     tail -n 5 "$RUN/out/node-$n.err" >&2 || true
     line="$(grep "^rdb_node not-ready" "$out" 2>/dev/null | tail -n1 || true)"
     if os_pid_is "$os" rdb_node; then
         say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
+        promote_hint "$n" "$line"
     else
         say "node $n: exited before it was ready${line:+; last: $line} (see $RUN/out/node-$n.err)"
     fi
     return 1
+}
+
+promote_hint() { # n line: a node that gave up waiting for an owner no link reaches names the
+    # promote that ends the wait (bug bash #64): the lowest running node but the lost one.
+    local n="$1" gone k
+    gone="$(printf '%s' "$2" | sed -n 's/.*node \([0-9]\) is not reachable from this process.*/\1/p')"
+    { [ -n "$gone" ] && [ "$gone" != "$n" ]; } || return 0
+    for k in 1 2 3; do
+        if [ "$k" != "$gone" ] && node_alive "$k"; then
+            say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
+            return 0
+        fi
+    done
 }
 
 not_ready() { # n: `start`/`restart` end here when await_ready did not see ready (A-R287 item 4)
@@ -506,6 +524,15 @@ clean() {
     say "removed $RUN"
 }
 
+last_line() { # n state: a running node's last stdout line; a stopped one's is from its last run
+    local line
+    line="$(tail -n1 "$RUN/out/node-$1.out" 2>/dev/null || true)"
+    case "$2" in
+        running*) printf '%s' "${line:--}" ;;
+        *) printf '%s' "${line:+(last run: $line)}" ;;
+    esac
+}
+
 status() {
     local n os state
     echo "run      $RUN"
@@ -514,7 +541,7 @@ status() {
         os="$(pid_of "node-$n")"
         if os_pid_is "$os" rdb_node; then state="running pid $os"; else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
-            "$(tail -n1 "$RUN/out/node-$n.out" 2>/dev/null || echo '-')" \
+            "$(last_line "$n" "$state")" \
             "$(tr '\n' ';' 2>/dev/null < "$RUN/faults/node-$n.txt" || echo none)"
     done
     "$REPO/scripts/local-cluster.sh" status --dir "$RUN/ctl" 2>/dev/null || true
@@ -525,21 +552,72 @@ status() {
 # The surviving rdb_node processes take the new plan from their control watch. rdb_dev's own
 # answer and exit code are passed through. rdb_dev is built in the run's profile (run.env), so
 # an `up --release` run promotes with a release rdb_dev too (A-R295).
-promote() {
-    local dev line release=""
+admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its exit code is ours
+    local dev line="$1" release=""
     [ "$PROFILE" = release ] && release=--release
     dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
-    if [ "${LR_BUILD:-0}" = 1 ] || [ ! -f "$dev" ]; then
+    if [ "${LR_BUILD:-1}" != 0 ] || [ ! -f "$dev" ]; then
         say "building rdb_dev into $TARGET/$PROFILE"
         # shellcheck disable=SC2086
-        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_dev) >&2
+        # A failed build must stop here, not run an older rdb_dev left in the folder: every
+        # caller sits behind `||`, where `set -e` does not apply (Revobot #73 finding 4).
+        (cd "$REPO" && cargo build $release -p rdb-api --example rdb_dev) >&2 || {
+            say "rdb_dev did not build; nothing was sent"
+            return 1
+        }
         dev="$(exe "$TARGET/$PROFILE/examples/rdb_dev")"
     fi
     [ -f "$dev" ] || die "rdb_dev not found at $dev after building"
-    line="admin promote $ARG${DROP:+ --drop $DROP}"
     say "$line (rdb_dev: $dev)"
     printf '%s\nquit\n' "$line" | "$dev" --dir "$RUN/admin" --log-dir "$RUN/logs/admin" \
         --control "$CONTROL" --nodes "$(peers)" --cert-dir "$RUN/certs" --app admin
+}
+
+promote() { admin_line "admin promote $ARG${DROP:+ --drop $DROP}"; }
+
+# Moves stopped node $1's folder to $RUN/db/aside/node-<n>-<UTC stamp> and says where; it is
+# never deleted (A-R441, A-R445). Returns 1, folder left in place, when the move fails.
+move_aside() {
+    local n="$1" aside
+    aside="$RUN/db/aside/node-$n-$(date -u +%Y%m%dT%H%M%SZ)"
+    if ! { mkdir -p "$RUN/db/aside" && mv "$RUN/db/nodes/$n" "$aside"; }; then
+        say "node $n's folder could not be moved aside to $aside"
+        return 1
+    fi
+    say "node $n's old folder moved aside to $aside"
+}
+
+# bb #65 over processes: only mode A (node N already left out by the owner) runs here, since
+# dropping N needs the owner's own process. rdb_dev checks the guards against the owner first,
+# before anything is stopped, so a refusal touches nothing (A-R441 F1). With --wipe, N is then
+# stopped and rdb_dev checks the fence, read after the stop: the owner's live pin does not name N
+# in any role and partitions/1 leaves it out (A-R441 F2). Only then is N's folder moved aside,
+# never deleted. A refused fence, or a failed move, starts N again on its own folder and exits 1.
+# Each phase prints a numbered line before it starts, so a 15 s rebuild is never silent.
+rebuild() {
+    local n="$ARG" aside steps=4 step=0
+    if [ "$WIPE" = 1 ]; then steps=5; fi
+    phase() { step=$((step + 1)); say "rebuild $n: step $step/$steps: $*"; }
+    phase "asking the owner whether node $n may be rebuilt (rdb_dev connects to every node first; a few seconds)"
+    admin_line "admin rebuild $n" || die "rebuild $n refused; node $n was not touched"
+    phase "stopping node $n (a clean stop; a hard kill after 15 s)"
+    stop_node "$n" say
+    if [ "$WIPE" = 1 ]; then
+        phase "checking with the owner that node $n is fenced out, then moving its folder aside (a few seconds)"
+        if ! admin_line "admin rebuild $n --wipe --fence"; then
+            start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+            die "rebuild $n refused; its folder is left in place and it runs on it again"
+        fi
+        if ! move_aside "$n"; then
+            start_node "$n" stopped; await_ready "$n" || not_ready "$n"
+            die "node $n's folder could not be moved aside; the folder is left in place and it runs on it again"
+        fi
+    fi
+    phase "starting node $n"
+    start_node "$n" stopped
+    phase "waiting for node $n to say ready (up to ${TIMEOUT_SEC}s)"
+    await_ready "$n" || not_ready "$n"
+    say "node $n restarted; the owner takes it back as a shadow, then regular (\`status\` shows it)"
 }
 
 case "$COMMAND" in
@@ -556,8 +634,15 @@ case "$COMMAND" in
         pick_run; check_node_arg "$ARG"
         if [ "$WIPE" = 1 ]; then
             node_alive "$ARG" && die "node $ARG runs; stop it before --wipe"
-            rm -rf "$RUN/db/nodes/$ARG"
-            say "node $ARG wiped"
+            # A pinned copy is never wiped before the owner drops it (bb #65, A-R441 A3).
+            admin_line "admin rebuild $ARG" ||
+                die "start $ARG --wipe refused: the owner still pins node $ARG, or did not answer; nothing was moved aside. Use \`lr rebuild $ARG --wipe\`"
+            # Then the fence, as `rebuild --wipe` checks it, and the folder goes aside, never
+            # deleted (A-R445).
+            admin_line "admin rebuild $ARG --wipe --fence" ||
+                die "start $ARG --wipe refused: the fence check failed; nothing was moved and node $ARG was not started"
+            move_aside "$ARG" ||
+                die "start $ARG --wipe: the folder is left in place and node $ARG was not started"
         fi
         start_node "$ARG"; await_ready "$ARG" || not_ready "$ARG" ;;
     restart) pick_run; check_node_arg "$ARG"; stop_node "$ARG"; start_node "$ARG" stopped; await_ready "$ARG" || not_ready "$ARG" ;;
@@ -578,6 +663,7 @@ case "$COMMAND" in
             [ "$DROP" != "$ARG" ] || die "promote $ARG cannot also drop $ARG"
         fi
         promote ;;
+    rebuild) pick_run; check_node_arg "$ARG"; rebuild ;;
     "") usage ;;
     *) echo "lr: unknown verb '$COMMAND'; the verbs are:" >&2; usage ;;
 esac

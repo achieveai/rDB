@@ -507,15 +507,34 @@ impl StorageHandle {
         }
     }
 
+    /// The snapshot a build of this store last published, never one a leader installed
+    /// (Revobot #73 finding 2). An ephemeral store never builds, so `None`.
+    pub fn built_snapshot_meta(
+        &self,
+    ) -> Option<openraft::SnapshotMeta<config_storage::RaftNodeId, config_storage::RaftNode>> {
+        match self {
+            StorageHandle::Ephemeral(_) => None,
+            StorageHandle::Rocks(s) => s.built_snapshot_meta(),
+        }
+    }
+
     /// How many snapshot builds this store has started and not yet finished (M5, OQ-44).
     ///
     /// Derived rather than held as a gauge, because the store counts events, not states:
-    /// builds *started* minus the ones that published minus the ones that failed. Installs
-    /// publish through the same counter, so they are subtracted back out — an install is not
-    /// a build, and counting it as one would make `TriggerSnapshot` claim a build was running
-    /// on a node that had merely received one.
+    /// builds *started* minus the ones that published, the ones that failed, and the ones an
+    /// install superseded. Installs publish through the same counter, so they are subtracted
+    /// back out — an install is not a build, and counting it as one would make
+    /// `TriggerSnapshot` claim a build was running on a node that had merely received one.
     ///
-    /// Saturating throughout: the three counters are read without a lock, so a build that
+    /// A build counts as finished once it has published, a moment before `build_snapshot`
+    /// returns; the store's own gauge stays up until the return. `trigger_snapshot` relies on
+    /// the earlier edge and covers the rest by waiting for OpenRaft to hear the build (#30).
+    ///
+    /// A superseded build publishes nothing and fails nothing. Before #68 it was not subtracted,
+    /// so after one this stayed at 1 for ever, every trigger answered `AlreadyInProgress`, and
+    /// no snapshot was built again.
+    ///
+    /// Saturating throughout: the counters are read without a lock, so a build that
     /// publishes between two loads must round to "nothing in flight" rather than underflow.
     pub fn snapshot_builds_in_flight(&self) -> u64 {
         match self {
@@ -528,6 +547,7 @@ impl StorageHandle {
                 s.snapshot_build_calls()
                     .saturating_sub(published_by_builds)
                     .saturating_sub(m.snapshot_build_failures)
+                    .saturating_sub(s.snapshot_builds_superseded())
             }
         }
     }

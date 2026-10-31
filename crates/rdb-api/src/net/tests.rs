@@ -1697,6 +1697,38 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     assert_eq!(rebooted["old"], old.0, "{rebooted}");
     assert_eq!(rebooted["boot"], again.boot.0, "{rebooted}");
 
+    // Node 3 rejoined as a shadow, and the owner re-plans it regular once it caught up: a
+    // second commit, fenced while it runs. A call inside it gets that window's documented
+    // answers, not a resume: `LEASE_EXPIRED` (gate run 2026-10-26: `shadow_promote`, then
+    // `read before` refused 12 ms later), `UNAVAILABLE` "not yet marked activated", or a put
+    // denied `GenerationChanged` that answers `UNKNOWN_OUTCOME` at its deadline. 7 of 36
+    // under load. Wait for that commit to finish before writing or reading, as m10_r394_e2
+    // does.
+    let promoted_by = std::time::Instant::now() + patience;
+    loop {
+        let owner = one
+            .db
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == NodeId(1))
+            .expect("node 1 answers a look");
+        let three_regular = owner.pinned.iter().any(|member| {
+            member.node == NodeId(3)
+                && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+        });
+        if three_regular && owner.fence.is_none() && owner.admits == Some(true) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < promoted_by,
+            "node 3 never re-planned regular, or node 1 never served after: pinned {:?}, \
+             fence {:?}, admits {:?}",
+            owner.pinned,
+            owner.fence,
+            owner.admits
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // Node 3 rejoined: writes resume on every copy, and nothing written before is lost.
     let resumed_by = std::time::Instant::now() + patience;
     loop {

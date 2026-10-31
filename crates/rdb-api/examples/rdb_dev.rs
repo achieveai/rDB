@@ -354,12 +354,32 @@
 //!                                         Prints `promoted: node n owns partition 1 at
 //!                                         generation G (was node P); node m dropped`.
 //!                                         A refusal prints `err admin promote: <error>`
-//!                                         and the run exits 1. Known gap: under `--nodes`
-//!                                         (`lr promote`) this build answers UNAVAILABLE
-//!                                         "node 2 could not be sent the new plan": the plan
-//!                                         goes as a message that never crosses the wire.
-//!                                         The partition is then left fencing, with no writes
-//! admin rebuild N | admin damage-copy N --seq S
+//!                                         and the run exits 1. Under `--nodes` (`lr
+//!                                         promote`) it runs the same way over the links
+//! admin rebuild <n> [--wipe]              take node n's copy of partition 1 out and back:
+//!                                         the owner drops n first when it is pinned (or
+//!                                         replaces a quarantined recovery without it),
+//!                                         then n restarts and rejoins as a shadow until it
+//!                                         is caught up. --wipe moves n's folder to
+//!                                         <dir>/aside/ first; it is never deleted. A
+//!                                         quarantined partition's copy is always moved
+//!                                         aside, --wipe or not: its history is the one
+//!                                         that disagrees. Prints
+//!                                         `rebuilt: node n ...` once n is pinned regular
+//!                                         again, naming the copies kept and the aside
+//!                                         folder. Refused, nothing done, for the owner
+//!                                         (promote first), a re-plan running, a partition
+//!                                         on two copies, or a quarantine whose evidence
+//!                                         does not name n. Under `--nodes` it only checks
+//!                                         that n is already left out; `lr rebuild n
+//!                                         [--wipe]` then stops n, has the fence checked
+//!                                         (`--wipe --fence`), moves the folder aside
+//!                                         and starts n
+//! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
+//!                                         n's head record as a validly chained different
+//!                                         one; `node restart n` then rejoins it and the
+//!                                         owner quarantines; `admin rebuild n` gets out
+//! admin damage-copy N --seq S
 //! node restart N --wipe | node stop N | control cut N
 //!                                         slice 2 verbs this build does not run yet: each
 //!                                         answers `not built yet: <verb>; nothing was done`,
@@ -1066,6 +1086,12 @@ struct Seen {
     /// While `wait ready` runs: its own `reached ready` line says ready, so the poller does not
     /// (k237, lead ruling on the G4 follow-up: the poller's `ready` printed before it).
     awaiting_ready: bool,
+    /// The node `admin promote` is making the owner, from the promote's start until the owner
+    /// read is that node. Between the two the prior owner is fenced `Frozen` and the new one
+    /// does not hold the newer generation yet, so the owner read said "writes stay stopped"
+    /// (bug bash #65 walk A). The poller says no owner line meanwhile; the promote's own line
+    /// answers. A refused promote clears it.
+    promoting: Option<NodeId>,
 }
 
 impl Progress {
@@ -1083,6 +1109,50 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
         poll_once(db, progress);
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Whether every node that restarted is back: `owner` did not restart, and its pinned
+/// configuration holds each restarted node at the boot it runs now as a regular secondary. The
+/// poller's "writes pause soon ... because node N restarted" is then stale, so it is not said
+/// (bug bash #65: it stayed the last word after `rebuilt` pinned node 3 again). The refusals'
+/// restart note is the `Db`'s and still names the restart.
+fn rejoined(owner: &NodeStatus, boot_of: impl Fn(NodeId) -> Option<BootId>) -> bool {
+    let restarted = restarted_nodes(&boot_of);
+    !restarted.is_empty()
+        && !restarted.contains(&owner.node)
+        && restarted.iter().all(|&node| {
+            owner.pinned.iter().any(|member| {
+                member.node == node
+                    && Some(member.boot) == boot_of(node)
+                    && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+            })
+        })
+}
+
+/// Sets [`Seen::promoting`].
+fn set_promoting(progress: &Progress, promoting: Option<NodeId>) {
+    progress
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .promoting = promoting;
+}
+
+/// The node the poller and notes read as the owner: the `primary` holding the newest
+/// generation, else node 1. After `admin promote` the prior owner still says `primary`, with a
+/// fenced grant, and holds the older generation (its `recovered` ties the new owner's); reading
+/// it printed "writes stay stopped" while the new owner took writes (bug bash #65 walk A).
+fn owner_status(nodes: &[NodeStatus]) -> Option<&NodeStatus> {
+    nodes
+        .iter()
+        .filter(|node| node.role == "primary")
+        .max_by_key(|node| {
+            (
+                node.holds.map(|holds| holds.generation),
+                std::cmp::Reverse(node.node),
+            )
+        })
+        .or_else(|| nodes.iter().find(|node| node.node == NodeId(1)))
 }
 
 /// Print each progress line that changed since it was last printed. The poller calls it every
@@ -1112,7 +1182,13 @@ fn poll_once(db: &Db, progress: &Progress) {
             };
         }
     }
-    if let Some(owner) = nodes.iter().find(|n| n.node == NodeId(1)) {
+    if let Some(to) = seen.promoting {
+        if owner_status(&nodes).map(|owner| owner.node) != Some(to) {
+            return;
+        }
+        seen.promoting = None;
+    }
+    if let Some(owner) = owner_status(&nodes) {
         if owner.recovered.is_some() && owner.recovered != seen.recovered {
             seen.recovered = owner.recovered;
             say(&format!(
@@ -1124,7 +1200,9 @@ fn poll_once(db: &Db, progress: &Progress) {
         if let Some(line) = ready_step(
             &mut seen,
             owner,
-            db.restart_note().as_deref(),
+            db.restart_note()
+                .filter(|_| !rejoined(owner, |node| db.boot_of(node)))
+                .as_deref(),
             &db.links().held(),
             &db.links().dropped(),
         ) {
@@ -1152,6 +1230,10 @@ const PAUSE_AGE_SECS: u64 = Budgets::SPEC_DEFAULTS.pause_age_millis.div_ceil(100
 const STUCK: &str =
     "writes stay stopped for this run: to write again, quit and start rdb_dev again";
 
+/// What a line says while writes are paused on a copy that is out, which M10 ends by itself.
+const RESUMES: &str = "writes are paused and resume by themselves once the owner re-plans \
+                       (the copy rejoins, or is dropped after 10 s out); `wait ready` waits";
+
 /// The reason a `ready` or `not ready` line carries, when a user could act on it wrongly. Each
 /// part is derived from the state that decides it (tester walk 7, W7-D1, W7-D2).
 ///
@@ -1160,8 +1242,8 @@ const STUCK: &str =
 /// latest about [`PAUSE_AGE_SECS`] after the next write, which stays unsafe with a copy out
 /// (tester r3). So the line promises "soon" and that bound, never a pause tied only to the
 /// next write (W7-D1). Once node 1 does not admit, the line says writes stay stopped only when
-/// that holds: L1 paused or reprotecting, which with a copy out nothing in M9 resumes, or the
-/// owner itself restarted. Not admitting because of a fence the poll can lift (FR, tester r3)
+/// that holds: the owner itself restarted. L1 paused or reprotecting with a copy out says writes
+/// resume ([`RESUMES`]): M10 re-plans or drops the copy (bb, #69 r4). Not admitting because of a fence the poll can lift (FR, tester r3)
 /// promises the resume and then the pause (W7-D2).
 ///
 /// A fenced grant. While A1's self-replace poll is live it looks stuck but is not: A1 replaces
@@ -1221,8 +1303,13 @@ fn ready_reason(
     if admits {
         return Some(format!("writes {pause}"));
     }
-    if owner.boot != rdb_api::host::BOOT || l1_rejecting(owner).is_some() {
+    if owner.boot != rdb_api::host::BOOT {
         return Some(format!("{note}; {STUCK}"));
+    }
+    // M10 (bb #65 paper cut, #69 walk r4): a copy out no longer stops writes for the run. The
+    // owner re-plans with the restarted copy, or drops a copy that stays out, and L1 resumes.
+    if let Some(mode) = l1_rejecting(owner) {
+        return Some(format!("{note}; l1={mode}: {RESUMES}"));
     }
     if let Some(line) = gave_up {
         return Some(format!("{line}; {note}"));
@@ -1682,7 +1769,7 @@ fn repl<'scope, 'env>(
             ["put", "--as", ..] => Err("put --as <n> <object> <value> [--if-version N]".to_owned()),
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
                 Ok(if_version) => {
-                    let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
+                    let answer = put_adopted(db, object.as_bytes(), value.as_bytes(), if_version);
                     let kind = Kind::Put {
                         object: object.as_bytes().to_vec(),
                         if_version,
@@ -1708,7 +1795,7 @@ fn repl<'scope, 'env>(
                 let (object, value) = ((*object).to_owned(), (*value).to_owned());
                 say(&format!("bg {object}: queued"));
                 scope.spawn(move || {
-                    let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
+                    let answer = put_adopted(db, object.as_bytes(), value.as_bytes(), if_version);
                     if answer.is_err() {
                         bg_failed.store(true, Ordering::Relaxed);
                     }
@@ -1808,7 +1895,7 @@ fn repl<'scope, 'env>(
                         .find(|status| status.node == node)
                         .map_or_else(
                             || missing_node_line(node, db.boot_of(node), db.restart_failed(node)),
-                            node_line,
+                            |status| node_line(status, owner_status(&answered)),
                         ));
                 }
                 Ok(())
@@ -1830,6 +1917,10 @@ fn repl<'scope, 'env>(
                 damage_chunk(db, object, rest).map(|ok| bad |= !ok)
             }
             ["admin", "damage", _, ..] => damage_record(db, &line).map(|ok| bad |= !ok),
+            ["admin", "fork-copy", node] => parse_node(node).map(|node| {
+                bad |= !answer(&fork_copy_line(db, node));
+            }),
+            ["admin", "fork-copy", ..] => Err(FORK_COPY_USAGE.to_owned()),
             ["admin", "clear", object] => {
                 let answer = db.write(object.as_bytes(), Change::Clear, None);
                 bad |= !kind_write_line(
@@ -1843,20 +1934,50 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["admin", "promote", rest @ ..] => {
-                parse_promote(rest).map(|(to, drop)| match promote_line(db, to, drop) {
-                    Ok(line) => say(&line),
-                    Err(line) => {
-                        say(&line);
-                        bad = true;
+                parse_promote(rest).map(|(to, drop)| {
+                    set_promoting(progress, Some(to));
+                    match promote_line(db, to, drop) {
+                        Ok(line) => say(&line),
+                        Err(line) => {
+                            set_promoting(progress, None);
+                            say(&line);
+                            bad = true;
+                        }
                     }
                 })
             }
+            ["admin", "rebuild", rest @ ..] => parse_rebuild(rest).map(|(node, ask)| {
+                let answer = match ask {
+                    RebuildAsk::Here { wipe } => {
+                        // Said before the owner answers, so it claims nothing a refusal then
+                        // contradicts (bb walk paper cut).
+                        say(&format!(
+                            "rebuild: asking the owner to take node {} out of partition 1 and \
+                             back{}; a refusal changes nothing, and an accepted rebuild waits \
+                             until node {} is back",
+                            node.0,
+                            if wipe { ", wiped" } else { "" },
+                            node.0
+                        ));
+                        db.rebuild(node, wipe)
+                    }
+                    RebuildAsk::Fence => db.rebuild_fence(node),
+                };
+                match answer {
+                    Ok(line) => say(&line),
+                    Err(error) => {
+                        tracing::warn!(node = node.0, error = %error, "repl_rebuild_refused");
+                        say(&format!("err admin rebuild {}: {error}", node.0));
+                        bad = true;
+                    }
+                }
+            }),
             ["admin", "status"] => {
                 bad |= !answer_all(&admin_status_lines(rt, db, store));
                 Ok(())
             }
             ["admin", ..] => Err(format!(
-                "admin status | {PROMOTE_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
                  clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
@@ -1954,7 +2075,6 @@ fn repl<'scope, 'env>(
 /// command`. Each line leaves this list when its verb is built.
 fn not_built(words: &[&str]) -> Option<&'static str> {
     Some(match words {
-        ["admin", "rebuild", ..] => "admin rebuild N",
         ["admin", "damage-copy", ..] => "admin damage-copy N --seq S",
         ["node", "restart", _, "--wipe"] => "node restart N --wipe",
         ["node", "stop", ..] => "node stop N",
@@ -1982,6 +2102,28 @@ fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
         ));
     }
     Ok((to, drop))
+}
+
+/// `admin rebuild`'s usage (#65).
+const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is 1, 2 or 3, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
+
+/// What `admin rebuild` was asked: in this process, or the fence `lr rebuild N --wipe` checks
+/// once it has stopped N.
+#[derive(Debug, PartialEq, Eq)]
+enum RebuildAsk {
+    Here { wipe: bool },
+    Fence,
+}
+
+/// `admin rebuild N [--wipe [--fence]]`'s words after `rebuild`.
+fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, RebuildAsk), String> {
+    let node = |n: &str| parse_node(n).map_err(|e| format!("{e}; {REBUILD_USAGE}"));
+    match rest {
+        [n] => Ok((node(n)?, RebuildAsk::Here { wipe: false })),
+        [n, "--wipe"] => Ok((node(n)?, RebuildAsk::Here { wipe: true })),
+        [n, "--wipe", "--fence"] => Ok((node(n)?, RebuildAsk::Fence)),
+        _ => Err(REBUILD_USAGE.to_owned()),
+    }
 }
 
 /// `admin promote`'s one line on success (lead, A-R245, A-R256): the new owner, the generation
@@ -2012,7 +2154,11 @@ fn promote_line(db: &Db, to: NodeId, drop: Option<NodeId>) -> Result<String, Str
             Ok(promoted_line(&promoted))
         }
         Err(error) => {
-            tracing::warn!(error = %error, "repl_promote_refused");
+            tracing::warn!(
+                error = %error,
+                no_mutation = error.no_mutation,
+                "repl_promote_refused"
+            );
             Err(format!("err admin promote: {error}"))
         }
     }
@@ -2159,7 +2305,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
         "sleep", "quit", "exit", "blob", "client", "put-loop",
     ];
-    const SUBVERBS: [&str; 26] = [
+    const SUBVERBS: [&str; 27] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -2186,6 +2332,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "control cut",
         "client drop-reply",
         "admin repair-element",
+        "admin fork-copy",
     ];
     let mut first = line.split_whitespace();
     let Some(verb) = first
@@ -3204,6 +3351,47 @@ fn root_rewrite(
 const SET_MEMBER_AS: &str = "a set member holds no envelope, so any bytes in it are damage; \
      damage a set member with --as digest, or a newer build's set with the root and --as newer";
 
+/// `admin fork-copy`'s usage (#65 mode C walk).
+const FORK_COPY_USAGE: &str = "admin fork-copy <n>: n is 1, 2 or 3; debug builds only";
+
+/// `admin fork-copy <n>` (#65): a debug-build hook that rewrites node n's head record as a
+/// validly chained different one, so n's copy diverges from the others. A restart of n then
+/// rejoins it, the owner's recovery finds the divergence and quarantines, and `admin rebuild n`
+/// is the way out (mode C). Release builds answer `err` and change nothing.
+fn fork_copy_line(db: &Db, node: NodeId) -> String {
+    #[cfg(debug_assertions)]
+    {
+        let Some(generation) = db
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == node)
+            .and_then(|status| status.holds)
+            .map(|holds| holds.generation)
+        else {
+            return format!(
+                "err admin fork-copy {}: node {} holds no copy of partition 1 to fork",
+                node.0, node.0
+            );
+        };
+        match db.fork_record(node, generation) {
+            Ok(seq) => format!(
+                "forked: node {}'s record at seq {seq} (generation {}) now differs from the other \
+                 copies; `node restart {}` rejoins it and the owner quarantines the partition",
+                node.0, generation.0, node.0
+            ),
+            Err(error) => format!("err admin fork-copy {}: {error}", node.0),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = db;
+        format!(
+            "err admin fork-copy {}: a debug-build hook; this release build changes nothing",
+            node.0
+        )
+    }
+}
+
 const DAMAGE_RECORD_USAGE: &str = "admin damage <object> [--element K | --item P] \
      [--as digest|kind0|newer] [--api-version N]; K is a map key or set member, P a list \
      position, N 0..=65535";
@@ -3879,7 +4067,7 @@ fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) -> bool {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             });
         let started = Instant::now();
-        let answer = db.put(object.as_bytes(), i.to_string().as_bytes(), None);
+        let answer = put_adopted(db, object.as_bytes(), i.to_string().as_bytes(), None);
         let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = answer
             .as_ref()
@@ -3932,7 +4120,7 @@ fn labelled_put_line(
 /// the write the partition waits on, nor that healing the links resolves it.
 fn waits_note(db: &Db) -> Option<String> {
     let nodes = db.node_status();
-    let owner = nodes.iter().find(|node| node.node == NodeId(1))?;
+    let owner = owner_status(&nodes)?;
     let links = db.links();
     waits_on_line(owner, &links.held(), &links.dropped()).map(|line| format!("note: {line}"))
 }
@@ -3944,6 +4132,41 @@ fn bg_note(db: &Db, label: &str, answer: &Result<rdb_api::PutOk, PutError>) {
         if let Some(note) = waits_note(db) {
             say(&format!("{label}: {note}"));
         }
+    }
+}
+
+/// How long a put refused with "no generation adopted yet" is sent again (bb #65 paper cut).
+const NOT_ADOPTED_PATIENCE: Duration = Duration::from_secs(3);
+
+/// `db.put`, sent again for up to [`NOT_ADOPTED_PATIENCE`] while the answer is "no generation
+/// adopted yet". Right after a promote the new owner adopts its generation a moment after it
+/// answers, and that refusal is `no_mutation` (nothing was sent), so sending it again is safe.
+/// Any other answer, and the last refusal after the patience, is returned as it came.
+fn put_adopted(
+    db: &Db,
+    object: &[u8],
+    value: &[u8],
+    if_version: Option<u64>,
+) -> Result<rdb_api::PutOk, PutError> {
+    let started = Instant::now();
+    let mut tries = 1_u32;
+    loop {
+        let answer = db.put(object, value, if_version);
+        let not_adopted = answer.as_ref().err().is_some_and(|refused| {
+            refused.error.no_mutation
+                && refused
+                    .error
+                    .detail
+                    .starts_with("no generation adopted yet")
+        });
+        if !not_adopted || started.elapsed() >= NOT_ADOPTED_PATIENCE {
+            if tries > 1 {
+                tracing::info!(tries, ok = answer.is_ok(), "repl_put_not_adopted_retried");
+            }
+            return answer;
+        }
+        tries += 1;
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -4147,13 +4370,49 @@ fn missing_node_line(node: NodeId, boot: Option<BootId>, failed: bool) -> String
     }
 }
 
+/// The `role=` a `nodes` line shows for `node`. A node that still says `primary` while `owner`
+/// (the [`owner_status`] read) is another node holding a newer generation was promoted away
+/// from: its own word is stale, so the line shows the role the owner's pinned configuration
+/// gives it (`none` when it pins it nowhere), and says the old word and who owns now (bug bash
+/// #65 walk: node 1 showed `gen=1 role=primary` after `admin promote 2` while it served as a
+/// secondary).
+fn shown_role(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
+    use rdb_core::contracts::ids::ReplicaRole;
+    let held = |status: &NodeStatus| status.holds.map(|holds| holds.generation);
+    let Some(owner) = owner.filter(|owner| {
+        owner.node != node.node && node.role == "primary" && held(owner) > held(node)
+    }) else {
+        return node.role.to_owned();
+    };
+    let pinned = owner
+        .pinned
+        .iter()
+        .find(|member| member.node == node.node)
+        .map_or("none", |member| match member.role {
+            ReplicaRole::Primary => "primary",
+            ReplicaRole::RegularSecondary => "secondary",
+            ReplicaRole::Shadow => "shadow",
+        });
+    let generation = |status: &NodeStatus| {
+        status
+            .holds
+            .map_or_else(|| "-".to_owned(), |holds| holds.generation.0.to_string())
+    };
+    format!(
+        "{pinned} (stale: says primary at gen={}; node {} owns partition 1 at gen={})",
+        generation(node),
+        owner.node.0,
+        generation(owner)
+    )
+}
+
 /// One node's line. `published=` is left off a secondary: P1 publishes nothing there, so its
 /// `0@<gen>` would read as a real position (PC12).
 ///
 /// `mode=? roles=?` stands where the partition mode (`ACTIVE`, `DEGRADED_RF2`, ..) and each
 /// copy's pinned role (regular or shadow) go once `NodeStatus` carries them (M10 S2, W5): a `?`
 /// says this build does not report them yet, so a walk reads it as no entry, not as nothing.
-fn node_line(node: &NodeStatus) -> String {
+fn node_line(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
     let published = match node.published {
         _ if node.role == "secondary" => String::new(),
         Some((g, s)) => format!(" published={}@{}", s.0, g.0),
@@ -4169,7 +4428,7 @@ fn node_line(node: &NodeStatus) -> String {
         node.recovery.as_deref().unwrap_or("-"),
         node.recovered
             .map_or_else(|| "-".to_owned(), |g| g.0.to_string()),
-        node.role,
+        shown_role(node, owner),
         node.protection.as_deref().unwrap_or("inert"),
         node.admits
             .map_or_else(|| "-".to_owned(), |a| a.to_string()),
@@ -4397,10 +4656,10 @@ fn set_lifecycle(
     rewrite(rt, cluster, &key, |body| {
         let mut record = PartitionRecord::decode(body)?;
         record.lifecycle = lifecycle;
-        // A rooted body (layout 3) stays rooted: `encode` alone writes layout 2 and drops the
-        // `PartitionRoot` the open wrote (review F-004).
-        let bytes = PartitionRoot::decode(body)
-            .map_or_else(|| record.encode(), |root| record.encode_with(&root));
+        // The body keeps its layout, its root and its members: `encode` alone writes layout 2
+        // and drops the `PartitionRoot` the open wrote (review F-004), and `encode_with` drops
+        // the members a layout-4 body pins (bug bash #64, A-R426 M1).
+        let bytes = record.encode_over(body, None)?;
         Some((bytes, format!("{:?}", record.lifecycle)))
     })
 }
@@ -4803,6 +5062,122 @@ mod tests {
         }
     }
 
+    /// Bug bash #65: after `rebuilt: node 3 ...` the poller still said "writes pause soon ...
+    /// because node 3 restarted", though the owner had pinned 3 regular at its new boot. The
+    /// note is stale only once every restarted node is pinned at its current boot.
+    #[test]
+    fn rejoined_once_the_owner_pins_each_restarted_node_at_its_boot() {
+        use rdb_core::contracts::ids::ReplicaRole;
+        use rdb_core::contracts::membership::{CopyId, Member};
+        let member = |node: u32, boot: u64, role| Member {
+            copy: CopyId(u8::try_from(node - 1).expect("small")),
+            node: NodeId(node),
+            boot: BootId(boot),
+            role,
+        };
+        let base = rdb_api::host::BOOT.0;
+        let boots = |node: NodeId| Some(BootId(if node == NodeId(3) { base + 1 } else { base }));
+        let mut owner = owner(None, true);
+        // Still pinned at the old boot: the pause note holds.
+        owner.pinned = vec![
+            member(1, base, ReplicaRole::Primary),
+            member(2, base, ReplicaRole::RegularSecondary),
+            member(3, base, ReplicaRole::RegularSecondary),
+        ];
+        assert!(!rejoined(&owner, boots));
+        // Back as a shadow: not yet.
+        owner.pinned[2] = member(3, base + 1, ReplicaRole::Shadow);
+        assert!(!rejoined(&owner, boots));
+        owner.pinned[2] = member(3, base + 1, ReplicaRole::RegularSecondary);
+        assert!(rejoined(&owner, boots));
+        // Nothing restarted: no note to drop.
+        assert!(!rejoined(&owner, |_| Some(BootId(base))));
+        // The owner itself restarted: never dropped.
+        assert!(!rejoined(&owner, |_| Some(BootId(base + 1))));
+    }
+
+    /// Bug bash #65 walk (tester, #65 thumbs-up): after `admin promote 2` the `nodes` line still
+    /// read `role=primary` for node 1 at gen=1, which serves as a secondary. A primary that the
+    /// owner read outranks shows the role the owner pins it as, and says it is stale; the owner,
+    /// and a primary that ties it, keep their own word.
+    #[test]
+    fn nodes_marks_a_primary_the_promote_moved_from_as_stale() {
+        use rdb_core::contracts::ids::ReplicaRole;
+        use rdb_core::contracts::membership::{CopyId, Member};
+        let holds = |generation| {
+            Some(rdb_api::host::Holding {
+                generation: Generation(generation),
+                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                applied: 1,
+                durable: 1,
+            })
+        };
+        let mut old = owner(None, false);
+        old.holds = holds(1);
+        let mut new = owner(None, true);
+        new.node = NodeId(2);
+        new.holds = holds(2);
+        new.pinned = vec![Member {
+            copy: CopyId(0),
+            node: NodeId(1),
+            boot: rdb_api::host::BOOT,
+            role: ReplicaRole::RegularSecondary,
+        }];
+        let nodes = [old.clone(), new.clone()];
+        let owner_read = owner_status(&nodes);
+        assert!(
+            node_line(&old, owner_read).contains(
+                " role=secondary (stale: says primary at gen=1; node 2 owns partition 1 at \
+                 gen=2) "
+            ),
+            "{}",
+            node_line(&old, owner_read)
+        );
+        assert!(node_line(&new, owner_read).contains(" role=primary l1="));
+        // Mid-promote, before node 2 holds the newer generation: neither is called stale.
+        new.holds = holds(1);
+        assert!(node_line(&new, Some(&old)).contains(" role=primary l1="));
+        assert!(node_line(&old, Some(&new)).contains(" role=primary l1="));
+    }
+
+    /// Bug bash #65 walk A: after `admin promote 2`, node 1 still said `primary` with a fenced
+    /// grant at its older generation, and the poller read it and printed "writes stay stopped"
+    /// while node 2 took writes. The owner read is the newest `primary`.
+    #[test]
+    fn owner_status_follows_a_promote() {
+        let holds = |generation| {
+            Some(rdb_api::host::Holding {
+                generation: Generation(generation),
+                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                applied: 1,
+                durable: 1,
+            })
+        };
+        // As `nodes` printed it after `admin promote 2 --drop 3`: both say `primary` and
+        // recovered=2; node 1 is fenced(Frozen) at gen=1, node 2 holds gen=2.
+        let mut old = owner(None, false);
+        old.authority = "fenced(Frozen)".to_owned();
+        old.recovered = Some(Generation(2));
+        old.holds = holds(1);
+        let mut new = owner(None, true);
+        new.node = NodeId(2);
+        new.recovered = Some(Generation(2));
+        new.holds = holds(2);
+        let mut third = owner(None, false);
+        third.node = NodeId(3);
+        third.role = "secondary";
+        third.holds = holds(1);
+        let nodes = [old.clone(), new, third.clone()];
+        assert_eq!(owner_status(&nodes).map(|n| n.node), Some(NodeId(2)));
+        // Before any promote, and with no primary at all, node 1 is read.
+        assert_eq!(
+            owner_status(&[old.clone(), third.clone()]).map(|n| n.node),
+            Some(NodeId(1))
+        );
+        old.role = "none";
+        assert_eq!(owner_status(&[third, old]).map(|n| n.node), Some(NodeId(1)));
+    }
+
     /// Walk 1L (M9 S2a): `control stop` of the control leader fenced the owner `Expired` and
     /// writes never came back. The voters elected 2338 ms after the stop, 3 ms past A1's
     /// horizon, because the default timers make a failover take up to 3000 ms against a
@@ -5088,7 +5463,7 @@ mod tests {
         let paused = with("held(grant 2)", "ActivationUnresolved", None);
         assert_eq!(
             reason(&paused, Some(note)),
-            Some(format!("{note}; {STUCK}"))
+            Some(format!("{note}; l1=paused: {RESUMES}"))
         );
         let frozen = with(
             "fenced(Frozen)",
@@ -5511,10 +5886,7 @@ mod tests {
                     "ready for now; writes pause soon, at the latest about 2 s after the next \
                      write, because {note}"
                 ),
-                format!(
-                    "not ready: writes not admitted: {note}; writes stay stopped for this run: \
-                     to write again, quit and start rdb_dev again"
-                ),
+                format!("not ready: writes not admitted: {note}; l1=paused: {RESUMES}"),
             ]
         );
     }
@@ -5522,8 +5894,8 @@ mod tests {
     /// W7-D1, W7-D2: every `ready`/`not ready` reason is derived from the state that decides it,
     /// checked against each state of the tester's walk-7 text matrix (s2b-tester.md, "Text
     /// matrix"). The stuck line ("writes stay stopped for this run") prints only where nothing
-    /// in M9 brings writes back: L1 paused or reprotecting with a copy out, the owner itself
-    /// restarted, or a fence no self-replace lifts. A fence whose poll is live, with a
+    /// brings writes back: the owner itself restarted, or a fence no self-replace lifts. L1
+    /// paused or reprotecting with a copy out says writes resume (bb, #69 r4). A fence whose poll is live, with a
     /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
     #[test]
     fn every_ready_line_matches_the_state_that_decides_it() {
@@ -5588,19 +5960,25 @@ mod tests {
                 "HP",
                 with(false, Some("paused"), None),
                 Some(note),
-                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {note}; l1=paused: {RESUMES}"
+                )),
             ),
             (
                 "HP reprotecting",
                 with(false, Some("reprotecting"), None),
                 Some(note),
-                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {note}; l1=reprotecting: {RESUMES}"
+                )),
             ),
             (
                 "SF paused",
                 with(false, Some("paused"), None),
                 Some(failed),
-                Some(format!("not ready: writes not admitted: {failed}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {failed}; l1=paused: {RESUMES}"
+                )),
             ),
             (
                 "FP",
@@ -5659,7 +6037,9 @@ mod tests {
                 "FR, L1 paused",
                 with(false, Some("paused"), expiring),
                 Some(note),
-                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+                Some(format!(
+                    "not ready: writes not admitted: {note}; l1=paused: {RESUMES}"
+                )),
             ),
             (
                 "FR, poll stopped",
@@ -6929,7 +7309,6 @@ mod tests {
     #[test]
     fn slice_2_verbs_and_flags_answer_not_built_yet_by_name() {
         for (line, verb) in [
-            ("admin rebuild 1", "admin rebuild N"),
             ("admin damage-copy 2 --seq 4", "admin damage-copy N --seq S"),
             ("node restart 1 --wipe", "node restart N --wipe"),
             ("node stop 3", "node stop N"),
@@ -6941,6 +7320,7 @@ mod tests {
         for line in [
             "node restart 1",
             "admin promote 2 --drop 3",
+            "admin rebuild 3 --wipe",
             "admin clear x",
             "control",
             "link drop 1-2",
@@ -7464,6 +7844,31 @@ mod tests {
             promoted_line(&promoted),
             "promoted: node 2 owns partition 1 at generation 3 (was node 1); node 3 dropped"
         );
+    }
+
+    /// bb #65: `admin rebuild N [--wipe]` runs in process; `lr rebuild N --wipe` adds `--fence`
+    /// once it has stopped N, and only after `--wipe` is it the fence check (A-R441 F2).
+    /// Cut: accept `--fence` without `--wipe` and the `3 --fence` line goes red. Unit.
+    #[test]
+    fn admin_rebuild_reads_its_node_and_the_fence_flag() {
+        fn words(line: &str) -> Vec<&str> {
+            line.split_whitespace().collect()
+        }
+        assert_eq!(
+            parse_rebuild(&words("3")),
+            Ok((NodeId(3), RebuildAsk::Here { wipe: false }))
+        );
+        assert_eq!(
+            parse_rebuild(&words("3 --wipe")),
+            Ok((NodeId(3), RebuildAsk::Here { wipe: true }))
+        );
+        assert_eq!(
+            parse_rebuild(&words("3 --wipe --fence")),
+            Ok((NodeId(3), RebuildAsk::Fence))
+        );
+        for bad in ["", "4", "3 --fence", "3 --fence --wipe", "3 --wipe x"] {
+            assert!(parse_rebuild(&words(bad)).is_err(), "{bad:?}");
+        }
     }
 
     /// A-R245: `admin status` lists both prefixes through the store it is given, the Db's own,

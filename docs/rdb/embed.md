@@ -637,6 +637,10 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   refuses to open them, and its error names the format range it reads. So roll back only onto
   a folder this build has written neither into. Otherwise, restore a backup taken before the
   upgrade.
+- **An older build cannot open a folder after this build wrote `partitions/1`.** This build
+  writes that record with its member list (layout 4). A build without layout 4 reads it as
+  undecodable and refuses the open (`Undecodable`), and keeps refusing. Run this build or a
+  newer one.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
@@ -653,24 +657,32 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   promoter has stored its plan, any node that can read rEtcd can finish that same stored plan,
   on a node and at a time the sender picks. That is harmless: it is the promoter's own plan.
   - **Wait for `promote` to answer before running it again.** A rerun while the earlier run is
-    still committing (up to about 15 s) cancels that run's commit. This costs time, not safety.
+    still committing (up to about 15 s) can cancel that run's commit. This costs time, not
+    safety. The earlier run then answers one of three things:
+    - Ok, when the other run dropped the same node. It reports the generation that committed.
+    - "another promote is running; promote again", when the rerun came before the earlier run
+      sent its plan. Promote again.
+    - "another promote committed instead …", when the other run dropped a different node or
+      made a different node the owner. Run status before promoting again.
   - **Upgrade every node before you use `promote`.** A node built before issue #70 still
     trusts a plan sent to it directly.
   - **The dropped node is added back automatically when it starts again, or at the next
     reopen heal; membership is fixed at three nodes.**
-  - **After every node restarts, a promote can be refused.** If the owner's copy is lost too,
-    `promote` answers `Unconfigured` ("node N holds no configuration since its restart"). The
-    member list is kept in memory only. To recover, bring back the owner's node or restore its
-    copy.
-  - **It also fires when only the node you promote has restarted** while the owner is down.
-    The way round: promote a node that has not restarted since the owner stopped.
-  - **The old owner says "moved" once it learns the new owner.** While the promote waits out
-    its permission to write, a live old owner can still take writes until it sees the freeze or
+  - **After every node restarts, a promote still works,** even with the owner's copy lost.
+    `partitions/1` keeps the member list and each member's role (record layout 4), and a
+    promote plans from it.
+  - **A record an older build wrote has no member list yet.** This build adds one at its first
+    recovery: the open's heal, or a promote. Until then, a promote of a node that restarted
+    while the owner is down answers `Unconfigured` ("node N holds no configuration since its
+    restart"). The way round: bring back the owner's node, or promote a node that has not
+    restarted since the owner stopped.
+  - **The old owner says "moved" within about a second.** While the promote waits out its
+    permission to write, a live old owner can still take writes until it sees the freeze or
     that permission runs out. After that, and while it is still cut from rEtcd, it answers
-    `LEASE_EXPIRED`. Once it is fenced and reads an owner record naming the new owner, it
-    answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true. That can take
-    10 s or more after the promote (issue #66). Either answer means nothing was written: send
-    again, as its step says. Its log shows `host_owner_learned`.
+    `LEASE_EXPIRED`. Once the promote is done, the old owner answers `NOT_PRIMARY` naming the
+    new owner (`hint`), with `no_mutation` true. It re-reads the owner record every 250 ms
+    until then. Either answer means nothing was written: send again, as its step says. Its log
+    shows `host_owner_learned`.
 - **On a very slow or overloaded machine, an open can fail with a "blocked" error**
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry
@@ -720,7 +732,7 @@ report it with the message.
 
 | Error | When | What to do |
 |---|---|---|
-| `ReadyError::Quarantined` | The copies' histories disagree, so the owner (the message names its node) takes no writes. The acknowledged data is kept | Do not delete the folder, and do not keep opening it. This build has no repair command yet: stop and report it with the message. It happens only if two copies hold different valid records at one position, which fencing prevents. The planned way out is `admin rebuild N`, which is not built yet |
+| `ReadyError::Quarantined` | The copies' histories disagree, so the owner (the message names its node) takes no writes. The acknowledged data is kept | Do not delete the folder, and do not keep opening it. Run `admin rebuild N` (`Db::rebuild`) for a copy whose history disagrees: it takes that copy out and back, wiped aside. A rebuild of a copy the quarantine does not name is refused and names the ones it does. A write refused while quarantined carries the same text. It happens only if two copies hold different valid records at one position, which fencing prevents |
 
 **Fix the cause first.** Opening again unchanged gives the same error; the "what to do"
 column says what to change before the next open.

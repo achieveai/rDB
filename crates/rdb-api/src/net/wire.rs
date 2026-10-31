@@ -376,12 +376,15 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::FenceBound { .. }
         | Msg::Inject { .. }
         | Msg::PeerBooted { .. }
+        | Msg::Rebuild { .. }
         | Msg::Synced(_)
         | Msg::Stop) => return Err(Box::new((WireError::LocalOnly(local_name(&local)), local))),
         #[cfg(debug_assertions)]
         local @ Msg::Damage { .. } => {
             return Err(Box::new((WireError::LocalOnly("Damage"), local)))
         }
+        #[cfg(debug_assertions)]
+        local @ Msg::Fork { .. } => return Err(Box::new((WireError::LocalOnly("Fork"), local))),
     };
     Ok(Outbound::Plain(plain))
 }
@@ -395,6 +398,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::FenceBound { .. } => "FenceBound",
         Msg::Inject { .. } => "Inject",
         Msg::PeerBooted { .. } => "PeerBooted",
+        Msg::Rebuild { .. } => "Rebuild",
         Msg::Stop => "Stop",
         Msg::Synced(_) => "Synced",
         _ => "a peer message",
