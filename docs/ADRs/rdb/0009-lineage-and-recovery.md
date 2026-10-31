@@ -404,12 +404,17 @@ can write our bytes, and a takeover first needs a non-`Serving` record (A-R51), 
 An unbound F1 (the simulator, layout-2 record) cannot resolve the recovery CAS this way:
 `PartitionRecord` binds no run id or cutoff, so our bytes cannot be told from a peer's identical
 decision (ruling F-g). **Amended (M10 S1-5, A-R182; closed achieveai/rDB#45 in the bug bash):**
-F1 bound to an rDB instance writes the layout-3 root, whose `run` (the fence's control revision),
+F1 bound to an rDB instance writes a record with a root, whose `run` (the fence's control revision),
 cutoff and owner boot name this run, so it resolves the recovery CAS by the same read-then-CAS
 (`ProposalUnresolved`). The host binds F1 from the first open, so this covers the bootstrap's CAS
 as well as a reopen's. Rows: `m10_bb_45_a_first_open_whose_recovery_cas_answers_unknown_is_ready_and_writes`
 and `m10_a_reopen_whose_recovery_cas_answers_unknown_settles_by_read_then_cas`
 (`rdb-api` `db/reopen_tests.rs`).
+**Amended 2026-10-26 (PR #73 review):** that record was layout 3 (the root alone) when this
+note was written. Since bug bash #64 (ruling A-R426) F1 writes layout 4: the same root, then the
+members the plan pins (`Cas::body` in `rdb-core` `recovery/commit.rs`). The root's fields are
+unchanged. The read-then-CAS now also compares the members (A-R426 M2, `Cas::same_run`): a
+record that pins another set is not ours.
 
 **Amended 2026-10-22 (M10, lead ruling A-R185; critic-d7fix C5): landing is a third `inherit`
 caller.** A copy that answers the discovery window late is left out of the barrier. Before this,

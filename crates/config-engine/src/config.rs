@@ -507,6 +507,17 @@ impl StorageHandle {
         }
     }
 
+    /// The snapshot a build of this store last published, never one a leader installed
+    /// (Revobot #73 finding 2). An ephemeral store never builds, so `None`.
+    pub fn built_snapshot_meta(
+        &self,
+    ) -> Option<openraft::SnapshotMeta<config_storage::RaftNodeId, config_storage::RaftNode>> {
+        match self {
+            StorageHandle::Ephemeral(_) => None,
+            StorageHandle::Rocks(s) => s.built_snapshot_meta(),
+        }
+    }
+
     /// How many snapshot builds this store has started and not yet finished (M5, OQ-44).
     ///
     /// Derived rather than held as a gauge, because the store counts events, not states:

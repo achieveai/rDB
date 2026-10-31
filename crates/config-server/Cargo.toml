@@ -52,4 +52,7 @@ sha2 = { workspace = true }
 # `config_client::AdminClient` does not wrap (mirrors `config-testkit/src/rotation.rs`'s own
 # `admin_rpc` helper, which cannot be reused directly — it dials an in-process harness).
 tonic = { workspace = true }
+# Test-only: paused time (`start_paused`), so the backup-wait rows in `run.rs` reach their
+# deadline through their own sleeps, not the wall clock (Revobot #73 round 2).
+tokio = { workspace = true, features = ["test-util"] }
 # `tempfile` is a normal dependency (restore staging); the tests use the same one.

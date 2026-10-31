@@ -115,6 +115,16 @@ impl Refused {
     }
 }
 
+/// Why the owner did not answer [`Ready`] (Revobot #73 finding 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unready {
+    /// A guard refused before anything started (G1-G4, G6, `owner`): nothing changed.
+    Refused(Refused),
+    /// It failed after the owner started the drop (G5, `quarantined`, `timeout`): a revocation
+    /// was queued or the quarantined F1 replaced, so it never claims nothing changed.
+    Failed(Refused),
+}
+
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.detail, self.guard)

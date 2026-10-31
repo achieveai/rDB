@@ -3287,11 +3287,12 @@ impl Db {
     /// # Errors
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
-    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard, an owner
-    /// in another process, or a re-plan that did not commit a serving partition without
-    /// `node`. A wipe the fence refuses restarts `node` on its own folder and says so. An
-    /// `UNAVAILABLE` with `no_mutation` false when `node` restarted but is not pinned regular
-    /// again in time.
+    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard or an
+    /// owner in another process. `UNAVAILABLE` with `no_mutation` false once the owner started
+    /// the drop: a re-plan that did not commit a serving partition without `node`, quarantined
+    /// again, or did not commit in time. A wipe the fence refuses restarts `node` on its own
+    /// folder and says so. An `UNAVAILABLE` with `no_mutation` false when `node` restarted but
+    /// is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
         if !self.runs(self.route.owner()) && !self.runs(node) {
             if wipe {
@@ -3552,7 +3553,10 @@ impl Db {
         }
         let ready = match answer.recv_timeout(within + Duration::from_secs(5)) {
             Ok(Ok(ready)) => ready,
-            Ok(Err(refusal)) => return Err(refused(refusal)),
+            Ok(Err(admin::rebuild::Unready::Refused(refusal))) => return Err(refused(refusal)),
+            Ok(Err(admin::rebuild::Unready::Failed(failure))) => {
+                return Err(rebuild_failed(failure))
+            }
             Err(_) => {
                 return Err(rebuild_error(
                     RetryRule::NotWired,
@@ -3585,9 +3589,33 @@ impl Db {
                 ))
             }
         };
+        // Revobot #73 finding 1: a mode C out of a reopen's quarantine finds this open never
+        // ready, and a restart waits for that. The drop commit just landed, so the owner
+        // admits a moment later: wait for it, as the end of a rebuild does.
+        if !self.ready() {
+            if let Err(error) = self.wait_ready(within) {
+                return Err(rebuild_error(
+                    RetryRule::NotWired,
+                    false,
+                    format!(
+                        "generation {} left node {} out, but node {} (the owner) did not admit \
+                         writes within {} s ({error}), so node {} was not restarted or wiped: \
+                         restart it to re-add it",
+                        ready.generation.0,
+                        node.0,
+                        owner.0,
+                        within.as_secs(),
+                        node.0
+                    ),
+                ));
+            }
+        }
         let moved = aside.as_ref().map(|aside| aside.to.clone());
         // A1 (critic-65): once the folder has moved, every later error says where it is.
         let named = |mut error: ApiError| {
+            // Revobot #73 finding 3: past Ready, the owner may have committed the drop (modes B and
+            // C), so nothing after it claims `no_mutation`.
+            error.no_mutation = false;
             if let Some(to) = moved.as_ref().filter(|to| to.exists()) {
                 // Before the tail that ends a rebuild error, so it still ends the detail.
                 let tail = format!("; {}", error::REBUILD_STEP);
@@ -4126,6 +4154,16 @@ pub(crate) fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
             RetryRule::RetryAfterRecovery
         };
         rebuild_error(retry, true, refused.to_string())
+    }
+}
+
+/// Revobot #73 finding 3: the owner failed a rebuild after it started the drop (a revocation
+/// queued, or the quarantined F1 replaced). The kind and retry rule are a refusal's; it never
+/// claims `no_mutation`.
+fn rebuild_failed(failed: admin::rebuild::Refused) -> ApiError {
+    ApiError {
+        no_mutation: false,
+        ..rebuild_refused(failed)
     }
 }
 
@@ -8542,10 +8580,12 @@ mod tests {
     /// `NotASource` from the retired receiver, F1 waited its 14 s out and dropped node 1 again,
     /// writes refused all that while. Now node 2 restores a dormant receiver to source it: no
     /// catch-up is refused, no re-plan is abandoned, and node 1 is promoted back. Node 1
-    /// restarts with its link to node 2 held until puts land, so the promote needs that
-    /// catch-up and the row never passes without one (#43: unforced, under load, 20 restarts
-    /// gave none). Cut: the source restore keeps a retired receiver (before the fix):
-    /// `catch_up_refused`, red. Cut: no hold: no catch-up, red.
+    /// restarts with its link to node 2 held until puts land, so it is behind at the heal (#43:
+    /// unforced, under load, 20 restarts gave no catch-up). After the heal it catches up by the
+    /// routed catch-up from node 2, or first through node 2's shadow cursor; the row asserts the
+    /// outcome, not the route (lead ruling, PR #73; the cursor route failed it 1 in 11): node 1
+    /// is promoted back, holds node 2's head, and writes go on. Cut: the source restore keeps a
+    /// retired receiver (before the fix): `catch_up_refused`, red.
     /// Integration (~10-60 s): the promote waits node 1's grant out, then each re-add and promote.
     #[config_log::retcd_test]
     fn m10_s2_d10_the_old_owner_is_added_back_while_writes_go_on() {
@@ -8573,9 +8613,18 @@ mod tests {
         let before = lines().len();
         db.links().hold(OWNER, NodeId(2));
         db.restart_node(OWNER).expect("restart node 1");
+        /// Sets the writer's `stop` when dropped, so a failed assertion in the scope below ends
+        /// the writer instead of leaving the scope waiting on it for ever (Revobot #73 finding 5).
+        struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let stop = std::sync::atomic::AtomicBool::new(false);
         let landed = std::sync::atomic::AtomicU64::new(0);
-        let cycle = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&stop);
             scope.spawn(|| {
                 let mut sent = 0;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -8599,7 +8648,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             db.links().heal(OWNER, NodeId(2));
-            let cycle = loop {
+            loop {
                 let lines = lines();
                 let cycle = lines[before..].to_vec();
                 let settled = cycle
@@ -8614,28 +8663,51 @@ mod tests {
                         })
                     });
                 if settled {
-                    break cycle;
+                    break;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
                     "node 2 did not promote node 1 back within {patience:?}"
                 );
                 std::thread::sleep(Duration::from_millis(50));
-            };
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            cycle
+            }
+            // Writes go on after the re-add: more puts land once node 1 is promoted back.
+            let promoted_at = landed.load(std::sync::atomic::Ordering::Relaxed);
+            while landed.load(std::sync::atomic::Ordering::Relaxed) < promoted_at + 3 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writes stopped after node 1 was promoted back, within {patience:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         });
-        let routed = cycle
-            .iter()
-            .filter(|line| line["@m"] == "catch_up_routed" && line["node"] == 2)
-            .count();
-        let lines = lines();
-        let refused: Vec<_> = lines
-            .iter()
+        // Node 1 caught up, by either route: it holds node 2's generation through node 2's
+        // head. Read after the writer stopped, so the head stands still.
+        let holds = |node: NodeId| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == node)
+                .and_then(|status| status.holds)
+        };
+        let head = holds(NodeId(2)).expect("node 2 holds");
+        loop {
+            let held = holds(OWNER);
+            if held.is_some_and(|held| {
+                held.generation >= head.generation && held.durable >= head.applied
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 holds {held:?}, not node 2's {head:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let refused: Vec<_> = lines()
+            .into_iter()
             .filter(|line| line["@m"] == "catch_up_refused" || line["@m"] == "rejoin_abandoned")
             .collect();
         assert!(refused.is_empty(), "{refused:?}");
-        assert_eq!(routed, 1, "no restart needed a catch-up from node 2");
         db.shutdown();
     }
 

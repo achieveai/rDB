@@ -80,8 +80,17 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
             "pre{i}"
         );
     }
+    /// Sets the writer's `stop` when dropped, so a panic in the scope below ends the writer
+    /// instead of leaving the scope waiting on it for ever (as the d10 row's, Revobot #73).
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let stop = AtomicBool::new(false);
     let (rebuilt, acked, longest) = std::thread::scope(|scope| {
+        let stopping = StopOnDrop(&stop);
         let writer = scope.spawn(|| {
             let mut acked = Vec::new();
             let mut longest = Duration::ZERO;
@@ -97,7 +106,7 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
             (acked, longest)
         });
         let rebuilt = db.rebuild_with(NodeId(3), true);
-        stop.store(true, Ordering::Relaxed);
+        drop(stopping);
         let (acked, longest) = writer.join().expect("the writer");
         (rebuilt, acked, longest)
     });
@@ -434,10 +443,96 @@ fn b3_mode_c_refuses_when_the_kept_copies_still_diverge() {
         "{}",
         refused.detail
     );
+    // Revobot #73 finding 3: the owner had reset its quarantined F1 and started a fresh run
+    // before this failed, so it never claims nothing changed.
+    assert!(!refused.no_mutation, "{refused:?}");
+    // A guard that refuses before anything starts (G2) still claims it.
+    let owner = db.rebuild_with(NodeId(1), false).expect_err("G2");
+    assert!(
+        owner.detail.contains("(G2)") && owner.no_mutation,
+        "{owner:?}"
+    );
     assert_eq!(db.boot_of(NodeId(3)), boot_3, "3 untouched");
     assert_eq!(
         files_under(&dir.path().join("aside")),
         0,
         "nothing moved aside"
+    );
+}
+
+/// Revobot #73 finding 1: node 3's copy is forked, then the whole `Db` shuts down and opens
+/// again. The reopen's F1 quarantines before any recovery commits, so the owner holds no
+/// committed result. `admin rebuild 3` still runs mode C from the quarantined run's plan: 3 is
+/// moved aside, pinned regular again, every acked write reads back and a new one is acked.
+/// Cut: `rebuild_asked` reads only `committed`: refused "has committed no recovery", red.
+/// Integration (~5-15 s): two opens, a fork, a quarantine, a re-plan, a restart, a re-add.
+#[config_log::retcd_test]
+fn b3_mode_c_after_a_reopen_rebuilds_from_the_quarantined_plan() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let mut db = ready(&rt, dir.path(), &store);
+    for i in 0..5 {
+        assert!(
+            put_acked(&db, &format!("pre{i}"), patience).is_some(),
+            "pre{i}"
+        );
+    }
+    let generation = db
+        .inspect(NodeId(3))
+        .and_then(|status| status.holds)
+        .expect("3 holds a lineage")
+        .generation;
+    db.fork_record(NodeId(3), generation).expect("3 forked");
+    db.shutdown();
+    drop(db);
+    let db = rt
+        .block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the reopen");
+    let started = Instant::now();
+    let mut phase = None;
+    while started.elapsed() < patience {
+        phase = db.inspect(NodeId(1)).and_then(|status| status.recovery);
+        if phase.as_deref() == Some("Quarantined") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        phase.as_deref(),
+        Some("Quarantined"),
+        "the reopen quarantines"
+    );
+    assert_eq!(
+        db.inspect(NodeId(1)).and_then(|status| status.recovered),
+        None,
+        "premise: nothing committed since the reopen"
+    );
+    let rebuilt = db.rebuild_with(NodeId(3), false).expect("the rebuild");
+    tracing::info!(line = %rebuilt.line(), "b3_rebuilt");
+    assert_eq!(rebuilt.mode, admin::rebuild::RebuildMode::Quarantined);
+    assert!(
+        rebuilt.kept.contains(&NodeId(1)) && rebuilt.kept.contains(&NodeId(2)),
+        "{rebuilt:?}"
+    );
+    let aside = rebuilt.aside.clone().expect("mode C always wipes");
+    assert!(aside.join("CURRENT").exists(), "{}", aside.display());
+    for key in (0..5).map(|i| format!("pre{i}")) {
+        let got = db.get(key.as_bytes()).expect("a read");
+        assert_eq!(
+            got.value.map(|(_, value)| value),
+            Some(Bytes::from(key.clone())),
+            "acked {key} reads back"
+        );
+    }
+    assert!(
+        put_acked(&db, "after", patience).is_some(),
+        "writes land again"
     );
 }
