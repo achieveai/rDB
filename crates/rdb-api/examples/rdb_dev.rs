@@ -1013,6 +1013,10 @@ where
         say("bootstrap: partition 1 recovery started");
     } else {
         say("reopen: partition 1 takes over from the last run (heal started)");
+        // A-R467: a reopen does not re-add a dropped copy, so the open says so.
+        if let Some(out) = left_out_line(&db, &rt, &*store) {
+            say(&format!("reopen: {out}"));
+        }
     }
     let progress = Progress::default();
     let stop = AtomicBool::new(false);
@@ -1244,8 +1248,8 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
 /// poller's "writes pause soon ... because node N restarted" is then stale, so it is not said
 /// (bug bash #65: it stayed the last word after `rebuilt` pinned node 3 again). The refusals'
 /// restart note is the `Db`'s and still names the restart.
-fn rejoined(owner: &NodeStatus, boot_of: impl Fn(NodeId) -> Option<BootId>) -> bool {
-    let restarted = restarted_nodes(&boot_of);
+fn rejoined(owner: &NodeStatus, base: BootId, boot_of: impl Fn(NodeId) -> Option<BootId>) -> bool {
+    let restarted = restarted_nodes(base, &boot_of);
     !restarted.is_empty()
         && !restarted.contains(&owner.node)
         && restarted.iter().all(|&node| {
@@ -1330,7 +1334,7 @@ fn poll_once(db: &Db, progress: &Progress) {
             db.base_boot(),
             owner,
             db.restart_note()
-                .filter(|_| !rejoined(owner, |node| db.boot_of(node)))
+                .filter(|_| !rejoined(owner, db.base_boot(), |node| db.boot_of(node)))
                 .as_deref(),
             &db.links().held(),
             &db.links().dropped(),
@@ -2175,6 +2179,13 @@ fn repl<'scope, 'env>(
                         } else {
                             wait_recovered(progress, within, || db.heal_state())
                         };
+                        // A-R467: ready below the copy count says which copy is out.
+                        let waited = waited.map(|line| {
+                            match left_out_line(db, rt, store).filter(|_| line.starts_with("reached ready")) {
+                                Some(out) => format!("{line}; warning: {out}"),
+                                None => line,
+                            }
+                        });
                         match waited {
                             Ok(line) => say(&line),
                             // A script must see that this open will never be ready (A-R191).
@@ -2356,9 +2367,13 @@ fn members_text(pinned: &[(NodeId, ReplicaRole)], known: &[NodeId], source: &str
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let pinned: Vec<NodeId> = pinned.iter().map(|(node, _)| *node).collect();
+    if let Some(out) = out_line(&pinned, known) {
+        return format!("members {roles}; {out} ({source})");
+    }
     let out = known
         .iter()
-        .filter(|node| !pinned.iter().any(|(pinned, _)| pinned == *node))
+        .filter(|node| !pinned.contains(node))
         .map(|node| node.0.to_string())
         .collect::<Vec<_>>();
     let out = if out.is_empty() {
@@ -2367,6 +2382,50 @@ fn members_text(pinned: &[(NodeId, ReplicaRole)], known: &[NodeId], source: &str
         out.join(" ")
     };
     format!("members {roles}; not pinned {out} ({source})")
+}
+
+/// A-R467: while partition 1 pins fewer copies than its copy count, each known node it leaves
+/// out is a copy to bring back, never a spare: `node 3 is out of partition 1: run `admin
+/// rebuild 3``. A reopen does not re-add a dropped copy (M11 T6 pins the record's members), so
+/// this is how the reader learns of it. `None` at the full count: an unpinned node is then a
+/// spare, which the members line says as `not pinned N`.
+fn out_line(pinned: &[NodeId], known: &[NodeId]) -> Option<String> {
+    if pinned.len() >= rdb_api::admin::members().len() {
+        return None;
+    }
+    let out: Vec<String> = known
+        .iter()
+        .filter(|node| !pinned.contains(node))
+        .map(|node| {
+            format!(
+                "node {} is out of partition 1: run `admin rebuild {}`",
+                node.0, node.0
+            )
+        })
+        .collect();
+    (!out.is_empty()).then(|| out.join("; "))
+}
+
+/// [`out_line`] from the members `partitions/1` pins, which every commit writes: read at the
+/// open, before the owner has recovered, and after `wait ready`. `None` when the record is not
+/// read, names no members (layout 3 and older), or leaves nothing out.
+fn left_out_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) -> Option<String> {
+    let known: Vec<NodeId> = match db.links().net() {
+        Some(net) => net.states().keys().copied().collect(),
+        None => vec![NodeId(1), NodeId(2), NodeId(3)],
+    };
+    let body = rt
+        .block_on(store.get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .ok()?
+        .record?
+        .value;
+    let pinned: Vec<NodeId> = rdb_core::authority::partition::RecordMember::decode_all(&body)?
+        .iter()
+        .map(|member| member.node)
+        .collect();
+    out_line(&pinned, &known)
 }
 
 /// `admin rebuild`'s usage (#65).
@@ -4520,7 +4579,7 @@ fn status_line(db: &Db, sent: &Sent, words: &[&str]) -> Result<bool, String> {
                 .iter()
                 .find(|node| node.node == NodeId(1))
                 .map(|owner| owner.in_flight == Some(RequestId(request)));
-            let restarted = restarted_nodes(|node| db.boot_of(node));
+            let restarted = restarted_nodes(db.base_boot(), |node| db.boot_of(node));
             let note = db.restart_note();
             let ours = sent.by_id.contains_key(&request);
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
@@ -4561,11 +4620,11 @@ fn known_status_line(request: u64, status: &TxnStatus) -> String {
 /// The nodes that restarted, from each node's boot (`boot_of`), never from the nodes that
 /// answered `node_status`: that leaves out a node whose restart failed, and `status` of a write
 /// in flight then said it waits for M10 while the other secondary could still take it.
-fn restarted_nodes(boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
+fn restarted_nodes(base: BootId, boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
     [1, 2, 3]
         .map(NodeId)
         .into_iter()
-        .filter(|&node| boot_of(node).is_some_and(|boot| boot != rdb_api::host::BOOT))
+        .filter(|&node| boot_of(node).is_some_and(|boot| boot != base))
         .collect()
 }
 
@@ -5350,16 +5409,16 @@ mod tests {
             member(2, base, ReplicaRole::RegularSecondary),
             member(3, base, ReplicaRole::RegularSecondary),
         ];
-        assert!(!rejoined(&owner, boots));
+        assert!(!rejoined(&owner, BootId(base), boots));
         // Back as a shadow: not yet.
         owner.pinned[2] = member(3, base + 1, ReplicaRole::Shadow);
-        assert!(!rejoined(&owner, boots));
+        assert!(!rejoined(&owner, BootId(base), boots));
         owner.pinned[2] = member(3, base + 1, ReplicaRole::RegularSecondary);
-        assert!(rejoined(&owner, boots));
+        assert!(rejoined(&owner, BootId(base), boots));
         // Nothing restarted: no note to drop.
-        assert!(!rejoined(&owner, |_| Some(BootId(base))));
+        assert!(!rejoined(&owner, BootId(base), |_| Some(BootId(base))));
         // The owner itself restarted: never dropped.
-        assert!(!rejoined(&owner, |_| Some(BootId(base + 1))));
+        assert!(!rejoined(&owner, BootId(base), |_| Some(BootId(base + 1))));
     }
 
     /// Bug bash #65 walk (tester, #65 thumbs-up): after `admin promote 2` the `nodes` line still
@@ -6237,6 +6296,86 @@ mod tests {
         );
     }
 
+    /// Critic round 2 (mc2-modec.txt lines 43 and 83): after a reopen every node starts at the
+    /// open's base boot, so counting restarts from boot 1 named all three nodes. The poller
+    /// then said "writes pause soon ... because node 3 restarted" right after `rebuilt`
+    /// (`rejoined` was never true, node 1 counting as restarted), and `status` Unknown waited
+    /// for "a restarted owner". Counted from the base, only node 3 restarted: once node 1 pins
+    /// it at its boot the pause note is not said, and `status` names node 2. Cut: compare with
+    /// `host::BOOT` in `restarted_nodes` again: every assert reads all three nodes, red. Unit.
+    #[test]
+    fn after_a_reopen_only_a_node_restarted_in_this_open_counts() {
+        use rdb_core::contracts::ids::ReplicaRole;
+        use rdb_core::contracts::membership::{CopyId, Member};
+        let base = BootId(65_537);
+        let boots = |node: NodeId| {
+            Some(if node == NodeId(3) {
+                BootId(65_538)
+            } else {
+                base
+            })
+        };
+        assert_eq!(restarted_nodes(base, boots), [NodeId(3)]);
+        let member = |node: u32, boot: BootId, role| Member {
+            copy: CopyId(u8::try_from(node - 1).expect("small")),
+            node: NodeId(node),
+            boot,
+            role,
+        };
+        let mut owner = owner(None, true);
+        owner.boot = base;
+        owner.pinned = vec![
+            member(1, base, ReplicaRole::Primary),
+            member(2, base, ReplicaRole::RegularSecondary),
+            member(3, BootId(65_538), ReplicaRole::RegularSecondary),
+        ];
+        assert!(rejoined(&owner, base, boots), "rebuilt node 3 is back");
+        let note = "node 3 restarted (now boot 65538); a restarted copy rejoins by itself once \
+                    the owner re-plans";
+        assert_eq!(
+            unknown_line(true, Some(true), &restarted_nodes(base, boots), Some(note)),
+            format!(
+                "status Unknown (not evidence of a lost write: it resolves once node 2, which \
+                 did not restart, can take it; {note})"
+            )
+        );
+    }
+
+    /// A-R467: a copy the record leaves out while the partition pins fewer than its three
+    /// copies is named with the step that brings it back, and reads differently from a spare,
+    /// which the full count leaves `not pinned`. The open's line and `wait ready`'s warning use
+    /// the same [`out_line`]. Cut: `out_line` answers `None`: the first assert reads `not
+    /// pinned 3`, red. Unit.
+    #[test]
+    fn a_left_out_copy_is_named_with_its_step_and_a_spare_is_not() {
+        let known = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        assert_eq!(
+            members_text(
+                &[
+                    (NodeId(1), ReplicaRole::Primary),
+                    (NodeId(2), ReplicaRole::RegularSecondary),
+                ],
+                &known[..3],
+                "as node 1 pins them"
+            ),
+            "members 1=owner 2=regular; node 3 is out of partition 1: run `admin rebuild 3` (as \
+             node 1 pins them)"
+        );
+        assert_eq!(
+            members_text(
+                &[
+                    (NodeId(1), ReplicaRole::Primary),
+                    (NodeId(2), ReplicaRole::RegularSecondary),
+                    (NodeId(3), ReplicaRole::RegularSecondary),
+                ],
+                &known,
+                "as node 1 pins them"
+            ),
+            "members 1=owner 2=regular 3=regular; not pinned 4 (as node 1 pins them)"
+        );
+        assert_eq!(out_line(&[NodeId(1), NodeId(2), NodeId(3)], &known), None);
+    }
+
     /// M11 final walk: after a reopen every node starts at that open's base boot (65537 on the
     /// second open), so a secondary's rebuild restart while L1 pauses printed "writes stay
     /// stopped for this run" and then, half a second later, "rebuilt ... writes are admitted
@@ -6554,7 +6693,7 @@ mod tests {
                 BootId(1)
             })
         };
-        let restarted = restarted_nodes(boots);
+        let restarted = restarted_nodes(rdb_api::host::BOOT, boots);
         assert_eq!(
             restarted,
             [NodeId(2)],

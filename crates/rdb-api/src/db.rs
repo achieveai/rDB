@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::ConfigStore;
-use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN};
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
@@ -379,13 +379,15 @@ pub enum OpenError {
          other copies"
     )]
     Unbound(PathBuf),
-    /// A wipe of this copy stopped between moving its folder aside and binding the new empty
-    /// one, and this open cannot finish it (ruling A-R466): it is a node process, or the copy
-    /// holds data, or no other copy names an instance. Nothing was started or removed.
+    /// A copy that names no instance, of a node a wipe moved aside, that this open does not bind
+    /// (ruling A-R466): it is a node process, or the copy holds data, or no other copy names
+    /// an instance. Either the wipe stopped before its bind, or an older build restarted the
+    /// node on the emptied folder without binding it (D-MC1); the text holds for both. Nothing
+    /// was started or removed.
     #[error(
-        "{copy} was being wiped when the Db stopped: its old data is at {aside}, and this open \
-         cannot finish the wipe. To undo the wipe, remove {copy} if it is there, move {aside} \
-         back to {copy}, then open the folder again"
+        "{copy} names no rDB instance, and a wipe moved that node's earlier folder to {aside}; \
+         this open does not bind {copy}. To go back to the folder from before the wipe, remove \
+         {copy} if it is there, move {aside} back to {copy}, then open the folder again"
     )]
     WipeUnfinished {
         /// The copy the wipe emptied, `nodes/<n>`.
@@ -1131,8 +1133,8 @@ impl Db {
         // Opening the engines takes their `LOCK`s, so of two opens racing on one directory one
         // is refused `InUse` here (F-001). Only an open that created `nodes/` and holds node 1's
         // `LOCK` may remove it.
-        let engines = match open_engines(&nodes_dir, &config.local, config.storage) {
-            Ok(engines) => engines,
+        let (engines, absent) = match open_engines(&nodes_dir, &config.local, config.storage) {
+            Ok(opened) => opened,
             Err((error, held_owner)) => {
                 if created && held_owner {
                     remove_claim(&nodes_dir);
@@ -1146,7 +1148,8 @@ impl Db {
             engines,
             created: created.then(|| nodes_dir.clone()),
         };
-        let found = Self::check(&mut claim.engines, &store, partial).await?;
+        let found =
+            Self::check(&mut claim.engines, absent, config.storage, &store, partial).await?;
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
             None => admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
@@ -1285,6 +1288,8 @@ impl Db {
     /// binding anything: only a formed database's copy opens there (ruling A-R231(a)).
     async fn check(
         engines: &mut BTreeMap<NodeId, RocksEngine>,
+        absent: Vec<Absent>,
+        storage: StorageOptions,
         store: &Arc<dyn ConfigStore>,
         partial: bool,
     ) -> Result<Found, OpenError> {
@@ -1336,30 +1341,48 @@ impl Db {
                 roll: None,
             });
         }
+        // A wipe that stopped after its move and before its synced bind (ruling A-R466) left an
+        // aside folder and a copy that is missing (`absent`) or empty and unbound. Such a copy
+        // may finish the wipe only on a whole-database open whose other copies name one
+        // instance; whether it does waits for `partitions/1` below (A-R466b). Nothing binds it
+        // before then.
+        let mut resume: Vec<(NodeId, PathBuf, PathBuf)> = Vec::new();
+        let unfinished = |node: NodeId, aside: PathBuf| OpenError::WipeUnfinished {
+            copy: PathBuf::from(format!("nodes/{}", node.0)),
+            aside,
+        };
         if holds_data {
             for (node, engine) in engines.iter().filter(|(_, e)| e.instance().is_none()) {
-                let copy = PathBuf::from(format!("nodes/{}", node.0));
                 let Some(aside) = engine
                     .path()
                     .parent()
                     .and_then(|nodes| wipe_aside(nodes, *node))
                 else {
-                    return Err(OpenError::Unbound(copy));
+                    return Err(OpenError::Unbound(PathBuf::from(format!(
+                        "nodes/{}",
+                        node.0
+                    ))));
                 };
-                // A wipe stopped after its move and before its synced bind (ruling A-R466):
-                // the empty copy is bound below like the rest and starts behind, as the wipe
-                // meant. Only on a whole-database open, and only with the others' one instance.
                 if partial || !engine.lineages().is_empty() || bound.len() != 1 {
-                    return Err(OpenError::WipeUnfinished { copy, aside });
+                    return Err(unfinished(*node, aside));
                 }
-                tracing::warn!(node = node.0, aside = %aside.display(), "node_wipe_resumed");
+                resume.push((*node, one_separator(engine.path()), aside));
             }
+        }
+        for gone in &absent {
+            if partial || bound.len() != 1 {
+                return Err(unfinished(gone.node, gone.aside.clone()));
+            }
+            resume.push((gone.node, one_separator(&gone.dir), gone.aside.clone()));
         }
         let instance = bound
             .first()
             .copied()
             .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
         for (node, engine) in engines.iter_mut() {
+            if resume.iter().any(|(held, ..)| held == node) {
+                continue;
+            }
             engine
                 .bind_instance(instance)
                 .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
@@ -1445,6 +1468,60 @@ impl Db {
                 admin::instance_hex(&instance),
                 admin::instance_hex(&root.instance)
             ))));
+        }
+        // A-R466b: the wipe finishes only when `partitions/1` leaves its node out, as every
+        // wipe's drop commit does before the move. A copy the record still pins was lost some
+        // other way, even with an aside from a wipe long finished: refused as missing or empty.
+        let pinned: Vec<NodeId> = read
+            .record
+            .as_ref()
+            .and_then(|found| RecordMember::decode_all(&found.value))
+            .map_or_else(
+                || ALL_NODES.to_vec(),
+                |members| members.iter().map(|member| member.node).collect(),
+            );
+        // A-R467: a reopen does not re-add a copy the record left out (M11 T6 pins the
+        // record's members), so the open says which local copy is out and the step that brings
+        // it back, while the partition pins fewer copies than its count.
+        if pinned.len() < admin::members().len() {
+            let local: BTreeSet<&NodeId> = engines
+                .keys()
+                .chain(resume.iter().map(|(node, ..)| node))
+                .collect();
+            for node in local {
+                if !pinned.contains(node) {
+                    tracing::warn!(
+                        node = node.0,
+                        generation = record.generation.0,
+                        pinned = ?pinned.iter().map(|node| node.0).collect::<Vec<_>>(),
+                        step = %format!("admin rebuild {}", node.0),
+                        "db_open_copy_left_out"
+                    );
+                }
+            }
+        }
+        if !resume.is_empty() {
+            if let Some((_, dir, _)) = resume.iter().find(|(node, ..)| pinned.contains(node)) {
+                return Err(OpenError::CopyMissing(dir.clone()));
+            }
+            for (node, dir, aside) in resume {
+                let mut engine = match engines.remove(&node) {
+                    Some(engine) => engine,
+                    None => RocksEngine::open_with(&dir, storage).map_err(|error| {
+                        OpenError::Node(format!("open {}: {error}", dir.display()))
+                    })?,
+                };
+                engine
+                    .bind_instance(instance)
+                    .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+                tracing::warn!(
+                    node = node.0,
+                    aside = %aside.display(),
+                    generation = record.generation.0,
+                    "node_wipe_resumed"
+                );
+                engines.insert(node, engine);
+            }
         }
         // PR #60 review F1: a copy staged into the generation and never switched in does not
         // hold it, so it does not stop the roll-forward that resumes it.
@@ -2969,9 +3046,10 @@ impl Db {
     /// The members and their roles are `to`'s own: the newest configuration it landed, read
     /// from it before anything is written. A shadow kept stays a shadow.
     ///
-    /// Membership is fixed at three nodes (A-R256 known limit for M10): a dropped node rejoins
-    /// as a secondary at the next reopen heal. An app-only `Db` promotes too, over its links
-    /// (A-R261).
+    /// A dropped node stays out across reopens: since M11 T6 the reopen's heal pins the members
+    /// `partitions/1` names, not nodes 1 to 3 as in M10 (A-R256), so the open logs
+    /// `db_open_copy_left_out` and `admin rebuild <n>` brings it back (A-R467). An app-only
+    /// `Db` promotes too, over its links (A-R261).
     ///
     /// # Errors
     ///
@@ -4400,7 +4478,7 @@ fn open_engines(
     nodes_dir: &Path,
     local: &[NodeId],
     storage: StorageOptions,
-) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
+) -> Result<(BTreeMap<NodeId, RocksEngine>, Vec<Absent>), (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
         rdb_storage::OpenError::Locked { .. } => OpenError::InUse(one_separator(dir)),
         rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(one_separator(dir)),
@@ -4424,15 +4502,19 @@ fn open_engines(
             }
         }
     }
-    // A copy a stopped wipe moved aside is created again here, and `Db::check` decides whether
-    // the wipe can finish (ruling A-R466).
-    if let Some((_, dir)) = missing
-        .iter()
-        .find(|(node, _)| wipe_aside(nodes_dir, *node).is_none())
-    {
-        if engines.values().any(|engine| !engine.lineages().is_empty()) {
-            let held = engines.contains_key(&OWNER);
-            return Err((OpenError::CopyMissing(one_separator(dir)), held));
+    // While another copy holds data, a missing copy a wipe moved aside is left to `Db::check`,
+    // which creates it only once `partitions/1` shows the wipe's drop (rulings A-R466,
+    // A-R466b); any other missing copy is refused here.
+    let mut absent = Vec::new();
+    if engines.values().any(|engine| !engine.lineages().is_empty()) {
+        for (node, dir) in std::mem::take(&mut missing) {
+            match wipe_aside(nodes_dir, node) {
+                Some(aside) => absent.push(Absent { node, dir, aside }),
+                None => {
+                    let held = engines.contains_key(&OWNER);
+                    return Err((OpenError::CopyMissing(one_separator(&dir)), held));
+                }
+            }
         }
     }
     for (node, dir) in missing {
@@ -4446,7 +4528,17 @@ fn open_engines(
             }
         }
     }
-    Ok(engines)
+    Ok((engines, absent))
+}
+
+/// A local copy that is missing while another copy holds data, and that a wipe moved aside:
+/// [`open_engines`] leaves it to `Db::check` (rulings A-R466, A-R466b).
+struct Absent {
+    node: NodeId,
+    /// Where the copy belongs, `nodes/<n>`.
+    dir: PathBuf,
+    /// The newest folder a wipe of `node` moved aside.
+    aside: PathBuf,
 }
 
 /// An open's engines and the `nodes/` it created, between opening the engines and handing them

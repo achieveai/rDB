@@ -83,7 +83,7 @@ fn reopens_with_members_1_2_3(
         .expect("the folder opens again after the rebuild");
     let patience = crate::host::test_patience(Duration::from_secs(20));
     db.wait_ready(patience).expect("the reopen is ready");
-    // A copy the record left out rejoins by the reopen's heal, so the members are polled for.
+    // The owner may still be pinning a rebuilt copy when it first answers, so poll.
     let started = Instant::now();
     let members = || {
         let (owner, pinned) = db.pinned_members().expect("the owner answers");
@@ -179,6 +179,158 @@ fn a_crash_inside_a_wipe_is_rolled_forward(method: &str, at: super::WipeCrash) {
         .expect("node 3 is re-added and catches up");
     assert_eq!(rebuilt.aside, None, "nothing is wiped twice");
     reopens_with_members_1_2_3(reopened, &rt, dir.path(), &store, "pre4");
+}
+
+/// A-R466b: an aside from a wipe that finished long ago does not let an open recreate a copy
+/// the record still pins. Node 3 is wiped and rebuilt (pinned regular again), the Db is shut
+/// down, and `nodes/3` is then lost: the open refuses `CopyMissing` and creates nothing. Before
+/// A-R466b it found the old aside, recreated `nodes/3` empty and opened. Cut: the record check
+/// in `Db::check`: the open succeeds, red.
+/// Integration (~3-8 s): two opens, one rebuild.
+#[config_log::retcd_test]
+fn b3_a466b_a_pinned_copy_lost_after_a_finished_wipe_is_refused() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let mut db = ready(&rt, dir.path(), &store);
+    assert!(put_acked(&db, "pre", patience).is_some(), "pre");
+    let rebuilt = db.rebuild_with(NodeId(3), true).expect("the wipe finishes");
+    assert!(
+        rebuilt.aside.is_some(),
+        "premise: node 3's old folder is aside"
+    );
+    db.shutdown();
+    drop(db);
+    let folder = dir.path().join("nodes").join("3");
+    std::fs::remove_dir_all(&folder).expect("node 3's copy is lost");
+    let refused = rt
+        .block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .map(|_| ())
+        .expect_err("a pinned member's lost copy is refused");
+    assert!(
+        matches!(&refused, OpenError::CopyMissing(path) if path.ends_with("nodes/3")),
+        "{refused:?}"
+    );
+    assert!(!folder.exists(), "the refused open created nodes/3");
+}
+
+/// A-R466: a node process never finishes a wipe. After a crash before the bind, an open of
+/// nodes 2 and 3 (`local: [2, 3]`) refuses `WipeUnfinished`, naming the aside folder and how to
+/// move it back. Cut: drop `partial` from the predicate: the open binds node 3, red.
+/// Integration (~2-5 s): two opens, a crash.
+#[config_log::retcd_test]
+fn b3_a466_a_node_process_does_not_finish_a_wipe() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let mut db = ready(&rt, dir.path(), &store);
+    assert!(put_acked(&db, "pre", patience).is_some(), "pre");
+    let folder = dir.path().join("nodes").join("3");
+    super::crash_wipe(&folder, super::WipeCrash::AfterCreate);
+    db.rebuild_with(NodeId(3), true)
+        .expect_err("the wipe stopped");
+    db.shutdown();
+    drop(db);
+    let refused = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(2), NodeId(3)],
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .map(|_| ())
+        .expect_err("a node process does not finish a wipe");
+    let OpenError::WipeUnfinished { copy, aside } = &refused else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(copy, Path::new("nodes/3"));
+    let text = refused.to_string();
+    assert!(
+        text.contains(&aside.display().to_string())
+            && text.contains("move")
+            && aside.to_string_lossy().contains("node-3-boot-"),
+        "{text}"
+    );
+}
+
+/// A-R467: the plain outage, no wipe. Node 3 is cut off past the owner's 10 s drop
+/// (`PEER_DROP_AFTER_MILLIS`) while writes go on, so the owner drops it; the Db is shut down
+/// and opened again. A reopen does not re-add a dropped copy (M11 T6 pins the record's
+/// members), so the open logs `db_open_copy_left_out` for node 3 with the step
+/// `admin rebuild 3`, and that rebuild brings members 1, 2 and 3 back. Cut: the
+/// `db_open_copy_left_out` warning in `Db::check`: no line, red.
+/// Integration (~15-25 s): two opens, a 10 s outage, one rebuild, a third open.
+#[config_log::retcd_test]
+fn b3_a467_a_copy_dropped_by_an_outage_is_named_at_the_reopen() {
+    const METHOD: &str = "b3_a467_a_copy_dropped_by_an_outage_is_named_at_the_reopen";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let mut db = ready(&rt, dir.path(), &store);
+    assert!(put_acked(&db, "pre", patience).is_some(), "pre");
+    db.links().hold(NodeId(1), NodeId(3));
+    db.links().hold(NodeId(2), NodeId(3));
+    let out_by = Duration::from_millis(crate::host::PEER_DROP_AFTER_MILLIS) + patience;
+    let started = Instant::now();
+    let mut i = 0;
+    let dropped = loop {
+        let _ = db.put(format!("out{i}").as_bytes(), b"v", None);
+        i += 1;
+        let pinned = db.pinned_members().map(|(_, pinned)| {
+            pinned
+                .iter()
+                .map(|member| member.node.0)
+                .collect::<Vec<_>>()
+        });
+        if pinned.as_ref().is_ok_and(|nodes| !nodes.contains(&3)) || started.elapsed() > out_by {
+            break pinned;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        dropped.as_ref().is_ok_and(|nodes| !nodes.contains(&3)),
+        "premise: the owner dropped node 3 within {out_by:?}: {dropped:?}"
+    );
+    assert!(
+        put_acked(&db, "after", patience).is_some(),
+        "a write with node 3 out"
+    );
+    db.links().heal(NodeId(1), NodeId(3));
+    db.links().heal(NodeId(2), NodeId(3));
+    db.shutdown();
+    drop(db);
+    let reopened = rt
+        .block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the reopen");
+    config_log::layer::flush_test_logs();
+    let named: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "db_open_copy_left_out")
+        .collect();
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert_eq!(named[0]["node"], 3, "{:?}", named[0]);
+    assert_eq!(named[0]["step"], "admin rebuild 3", "{:?}", named[0]);
+    reopened.wait_ready(patience).expect("the reopen is ready");
+    reopened
+        .rebuild_with(NodeId(3), false)
+        .expect("admin rebuild 3 brings node 3 back");
+    reopens_with_members_1_2_3(reopened, &rt, dir.path(), &store, "after");
 }
 
 /// A-R466, the crash right after the move: `nodes/3` is missing. Before the roll-forward the
