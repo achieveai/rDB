@@ -2,16 +2,18 @@
 //!
 //! ```text
 //! rdb-server --control E --nodes 1=A,2=B,3=C --cert-dir D --listen 127.0.0.1:P
-//!            [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S]
+//!            [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F]
 //! ```
 //!
 //! It checks `--listen` first (loopback only, `rdb_server::check_listen`), then opens its `Db`
 //! as an app (`local = []`, links to every node in `--nodes` as app `NAME`, default `pilot-b`,
 //! under client id `N`, default 100), waits until it is ready, and only then binds `--listen`,
 //! so "connection refused" means not ready. Then it prints
-//! `rdb-server ready listen=ADDR client=N log=PATH` and serves until Ctrl-C.
+//! `rdb-server ready listen=ADDR client=N log=PATH` and serves until Ctrl-C, or until the file
+//! `--stop-file` names exists: a graceful stop a script can ask for on Windows, where it cannot
+//! send Ctrl-C to another console. Either way it then waits for running calls to write their lines.
 //!
-//! Exits: 0 stopped by Ctrl-C; 2 bad arguments, a non-loopback `--listen`, or setup; 3 the open
+//! Exits: 0 stopped by Ctrl-C or the stop file; 2 bad arguments, a non-loopback `--listen`, or setup; 3 the open
 //! or a link was refused; 5 not ready in time; 6 the listener could not bind.
 
 use std::collections::BTreeMap;
@@ -30,8 +32,8 @@ use rdb_server::{check_listen, serve, Gateway};
 
 const USAGE: &str = "usage: rdb-server --control host:port[,host:port...] \
                      --nodes 1=ADDR,2=ADDR,3=ADDR[,...] --cert-dir D --listen 127.0.0.1:PORT \
-                     [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S]\n\
-                     exits: 0 stopped by Ctrl-C; 2 bad arguments, a non-loopback --listen, or \
+                     [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F]\n\
+                     exits: 0 stopped by Ctrl-C or the stop file; 2 bad arguments, a non-loopback --listen, or \
                      setup; 3 the open or a link was refused; 5 not ready in time; 6 the \
                      listener could not bind";
 
@@ -48,6 +50,7 @@ struct Args {
     client_id: u32,
     log_dir: PathBuf,
     ready: Duration,
+    stop_file: Option<PathBuf>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -59,6 +62,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut client_id = 100;
     let mut log_dir = None;
     let mut ready = Duration::from_secs(60);
+    let mut stop_file = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -96,6 +100,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .map_err(|_| format!("--client-id takes a number, got {text}"))?;
             }
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
+            "--stop-file" => stop_file = Some(PathBuf::from(value("--stop-file")?)),
             "--ready-secs" => {
                 let text = value("--ready-secs")?;
                 let secs = text
@@ -125,6 +130,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         client_id,
         log_dir,
         ready,
+        stop_file,
     })
 }
 
@@ -247,10 +253,24 @@ async fn run_async(args: &Args, rt: &tokio::runtime::Runtime) -> ExitCode {
         one_separator(&log_path)
     );
     let gateway = Gateway::new(Arc::clone(&db), args.client_id, timeouts.put, timeouts.read);
-    let shutdown = async {
-        // A failed signal hook ends the serve rather than serving with no way to stop.
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "rdb_server_signal_failed");
+    let stop_file = args.stop_file.clone();
+    let shutdown = async move {
+        let asked = async {
+            let Some(path) = stop_file else {
+                return std::future::pending::<()>().await;
+            };
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        tokio::select! {
+            // A failed signal hook ends the serve rather than serving with no way to stop.
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    tracing::error!(%error, "rdb_server_signal_failed");
+                }
+            }
+            () = asked => tracing::info!("rdb_server_stop_file_seen"),
         }
         tracing::info!("rdb_server_stopping");
     };

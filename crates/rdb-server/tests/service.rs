@@ -201,6 +201,51 @@ async fn the_gateway_serves_the_slice_1_contracts() {
         "{lines:#?}"
     );
 
+    // F-004: past the in-flight limit a call is refused before it starts: OVERLOADED, changed
+    // nothing, with a retry hint, and logged. A limit of 0 refuses every call.
+    let full = Gateway::new(
+        Arc::clone(&db),
+        rdb_api::db::DEFAULT_CLIENT.0,
+        timeouts.put,
+        timeouts.read,
+    )
+    .with_max_in_flight(0);
+    let (full_listener, full_addr) = config_testkit::ports::ephemeral_listener().await;
+    let (full_stop, full_stopped) = tokio::sync::oneshot::channel::<()>();
+    let full_server = tokio::spawn(rdb_server::serve(full, full_listener, async {
+        let _ = full_stopped.await;
+    }));
+    let mut full_client = RdbClient::connect(format!("http://{full_addr}"))
+        .await
+        .expect("connect to the full gateway");
+    let refused = put(&mut full_client, b"over-limit", b"v", None)
+        .await
+        .expect_err("a call past the limit");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::ResourceExhausted,
+        "{refused:?}"
+    );
+    let detail = rdb_error_of(&refused).expect("the server decided");
+    assert_eq!(detail.kind_name, "OVERLOADED", "{refused:?}");
+    assert!(detail.no_mutation, "{refused:?}");
+    assert_eq!(detail.retry, i32::from(pb::RetryRule::BoundedJitter));
+    assert_eq!(detail.retry_after_ms, Some(50), "{refused:?}");
+    assert!(
+        !get(&mut client, b"over-limit").await.found,
+        "nothing was written"
+    );
+    config_log::layer::flush_test_logs();
+    let overloaded: Vec<_> = config_testkit::logs::lines_for_current_test(MODULE, TEST)
+        .into_iter()
+        .filter(|line| line["@m"] == "rdb_server_call" && line["kind"] == "OVERLOADED")
+        .collect();
+    assert_eq!(overloaded.len(), 1, "{overloaded:#?}");
+    assert_eq!(overloaded[0]["no_mutation"], true, "{overloaded:#?}");
+    drop(full_client);
+    full_stop.send(()).expect("full server still running");
+    full_server.await.expect("join").expect("serve");
+
     drop(client);
     stop.send(()).expect("server still running");
     server.await.expect("join").expect("serve");

@@ -18,6 +18,13 @@ public class RetryRuleTests
         return (client, gateway);
     }
 
+    /// <summary>Server timeouts of 100 ms (put) and 50 ms (read) and 100 ms of slack: a put's attempt is 300 ms, a read's 200 ms.</summary>
+    private static void Shrink(RdbClient client)
+    {
+        client.UseServerTimeouts(TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(50));
+        client.Slack = TimeSpan.FromMilliseconds(100);
+    }
+
     private static RpcException Paused(bool noMutation, ulong? requestId = null) =>
         Wire.Refusal(StatusCode.Unavailable, Pb.ErrorKind.ProtectionPaused, "PROTECTION_PAUSED",
             Pb.RetryRule.BoundedJitter, noMutation, requestId);
@@ -57,11 +64,12 @@ public class RetryRuleTests
         Assert.Single(gateway.Calls);
     }
 
-    // C1: bounded by time. A put's attempt is about 12 s; in a 1 s budget a second send never starts.
+    // C1: bounded by time. A put's attempt is 300 ms here; after a pause of at least 25 ms a second one does not fit 320 ms.
     [Fact]
     public async Task C1_a_retry_starts_only_when_a_whole_attempt_fits_the_budget()
     {
-        var (client, gateway) = Client(TimeSpan.FromSeconds(1));
+        var (client, gateway) = Client(TimeSpan.FromMilliseconds(320));
+        Shrink(client);
         gateway.Then(Paused(true));
         var e = await Assert.ThrowsAsync<RdbException>(() => client.PutAsync("k", "v"));
         Assert.Equal(RdbErrorKind.ProtectionPaused, e.Kind);
@@ -123,6 +131,7 @@ public class RetryRuleTests
     public async Task C3_a_write_that_never_connects_is_not_sent_and_says_why()
     {
         var (client, gateway) = Client(TimeSpan.FromMilliseconds(400), instantPauses: false);
+        Shrink(client); // a put's attempt is 300 ms
         client.FakeConnect = () => new TaskCanceledException("A task was canceled.");
         var e = await Assert.ThrowsAsync<RdbException>(() => client.PutAsync("k", "v"));
         Assert.Equal(RdbErrorKind.Unavailable, e.Kind);
@@ -167,9 +176,10 @@ public class RetryRuleTests
     [Fact]
     public async Task A_read_with_no_answer_says_so_not_that_it_was_not_sent()
     {
-        // A read's attempt is about 4 s, so in a 300 ms budget the lost read is not sent again.
+        // A read's attempt is 200 ms here and the loss takes 150 ms, so in a 300 ms budget it is not sent again.
         var (client, gateway) = Client(TimeSpan.FromMilliseconds(300));
-        gateway.Then(Wire.Lost());
+        Shrink(client);
+        gateway.ThenAfter(TimeSpan.FromMilliseconds(150), Wire.Lost());
         var e = await Assert.ThrowsAsync<RdbException>(() => client.GetAsync("k"));
         Assert.Single(gateway.Calls);
         Assert.Contains("no answer within", e.Message);

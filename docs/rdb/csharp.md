@@ -16,7 +16,7 @@ dotnet run --project samples/Rdb.Sample -- ready
 dotnet run --project samples/Rdb.Sample -- put greeting hello
 dotnet run --project samples/Rdb.Sample -- get greeting
 dotnet run --project samples/Rdb.Sample -- walk
-scripts/rdb-server-dev.sh down        # the gateway, then lr down
+scripts/rdb-server-dev.sh down        # stop the gateway gracefully, then lr down
 scripts/rdb-server-dev.sh clean
 ```
 
@@ -24,7 +24,13 @@ Defaults: lr on base port 19100, the gateway on `127.0.0.1:19190`, runs under
 `C:/rdb_test_data/lr-cs`. `--base-port`, `--listen` and `--root` change them. `kill` kills the
 gateway as a crash; `gateway` starts it again on the same run; `resume` runs `lr up --resume` then
 the gateway. The gateway's output is `<run>/out/rdb-server.out`, its log `<run>/logs/rdb-server.jsonl`
-(one `rdb_server_call` line per call: method, kind, ms, request id; never keys or values).
+(never keys or values). Each call writes one `rdb_server_call` line: `method`, `kind` (`OK`, the
+error kind, or the gRPC code), `ms`, `request_id`, `no_mutation` (on errors), and `caller_gone`
+(true when the client had given up before the call ended: that is the line an operator settles an
+unknown write from). Each write that landed also writes `rdb_server_write`: `method`, `request_id`,
+`generation`, `version`. A gateway past 64 running calls refuses more with `OVERLOADED`
+(`no_mutation`, retried by the client). On Ctrl-C it waits up to 45 s for running calls to end and
+write their lines.
 
 ## The API
 
@@ -51,8 +57,10 @@ The server's decision rides in the gRPC rich status (`grpc-status-details-bin`, 
 - `RdbException`: anything else. `Kind`, `KindName`, `Retry`, `NoMutation`, `RequestId`,
   `Generation`, `RetryAfter`, `FromServer`. `Message` ends with the next step.
 
-`FromServer = false` with `Kind = Unavailable` means nothing was sent: the client could not connect
-within `Timeout`. A write while the gateway is down is "not sent", never "unknown".
+`FromServer = false` with `Kind = Unavailable` on a **write** means nothing was sent: the client
+could not connect within `Timeout`. A write while the gateway is down is "not sent", never
+"unknown". On a **read** it can also mean the read was sent and not answered (the message says "no
+answer"); a read changes nothing, so call it again.
 
 A refusal with `NoMutation = true` wrote nothing and needs no `StatusAsync`, whether or not it
 carries a `RequestId`. Some carry one (`LEASE_EXPIRED`); some never do (`CONDITION_FAILED`,
@@ -68,17 +76,23 @@ answer was lost with no request id (read the object, then decide).
   refused it with `NoMutation` and a retry rule of RefreshRoute, RetryAfterRecovery or
   BoundedJitter. A read retries on the rule alone, and after a lost transport.
 - Back-off is jittered, at least the server's `RetryAfter`, and bounded by time (`Timeout`,
-  default 30 s), never by count.
-- Each attempt waits the server's worst case: about 12 s for a put, the deadline plus about 11 s
-  for a transaction. A retry starts only when a whole attempt still fits in `Timeout`. A `Timeout`
-  shorter than one attempt still makes one attempt, cut at `Timeout`; a write cut that way is
-  `RdbUnknownOutcomeException` with no request id.
-- Cancelling a write gives `OperationCanceledException`. The write may have applied.
+  default 45 s), never by count.
+- Each attempt waits the server's worst case plus 2 s: 12 s for a put, 4 s for a read or status,
+  and for a transaction 5 s + its deadline + 1 s + 2 s (13 s at the default 5 s deadline, 38 s at
+  the largest, 30 s). A send starts only when a whole attempt still fits in `Timeout`, the first
+  one included. A `Timeout` shorter than one attempt is refused before anything is sent:
+  `RdbException` with `Kind = InvalidArgument`, `NoMutation = true`, `FromServer = false`.
+- Cancelling a call (its `CancellationToken`) gives a bare `OperationCanceledException`, with no
+  request id. For a write, it may have applied. Settle it by **reading the object**; never send
+  it again blindly, or it may apply twice.
+- One client shares one connection. A call that fails in transport makes later calls connect
+  afresh; calls already running on the old connection run on to their own result.
 
 ## Limits and notes
 
-- Keys up to 1,024 bytes, up to 254 puts per transaction, a transaction deadline up to 30 s. The
-  server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
+- Keys up to 1,024 bytes, values up to about 1 MiB (1,048,536 bytes), up to 255 puts per
+  transaction, a transaction deadline up to 30 s. The server checks them (`INVALID_ARGUMENT`),
+  exactly as the embedded API does.
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
 - A version is the partition's, not the object's: every write in the partition raises it, so an
@@ -91,3 +105,7 @@ answer was lost with no request id (read the object, then decide).
   answers, so it may drop them: a status of an older write can say ReadTheObject.
 - Loopback only: `--listen` refuses `0.0.0.0`, `[::]`, `[::ffff:127.0.0.1]`, LAN addresses and host
   names. TLS for apps comes in slice 3.
+- **Local trust.** Until slice 3 the gateway checks no caller: any process on this machine can call
+  it and acts as the gateway's app, with its client id and its rights. And while the gateway is
+  down, any local process that takes its port receives your calls, values included. Run it only on
+  a machine whose local users and processes you trust.

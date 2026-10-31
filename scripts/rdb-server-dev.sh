@@ -5,7 +5,7 @@
 #   scripts/rdb-server-dev.sh gateway [--listen ADDR] [--root DIR]   start the gateway on the current run
 #   scripts/rdb-server-dev.sh resume  [--listen ADDR] [--root DIR]   `lr up --resume`, then the gateway
 #   scripts/rdb-server-dev.sh kill    [--root DIR]                    kill the gateway at once (a crash)
-#   scripts/rdb-server-dev.sh down    [--root DIR]                    stop the gateway, then `lr down`
+#   scripts/rdb-server-dev.sh down    [--root DIR]                    stop the gateway gracefully, then `lr down`
 #   scripts/rdb-server-dev.sh clean   [--root DIR]                    `lr clean` (after down)
 #
 # `up` starts rDB as three node processes with `scripts/local-rdb.sh up` (`lr`), builds
@@ -19,6 +19,8 @@
 #
 # The gateway's files go in the run folder: out/rdb-server.out|.err, logs/rdb-server.jsonl,
 # and its pid in `pids` as role `rdb-server`, so `lr down` does not know it: use `down` here.
+# `down` asks the gateway to stop by creating `<run>/rdb-server.stop` (its `--stop-file`), so it
+# drains running calls and writes their lines; `kill` does not.
 # Delete (slice 2): no Delete yet. Write an empty value as a tombstone (docs/rdb/csharp.md).
 
 set -euo pipefail
@@ -35,7 +37,7 @@ while [ $# -gt 0 ]; do
         --listen) LISTEN="$2"; shift 2 ;;
         --root) ROOT="$2"; shift 2 ;;
         --release) RELEASE="--release"; shift ;;
-        *) echo "rdb-server-dev: unknown argument $1" >&2; sed -n '3,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) echo "rdb-server-dev: unknown argument $1" >&2; sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 
@@ -60,7 +62,8 @@ pid_of_gateway() { awk '$1 == "rdb-server" { print $2 }' "$RUN/pids" 2>/dev/null
 gateway_alive() {
     local p; p="$(pid_of_gateway)"; [ -n "$p" ] || return 1
     if is_msys; then ps -W | awk -v p="$p" '$4 == p && index($NF, "rdb-server") { f = 1 } END { exit !f }'
-    else kill -0 "$p" 2>/dev/null; fi
+    # Not MSYS: the pid must still be alive and still be rdb-server, never a process that reused it.
+    else kill -0 "$p" 2>/dev/null && ps -p "$p" -o comm= 2>/dev/null | grep -q rdb-server; fi
 }
 
 start_gateway() {
@@ -75,8 +78,9 @@ start_gateway() {
     [ -f "$bin" ] || die "rdb-server not found at $bin after building"
     out="$RUN/out/rdb-server.out"
     err="$RUN/out/rdb-server.err"
+    rm -f "$RUN/rdb-server.stop"
     "$bin" --control "$CONTROL" --nodes "$PEERS" --cert-dir "$RUN/certs" --app pilot-b \
-        --client-id 100 --listen "$LISTEN" --log-dir "$RUN/logs" >"$out" 2>"$err" &
+        --client-id 100 --listen "$LISTEN" --log-dir "$RUN/logs" --stop-file "$RUN/rdb-server.stop" >"$out" 2>"$err" &
     pid=$!
     os="$pid"
     if [ -r "/proc/$pid/winpid" ]; then
@@ -111,6 +115,22 @@ kill_gateway() {
     say "gateway killed (pid $p)"
 }
 
+# Graceful: create the stop file the gateway watches, then wait for it to drain its calls and exit
+# (it waits up to 45 s for running calls). Only past 60 s is it killed, and that is said.
+stop_gateway() {
+    load_run
+    local p i; p="$(pid_of_gateway)"
+    if [ -z "$p" ] || ! gateway_alive; then say "no gateway runs"; return 0; fi
+    : > "$RUN/rdb-server.stop"
+    for i in $(seq 1 600); do
+        if ! gateway_alive; then rm -f "$RUN/rdb-server.stop"; say "gateway stopped (pid $p)"; return 0; fi
+        sleep 0.1
+    done
+    say "gateway did not stop within 60 s of its stop file; killing it (pid $p)"
+    kill_gateway
+    rm -f "$RUN/rdb-server.stop"
+}
+
 case "$COMMAND" in
     up)
         # shellcheck disable=SC2086
@@ -119,7 +139,7 @@ case "$COMMAND" in
     gateway) start_gateway ;;
     resume) "$LR" up --resume; start_gateway ;;
     kill) kill_gateway ;;
-    down) kill_gateway; "$LR" down ;;
+    down) stop_gateway; "$LR" down ;;
     clean) "$LR" clean ;;
-    *) sed -n '3,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    *) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

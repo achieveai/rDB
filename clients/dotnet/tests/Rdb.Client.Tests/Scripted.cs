@@ -6,17 +6,20 @@ namespace Rdb.Client.Tests;
 
 /// <summary>
 /// A gateway that answers from a script: each call takes the next entry, a reply or an
-/// <see cref="RpcException"/>. A call past the end of the script fails the test loudly.
+/// <see cref="RpcException"/>, after an optional delay. A call past the end of the script fails the test loudly.
 /// </summary>
 internal sealed class ScriptedInvoker : CallInvoker
 {
-    private readonly Queue<object> _script = new();
+    private readonly Queue<(TimeSpan Delay, object Answer)> _script = new();
 
     public List<string> Calls { get; } = new();
 
-    public ScriptedInvoker Then(object replyOrError)
+    public ScriptedInvoker Then(object replyOrError) => ThenAfter(TimeSpan.Zero, replyOrError);
+
+    /// <summary>The next call answers after <paramref name="delay"/>: a call that takes time on the server.</summary>
+    public ScriptedInvoker ThenAfter(TimeSpan delay, object replyOrError)
     {
-        _script.Enqueue(replyOrError);
+        _script.Enqueue((delay, replyOrError));
         return this;
     }
 
@@ -25,9 +28,16 @@ internal sealed class ScriptedInvoker : CallInvoker
     {
         Calls.Add(method.Name);
         if (_script.Count == 0) throw new InvalidOperationException($"unscripted call {method.Name} (call {Calls.Count})");
-        var next = _script.Dequeue();
-        var answer = next is Exception ex ? Task.FromException<TResponse>(ex) : Task.FromResult((TResponse)next);
+        var (delay, next) = _script.Dequeue();
+        var answer = Answer<TResponse>(delay, next);
         return new AsyncUnaryCall<TResponse>(answer, Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
+    }
+
+    private static async Task<TResponse> Answer<TResponse>(TimeSpan delay, object next)
+    {
+        if (delay > TimeSpan.Zero) await Task.Delay(delay);
+        if (next is Exception ex) throw ex;
+        return (TResponse)next;
     }
 
     public override TResponse BlockingUnaryCall<TRequest, TResponse>(
@@ -58,10 +68,12 @@ internal static class Wire
 
     /// <summary>A refusal the server decided, in the rich status trailer.</summary>
     public static RpcException Refusal(
-        StatusCode code, Pb.ErrorKind kind, string kindName, Pb.RetryRule retry, bool noMutation, ulong? requestId = null)
+        StatusCode code, Pb.ErrorKind kind, string kindName, Pb.RetryRule retry, bool noMutation, ulong? requestId = null,
+        ulong? retryAfterMs = null)
     {
         var detail = new Pb.RdbError { Kind = kind, KindName = kindName, Retry = retry, NoMutation = noMutation };
         if (requestId is { } id) detail.RequestId = id;
+        if (retryAfterMs is { } after) detail.RetryAfterMs = after;
         var status = new Pb.RpcStatus { Code = (int)code, Message = $"{kindName} (detail; next: step)" };
         status.Details.Add(new Pb.AnyDetail { TypeUrl = RdbErrors.RdbErrorTypeUrl, Value = detail.ToByteString() });
         var trailers = new Metadata { { RdbErrors.DetailsTrailer, status.ToByteArray() } };

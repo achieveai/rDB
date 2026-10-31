@@ -42,6 +42,131 @@ const RULES: [RetryRule; 8] = [
     RetryRule::NotWired,
 ];
 
+/// Each kind's fixed place on the wire, written out by hand: its name and number in
+/// `proto/rdb/v1/rdb.proto`, and its advisory gRPC code. Not derived from the code under test,
+/// so swapping two arms of `wire_kind` or `code_for` turns a row red (review F-007).
+const KIND_TABLE: [(ErrorKind, &str, i32, tonic::Code); 21] = {
+    use tonic::Code as C;
+    use ErrorKind as K;
+    [
+        (K::NotPrimary, "NOT_PRIMARY", 1, C::Unavailable),
+        (K::RouteChanged, "ROUTE_CHANGED", 2, C::Unavailable),
+        (K::LeaseExpired, "LEASE_EXPIRED", 3, C::Unavailable),
+        (K::RecoveryReadOnly, "RECOVERY_READ_ONLY", 4, C::Unavailable),
+        (K::ProtectionPaused, "PROTECTION_PAUSED", 5, C::Unavailable),
+        (
+            K::ConditionFailed,
+            "CONDITION_FAILED",
+            6,
+            C::FailedPrecondition,
+        ),
+        (K::CrossAffinity, "CROSS_AFFINITY", 7, C::InvalidArgument),
+        (
+            K::InvalidArgument,
+            "INVALID_ARGUMENT",
+            8,
+            C::InvalidArgument,
+        ),
+        (K::Overloaded, "OVERLOADED", 9, C::ResourceExhausted),
+        (
+            K::DeadlineBeforeAdmission,
+            "DEADLINE_BEFORE_ADMISSION",
+            10,
+            C::DeadlineExceeded,
+        ),
+        (K::UnknownOutcome, "UNKNOWN_OUTCOME", 11, C::Unknown),
+        (
+            K::GenerationChanged,
+            "GENERATION_CHANGED",
+            12,
+            C::FailedPrecondition,
+        ),
+        (
+            K::RequestIdReuse,
+            "REQUEST_ID_REUSE",
+            13,
+            C::FailedPrecondition,
+        ),
+        (
+            K::StaleContinuation,
+            "STALE_CONTINUATION",
+            14,
+            C::FailedPrecondition,
+        ),
+        (K::CorruptHistory, "CORRUPT_HISTORY", 15, C::DataLoss),
+        (
+            K::IncompatibleVersion,
+            "INCOMPATIBLE_VERSION",
+            16,
+            C::DataLoss,
+        ),
+        (
+            K::StatusExpired,
+            "STATUS_EXPIRED",
+            17,
+            C::FailedPrecondition,
+        ),
+        (
+            K::DivergenceRequiresOperator,
+            "DIVERGENCE_REQUIRES_OPERATOR",
+            18,
+            C::DataLoss,
+        ),
+        (K::Unavailable, "UNAVAILABLE", 19, C::Unavailable),
+        (
+            K::UploadChunkConflict,
+            "UPLOAD_CHUNK_CONFLICT",
+            20,
+            C::FailedPrecondition,
+        ),
+        (K::CorruptBlob, "CORRUPT_BLOB", 21, C::DataLoss),
+    ]
+};
+
+/// Each rule's name and number in the proto, written out by hand (review F-007).
+const RULE_TABLE: [(RetryRule, &str, i32); 8] = [
+    (RetryRule::RefreshRoute, "REFRESH_ROUTE", 1),
+    (RetryRule::RetryAfterRecovery, "RETRY_AFTER_RECOVERY", 2),
+    (RetryRule::Definitive, "DEFINITIVE", 3),
+    (RetryRule::BoundedJitter, "BOUNDED_JITTER", 4),
+    (RetryRule::QueryStatus, "QUERY_STATUS", 5),
+    (RetryRule::Reconcile, "RECONCILE", 6),
+    (RetryRule::Quarantine, "QUARANTINE", 7),
+    (RetryRule::NotWired, "NOT_WIRED", 8),
+];
+
+/// F-007: every kind goes on the wire as its proto number and name with its fixed code, and
+/// every rule as its proto number. The generated enum is checked against the same table, so
+/// the table is the proto's numbering, not a copy of the code's.
+#[test]
+fn every_kind_and_rule_has_its_fixed_wire_number_and_code() {
+    assert_eq!(KIND_TABLE.len(), KINDS.len(), "the table lists every kind");
+    for (kind, name, number, code) in KIND_TABLE {
+        assert_eq!(i32::from(wire_kind(kind)), number, "{kind:?}: wire number");
+        assert_eq!(
+            rdb_server::pb::ErrorKind::from_str_name(name).map(i32::from),
+            Some(number),
+            "{kind:?}: the proto numbers {name} as {number}"
+        );
+        assert_eq!(code_for(kind), code, "{kind:?}: gRPC code");
+        let detail = rdb_error_of(&to_status(&ApiError::new(kind, "d"), None)).expect("detail");
+        assert_eq!(detail.kind, number, "{kind:?}: the detail carries {number}");
+        assert_eq!(
+            detail.kind_name, name,
+            "{kind:?}: the detail carries {name}"
+        );
+    }
+    assert_eq!(RULE_TABLE.len(), RULES.len(), "the table lists every rule");
+    for (rule, name, number) in RULE_TABLE {
+        assert_eq!(i32::from(wire_retry(rule)), number, "{rule:?}: wire number");
+        assert_eq!(
+            rdb_server::pb::RetryRule::from_str_name(name).map(i32::from),
+            Some(number),
+            "{rule:?}: the proto numbers {name} as {number}"
+        );
+    }
+}
+
 /// C5: only a loopback IP is served. Each refusal names what to pass instead.
 #[test]
 fn c5_check_listen_serves_loopback_ips_only() {

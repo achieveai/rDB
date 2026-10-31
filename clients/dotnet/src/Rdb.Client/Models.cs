@@ -9,12 +9,13 @@ public sealed class RdbClientOptions
     public string Endpoint { get; set; } = "http://127.0.0.1:19190";
 
     /// <summary>
-    /// Time budget for one call, retries included. Default 30 s. One attempt can take the gateway up to about
-    /// 12 s for a put and the transaction deadline plus about 9 s for a transaction, so a retry is started only when
-    /// a whole attempt still fits. A budget shorter than one attempt still makes one attempt, cut at the budget: a
-    /// write cut that way is <see cref="RdbUnknownOutcomeException"/> with no request id.
+    /// Time budget for one call, retries included. Default 45 s. One attempt is the server's worst case plus 2 s:
+    /// 12 s for a put (twice the 5 s put timeout), 4 s for a read or status, and for a transaction the put timeout,
+    /// the transaction deadline and the host's 1 s of margins, so 13 s at the default 5 s deadline and 38 s at the
+    /// largest, 30 s. A send starts only when a whole attempt still fits, so the default fits every call. A budget
+    /// shorter than one attempt is refused before anything is sent (INVALID_ARGUMENT, no_mutation).
     /// </summary>
-    public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(45);
 }
 
 /// <summary>What the server says about readiness.</summary>
