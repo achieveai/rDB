@@ -333,6 +333,19 @@ fn b3_a467_a_copy_dropped_by_an_outage_is_named_at_the_reopen() {
     reopens_with_members_1_2_3(reopened, &rt, dir.path(), &store, "after");
 }
 
+/// A-R469 (tester D-R3-1): the open names a local copy as left out only when it held one. Node
+/// 3 held data and is out; node 4's folder holds no partition 1 data, so it is a spare and is
+/// never named; node 2 is pinned. Cut: the held-a-copy filter in `left_out_copies`: red.
+/// Unit (<1 ms).
+#[test]
+fn b3_a469_a_spare_without_partition_data_is_not_left_out() {
+    let local = [(NodeId(2), true), (NodeId(3), true), (NodeId(4), false)];
+    assert_eq!(
+        super::left_out_copies(&local, &[NodeId(1), NodeId(2)]),
+        vec![NodeId(3)]
+    );
+}
+
 /// A-R466, the crash right after the move: `nodes/3` is missing. Before the roll-forward the
 /// open refused `CopyMissing`. Cut: the aside test in `open_engines` (refuse a missing copy as
 /// before): red.

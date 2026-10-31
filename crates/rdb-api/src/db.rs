@@ -1484,20 +1484,19 @@ impl Db {
         // record's members), so the open says which local copy is out and the step that brings
         // it back, while the partition pins fewer copies than its count.
         if pinned.len() < admin::members().len() {
-            let local: BTreeSet<&NodeId> = engines
-                .keys()
-                .chain(resume.iter().map(|(node, ..)| node))
+            let local: Vec<(NodeId, bool)> = engines
+                .iter()
+                .map(|(node, engine)| (*node, holds_partition(engine)))
+                .chain(resume.iter().map(|(node, ..)| (*node, true)))
                 .collect();
-            for node in local {
-                if !pinned.contains(node) {
-                    tracing::warn!(
-                        node = node.0,
-                        generation = record.generation.0,
-                        pinned = ?pinned.iter().map(|node| node.0).collect::<Vec<_>>(),
-                        step = %format!("admin rebuild {}", node.0),
-                        "db_open_copy_left_out"
-                    );
-                }
+            for node in left_out_copies(&local, &pinned) {
+                tracing::warn!(
+                    node = node.0,
+                    generation = record.generation.0,
+                    pinned = ?pinned.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    step = %format!("admin rebuild {}", node.0),
+                    "db_open_copy_left_out"
+                );
             }
         }
         if !resume.is_empty() {
@@ -4529,6 +4528,28 @@ fn open_engines(
         }
     }
     Ok((engines, absent))
+}
+
+/// Whether `engine`'s folder holds data of partition 1: proof that its node held a copy.
+fn holds_partition(engine: &RocksEngine) -> bool {
+    engine
+        .lineages()
+        .iter()
+        .any(|(partition, _)| *partition == PARTITION)
+}
+
+/// A-R467, A-R469: the local copies an open names as left out of `partitions/1`. `local` pairs
+/// each local node with whether it held a copy (its folder holds partition 1 data, or a wipe
+/// of it is being finished). A node that never held one is a spare and is never named.
+fn left_out_copies(local: &[(NodeId, bool)], pinned: &[NodeId]) -> Vec<NodeId> {
+    let mut out: Vec<NodeId> = local
+        .iter()
+        .filter(|(node, held)| *held && !pinned.contains(node))
+        .map(|(node, _)| *node)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// The engines [`open_engines`] opened, and the copies it left to `Db::check`.
