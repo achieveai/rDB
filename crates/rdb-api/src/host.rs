@@ -6668,7 +6668,12 @@ impl Host {
     fn shadow_duty(&mut self, partition: PartitionId, now: Tick) {
         // A-R459: the lag clock runs only while each duty finds the move's shadow behind.
         let lagging = self.move_catching_up.remove(&partition);
+        // A-R464 (critic-s1c R1): a duty that cannot judge the shadow puts the clock back, so a
+        // re-plan or a link down for one duty does not start it again; only progress does.
         if self.rejoins.contains_key(&partition) {
+            if let Some(clock) = lagging {
+                self.move_catching_up.insert(partition, clock);
+            }
             return;
         }
         let Some(committed) = self.committed.get(&partition) else {
@@ -6688,7 +6693,13 @@ impl Host {
         // T8: a shadow this owner has no link to is not promoted, however far it got: the
         // promote would leave the source out for a copy that may be gone. A move's shadow is
         // given up past the drop clock instead ([`Self::shadow_give_up_duty`]).
-        if !owner || !self.linked(shadow.node) {
+        if !owner {
+            return;
+        }
+        if !self.linked(shadow.node) {
+            if let Some(clock) = lagging {
+                self.move_catching_up.insert(partition, clock);
+            }
             return;
         }
         // M11: a shadow pinned beside all rf3 regular copies is a move's target. It is promoted

@@ -4917,3 +4917,143 @@ fn m11_r463_b_the_catch_up_clock_starts_again_only_on_progress() {
         "no progress past the deadline"
     );
 }
+
+/// Critic-s1c R1 (ruling A-R464), the re-plan return: a duty that runs while a re-plan is
+/// running cannot judge the shadow, so it puts the catch-up clock back with its start kept,
+/// and the next duty past the deadline still gives the move up.
+/// Cut: the restore on the `rejoins` return, red (the clock is gone after the duty).
+#[test]
+fn m11_r464_b_a_re_plan_keeps_the_catch_up_clock_start() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    host.move_catch_up_millis = 1_000;
+    let p = PartitionId(1);
+    let started = CatchUp {
+        to: NodeId(4),
+        since: Tick(0),
+        low: 100,
+        acked: 600,
+    };
+    host.move_catching_up.insert(p, started);
+    let replan = Replan {
+        drop: None,
+        rejoiner: None,
+        promote: false,
+        since: Tick(400),
+    };
+    host.rejoins.insert(
+        p,
+        Rejoin::Planned {
+            generation: Generation(9),
+            replan,
+        },
+    );
+    host.shadow_duty(p, Tick(500));
+    host.rejoins.remove(&p);
+    let kept = host.move_catching_up.remove(&p);
+    assert_eq!(kept.map(|clock| clock.since), Some(Tick(0)), "{kept:?}");
+    let seen = CatchUp {
+        since: Tick(1_200),
+        low: 120,
+        acked: 650,
+        ..started
+    };
+    host.move_lag_duty(p, kept, seen, 500, OwnerEpoch(1));
+    assert!(
+        !host.move_catching_up.contains_key(&p),
+        "given up 1.2 s after the start, past the 1 s deadline"
+    );
+}
+
+/// Critic-s1c R1 (ruling A-R464): `shadow_duty` took the catch-up clock out first and lost it
+/// on two early returns, a running re-plan and a shadow with no link, so a link that dropped
+/// for one duty at least once a deadline started the clock again, and under writes the copy
+/// could not keep up with the move was never given up. Here node 1's stream to node 4 is cut
+/// after the pin (no new low ever), writes land, and the link to node 4 is held for 300 ms
+/// (one 200 ms duty, under the 1 s drop clock) every second against a 3 s deadline. The move
+/// is still given up by the catch-up clock, at or after its deadline, and the drop clock
+/// never fires.
+/// Cut: the restore on the `!linked` return, red (never given up within 20 s of host time).
+/// Integration (~6 s): bootstrap's window, the join, the flaps, the give-up re-plan.
+#[config_log::retcd_test]
+fn m11_r464_a_a_flapping_link_does_not_start_the_catch_up_clock_again() {
+    const METHOD: &str = "m11_r464_a_a_flapping_link_does_not_start_the_catch_up_clock_again";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    trio.nodes[0].0.move_catch_up_millis = 3_000;
+    match trio.ask(move_call(10_000, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            trio.links.drop_direction(NodeId(1), NodeId(4));
+        }
+        pinned.then_some(())
+    });
+    trio.until("the pin's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.ready();
+    let started = trio.clock.now().0;
+    let (mut request, mut flaps) = (0, 0);
+    let mut held_at: Option<u64> = None;
+    let mut next_hold = started + 1_000;
+    while commit_of(&trio).is_some_and(|(_, _, members)| members.contains(&4)) {
+        let now = trio.clock.now().0;
+        assert!(
+            now - started < 20_000,
+            "node 4 not given up {} ms after the cut; {flaps} flaps",
+            now - started
+        );
+        // No put while the link is held, and no hold while a re-plan runs: a put waits for its
+        // answer, and the give-up re-plan's answer can need the held link.
+        let replanning = trio.nodes[0].0.rejoins.contains_key(&PartitionId(1));
+        match held_at {
+            Some(at) if now - at >= 300 => {
+                // The heal lifts the cut too: cut again before anything is sent.
+                trio.links.heal(NodeId(1), NodeId(4));
+                trio.links.drop_direction(NodeId(1), NodeId(4));
+                held_at = None;
+                next_hold = now + 700;
+                flaps += 1;
+                continue;
+            }
+            Some(_) => {
+                pass(&mut trio, 20);
+                continue;
+            }
+            None if now >= next_hold && !replanning => {
+                trio.links.hold(NodeId(1), NodeId(4));
+                held_at = Some(now);
+                continue;
+            }
+            None => {}
+        }
+        request += 1;
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            Answer::Error { error, .. } if error.no_mutation => pass(&mut trio, 20),
+            // UNKNOWN_OUTCOME is fine: the row tests the clock, not that put.
+            Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {}
+            other => panic!("put {request}: {other:?}"),
+        }
+    }
+    trio.links.heal(NodeId(1), NodeId(4));
+    assert!(flaps >= 2, "control: the link flapped {flaps} times");
+    let (_, _, members) = commit_of(&trio).expect("a commit");
+    assert_eq!(members, vec![1, 2, 3], "node 3 keeps its copy");
+    let given_up = logged!(METHOD, "move_catch_up_given_up");
+    assert_eq!(given_up.len(), 1, "{given_up:?}");
+    assert!(
+        given_up[0]["waited_ms"].as_u64().expect("waited_ms") >= 3_000,
+        "{given_up:?}"
+    );
+    let unreachable = logged!(METHOD, "move_given_up");
+    assert!(
+        unreachable.is_empty(),
+        "the drop clock fired: {unreachable:?}"
+    );
+}
