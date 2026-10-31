@@ -505,6 +505,10 @@ struct Opened {
     /// open sets it, an app-only one too (A-R261). `None` only in a `Db` a crate test builds by
     /// hand.
     control: Option<PromoteStore>,
+    /// The rDB instance this open's copies name. A wiped node's empty folder is bound to it
+    /// before the node starts again (D-MC1), or the next open refuses it `Unbound`. `None`
+    /// only in an app-only open, which runs no node, and a `Db` a crate test builds by hand.
+    instance: Option<[u8; INSTANCE_LEN]>,
 }
 
 /// The control store, runtime and budgets [`Db::promote`] runs on.
@@ -525,6 +529,7 @@ impl Default for Opened {
             heal_task: None,
             stuck: Mutex::new(None),
             control: None,
+            instance: None,
         }
     }
 }
@@ -1217,6 +1222,7 @@ impl Db {
             opened: Opened {
                 base_boot: boot,
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
+                instance: Some(found.instance),
                 ..Opened::default()
             },
             route: Route {
@@ -3170,23 +3176,28 @@ impl Db {
         let folder = respawn.nodes_dir.join(node.0.to_string());
         // M5: the record is read after the stop, so nothing can take the node back between the
         // check and the move.
+        let wiping = aside.is_some();
         let unmoved = aside.and_then(|aside| {
             match self.wipe_fenced(node, aside.generation, Some((aside.boot, old_boot))) {
                 Some(refused) => Some(refused),
                 None => move_aside(node, &folder, &aside.to).err(),
             }
         });
-        let started = host::spawn_with(
-            node,
-            folder,
-            Arc::clone(&self.links),
-            Arc::clone(&self.control),
-            self.clock,
-            respawn.budgets,
-            respawn.limits,
-            boot,
-            respawn.storage,
-        );
+        let started = if wiping && unmoved.is_none() {
+            self.start_emptied(node, &folder, respawn, boot)
+        } else {
+            host::spawn_with(
+                node,
+                folder,
+                Arc::clone(&self.links),
+                Arc::clone(&self.control),
+                self.clock,
+                respawn.budgets,
+                respawn.limits,
+                boot,
+                respawn.storage,
+            )
+        };
         match started {
             Ok(started) => {
                 *handle = started;
@@ -3232,6 +3243,52 @@ impl Db {
                 Err(ApiError::host(&detail))
             }
         }
+    }
+
+    /// Start `node` at `boot` on the empty `folder` its wipe left (D-MC1): open the engine,
+    /// bind it to this open's instance with a synced write, then start the node on it. Without
+    /// the binding the copy fills from the others, and the next open refuses the folder
+    /// `Unbound`. A `Db` that names no instance cannot bind, so the node is not started.
+    fn start_emptied(
+        &self,
+        node: NodeId,
+        folder: &Path,
+        respawn: &Respawn,
+        boot: BootId,
+    ) -> Result<NodeHandle, String> {
+        let instance = self.opened.instance.ok_or_else(|| {
+            format!(
+                "node {}: this Db names no rDB instance, so its emptied folder {} cannot be \
+                 bound; reopen the directory to start it",
+                node.0,
+                folder.display()
+            )
+        })?;
+        let mut engine = RocksEngine::open_with(folder, respawn.storage)
+            .map_err(|e| format!("node {}: open {}: {e}", node.0, folder.display()))?;
+        engine.bind_instance(instance).map_err(|error| {
+            format!(
+                "node {}: bind the emptied folder {}: {error}",
+                node.0,
+                folder.display()
+            )
+        })?;
+        tracing::info!(
+            node = node.0,
+            boot = boot.0,
+            instance_hex = %admin::instance_hex(&instance),
+            "node_emptied_folder_bound"
+        );
+        host::spawn_on(
+            node,
+            engine,
+            Arc::clone(&self.links),
+            Arc::clone(&self.control),
+            self.clock,
+            respawn.budgets,
+            respawn.limits,
+            boot,
+        )
     }
 
     /// Why `node`'s wipe is refused after its stop, or `None` (critic-bb M5): `partitions/1`

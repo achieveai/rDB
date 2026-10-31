@@ -534,6 +534,46 @@ mod tests {
         );
     }
 
+    /// Merge-check gap (final walk 7b4762b): a rebuild onto a spare while the partition is
+    /// quarantined is refused G6. A spare is configured but not pinned, so it holds no copy the
+    /// evidence can name, even evidence naming copy 3, the id node 4 would take. Cut: `names`
+    /// matches `CopyId(node - 1)` without the pinned members: the spare is let through, red.
+    #[test]
+    fn b3_g6_a_quarantined_rebuild_onto_a_spare_is_refused() {
+        let members = rf3();
+        let known = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let pairwise = DivergenceEvidence::Pairwise {
+            seq: Seq(5),
+            a: (CopyId(0), Digest::ROOT),
+            b: (CopyId(2), Digest::ROOT),
+        };
+        let spares_id = DivergenceEvidence::RootMismatch {
+            copy: CopyId(3),
+            base_seq: Seq(1),
+            expected: Digest::ROOT,
+            found: None,
+        };
+        for evidence in [&pairwise, &spares_id] {
+            let asked = Asked {
+                known: &known,
+                ..asked(4, &members, false, Some(Some(evidence)))
+            };
+            let refused = decide(&asked, |_| true).expect_err("a spare under quarantine");
+            assert_eq!(refused.guard, "G6", "{evidence:?}: {}", refused.detail);
+            assert!(
+                refused.detail.contains("does not name node 4's copy"),
+                "{}",
+                refused.detail
+            );
+        }
+        // The premise: with no quarantine the same spare is a mode A rebuild, not refused.
+        let asked = Asked {
+            known: &known,
+            ..asked(4, &members, false, None)
+        };
+        assert_eq!(decide(&asked, |_| true), Ok(RebuildMode::NotPinned));
+    }
+
     #[test]
     fn b3_g5_needs_a_serving_commit_without_n() {
         let members = rf3();

@@ -60,13 +60,49 @@ fn files_under(dir: &Path) -> usize {
     std::fs::read_dir(dir).map_or(0, |entries| entries.count())
 }
 
+/// D-MC1 (final walk 7b4762b): shut `db` down and open the same folder again. It opens, is
+/// ready, node 1 owns partition 1 with members 1, 2 and 3, and `key` reads back. A wiped node
+/// restarted on an empty folder that names no instance made this open refuse
+/// "nodes/3 holds data but names no rDB instance".
+fn reopens_with_members_1_2_3(
+    mut db: Db,
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    store: &Arc<dyn ConfigStore>,
+    key: &str,
+) {
+    db.shutdown();
+    drop(db);
+    let db = rt
+        .block_on(Db::open_with(
+            config(dir),
+            Arc::clone(store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the folder opens again after the rebuild");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(20)))
+        .expect("the reopen is ready");
+    let (owner, pinned) = db.pinned_members().expect("the owner answers");
+    let mut nodes: Vec<u32> = pinned.iter().map(|m| m.node.0).collect();
+    nodes.sort_unstable();
+    assert_eq!((owner, nodes), (NodeId(1), vec![1, 2, 3]), "{pinned:?}");
+    let got = db.get(key.as_bytes()).expect("a read after the reopen");
+    assert_eq!(
+        got.value.map(|(_, value)| value),
+        Some(Bytes::from(key.to_owned())),
+        "acked {key} reads back after the reopen"
+    );
+}
+
 /// Under writes, `admin rebuild 3 --wipe` with 3 pinned (mode B): the owner drops 3, waits for
 /// that commit, 3 restarts on an empty folder and is pinned regular again. Every acked write
 /// reads back, the longest wait for an ack is bounded, and 3's old folder is moved aside with
-/// its files (G7), never deleted.
+/// its files (G7), never deleted. The folder then opens again with members 1, 2 and 3 (D-MC1).
 /// Cut G7 (`move_aside` deleting): the aside folder is missing. Cut G5/B2 (no drop before the
-/// wipe): the fence refuses, since `partitions/1` still pins 3, and the row goes red.
-/// Integration (~5-15 s): one open, a drop re-plan, a restart, a re-add and its promote.
+/// wipe): the fence refuses, since `partitions/1` still pins 3, and the row goes red. Cut
+/// D-MC1 (no `bind_instance` on the emptied folder): the reopen is refused `Unbound`, red.
+/// Integration (~5-15 s): two opens, a drop re-plan, a restart, a re-add and its promote.
 #[config_log::retcd_test]
 fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_write() {
     let rt = runtime();
@@ -165,6 +201,7 @@ fn b3_rebuild_under_writes_brings_node_3_back_regular_and_keeps_every_acked_writ
         );
     }
     assert!(files_under(&aside) > 0);
+    reopens_with_members_1_2_3(db, &rt, dir.path(), &store, "pre0");
 }
 
 /// G2 at the `Db`: rebuilding the owner is refused `INVALID_ARGUMENT`, names `admin promote`,
@@ -273,9 +310,11 @@ fn quarantine_by_fork(db: &Db, nodes: &[NodeId], patience: Duration) -> bool {
 /// Mode C (critic-bb §3): node 3's copy diverges (a validly chained different head), its
 /// restart's rejoin quarantines the owner's F1, and `admin rebuild 3` replaces that F1 with a
 /// fresh run without 3, always wipes 3 (moved aside), and 3 is pinned regular again. Every
-/// write acked before reads back, and a new write is acked after.
-/// Cut: keep the quarantined F1 (no fresh run): the rebuild is refused, red.
-/// Integration (~5-15 s): one open, a fork, a quarantine, a re-plan, a restart, a re-add.
+/// write acked before reads back, and a new write is acked after. The folder then opens again
+/// with members 1, 2 and 3 (D-MC1).
+/// Cut: keep the quarantined F1 (no fresh run): the rebuild is refused, red. Cut D-MC1 (no
+/// `bind_instance` on the emptied folder): the reopen is refused `Unbound`, red.
+/// Integration (~5-15 s): two opens, a fork, a quarantine, a re-plan, a restart, a re-add.
 #[config_log::retcd_test]
 fn b3_mode_c_takes_a_quarantined_partition_out_and_back() {
     let rt = runtime();
@@ -311,6 +350,64 @@ fn b3_mode_c_takes_a_quarantined_partition_out_and_back() {
         put_acked(&db, "after", patience).is_some(),
         "writes land again"
     );
+    reopens_with_members_1_2_3(db, &rt, dir.path(), &store, "after");
+}
+
+/// M-MC2 (final walk 7b4762b): `admin rebuild 3` asked straight after a reopen, before the
+/// owner's recovery has committed, said "ask the node that owns it" while node 1 owns it. Here
+/// the reopen holds links 1-2 and 1-3, so node 1's recovery cannot commit or quarantine. The
+/// refusal says it has not committed since it started, is not quarantined, names the phase,
+/// and says to try again once ready; it never sends the reader to another node first. Nothing
+/// restarts. Cut: the old text: red on every assert of the text.
+/// Integration (~1-3 s): two opens, one refusal.
+#[config_log::retcd_test]
+fn b3_mmc2_a_rebuild_before_the_owner_recovered_says_try_again_when_ready() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let mut db = ready(&rt, dir.path(), &store);
+    assert!(put_acked(&db, "pre", patience).is_some(), "pre");
+    db.shutdown();
+    drop(db);
+    let held = DbConfig {
+        hold: vec![(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))],
+        ..config(dir.path())
+    };
+    let db = rt
+        .block_on(Db::open_with(
+            held,
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the reopen");
+    let before = untouched(&db);
+    assert_eq!(
+        before.1, None,
+        "premise: nothing committed since the reopen"
+    );
+    let refused = db
+        .rebuild_with(NodeId(3), false)
+        .expect_err("the owner has not recovered");
+    tracing::info!(detail = %refused.detail, "b3_mmc2_refused");
+    assert!(refused.no_mutation, "{refused:?}");
+    assert!(
+        refused.detail.starts_with(
+            "node 1 cannot rebuild a copy of partition 1 yet: its recovery has not committed \
+             since it started and is not quarantined ("
+        ),
+        "{}",
+        refused.detail
+    );
+    assert!(
+        refused.detail.contains(
+            "If node 1 owns the partition, try again once it is ready; otherwise ask the owner"
+        ) && !refused.detail.contains("Quarantined"),
+        "{}",
+        refused.detail
+    );
+    assert_eq!(untouched(&db), before, "nothing restarted");
 }
 
 /// Every node's boot and the owner's landed generation: what a refused rebuild must not move.
@@ -463,9 +560,11 @@ fn b3_mode_c_refuses_when_the_kept_copies_still_diverge() {
 /// Revobot #73 finding 1: node 3's copy is forked, then the whole `Db` shuts down and opens
 /// again. The reopen's F1 quarantines before any recovery commits, so the owner holds no
 /// committed result. `admin rebuild 3` still runs mode C from the quarantined run's plan: 3 is
-/// moved aside, pinned regular again, every acked write reads back and a new one is acked.
-/// Cut: `rebuild_asked` reads only `committed`: refused "has committed no recovery", red.
-/// Integration (~5-15 s): two opens, a fork, a quarantine, a re-plan, a restart, a re-add.
+/// moved aside, pinned regular again, every acked write reads back and a new one is acked. A
+/// third open of the folder then opens with members 1, 2 and 3: the tester's D-MC1 repro.
+/// Cut: `rebuild_asked` reads only `committed`: refused "has not committed", red. Cut
+/// D-MC1 (no `bind_instance` on the emptied folder): the third open is refused `Unbound`, red.
+/// Integration (~5-15 s): three opens, a fork, a quarantine, a re-plan, a restart, a re-add.
 #[config_log::retcd_test]
 fn b3_mode_c_after_a_reopen_rebuilds_from_the_quarantined_plan() {
     let rt = runtime();
@@ -535,4 +634,5 @@ fn b3_mode_c_after_a_reopen_rebuilds_from_the_quarantined_plan() {
         put_acked(&db, "after", patience).is_some(),
         "writes land again"
     );
+    reopens_with_members_1_2_3(db, &rt, dir.path(), &store, "after");
 }

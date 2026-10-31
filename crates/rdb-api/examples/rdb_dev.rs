@@ -239,7 +239,9 @@
 //!                                         as a shadow, catches up from seq 1, then one
 //!                                         commit pins it regular and leaves <from> out.
 //!                                         Prints `moving: ..` lines until `moved: node <to>
-//!                                         regular at generation G; node <from> left out`.
+//!                                         regular, node <from> left out; partition 1 is at
+//!                                         generation G now` (G is the current generation,
+//!                                         which a later restart moves on).
 //!                                         Asking again resumes. A finished move asked
 //!                                         again (a replayed plan) says `already moved ..`
 //!                                         and exits 0, while the owner that ran it serves.

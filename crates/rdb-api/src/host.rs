@@ -6172,8 +6172,9 @@ impl Host {
                 return Ok(MoveAnswer {
                     done: true,
                     line: format!(
-                        "moved: node {} regular at generation {}; node {} left out",
-                        to.0, generation.0, from.0
+                        "moved: node {} regular, node {} left out; partition {} is at \
+                         generation {} now",
+                        to.0, from.0, partition.0, generation.0
                     ),
                 });
             }
@@ -7365,18 +7366,27 @@ impl Host {
                     plan.anchor.lineage.generation,
                     RebuildBasis::Quarantined(Box::new((plan, fence))),
                 ),
+                // M-MC2 (final walk 7b4762b): asked straight after a reopen, the owner is still
+                // recovering, so "ask the node that owns it" pointed at itself. The text names
+                // the two things checked: no commit since this node started, no quarantine.
                 None => {
+                    let phase = self.recoveries.get(&partition).map_or_else(
+                        || "no recovery runs yet".to_owned(),
+                        |f1| format!("recovery phase {:?}", f1.phase()),
+                    );
                     return refuse(
                         &reply,
                         Refused {
                             guard: "owner",
                             detail: format!(
-                                "node {} has committed no recovery of partition {}, so it cannot \
-                                 rebuild a copy: ask the node that owns it",
-                                self.node.0, partition.0
+                                "node {} cannot rebuild a copy of partition {} yet: its recovery \
+                                 has not committed since it started and is not quarantined \
+                                 ({phase}). If node {} owns the partition, try again \
+                                 once it is ready; otherwise ask the owner",
+                                self.node.0, partition.0, self.node.0
                             ),
                         },
-                    )
+                    );
                 }
             },
         };

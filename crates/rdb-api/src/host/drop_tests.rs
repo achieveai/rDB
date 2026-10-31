@@ -3489,8 +3489,20 @@ fn m11_q3_a_move_onto_an_empty_node_pins_its_shadow_in_under_half_a_second() {
     // A-R452 amendment: a replayed plan passes. The finished move is its end state, so it is
     // answered done every time, not only once.
     request += 1;
+    // S4 text (final walk 7b4762b): the generation named is the partition's current one,
+    // said as such, never as the move's own (a later restart moves it on).
+    let (now, _, _) = commit_of(&trio).expect("a commit");
     match trio.ask(move_call(request, 3, 4)) {
-        Answer::Moved(answer) => assert!(answer.done, "{answer:?}"),
+        Answer::Moved(answer) => {
+            assert!(answer.done, "{answer:?}");
+            assert_eq!(
+                answer.line,
+                format!(
+                    "moved: node 4 regular, node 3 left out; partition 1 is at generation {} now",
+                    now.0
+                )
+            );
+        }
         other => panic!("move 3 4 replayed: {other:?}"),
     }
     // Writes go on with node 4 counted. Around the promote a few are refused, changing nothing.
