@@ -54,6 +54,10 @@ The server's decision rides in the gRPC rich status (`grpc-status-details-bin`, 
 `FromServer = false` with `Kind = Unavailable` means nothing was sent: the client could not connect
 within `Timeout`. A write while the gateway is down is "not sent", never "unknown".
 
+`RequestId` is set only when a write was sent. A refusal with `NoMutation = true` (such as
+`CONDITION_FAILED` or `INVALID_ARGUMENT`) was decided before anything was sent, so it has no
+`RequestId` and needs no `StatusAsync`: nothing was written.
+
 ## Retries
 
 - The client sends a call again only when nothing was applied: it could not connect, or the server
@@ -73,6 +77,9 @@ within `Timeout`. A write while the gateway is down is "not sent", never "unknow
   server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
+- A version is the partition's, not the object's: every write in the partition raises it, so an
+  object's version can jump by more than one between two of your writes. Compare versions for
+  equality (`ifVersion`), never count on them.
 - **One gateway is one client.** Every app on one gateway shares its client id and its 8 slots for
   unsettled writes: under an outage the ninth unknown write evicts the oldest, whose status then
   says ReadTheObject. Ask `StatusAsync` soon after an unknown outcome.

@@ -71,7 +71,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .collect();
             }
             "--nodes" => {
-                for pair in value("--nodes")?.split(',').filter(|p| !p.trim().is_empty()) {
+                for pair in value("--nodes")?
+                    .split(',')
+                    .filter(|p| !p.trim().is_empty())
+                {
                     let (n, addr) = pair
                         .trim()
                         .split_once('=')

@@ -82,7 +82,7 @@ static async Task<int> Run(RdbClient client, List<string> a)
         case "put":
         {
             var key = Key(flags, pos, 0);
-            var value = flags.TryGetValue("--value-file", out var vf) ? File.ReadAllBytes(vf)
+            var value = flags.TryGetValue("--value-file", out var vf) ? ReadFile("--value-file", vf)
                 : pos.Count > 1 ? Encoding.UTF8.GetBytes(pos[1]) : throw new UsageException("put needs KEY VALUE");
             ulong? ifv = flags.TryGetValue("--if-version", out var iv) ? ULong(iv) : null;
             var r = await client.PutAsync(key, value, ifv);
@@ -191,8 +191,18 @@ static Dictionary<string, string> Flags(List<string> a, out List<string> positio
     return flags;
 }
 
+// A file the user named that cannot be read is a usage error (exit 2), not a crash (cs-tester D3).
+static byte[] ReadFile(string flag, string path)
+{
+    try { return File.ReadAllBytes(path); }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+    {
+        throw new UsageException($"{flag} {path}: cannot read it ({e.Message})");
+    }
+}
+
 static byte[] Key(Dictionary<string, string> flags, List<string> pos, int at) =>
-    flags.TryGetValue("--key-file", out var kf) ? File.ReadAllBytes(kf)
+    flags.TryGetValue("--key-file", out var kf) ? ReadFile("--key-file", kf)
     : pos.Count > at ? Encoding.UTF8.GetBytes(pos[at]) : throw new UsageException("give a KEY or --key-file");
 
 static RdbTxnPut TxnPut(string s)

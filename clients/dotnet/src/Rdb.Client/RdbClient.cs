@@ -273,6 +273,13 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
             }
         }
         if (lastRefusal is not null) return Stamp(lastRefusal);
+        if (!isWrite && sends > 0)
+        {
+            // A read that was sent but not answered: "not sent" would be false. A read changes nothing.
+            return Stamp(new RdbException(
+                $"{op}: no answer within {_options.Timeout.TotalSeconds:0.#} s ({lastNote ?? "no answer"}). A read changes nothing; try again.",
+                RdbErrorKind.Unavailable, "UNAVAILABLE", RdbRetry.Unrecognized, true, null, null, null, false));
+        }
         return Stamp(new RdbException(
             $"{op}: not sent within {_options.Timeout.TotalSeconds:0.#} s ({lastNote ?? "no attempt made"}). Nothing was applied.",
             RdbErrorKind.Unavailable, "UNAVAILABLE", RdbRetry.Unrecognized, true, null, null, null, false));

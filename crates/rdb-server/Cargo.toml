@@ -28,6 +28,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 config-testkit = { workspace = true }
 config-log-macros = { workspace = true }
+serde_json = { workspace = true }
 
 [build-dependencies]
 protox = { workspace = true }

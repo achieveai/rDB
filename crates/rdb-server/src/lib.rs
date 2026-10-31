@@ -22,6 +22,7 @@ use rdb_api::{
     TxnStatus, MAX_OBJECT_ID, MAX_OPS, MAX_TXN_DEADLINE,
 };
 use tonic::{Code, Request, Response, Status};
+use tracing::Instrument as _;
 
 /// The generated wire types and service of `rdb.v1`.
 #[allow(missing_docs, clippy::all, clippy::pedantic)]
@@ -191,9 +192,10 @@ pub fn rdb_error_of(status: &Status) -> Option<pb::RdbError> {
 }
 
 fn put_status(error: &PutError) -> Status {
-    let sent = error.request.as_ref().map(|request| {
-        (request.identity.request, request.expected_generation)
-    });
+    let sent = error
+        .request
+        .as_ref()
+        .map(|request| (request.identity.request, request.expected_generation));
     to_status(&error.error, sent)
 }
 
@@ -254,42 +256,107 @@ impl Gateway {
         pb::rdb_server::RdbServer::new(self).max_decoding_message_size(MAX_DECODE_BYTES)
     }
 
-    async fn blocking<T, F>(&self, method: &'static str, call: F) -> Result<T, Status>
+    async fn blocking<T, F>(
+        &self,
+        method: &'static str,
+        request_of: fn(&T) -> Option<u64>,
+        call: F,
+    ) -> Result<T, Status>
     where
         T: Send + 'static,
         F: FnOnce(&Db) -> Result<T, Status> + Send + 'static,
     {
         let db = Arc::clone(&self.db);
-        let started = Instant::now();
-        let answer = tokio::task::spawn_blocking(move || call(&db))
-            .await
-            .unwrap_or_else(|join| {
-                tracing::error!(method, error = %join, "rdb_server_call_panicked");
-                Err(Status::internal(format!("{method}: the call failed: {join}")))
-            });
-        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match &answer {
-            Ok(_) => tracing::info!(method, kind = "OK", ms, "rdb_server_call"),
-            Err(status) => {
-                let detail = rdb_error_of(status);
-                let kind = detail
-                    .as_ref()
-                    .map_or_else(|| format!("{:?}", status.code()), |d| d.kind_name.clone());
-                tracing::info!(
-                    method,
-                    kind,
-                    ms,
-                    request_id = detail.as_ref().and_then(|d| d.request_id),
-                    no_mutation = detail.as_ref().map(|d| d.no_mutation),
-                    "rdb_server_call"
-                );
-            }
-        }
-        answer
+        logged_call(method, request_of, move || call(&db)).await
     }
 }
 
-fn log_ok_request(method: &'static str, reply: &pb::WriteReply) {
+/// No request id: the answer of a call that is not a write.
+const fn no_request<T>(_: &T) -> Option<u64> {
+    None
+}
+
+/// A write's request id.
+#[allow(clippy::unnecessary_wraps)]
+const fn write_request(reply: &pb::WriteReply) -> Option<u64> {
+    Some(reply.request_id)
+}
+
+/// Run `work` on tokio's blocking pool and write one `rdb_server_call` line when it ends:
+/// `method`, the final `kind` (`OK`, the `RdbError`'s kind, or the gRPC code), `ms`, the
+/// request id (`request_of` on success, the `RdbError`'s on failure), `no_mutation`, and
+/// `caller_gone`.
+///
+/// The line is written by a task of its own, so it is written even when the caller has gone:
+/// tonic drops a handler's future at the client's deadline or when the connection breaks,
+/// while the `Db` call runs on to its end. That call is the unknown outcome an operator
+/// settles from this line (cs-tester D2); `caller_gone=true` marks it.
+///
+/// # Errors
+///
+/// `work`'s error, or `INTERNAL` when `work` panicked.
+pub async fn logged_call<T, F>(
+    method: &'static str,
+    request_of: fn(&T) -> Option<u64>,
+    work: F,
+) -> Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Status> + Send + 'static,
+{
+    let started = Instant::now();
+    let span = tracing::Span::current();
+    let (answered, answer) = tokio::sync::oneshot::channel();
+    tokio::spawn(
+        async move {
+            let span = tracing::Span::current();
+            let answer = tokio::task::spawn_blocking(move || span.in_scope(work))
+                .await
+                .unwrap_or_else(|join| {
+                    tracing::error!(method, error = %join, "rdb_server_call_panicked");
+                    Err(Status::internal(format!(
+                        "{method}: the call failed: {join}"
+                    )))
+                });
+            let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let (kind, request_id, no_mutation) = match &answer {
+                Ok(reply) => ("OK".to_owned(), request_of(reply), None),
+                Err(status) => {
+                    let detail = rdb_error_of(status);
+                    let kind = detail
+                        .as_ref()
+                        .map_or_else(|| format!("{:?}", status.code()), |d| d.kind_name.clone());
+                    (
+                        kind,
+                        detail.as_ref().and_then(|d| d.request_id),
+                        detail.as_ref().map(|d| d.no_mutation),
+                    )
+                }
+            };
+            let caller_gone = answered.send(answer).is_err();
+            tracing::info!(
+                method,
+                kind,
+                ms,
+                request_id,
+                no_mutation,
+                caller_gone,
+                "rdb_server_call"
+            );
+        }
+        .instrument(span),
+    );
+    answer.await.unwrap_or_else(|_| {
+        Err(Status::internal(format!(
+            "{method}: the call's task ended without an answer"
+        )))
+    })
+}
+
+/// `ok` on the wire, logged as `rdb_server_write` on the blocking pool, where it is written
+/// even when the caller has gone (cs-tester D2).
+fn logged_write(method: &'static str, ok: &PutOk) -> pb::WriteReply {
+    let reply = write_reply(ok);
     tracing::info!(
         method,
         request_id = reply.request_id,
@@ -297,6 +364,7 @@ fn log_ok_request(method: &'static str, reply: &pb::WriteReply) {
         version = reply.version,
         "rdb_server_write"
     );
+    reply
 }
 
 #[tonic::async_trait]
@@ -314,7 +382,7 @@ impl pb::rdb_server::Rdb for Gateway {
         let client_id = self.client_id;
         let put_timeout_ms = millis(self.put_timeout);
         let read_timeout_ms = millis(self.read_timeout);
-        self.blocking("Ready", move |db| {
+        self.blocking("Ready", no_request, move |db| {
             let (ready, detail) = match db.wait_ready(within) {
                 Ok(()) => (true, String::new()),
                 Err(error) => (false, error.to_string()),
@@ -337,20 +405,21 @@ impl pb::rdb_server::Rdb for Gateway {
         request: Request<pb::PutRequest>,
     ) -> Result<Response<pb::WriteReply>, Status> {
         let put = request.into_inner();
-        let reply = self
-            .blocking("Put", move |db| {
-                db.put(&put.object, &put.value, put.if_version)
-                    .map(|ok| write_reply(&ok))
-                    .map_err(|error| put_status(&error))
-            })
-            .await?;
-        log_ok_request("Put", &reply);
-        Ok(Response::new(reply))
+        self.blocking("Put", write_request, move |db| {
+            db.put(&put.object, &put.value, put.if_version)
+                .map(|ok| logged_write("Put", &ok))
+                .map_err(|error| put_status(&error))
+        })
+        .await
+        .map(Response::new)
     }
 
-    async fn get(&self, request: Request<pb::GetRequest>) -> Result<Response<pb::GetReply>, Status> {
+    async fn get(
+        &self,
+        request: Request<pb::GetRequest>,
+    ) -> Result<Response<pb::GetReply>, Status> {
         let object = request.into_inner().object;
-        self.blocking("Get", move |db| {
+        self.blocking("Get", no_request, move |db| {
             let ok = db.get(&object).map_err(|error| to_status(&error, None))?;
             let (found, version, value) = match ok.value {
                 Some((version, value)) => (true, version, value),
@@ -369,32 +438,33 @@ impl pb::rdb_server::Rdb for Gateway {
         .map(Response::new)
     }
 
-    async fn txn(&self, request: Request<pb::TxnRequest>) -> Result<Response<pb::WriteReply>, Status> {
+    async fn txn(
+        &self,
+        request: Request<pb::TxnRequest>,
+    ) -> Result<Response<pb::WriteReply>, Status> {
         let txn = request.into_inner();
         let deadline = if txn.deadline_ms == 0 {
             TXN_DEFAULT_DEADLINE
         } else {
             Duration::from_millis(u64::from(txn.deadline_ms))
         };
-        let reply = self
-            .blocking("Txn", move |db| {
-                let puts: Vec<TxnPut<'_>> = txn
-                    .puts
-                    .iter()
-                    .map(|put| TxnPut {
-                        group: DEFAULT_GROUP,
-                        object: &put.object,
-                        value: &put.value,
-                        if_version: put.if_version,
-                    })
-                    .collect();
-                db.txn(&puts, deadline)
-                    .map(|ok| write_reply(&ok))
-                    .map_err(|error| put_status(&error))
-            })
-            .await?;
-        log_ok_request("Txn", &reply);
-        Ok(Response::new(reply))
+        self.blocking("Txn", write_request, move |db| {
+            let puts: Vec<TxnPut<'_>> = txn
+                .puts
+                .iter()
+                .map(|put| TxnPut {
+                    group: DEFAULT_GROUP,
+                    object: &put.object,
+                    value: &put.value,
+                    if_version: put.if_version,
+                })
+                .collect();
+            db.txn(&puts, deadline)
+                .map(|ok| logged_write("Txn", &ok))
+                .map_err(|error| put_status(&error))
+        })
+        .await
+        .map(Response::new)
     }
 
     async fn status(
@@ -402,9 +472,12 @@ impl pb::rdb_server::Rdb for Gateway {
         request: Request<pb::StatusRequest>,
     ) -> Result<Response<pb::StatusReply>, Status> {
         let asked = request.into_inner();
-        self.blocking("Status", move |db| {
+        self.blocking("Status", no_request, move |db| {
             let status = db
-                .status(RequestId(asked.request_id), asked.generation.map(Generation))
+                .status(
+                    RequestId(asked.request_id),
+                    asked.generation.map(Generation),
+                )
                 .map_err(|error| to_status(&error, None))?;
             Ok(status_reply(&status))
         })

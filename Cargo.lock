@@ -3580,6 +3580,7 @@ dependencies = [
  "protox",
  "rdb-api",
  "rdb-value",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
