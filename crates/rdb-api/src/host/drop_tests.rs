@@ -4100,7 +4100,7 @@ fn m11_a5_a_free_slot_takes_one_spare_note() {
     for ask in ["rebuild 4", "rebuild 4 again"] {
         match owner.rebuild_from_app(PartitionId(1), NodeId(4)) {
             Ok(line) => assert!(
-                line.contains("node 4 is a spare")
+                line.contains("node 4 is not pinned")
                     && line.contains("while node 1 stays the owner")
                     && !line.contains("  "),
                 "{ask}: {line}"
@@ -4124,6 +4124,36 @@ fn m11_a5_a_free_slot_takes_one_spare_note() {
         .map(|member| member.node.0)
         .collect();
     assert!(!noted.contains(&5), "{noted:?}");
+}
+
+/// Ruling A-R471 (tester, bd5e8da r4sp.txt:132): after a full lr reopen the owner's
+/// in-memory left-out set is empty, so `admin rebuild 3` of the copy it dropped took the spare
+/// path and said "node 3 is a spare", which was false: node 3 held a copy. Not pinned is all
+/// the owner knows there, and that is all the answer says. Simulated here by clearing the set,
+/// as the owner's restart does. Cut: the spare wording back: red.
+/// Integration (~4 s): b1's drop, one ask.
+#[config_log::retcd_test]
+fn m11_r471_an_owner_without_the_left_out_set_does_not_call_a_copy_a_spare() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), tuned);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    let owner = &mut trio.nodes[0].0;
+    owner.left_out.clear();
+    match owner.rebuild_from_app(PartitionId(1), NodeId(3)) {
+        Ok(line) => assert!(
+            !line.contains("spare")
+                && line.contains("rebuild: node 3 is not pinned; node 1 (the owner) noted it")
+                && !line.contains("  "),
+            "{line}"
+        ),
+        Err(error) => panic!("rebuild 3: {error:?}"),
+    }
 }
 
 /// Critic M1 (a), ruling A-R457: a move whose shadow caught up after a regular copy was dropped

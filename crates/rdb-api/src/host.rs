@@ -7705,7 +7705,7 @@ impl Host {
                 node.0, self.node.0, ready.generation.0
             )),
             Ok(Ok(ready)) => Ok(format!(
-                "rebuild: node {} is a spare; node {} (the owner) noted it for the free slot at \
+                "rebuild: node {} is not pinned; node {} (the owner) noted it for the free slot at \
                  generation {} (mode A), while node {} stays the owner (a new owner forgets the \
                  note: run the rebuild again); restart it and the owner takes it back, first \
                  as a shadow, then regular",
@@ -7779,7 +7779,7 @@ impl Host {
                 guard: "slot",
                 detail: format!(
                     "node {}'s copy id is taken in partition {} (members: {list}): name another \
-                     spare",
+                     node",
                     node.0, partition.0
                 ),
             });

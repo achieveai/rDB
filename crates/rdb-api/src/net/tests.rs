@@ -355,7 +355,7 @@ fn answers() -> Vec<Answer> {
         Answer::Compiled(zero()),
         Answer::Unchanged,
         Answer::Status(zero()),
-        Answer::Rebuilt("rebuild: node 4 is a spare".to_owned()),
+        Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
         Answer::Moved(MoveAnswer {
             done: true,
             line: "already moved: node 3 to node 4".to_owned(),
