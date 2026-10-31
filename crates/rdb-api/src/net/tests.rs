@@ -1970,7 +1970,7 @@ fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
     one.db
         .put(b"after", b"1", None)
         .expect("a put with node 4 regular");
-    assert!(line.contains("spare"), "{line}");
+    assert!(line.contains("node 4 is not pinned"), "{line}");
 
     app.shutdown();
     drop(app_net);
