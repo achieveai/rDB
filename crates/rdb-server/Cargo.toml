@@ -1,0 +1,34 @@
+[package]
+name = "rdb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "rdb-server: a loopback gRPC gateway over one rdb_api::Db, for apps in other languages (C#: Rdb.Client)"
+
+[dependencies]
+rdb-api = { workspace = true }
+# `MAX_PAYLOAD`, the largest value, so the decode limit admits the largest transaction.
+rdb-value = { workspace = true }
+# `ConfigStore`, the trait the rEtcd client is passed to `Db::open` as.
+config-core = { workspace = true }
+# The rEtcd gRPC client: rDB's control store.
+config-client = { workspace = true }
+# `ports::bind_tcp`, so a port-0 listen honours RETCD_TEST_PORT_RANGE as the daemons do.
+config-gossip = { workspace = true }
+# JSONL logs (ADR-0013).
+config-log = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+config-testkit = { workspace = true }
+config-log-macros = { workspace = true }
+
+[build-dependencies]
+protox = { workspace = true }
+tonic-build = { workspace = true }
