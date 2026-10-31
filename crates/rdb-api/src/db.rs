@@ -4981,7 +4981,11 @@ mod tests {
     /// with `no_mutation` true wrote nothing, so the same put is sent again after a short wait.
     /// Any other refusal, or a pause that outlasts the patience, fails the row. For a put a row
     /// needs to land on a host whose fsyncs may outlast L1's pause age: A-R391 (every copy's
-    /// sync took 530-628 ms against 400 ms) and A-R392 (D18's puts before its stall).
+    /// sync took 530-628 ms against 400 ms) and A-R392 (D18's puts before its stall). A new
+    /// generation's `Unavailable` "not yet marked activated" refusal (A-R184) is sent again the
+    /// same way: it is `no_mutation` and lifts once the open counter marks the generation, which
+    /// a put right after a commit can beat under load (m11_t6 at adf72e7). A refusal that may
+    /// have mutated is never sent again.
     pub(super) fn put_through_pauses(db: &Db, object: &[u8], value: &[u8], case: &str) {
         let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
         let mut paused = 0_u32;
@@ -4989,8 +4993,10 @@ mod tests {
             match db.put(object, value, None) {
                 Ok(_) => break,
                 Err(refused)
-                    if refused.error.kind == ErrorKind::ProtectionPaused
-                        && refused.error.no_mutation
+                    if refused.error.no_mutation
+                        && (refused.error.kind == ErrorKind::ProtectionPaused
+                            || (refused.error.kind == ErrorKind::Unavailable
+                                && refused.error.detail.contains("not yet marked activated")))
                         && Instant::now() < deadline =>
                 {
                     paused += 1;

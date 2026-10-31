@@ -632,23 +632,31 @@ promote() {
 
 spare_hint() { # after a promote: the owner does not pin a running spare by itself (tester paper
     # cut, 7913fb8). With fewer than 3 copies pinned, name the rebuild that fills the free slot.
+    # With more than one running node unpinned, lr cannot tell which held a copy (A-R469), so
+    # it lists them and names none.
     local members k
     members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
-    k="$(spare_target "$members")"
-    [ -n "$k" ] || return 0
-    say "partition 1 has $(copies_of "$members") copies and node $k runs unpinned; to make it the third copy, run: scripts/local-rdb.sh rebuild $k --run $RUN"
+    k="$(unpinned_running "$members")"
+    case "$k" in
+        "") return 0 ;;
+        *" "*) say "partition 1 has $(copies_of "$members") copies and nodes $k run unpinned; to make one of them the third copy, run: scripts/local-rdb.sh rebuild <node> --run $RUN" ;;
+        *) say "partition 1 has $(copies_of "$members") copies and node $k runs unpinned; to make it the third copy, run: scripts/local-rdb.sh rebuild $k --run $RUN" ;;
+    esac
 }
 
 copies_of() { printf '%s' "$1" | sed -n 's/^members \([^;]*\);.*/\1/p' | { grep -o '[0-9]*=' || true; } | wc -l | tr -d ' '; }
 
-spare_target() { # members-line: the lowest running node the line leaves unpinned, while fewer
-    # than 3 copies are pinned; nothing when the line is missing or the slots are full
-    local k unpinned
+unpinned_running() { # members-line: the running nodes the line leaves unpinned, space-separated,
+    # while fewer than 3 copies are pinned; nothing when the line is missing or the slots are
+    # full. Reads both forms: `; not pinned 3 4 (` and, short of copies over lr (A-R469),
+    # `; partition 1 has 2 of 3 copies; not pinned: 3 4; ...`.
+    local k unpinned out=""
     [ -n "$1" ] && [ "$(copies_of "$1")" -lt 3 ] || return 0
-    unpinned=" $(printf '%s' "$1" | sed -n 's/.*; not pinned \([0-9 ]*\) (.*/\1/p') "
+    unpinned=" $(printf '%s' "$1" | sed -n -e 's/.*; not pinned: \([0-9 ]*\);.*/\1/p' -e 't' -e 's/.*; not pinned \([0-9 ]*\) (.*/\1/p') "
     for k in $(all_nodes); do
-        case "$unpinned" in *" $k "*) node_alive "$k" && { echo "$k"; return 0; } ;; esac
+        case "$unpinned" in *" $k "*) node_alive "$k" && out="$out${out:+ }$k" ;; esac
     done
+    printf '%s' "$out"
 }
 
 # Moves stopped node $1's folder to $RUN/db/aside/node-<n>-<UTC stamp> and says where; it is
