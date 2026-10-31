@@ -4478,7 +4478,7 @@ fn open_engines(
     nodes_dir: &Path,
     local: &[NodeId],
     storage: StorageOptions,
-) -> Result<(BTreeMap<NodeId, RocksEngine>, Vec<Absent>), (OpenError, bool)> {
+) -> Result<Opened, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
         rdb_storage::OpenError::Locked { .. } => OpenError::InUse(one_separator(dir)),
         rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(one_separator(dir)),
@@ -4530,6 +4530,9 @@ fn open_engines(
     }
     Ok((engines, absent))
 }
+
+/// The engines [`open_engines`] opened, and the copies it left to `Db::check`.
+type Opened = (BTreeMap<NodeId, RocksEngine>, Vec<Absent>);
 
 /// A local copy that is missing while another copy holds data, and that a wipe moved aside:
 /// [`open_engines`] leaves it to `Db::check` (rulings A-R466, A-R466b).
