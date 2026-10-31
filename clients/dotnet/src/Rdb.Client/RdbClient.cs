@@ -226,7 +226,7 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
             var connectFailure = await ConnectAsync(left < ConnectWindow ? left : ConnectWindow, ct).ConfigureAwait(false);
             if (connectFailure is not null)
             {
-                lastNote = $"cannot connect to {_endpoint} ({connectFailure.GetType().Name}: {connectFailure.Message})";
+                lastNote = $"cannot connect to {_endpoint} ({ConnectCause(connectFailure)})";
                 lastRefusal = null;
                 DropChannel();
                 if (await PauseWithin(NextPause()).ConfigureAwait(false)) continue;
@@ -252,11 +252,11 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
                     if (isWrite)
                     {
                         return Stamp(new RdbUnknownOutcomeException(
-                            $"{op}: the answer was lost ({ex.StatusCode}: {ex.Status.Detail}); the write may have applied. " +
+                            $"{op}: the answer was lost ({Cause(ex)}); the write may have applied. " +
                             "next: read the object to see its value",
-                            RdbErrorKind.UnknownOutcome, "UNKNOWN_OUTCOME", RdbRetry.Unrecognized, null, null, null, false, ex));
+                            RdbErrorKind.UnknownOutcome, "UNKNOWN_OUTCOME", RdbRetry.Reconcile, null, null, null, false, ex));
                     }
-                    lastNote = $"{op}: the transport lost the call ({ex.StatusCode}: {ex.Status.Detail})";
+                    lastNote = $"{op}: the transport lost the call ({Cause(ex)})";
                     lastRefusal = null;
                     DropChannel();
                     if (await PauseWithin(NextPause()).ConfigureAwait(false)) continue;
@@ -278,12 +278,29 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
             // A read that was sent but not answered: "not sent" would be false. A read changes nothing.
             return Stamp(new RdbException(
                 $"{op}: no answer within {_options.Timeout.TotalSeconds:0.#} s ({lastNote ?? "no answer"}). A read changes nothing; try again.",
-                RdbErrorKind.Unavailable, "UNAVAILABLE", RdbRetry.Unrecognized, true, null, null, null, false));
+                RdbErrorKind.Unavailable, "UNAVAILABLE", RdbRetry.BoundedJitter, true, null, null, null, false));
         }
         return Stamp(new RdbException(
             $"{op}: not sent within {_options.Timeout.TotalSeconds:0.#} s ({lastNote ?? "no attempt made"}). Nothing was applied.",
-            RdbErrorKind.Unavailable, "UNAVAILABLE", RdbRetry.Unrecognized, true, null, null, null, false));
+            RdbErrorKind.Unavailable, "UNAVAILABLE", RdbRetry.BoundedJitter, true, null, null, null, false));
     }
+
+    /// <summary>A transport error's cause: its code, and its detail only when it has one.</summary>
+    internal static string Cause(RpcException ex)
+    {
+        if (!string.IsNullOrWhiteSpace(ex.Status.Detail)) return $"{ex.StatusCode}: {ex.Status.Detail}";
+        return ex.StatusCode == StatusCode.DeadlineExceeded
+            ? "DeadlineExceeded: no answer before the call's deadline"
+            : ex.StatusCode.ToString();
+    }
+
+    /// <summary>A failed connect's cause. A connect cut at its window says so, not "a task was canceled".</summary>
+    internal static string ConnectCause(Exception ex) => ex switch
+    {
+        OperationCanceledException => $"no connection within {ConnectWindow.TotalSeconds:0.#} s",
+        _ when string.IsNullOrWhiteSpace(ex.Message) => ex.GetType().Name,
+        _ => $"{ex.GetType().Name}: {ex.Message}",
+    };
 
     private static TimeSpan Jitter(TimeSpan around) =>
         TimeSpan.FromMilliseconds(around.TotalMilliseconds * (0.5 + Random.Shared.NextDouble()));

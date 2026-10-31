@@ -54,9 +54,13 @@ The server's decision rides in the gRPC rich status (`grpc-status-details-bin`, 
 `FromServer = false` with `Kind = Unavailable` means nothing was sent: the client could not connect
 within `Timeout`. A write while the gateway is down is "not sent", never "unknown".
 
-`RequestId` is set only when a write was sent. A refusal with `NoMutation = true` (such as
-`CONDITION_FAILED` or `INVALID_ARGUMENT`) was decided before anything was sent, so it has no
-`RequestId` and needs no `StatusAsync`: nothing was written.
+A refusal with `NoMutation = true` wrote nothing and needs no `StatusAsync`, whether or not it
+carries a `RequestId`. Some carry one (`LEASE_EXPIRED`); some never do (`CONDITION_FAILED`,
+`INVALID_ARGUMENT`). `StatusAsync` is for an unknown outcome only.
+
+Errors the client makes itself (`FromServer = false`) carry a retry class too: `BoundedJitter`
+for "not sent" and for a read with no answer (call again later), `Reconcile` for a write whose
+answer was lost with no request id (read the object, then decide).
 
 ## Retries
 

@@ -151,14 +151,130 @@ pub const fn wire_retry(rule: RetryRule) -> pb::RetryRule {
     }
 }
 
-/// `error` as a gRPC status: the code from [`code_for`], `error`'s `Display` as the message
+/// `error`'s text for an app on the wire: `NAME (detail; next: step)`, with the step from
+/// [`wire_step`] in place of the embedded API's, which names Rust calls (`Db::status`,
+/// `Db::resend`) an app in another language has not got. When the detail already ends with its
+/// own step ([`ApiError::next_step`] is `None`), the text is `error`'s `Display` unchanged.
+#[must_use]
+pub fn wire_message(error: &ApiError) -> String {
+    match error.next_step() {
+        Some(_) => format!(
+            "{} ({}; next: {})",
+            error.name(),
+            error.detail,
+            wire_step(error.kind, error.retry, error.no_mutation)
+        ),
+        None => error.to_string(),
+    }
+}
+
+/// The next step for an error of `kind` with `retry` and `no_mutation`, in the gateway's calls
+/// (`Ready`, `Put`, `Txn`, `Status`). The gateway never sends a write again, so where the
+/// embedded API says to resend, an app asks `Status`. Total over [`ErrorKind`], so a new kind
+/// does not compile until it has a step. `no_mutation` true: this call wrote nothing, so a
+/// write may go again as a new write. False: it may have applied, so only `Status` is safe.
+#[must_use]
+pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> &'static str {
+    const MAY_HAVE: &str = "the write may have applied: call Status with its request id before \
+                            writing again, and never send it again as a new write";
+    if matches!(retry, RetryRule::NotWired) {
+        return "retrying will not help: keep the gateway's log and report this message";
+    }
+    match kind {
+        ErrorKind::NotPrimary | ErrorKind::RouteChanged if no_mutation => {
+            "this call wrote nothing: call it again; a write goes again as a new Put or Txn"
+        }
+        ErrorKind::LeaseExpired if no_mutation => {
+            "call Ready, then call again; this call wrote nothing, so a write goes again as a \
+             new Put or Txn"
+        }
+        ErrorKind::LeaseExpired => {
+            "call Ready; the write may have applied: call Status with its request id before \
+             writing again, and never send it again as a new write"
+        }
+        ErrorKind::RecoveryReadOnly if no_mutation => {
+            "reads still work; writes return when the lost copies are back; this call wrote \
+             nothing, so a write goes again as a new Put or Txn then"
+        }
+        ErrorKind::RecoveryReadOnly => {
+            "reads still work; once writes return, call Status with the write's request id \
+             before writing again, and never send it again as a new write"
+        }
+        ErrorKind::ProtectionPaused if no_mutation => {
+            "wait, then call again; this call wrote nothing, so a write goes again as a new Put \
+             or Txn"
+        }
+        ErrorKind::Overloaded if no_mutation => {
+            "wait for retry_after_ms, then call again; this call wrote nothing, so a write goes \
+             again as a new Put or Txn"
+        }
+        ErrorKind::DeadlineBeforeAdmission if no_mutation => {
+            "this call wrote nothing: send it again as a new write with a longer deadline (a \
+             Txn's deadline_ms)"
+        }
+        ErrorKind::Unavailable if matches!(retry, RetryRule::RetryAfterRecovery) && no_mutation => {
+            "this call wrote nothing: once the owner is back, call it again; a write goes again \
+             as a new Put or Txn"
+        }
+        ErrorKind::Unavailable if matches!(retry, RetryRule::RetryAfterRecovery) => {
+            "once the owner is back, call Status with the write's request id before writing \
+             again, and never send it again as a new write"
+        }
+        ErrorKind::NotPrimary
+        | ErrorKind::RouteChanged
+        | ErrorKind::ProtectionPaused
+        | ErrorKind::Overloaded
+        | ErrorKind::DeadlineBeforeAdmission => MAY_HAVE,
+        ErrorKind::ConditionFailed => "read the object again, then decide whether to write",
+        ErrorKind::CrossAffinity => {
+            "split the request: one request names objects of one affinity group only"
+        }
+        ErrorKind::InvalidArgument => {
+            "fix the argument this message names; the same request fails the same way"
+        }
+        ErrorKind::UnknownOutcome if matches!(retry, RetryRule::QueryStatus) => {
+            "call Status with this request id; never send it again as a new write"
+        }
+        ErrorKind::UnknownOutcome => "a read changes nothing, so read again",
+        ErrorKind::GenerationChanged => {
+            "this call wrote nothing; if the request was sent before, call Status with its \
+             request id to see whether an earlier send applied it"
+        }
+        ErrorKind::RequestIdReuse => {
+            "use a new request id for a different write; this id stays bound to its first write"
+        }
+        ErrorKind::StaleContinuation => "start the read again from the beginning",
+        ErrorKind::CorruptHistory => {
+            "a damaged entry: write the object again to replace it, or report this message to \
+             an operator"
+        }
+        ErrorKind::IncompatibleVersion => {
+            "the data was written by a newer build: run the database on that build"
+        }
+        ErrorKind::StatusExpired => {
+            "the answer is no longer kept: read the object, and write again only if its value \
+             is not the one you want"
+        }
+        ErrorKind::DivergenceRequiresOperator => {
+            "an operator must act: keep the gateway's log and report this message; retrying \
+             will not help"
+        }
+        ErrorKind::Unavailable => {
+            "the database is not serving right now: wait a few seconds and try again"
+        }
+        ErrorKind::UploadChunkConflict => "start the upload again under a new upload id",
+        ErrorKind::CorruptBlob => "write the blob again",
+    }
+}
+
+/// `error` as a gRPC status: the code from [`code_for`], [`wire_message`] as the message
 /// (`NAME (detail; next: step)`), and one [`pb::RdbError`] in the rich status details. `sent`
 /// is the request a write sent, when it sent one: its id and generation go in the detail, so
 /// the client can ask `Status`.
 #[must_use]
 pub fn to_status(error: &ApiError, sent: Option<(RequestId, Option<Generation>)>) -> Status {
     let code = code_for(error.kind);
-    let message = error.to_string();
+    let message = wire_message(error);
     let detail = pb::RdbError {
         kind: wire_kind(error.kind).into(),
         kind_name: error.name(),
@@ -227,6 +343,9 @@ pub struct Gateway {
     client_id: u32,
     put_timeout: Duration,
     read_timeout: Duration,
+    /// The span `new` was called in. tonic runs each call in a task of its own, outside any
+    /// span, so a call enters this one: a test that builds the gateway gets its lines.
+    span: tracing::Span,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -247,6 +366,7 @@ impl Gateway {
             client_id,
             put_timeout,
             read_timeout,
+            span: tracing::Span::current(),
         }
     }
 
@@ -267,7 +387,9 @@ impl Gateway {
         F: FnOnce(&Db) -> Result<T, Status> + Send + 'static,
     {
         let db = Arc::clone(&self.db);
-        logged_call(method, request_of, move || call(&db)).await
+        logged_call(method, request_of, move || call(&db))
+            .instrument(self.span.clone())
+            .await
     }
 }
 

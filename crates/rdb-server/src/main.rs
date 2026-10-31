@@ -244,7 +244,7 @@ async fn run_async(args: &Args, rt: &tokio::runtime::Runtime) -> ExitCode {
     println!(
         "rdb-server ready listen={bound} client={} log={}",
         args.client_id,
-        log_path.display()
+        one_separator(&log_path)
     );
     let gateway = Gateway::new(Arc::clone(&db), args.client_id, timeouts.put, timeouts.read);
     let shutdown = async {
@@ -344,4 +344,15 @@ async fn connect(args: &Args) -> Result<(Arc<Links>, Arc<Net>), ExitCode> {
     tracing::info!(up = ?up, client = args.client_id, "rdb_server_links_up");
     println!("links up nodes={}", up.join(","));
     Ok((links, net))
+}
+
+/// `path` with one separator throughout. On Windows `--log-dir C:/x` joined with a file name
+/// prints `C:/x\rdb-server.jsonl`; `/` is accepted everywhere on Windows, so it is the one used.
+fn one_separator(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        shown.replace('\\', "/")
+    } else {
+        shown
+    }
 }
