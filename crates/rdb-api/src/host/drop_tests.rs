@@ -3951,7 +3951,7 @@ fn m11_t12_b_a_rebuild_onto_a_spare_with_no_free_slot_is_refused_in_one_sentence
         RebuildReply(tx),
     );
     match rx.try_recv() {
-        Ok(Err(refused)) => {
+        Ok(Err(crate::admin::rebuild::Unready::Refused(refused))) => {
             assert_eq!(refused.guard, "slot", "{refused:?}");
             assert!(
                 refused.detail.contains("admin move <source> 4") && !refused.detail.contains("  "),

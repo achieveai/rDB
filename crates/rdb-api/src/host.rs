@@ -7708,7 +7708,12 @@ impl Host {
                  as a shadow, then regular",
                 node.0, self.node.0, ready.generation.0, self.node.0
             )),
-            Ok(Err(refused)) => Err(crate::db::rebuild_refused(refused)),
+            Ok(Err(crate::admin::rebuild::Unready::Refused(refused))) => {
+                Err(crate::db::rebuild_refused(refused))
+            }
+            Ok(Err(crate::admin::rebuild::Unready::Failed(failed))) => {
+                Err(crate::db::rebuild_failed(failed))
+            }
             Err(_) => Err(ApiError::host(&format!(
                 "node {}'s rebuild of node {} was not answered in its step",
                 self.node.0, node.0

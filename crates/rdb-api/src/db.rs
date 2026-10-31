@@ -4160,7 +4160,7 @@ pub(crate) fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
 /// Revobot #73 finding 3: the owner failed a rebuild after it started the drop (a revocation
 /// queued, or the quarantined F1 replaced). The kind and retry rule are a refusal's; it never
 /// claims `no_mutation`.
-fn rebuild_failed(failed: admin::rebuild::Refused) -> ApiError {
+pub(crate) fn rebuild_failed(failed: admin::rebuild::Refused) -> ApiError {
     ApiError {
         no_mutation: false,
         ..rebuild_refused(failed)
