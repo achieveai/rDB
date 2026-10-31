@@ -379,6 +379,20 @@ pub enum OpenError {
          other copies"
     )]
     Unbound(PathBuf),
+    /// A wipe of this copy stopped between moving its folder aside and binding the new empty
+    /// one, and this open cannot finish it (ruling A-R466): it is a node process, or the copy
+    /// holds data, or no other copy names an instance. Nothing was started or removed.
+    #[error(
+        "{copy} was being wiped when the Db stopped: its old data is at {aside}, and this open \
+         cannot finish the wipe. To undo the wipe, remove {copy} if it is there, move {aside} \
+         back to {copy}, then open the folder again"
+    )]
+    WipeUnfinished {
+        /// The copy the wipe emptied, `nodes/<n>`.
+        copy: PathBuf,
+        /// Where the wipe moved its old folder.
+        aside: PathBuf,
+    },
     /// The copies and the control store do not belong together: the copies name different
     /// instances, or the store's `partitions/1` or open counter does not name this one.
     #[error("this directory and the control store do not belong together: {0}")]
@@ -1323,11 +1337,22 @@ impl Db {
             });
         }
         if holds_data {
-            if let Some((node, _)) = engines.iter().find(|(_, e)| e.instance().is_none()) {
-                return Err(OpenError::Unbound(PathBuf::from(format!(
-                    "nodes/{}",
-                    node.0
-                ))));
+            for (node, engine) in engines.iter().filter(|(_, e)| e.instance().is_none()) {
+                let copy = PathBuf::from(format!("nodes/{}", node.0));
+                let Some(aside) = engine
+                    .path()
+                    .parent()
+                    .and_then(|nodes| wipe_aside(nodes, *node))
+                else {
+                    return Err(OpenError::Unbound(copy));
+                };
+                // A wipe stopped after its move and before its synced bind (ruling A-R466):
+                // the empty copy is bound below like the rest and starts behind, as the wipe
+                // meant. Only on a whole-database open, and only with the others' one instance.
+                if partial || !engine.lineages().is_empty() || bound.len() != 1 {
+                    return Err(OpenError::WipeUnfinished { copy, aside });
+                }
+                tracing::warn!(node = node.0, aside = %aside.display(), "node_wipe_resumed");
             }
         }
         let instance = bound
@@ -2589,6 +2614,13 @@ impl Db {
         self.clock.now()
     }
 
+    /// The boot every node of this open started at. A node whose [`Self::boot_of`] differs
+    /// restarted in this open; after a reopen this is not [`host::BOOT`].
+    #[must_use]
+    pub const fn base_boot(&self) -> BootId {
+        self.opened.base_boot
+    }
+
     /// The boot `node`'s running process has, or `None` for a node this `Db` does not run. After
     /// a restart that failed, the boot that restart gave it: no process runs it, and the old
     /// boot is retired either way (F-013).
@@ -3256,6 +3288,11 @@ impl Db {
         respawn: &Respawn,
         boot: BootId,
     ) -> Result<NodeHandle, String> {
+        // Every open that runs nodes sets it; only a `Db` a crate test builds by hand does not.
+        debug_assert!(
+            self.opened.instance.is_some(),
+            "a Db that restarts nodes names its instance"
+        );
         let instance = self.opened.instance.ok_or_else(|| {
             format!(
                 "node {}: this Db names no rDB instance, so its emptied folder {} cannot be \
@@ -3264,8 +3301,22 @@ impl Db {
                 folder.display()
             )
         })?;
+        #[cfg(test)]
+        if wipe_crashes(folder, WipeCrash::AfterMove) {
+            return Err(format!(
+                "node {}: test hook: the wipe stopped after the move",
+                node.0
+            ));
+        }
         let mut engine = RocksEngine::open_with(folder, respawn.storage)
             .map_err(|e| format!("node {}: open {}: {e}", node.0, folder.display()))?;
+        #[cfg(test)]
+        if wipe_crashes(folder, WipeCrash::AfterCreate) {
+            return Err(format!(
+                "node {}: test hook: the wipe stopped before the bind",
+                node.0
+            ));
+        }
         engine.bind_instance(instance).map_err(|error| {
             format!(
                 "node {}: bind the emptied folder {}: {error}",
@@ -4093,6 +4144,7 @@ fn open_refused(error: OpenError) -> OpenError {
         OpenError::InUse(_) => "InUse",
         OpenError::CopyMissing(_) => "CopyMissing",
         OpenError::Unbound(_) => "Unbound",
+        OpenError::WipeUnfinished { .. } => "WipeUnfinished",
         OpenError::Mismatch(_) => "Mismatch",
         OpenError::Undecodable { .. } => "Undecodable",
         OpenError::Config(_) => "Config",
@@ -4249,6 +4301,28 @@ fn aside_path(nodes_dir: &Path, node: NodeId, boot: BootId) -> PathBuf {
         .join(format!("node-{}-boot-{}-{millis}", node.0, boot.0))
 }
 
+/// The newest folder a wipe of `node` moved aside under `nodes_dir`'s `aside/`, by its trailing
+/// unix ms (see [`aside_path`]); `None` when there is none.
+fn wipe_aside(nodes_dir: &Path, node: NodeId) -> Option<PathBuf> {
+    let prefix = format!("node-{}-boot-", node.0);
+    let entries = std::fs::read_dir(nodes_dir.parent().unwrap_or(nodes_dir).join("aside")).ok()?;
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let millis: u128 = name
+                .strip_prefix(&prefix)?
+                .rsplit('-')
+                .next()?
+                .parse()
+                .ok()?;
+            Some((millis, entry.path()))
+        })
+        .max_by_key(|(millis, _)| *millis)
+        .map(|(_, path)| one_separator(&path))
+}
+
 /// Move `folder` to `to`, creating `to`'s parent. Never deletes (critic-bb G7).
 fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
     let moved = to
@@ -4319,7 +4393,8 @@ fn one_separator(path: &Path) -> PathBuf {
 
 /// Open the copies of `local` under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
 /// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
-/// missing copy is created only while no copy holds data. On error, says whether node 1's
+/// missing copy is created only while no copy holds data, or when a wipe moved it aside
+/// (ruling A-R466). On error, says whether node 1's
 /// `LOCK` was held, which is what lets a claim be removed; every engine is closed by then.
 fn open_engines(
     nodes_dir: &Path,
@@ -4349,7 +4424,12 @@ fn open_engines(
             }
         }
     }
-    if let Some((_, dir)) = missing.first() {
+    // A copy a stopped wipe moved aside is created again here, and `Db::check` decides whether
+    // the wipe can finish (ruling A-R466).
+    if let Some((_, dir)) = missing
+        .iter()
+        .find(|(node, _)| wipe_aside(nodes_dir, *node).is_none())
+    {
         if engines.values().any(|engine| !engine.lineages().is_empty()) {
             let held = engines.contains_key(&OWNER);
             return Err((OpenError::CopyMissing(one_separator(dir)), held));
@@ -4667,6 +4747,35 @@ fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
     let before = stops.len();
     stops.retain(|(at, stop)| !(at == dir && *stop == node));
     stops.len() != before
+}
+
+/// Test-only (A-R466): where a wipe of a node's folder stops, as a process that crashed there
+/// would. `AfterMove`: the old folder is aside and no engine exists. `AfterCreate`: the new
+/// engine exists and names no instance.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WipeCrash {
+    AfterMove,
+    AfterCreate,
+}
+
+/// Test-only: the folders whose next wipe stops, and where.
+#[cfg(test)]
+static WIPE_CRASH: Mutex<Vec<(PathBuf, WipeCrash)>> = Mutex::new(Vec::new());
+
+/// Test-only: the next wipe of `folder` stops at `at`.
+#[cfg(test)]
+pub(crate) fn crash_wipe(folder: &Path, at: WipeCrash) {
+    lock(&WIPE_CRASH).push((folder.to_path_buf(), at));
+}
+
+/// Whether the wipe of `folder` stops at `at`; a hit disarms the hook.
+#[cfg(test)]
+fn wipe_crashes(folder: &Path, at: WipeCrash) -> bool {
+    let mut crashes = lock(&WIPE_CRASH);
+    let before = crashes.len();
+    crashes.retain(|(dir, point)| !(dir == folder && *point == at));
+    crashes.len() != before
 }
 
 #[cfg(test)]

@@ -1327,6 +1327,7 @@ fn poll_once(db: &Db, progress: &Progress) {
         let admits = owner.admits == Some(true);
         if let Some(line) = ready_step(
             &mut seen,
+            db.base_boot(),
             owner,
             db.restart_note()
                 .filter(|_| !rejoined(owner, |node| db.boot_of(node)))
@@ -1392,6 +1393,7 @@ const RESUMES: &str = "writes are paused and resume by themselves once the owner
 /// self-replace, or a restart with L1 refusing. After a restart, the pause follows the resume.
 fn ready_reason(
     owner: &NodeStatus,
+    base: BootId,
     admits: bool,
     restart_note: Option<&str>,
     held: &[(NodeId, NodeId)],
@@ -1431,7 +1433,9 @@ fn ready_reason(
     if admits {
         return Some(format!("writes {pause}"));
     }
-    if owner.boot != rdb_api::host::BOOT {
+    // M11 final walk: against this open's base boot, never boot 1, or every node of a reopened
+    // folder reads as a restarted owner and a secondary's rebuild printed this line.
+    if owner.boot != base {
         return Some(format!("{note}; {STUCK}"));
     }
     // M10 (bb #65 paper cut, #69 walk r4): a copy out no longer stops writes for the run. The
@@ -1654,6 +1658,7 @@ const fn never_replaced(reason: DenyReason) -> bool {
 /// r6_3200: the fence's resume line stayed the last word after A1 stopped, `unheld`).
 fn ready_step(
     seen: &mut Seen,
+    base: BootId,
     owner: &NodeStatus,
     restart_note: Option<&str>,
     held: &[(NodeId, NodeId)],
@@ -1664,7 +1669,7 @@ fn ready_step(
     step_line(
         seen,
         admits,
-        ready_reason(owner, admits, restart_note, held, dropped),
+        ready_reason(owner, base, admits, restart_note, held, dropped),
     )
 }
 
@@ -5522,7 +5527,14 @@ mod tests {
             (fenced.clone(), Some(note)),
             (owner(None, true), None),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart, &[], &[]));
+            lines.extend(ready_step(
+                &mut seen,
+                rdb_api::host::BOOT,
+                &node,
+                restart,
+                &[],
+                &[],
+            ));
         }
         assert_eq!(
             lines,
@@ -5585,7 +5597,14 @@ mod tests {
             for polling in [true, false] {
                 let mut seen = Seen::default();
                 assert_eq!(
-                    ready_step(&mut seen, &fenced(reason, polling), None, &[], &[]),
+                    ready_step(
+                        &mut seen,
+                        rdb_api::host::BOOT,
+                        &fenced(reason, polling),
+                        None,
+                        &[],
+                        &[]
+                    ),
                     Some(stuck(name)),
                     "{name}, polling={polling}"
                 );
@@ -5602,7 +5621,7 @@ mod tests {
             fenced(DenyReason::Expired, false),
         ]
         .iter()
-        .filter_map(|node| ready_step(&mut seen, node, None, &[], &[]))
+        .filter_map(|node| ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], &[]))
         .collect();
         assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
     }
@@ -5646,7 +5665,9 @@ mod tests {
             ),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .skip(2)
         .collect();
         assert_eq!(lines, [blocked]);
@@ -5657,7 +5678,14 @@ mod tests {
         healthy.protection = Some("healthy".to_owned());
         for node in [stuck, healthy] {
             assert_eq!(
-                ready_step(&mut Seen::default(), &node, Some(note), &[], &[]),
+                ready_step(
+                    &mut Seen::default(),
+                    rdb_api::host::BOOT,
+                    &node,
+                    Some(note),
+                    &[],
+                    &[]
+                ),
                 Some(format!("{blocked}; {note}")),
                 "{node:?}"
             );
@@ -5698,7 +5726,9 @@ mod tests {
             (serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .skip(2)
         .collect();
         assert_eq!(
@@ -5709,7 +5739,9 @@ mod tests {
             ]
         );
 
-        let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[], &[]);
+        let reason = |node: &NodeStatus, note| {
+            ready_reason(node, rdb_api::host::BOOT, false, note, &[], &[])
+        };
         let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
                     owner re-plans";
         let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
@@ -5785,7 +5817,9 @@ mod tests {
             (&serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .collect();
         let not_ready = |why: &str| format!("not ready: writes not admitted: {why}");
         assert_eq!(
@@ -5829,7 +5863,9 @@ mod tests {
             };
             let lines: Vec<String> = [&fenced, &stopped, &stopped]
                 .iter()
-                .filter_map(|node| ready_step(&mut seen, node, restart, &[], &[]))
+                .filter_map(|node| {
+                    ready_step(&mut seen, rdb_api::host::BOOT, node, restart, &[], &[])
+                })
                 .skip(1)
                 .collect();
             let want = restart.map_or_else(
@@ -5843,7 +5879,14 @@ mod tests {
         fenced_stopped.fence_polling = false;
         fenced_stopped.replace_stopped = true;
         assert_eq!(
-            ready_step(&mut Seen::default(), &fenced_stopped, None, &[], &[]),
+            ready_step(
+                &mut Seen::default(),
+                rdb_api::host::BOOT,
+                &fenced_stopped,
+                None,
+                &[],
+                &[]
+            ),
             Some(
                 "not ready: writes not admitted: node 1's grant is fenced(Expired); nothing in M9 \
                  replaces it, so writes stay stopped for this run: to write again, quit and \
@@ -5864,7 +5907,7 @@ mod tests {
         };
         let lines: Vec<String> = [fenced, unheld.clone(), unheld]
             .iter()
-            .filter_map(|node| ready_step(&mut seen, node, None, &[], &[]))
+            .filter_map(|node| ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], &[]))
             .collect();
         assert_eq!(
             lines,
@@ -5910,7 +5953,9 @@ mod tests {
             (&serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, dropped)| ready_step(&mut seen, node, None, &[], dropped))
+        .filter_map(|(node, dropped)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], dropped)
+        })
         .collect();
         assert_eq!(
             lines,
@@ -5929,7 +5974,7 @@ mod tests {
 
         let resolving = paused("held(grant 2)", "ActivationUnresolved", None);
         assert_eq!(
-            ready_reason(&resolving, false, None, &[], &DROPPED),
+            ready_reason(&resolving, rdb_api::host::BOOT, false, None, &[], &DROPPED),
             Some(
                 "node 1's recovery is waiting for the control store to confirm activation, \
                  l1=paused and links 2->1, 3->1 are dropped; writes resume only once the store \
@@ -5941,6 +5986,7 @@ mod tests {
         assert_eq!(
             ready_reason(
                 &regranted,
+                rdb_api::host::BOOT,
                 false,
                 None,
                 &[(NodeId(1), NodeId(2))],
@@ -5978,7 +6024,9 @@ mod tests {
         let mut seen = Seen::default();
         let lines: Vec<String> = [&paused, &admitting, &thawed]
             .iter()
-            .filter_map(|node| ready_step(&mut seen, node, None, &[], &DROPPED))
+            .filter_map(|node| {
+                ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], &DROPPED)
+            })
             .collect();
         let waits = "partition 1 waits on request 2's outcome (seq 3), which node 1 applied and \
                      has not published, and links 2->1, 3->1 are dropped; writes resume once it \
@@ -5992,7 +6040,7 @@ mod tests {
             "L1 admitting does not make it ready"
         );
         assert_eq!(
-            ready_reason(&paused, false, None, &HELD, &[]),
+            ready_reason(&paused, rdb_api::host::BOOT, false, None, &HELD, &[]),
             Some(
                 "partition 1 waits on request 2's outcome (seq 3), which node 1 applied and has \
                  not published, and links 1-2, 1-3 are held; writes resume once it publishes, \
@@ -6025,7 +6073,14 @@ mod tests {
             node.fence_polling = true;
             node.protection = Some(mode.to_owned());
             assert_eq!(
-                ready_step(&mut Seen::default(), &node, None, &HELD, &[]),
+                ready_step(
+                    &mut Seen::default(),
+                    rdb_api::host::BOOT,
+                    &node,
+                    None,
+                    &HELD,
+                    &[]
+                ),
                 Some(format!(
                     "not ready: writes not admitted: node 1's grant is fenced(Expired), \
                      l1={mode} and links 1-2, 1-3 are held; writes resume only once the old \
@@ -6037,7 +6092,14 @@ mod tests {
             );
             for held in [&[][..], &[(NodeId(2), NodeId(3))][..]] {
                 assert_eq!(
-                    ready_step(&mut Seen::default(), &node, None, held, &[]),
+                    ready_step(
+                        &mut Seen::default(),
+                        rdb_api::host::BOOT,
+                        &node,
+                        None,
+                        held,
+                        &[]
+                    ),
                     Some(
                         "not ready: writes not admitted: node 1's grant is fenced(Expired); \
                          writes resume by themselves once the old grant's expiry is proven, so \
@@ -6075,11 +6137,25 @@ mod tests {
         };
         let mut startup = Seen::default();
         assert_eq!(
-            ready_step(&mut startup, &held("paused", false), None, &[], &[]),
+            ready_step(
+                &mut startup,
+                rdb_api::host::BOOT,
+                &held("paused", false),
+                None,
+                &[],
+                &[]
+            ),
             None
         );
         assert_eq!(
-            ready_step(&mut startup, &held("reprotecting", false), None, &[], &[]),
+            ready_step(
+                &mut startup,
+                rdb_api::host::BOOT,
+                &held("reprotecting", false),
+                None,
+                &[],
+                &[]
+            ),
             None
         );
         let wait = "not ready: writes not admitted: l1=paused and links 1-2, 1-3 are held: \
@@ -6098,7 +6174,9 @@ mod tests {
             (held("healthy", true), &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .collect();
         assert_eq!(
             lines,
@@ -6137,7 +6215,14 @@ mod tests {
             (owner(None, true), Some(note)),
             (paused, Some(note)),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart, &[], &[]));
+            lines.extend(ready_step(
+                &mut seen,
+                rdb_api::host::BOOT,
+                &node,
+                restart,
+                &[],
+                &[],
+            ));
         }
         assert_eq!(
             lines,
@@ -6149,6 +6234,31 @@ mod tests {
                 ),
                 format!("not ready: writes not admitted: {note}; l1=paused: {RESUMES}"),
             ]
+        );
+    }
+
+    /// M11 final walk: after a reopen every node starts at that open's base boot (65537 on the
+    /// second open), so a secondary's rebuild restart while L1 pauses printed "writes stay
+    /// stopped for this run" and then, half a second later, "rebuilt ... writes are admitted
+    /// again". The owner restarted only when its boot differs from the open's base. Cut: compare
+    /// with `host::BOOT` again: the first assert reads the stuck line, red. Unit.
+    #[test]
+    fn a_reopened_owner_at_its_base_boot_is_not_stuck() {
+        let base = BootId(65_537);
+        let note = "node 3 restarted (now boot 65538); a restarted copy rejoins by itself once \
+                    the owner re-plans";
+        let mut paused = owner(None, false);
+        paused.boot = base;
+        paused.protection = Some("paused".to_owned());
+        assert_eq!(
+            ready_reason(&paused, base, false, Some(note), &[], &[]),
+            Some(format!("{note}; l1=paused: {RESUMES}"))
+        );
+        let mut restarted = paused.clone();
+        restarted.boot = BootId(65_538);
+        assert_eq!(
+            ready_reason(&restarted, base, false, Some(note), &[], &[]),
+            Some(format!("{note}; {STUCK}"))
         );
     }
 
@@ -6327,7 +6437,7 @@ mod tests {
                 ..Seen::default()
             };
             assert_eq!(
-                ready_step(&mut seen, &node, restart, &[], &[]),
+                ready_step(&mut seen, rdb_api::host::BOOT, &node, restart, &[], &[]),
                 line,
                 "state {state}"
             );
@@ -6493,7 +6603,14 @@ mod tests {
     /// `seen` after a `ready` line, as the poller holds it before a failure.
     fn lines_ready(seen: &mut Seen) {
         assert_eq!(
-            ready_step(seen, &owner(None, true), None, &[], &[]),
+            ready_step(
+                seen,
+                rdb_api::host::BOOT,
+                &owner(None, true),
+                None,
+                &[],
+                &[]
+            ),
             Some("ready".to_owned())
         );
     }

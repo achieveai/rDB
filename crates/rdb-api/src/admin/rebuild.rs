@@ -19,9 +19,10 @@ use config_core::{ConfigStore, GetRequest};
 use rdb_core::authority::partition::{PartitionRecord, RecordMember};
 use rdb_core::contracts::authority::PartitionMode;
 use rdb_core::contracts::control::ControlKey;
-use rdb_core::contracts::ids::{BootId, Generation, NodeId, ReplicaRole};
+use rdb_core::contracts::ids::{BootId, Generation, NodeId, PartitionId, ReplicaRole};
 use rdb_core::contracts::membership::Member;
 use rdb_core::contracts::recovery::DivergenceEvidence;
+use rdb_core::recovery::RecoveryPhase;
 
 /// Which way N comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +236,42 @@ fn names(evidence: &DivergenceEvidence, members: &[Member], node: NodeId) -> boo
     members
         .iter()
         .any(|m| m.node == node && copies.contains(&m.copy))
+}
+
+/// Why the owner `node` cannot rebuild yet when it has committed no recovery of `partition`
+/// since it started and holds no quarantined run to rebuild from (M-MC2, ruling A-R465).
+/// `phase` is its F1's, `None` when none runs. Each text is true of the phase it names:
+/// `Blocked` stays blocked until a fresh fence, so waiting never helps, and a quarantined run
+/// without its plan and fence is quarantined, never "not quarantined".
+pub(crate) fn no_commit_refusal(
+    node: NodeId,
+    partition: PartitionId,
+    phase: Option<&RecoveryPhase>,
+) -> Refused {
+    let (n, p) = (node.0, partition.0);
+    let detail = match phase {
+        Some(RecoveryPhase::Blocked(reason)) => format!(
+            "node {n} owns partition {p} and cannot rebuild a copy of it: its recovery has not \
+             committed since it started and is blocked ({reason:?}), which it does not leave by \
+             itself. Shut the Db down and open the folder again, then rebuild"
+        ),
+        Some(RecoveryPhase::Quarantined) => format!(
+            "node {n} owns partition {p} and cannot rebuild a copy of it: its recovery is \
+             quarantined, but it holds no plan and fence of that run to rebuild from. Shut the \
+             Db down and open the folder again, then rebuild"
+        ),
+        other => format!(
+            "node {n} owns partition {p} and cannot rebuild a copy of it yet: its recovery has \
+             not committed since it started and is not quarantined ({}). Run the rebuild again \
+             once node {n}'s recovery has committed (`nodes` shows its recovery phase); if it \
+             stays in this phase, shut the Db down and open the folder again, then rebuild",
+            other.map_or_else(
+                || "no recovery runs yet".to_owned(),
+                |phase| format!("recovery phase {phase:?}")
+            )
+        ),
+    };
+    Refused::new("owner", detail)
 }
 
 /// G5: the drop commit landed `Active` or `DegradedRf2` and pins no `node`.
@@ -572,6 +609,52 @@ mod tests {
             ..asked(4, &members, false, None)
         };
         assert_eq!(decide(&asked, |_| true), Ok(RebuildMode::NotPinned));
+    }
+
+    /// A-R465: a blocked recovery stays blocked until a fresh fence, so the refusal says to shut
+    /// down and reopen, never to run it again later. Cut: drop the `Blocked` arm: the text
+    /// says "Run the rebuild again", red.
+    #[test]
+    fn b3_mmc2_a_blocked_recovery_says_reopen_not_try_again() {
+        let blocked =
+            RecoveryPhase::Blocked(rdb_core::contracts::authority::BlockReason::ControlUnknown);
+        let refused = no_commit_refusal(NodeId(1), PartitionId(1), Some(&blocked));
+        assert_eq!(refused.guard, "owner");
+        assert_eq!(
+            refused.detail,
+            "node 1 owns partition 1 and cannot rebuild a copy of it: its recovery has not \
+             committed since it started and is blocked (ControlUnknown), which it does not leave \
+             by itself. Shut the Db down and open the folder again, then rebuild"
+        );
+    }
+
+    /// A-R465: quarantined with no plan and fence to rebuild from is said as quarantined, never
+    /// "is not quarantined (recovery phase Quarantined)". Cut: drop the `Quarantined` arm: the
+    /// text contradicts itself, red.
+    #[test]
+    fn b3_mmc2_quarantined_without_a_plan_says_so() {
+        let refused =
+            no_commit_refusal(NodeId(1), PartitionId(1), Some(&RecoveryPhase::Quarantined));
+        assert_eq!(
+            refused.detail,
+            "node 1 owns partition 1 and cannot rebuild a copy of it: its recovery is \
+             quarantined, but it holds no plan and fence of that run to rebuild from. Shut the Db \
+             down and open the folder again, then rebuild"
+        );
+        assert!(!refused.detail.contains("not quarantined"));
+        // The still-running phases keep the run-again text (the Db row covers `None`).
+        let running =
+            no_commit_refusal(NodeId(1), PartitionId(1), Some(&RecoveryPhase::Collecting));
+        assert!(
+            running
+                .detail
+                .contains("is not quarantined (recovery phase Collecting)")
+                && running
+                    .detail
+                    .contains("Run the rebuild again once node 1's recovery"),
+            "{}",
+            running.detail
+        );
     }
 
     #[test]

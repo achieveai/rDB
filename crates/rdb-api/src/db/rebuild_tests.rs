@@ -81,17 +81,127 @@ fn reopens_with_members_1_2_3(
             crate::host::test_budgets(),
         ))
         .expect("the folder opens again after the rebuild");
-    db.wait_ready(crate::host::test_patience(Duration::from_secs(20)))
-        .expect("the reopen is ready");
-    let (owner, pinned) = db.pinned_members().expect("the owner answers");
-    let mut nodes: Vec<u32> = pinned.iter().map(|m| m.node.0).collect();
-    nodes.sort_unstable();
-    assert_eq!((owner, nodes), (NodeId(1), vec![1, 2, 3]), "{pinned:?}");
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    db.wait_ready(patience).expect("the reopen is ready");
+    // A copy the record left out rejoins by the reopen's heal, so the members are polled for.
+    let started = Instant::now();
+    let members = || {
+        let (owner, pinned) = db.pinned_members().expect("the owner answers");
+        let mut nodes: Vec<u32> = pinned.iter().map(|m| m.node.0).collect();
+        nodes.sort_unstable();
+        (owner, nodes, pinned)
+    };
+    let mut seen = members();
+    while (seen.0, &seen.1) != (NodeId(1), &vec![1, 2, 3]) && started.elapsed() < patience {
+        std::thread::sleep(Duration::from_millis(50));
+        seen = members();
+    }
+    assert_eq!((seen.0, seen.1), (NodeId(1), vec![1, 2, 3]), "{:?}", seen.2);
     let got = db.get(key.as_bytes()).expect("a read after the reopen");
     assert_eq!(
         got.value.map(|(_, value)| value),
         Some(Bytes::from(key.to_owned())),
         "acked {key} reads back after the reopen"
+    );
+}
+
+/// A-R466: a crash inside `admin rebuild 3 --wipe` (mode B), after 3's folder was moved aside
+/// and before its new engine was bound, at `at`. The next open finishes the wipe: it creates
+/// and binds the empty folder, logs `node_wipe_resumed` with the aside path, and is ready with
+/// every acked write reading back. `admin rebuild 3` then re-adds the empty copy, and the next
+/// open has members 1, 2 and 3.
+fn a_crash_inside_a_wipe_is_rolled_forward(method: &str, at: super::WipeCrash) {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let db = ready(&rt, dir.path(), &store);
+    for i in 0..5 {
+        assert!(
+            put_acked(&db, &format!("pre{i}"), patience).is_some(),
+            "pre{i}"
+        );
+    }
+    let folder = dir.path().join("nodes").join("3");
+    super::crash_wipe(&folder, at);
+    let stopped = db
+        .rebuild_with(NodeId(3), true)
+        .expect_err("the wipe stopped");
+    assert!(stopped.detail.contains("test hook"), "{stopped:?}");
+    assert_eq!(
+        folder.join("CURRENT").exists(),
+        at == super::WipeCrash::AfterCreate,
+        "premise: the folder at the crash point"
+    );
+    let asides = files_under(&dir.path().join("aside"));
+    assert_eq!(asides, 1, "premise: 3's old folder is aside");
+    let mut db = db;
+    db.shutdown();
+    drop(db);
+    let reopened = rt
+        .block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the open finishes the wipe");
+    config_log::layer::flush_test_logs();
+    let resumed: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "node_wipe_resumed")
+        .collect();
+    assert_eq!(resumed.len(), 1, "{resumed:?}");
+    assert_eq!(resumed[0]["node"], 3, "{:?}", resumed[0]);
+    assert!(
+        resumed[0]["aside"]
+            .as_str()
+            .is_some_and(|aside| aside.contains("node-3-boot-")),
+        "{:?}",
+        resumed[0]
+    );
+    reopened
+        .wait_ready(patience)
+        .expect("the resumed open is ready");
+    let got = reopened
+        .get(b"pre4")
+        .expect("a read after the resumed open");
+    assert_eq!(
+        got.value.map(|(_, value)| value),
+        Some(Bytes::from_static(b"pre4")),
+        "acked pre4 reads back after the resumed open"
+    );
+    // The drop committed before the crash, and a reopen does not re-add a left-out copy by
+    // itself, so the operator's `admin rebuild 3` (no wipe: the copy is already empty) brings
+    // the empty copy back; it catches up from the others.
+    let rebuilt = reopened
+        .rebuild_with(NodeId(3), false)
+        .expect("node 3 is re-added and catches up");
+    assert_eq!(rebuilt.aside, None, "nothing is wiped twice");
+    reopens_with_members_1_2_3(reopened, &rt, dir.path(), &store, "pre4");
+}
+
+/// A-R466, the crash right after the move: `nodes/3` is missing. Before the roll-forward the
+/// open refused `CopyMissing`. Cut: the aside test in `open_engines` (refuse a missing copy as
+/// before): red.
+/// Integration (~5-15 s): three opens, a drop re-plan, a crash, a re-add.
+#[config_log::retcd_test]
+fn b3_a466_a_crash_after_the_move_reopens() {
+    a_crash_inside_a_wipe_is_rolled_forward(
+        "b3_a466_a_crash_after_the_move_reopens",
+        super::WipeCrash::AfterMove,
+    );
+}
+
+/// A-R466, the crash after the new engine was created and before its bind: `nodes/3` is empty
+/// and names no instance. Before the roll-forward the open refused `Unbound` ("holds data",
+/// which was false). Cut: the resume predicate in `Db::check` (no roll-forward): red.
+/// Integration (~5-15 s): three opens, a drop re-plan, a crash, a re-add.
+#[config_log::retcd_test]
+fn b3_a466_a_crash_before_the_bind_reopens() {
+    a_crash_inside_a_wipe_is_rolled_forward(
+        "b3_a466_a_crash_before_the_bind_reopens",
+        super::WipeCrash::AfterCreate,
     );
 }
 
@@ -356,12 +466,13 @@ fn b3_mode_c_takes_a_quarantined_partition_out_and_back() {
 /// M-MC2 (final walk 7b4762b): `admin rebuild 3` asked straight after a reopen, before the
 /// owner's recovery has committed, said "ask the node that owns it" while node 1 owns it. Here
 /// the reopen holds links 1-2 and 1-3, so node 1's recovery cannot commit or quarantine. The
-/// refusal says it has not committed since it started, is not quarantined, names the phase,
-/// and says to try again once ready; it never sends the reader to another node first. Nothing
+/// refusal names node 1 the owner, says its recovery has not committed since it started and is
+/// not quarantined, names the phase, and says what to do: rebuild again after the commit, or
+/// reopen if the phase does not move. Never "once it is ready", which a forked copy is not. Nothing
 /// restarts. Cut: the old text: red on every assert of the text.
 /// Integration (~1-3 s): two opens, one refusal.
 #[config_log::retcd_test]
-fn b3_mmc2_a_rebuild_before_the_owner_recovered_says_try_again_when_ready() {
+fn b3_mmc2_a_rebuild_before_the_owner_recovered_names_the_owner_and_the_step() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
@@ -394,16 +505,20 @@ fn b3_mmc2_a_rebuild_before_the_owner_recovered_says_try_again_when_ready() {
     assert!(refused.no_mutation, "{refused:?}");
     assert!(
         refused.detail.starts_with(
-            "node 1 cannot rebuild a copy of partition 1 yet: its recovery has not committed \
-             since it started and is not quarantined ("
+            "node 1 owns partition 1 and cannot rebuild a copy of it yet: its recovery has not \
+             committed since it started and is not quarantined ("
         ),
         "{}",
         refused.detail
     );
     assert!(
         refused.detail.contains(
-            "If node 1 owns the partition, try again once it is ready; otherwise ask the owner"
-        ) && !refused.detail.contains("Quarantined"),
+            "Run the rebuild again once node 1's recovery has committed (`nodes` shows its \
+             recovery phase); if it stays in this phase, shut the Db down and open the folder \
+             again, then rebuild"
+        ) && !refused.detail.contains("Quarantined")
+            && !refused.detail.contains("once it is ready")
+            && !refused.detail.contains("If node"),
         "{}",
         refused.detail
     );

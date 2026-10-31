@@ -7366,26 +7366,19 @@ impl Host {
                     plan.anchor.lineage.generation,
                     RebuildBasis::Quarantined(Box::new((plan, fence))),
                 ),
-                // M-MC2 (final walk 7b4762b): asked straight after a reopen, the owner is still
-                // recovering, so "ask the node that owns it" pointed at itself. The text names
-                // the two things checked: no commit since this node started, no quarantine.
+                // M-MC2 (final walk 7b4762b), A-R465: asked straight after a reopen, the owner is
+                // still recovering, so "ask the node that owns it" pointed at itself. The text
+                // names what this branch holds: no commit since this node started, and no
+                // quarantined run to rebuild from, said per F1 phase.
                 None => {
-                    let phase = self.recoveries.get(&partition).map_or_else(
-                        || "no recovery runs yet".to_owned(),
-                        |f1| format!("recovery phase {:?}", f1.phase()),
-                    );
+                    let phase = self.recoveries.get(&partition).map(Recovery::phase);
                     return refuse(
                         &reply,
-                        Refused {
-                            guard: "owner",
-                            detail: format!(
-                                "node {} cannot rebuild a copy of partition {} yet: its recovery \
-                                 has not committed since it started and is not quarantined \
-                                 ({phase}). If node {} owns the partition, try again \
-                                 once it is ready; otherwise ask the owner",
-                                self.node.0, partition.0, self.node.0
-                            ),
-                        },
+                        crate::admin::rebuild::no_commit_refusal(
+                            self.node,
+                            partition,
+                            phase.as_ref(),
+                        ),
                     );
                 }
             },
