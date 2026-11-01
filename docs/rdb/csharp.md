@@ -87,20 +87,23 @@ answer was lost with no request id (read the object, then decide).
   attempt is refused before anything is sent: `RdbException` with `Kind = InvalidArgument`,
   `NoMutation = true`, `FromServer = false`. A `Timeout` that covers the attempt but not the
   connect ends "not sent" (`NoMutation = true`): the time left after connecting was too short.
+- A `Timeout` near the minimum buys one attempt. During an outage a burst of writes may end well
+  before its `Timeout` as `UNAVAILABLE` or `OVERLOADED`, with nothing applied. Give a larger
+  `Timeout` to retry through an outage.
 - Cancelling a call (its `CancellationToken`) gives a bare `OperationCanceledException`, with no
   request id. For a write, it may have applied. Settle it by **reading the object**; never send
   it again blindly, or it may apply twice.
 - One client shares its connections. Past the gateway's 64 streams on one connection it opens
-  another, so a call never waits unsent in the client. A call that fails in transport makes later
+  another rather than queue the call in the client. A call that fails in transport makes later
   calls connect afresh; calls already running on the old connection run on to their own result.
 
 ## Limits and notes
 
 - Keys up to 1,024 bytes, up to 255 puts per transaction, a transaction deadline up to 30 s.
 - One write's whole record must fit 1 MiB (1,048,576 bytes), framing included. One put's
-  largest value is **1,048,240 bytes minus the key's length** for a new key, 1 byte more for an
-  existing key, with or without `ifVersion` (a 3-byte key: 1,048,237 new, 1,048,238 existing);
-  measured for plain ASCII keys. A transaction's puts share the 1 MiB.
+  largest value is **1,048,240 bytes minus the key's length, minus 1 per 0x00 byte in the key**,
+  for a new key; 1 byte more for an existing key; the same with or without `ifVersion` (a 3-byte
+  key with no 0x00 byte: 1,048,237 new, 1,048,238 existing). A transaction's puts share the 1 MiB.
   The server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
@@ -114,9 +117,13 @@ answer was lost with no request id (read the object, then decide).
   answers, so it may drop them: a status of an older write can say ReadTheObject.
 - Loopback only: `--listen` refuses `0.0.0.0`, `[::]`, `[::ffff:127.0.0.1]`, LAN addresses and host
   names. TLS for apps comes in slice 3.
-- **Known limit: memory is not bounded.** The gateway decodes a request of up to 254 MiB
-  (`MAX_DECODE_BYTES`) before any check, and it does not cap connections, so many large requests
-  at once can exhaust its memory. The 64-call limit bounds running calls, not decoding.
+- **Known limit: memory is not bounded.** The gateway decodes a request of up to 267,719,656 bytes
+  (about 255 MiB, `MAX_DECODE_BYTES`) before any check, and it does not cap connections, so many
+  large requests at once can exhaust its memory. The 64-call limit bounds running calls, not
+  decoding.
+- **Known limit: an unsent write can read as unknown.** If an extra connection fails to open while
+  more than 64 calls are in flight, a write still waiting for it may end unknown though it was
+  never sent. Treat unknown as "maybe applied", as always: ask `StatusAsync` or read the object.
 - **Local trust.** Until slice 3 the gateway checks no caller: any process on this machine can call
   it and acts as the gateway's app, with its client id and its rights. And while the gateway is
   down, any local process that takes its port receives your calls, values included. Run it only on
