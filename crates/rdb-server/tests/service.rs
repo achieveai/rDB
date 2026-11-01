@@ -246,6 +246,20 @@ async fn the_gateway_serves_the_slice_1_contracts() {
     full_stop.send(()).expect("full server still running");
     full_server.await.expect("join").expect("serve");
 
+    // F-016: a put's record must fit `MAX_ENVELOPE_BYTES` (1 MiB): 265 bytes of record framing
+    // (`rdb_core::transaction::record_len`: 175 fixed, 90 for the dedup row), then 10 bytes
+    // plus the key plus the value. So with a 3-byte key the largest value is 1,048,298 bytes.
+    let largest = 1_048_576 - 265 - 10 - 3;
+    put(&mut client, b"big", &vec![b'z'; largest], None)
+        .await
+        .expect("the largest value for a 3-byte key");
+    let over = put(&mut client, b"big", &vec![b'z'; largest + 1], None)
+        .await
+        .expect_err("one byte past the record");
+    let detail = rdb_error_of(&over).expect("the server decided");
+    assert_eq!(detail.kind_name, "INVALID_ARGUMENT", "{over:?}");
+    assert!(detail.no_mutation, "{over:?}");
+
     drop(client);
     stop.send(()).expect("server still running");
     server.await.expect("join").expect("serve");

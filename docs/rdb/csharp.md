@@ -90,9 +90,11 @@ answer was lost with no request id (read the object, then decide).
 
 ## Limits and notes
 
-- Keys up to 1,024 bytes, values up to about 1 MiB (1,048,536 bytes), up to 255 puts per
-  transaction, a transaction deadline up to 30 s. The server checks them (`INVALID_ARGUMENT`),
-  exactly as the embedded API does.
+- Keys up to 1,024 bytes, up to 255 puts per transaction, a transaction deadline up to 30 s.
+- One write's record must fit 1 MiB (1,048,576 bytes): 265 bytes of framing, then per put 10
+  bytes plus its key plus its value, and 1 byte per `ifVersion`. So one put's largest value is
+  1,048,301 bytes minus the key's length (1,048,298 for a 3-byte key); a transaction's puts share
+  the 1 MiB. The server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
 - A version is the partition's, not the object's: every write in the partition raises it, so an
@@ -105,6 +107,9 @@ answer was lost with no request id (read the object, then decide).
   answers, so it may drop them: a status of an older write can say ReadTheObject.
 - Loopback only: `--listen` refuses `0.0.0.0`, `[::]`, `[::ffff:127.0.0.1]`, LAN addresses and host
   names. TLS for apps comes in slice 3.
+- **Known limit: memory is not bounded.** The gateway decodes a request of up to 254 MiB
+  (`MAX_DECODE_BYTES`) before any check, and it does not cap connections, so many large requests
+  at once can exhaust its memory. The 64-call limit bounds running calls, not decoding.
 - **Local trust.** Until slice 3 the gateway checks no caller: any process on this machine can call
   it and acts as the gateway's app, with its client id and its rights. And while the gateway is
   down, any local process that takes its port receives your calls, values included. Run it only on

@@ -433,6 +433,9 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
             KeepAlivePingDelay = TimeSpan.FromSeconds(20),
             KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
             KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always,
+            // The gateway serves 64 streams per connection. Without a second connection, call 65 waits in this
+            // client, and a deadline that ends there reads as an unknown outcome for a write never sent (F-015).
+            EnableMultipleHttp2Connections = true,
         },
         DisposeHttpClient = true,
     });

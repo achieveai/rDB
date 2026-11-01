@@ -37,6 +37,28 @@ public class ChannelTests
         var written = await put.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(41UL, written.RequestId);
     }
+
+    // F-015: past the gateway's 64 streams on one connection, a write must not end "unknown" unless it was sent.
+    // 70 writes on one client against a gateway that holds every Put it receives; each attempt is 1.5 s.
+    [Fact]
+    public async Task A_write_queued_past_the_stream_limit_is_never_reported_unknown_unless_it_was_sent()
+    {
+        await using var gateway = await FakeGateway.StartAsync();
+        using var client = RdbClient.Create(new RdbClientOptions { Endpoint = gateway.Address, Timeout = TimeSpan.FromSeconds(2) });
+        client.UseServerTimeouts(TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(500));
+        client.Slack = TimeSpan.FromMilliseconds(500);
+        var writes = Enumerable.Range(0, 70).Select(i => client.PutAsync($"k{i}", "v")).ToArray();
+        var ends = await Task.WhenAll(writes.Select(async w =>
+        {
+            try { await w; return "OK"; }
+            catch (RdbUnknownOutcomeException) { return "UNKNOWN"; }
+            catch (RdbException e) { return e.KindName; }
+        })).WaitAsync(TimeSpan.FromSeconds(20));
+        var unknown = ends.Count(e => e == "UNKNOWN");
+        Assert.True(unknown <= gateway.Puts,
+            $"{unknown} writes ended unknown but only {gateway.Puts} reached the gateway: " +
+            string.Join(", ", ends.GroupBy(e => e).Select(g => $"{g.Key}={g.Count()}")));
+    }
 }
 
 /// <summary>
@@ -47,6 +69,7 @@ internal sealed class FakeGateway : IAsyncDisposable
 {
     private readonly WebApplication _app;
     private int _gets;
+    private int _puts;
 
     private FakeGateway(WebApplication app, string address)
     {
@@ -62,17 +85,26 @@ internal sealed class FakeGateway : IAsyncDisposable
 
     public int Gets => Volatile.Read(ref _gets);
 
+    /// <summary>Puts that reached the gateway.</summary>
+    public int Puts => Volatile.Read(ref _puts);
+
     public static async Task<FakeGateway> StartAsync()
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
-        builder.WebHost.ConfigureKestrel(k => k.Listen(IPAddress.Loopback, 0, l => l.Protocols = HttpProtocols.Http2));
+        builder.WebHost.ConfigureKestrel(k =>
+        {
+            // As the gateway: 64 streams per connection (rdb-server MAX_IN_FLIGHT).
+            k.Limits.Http2.MaxStreamsPerConnection = 64;
+            k.Listen(IPAddress.Loopback, 0, l => l.Protocols = HttpProtocols.Http2);
+        });
         var app = builder.Build();
         FakeGateway? self = null;
         app.MapPost("/rdb.v1.Rdb/Put", async ctx =>
         {
             await ctx.Request.Body.CopyToAsync(Stream.Null);
-            self!.PutArrived.TrySetResult();
+            Interlocked.Increment(ref self!._puts);
+            self.PutArrived.TrySetResult();
             await self.ReleasePut.Task.WaitAsync(ctx.RequestAborted);
             await Reply(ctx, new Pb.WriteReply { RequestId = 41, Generation = 2, Version = 7, Outcome = Pb.Outcome.Published });
         });

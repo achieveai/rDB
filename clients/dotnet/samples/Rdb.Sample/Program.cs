@@ -15,7 +15,7 @@ usage: Rdb.Sample [--endpoint URL] [--timeout DUR] [--verbose] COMMAND
   walk                                     put, get, txn, a refused txn, status: one line each
 options:
   --endpoint URL   the gateway (default $RDB_ENDPOINT, else http://127.0.0.1:19190)
-  --timeout DUR    the call budget, retries included (default 30s). DUR: 500ms, 2s, 1m, or seconds
+  --timeout DUR    the call budget, retries included (default 45s). DUR: 500ms, 2s, 1m, or seconds
   --verbose        print every field of an error
 exits: 0 ok; 1 not found; 2 usage; 3 refused by the server (nothing applied);
        4 unknown outcome (may have applied: ask status, or read the object);
