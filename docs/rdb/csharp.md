@@ -98,8 +98,9 @@ answer was lost with no request id (read the object, then decide).
 
 - Keys up to 1,024 bytes, up to 255 puts per transaction, a transaction deadline up to 30 s.
 - One write's whole record must fit 1 MiB (1,048,576 bytes), framing included. One put's
-  largest value is **1,048,241 bytes minus the key's length** (1,048,238 for a 3-byte key), with
-  or without `ifVersion`; measured for plain ASCII keys. A transaction's puts share the 1 MiB.
+  largest value is **1,048,240 bytes minus the key's length** for a new key, 1 byte more for an
+  existing key, with or without `ifVersion` (a 3-byte key: 1,048,237 new, 1,048,238 existing);
+  measured for plain ASCII keys. A transaction's puts share the 1 MiB.
   The server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.

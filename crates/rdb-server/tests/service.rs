@@ -246,19 +246,24 @@ async fn the_gateway_serves_the_slice_1_contracts() {
     full_stop.send(()).expect("full server still running");
     full_server.await.expect("join").expect("serve");
 
-    // F-016: a put's whole record must fit 1 MiB. Measured by binary search on 2026-11-01: the
-    // largest value is 1,048,241 bytes less the key (335 bytes of record, envelope, CBOR and key
-    // framing), the same with or without `if_version`. So a 3-byte key takes 1,048,238.
-    let largest = 1_048_241 - 3;
-    put(&mut client, b"big", &vec![b'z'; largest], None)
-        .await
-        .expect("the largest value for a 3-byte key");
-    let over = put(&mut client, b"big", &vec![b'z'; largest + 1], None)
-        .await
-        .expect_err("one byte past the record");
-    let detail = rdb_error_of(&over).expect("the server decided");
-    assert_eq!(detail.kind_name, "INVALID_ARGUMENT", "{over:?}");
-    assert!(detail.no_mutation, "{over:?}");
+    // F-016: a put's whole record must fit 1 MiB. Measured by binary search on 2026-11-01: a
+    // replace's largest value is 1,048,241 bytes less the key (335 bytes of record, envelope, CBOR
+    // and key framing), with or without `if_version`. A put to a new key carries an "absent"
+    // condition, one byte more. So with a 3-byte key: 1,048,237 new, 1,048,238 existing.
+    for (largest, what) in [
+        (1_048_240 - 3, "a new key"),
+        (1_048_241 - 3, "an existing key"),
+    ] {
+        let over = put(&mut client, b"big", &vec![b'z'; largest + 1], None)
+            .await
+            .expect_err(what);
+        let detail = rdb_error_of(&over).expect("the server decided");
+        assert_eq!(detail.kind_name, "INVALID_ARGUMENT", "{what}: {over:?}");
+        assert!(detail.no_mutation, "{what}: {over:?}");
+        put(&mut client, b"big", &vec![b'z'; largest], None)
+            .await
+            .unwrap_or_else(|e| panic!("the largest value for {what}: {e:?}"));
+    }
 
     drop(client);
     stop.send(()).expect("server still running");
