@@ -79,22 +79,28 @@ answer was lost with no request id (read the object, then decide).
   default 45 s), never by count.
 - Each attempt waits the server's worst case plus 2 s: 12 s for a put, 4 s for a read or status,
   and for a transaction 5 s + its deadline + 1 s + 2 s (13 s at the default 5 s deadline, 38 s at
-  the largest, 30 s). A send starts only when a whole attempt still fits in `Timeout`, the first
-  one included. A `Timeout` shorter than one attempt is refused before anything is sent:
-  `RdbException` with `Kind = InvalidArgument`, `NoMutation = true`, `FromServer = false`.
+  the largest, 30 s). A read or status attempt is 2 x the server read timeout (1 s by default)
+  plus 2 s. A send starts only when a whole attempt still fits in what is left of `Timeout`
+  **after connecting**, the first one included.
+- **Minimum `Timeout`: one attempt plus 1 s to connect.** That is 13 s for a put, 5 s for a read
+  or status, and 14 s for a transaction at the default 5 s deadline. A `Timeout` shorter than one
+  attempt is refused before anything is sent: `RdbException` with `Kind = InvalidArgument`,
+  `NoMutation = true`, `FromServer = false`. A `Timeout` that covers the attempt but not the
+  connect ends "not sent" (`NoMutation = true`): the time left after connecting was too short.
 - Cancelling a call (its `CancellationToken`) gives a bare `OperationCanceledException`, with no
   request id. For a write, it may have applied. Settle it by **reading the object**; never send
   it again blindly, or it may apply twice.
-- One client shares one connection. A call that fails in transport makes later calls connect
-  afresh; calls already running on the old connection run on to their own result.
+- One client shares its connections. Past the gateway's 64 streams on one connection it opens
+  another, so a call never waits unsent in the client. A call that fails in transport makes later
+  calls connect afresh; calls already running on the old connection run on to their own result.
 
 ## Limits and notes
 
 - Keys up to 1,024 bytes, up to 255 puts per transaction, a transaction deadline up to 30 s.
-- One write's record must fit 1 MiB (1,048,576 bytes): 265 bytes of framing, then per put 10
-  bytes plus its key plus its value, and 1 byte per `ifVersion`. So one put's largest value is
-  1,048,301 bytes minus the key's length (1,048,298 for a 3-byte key); a transaction's puts share
-  the 1 MiB. The server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
+- One write's whole record must fit 1 MiB (1,048,576 bytes), framing included. One put's
+  largest value is **1,048,241 bytes minus the key's length** (1,048,238 for a 3-byte key), with
+  or without `ifVersion`; measured for plain ASCII keys. A transaction's puts share the 1 MiB.
+  The server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
 - A version is the partition's, not the object's: every write in the partition raises it, so an

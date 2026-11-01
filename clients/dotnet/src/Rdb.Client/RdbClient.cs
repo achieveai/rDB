@@ -232,7 +232,7 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
             return Stamp(new RdbException(
                 $"{op}: Timeout {_options.Timeout.TotalSeconds:0.#} s is shorter than one attempt " +
                 $"({attempt.TotalSeconds:0.#} s); nothing was sent. next: raise RdbClientOptions.Timeout to at least " +
-                $"{Math.Ceiling(attempt.TotalSeconds):0} s",
+                $"{Math.Ceiling(attempt.TotalSeconds) + 1:0} s (one attempt plus 1 s to connect)",
                 RdbErrorKind.InvalidArgument, "INVALID_ARGUMENT", RdbRetry.Definitive, true, null, null, null, false));
         }
 
@@ -259,7 +259,11 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
                 }
                 left = budgetEnd - DateTime.UtcNow;
                 // Never send unless the whole attempt fits: a cut attempt turns a settleable answer into a lost one.
-                if (left < attempt) break;
+                if (left < attempt)
+                {
+                    lastNote ??= $"the time left after connecting ({left.TotalSeconds:0.##} s) was shorter than one attempt ({attempt.TotalSeconds:0.#} s)";
+                    break;
+                }
                 sends++;
                 var deadline = DateTime.UtcNow + attempt;
                 try

@@ -98,6 +98,28 @@ public class GuardTests
         Assert.Empty(gateway.Calls);
     }
 
+    // D4 (A-R474): a budget of exactly one attempt passes the up-front check, but connecting spends part of it, so
+    // the send no longer fits. It ends "not sent" and says why. A put's attempt is 300 ms here; the connect takes 50.
+    [Fact]
+    public async Task A_timeout_of_exactly_one_attempt_is_not_sent_once_connecting_has_spent_some_of_it()
+    {
+        var (client, gateway, _) = Client(TimeSpan.FromMilliseconds(300));
+        client.UseServerTimeouts(TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(50));
+        client.Slack = TimeSpan.FromMilliseconds(100);
+        client.FakeConnect = () =>
+        {
+            Thread.Sleep(50);
+            return null;
+        };
+        gateway.Then(Wire.Written());
+        var e = await Assert.ThrowsAsync<RdbException>(() => client.PutAsync("k", "v"));
+        Assert.Equal(RdbErrorKind.Unavailable, e.Kind);
+        Assert.True(e.NoMutation);
+        Assert.Contains("not sent", e.Message);
+        Assert.Contains("time left after connecting", e.Message);
+        Assert.Empty(gateway.Calls);
+    }
+
     // F-002: a budget shorter than one attempt is refused before anything is sent.
     [Fact]
     public async Task A_timeout_shorter_than_one_attempt_is_refused_before_sending()
@@ -109,7 +131,7 @@ public class GuardTests
         Assert.True(e.NoMutation);
         Assert.False(e.FromServer);
         Assert.Contains("nothing was sent", e.Message);
-        Assert.Contains("at least 12 s", e.Message);
+        Assert.Contains("at least 13 s (one attempt plus 1 s to connect)", e.Message);
         Assert.Empty(gateway.Calls);
     }
 

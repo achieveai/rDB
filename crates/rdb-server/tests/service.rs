@@ -246,10 +246,10 @@ async fn the_gateway_serves_the_slice_1_contracts() {
     full_stop.send(()).expect("full server still running");
     full_server.await.expect("join").expect("serve");
 
-    // F-016: a put's record must fit `MAX_ENVELOPE_BYTES` (1 MiB): 265 bytes of record framing
-    // (`rdb_core::transaction::record_len`: 175 fixed, 90 for the dedup row), then 10 bytes
-    // plus the key plus the value. So with a 3-byte key the largest value is 1,048,298 bytes.
-    let largest = 1_048_576 - 265 - 10 - 3;
+    // F-016: a put's whole record must fit 1 MiB. Measured by binary search on 2026-11-01: the
+    // largest value is 1,048,241 bytes less the key (335 bytes of record, envelope, CBOR and key
+    // framing), the same with or without `if_version`. So a 3-byte key takes 1,048,238.
+    let largest = 1_048_241 - 3;
     put(&mut client, b"big", &vec![b'z'; largest], None)
         .await
         .expect("the largest value for a 3-byte key");
