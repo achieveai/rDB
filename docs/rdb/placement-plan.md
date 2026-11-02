@@ -33,7 +33,7 @@ JSON. Every field is required; an unknown field is refused.
 plan: 7 nodes, 6 partitions, max moves none; model only, nothing is applied
 before: copy skew 3, primary skew 0
 step: hand partition 1's primary from node 2 to node 3 (no live command: an owner move is refused today) # repair: the node is draining
-rdb_dev admin move 2 4                   # repair: the node is draining
+admin move 2 4                           # repair: the node is draining
 step: hand partition 2's primary from node 2 to node 3 (no live command: an owner move is refused today) # repair: the node is draining
 step: move partition 2's copy from node 2 to node 7 (no live command: today's CLI moves partition 1 only) # repair: the node is draining
 after: 15 moves, copy skew 2, primary skew 1
@@ -42,9 +42,11 @@ after: primaries per node 1=1 3=2 4=1 5=1 7=1
 residual: copy skew 2 (target 1): no legal move narrows it
 ```
 
-- One line per step, in order, ending `# <why>`. Only a line that starts `rdb_dev` is a command.
-- A copy move of partition 1 prints as `rdb_dev admin move <from> <to>`: the copy on the first node moves to
-  the second. A step never moves the primary's own copy.
+- One line per step, in order, ending `# <why>`. Only a line that starts `admin` is a command.
+- A copy move of partition 1 prints as `admin move <from> <to>`: the copy on the first node moves
+  to the second. It is an rdb_dev session line: type it in a session, put it in a `--script`
+  file, or run `lr move <from> <to>` on a local cluster. `rdb_dev admin move ..` as shell
+  arguments is refused. A step never moves the primary's own copy.
 - Running a plan again is safe. A copy move that already finished prints `already moved ..`
   and exits 0, so a replayed plan skips it. This holds while the owner that ran the move is
   still the owner; a new or restarted owner refuses it and says why.

@@ -818,7 +818,7 @@ fn a_copy_never_lands_in_a_failure_domain_another_copy_uses_when_spread_is_feasi
 }
 
 /// Node 1 is draining and leads every partition, so the plan hands three primaries off and moves
-/// copies of partition 1 and of others. Only a live command may print as an `rdb_dev` line: an
+/// copies of partition 1 and of others. Only a live command may print as an `admin` line: an
 /// owner move is refused (D3), so a primary handoff prints as a plain `step:` line, and so does
 /// a copy move of a partition other than 1, which no live command takes.
 #[retcd_test]
@@ -833,9 +833,11 @@ fn a_primary_handoff_never_prints_as_an_rdb_dev_command_line() {
         assert!(line.ends_with(&why), "{line}");
         if step.primary {
             assert!(line.starts_with("step: "), "{line}");
+            assert!(!line.contains("admin move"), "{line}");
             assert!(!line.contains("rdb_dev"), "{line}");
         } else if step.partition == 1 {
-            let command = format!("rdb_dev admin move {} {} ", step.from, step.to);
+            // PR #74 F-003: the session line, which runs; `rdb_dev admin move` argv does not.
+            let command = format!("admin move {} {} ", step.from, step.to);
             assert!(line.starts_with(&command), "{line}");
             assert!(!line.contains("--"), "{line}");
         } else {
