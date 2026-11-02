@@ -1879,9 +1879,7 @@ impl Db {
         // (A-R287 P1, tester-s2 F-T1). Re-read `partitions/1` and, if it names a new owner,
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
-        // Only these two carry a write to the owner. A compile, a read and a status look write
-        // nothing, so losing the owner under one applied nothing (A-R394 E1).
-        let writes = matches!(call, ClientCall::Put { .. } | ClientCall::Resend { .. });
+        let writes = writes_to_owner(&call);
         let mut sent = self.send_call(owner, call);
         if let (Err(_), Some(call)) = (&sent, spare) {
             self.refresh_owner();
@@ -3972,6 +3970,20 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
     error
 }
 
+/// Whether `call` carries a write to the owner, so an answer lost under it may hide one applied.
+/// A move or a rebuild changes the partition record and its copies (PR #74 F-004). A compile, a
+/// read and a status look write nothing, so losing the owner under one applied nothing
+/// (A-R394 E1).
+fn writes_to_owner(call: &ClientCall) -> bool {
+    matches!(
+        call,
+        ClientCall::Put { .. }
+            | ClientCall::Resend { .. }
+            | ClientCall::Move { .. }
+            | ClientCall::Rebuild { .. }
+    )
+}
+
 /// The refusal for a call `owner` dropped unanswered (F-001). A node of this process that drops
 /// one is a host fault. One in another process went out of reach, most often because its
 /// process stopped (`lr down`): `UNAVAILABLE`, wait and retry, never "report this" (tc1 D1).
@@ -5529,6 +5541,63 @@ mod tests {
         unsent("status", &status);
         let get = db.get(b"a").expect_err("the get was dropped");
         unsent("get", &get);
+    }
+
+    /// PR #74 F-004: an admin move or rebuild sent to an owner in another process that goes out
+    /// of reach before answering may already have started (a revocation, a spare note), so the
+    /// lost reply is `no_mutation: false`, as a put's is, never "nothing was applied".
+    /// Cut: `writes_to_owner` counts only `Put` and `Resend`, red (`no_mutation` true).
+    /// Unit (~10 ms): no node thread; the owner's mailbox is a link this test drops calls from.
+    #[test]
+    fn pr74_f004_a_lost_reply_to_an_admin_move_or_rebuild_may_have_applied() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (tx, mailbox) = mpsc::channel();
+        links.register(OWNER, tx, crate::host::BOOT);
+        std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                drop(msg);
+            }
+        });
+        let db = Db {
+            nodes: Mutex::new(Vec::new()),
+            respawn: None,
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts::default(),
+            next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
+            client: DEFAULT_CLIENT,
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+            route: Route::default(),
+        };
+        let moved = db
+            .move_copy(NodeId(3), NodeId(4))
+            .expect_err("the move was dropped");
+        assert_eq!(
+            (moved.kind, moved.no_mutation),
+            (ErrorKind::Unavailable, false),
+            "{moved}"
+        );
+        assert!(
+            !moved.to_string().contains("nothing was applied"),
+            "{moved}"
+        );
+        // `Db::rebuild` looks at the owner first, so its call is checked at the classifier.
+        let rebuild = ClientCall::Rebuild {
+            identity: db.identity(),
+            node: NodeId(4),
+        };
+        assert!(
+            writes_to_owner(&rebuild),
+            "a lost rebuild reply may hide its spare note"
+        );
     }
 
     /// A-R394 P1 (tester tc2 S4 c): `wait_ready` with no link to the owner up (its process is
