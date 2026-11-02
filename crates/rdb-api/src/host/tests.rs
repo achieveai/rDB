@@ -6361,7 +6361,7 @@ mod routed_fence {
         AuthorityGeneration, BootId, ConfigVersion, Generation, GrantId, NodeId, OwnerEpoch,
         PartitionId, ReplicaRole, Revision, Seq,
     };
-    use rdb_core::contracts::membership::Member;
+    use rdb_core::contracts::membership::{CopyId, Member};
     use rdb_core::contracts::recovery::{LineageAnchor, RecoveryPlan};
     use rdb_core::contracts::time::Tick;
 
@@ -6702,6 +6702,39 @@ mod routed_fence {
             facts.plan = Some(bytes::Bytes::from(bytes));
             assert_eq!(bind(&proof, facts), Err("plan_unreadable"), "{what}");
         }
+    }
+
+    /// `stored_plan()` as the PR #74 base build (313f959, `PROMOTE_PLAN_VERSION` 1) stored it:
+    /// version byte `1`, then the plan without `must_hold`. Kept as bytes so a later change to
+    /// `RecoveryPlan` cannot move the old format with it.
+    const V1_STORED_PLAN: &str = "0101030209000000000000000000000000000000000000000000000000000000000000000001050201020100020301010102010101010102000101010201020103020107010501ffffffffffffffffff0100e807";
+
+    /// PR #74 F-001 (ruling A-R477), old to new: a plan stored before `must_hold` (version 1)
+    /// decodes with `must_hold` empty and still binds a routed fence.
+    /// Unit (<1 ms).
+    #[test]
+    fn pr74_f001_a_version_1_stored_plan_decodes_with_must_hold_empty() {
+        let old = hex::decode(V1_STORED_PLAN).expect("hex");
+        assert_eq!(old[0], 1);
+        let plan = crate::admin::decode_promote_plan(&old).expect("a version 1 plan");
+        assert!(plan.must_hold.is_empty());
+        assert_eq!(plan, stored_plan());
+        let (proof, mut facts) = true_fence();
+        facts.plan = Some(bytes::Bytes::from(old));
+        assert_eq!(bind(&proof, facts), Ok(()));
+    }
+
+    /// PR #74 F-001 (ruling A-R477), new: a plan with `must_hold` set is stored as version 2 and
+    /// reads back whole. A build that reads only 1 refuses the version byte by name
+    /// (`plan version 2, this build reads 1`, `plan_unreadable`).
+    /// Unit (<1 ms).
+    #[test]
+    fn pr74_f001_a_version_2_stored_plan_round_trips_must_hold() {
+        let mut plan = stored_plan();
+        plan.must_hold = [CopyId(3)].into_iter().collect();
+        let bytes = crate::admin::encode_promote_plan(&plan);
+        assert_eq!(bytes[0], 2);
+        assert_eq!(crate::admin::decode_promote_plan(&bytes), Ok(plan));
     }
 
     /// A-R447: the stored plan's key is tagged in bits 48..64, and a revision that would reach

@@ -261,6 +261,7 @@ fn plan(extra: &[Member]) -> RecoveryPlan {
             past_horizon: DenyReason::NoGrant,
         },
         retention_millis: RETENTION,
+        must_hold: std::collections::BTreeSet::new(),
     }
 }
 

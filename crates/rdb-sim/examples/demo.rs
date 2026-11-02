@@ -458,6 +458,7 @@ fn run_demo() -> Result<String, String> {
             past_horizon: DenyReason::NoGrant,
         },
         retention_millis: 1_000,
+        must_hold: std::collections::BTreeSet::new(),
         config: pinned,
     };
     let fence = FencingProof {

@@ -510,6 +510,12 @@ pub struct RecoveryPlan {
     pub authority_view: AuthorityView,
     /// How long a returning stale owner's suffix is kept (spec §8.4: seven days).
     pub retention_millis: u64,
+    /// **Added 2026-11-01 (PR #74 F-001, ruling A-R477):** copies selection must find among the
+    /// reporters. When `required` lacks one, F1 blocks with `BarrierIncomplete` naming each
+    /// missing copy instead of committing without it. The host names a move's target here for
+    /// the promote that leaves the source out; every other plan leaves it empty, which is what
+    /// F1 did before. Last, so a stored plan written before it is its prefix.
+    pub must_hold: BTreeSet<CopyId>,
 }
 
 /// Why a recovery quarantined (`design.md` §5.3, §5.4).
