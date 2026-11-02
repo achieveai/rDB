@@ -718,14 +718,17 @@ impl Planner {
             }
             loop {
                 let (copies, primary) = self.parts[&id].clone();
+                // PR #74 F-002: a copy with no legal target does not end the repair; a later
+                // broken copy that has one still moves.
                 let next = self
                     .violations(&copies, primary)
                     .into_iter()
-                    .find(|(node, rule)| *node != primary && *rule != Rule::PrimaryNotEligible);
-                let Some((from, rule)) = next else { break };
-                let Some(to) = self.best_copy_target(id, from, false) else {
-                    break;
-                };
+                    .filter(|(node, rule)| *node != primary && *rule != Rule::PrimaryNotEligible)
+                    .find_map(|(from, rule)| {
+                        self.best_copy_target(id, from, false)
+                            .map(|to| (from, rule, to))
+                    });
+                let Some((from, rule, to)) = next else { break };
                 if !self.take(Step {
                     partition: id,
                     from,
