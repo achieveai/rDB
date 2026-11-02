@@ -665,7 +665,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **An older build cannot open a folder after this build wrote `partitions/1`.** This build
   writes that record with its member list (layout 4). A build without layout 4 reads it as
   undecodable and refuses the open (`Undecodable`), and keeps refusing. Run this build or a
-  newer one.
+  newer one. After an `admin move`, do not roll back to a build before moves (M11) either: it
+  reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
