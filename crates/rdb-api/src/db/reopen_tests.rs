@@ -982,6 +982,40 @@ fn m10_cut_one_unbound_copy_with_data_is_refused_and_stays_unbound() {
     );
 }
 
+/// PR #74 question (whole-open lineage guard, A-R466b): a copy that holds data and names no
+/// instance is never an unfinished wipe, even beside an aside folder for its node and two copies
+/// that name one instance. The whole-database open refuses `WipeUnfinished` and binds nothing;
+/// the copy keeps its data. Only an empty unbound copy may finish a wipe.
+/// Cut: drop `!engine.lineages().is_empty()` from the resume predicate in `Db::check`, red (the
+/// open resumes the "wipe" of a copy that holds data).
+/// Integration (~1 s): one fresh open until ready, a raw marker delete, one refused reopen.
+#[config_log::retcd_test]
+fn pr74_q8_an_unbound_copy_with_data_beside_an_aside_is_not_a_wipe_to_finish() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let ours = marker(dir.path(), 1).expect("bound");
+    set_marker(dir.path(), 3, None);
+    let aside = dir.path().join("aside").join("node-3-boot-1-1000");
+    std::fs::create_dir_all(&aside).expect("an aside folder for node 3");
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::WipeUnfinished { .. }) => error,
+        other => panic!("WipeUnfinished, not {:?}", other.map(|_| "Db")),
+    };
+    assert!(
+        refused.to_string().contains("node-3-boot-1-1000"),
+        "{refused}"
+    );
+    assert_eq!(
+        [1, 2, 3].map(|n| marker(dir.path(), n)),
+        [Some(ours), Some(ours), None],
+        "the refusal bound nothing"
+    );
+    assert!(aside.exists(), "the aside folder stays where it is");
+}
+
 /// A `MemStore` on which a second open counts in the gap between the first open's read of the
 /// counter and its CAS: the first `get` of `key` reads, then runs [`admin::count_open`] for the
 /// same instance on the inner store, then answers with what it read.
