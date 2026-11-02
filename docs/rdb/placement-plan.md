@@ -55,7 +55,9 @@ residual: copy skew 2 (target 1): no legal move narrows it
   live command yet.
 - A primary handoff prints as `step: hand partition P's primary from node A to node B`. Only
   the primary role moves, to a node that already has a copy. It has no live command: an owner
-  move is refused today. (`admin promote` names an owner only while the old owner is dead.)
+  move is refused today. (`admin promote` is not that handoff. It makes another copy the owner
+  whether or not the old owner is alive, and it drops the old owner's copy unless `--drop` names
+  another node.)
 - `residual:` lines name each goal the plan could not meet, and why. `residual: none` means
   every goal was met.
 - A file that does not read, or does not add up (an unknown node, a primary that is not a copy),
