@@ -1434,6 +1434,12 @@ fn select(
         .map(lineage::VerifiedInventory::copy)
         .filter(|copy| is_regular(&plan.config, *copy))
         .collect();
+    // PR #74 F-001 (ruling A-R477): a copy the plan says must hold the barrier and that did not
+    // report blocks the run, named, instead of a commit without it.
+    let missing: Vec<CopyId> = plan.must_hold.difference(&required).copied().collect();
+    if !missing.is_empty() {
+        return block(BlockReason::BarrierIncomplete { missing }, emit);
+    }
     if let PartitionMode::Blocked { reason } = mode_for(required.len()) {
         return block(reason, emit);
     }

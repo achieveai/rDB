@@ -5625,7 +5625,17 @@ impl Host {
         let version = ConfigVersion(pinned.config_version.0 + 1);
         let generation = root.generation.next();
         let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
-        let plan = crate::admin::recovery_plan(
+        // PR #74 F-001 (ruling A-R477): a promote that leaves a copy out (a move's source) commits
+        // only with its rejoiner, the move's target, in the barrier. Otherwise F1 blocks naming
+        // it, and [`Self::move_blocked`] gives the move up with the source kept.
+        let must_hold: BTreeSet<CopyId> = replan
+            .rejoiner
+            .filter(|_| replan.promote && replan.drop.is_some())
+            .and_then(|node| members.iter().find(|member| member.node == node))
+            .map(|member| member.copy)
+            .into_iter()
+            .collect();
+        let mut plan = crate::admin::recovery_plan(
             anchor,
             version,
             members,
@@ -5633,6 +5643,7 @@ impl Host {
             view.grant_id,
             view.authority_generation,
         );
+        plan.must_hold = must_hold;
         let fence = FencingProof {
             partition,
             prior_generation: root.generation,
@@ -5658,6 +5669,7 @@ impl Host {
             readded = ?readded.map(|member| member.node.0),
             joining = ?joining.map(|member| member.node.0),
             shadowed = ?shadowed.map(|node| node.0),
+            must_hold = ?plan.must_hold.iter().map(|copy| copy.0).collect::<Vec<_>>(),
             "rejoin_plan"
         );
         self.rejoins
