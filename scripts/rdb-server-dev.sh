@@ -51,10 +51,18 @@ is_msys() { case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) retur
 # Binaries started here run on CPUs 0-3, as cargo's runner does (AGENTS.md).
 [ -f "$HOME/.cargo/cap4.sh" ] && . "$HOME/.cargo/cap4.sh"
 
-load_run() { # sources run.env through `lr env`: CONTROL, PEERS, PROFILE, BASE_PORT, RUN
-    local env
+load_run() { # reads `lr env` as data: CONTROL, PEERS, PROFILE, BASE_PORT, RUN
+    local env line name
     env="$("$LR" env)" || die "no lr run under $ROOT: start one with 'up'"
-    eval "$(printf '%s\n' "$env" | grep -E '^(RUN|CONTROL|PEERS|PROFILE|BASE_PORT)=')"
+    # Never eval it: `RUN=` is the run folder unquoted, so a --root with a space ran the word
+    # after the space as a command (PR #78 review).
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        name="${line%%=*}"
+        case "$name" in
+            RUN | CONTROL | PEERS | PROFILE | BASE_PORT) printf -v "$name" '%s' "${line#*=}" ;;
+        esac
+    done <<<"$env"
     [ -n "$LISTEN" ] || LISTEN="127.0.0.1:$((BASE_PORT + 90))"
 }
 
