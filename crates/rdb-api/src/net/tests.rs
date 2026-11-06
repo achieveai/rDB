@@ -1181,6 +1181,8 @@ fn assert_not_admin(got: &Msg, answer: &Answer, app: &str, verb: &str) {
         "{text}"
     );
     assert!(text.contains("did nothing"), "{text}");
+    // Hand walk (lr, app pilot): the text carried the source's indentation as runs of spaces.
+    assert!(!text.contains("  "), "one space between words: {text:?}");
 }
 
 /// A-R479 (PR #74, Revobot R2 Q 4433944757): an app that is not on node 1's admin-app list

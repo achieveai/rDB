@@ -847,7 +847,10 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 ("rebuild", crate::db::error::REBUILD_STEP)
             };
             return Some(format!(
-                "app {app} is not an admin app on node {}: only an admin app may move or                  rebuild a copy, and the node's operator names them; add {app} to the node's                  admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`) or run the                  {verb} as an admin app (`lr` runs it as `admin`); {step}",
+                "app {app} is not an admin app on node {}: only an admin app may move or \
+                 rebuild a copy, and the node's operator names them; add {app} to the node's \
+                 admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`) or run the \
+                 {verb} as an admin app (`lr` runs it as `admin`); {step}",
                 to.0
             ));
         }
