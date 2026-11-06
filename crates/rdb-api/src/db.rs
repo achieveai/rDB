@@ -3470,7 +3470,8 @@ impl Db {
     /// # Errors
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
-    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard or an
+    /// text names `admin promote`), or, with the owner in another process, this app is not on
+    /// its node's admin apps (`NetConfig::admin_apps`, A-R479). `UNAVAILABLE`, nothing changed, for another guard or an
     /// owner in another process. `UNAVAILABLE` with `no_mutation` false once the owner started
     /// the drop: a re-plan that did not commit a serving partition without `node`, quarantined
     /// again, or did not commit in time. A wipe the fence refuses restarts `node` on its own
@@ -3558,6 +3559,8 @@ impl Db {
     ///
     /// The owner's refusal, which changed nothing and names the next step (`INVALID_ARGUMENT`
     /// for a move that cannot be made as asked, `UNAVAILABLE` for one to run again later);
+    /// `INVALID_ARGUMENT`, nothing changed, when this `Db` runs over links as an app the owner's
+    /// node does not list as an admin app (`NetConfig::admin_apps`, A-R479);
     /// `NOT_PRIMARY` when the node asked is not the owner; `UNAVAILABLE` when no answer came in
     /// the read timeout.
     pub fn move_copy(&self, from: NodeId, to: NodeId) -> Result<host::MoveAnswer, ApiError> {

@@ -47,6 +47,9 @@ residual: copy skew 2 (target 1): no legal move narrows it
   to the second. It is an rdb_dev session line: type it in a session, put it in a `--script`
   file, or run `lr move <from> <to>` on a local cluster. `rdb_dev admin move ..` as shell
   arguments is refused. A step never moves the primary's own copy.
+- Only an admin app may send a move: the nodes refuse it from any other app's certificate
+  (`rdb_node --admin-apps`, default `admin`, the app `lr` runs as). The owner then completes
+  the move with its own rEtcd access.
 - Running a plan again is safe. A copy move that already finished prints `already moved ..`
   and exits 0, so a replayed plan skips it. This holds while the owner that ran the move is
   still the owner; a new or restarted owner refuses it and says why.

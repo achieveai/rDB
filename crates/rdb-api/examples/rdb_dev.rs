@@ -531,7 +531,8 @@ struct Args {
     nodes: std::collections::BTreeMap<NodeId, String>,
     /// `--cert-dir D`: the run's certificates, read for `--nodes`.
     cert_dir: Option<PathBuf>,
-    /// `--app NAME`: the app certificate `--nodes` dials as.
+    /// `--app NAME`: the app certificate `--nodes` dials as. `admin move` and `admin rebuild`
+    /// need an admin app (`rdb_node --admin-apps`, default `admin`; A-R479).
     app: String,
     /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
     help: bool,
@@ -1138,6 +1139,8 @@ fn connect_app(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, 
                 dial: args.nodes.clone(),
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                // An app receives no calls (A-R479).
+                admin_apps: std::collections::BTreeSet::new(),
             },
             &links,
             None,

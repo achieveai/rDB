@@ -20,6 +20,11 @@
 //! name another node as a message's sender. Anything else is dropped before a node sees it,
 //! logged `net_msg_sender_refused{peer, msg, to, reason}` (review-s2 F-008).
 //!
+//! A copy move or a rebuild changes who holds a copy: the owner completes the re-plan with its
+//! own store credentials, so the app's certificate is the whole authority for it. Only an app
+//! on [`NetConfig::admin_apps`] may send one (ruling A-R479); any other app's is answered
+//! `INVALID_ARGUMENT` before a node sees it, and changes nothing.
+//!
 //! Not checked (A-R415, advisory): a node's `Routed` event whose body names another copy, and
 //! a frame's `boot` against its link's. Only that node's own certificate can send either, and a
 //! member lying about itself is outside the fault model.
@@ -117,6 +122,12 @@ pub struct NetConfig {
     pub protocol_version: u32,
     /// The faults this process applies.
     pub faults: Arc<Faults>,
+    /// The apps whose certificate may send a copy move or a rebuild (`ClientCall::Move`,
+    /// `ClientCall::Rebuild`) to a node of this process (ruling A-R479). Empty, the default
+    /// for a library caller, means no app may: a move or rebuild from an app is then refused
+    /// before a node sees it. `rdb_node` defaults it to `admin` (`--admin-apps`), the app `lr`
+    /// and `rdb_dev` run as. An app's process receives no calls, so its own list is unused.
+    pub admin_apps: BTreeSet<String>,
 }
 
 impl NetConfig {
@@ -219,6 +230,7 @@ struct Route {
 
 struct Shared {
     label: Label,
+    admin_apps: BTreeSet<String>,
     boot: BootId,
     protocol_version: u32,
     faults: Arc<Faults>,
@@ -265,6 +277,7 @@ impl Net {
     ) -> Result<Arc<Self>, String> {
         let shared = Arc::new(Shared {
             label: config.label.clone(),
+            admin_apps: config.admin_apps.clone(),
             boot: config.boot,
             protocol_version: config.protocol_version,
             faults: Arc::clone(&config.faults),
@@ -813,10 +826,31 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
 /// to it:
 /// - an app holds no copy, so it sends client calls, `Inspect`, and a promote's `Plan` and
 ///   `FenceProven` (`Routed`, A-R415 C-3); any other kind from an app is refused;
+/// - a copy move or a rebuild changes who holds a copy: the owner completes it with its own
+///   store credentials, so only an app on `admin_apps` may send one (ruling A-R479). The
+///   reason is the whole refusal, which [`receive`] answers the call with;
 /// - a node may name no other node as a frame's `from`, an ask's or catch-up's `asker`, or a
 ///   landed result's `emitter`.
-fn sender_refused(peer: &Label, msg: &WireMsg) -> Option<String> {
+fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) -> Option<String> {
     let claimed = match (peer, msg) {
+        (
+            Label::App(app),
+            WireMsg::Client {
+                call: call @ (wire::WireCall::Move { .. } | wire::WireCall::Rebuild { .. }),
+                to,
+                ..
+            },
+        ) if !admin_apps.contains(app) => {
+            let (verb, step) = if matches!(call, wire::WireCall::Move { .. }) {
+                ("move", crate::db::error::MOVE_STEP)
+            } else {
+                ("rebuild", crate::db::error::REBUILD_STEP)
+            };
+            return Some(format!(
+                "app {app} is not an admin app on node {}: only an admin app may move or                  rebuild a copy, and the node's operator names them; add {app} to the node's                  admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`) or run the                  {verb} as an admin app (`lr` runs it as `admin`); {step}",
+                to.0
+            ));
+        }
         (
             Label::App(_),
             WireMsg::Client { .. }
@@ -848,9 +882,19 @@ fn sender_refused(peer: &Label, msg: &WireMsg) -> Option<String> {
 
 /// Deliver a received message to the local node it names.
 fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
-    if let Some(reason) = sender_refused(&conn.peer, &msg) {
+    if let Some(reason) = sender_refused(&conn.peer, &msg, &shared.admin_apps) {
         tracing::warn!(peer = %conn.peer, msg = msg.name(), to = msg.to().0, %reason,
             "net_msg_sender_refused");
+        // A refused call is answered, never left to time out: it changed nothing (A-R479).
+        if let WireMsg::Client { reply, .. } = &msg {
+            conn.out(Frame::Reply {
+                correlation: *reply,
+                reply: WireReply::Answer(WireAnswer::carry(&Answer::Error {
+                    error: ApiError::invalid(reason),
+                    request: None,
+                })),
+            });
+        }
         return;
     }
     let client = match &msg {

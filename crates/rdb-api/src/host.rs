@@ -758,7 +758,9 @@ pub enum ClientCall {
         generation: Option<Generation>,
     },
     /// M11: move the copy on node `from` to node `to`, or say where that move stands
-    /// ([`Answer::Moved`]). Only the pinned primary takes it; asking again resumes a move.
+    /// ([`Answer::Moved`]). Only the pinned primary takes it; asking again resumes a move. It
+    /// changes who holds a copy, and the owner completes it with its own store credentials, so
+    /// over a link only an admin app may send it (`NetConfig::admin_apps`, A-R479).
     Move {
         /// The identity minted for it.
         identity: RequestIdentity,
@@ -770,7 +772,9 @@ pub enum ClientCall {
     /// M11 T12 over processes: `admin rebuild node` from an app with no node of its own
     /// ([`Answer::Rebuilt`]). Only the pinned primary takes it, and only for a node it does not
     /// pin: a spare is noted for the free slot, a copy already left out is answered as it is.
-    /// Dropping a pinned copy needs the owner's own process.
+    /// Dropping a pinned copy needs the owner's own process. A noted spare is pinned once it
+    /// restarts, so this changes membership too: over a link only an admin app may send it
+    /// (`NetConfig::admin_apps`, A-R479).
     Rebuild {
         /// The identity minted for it.
         identity: RequestIdentity,
@@ -11900,7 +11904,8 @@ pub struct FenceFacts {
 ///
 /// `Ok` is that stored plan: the only plan the host gives F1 with a routed fence. A routed
 /// `Plan` is never pushed, so an app with only the link cert cannot choose the members, roles
-/// or boots a promote commits. The record is created once and never rewritten, and the commit
+/// or boots a promote commits. This is about a promote only: a copy move or a rebuild does
+/// change the members, sent by an admin app over its link alone (A-R479). The record is created once and never rewritten, and the commit
 /// CAS at `control_revision` pins the key it was read at.
 pub(crate) fn bind_routed_fence(
     routed: PartitionId,

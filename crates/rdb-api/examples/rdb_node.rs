@@ -6,7 +6,7 @@
 //! rdb_node --form --dir D --control E [--log-dir L]
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
-//!          [--ready-secs S]
+//!          [--ready-secs S] [--admin-apps a,b]
 //! ```
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
@@ -22,6 +22,10 @@
 //!   `--protocol-version` makes it speak another wire version, to walk the refusal.
 //!   `--faults` names the fault file it polls every 50 ms (`hold <n>|hold all|drop-request N|
 //!   drop-reply N|cut-control`). It stops cleanly when `--stop-file` appears.
+//!   `--admin-apps` names the apps whose certificate may send `admin move` and `admin rebuild`
+//!   (ruling A-R479); unset, it is `admin`, the app `lr` and `rdb_dev` run as. Any other app's
+//!   move or rebuild is refused before the node sees it. An empty value (`--admin-apps ''`)
+//!   lets no app move or rebuild.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -62,13 +66,19 @@ struct Args {
     ready_secs: Option<u64>,
     /// `--gen-certs`: certificates for nodes 1 to this (M11 WS A); `None` is 3.
     nodes: Option<u32>,
+    /// `--admin-apps`: the apps that may move or rebuild a copy (A-R479); `None` is `admin`.
+    admin_apps: Option<BTreeSet<String>>,
 }
+
+/// The admin app `--admin-apps` defaults to: the app `lr` and `rdb_dev` run as (A-R479).
+const DEFAULT_ADMIN_APP: &str = "admin";
 
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
   rdb_node --form --dir D --control E [--log-dir L]
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
+           [--admin-apps a,b]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -84,6 +94,15 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     .filter(|a| !a.is_empty())
                     .map(str::to_owned)
                     .collect();
+            }
+            "--admin-apps" => {
+                args.admin_apps = Some(
+                    value("--admin-apps")?
+                        .split(',')
+                        .filter(|a| !a.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                );
             }
             "--node" => {
                 let n: u32 = value("--node")?
@@ -347,6 +366,10 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
             dial: NetConfig::dial_lower(node, &args.peers),
             protocol_version: args.protocol_version.unwrap_or(PROTOCOL_VERSION),
             faults,
+            admin_apps: args
+                .admin_apps
+                .clone()
+                .unwrap_or_else(|| BTreeSet::from([DEFAULT_ADMIN_APP.to_owned()])),
         },
         &links,
         Some(listener),
