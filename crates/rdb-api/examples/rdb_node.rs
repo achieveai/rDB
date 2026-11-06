@@ -374,7 +374,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
             dial: NetConfig::dial_lower(node, &args.peers),
             protocol_version: args.protocol_version.unwrap_or(PROTOCOL_VERSION),
             faults,
-            admin_apps: admin_apps(&args),
+            admin_apps: admin_apps(args),
         },
         &links,
         Some(listener),
