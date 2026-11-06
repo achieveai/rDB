@@ -5627,7 +5627,11 @@ mod tests {
         );
         let lost = super::unanswered(false, OWNER, carries(&rebuild));
         assert!(!lost.no_mutation, "{lost}");
-        assert_eq!(lost.explain(), text, "one admin text for a move and a rebuild");
+        assert_eq!(
+            lost.explain(),
+            text,
+            "one admin text for a move and a rebuild"
+        );
     }
 
     /// A-R394 P1 (tester tc2 S4 c): `wait_ready` with no link to the owner up (its process is
