@@ -33,6 +33,10 @@ const OPEN_AGAIN: &str = "open the folder again";
 /// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
 const RUN_AGAIN: &str = "run it again to read where it stands";
 
+/// The tail of [`ApiError::owner_lost_admin`]: its detail names the step, and an admin call has
+/// no request id for the `Db::resend` / `Db::status` step a lost write gets (PR #74 R2).
+const ADMIN_LOST_STEP: &str = "then check with `admin status`";
+
 /// The tail every `admin rebuild` error ends with (#65): its detail already names the step
 /// (stop it, send a write, promote first, restart it), which "retrying will not help" would
 /// contradict (bb walk paper cut).
@@ -186,6 +190,28 @@ impl ApiError {
         }
     }
 
+    /// [`Self::owner_lost`] for an admin move or rebuild (PR #74 F-004, R2). It may have
+    /// started, so not `no_mutation`; but it carries no request id, so the step is to repeat
+    /// the same admin call, which is guarded: a move answers where it stands or that it is
+    /// done, and a rebuild answers its own spare note again.
+    #[must_use]
+    pub fn owner_lost_admin(node: NodeId) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: false,
+            detail: format!(
+                "node {}, the owner, went out of reach while this admin call waited for its \
+                 answer (its process may have stopped); the move or rebuild may have started: \
+                 once the owner is back, run the same `admin move` or `admin rebuild` again (a \
+                 move answers where it stands or that it is done, a rebuild recognises its own \
+                 note), {ADMIN_LOST_STEP}",
+                node.0
+            ),
+            retry_after: None,
+        }
+    }
+
     /// [`Self::owner_lost`] for a call that writes nothing: a read, a status look, or a write's
     /// compile, which answers before the write itself is sent (tester tc2 E1, A-R394). Nothing
     /// was applied, so `no_mutation`, and there is no request to resend.
@@ -264,6 +290,7 @@ impl ApiError {
             || self.detail.ends_with(REBUILD_STEP)
             || self.detail.ends_with(MOVE_STEP)
             || self.detail.ends_with(MOVE_ENDED)
+            || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
         {

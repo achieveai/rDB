@@ -1879,7 +1879,7 @@ impl Db {
         // (A-R287 P1, tester-s2 F-T1). Re-read `partitions/1` and, if it names a new owner,
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
-        let writes = writes_to_owner(&call);
+        let carried = carries(&call);
         let mut sent = self.send_call(owner, call);
         if let (Err(_), Some(call)) = (&sent, spare) {
             self.refresh_owner();
@@ -1917,7 +1917,7 @@ impl Db {
                 error: unanswered(
                     lock(&self.nodes).iter().any(|handle| handle.node == owner),
                     owner,
-                    writes,
+                    carried,
                 ),
                 request: None,
             }),
@@ -3970,32 +3970,43 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
     error
 }
 
-/// Whether `call` carries a write to the owner, so an answer lost under it may hide one applied.
-/// A move or a rebuild changes the partition record and its copies (PR #74 F-004). A compile, a
-/// read and a status look write nothing, so losing the owner under one applied nothing
-/// (A-R394 E1).
-fn writes_to_owner(call: &ClientCall) -> bool {
-    matches!(
-        call,
-        ClientCall::Put { .. }
-            | ClientCall::Resend { .. }
-            | ClientCall::Move { .. }
-            | ClientCall::Rebuild { .. }
-    )
+/// What a call carries to the owner, so what an answer lost under it may hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carries {
+    /// A compile, a read or a status look writes nothing, so losing the owner under one
+    /// applied nothing (A-R394 E1).
+    Nothing,
+    /// A put or a resend: it may have applied, and its request id settles it.
+    Write,
+    /// A move or a rebuild changes the partition record and its copies (PR #74 F-004), and has
+    /// no request id: repeating the same admin call is how to settle it (R2).
+    Admin,
+}
+
+fn carries(call: &ClientCall) -> Carries {
+    match call {
+        ClientCall::Put { .. } | ClientCall::Resend { .. } => Carries::Write,
+        ClientCall::Move { .. } | ClientCall::Rebuild { .. } => Carries::Admin,
+        ClientCall::Compile { .. }
+        | ClientCall::Status { .. }
+        | ClientCall::Get { .. }
+        | ClientCall::GetPrevious { .. } => Carries::Nothing,
+    }
 }
 
 /// The refusal for a call `owner` dropped unanswered (F-001). A node of this process that drops
 /// one is a host fault. One in another process went out of reach, most often because its
 /// process stopped (`lr down`): `UNAVAILABLE`, wait and retry, never "report this" (tc1 D1).
-/// `writes`: the call carried a write, which may then have applied; a call that writes nothing
-/// (a compile, a read, a status look) applied nothing (A-R394 E1).
-fn unanswered(local: bool, owner: NodeId, writes: bool) -> ApiError {
+/// `carried`: a write or an admin call may then have applied; a call that writes nothing (a
+/// compile, a read, a status look) applied nothing (A-R394 E1).
+fn unanswered(local: bool, owner: NodeId, carried: Carries) -> ApiError {
     if local {
-        ApiError::host("the owner dropped the call unanswered")
-    } else if writes {
-        ApiError::owner_lost(owner)
-    } else {
-        ApiError::owner_lost_unsent(owner)
+        return ApiError::host("the owner dropped the call unanswered");
+    }
+    match carried {
+        Carries::Write => ApiError::owner_lost(owner),
+        Carries::Admin => ApiError::owner_lost_admin(owner),
+        Carries::Nothing => ApiError::owner_lost_unsent(owner),
     }
 }
 
@@ -5546,7 +5557,8 @@ mod tests {
     /// PR #74 F-004: an admin move or rebuild sent to an owner in another process that goes out
     /// of reach before answering may already have started (a revocation, a spare note), so the
     /// lost reply is `no_mutation: false`, as a put's is, never "nothing was applied".
-    /// Cut: `writes_to_owner` counts only `Put` and `Resend`, red (`no_mutation` true).
+    /// Cut: `carries` counts only `Put` and `Resend` as writes, red (`no_mutation` true). R2 cut:
+    /// `unanswered` gives an admin call `owner_lost`'s `Db::resend` step, red.
     /// Unit (~10 ms): no node thread; the owner's mailbox is a link this test drops calls from.
     #[test]
     fn pr74_f004_a_lost_reply_to_an_admin_move_or_rebuild_may_have_applied() {
@@ -5589,15 +5601,33 @@ mod tests {
             !moved.to_string().contains("nothing was applied"),
             "{moved}"
         );
-        // `Db::rebuild` looks at the owner first, so its call is checked at the classifier.
+        // Revobot R2 (thread 4433944765): an admin call has no request id, so the advice is to
+        // repeat the same admin call and check `admin status`, never `Db::resend`/`Db::status`.
+        let text = moved.explain();
+        assert!(
+            !text.contains("Db::resend") && !text.contains("Db::status"),
+            "{text}"
+        );
+        assert!(
+            text.contains("run the same `admin move` or `admin rebuild` again")
+                && text.contains("`admin status`"),
+            "{text}"
+        );
+        assert_eq!(text.matches("; next: ").count(), 0, "said once: {text}");
+        // `Db::rebuild` looks at the owner first, so its call is checked at the classifier,
+        // and its lost reply gets the same admin advice.
         let rebuild = ClientCall::Rebuild {
             identity: db.identity(),
             node: NodeId(4),
         };
-        assert!(
-            writes_to_owner(&rebuild),
+        assert_eq!(
+            carries(&rebuild),
+            Carries::Admin,
             "a lost rebuild reply may hide its spare note"
         );
+        let lost = super::unanswered(false, OWNER, carries(&rebuild));
+        assert!(!lost.no_mutation, "{lost}");
+        assert_eq!(lost.explain(), text, "one admin text for a move and a rebuild");
     }
 
     /// A-R394 P1 (tester tc2 S4 c): `wait_ready` with no link to the owner up (its process is

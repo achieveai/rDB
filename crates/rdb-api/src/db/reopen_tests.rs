@@ -5373,7 +5373,7 @@ mod guide_did_it_land {
 /// app follows with a new id.
 #[test]
 fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_host_fault() {
-    let lost = unanswered(false, NodeId(1), true);
+    let lost = unanswered(false, NodeId(1), Carries::Write);
     let text = lost.to_string();
     assert_eq!(
         (lost.kind, lost.retry, lost.no_mutation),
@@ -5394,7 +5394,7 @@ fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_hos
     assert!(!text.contains("try again"), "{text}");
     assert!(!text.contains("report this message"), "{text}");
     assert!(!text.contains("host fault"), "{text}");
-    let local = unanswered(true, NodeId(1), true).to_string();
+    let local = unanswered(true, NodeId(1), Carries::Write).to_string();
     assert!(
         local.contains("host fault: the owner dropped the call unanswered"),
         "{local}"
