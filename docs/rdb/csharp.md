@@ -29,8 +29,10 @@ error kind, or the gRPC code), `ms`, `request_id`, `no_mutation` (on errors), an
 (true when the client had given up before the call ended: that is the line an operator settles an
 unknown write from). Each write that landed also writes `rdb_server_write`: `method`, `request_id`,
 `generation`, `version`. A gateway past 64 running calls refuses more with `OVERLOADED`
-(`no_mutation`, retried by the client). On Ctrl-C it waits up to 45 s for running calls to end and
-write their lines.
+(`no_mutation`, retried by the client). A stop (Ctrl-C, or `down`) ends within 45 s of being
+asked, however long a call has left: it waits that long in all for running calls to end and write
+their lines, then logs any still open (`rdb_server_stop_cut`) or running
+(`rdb_server_drain_incomplete`), whose lines may be lost.
 
 ## The API
 
@@ -38,12 +40,17 @@ write their lines.
 using var db = RdbClient.Create(new RdbClientOptions { Endpoint = "http://127.0.0.1:19190" });
 var ready = await db.ReadyAsync();                 // ready.Ready, ready.Detail
 var w = await db.PutAsync("greeting", "hello");    // w.Version, w.RequestId, w.Generation
-var r = await db.GetAsync("greeting");             // null when absent; r.ValueAsString()
+var r = await db.GetAsync("greeting");             // r.Found false when absent; r.ValueAsString()
 var t = await db.TxnAsync(new[] { new RdbTxnPut("a", "90"), new RdbTxnPut("b", "10", ifVersion: 7) });
 var s = await db.StatusAsync(t.RequestId, t.Generation);   // Yes, NotKnown, ReadTheObject
 ```
 
 Values are bytes. Pick your own format (UTF-8 JSON is fine). The gateway never parses them.
+
+`GetAsync` always returns a record. `Found = false` means the key is absent. `RecoveryMode = true`
+means the partition recovered from one copy after a loss and serves reads only: the answer may
+lack writes acknowledged just before the loss, so it is not authoritative. An absent key may have
+been written, and a value may be older than the last one acknowledged.
 
 ## Errors
 
@@ -63,8 +70,10 @@ could not connect within `Timeout`. A write while the gateway is down is "not se
 answer"); a read changes nothing, so call it again.
 
 A refusal with `NoMutation = true` wrote nothing and needs no `StatusAsync`, whether or not it
-carries a `RequestId`. Some carry one (`LEASE_EXPIRED`); some never do (`CONDITION_FAILED`,
-`INVALID_ARGUMENT`). `StatusAsync` is for an unknown outcome only.
+carries a `RequestId`. A refusal carries one whenever the write was sent before it was refused,
+whatever its kind: `LEASE_EXPIRED`, and also `CONDITION_FAILED` or `INVALID_ARGUMENT` (for example
+a transaction with two puts to the same new key). A write refused before it was sent, such as one
+with a key over 1,024 bytes, carries none. `StatusAsync` is for an unknown outcome only.
 
 Errors the client makes itself (`FromServer = false`) carry a retry class too: `BoundedJitter`
 for "not sent" and for a read with no answer (call again later), `Reconcile` for a write whose
@@ -90,8 +99,9 @@ answer was lost with no request id (read the object, then decide).
 - A `Timeout` near the minimum buys one attempt. During an outage a burst of writes may end well
   before its `Timeout` as `UNAVAILABLE` or `OVERLOADED`, with nothing applied. Give a larger
   `Timeout` to retry through an outage.
-- Cancelling a call (its `CancellationToken`) gives a bare `OperationCanceledException`, with no
-  request id. For a write, it may have applied. Settle it by **reading the object**; never send
+- Cancelling a call (its `CancellationToken`) gives an `OperationCanceledException`, with no
+  request id; when the transport had already failed the call, that error is its `InnerException`.
+  For a write, it may have applied. Settle it by **reading the object**; never send
   it again blindly, or it may apply twice.
 - One client shares its connections. Past the gateway's 64 streams on one connection it opens
   another rather than queue the call in the client. A call that fails in transport makes later
@@ -99,7 +109,11 @@ answer was lost with no request id (read the object, then decide).
 
 ## Limits and notes
 
-- Keys up to 1,024 bytes, up to 255 puts per transaction, a transaction deadline up to 30 s.
+- Keys up to 1,024 bytes, up to 255 puts per transaction, a transaction deadline from 1 ms up to
+  30 s. `TxnAsync` refuses a deadline under 1 ms (`ArgumentOutOfRangeException`) before sending.
+- A request over the gateway's decode limit (267,719,656 bytes) is refused by the client before
+  sending: `RdbException` with `Kind = InvalidArgument`, `NoMutation = true`. The gateway would
+  refuse it with no `RdbError`, which would read as an unknown outcome.
 - One write's whole record must fit 1 MiB (1,048,576 bytes), framing included. One put's
   largest value is **1,048,240 bytes minus the key's length, minus 1 per 0x00 byte in the key**,
   for a new key; 1 byte more for an existing key; the same with or without `ifVersion` (a 3-byte
@@ -118,9 +132,10 @@ answer was lost with no request id (read the object, then decide).
 - Loopback only: `--listen` refuses `0.0.0.0`, `[::]`, `[::ffff:127.0.0.1]`, LAN addresses and host
   names. TLS for apps comes in slice 3.
 - **Known limit: memory is not bounded.** The gateway decodes a request of up to 267,719,656 bytes
-  (about 255 MiB, `MAX_DECODE_BYTES`) before any check, and it does not cap connections, so many
-  large requests at once can exhaust its memory. The 64-call limit bounds running calls, not
-  decoding.
+  (about 255 MiB, `MAX_DECODE_BYTES`) before any check. The 64-call limit bounds running calls,
+  not decoding: on one connection, 64 streams can each decode up to 267,719,656 bytes before the
+  64-call cap applies, about 16 GiB, and connections are not capped. So many large requests at
+  once can exhaust its memory. Tracked in #75.
 - **Known limit: an unsent write can read as unknown.** If an extra connection fails to open while
   more than 64 calls are in flight, a write still waiting for it may end unknown though it was
   never sent. Treat unknown as "maybe applied", as always: ask `StatusAsync` or read the object.

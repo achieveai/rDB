@@ -30,7 +30,7 @@ public class ChannelTests
 
         // The first Get fails in transport (UNAVAILABLE, no RdbError); the client reads again on a fresh channel.
         var record = await client.GetAsync("k").WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal("v", record!.ValueAsString());
+        Assert.Equal("v", record.ValueAsString());
         Assert.Equal(2, gateway.Gets);
 
         gateway.ReleasePut.SetResult();
@@ -47,17 +47,24 @@ public class ChannelTests
         using var client = RdbClient.Create(new RdbClientOptions { Endpoint = gateway.Address, Timeout = TimeSpan.FromSeconds(2) });
         client.UseServerTimeouts(TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(500));
         client.Slack = TimeSpan.FromMilliseconds(500);
-        var writes = Enumerable.Range(0, 70).Select(i => client.PutAsync($"k{i}", "v")).ToArray();
-        var ends = await Task.WhenAll(writes.Select(async w =>
+        var keys = Enumerable.Range(0, 70).Select(i => $"k{i}").ToArray();
+        var ends = await Task.WhenAll(keys.Select(async key =>
         {
-            try { await w; return "OK"; }
-            catch (RdbUnknownOutcomeException) { return "UNKNOWN"; }
-            catch (RdbException e) { return e.KindName; }
+            try { await client.PutAsync(key, "v"); return (Key: key, End: "OK"); }
+            catch (RdbUnknownOutcomeException) { return (Key: key, End: "UNKNOWN"); }
+            catch (RdbException e) when (e.NoMutation && !e.FromServer) { return (Key: key, End: "NOT_SENT"); }
+            catch (RdbException e) { return (Key: key, End: e.KindName); }
         })).WaitAsync(TimeSpan.FromSeconds(20));
-        var unknown = ends.Count(e => e == "UNKNOWN");
-        Assert.True(unknown <= gateway.Puts,
-            $"{unknown} writes ended unknown but only {gateway.Puts} reached the gateway: " +
-            string.Join(", ", ends.GroupBy(e => e).Select(g => $"{g.Key}={g.Count()}")));
+        var received = gateway.PutKeys;
+        var summary = string.Join(", ", ends.GroupBy(e => e.End).Select(g => $"{g.Key}={g.Count()}")) +
+            $"; received {received.Count}";
+        // Key by key (PR #78 item 3): every write reported unknown reached the gateway, and every write reported
+        // not sent did not.
+        var unknownNotReceived = ends.Where(e => e.End == "UNKNOWN" && !received.Contains(e.Key)).Select(e => e.Key).ToArray();
+        var notSentReceived = ends.Where(e => e.End == "NOT_SENT" && received.Contains(e.Key)).Select(e => e.Key).ToArray();
+        Assert.True(unknownNotReceived.Length == 0, $"unknown but never received: {string.Join(",", unknownNotReceived)} ({summary})");
+        Assert.True(notSentReceived.Length == 0, $"not sent but received: {string.Join(",", notSentReceived)} ({summary})");
+        Assert.All(ends, e => Assert.True(e.End is "UNKNOWN" or "NOT_SENT", $"{e.Key} ended {e.End} ({summary})"));
     }
 }
 
@@ -88,6 +95,11 @@ internal sealed class FakeGateway : IAsyncDisposable
     /// <summary>Puts that reached the gateway.</summary>
     public int Puts => Volatile.Read(ref _puts);
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _putKeys = new();
+
+    /// <summary>The keys of the Puts that reached the gateway.</summary>
+    public IReadOnlySet<string> PutKeys => _putKeys.Keys.ToHashSet();
+
     public static async Task<FakeGateway> StartAsync()
     {
         var builder = WebApplication.CreateSlimBuilder();
@@ -102,8 +114,12 @@ internal sealed class FakeGateway : IAsyncDisposable
         FakeGateway? self = null;
         app.MapPost("/rdb.v1.Rdb/Put", async ctx =>
         {
-            await ctx.Request.Body.CopyToAsync(Stream.Null);
-            Interlocked.Increment(ref self!._puts);
+            // One gRPC frame: a flag byte, a 4-byte length, the PutRequest.
+            var body = new MemoryStream();
+            await ctx.Request.Body.CopyToAsync(body);
+            var put = Pb.PutRequest.Parser.ParseFrom(body.GetBuffer().AsSpan(5, (int)body.Length - 5));
+            self!._putKeys.TryAdd(put.Object.ToStringUtf8(), true);
+            Interlocked.Increment(ref self._puts);
             self.PutArrived.TrySetResult();
             await self.ReleasePut.Task.WaitAsync(ctx.RequestAborted);
             await Reply(ctx, new Pb.WriteReply { RequestId = 41, Generation = 2, Version = 7, Outcome = Pb.Outcome.Published });

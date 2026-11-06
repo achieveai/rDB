@@ -146,4 +146,34 @@ public class GuardTests
         Assert.Equal(TimeSpan.FromSeconds(38), client.TxnAttempt(TimeSpan.FromSeconds(30)));
         Assert.True(new RdbClientOptions().Timeout >= client.TxnAttempt(TimeSpan.FromSeconds(30)));
     }
+
+    // PR #78 item 7: a transaction deadline under 1 ms went on the wire as 0, which the gateway reads as its 5 s
+    // default. It is refused as a deadline of zero is, before anything is sent.
+    [Fact]
+    public async Task A_transaction_deadline_under_one_millisecond_is_refused_before_sending()
+    {
+        var (client, gateway, _) = Client(TimeSpan.FromSeconds(60));
+        gateway.Then(Wire.Written());
+        var e = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => client.TxnAsync(new[] { new RdbTxnPut("a", "1") }, TimeSpan.FromTicks(TimeSpan.TicksPerMillisecond / 2)));
+        Assert.Contains("at least 1 ms", e.Message);
+        Assert.Empty(gateway.Calls);
+    }
+
+    // PR #78 item 10: the gateway refuses a request past its decode limit (rdb-server MAX_DECODE_BYTES) in tonic,
+    // before its handler, with no RdbError, so a write refused there read as an unknown outcome though it never
+    // ran. The client checks the size first and reports it not sent. The fake answers as tonic does.
+    [Fact]
+    public async Task A_write_past_the_gateways_decode_limit_is_refused_before_sending()
+    {
+        var (client, gateway, _) = Client(TimeSpan.FromSeconds(60));
+        gateway.Then(Wire.Lost(StatusCode.OutOfRange, "Error, decoded message length too large"));
+        var e = await Assert.ThrowsAsync<RdbException>(
+            () => client.PutAsync(new byte[] { (byte)'k' }, new byte[267_719_656]));
+        Assert.Equal(RdbErrorKind.InvalidArgument, e.Kind);
+        Assert.True(e.NoMutation);
+        Assert.False(e.FromServer);
+        Assert.Contains("nothing was sent", e.Message);
+        Assert.Empty(gateway.Calls);
+    }
 }

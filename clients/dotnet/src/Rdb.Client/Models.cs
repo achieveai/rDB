@@ -35,8 +35,12 @@ public enum RdbOutcome
 /// <summary>A published write. Keep <see cref="RequestId"/> and <see cref="Generation"/> to ask <see cref="RdbClient.StatusAsync"/>.</summary>
 public sealed record RdbWrite(ulong Version, ulong RequestId, ulong Generation, RdbOutcome Outcome);
 
-/// <summary>An object read back.</summary>
-public sealed record RdbRecord(ulong Version, ReadOnlyMemory<byte> Value, ulong Generation, bool RecoveryMode)
+/// <summary>
+/// An object read back. <see cref="Found"/> false: the key is absent (Version 0, empty Value). <see cref="RecoveryMode"/>
+/// true: the partition serves a recovery copy, which may lack writes acknowledged just before a loss, so the answer,
+/// absent included, is not authoritative.
+/// </summary>
+public sealed record RdbRecord(bool Found, ulong Version, ReadOnlyMemory<byte> Value, ulong Generation, bool RecoveryMode)
 {
     /// <summary>The value as UTF-8 text.</summary>
     public string ValueAsString() => Encoding.UTF8.GetString(Value.Span);

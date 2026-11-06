@@ -111,7 +111,7 @@ public class RetryRuleTests
         var (client, gateway) = Client(TimeSpan.FromSeconds(60));
         gateway.Then(Wire.Lost()).Then(Wire.Found("v"));
         var record = await client.GetAsync("k");
-        Assert.Equal("v", record!.ValueAsString());
+        Assert.Equal("v", record.ValueAsString());
         Assert.Equal(2, gateway.Calls.Count);
     }
 
@@ -185,5 +185,37 @@ public class RetryRuleTests
         Assert.Contains("no answer within", e.Message);
         Assert.DoesNotContain("not sent", e.Message);
         Assert.Equal(RdbRetry.BoundedJitter, e.Retry);
+    }
+
+    // PR #78 item 4: an absent read during recovery says so. A bare null dropped recovery_mode, and a read in
+    // recovery mode is not authoritative: "absent" there may be wrong.
+    [Fact]
+    public async Task An_absent_read_keeps_the_recovery_flag()
+    {
+        var (client, gateway) = Client(TimeSpan.FromSeconds(60));
+        gateway.Then(new Pb.GetReply { Found = false, Generation = 3, RecoveryMode = true });
+        var record = await client.GetAsync("k");
+        Assert.False(record.Found);
+        Assert.True(record.RecoveryMode);
+        Assert.Equal(3UL, record.Generation);
+        Assert.Equal(0, record.Value.Length);
+    }
+
+    // PR #78 item 8: a call cancelled through its token keeps the transport's exception as the inner exception.
+    [Fact]
+    public async Task A_cancelled_call_keeps_the_transport_error_as_its_cause()
+    {
+        var (client, gateway) = Client(TimeSpan.FromSeconds(60));
+        using var cts = new CancellationTokenSource();
+        client.FakeConnect = () =>
+        {
+            cts.Cancel(); // cancelled after the loop's own check, so the send sees it
+            return null;
+        };
+        var lost = Wire.Lost(StatusCode.Cancelled, "Call canceled by the client.");
+        gateway.Then(lost);
+        var e = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.PutAsync("k", "v", ct: cts.Token));
+        Assert.Same(lost, e.InnerException);
+        Assert.Equal(cts.Token, e.CancellationToken);
     }
 }

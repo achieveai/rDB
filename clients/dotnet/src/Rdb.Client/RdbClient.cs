@@ -15,7 +15,8 @@ namespace Rdb.Client;
 /// <see cref="RdbUnknownOutcomeException"/>, and <see cref="StatusAsync"/> settles it.
 /// </para>
 /// <para>
-/// A call you cancel through its token ends in a bare <see cref="OperationCanceledException"/> with no request id.
+/// A call you cancel through its token ends in an <see cref="OperationCanceledException"/> with no request id; when the
+/// transport had already failed the call, that error is its inner exception.
 /// A cancelled write may have applied: read the object to settle it, and never send it again blindly.
 /// </para>
 /// </summary>
@@ -31,6 +32,12 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
     private static readonly TimeSpan TxnMargins = TimeSpan.FromSeconds(1);
 
     private static readonly TimeSpan DefaultTxnDeadline = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The largest request the gateway decodes (rdb-server MAX_DECODE_BYTES). It refuses a larger one before its handler,
+    /// with no RdbError, so the client refuses it first: a write refused there would read as an unknown outcome.
+    /// </summary>
+    internal const int MaxRequestBytes = 267_719_656;
 
     private readonly RdbClientOptions _options;
     private readonly string _endpoint;
@@ -115,19 +122,19 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
     {
         var req = new Pb.PutRequest { Object = ByteString.CopyFrom(key.Span), Value = ByteString.CopyFrom(value.Span) };
         if (ifVersion is { } v) req.IfVersion = v;
-        var r = await CallAsync("put", isWrite: true, PutAttempt(), (c, o) => c.PutAsync(req, o), ct).ConfigureAwait(false);
+        var r = await CallAsync("put", isWrite: true, PutAttempt(), (c, o) => c.PutAsync(req, o), ct, req.CalculateSize()).ConfigureAwait(false);
         return Write(r);
     }
 
-    /// <summary>Read a key. Null when it does not exist.</summary>
-    public Task<RdbRecord?> GetAsync(string key, CancellationToken ct = default) => GetAsync(Utf8(key, nameof(key)), ct);
+    /// <summary>Read a key. Always a record: <see cref="RdbRecord.Found"/> false when it does not exist, with <see cref="RdbRecord.RecoveryMode"/> still set.</summary>
+    public Task<RdbRecord> GetAsync(string key, CancellationToken ct = default) => GetAsync(Utf8(key, nameof(key)), ct);
 
-    /// <summary>Read a key. Null when it does not exist.</summary>
-    public async Task<RdbRecord?> GetAsync(ReadOnlyMemory<byte> key, CancellationToken ct = default)
+    /// <summary>Read a key. Always a record: <see cref="RdbRecord.Found"/> false when it does not exist, with <see cref="RdbRecord.RecoveryMode"/> still set.</summary>
+    public async Task<RdbRecord> GetAsync(ReadOnlyMemory<byte> key, CancellationToken ct = default)
     {
         var req = new Pb.GetRequest { Object = ByteString.CopyFrom(key.Span) };
         var r = await CallAsync("get", isWrite: false, ReadAttempt(), (c, o) => c.GetAsync(req, o), ct).ConfigureAwait(false);
-        return r.Found ? new RdbRecord(r.Version, r.Value.Memory, r.Generation, r.RecoveryMode) : null;
+        return new RdbRecord(r.Found, r.Version, r.Value.Memory, r.Generation, r.RecoveryMode);
     }
 
     /// <summary>Write every put, or none. <paramref name="deadline"/> is the server's deadline (default 5 s, at most 30 s).</summary>
@@ -135,7 +142,8 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(puts);
         var d = deadline ?? DefaultTxnDeadline;
-        if (d <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(deadline), "deadline must be positive");
+        // Whole milliseconds go on the wire, and 0 there means the gateway's 5 s default: under 1 ms is refused as zero is.
+        if (d < TimeSpan.FromMilliseconds(1)) throw new ArgumentOutOfRangeException(nameof(deadline), "deadline must be at least 1 ms");
         var req = new Pb.TxnRequest { DeadlineMs = (uint)Math.Min(d.TotalMilliseconds, uint.MaxValue) };
         foreach (var p in puts)
         {
@@ -143,7 +151,7 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
             if (p.IfVersion is { } v) tp.IfVersion = v;
             req.Puts.Add(tp);
         }
-        var r = await CallAsync("txn", isWrite: true, TxnAttempt(d), (c, o) => c.TxnAsync(req, o), ct).ConfigureAwait(false);
+        var r = await CallAsync("txn", isWrite: true, TxnAttempt(d), (c, o) => c.TxnAsync(req, o), ct, req.CalculateSize()).ConfigureAwait(false);
         return Write(r);
     }
 
@@ -195,7 +203,7 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
     /// </summary>
     internal async Task<T> CallAsync<T>(
         string op, bool isWrite, TimeSpan attempt,
-        Func<Pb.Rdb.RdbClient, CallOptions, AsyncUnaryCall<T>> send, CancellationToken ct)
+        Func<Pb.Rdb.RdbClient, CallOptions, AsyncUnaryCall<T>> send, CancellationToken ct, int requestBytes = 0)
     {
         var watch = Stopwatch.StartNew();
         var budgetEnd = DateTime.UtcNow + _options.Timeout;
@@ -225,6 +233,15 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
             if (DateTime.UtcNow + pause >= budgetEnd) return false;
             if (pause > TimeSpan.Zero) await Pause(pause, ct).ConfigureAwait(false);
             return true;
+        }
+
+        if (requestBytes > MaxRequestBytes)
+        {
+            // The gateway would refuse it before its handler, with no RdbError, so a write would read as unknown.
+            return Stamp(new RdbException(
+                $"{op}: the request is {requestBytes} bytes, over the gateway's limit of {MaxRequestBytes}; " +
+                "nothing was sent. next: make the request smaller (a value fits 1 MiB less its key; see the limits)",
+                RdbErrorKind.InvalidArgument, "INVALID_ARGUMENT", RdbRetry.Definitive, true, null, null, null, false));
         }
 
         if (_options.Timeout < attempt)
@@ -283,7 +300,7 @@ public sealed class RdbClient : IDisposable, IAsyncDisposable
                 }
                 catch (RpcException ex)
                 {
-                    if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
+                    if (ct.IsCancellationRequested) throw new OperationCanceledException($"{op}: cancelled ({Cause(ex)})", ex, ct);
                     var d = RdbErrors.Detail(ex);
                     if (d is null)
                     {

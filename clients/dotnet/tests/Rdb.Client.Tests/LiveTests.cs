@@ -41,7 +41,7 @@ public class LiveTests
         var second = await client.PutAsync(key, "two");
         Assert.True(second.Version > first.Version);
         var record = await client.GetAsync(key);
-        Assert.Equal("two", record!.ValueAsString());
+        Assert.Equal("two", record.ValueAsString());
         Assert.Equal(second.Version, record.Version);
     }
 
@@ -52,9 +52,9 @@ public class LiveTests
         var key = Key("empty");
         await client.PutAsync(key, "");
         var record = await client.GetAsync(key);
-        Assert.NotNull(record);
-        Assert.Equal(0, record!.Value.Length);
-        Assert.Null(await client.GetAsync(Key("absent")));
+        Assert.True(record.Found);
+        Assert.Equal(0, record.Value.Length);
+        Assert.False((await client.GetAsync(Key("absent"))).Found);
     }
 
     [LiveFact]
@@ -82,8 +82,8 @@ public class LiveTests
         var t = await client.TxnAsync(new[] { new RdbTxnPut(a, "90"), new RdbTxnPut(b, "10") });
         await Assert.ThrowsAsync<RdbConditionFailedException>(() =>
             client.TxnAsync(new[] { new RdbTxnPut(a, "0", ifVersion: t.Version + 1000), new RdbTxnPut(b, "100") }));
-        Assert.Equal("90", (await client.GetAsync(a))!.ValueAsString());
-        Assert.Equal("10", (await client.GetAsync(b))!.ValueAsString());
+        Assert.Equal("90", (await client.GetAsync(a)).ValueAsString());
+        Assert.Equal("10", (await client.GetAsync(b)).ValueAsString());
     }
 
     [LiveFact]

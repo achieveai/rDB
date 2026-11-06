@@ -92,9 +92,9 @@ static async Task<int> Run(RdbClient client, List<string> a)
         case "get":
         {
             var r = await client.GetAsync(Key(flags, pos, 0));
-            if (r is null)
+            if (!r.Found)
             {
-                Console.WriteLine("get absent");
+                Console.WriteLine($"get absent generation={r.Generation} recovery_mode={r.RecoveryMode.ToString().ToLowerInvariant()}");
                 return 1;
             }
             Console.WriteLine($"get version={r.Version} generation={r.Generation} recovery_mode={r.RecoveryMode.ToString().ToLowerInvariant()} bytes={r.Value.Length} value={r.ValueAsString()}");
@@ -134,7 +134,7 @@ static async Task<int> Walk(RdbClient client)
     var p = await client.PutAsync("greeting", "hello");
     Console.WriteLine($"walk put greeting version={p.Version} request_id={p.RequestId} generation={p.Generation}");
     var g = await client.GetAsync("greeting");
-    Console.WriteLine($"walk get greeting version={g?.Version} value={g?.ValueAsString()}");
+    Console.WriteLine($"walk get greeting version={g.Version} value={g.ValueAsString()}");
     var a = await client.GetAsync("acct-a");
     var t = await client.TxnAsync(new[] { new RdbTxnPut("acct-a", "90"), new RdbTxnPut("acct-b", "10") });
     Console.WriteLine($"walk txn acct-a=90 acct-b=10 version={t.Version} request_id={t.RequestId} generation={t.Generation}");
@@ -143,7 +143,7 @@ static async Task<int> Walk(RdbClient client)
     try
     {
         // Conditioned on acct-a's version from before the txn: stale, so refused.
-        await client.TxnAsync(new[] { new RdbTxnPut("acct-a", "1", a?.Version ?? 1), new RdbTxnPut("acct-b", "2") });
+        await client.TxnAsync(new[] { new RdbTxnPut("acct-a", "1", a.Found ? a.Version : 1), new RdbTxnPut("acct-b", "2") });
         Console.WriteLine("walk stale txn: applied (unexpected)");
         return 3;
     }
@@ -153,7 +153,7 @@ static async Task<int> Walk(RdbClient client)
     }
     var a2 = await client.GetAsync("acct-a");
     var b2 = await client.GetAsync("acct-b");
-    Console.WriteLine($"walk after refusal acct-a={a2?.ValueAsString()} acct-b={b2?.ValueAsString()}");
+    Console.WriteLine($"walk after refusal acct-a={a2.ValueAsString()} acct-b={b2.ValueAsString()}");
     return 0;
 }
 
