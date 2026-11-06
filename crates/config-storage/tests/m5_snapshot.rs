@@ -2265,12 +2265,14 @@ async fn a2_a_superseded_build_whose_file_was_pruned_captures_again() {
 }
 
 /// Parks each of the first two crossings of [`Boundary::AfterInstallDropCf`] (two installs)
-/// and holds the second snapshot capture, each on its own handshake (Q-R1).
+/// and holds the second snapshot capture, each on its own handshake (Q-R1). The first capture
+/// is signalled without a hold, so the row knows its checkpoint exists before install 1 goes on.
 struct TwoInstalls {
     boundary_seen: AtomicU64,
     capture_seen: AtomicU64,
     first: Handshake,
     second: Handshake,
+    first_capture: Handshake,
     capture: Handshake,
 }
 
@@ -2287,8 +2289,10 @@ impl FaultInjector for TwoInstalls {
     }
 
     fn during_snapshot_capture(&self) {
-        if self.capture_seen.fetch_add(1, Ordering::SeqCst) == 1 {
-            self.capture.arrive(true);
+        match self.capture_seen.fetch_add(1, Ordering::SeqCst) {
+            0 => self.first_capture.arrive(false),
+            1 => self.capture.arrive(true),
+            _ => {}
         }
     }
 }
@@ -2323,6 +2327,7 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
             capture_seen: AtomicU64::new(0),
             first: Handshake::new(),
             second: Handshake::new(),
+            first_capture: Handshake::new(),
             capture: Handshake::new(),
         });
         let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
@@ -2338,6 +2343,10 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
             let dst = dst.clone();
             tokio::spawn(async move { build(&dst).await })
         };
+        // The build's first checkpoint must be taken while install 1 is parked, or it captures
+        // the installed state, publishes, and never captures again (a slow start on a loaded
+        // host did that once).
+        wait_reached(race.clone(), |r| &r.first_capture).await;
         tokio::time::sleep(HOLD).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
         race.first.release();
         install_one

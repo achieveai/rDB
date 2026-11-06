@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::ApiError;
 use crate::host::{
-    Answer, Change, ClientCall, DormantSeed, Holding, ListEdit, Look, Msg, NodeStatus, PeerAsk,
-    PutOp, Seen,
+    Answer, Change, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg, NodeStatus,
+    PeerAsk, PutOp, Seen,
 };
 
 /// Who is at the other end of a connection, as its certificate names it.
@@ -729,6 +729,15 @@ pub enum WireCall {
         identity: RequestIdentity,
         generation: Option<Generation>,
     },
+    Move {
+        identity: RequestIdentity,
+        from: NodeId,
+        to: NodeId,
+    },
+    Rebuild {
+        identity: RequestIdentity,
+        node: NodeId,
+    },
 }
 
 impl WireCall {
@@ -740,7 +749,9 @@ impl WireCall {
             | Self::Compile { identity, .. }
             | Self::Get { identity, .. }
             | Self::GetPrevious { identity, .. }
-            | Self::Status { identity, .. } => *identity,
+            | Self::Status { identity, .. }
+            | Self::Move { identity, .. }
+            | Self::Rebuild { identity, .. } => *identity,
             Self::Resend { request } => request.identity,
         }
     }
@@ -755,6 +766,8 @@ impl WireCall {
             Self::Get { .. } => "get",
             Self::GetPrevious { .. } => "get_previous",
             Self::Status { .. } => "status",
+            Self::Move { .. } => "move",
+            Self::Rebuild { .. } => "rebuild",
         }
     }
 }
@@ -812,6 +825,15 @@ impl TryFrom<&ClientCall> for WireCall {
                 identity: *identity,
                 generation: *generation,
             },
+            ClientCall::Move { identity, from, to } => Self::Move {
+                identity: *identity,
+                from: *from,
+                to: *to,
+            },
+            ClientCall::Rebuild { identity, node } => Self::Rebuild {
+                identity: *identity,
+                node: *node,
+            },
         })
     }
 }
@@ -864,6 +886,8 @@ impl TryFrom<WireCall> for ClientCall {
                 identity,
                 generation,
             },
+            WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
+            WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
         })
     }
 }
@@ -1516,6 +1540,14 @@ pub enum WireAnswer {
         error: WireApiError,
         request: Option<TxnRequest>,
     },
+    // M11 (A-R449): added last, so the variants above keep their encoded index.
+    Moved {
+        done: bool,
+        line: String,
+    },
+    Rebuilt {
+        line: String,
+    },
 }
 
 impl WireAnswer {
@@ -1550,6 +1582,11 @@ impl WireAnswer {
             Answer::Compiled(request) => Self::Compiled(request.clone()),
             Answer::Unchanged => Self::Unchanged,
             Answer::Status(status) => Self::Status(*status),
+            Answer::Moved(moved) => Self::Moved {
+                done: moved.done,
+                line: moved.line.clone(),
+            },
+            Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
                 request: request.clone(),
@@ -1585,6 +1622,8 @@ impl WireAnswer {
             Self::Compiled(request) => Answer::Compiled(request),
             Self::Unchanged => Answer::Unchanged,
             Self::Status(status) => Answer::Status(status),
+            Self::Moved { done, line } => Answer::Moved(MoveAnswer { done, line }),
+            Self::Rebuilt { line } => Answer::Rebuilt(line),
             Self::Error { error, request } => Answer::Error {
                 error: error.into(),
                 request,

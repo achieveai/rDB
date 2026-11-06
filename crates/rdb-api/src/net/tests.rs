@@ -30,8 +30,8 @@ use super::wire::{self, Frame, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 use super::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
 use crate::db::ApiError;
 use crate::host::{
-    Answer, Change, Client, ClientCall, DormantSeed, Holding, ListEdit, Look, Msg, NodeStatus,
-    PeerAsk, PutOp, Seen,
+    Answer, Change, Client, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg,
+    NodeStatus, PeerAsk, PutOp, Seen,
 };
 use crate::transport::Links;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
@@ -256,6 +256,15 @@ fn calls() -> Vec<ClientCall> {
         identity: identity(4, 32),
         generation: Some(zero()),
     });
+    calls.push(ClientCall::Rebuild {
+        identity: identity(4, 33),
+        node: NodeId(4),
+    });
+    calls.push(ClientCall::Move {
+        identity: identity(4, 34),
+        from: NodeId(3),
+        to: NodeId(4),
+    });
     calls
 }
 
@@ -346,6 +355,15 @@ fn answers() -> Vec<Answer> {
         Answer::Compiled(zero()),
         Answer::Unchanged,
         Answer::Status(zero()),
+        Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
+        Answer::Moved(MoveAnswer {
+            done: true,
+            line: "already moved: node 3 to node 4".to_owned(),
+        }),
+        Answer::Moved(MoveAnswer {
+            done: false,
+            line: "moving".to_owned(),
+        }),
         Answer::Error {
             error,
             request: Some(zero()),
@@ -535,6 +553,15 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         };
         assert_eq!(format!("{:?}", back.land()), before);
     }
+    // Critic A1: M11's answers go last, so a pre-M11 answer keeps its encoded index (postcard
+    // writes the variant index first).
+    let index = |answer: &WireAnswer| postcard::to_stdvec(answer).expect("encodes")[0];
+    assert_eq!(index(&WireAnswer::Unchanged), 3);
+    let error = WireAnswer::carry(&Answer::Error {
+        error: ApiError::host("x"),
+        request: None,
+    });
+    assert_eq!(index(&error), 5);
 
     let status = status();
     let bytes = wire::encode(&Frame::Reply {
@@ -666,6 +693,8 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
             dial: spec.dial,
             protocol_version: spec.version,
             faults: Faults::new(),
+            // As `rdb_node` defaults it (A-R479).
+            admin_apps: admin_apps(),
         },
         &links,
         listener,
@@ -685,6 +714,11 @@ fn certs_for(dir: &FsPath, nodes: &[u32]) {
 }
 
 const PATIENCE: Duration = Duration::from_secs(5);
+
+/// The admin-app list `rdb_node` runs with unless told otherwise (A-R479).
+fn admin_apps() -> BTreeSet<String> {
+    BTreeSet::from(["admin".to_owned()])
+}
 
 /// Take the next message from `mail` on a blocking thread, so the runtime keeps serving the
 /// link while a row waits.
@@ -1059,6 +1093,158 @@ async fn an_app_link_never_delivers_a_peer_message() {
     );
 }
 
+/// A-R479: app `app`'s process sends node 1 `call` (a Move or a Rebuild), then an `Inspect`.
+/// Returns what node 1's node got first and the answer the app got for `call`. Node 1 runs
+/// with the admin-app list `rdb_node` defaults to, `admin`.
+async fn app_admin_call(app: &str, call: ClientCall) -> (Msg, Answer) {
+    let dir = config_testkit::fs::temp_dir();
+    let label = Label::App(app.to_owned());
+    certs::generate(dir.path(), &[Label::Node(NodeId(1)), label.clone()]).expect("certs");
+    let one = side(Spec::node(1, dir.path(), &[]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let sender = Spec {
+        claim: Some(label.clone()),
+        cert_of: Some(label),
+        ..Spec::node(9, dir.path(), &[1]).dialling(1, addr)
+    };
+    let sender = side(sender, false).await;
+    sender
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("app -> 1 up");
+    let (reply, answer) = mpsc::channel();
+    sender
+        .links
+        .post(
+            NodeId(1),
+            Msg::Client(Client {
+                partition: PartitionId(1),
+                call,
+                reply,
+            }),
+        )
+        .expect("posted");
+    let (inspect, _inspected) = mpsc::channel();
+    sender
+        .links
+        .post(
+            NodeId(1),
+            Msg::Inspect {
+                partition: PartitionId(1),
+                reply: inspect,
+            },
+        )
+        .expect("posted");
+    let (got, mail) = next(one.mail).await;
+    // A call that reached node 1 is answered as its host would, so the app's wait ends.
+    let answered = tokio::task::spawn_blocking(move || {
+        if let Msg::Client(Client { reply, .. }) = &got {
+            reply
+                .send(Answer::Error {
+                    error: ApiError::host("node 1's node took the call"),
+                    request: None,
+                })
+                .expect("caller waits");
+        }
+        let answer = answer.recv_timeout(PATIENCE).expect("the app is answered");
+        drop(mail);
+        (got, answer)
+    })
+    .await
+    .expect("join");
+    drop(sender);
+    answered
+}
+
+/// The refusal a non-admin app gets for `verb`: definitive, nothing done, and it says who
+/// decides and what to do (A-R465).
+fn assert_not_admin(got: &Msg, answer: &Answer, app: &str, verb: &str) {
+    assert!(
+        matches!(got, Msg::Inspect { .. }),
+        "an app not on the admin list never reaches node 1's node with a {verb}: {got:?}"
+    );
+    let Answer::Error { error, request } = answer else {
+        panic!("a refusal: {answer:?}");
+    };
+    assert_eq!(request, &None);
+    assert_eq!(
+        (error.kind, error.retry, error.no_mutation),
+        (ErrorKind::InvalidArgument, RetryRule::Definitive, true),
+        "{error}"
+    );
+    let text = error.explain();
+    assert!(
+        text.contains(&format!("app {app} is not an admin app"))
+            && text.contains("--admin-apps")
+            && text.contains("as an admin app"),
+        "{text}"
+    );
+    assert!(text.contains("did nothing"), "{text}");
+    // Hand walk (lr, app pilot): the text carried the source's indentation as runs of spaces.
+    assert!(!text.contains("  "), "one space between words: {text:?}");
+}
+
+/// A-R479 (PR #74, Revobot R2 Q 4433944757): an app that is not on node 1's admin-app list
+/// sends a copy move. It never reaches node 1's node, so nothing moves, and the app is
+/// answered `INVALID_ARGUMENT`, no_mutation, naming the list and the admin app to use. Cut: no
+/// admin arm in `sender_refused`, red: node 1's first message is the move.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr74_r479_a_move_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::Move {
+            identity: identity(9, 1),
+            from: NodeId(3),
+            to: NodeId(4),
+        },
+    )
+    .await;
+    assert_not_admin(&got, &answer, "pilot", "move");
+}
+
+/// A-R479: as the row above, for `admin rebuild`: a spare note is a membership change too.
+/// Cut: as above, red.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::Rebuild {
+            identity: identity(9, 1),
+            node: NodeId(4),
+        },
+    )
+    .await;
+    assert_not_admin(&got, &answer, "pilot", "rebuild");
+}
+
+/// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with
+/// a move and a rebuild, so `lr move` and `lr rebuild` keep working. That the move then
+/// completes is the multi-process rows' and the `lr move` hand check's (T12's row runs its
+/// rebuild as `admin`). Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr74_r479_the_admin_app_still_reaches_the_owner_with_a_move_and_a_rebuild() {
+    for call in [
+        ClientCall::Move {
+            identity: identity(9, 1),
+            from: NodeId(3),
+            to: NodeId(4),
+        },
+        ClientCall::Rebuild {
+            identity: identity(9, 2),
+            node: NodeId(4),
+        },
+    ] {
+        let (got, _answer) = app_admin_call("admin", call.clone()).await;
+        let Msg::Client(Client { call: reached, .. }) = got else {
+            panic!("the admin app's {call:?} reaches node 1's node: {got:?}");
+        };
+        assert_eq!(format!("{reached:?}"), format!("{call:?}"));
+    }
+}
+
 /// M10 S2 review-s2 F-008 row: which kinds each label may send, checked on every kind. An app
 /// may send a call, an `Inspect` and a promote's plan or fence, no other recovery event (C-3),
 /// and no catch-up, restore or landing (review-s2 F-008 gap, A-R418: each is listed, so an
@@ -1113,8 +1299,16 @@ fn a_sender_is_held_to_its_certificate_label() {
         seq: zero(),
     });
     for allowed in [&client, &inspect, &plan, &fence] {
-        assert_eq!(super::sender_refused(&app, allowed), None, "{allowed:?}");
-        assert_eq!(super::sender_refused(&node2, allowed), None, "{allowed:?}");
+        assert_eq!(
+            super::sender_refused(&app, allowed, &admin_apps()),
+            None,
+            "{allowed:?}"
+        );
+        assert_eq!(
+            super::sender_refused(&node2, allowed, &admin_apps()),
+            None,
+            "{allowed:?}"
+        );
     }
     let progress = on_wire(Msg::Routed {
         partition: PartitionId(1),
@@ -1163,15 +1357,70 @@ fn a_sender_is_held_to_its_certificate_label() {
         landing,
     ] {
         assert!(
-            super::sender_refused(&app, &peer).is_some(),
+            super::sender_refused(&app, &peer, &admin_apps()).is_some(),
             "app sends {peer:?}"
         );
-        assert_eq!(super::sender_refused(&node2, &peer), None, "{peer:?}");
+        assert_eq!(
+            super::sender_refused(&node2, &peer, &admin_apps()),
+            None,
+            "{peer:?}"
+        );
     }
     for forged in [on_wire(frame_from(3)), on_wire(ask_from(3))] {
-        let reason = super::sender_refused(&node2, &forged).expect("forged");
+        let reason = super::sender_refused(&node2, &forged, &admin_apps()).expect("forged");
         assert!(reason.contains("node 3"), "{reason}");
     }
+}
+
+/// A-R479, the arm itself: a copy move and a rebuild pass only from an app on the admin list
+/// (or from a node); an empty list, a library caller's default, refuses every app's. Other
+/// calls from any app are untouched. Cut: no admin arm, red.
+/// Unit.
+#[test]
+fn pr74_r479_only_an_admin_app_may_send_a_move_or_a_rebuild() {
+    let call = |call: wire::WireCall| WireMsg::Client {
+        to: NodeId(1),
+        partition: PartitionId(1),
+        call,
+        reply: 1,
+    };
+    let moved = call(wire::WireCall::Move {
+        identity: identity(1, 1),
+        from: NodeId(3),
+        to: NodeId(4),
+    });
+    let rebuilt = call(wire::WireCall::Rebuild {
+        identity: identity(1, 1),
+        node: NodeId(4),
+    });
+    let status = call(wire::WireCall::Status {
+        identity: identity(1, 1),
+        generation: None,
+    });
+    let admin = Label::App("admin".to_owned());
+    let pilot = Label::App("pilot".to_owned());
+    let node2 = Label::Node(NodeId(2));
+    let none = BTreeSet::new();
+    for msg in [&moved, &rebuilt] {
+        assert_eq!(super::sender_refused(&admin, msg, &admin_apps()), None);
+        assert_eq!(super::sender_refused(&node2, msg, &none), None);
+        let reason = super::sender_refused(&pilot, msg, &admin_apps()).expect("pilot refused");
+        assert!(
+            reason.contains("app pilot is not an admin app on node 1"),
+            "{reason}"
+        );
+        assert!(reason.contains("`lr` runs it as `admin`"), "{reason}");
+        // Critic-479 A6: app `admin` refused by a node whose list leaves it out is not told
+        // to run the call as `admin`, which it already is.
+        let reason =
+            super::sender_refused(&admin, msg, &none).expect("an empty list refuses admin");
+        assert!(
+            reason.contains("app admin is not an admin app on node 1"),
+            "{reason}"
+        );
+        assert!(!reason.contains("as an admin app"), "{reason}");
+    }
+    assert_eq!(super::sender_refused(&pilot, &status, &none), None);
 }
 
 /// The reason node 1's dialler holds for node `to`, once it is refused. Polls until the link is
@@ -1239,6 +1488,24 @@ async fn a_newer_protocol_version_is_refused_naming_both_sides() {
         PROTOCOL_VERSION + 1
     );
     assert_eq!(reason, want);
+}
+
+/// M11 (ruling A-R449): a build speaking protocol_version 3, before `Move`/`Moved` were on the
+/// wire, is refused at the handshake naming both versions, never linked to fail on a move.
+/// Cut: `PROTOCOL_VERSION` left at 3 → the link comes up. Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let older = Spec {
+        version: 3,
+        ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 4");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
@@ -1487,8 +1754,8 @@ struct NodeProcess {
 }
 
 /// Start node `node`'s process on the formed folder `dir`, as `rdb_node` does: the links first
-/// (serving on `listener`, dialling the lower nodes in `addrs`), then its `Db` on its own copy at
-/// `next_boot(dir)`.
+/// (serving on `listener`, linking every node in `addrs` and dialling the lower ones), then
+/// its `Db` on its own copy at `next_boot(dir)`.
 fn node_process(
     rt: &tokio::runtime::Runtime,
     dir: &FsPath,
@@ -1508,14 +1775,11 @@ fn node_process(
                 label: Label::Node(me),
                 boot,
                 tls: certs::load(certs_dir, &Label::Node(me)).expect("certs"),
-                peers: crate::db::ALL_NODES
-                    .iter()
-                    .copied()
-                    .filter(|n| *n != me)
-                    .collect(),
+                peers: addrs.keys().copied().filter(|n| *n != me).collect(),
                 dial: NetConfig::dial_lower(me, addrs),
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                admin_apps: admin_apps(),
             },
             &links,
             Some(listener),
@@ -1765,6 +2029,180 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
     two.db.shutdown();
 }
 
+/// M11 T12 over processes (lead ruling on dev-a's open item 1): `admin rebuild 4` from an app
+/// with no node of its own (`rdb_dev --nodes`, as `lr rebuild 4` runs it) reaches the owner in
+/// its own process, and the owner notes spare node 4 for the free slot. Nodes 1 and 2 serve
+/// with node 3 never started, so the owner's commit pins two copies; node 4 runs as a spare.
+/// The app's rebuild answers that node 4 is noted; node 4's process restarts, as lr does, and
+/// the owner pins it as a shadow and then regular: nodes 1, 2 and 4, and a put lands. Cut: the
+/// app answers mode A from the owner's status look and asks the owner nothing (the route #65
+/// had), red: node 4 is never pinned.
+/// Integration (~10 s): a formation, three node opens, the app's open, one process restart,
+/// the re-add's re-plan and the shadow's promote, real TLS on loopback.
+#[config_log::retcd_test]
+fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    let certs_dir = dir.path().join("certs");
+    let app_label = Label::App("admin".to_owned());
+    let mut labels: Vec<Label> = (1..=4).map(|n| Label::Node(NodeId(n))).collect();
+    labels.push(app_label.clone());
+    certs::generate(&certs_dir, &labels).expect("certs generate");
+    let data = dir.path().join("db");
+    let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    {
+        let mut formed = rt
+            .block_on(crate::db::Db::open(
+                db_config(&data),
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("formation opens");
+        formed.wait_ready(patience).expect("formation is ready");
+        formed.shutdown();
+    }
+
+    const PEERS: [u32; 4] = [1, 2, 3, 4];
+    let mut listeners: BTreeMap<NodeId, tokio::net::TcpListener> = BTreeMap::new();
+    let mut addrs = BTreeMap::new();
+    for node in PEERS {
+        let (listener, addr) = rt.block_on(config_testkit::ports::ephemeral_listener());
+        listeners.insert(NodeId(node), listener);
+        addrs.insert(NodeId(node), addr.to_string());
+    }
+    let start = |node: u32, listener: tokio::net::TcpListener| {
+        node_process(&rt, &data, &certs_dir, &store, node, listener, &addrs)
+    };
+    // The copies open before the owner heals, so its plan finds them up (A-R165).
+    let mut four = start(4, listeners.remove(&NodeId(4)).expect("a listener"));
+    let mut three = start(3, listeners.remove(&NodeId(3)).expect("a listener"));
+    let mut two = start(2, listeners.remove(&NodeId(2)).expect("a listener"));
+    let mut one = start(1, listeners.remove(&NodeId(1)).expect("a listener"));
+    one.db
+        .wait_ready(patience)
+        .expect("node 1's process heals and is ready");
+    // Node 3's process stops for good; a write finds it gone and the owner drops it about
+    // `PEER_DROP_AFTER_MILLIS` later, leaving two copies pinned.
+    three.db.shutdown();
+    drop(three);
+    let paused_by = std::time::Instant::now() + patience;
+    let mut landed = 0u32;
+    loop {
+        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+            Ok(_) => landed += 1,
+            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
+            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
+        }
+        assert!(
+            std::time::Instant::now() < paused_by,
+            "writes never paused with node 3 away: {landed} landed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let owner_pins = |one: &NodeProcess| -> Vec<(u32, rdb_core::contracts::ids::ReplicaRole)> {
+        one.db
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == NodeId(1))
+            .map(|status| {
+                status
+                    .pinned
+                    .iter()
+                    .map(|member| (member.node.0, member.role))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let pinned_by = std::time::Instant::now() + patience;
+    while owner_pins(&one).len() != 2 {
+        assert!(
+            std::time::Instant::now() < pinned_by,
+            "node 1 did not pin two copies with node 3 down: {:?}",
+            owner_pins(&one)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let app_links = Links::new();
+    let app_net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label: app_label.clone(),
+                boot: BootId(0),
+                tls: certs::load(&certs_dir, &app_label).expect("app certs"),
+                peers: PEERS.iter().map(|n| NodeId(*n)).collect(),
+                dial: addrs.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+                admin_apps: BTreeSet::new(),
+            },
+            &app_links,
+            None,
+        )
+        .expect("the app's net starts")
+    };
+    let up: Vec<NodeId> = [1, 2, 4].map(NodeId).to_vec();
+    rt.block_on(app_net.wait_up(&up, patience))
+        .expect("the app links nodes 1, 2 and 4");
+    let app_dir = config_testkit::fs::temp_dir();
+    let mut app = rt
+        .block_on(crate::db::Db::open(
+            crate::db::DbConfig {
+                local: Vec::new(),
+                links: Some(app_links),
+                client: ClientId(9),
+                ..db_config(app_dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+        ))
+        .expect("the app-only open");
+    let line = app
+        .rebuild(NodeId(4), false)
+        .expect("rebuild 4 onto the spare");
+
+    // As `lr rebuild 4` does: node 4's process stops and starts again on its own folder.
+    four.db.shutdown();
+    drop(four);
+    let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
+    let mut four = start(4, relisten);
+    let regular_by = std::time::Instant::now() + patience;
+    loop {
+        let pins = owner_pins(&one);
+        let nodes: Vec<u32> = pins.iter().map(|(node, _)| *node).collect();
+        let four_regular =
+            pins.contains(&(4, rdb_core::contracts::ids::ReplicaRole::RegularSecondary));
+        if four_regular {
+            assert_eq!(nodes, vec![1, 2, 4], "{pins:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < regular_by,
+            "node 4 was not pinned regular within {patience:?}: {pins:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    one.db
+        .wait_ready(patience)
+        .expect("node 1 serves with node 4 regular");
+    one.db
+        .put(b"after", b"1", None)
+        .expect("a put with node 4 regular");
+    assert!(line.contains("node 4 is not pinned"), "{line}");
+
+    app.shutdown();
+    drop(app_net);
+    four.db.shutdown();
+    two.db.shutdown();
+    one.db.shutdown();
+}
+
 /// A-R313, the hang in the row above (L5-3, killed at 900 s): node 2 dialled node 1 while node
 /// 1's `Db` was still opening, gave up after `HANDSHAKE` and dialled again, so node 1 held two
 /// handshakes from node 2 waiting on `serving`. Both went on once node 1 registered, and the
@@ -1782,6 +2220,7 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
         .expect("runtime");
     let shared = Arc::new(super::Shared {
         label: Label::Node(NodeId(1)),
+        admin_apps: admin_apps(),
         boot: BootId(11),
         protocol_version: PROTOCOL_VERSION,
         faults: Faults::new(),

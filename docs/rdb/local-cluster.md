@@ -29,6 +29,8 @@ Where things go:
   - `db/nodes/1..3`: each node's copy.
   - `ctl/`: rEtcd's data and logs.
   - `certs/`: the run's TLS certificates. Apps `pilot`, `pilot-a`, `pilot-b` and `admin` have one.
+    Only `admin` may move or rebuild a copy: the nodes run with `--admin-apps` unset, which
+    means `admin`. `lr move`, `lr rebuild` and `lr promote` run as `admin`.
   - `logs/rdb_node-N.jsonl`: node N's log. `out/node-N.out` and `.err`: its console.
   - `run.env`: the ports and binaries.
 - Ports: rEtcd uses `P+1` to `P+24`. Node N listens on `P+40+N`. `P` is 19800 unless you pass
@@ -67,6 +69,9 @@ works as written. `--run DIR` picks another run.
 | `clean` | `down`, then deletes the run folder, **its logs included**: copy what you need first. Prints `lr: removed <run folder>`. |
 
 `scripts/local-rdb.sh` with no verb lists every verb, including the fault verbs.
+
+To plan copy moves from an inventory file (model only; it applies nothing), see
+[placement-plan.md](placement-plan.md).
 
 ## 3. Your app
 
@@ -132,6 +137,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 dial,
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                // An app receives no calls (A-R479).
+                admin_apps: std::collections::BTreeSet::new(),
             },
             &links,
             None,

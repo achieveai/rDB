@@ -572,7 +572,14 @@ impl Recovery {
             copies: queried.iter().copied().collect(),
         });
         self.arm(deadline, emit);
-        let collect = Collecting::new(proof.clone(), queried, deadline);
+        let shadows: BTreeSet<CopyId> = plan
+            .config
+            .members
+            .iter()
+            .filter(|m| m.role == ReplicaRole::Shadow)
+            .map(|m| m.copy)
+            .collect();
+        let collect = Collecting::new(proof.clone(), queried, shadows, deadline);
         Some(Phase::Collecting(Box::new(Run { plan, collect })))
     }
 
@@ -610,7 +617,11 @@ impl Recovery {
                     }
                 }
             },
-            Input::Recovery(RecoveryEvent::InventoryFailed { copy }) => collect.failed(*copy, emit),
+            Input::Recovery(RecoveryEvent::InventoryFailed { copy }) => {
+                if collect.failed(*copy, emit) && collect.close_if_all_answered(emit) {
+                    return self.decide(ctx, run, emit);
+                }
+            }
             Input::Recovery(RecoveryEvent::TransferProgress {
                 copy,
                 advertised_seq,
@@ -1423,6 +1434,12 @@ fn select(
         .map(lineage::VerifiedInventory::copy)
         .filter(|copy| is_regular(&plan.config, *copy))
         .collect();
+    // PR #74 F-001 (ruling A-R477): a copy the plan says must hold the barrier and that did not
+    // report blocks the run, named, instead of a commit without it.
+    let missing: Vec<CopyId> = plan.must_hold.difference(&required).copied().collect();
+    if !missing.is_empty() {
+        return block(BlockReason::BarrierIncomplete { missing }, emit);
+    }
     if let PartitionMode::Blocked { reason } = mode_for(required.len()) {
         return block(reason, emit);
     }

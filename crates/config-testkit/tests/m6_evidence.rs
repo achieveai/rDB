@@ -766,6 +766,17 @@ async fn m6_107_evidence_partition_matrix() {
         }
     }
 
+    // A put to a leader on the minority side fails at its write timeout, but the entry stays in
+    // that leader's log. If it keeps its term through the heal, the entry commits afterwards.
+    // Until then every node shows the same applied index and hash, so `wait_converged` above can
+    // pass first, and a hash taken later races that commit. One more acknowledged write is the
+    // barrier: once it is applied everywhere, every earlier entry is committed or truncated.
+    pre_partition_write(&cluster, "part/final_barrier").await;
+    cluster
+        .wait_converged(cluster.deadline(20))
+        .await
+        .unwrap_or_else(|t| panic!("voters disagree after the matrix: {t}"));
+
     // No acknowledged mutation lost, and no two of them share a revision.
     let leader = cluster.leader().await;
     let client = cluster.client(leader);

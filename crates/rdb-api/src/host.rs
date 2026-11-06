@@ -215,6 +215,31 @@ pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 /// `PeerBooted` instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
 pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
 
+/// Critic M2 (A-R442): how many records behind the primary's head a shadow may be when the owner
+/// promotes it. The promote's barrier replays the rest inside the fence, where writes pause, so
+/// this bounds the pause at promote: the catch-up cursor sends one record a round trip, and in the
+/// host rows 123 records behind paused writes 717 ms; at 32 the pause measured 133-193 ms
+/// (2026-10-26), under the 0.5 s goal with the re-plan's own cost. A shadow that keeps up
+/// trails by the records in flight, far below this; one that trails more is still catching up,
+/// and waits. If writes land faster than it catches up, it waits until they slow.
+pub const PROMOTE_LAG_RECORDS: u64 = 32;
+
+/// A-R458, A-R461: the most records a node reads ahead into its kept ladders in one duty: an
+/// owner's dormant ladder while a move's shadow catches up (`Host::warm_dormant_ladder`), and
+/// every held partition's inventory ladder (`Host::ladder_duty`). A full read of 20k records
+/// took 475-595 ms inside a re-plan's fence (2026-10-26); a thousand a duty spreads that
+/// outside it.
+pub const WARM_RUNGS: u64 = 1_000;
+
+/// A-R459, A-R463: how long a move's shadow may stay further than [`PROMOTE_LAG_RECORDS`]
+/// behind the owner's head with no progress before the owner gives the move up and keeps the
+/// source. Progress is a lag below every one seen since the clock began, or the bulk copy below
+/// the pin's cutoff advancing; either starts the clock again, so a history of any size moves.
+/// The catch-up sends one record a round trip, so a shadow under a write load faster than that,
+/// or on a slow link, never gets within the bound; without a deadline the move, and every other
+/// one, waited for good. Batched catch-up is the follow-up (workstream C).
+pub const MOVE_CATCH_UP_MILLIS: u64 = 90_000;
+
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
 const DROP_CHECK_EVERY_MILLIS: u64 = 200;
 
@@ -732,6 +757,30 @@ pub enum ClientCall {
         /// The generation the caller believes it ran in.
         generation: Option<Generation>,
     },
+    /// M11: move the copy on node `from` to node `to`, or say where that move stands
+    /// ([`Answer::Moved`]). Only the pinned primary takes it; asking again resumes a move. It
+    /// changes who holds a copy, and the owner completes it with its own store credentials, so
+    /// over a link only an admin app may send it (`NetConfig::admin_apps`, A-R479).
+    Move {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The member that gives its copy up.
+        from: NodeId,
+        /// The node that takes it, first as a shadow.
+        to: NodeId,
+    },
+    /// M11 T12 over processes: `admin rebuild node` from an app with no node of its own
+    /// ([`Answer::Rebuilt`]). Only the pinned primary takes it, and only for a node it does not
+    /// pin: a spare is noted for the free slot, a copy already left out is answered as it is.
+    /// Dropping a pinned copy needs the owner's own process. A noted spare is pinned once it
+    /// restarts, so this changes membership too: over a link only an admin app may send it
+    /// (`NetConfig::admin_apps`, A-R479).
+    Rebuild {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The node to take back.
+        node: NodeId,
+    },
 }
 
 /// One write of a [`ClientCall::Compile`]: apply `change` to `object` in affinity group
@@ -953,6 +1002,10 @@ pub enum Answer {
     Unchanged,
     /// A status query was answered.
     Status(TxnStatus),
+    /// Where a [`ClientCall::Move`] stands.
+    Moved(MoveAnswer),
+    /// A [`ClientCall::Rebuild`] was taken: the operator's line.
+    Rebuilt(String),
     /// The call failed.
     Error {
         /// Why.
@@ -961,6 +1014,16 @@ pub enum Answer {
         /// [`ClientCall::Resend`] caller already holds what it sent.
         request: Option<TxnRequest>,
     },
+}
+
+/// Where a copy move stands (M11): `done` once the target is pinned regular and the source is
+/// out. `line` is the operator's line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveAnswer {
+    /// The move has committed.
+    pub done: bool,
+    /// What to print.
+    pub line: String,
 }
 
 impl Answer {
@@ -1251,6 +1314,58 @@ struct Replan {
     promote: bool,
     /// When the revocation was asked.
     since: Tick,
+}
+
+/// M11: a copy move the owner was asked for, from its ask to the commit that pins `to`
+/// regular without `from`. Kept in memory only: once `to` is pinned as a shadow, asking again
+/// resumes it (D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyMove {
+    from: NodeId,
+    to: NodeId,
+    /// Set when the move was given up; the next ask answers it once and clears the entry.
+    abandoned: Option<String>,
+    /// A-R457 (a): the move ended by filling a free slot. Its promote found fewer than rf
+    /// regular copies, so the target was pinned regular and the source kept its copy.
+    /// `abandoned` says so, and the next ask answers it with [`MOVE_ENDED`], not with
+    /// [`MOVE_STEP`]'s claim that the move did nothing.
+    ///
+    /// [`MOVE_ENDED`]: crate::db::error::MOVE_ENDED
+    /// [`MOVE_STEP`]: crate::db::error::MOVE_STEP
+    filled: bool,
+    /// A-R459: the move was given up because its shadow stayed too far behind the head. Its
+    /// next ask says why even with the target reachable (T9 would start it afresh), and the ask
+    /// after that starts it afresh.
+    lagged: bool,
+}
+
+/// A-R463: a move's shadow found behind the head, and since when it has made no progress:
+/// its lag reached no new low, and the bulk copy below the pin's cutoff did not advance.
+#[derive(Debug, Clone, Copy)]
+struct CatchUp {
+    to: NodeId,
+    since: Tick,
+    /// The least the shadow was behind at any duty since the clock began.
+    low: u64,
+    /// What the shadow had acknowledged at the last duty.
+    acked: u64,
+}
+
+/// A-R458, A-R461: a ladder of verified digests this node keeps for one partition across
+/// re-plans, so a re-plan extends it by the records that arrived since instead of reading every
+/// record again. Two are kept: the one last given a dormant receiver (R1 drops the dormant
+/// receiver at each `Recovered`, so a re-plan restores a new one), and the one a survivor
+/// inventory reports. The digests chain, so a tip this engine still holds at the same digest
+/// proves every rung below it. A reopen starts with none.
+#[derive(Debug)]
+struct KeptLadder {
+    generation: Generation,
+    /// The plan's primary, node and boot, when a dormant ladder was read; `None` for an
+    /// inventory ladder.
+    owner: Option<(NodeId, BootId)>,
+    /// Every verified digest from the first rung through the tip, dense: `(0, ROOT)` for a
+    /// dormant ladder, the generation's base for an inventory ladder read cold (critic-s1b A1).
+    rungs: Vec<(Seq, Digest)>,
 }
 
 /// #65: an `admin rebuild` the owner answers once the commit that leaves `node` out lands.
@@ -1985,6 +2100,14 @@ struct Host {
     /// Partitions whose dormant receiver holds its full ladder (A-R173, critic-d7 F2): built
     /// once, by the first catch-up this node sources; a new dormant receiver forgets it.
     ladders: BTreeSet<PartitionId>,
+    /// A-R458: each partition's last dormant ladder, extended on the next source restore.
+    dormant_ladders: BTreeMap<PartitionId, KeptLadder>,
+    /// A-R461: each partition's survivor-inventory ladder, warmed by [`Self::ladder_duty`] and
+    /// extended by [`Self::survivor`], so a join's inventory reads only what arrived since.
+    inventory_ladders: BTreeMap<PartitionId, KeptLadder>,
+    /// Critic-s1b A2: how many passes [`Self::ladder_duty`] has made. Each starts one partition
+    /// further on, so a write rate above its budget cannot starve the partitions at the end.
+    ladder_passes: usize,
     /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
     /// once by the first `SnapshotCatchupRequired` served at that generation.
     primary_ladders: BTreeSet<(PartitionId, Generation)>,
@@ -2005,6 +2128,18 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// Per partition, the spares `admin rebuild` noted in `left_out` for a free slot (M11
+    /// A-R456, critic A5). A slot takes one note; a note is pending while its node is still left
+    /// out. Memory only: a new owner starts with none, so the operator re-runs the rebuild.
+    spare_notes: BTreeMap<PartitionId, BTreeSet<NodeId>>,
+    /// M11: per partition, the copy move this owner was asked for and has not yet answered
+    /// done ([`Host::move_step`]). Only the ask: where the move stands is read from the
+    /// commit's pinned members each time (D2, A-R452).
+    moves: BTreeMap<PartitionId, CopyMove>,
+    /// M11 (A-R452 amendment): per partition, the last move that committed here, `(from, to)`.
+    /// While the commit still shows it done it is answered `moved` on every ask, so a replayed
+    /// plan passes. In memory only: a restarted owner, or a new one, refuses the replay (T1).
+    moved: BTreeMap<PartitionId, (NodeId, NodeId)>,
     /// #65: per partition, the divergence evidence F1's last `Quarantine` reported, for
     /// `admin rebuild`'s G6. Kept until a rebuild replaces the quarantined F1.
     quarantines: BTreeMap<PartitionId, rdb_core::contracts::recovery::DivergenceEvidence>,
@@ -2061,6 +2196,21 @@ struct Host {
     /// #67 (A-R435): per (partition, pinned regular secondary), since when this owner has had
     /// no link to it ([`Self::count_unreachable`]).
     unreachable: BTreeMap<(PartitionId, NodeId), Unreachable>,
+    /// M11 T4: per partition, the shadow a move pinned and since when this owner has had no
+    /// link to it ([`Self::shadow_give_up_duty`]).
+    shadow_unreachable: BTreeMap<PartitionId, (NodeId, Tick)>,
+    /// A-R459, A-R463: per partition, the shadow a move this owner holds pinned while it is
+    /// further than [`PROMOTE_LAG_RECORDS`] behind the head, and its progress clock
+    /// ([`Self::move_lag_duty`]).
+    move_catching_up: BTreeMap<PartitionId, CatchUp>,
+    /// M11 T10: per partition, the promote re-plan (its generation and `since`) whose move
+    /// target this owner told F1 was lost ([`Self::move_target_lost_duty`]); told once a plan.
+    target_lost_told: BTreeMap<PartitionId, (Generation, Tick)>,
+    /// M11 T7: partitions whose revocation was asked while A1 held no grant. A1 records such a
+    /// revocation but answers no `DrainProof` (it has no view to supersede), so
+    /// [`Self::retry_blocked_rejoin`] asks it again as soon as A1 holds one, instead of after
+    /// `peer_drop_after_millis`.
+    revoke_unheld: BTreeSet<PartitionId>,
     /// Per partition, the planned re-plan F1 was first seen `Blocked` on by a drop check, and
     /// when: (generation, the plan's `since`, seen at). `blocked_ms` of `rejoin_replan_on_boot`,
     /// which is `None` when no drop check saw the block before the re-plan.
@@ -2068,6 +2218,8 @@ struct Host {
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
+    /// [`MOVE_CATCH_UP_MILLIS`]; crate tests set it directly.
+    move_catch_up_millis: u64,
     /// D9 (A-R398): a restart re-plan from an `Active` commit pins the restarted secondary as a
     /// shadow ([`Self::restart_shadowed`]). Crate rows of the regular rejoin path (F1 routes the
     /// catch-up, as it still does from any other commit) set it false.
@@ -2190,6 +2342,9 @@ impl Host {
             deferred_syncs: BTreeMap::new(),
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
+            dormant_ladders: BTreeMap::new(),
+            inventory_ladders: BTreeMap::new(),
+            ladder_passes: 0,
             primary_ladders: BTreeSet::new(),
             snapshots_served: BTreeSet::new(),
             committed_correlation: BTreeMap::new(),
@@ -2198,6 +2353,9 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
+            spare_notes: BTreeMap::new(),
+            moves: BTreeMap::new(),
+            moved: BTreeMap::new(),
             quarantines: BTreeMap::new(),
             rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
@@ -2216,9 +2374,14 @@ impl Host {
             latest_stall: BTreeMap::new(),
             boot_seen_while_planned: BTreeMap::new(),
             unreachable: BTreeMap::new(),
+            shadow_unreachable: BTreeMap::new(),
+            move_catching_up: BTreeMap::new(),
+            target_lost_told: BTreeMap::new(),
+            revoke_unheld: BTreeSet::new(),
             blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
+            move_catch_up_millis: MOVE_CATCH_UP_MILLIS,
             restart_shadow: true,
             instance: engine_instance,
             activation: BTreeMap::new(),
@@ -3031,6 +3194,9 @@ impl Host {
         if self.next_drop_check <= now {
             self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
             self.drop_duty(now);
+            let started = Instant::now();
+            self.ladder_duty();
+            self.slow_step("duty", || "ladder".to_owned(), started);
         }
         self.rebuild_duty(now);
         self.resend_caught_up(now);
@@ -5185,12 +5351,9 @@ impl Host {
     /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
     /// rejoiner) is re-added at once, and a copy dropped at its live boot waits for a restart.
     fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
-        let copies = config
-            .members
-            .iter()
-            .filter(|member| member.role != ReplicaRole::Shadow)
-            .count();
-        if copies >= crate::admin::members().len() {
+        // A-R455 (T11): a shadow holds a slot too, so a re-add pins only up to the free slots;
+        // an extra left-out node stays out rather than becoming a shadow with no slot to fill.
+        if config.members.len() >= crate::admin::members().len() {
             return None;
         }
         self.left_out.get(&partition)?.iter().copied().find(|left| {
@@ -5198,7 +5361,11 @@ impl Host {
                 .members
                 .iter()
                 .any(|member| member.node == left.node || member.copy == left.copy);
+            // An `admin rebuild` waiting on this drop is not undone by a re-add: the node
+            // comes back only once restarted on its wiped folder (M11, b3).
+            let rebuilding = self.rebuild_asks.values().any(|ask| ask.node == left.node);
             !pinned
+                && !rebuilding
                 && self
                     .links
                     .boot_of(left.node)
@@ -5309,6 +5476,17 @@ impl Host {
     fn start_revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, replan: Replan) {
         self.rejoins
             .insert(partition, Rejoin::Revoking { epoch, replan });
+        if self.authority.state().is_held() {
+            self.revoke_unheld.remove(&partition);
+        } else {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                epoch = epoch.0,
+                "revoke_asked_unheld"
+            );
+            self.revoke_unheld.insert(partition);
+        }
         let revoke = AuthorityEvent::RevokeEpochRequested { partition, epoch };
         self.push(
             Site {
@@ -5424,7 +5602,12 @@ impl Host {
                 ..*left
             })
         });
-        if let Some(member) = readded {
+        // M11 D1: a left-out target is the re-add above too; it is pinned once, as that.
+        let joining = readded
+            .is_none()
+            .then(|| self.move_shadow(partition, replan, &pinned.members))
+            .flatten();
+        for member in readded.into_iter().chain(joining) {
             members.push(member);
             members.sort_by_key(|member| member.copy);
         }
@@ -5446,7 +5629,17 @@ impl Host {
         let version = ConfigVersion(pinned.config_version.0 + 1);
         let generation = root.generation.next();
         let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
-        let plan = crate::admin::recovery_plan(
+        // PR #74 F-001 (ruling A-R477): a promote that leaves a copy out (a move's source) commits
+        // only with its rejoiner, the move's target, in the barrier. Otherwise F1 blocks naming
+        // it, and [`Self::move_blocked`] gives the move up with the source kept.
+        let must_hold: BTreeSet<CopyId> = replan
+            .rejoiner
+            .filter(|_| replan.promote && replan.drop.is_some())
+            .and_then(|node| members.iter().find(|member| member.node == node))
+            .map(|member| member.copy)
+            .into_iter()
+            .collect();
+        let mut plan = crate::admin::recovery_plan(
             anchor,
             version,
             members,
@@ -5454,6 +5647,7 @@ impl Host {
             view.grant_id,
             view.authority_generation,
         );
+        plan.must_hold = must_hold;
         let fence = FencingProof {
             partition,
             prior_generation: root.generation,
@@ -5477,7 +5671,9 @@ impl Host {
             dropped = ?replan.drop.map(|node| node.0),
             rejoiner = ?replan.rejoiner.map(|node| node.0),
             readded = ?readded.map(|member| member.node.0),
+            joining = ?joining.map(|member| member.node.0),
             shadowed = ?shadowed.map(|node| node.0),
+            must_hold = ?plan.must_hold.iter().map(|copy| copy.0).collect::<Vec<_>>(),
             "rejoin_plan"
         );
         self.rejoins
@@ -5512,7 +5708,7 @@ impl Host {
         }
         let Some(Rejoin::Planned {
             generation: planned,
-            ..
+            replan,
         }) = self.rejoins.get(&partition).copied()
         else {
             return;
@@ -5521,6 +5717,8 @@ impl Host {
             return;
         }
         self.rejoins.remove(&partition);
+        let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
+        self.move_committed(partition, generation, waited_ms);
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -5553,7 +5751,9 @@ impl Host {
             self.replan_on_boot(partition, now);
             self.retry_blocked_rejoin(partition, now);
             self.repair_duty(partition, now);
-            self.shadow_duty(partition);
+            self.shadow_duty(partition, now);
+            self.shadow_give_up_duty(partition, now);
+            self.move_target_lost_duty(partition);
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
             let Some((copy, durable)) = self.holding_up(partition, now) else {
@@ -5865,14 +6065,648 @@ impl Host {
             .collect()
     }
 
+    /// M11 thin slice: move the copy on `from` to `to`, or say where that move stands. Only the
+    /// pinned primary takes it. The move is two re-plans through the restart machinery: the
+    /// first pins `to` as a shadow (R1 catches it up off the stream, from seq 1), and once it
+    /// reaches the cutoff [`Self::shadow_duty`] pins it regular and leaves `from` out in one
+    /// commit. Membership changes only by those commits. Asking again resumes: the intent is
+    /// in memory, and once `to` is pinned as a shadow the pin itself says what is moving (D2).
+    /// Every refusal changes nothing and names the next step.
+    fn move_step(
+        &mut self,
+        partition: PartitionId,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<MoveAnswer, ApiError> {
+        let step = crate::db::error::MOVE_STEP;
+        let refuse = |detail: String| Err(ApiError::invalid(format!("{detail}; {step}")));
+        let wait = |detail: String| {
+            let mut error = ApiError::new(ErrorKind::Unavailable, format!("{detail}; {step}"));
+            error.no_mutation = true;
+            Err(error)
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return wait(format!(
+                "node {} has committed no generation of partition {} yet: run the move again \
+                 once it serves",
+                self.node.0, partition.0
+            ));
+        };
+        let members = committed.committed.pinned_config.members.clone();
+        let generation = committed.new_generation;
+        let mode = committed.mode.clone();
+        let epoch = committed.selected.root.owner_epoch;
+        let owner = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| member.node);
+        self.answers_as_owner(partition, owner)?;
+        if from == to {
+            return refuse(format!(
+                "node {} is both the source and the target: name two different nodes",
+                from.0
+            ));
+        }
+        if from == self.node {
+            // D3: the owner's copy moves only after the ownership does.
+            return refuse(format!(
+                "node {} owns partition {}: move the ownership first with `admin promote <other \
+                 node> --drop {}`, then move its copy",
+                from.0, partition.0, from.0
+            ));
+        }
+        let role = |node: NodeId| {
+            members
+                .iter()
+                .find(|member| member.node == node)
+                .map(|member| member.role)
+        };
+        let mut asked = self.moves.get(&partition).cloned();
+        // Another ask that was given up, or whose move the commit shows done, is over.
+        let over = |mv: &CopyMove| {
+            mv.abandoned.is_some()
+                || (role(mv.from).is_none() && role(mv.to) == Some(ReplicaRole::RegularSecondary))
+        };
+        if asked
+            .as_ref()
+            .is_some_and(|mv| over(mv) && (mv.from, mv.to) != (from, to))
+        {
+            self.moves.remove(&partition);
+            asked = None;
+        }
+        let mut ours = asked
+            .as_ref()
+            .is_some_and(|mv| (mv.from, mv.to) == (from, to));
+        if let Some((why, filled, lagged)) = asked
+            .as_ref()
+            .filter(|_| ours)
+            .and_then(|mv| mv.abandoned.clone().map(|why| (why, mv.filled, mv.lagged)))
+        {
+            self.moves.remove(&partition);
+            if filled {
+                // A-R457 (a): the move pinned the target regular in a free slot and kept the
+                // source; that is what it did, so the answer does not say it did nothing.
+                let mut error = ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!("{why}; {}", crate::db::error::MOVE_ENDED),
+                );
+                error.no_mutation = true;
+                return Err(error);
+            }
+            // T9: once the give-up has committed and the target is reachable again, the re-run
+            // starts the move afresh instead of repeating why the last one was given up.
+            let back = role(to).is_none()
+                && !self.rejoins.contains_key(&partition)
+                && self.linked(to)
+                && self.links.boot_of(to).is_some();
+            // A-R459: a move given up for lag had its target reachable throughout, so `back`
+            // would hold at once and the reason would never be said. It is said once; the entry
+            // is gone, so the next ask starts the move afresh.
+            if lagged || !back {
+                return wait(why);
+            }
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = to.0,
+                "move_given_up_cleared"
+            );
+            asked = None;
+            ours = false;
+        }
+        match (role(from), role(to)) {
+            // A-R452: `moved` answers the ask this owner ran, or replays the move that last
+            // committed here (amendment). The record cannot tell a source a move left out from
+            // one that never held a copy (T1), so any other ask is refused.
+            (None, Some(ReplicaRole::RegularSecondary))
+                if ours || self.moved.get(&partition) == Some(&(from, to)) =>
+            {
+                if ours {
+                    self.moves.remove(&partition);
+                }
+                return Ok(MoveAnswer {
+                    done: true,
+                    line: format!(
+                        "moved: node {} regular, node {} left out; partition {} is at \
+                         generation {} now",
+                        to.0, from.0, partition.0, generation.0
+                    ),
+                });
+            }
+            // T1: a source with no copy is refused unless this owner ran that move.
+            (None, _) => {
+                return refuse(format!(
+                    "node {} holds no copy of partition {} (members: {}): run `admin status` to \
+                     see whether a move already took it, or name a member as the source",
+                    from.0,
+                    partition.0,
+                    member_list(&members)
+                ));
+            }
+            (_, Some(ReplicaRole::Primary)) => {
+                return refuse(format!(
+                    "node {} already holds partition {}'s copy as its owner: name a node with \
+                     no copy as the target",
+                    to.0, partition.0
+                ));
+            }
+            // T7 paper cut: both still hold copies, so no move between them runs here; one asked
+            // of an earlier owner was lost with it.
+            (Some(_), Some(ReplicaRole::RegularSecondary)) => {
+                return refuse(format!(
+                    "node {} already holds a regular copy of partition {}, and node {} still \
+                     holds its copy: no move between them runs on node {} (the owner); one \
+                     asked of an earlier owner was lost with it. Name a node with no copy as \
+                     the target",
+                    to.0, partition.0, from.0, self.node.0
+                ));
+            }
+            (Some(ReplicaRole::Shadow), _) => {
+                return refuse(format!(
+                    "node {} is a shadow of partition {}, not a regular copy: wait until it is \
+                     regular, then move it",
+                    from.0, partition.0
+                ));
+            }
+            _ => {}
+        }
+        let shadow = role(to) == Some(ReplicaRole::Shadow);
+        let regular = members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        let rf = crate::admin::members().len();
+        // A-R457 (a): below rf regular copies the promote fills the free slot and keeps the
+        // source, so the line says that instead of "leaving node N out".
+        let fills = regular < rf;
+        let progress = |replanning: bool| {
+            let line = match (shadow, replanning) {
+                (true, _) if fills => format!(
+                    "moving: node {} catching up as a shadow; only {regular} of {rf} copies are \
+                     regular (members: {}), so once it is caught up node {} fills the free slot \
+                     and node {} keeps its copy; node {} then holds a regular copy too, so to \
+                     move node {}'s copy afterwards, name a node with no copy: `admin move {} \
+                     <node with no copy>`",
+                    to.0,
+                    member_list(&members),
+                    to.0,
+                    from.0,
+                    to.0,
+                    from.0,
+                    from.0
+                ),
+                (false, _) => format!("moving: node {} joining as a shadow", to.0),
+                (true, false) => format!("moving: node {} catching up as a shadow", to.0),
+                (true, true) => format!(
+                    "moving: node {} caught up; pinning it regular and leaving node {} out",
+                    to.0, from.0
+                ),
+            };
+            Ok(MoveAnswer { done: false, line })
+        };
+        if self.rejoins.contains_key(&partition) {
+            if ours {
+                return progress(true);
+            }
+            return wait(format!(
+                "a re-plan of partition {} is running: run the move again once it commits",
+                partition.0
+            ));
+        }
+        if let Some(other) = asked.filter(|_| !ours) {
+            return wait(format!(
+                "the move of node {} to node {} is still running: run `admin move {} {}` to \
+                 follow it, then this one",
+                other.from.0, other.to.0, other.from.0, other.to.0
+            ));
+        }
+        if let Some(other) = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Shadow && member.node != to)
+        {
+            let regular = members
+                .iter()
+                .filter(|member| member.role != ReplicaRole::Shadow)
+                .count();
+            // A-R455: "catching up" names only a shadow that holds a free slot.
+            if regular < crate::admin::members().len() {
+                return wait(format!(
+                    "node {} is pinned as a shadow of partition {} and still catching up: run \
+                     the move again once it is regular",
+                    other.node.0, partition.0
+                ));
+            }
+            return wait(format!(
+                "node {} is pinned as a shadow of partition {} beside all {} regular copies: an \
+                 earlier move onto it was not finished. Finish it with `admin move <source> {}`, \
+                 then run this move",
+                other.node.0, partition.0, regular, other.node.0
+            ));
+        }
+        if role(to) == Some(ReplicaRole::Shadow) && !self.linked(to) {
+            // T4: the pin stays, so the move goes on by itself once the target is back.
+            return wait(format!(
+                "node {} is pinned as this move's shadow but is not reachable from node {} (the \
+                 owner): start it (`lr start {}`) and the move goes on; unreachable for {} ms \
+                 in all, the move is given up, node {} is left out and node {} keeps its copy",
+                to.0, self.node.0, to.0, self.peer_drop_after_millis, to.0, from.0
+            ));
+        }
+        if ours && shadow && fills {
+            return progress(false);
+        }
+        if !self.linked(to) || self.links.boot_of(to).is_none() {
+            return wait(format!(
+                "node {} is not reachable from node {} (the owner): start it (`lr start {}`), or \
+                 name a node that runs, and run the move again",
+                to.0, self.node.0, to.0
+            ));
+        }
+        if regular < rf && members.len() < rf {
+            // A-R456: a copy is missing and a slot is free; the way back is a rebuild onto a
+            // spare, which `to` is.
+            return wait(format!(
+                "partition {} serves {mode:?} with {regular} regular copies (members: {}): a move \
+                 needs all {rf} serving. A copy is missing: run `admin rebuild {}` to pin node {} \
+                 in the free slot, then run the move again",
+                partition.0,
+                member_list(&members),
+                to.0,
+                to.0
+            ));
+        }
+        if mode != PartitionMode::Active || regular != rf {
+            return wait(format!(
+                "partition {} serves {mode:?} with {regular} regular copies (members: {}): a move \
+                 needs all {rf} serving; run it again once they are",
+                partition.0,
+                member_list(&members)
+            ));
+        }
+        let taken = move_copy_id(to)
+            .is_none_or(|copy| !shadow && members.iter().any(|member| member.copy == copy));
+        if taken {
+            return refuse(format!(
+                "node {}'s copy id is taken in partition {} (members: {}): name another node",
+                to.0,
+                partition.0,
+                member_list(&members)
+            ));
+        }
+        self.moves.insert(
+            partition,
+            CopyMove {
+                from,
+                to,
+                abandoned: None,
+                filled: false,
+                lagged: false,
+            },
+        );
+        if shadow {
+            // Resumed (D2): the pin names the shadow; shadow_duty promotes it once caught up.
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                from = from.0,
+                to = to.0,
+                "move_resumed"
+            );
+            return progress(false);
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            from = from.0,
+            to = to.0,
+            "move_started"
+        );
+        let replan = Replan {
+            drop: None,
+            rejoiner: Some(to),
+            promote: false,
+            since: self.clock.now(),
+        };
+        self.start_revoke(partition, epoch, replan);
+        progress(false)
+    }
+
+    /// M11: the shadow a move pins, when `replan` is that move's first re-plan: `to` is the
+    /// rejoiner, not pinned, and this owner holds the move. It joins at its live boot under
+    /// [`move_copy_id`]; R1 feeds it off the stream and F1's barrier skips it.
+    fn move_shadow(
+        &self,
+        partition: PartitionId,
+        replan: Replan,
+        pinned: &[Member],
+    ) -> Option<Member> {
+        let mv = self.moves.get(&partition)?;
+        if replan.promote
+            || mv.abandoned.is_some()
+            || replan.rejoiner != Some(mv.to)
+            || pinned.iter().any(|member| member.node == mv.to)
+        {
+            return None;
+        }
+        let copy = move_copy_id(mv.to)?;
+        if pinned.iter().any(|member| member.copy == copy) {
+            return None;
+        }
+        Some(Member {
+            copy,
+            node: mv.to,
+            boot: self.links.boot_of(mv.to)?,
+            role: ReplicaRole::Shadow,
+        })
+    }
+
+    /// M11: a commit that ends one of a move's re-plans, `waited_ms` after its revocation was
+    /// asked: the pause writes saw. Once `to` is regular and `from` is out, `from` is no longer
+    /// a left-out member (T3); the ask is answered `moved` by the next `move_step`.
+    fn move_committed(&mut self, partition: PartitionId, generation: Generation, waited_ms: u64) {
+        let Some(mv) = self.moves.get(&partition).cloned() else {
+            return;
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let role = |node: NodeId| {
+            members
+                .iter()
+                .find(|member| member.node == node)
+                .map(|member| member.role)
+        };
+        let phase = match (role(mv.from), role(mv.to)) {
+            (None, Some(ReplicaRole::RegularSecondary)) => "moved",
+            (_, Some(ReplicaRole::Shadow)) => "shadow_pinned",
+            (Some(_), Some(ReplicaRole::RegularSecondary)) if mv.abandoned.is_none() => "filled",
+            _ => "other",
+        };
+        if phase == "filled" {
+            // A-R457 (a): the promote found fewer than rf regular copies, so `shadow_duty` kept
+            // the source: the target filled the free slot and the move ends here.
+            let why = format!(
+                "the move of node {} to node {} ended without leaving node {} out: when node {} \
+                 caught up, too few copies were regular, so node {} filled the free slot at \
+                 generation {} and node {} kept its copy (members: {}). To move node {}'s copy \
+                 now, name a node with no copy: `admin move {} <node with no copy>`",
+                mv.from.0,
+                mv.to.0,
+                mv.from.0,
+                mv.to.0,
+                mv.to.0,
+                generation.0,
+                mv.from.0,
+                member_list(members),
+                mv.from.0,
+                mv.from.0
+            );
+            self.moves.insert(
+                partition,
+                CopyMove {
+                    abandoned: Some(why),
+                    filled: true,
+                    ..mv.clone()
+                },
+            );
+        }
+        if phase == "moved" {
+            // A-R462 (critic-s1b F1): the move is over; `moved` answers every later ask, so the
+            // entry goes now. Kept, it read as a live move to `unwaited_shadows` and
+            // `shadow_duty` once its target restarted as a shadow.
+            self.moves.remove(&partition);
+            self.moved.insert(partition, (mv.from, mv.to));
+            // T3 (critic M4): the copy moved away; the source is a spare now, not a member a
+            // drop left out, so its restart re-adds nothing.
+            if let Some(left) = self.left_out.get_mut(&partition) {
+                left.retain(|member| member.node != mv.from);
+            }
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            from = mv.from.0,
+            to = mv.to.0,
+            phase,
+            waited_ms,
+            "move_committed"
+        );
+    }
+
+    /// M11 (critic M1): F1 blocked a move's re-plan on the target's copy. The move is given up
+    /// and the commit's members are planned again without the target, so the source keeps its
+    /// copy: the target, if already pinned as a shadow, is left out. `true` when it was.
+    fn move_blocked(
+        &mut self,
+        partition: PartitionId,
+        replan: Replan,
+        reason: &BlockReason,
+        members: &[Member],
+        epoch: OwnerEpoch,
+    ) -> bool {
+        let Some(mv) = self.moves.get(&partition).cloned() else {
+            return false;
+        };
+        if mv.abandoned.is_some() || replan.rejoiner != Some(mv.to) {
+            return false;
+        }
+        let pinned = members.iter().find(|member| member.node == mv.to);
+        let Some(copy) = pinned.map(|member| member.copy).or(move_copy_id(mv.to)) else {
+            return false;
+        };
+        if named_by_block(reason, Some(copy)) != Some(copy) {
+            return false;
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            from = mv.from.0,
+            to = mv.to.0,
+            waited_ms = HostClock::millis_until(replan.since, self.clock.now()),
+            reason = ?reason,
+            "move_abandoned"
+        );
+        let why = format!(
+            "the move of node {} to node {} was given up: recovery could not reach node {}'s \
+             copy ({reason:?}); node {} keeps its copy. Check node {} and run the move again",
+            mv.from.0, mv.to.0, mv.to.0, mv.from.0, mv.to.0
+        );
+        self.moves.insert(
+            partition,
+            CopyMove {
+                abandoned: Some(why),
+                ..mv
+            },
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, pinned.map(|member| member.node), None);
+        true
+    }
+
+    /// M11 T4, A-R457 (b): a shadow this owner has had no link to for `peer_drop_after_millis`
+    /// is given up, whatever the regular count: the owner re-plans without it, as
+    /// [`Self::move_blocked`] does, and the source keeps its copy. A move this owner holds for it
+    /// is marked given up, so its next ask says why. Without the bound a dead target held the
+    /// pin, and every other move, for good. Logged `move_shadow_unreachable` when the clock
+    /// starts and `move_given_up` when it ends.
+    fn shadow_give_up_duty(&mut self, partition: PartitionId, now: Tick) {
+        let target = self
+            .committed
+            .get(&partition)
+            .filter(|_| !self.rejoins.contains_key(&partition))
+            .and_then(|committed| {
+                let members = &committed.committed.pinned_config.members;
+                let owner = members
+                    .iter()
+                    .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+                // A-R457 (b): whatever the regular count. A shadow in a free slot (a spare's
+                // rebuild, a re-add) that died for good held that slot, and so every rebuild
+                // and move, until it came back.
+                if !owner {
+                    return None;
+                }
+                members
+                    .iter()
+                    .find(|member| member.role == ReplicaRole::Shadow)
+                    .map(|member| (member.node, committed.selected.root.owner_epoch))
+            })
+            .filter(|(node, _)| !self.linked(*node));
+        let Some((node, epoch)) = target else {
+            self.shadow_unreachable.remove(&partition);
+            return;
+        };
+        let since = match self.shadow_unreachable.get(&partition) {
+            Some((counted, since)) if *counted == node => *since,
+            _ => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    shadow = node.0,
+                    "move_shadow_unreachable"
+                );
+                self.shadow_unreachable.insert(partition, (node, now));
+                return;
+            }
+        };
+        let waited_ms = HostClock::millis_until(since, now);
+        if waited_ms < self.peer_drop_after_millis {
+            return;
+        }
+        self.shadow_unreachable.remove(&partition);
+        let held = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.to == node && mv.abandoned.is_none())
+            .cloned();
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            shadow = node.0,
+            from = ?held.as_ref().map(|mv| mv.from.0),
+            waited_ms,
+            "move_given_up"
+        );
+        if let Some(mv) = held {
+            let why = format!(
+                "the move of node {} to node {} was given up: node {} was unreachable from node \
+                 {} (the owner) for {waited_ms} ms; node {} keeps its copy. Start node {} and \
+                 run the move again",
+                mv.from.0, mv.to.0, mv.to.0, self.node.0, mv.from.0, mv.to.0
+            );
+            self.moves.insert(
+                partition,
+                CopyMove {
+                    abandoned: Some(why),
+                    ..mv
+                },
+            );
+        }
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(node), None);
+    }
+
+    /// M11 T10 (ruling A-R454): a move's promote whose target this owner has no link to while
+    /// F1 waits on it before commit (`Synchronizing` or `Barrier`). F1 is told the target's
+    /// copy is lost (`CopyLost`, to F1 alone), so it blocks on it at once rather than retrying
+    /// the barrier for 2+4+8 discovery windows, and [`Self::move_blocked`] gives the move up
+    /// with the source kept. Told once per plan; logged `move_target_lost`.
+    fn move_target_lost_duty(&mut self, partition: PartitionId) {
+        let Some(Rejoin::Planned { generation, replan }) = self.rejoins.get(&partition).copied()
+        else {
+            self.target_lost_told.remove(&partition);
+            return;
+        };
+        let plan = (generation, replan.since);
+        if !replan.promote || self.target_lost_told.get(&partition) == Some(&plan) {
+            return;
+        }
+        let Some(to) = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.abandoned.is_none() && replan.rejoiner == Some(mv.to))
+            .map(|mv| mv.to)
+        else {
+            return;
+        };
+        let waiting = matches!(
+            self.recoveries.get(&partition).map(Recovery::phase),
+            Some(RecoveryPhase::Synchronizing | RecoveryPhase::Barrier)
+        );
+        if !waiting || self.linked(to) {
+            return;
+        }
+        let pinned = self.committed.get(&partition).and_then(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.node == to)
+                .map(|member| member.copy)
+        });
+        let Some(copy) = pinned.or(move_copy_id(to)) else {
+            return;
+        };
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            to = to.0,
+            copy = copy.0,
+            waited_ms = HostClock::millis_until(replan.since, self.clock.now()),
+            "move_target_lost"
+        );
+        self.target_lost_told.insert(partition, plan);
+        self.push(
+            Site {
+                partition,
+                correlation: REJOIN,
+            },
+            EventKind::Kernel(KernelEvent::CopyLost { copy }),
+            false,
+            Some(ModuleName::Recovery),
+        );
+    }
+
     /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
     /// drop left out and a restart re-added, [`Self::readd_candidate`]) has applied up to the
     /// commit's cutoff, as this primary's tracker last admitted it, the owner re-plans with it
     /// as the rejoiner, and [`Self::drained`] pins it as a regular secondary. That run's F1
     /// catches up what it still lacks and syncs it in the barrier before L1 counts it. Nothing
     /// while a re-plan runs, or on a node that is not the commit's pinned primary.
-    fn shadow_duty(&mut self, partition: PartitionId) {
+    fn shadow_duty(&mut self, partition: PartitionId, now: Tick) {
+        // A-R459: the lag clock runs only while each duty finds the move's shadow behind.
+        let lagging = self.move_catching_up.remove(&partition);
+        // A-R464 (critic-s1c R1): a duty that cannot judge the shadow puts the clock back, so a
+        // re-plan or a link down for one duty does not start it again; only progress does.
         if self.rejoins.contains_key(&partition) {
+            if let Some(clock) = lagging {
+                self.move_catching_up.insert(partition, clock);
+            }
             return;
         }
         let Some(committed) = self.committed.get(&partition) else {
@@ -5889,9 +6723,45 @@ impl Host {
         else {
             return;
         };
+        // T8: a shadow this owner has no link to is not promoted, however far it got: the
+        // promote would leave the source out for a copy that may be gone. A move's shadow is
+        // given up past the drop clock instead ([`Self::shadow_give_up_duty`]).
         if !owner {
             return;
         }
+        if !self.linked(shadow.node) {
+            if let Some(clock) = lagging {
+                self.move_catching_up.insert(partition, clock);
+            }
+            return;
+        }
+        // M11: a shadow pinned beside all rf3 regular copies is a move's target. It is promoted
+        // only for the move this owner holds, and the promote leaves the source out; with no
+        // move held (this owner restarted or was promoted since), it waits for `admin move`
+        // to be asked again (D2).
+        let regular = members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        let moving = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.to == shadow.node && mv.abandoned.is_none())
+            .map(|mv| mv.from);
+        if moving.is_none() && regular >= crate::admin::members().len() {
+            return;
+        }
+        // A-R457 (a): below rf regular copies the shadow fills the free slot and the source
+        // keeps its copy; dropping it would leave fewer copies than were reachable.
+        let rf = crate::admin::members().len();
+        let drop = moving
+            .filter(|from| regular >= rf && members.iter().any(|member| member.node == *from));
+        let generation = committed.new_generation;
+        let ladder_owner = Self::ladder_owner(&committed.committed.pinned_config);
+        self.warm_dormant_ladder(partition, generation, ladder_owner);
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
         let Some(primary) = self.replication.primary(self.node, partition) else {
             return;
         };
@@ -5900,10 +6770,25 @@ impl Host {
             .peer(shadow.copy)
             .map_or(0, |peer| peer.progress.buffered_applied.0);
         let cutoff = committed.selected.cutoff_seq;
-        if acked < cutoff.0 {
+        // Critic M2 (A-R442): the promote's barrier replays what the shadow still lacks inside
+        // the fence, so writes pause for as long as that takes. Promote only once the shadow is
+        // within PROMOTE_LAG_RECORDS of the head: the pause is bounded by that, not by how
+        // many writes landed while it caught up.
+        let head = primary.tracker().head().0;
+        let epoch = committed.selected.root.owner_epoch;
+        let behind = head.saturating_sub(acked);
+        if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
+            if moving.is_some() {
+                let seen = CatchUp {
+                    to: shadow.node,
+                    since: now,
+                    low: behind,
+                    acked,
+                };
+                self.move_lag_duty(partition, lagging, seen, cutoff.0, epoch);
+            }
             return;
         }
-        let epoch = committed.selected.root.owner_epoch;
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -5912,15 +6797,90 @@ impl Host {
             copy = shadow.copy.0,
             acked,
             cutoff = cutoff.0,
+            head,
+            dropped = ?drop.map(|node| node.0),
             "shadow_promote"
         );
         let replan = Replan {
-            drop: None,
+            drop,
             rejoiner: Some(shadow.node),
             promote: true,
             since: self.clock.now(),
         };
         self.start_revoke(partition, epoch, replan);
+    }
+
+    /// A-R459, A-R463: a move's shadow (`seen.to`) that this owner found `seen.low` records
+    /// behind its head, further than [`PROMOTE_LAG_RECORDS`], having acknowledged `seen.acked`.
+    /// The clock starts at the first such duty and runs while no duty sees progress: a lag below
+    /// every one seen since the clock began, or, below the pin's `cutoff`, the bulk copy
+    /// advancing (`lagging` is the entry this duty took). Either starts it again. Past
+    /// `move_catch_up_millis` with no progress the move is given up as
+    /// [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without the shadow and the
+    /// source keeps its copy, and the move's next ask says the copy made no progress. Logged
+    /// `move_catch_up_given_up` (warn).
+    fn move_lag_duty(
+        &mut self,
+        partition: PartitionId,
+        lagging: Option<CatchUp>,
+        seen: CatchUp,
+        cutoff: u64,
+        epoch: OwnerEpoch,
+    ) {
+        let (to, behind, now) = (seen.to, seen.low, seen.since);
+        let clock = match lagging {
+            Some(last) if last.to == to => {
+                let progress =
+                    behind < last.low || (last.acked < cutoff && seen.acked > last.acked);
+                CatchUp {
+                    since: if progress { now } else { last.since },
+                    low: last.low.min(behind),
+                    ..seen
+                }
+            }
+            _ => seen,
+        };
+        let waited_ms = HostClock::millis_until(clock.since, now);
+        if waited_ms < self.move_catch_up_millis {
+            self.move_catching_up.insert(partition, clock);
+            return;
+        }
+        let Some(mv) = self.moves.get(&partition).cloned() else {
+            return;
+        };
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            from = mv.from.0,
+            to = to.0,
+            behind,
+            waited_ms,
+            "move_catch_up_given_up"
+        );
+        let why = format!(
+            "the move of node {} to node {} was given up: node {} made no progress for {} s and \
+             was still {behind} records behind node {}'s head, and it is promoted only within \
+             {PROMOTE_LAG_RECORDS}: writes are arriving faster than the copy catches up, or its \
+             link from node {} is slow. Node {} keeps its copy. Run the move again when the \
+             write load drops or the link recovers",
+            mv.from.0,
+            to.0,
+            to.0,
+            waited_ms / 1_000,
+            self.node.0,
+            self.node.0,
+            mv.from.0
+        );
+        self.moves.insert(
+            partition,
+            CopyMove {
+                abandoned: Some(why),
+                lagged: true,
+                ..mv
+            },
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(to), None);
     }
 
     /// The regular secondaries `partition`'s commit pins, while that commit is `ReadOnly`, this
@@ -5961,6 +6921,36 @@ impl Host {
             (node, me)
         };
         !self.links.held().contains(&pair)
+    }
+
+    /// A-R460: the shadows of `partition`'s plan whose inventory F1 is told failed at once
+    /// instead of asked for: a move's target, and a copy this plan adds that the committed
+    /// configuration does not pin (a join or a rebuild's re-add). F1 waits for every copy it
+    /// asks until its window's deadline, so a held or slow target paused writes for the whole
+    /// 2 s at a join (tester walk at 6c93326). Such a copy holds nothing a write was acked on:
+    /// a shadow never counts, and the owner holds everything the shadow could have been sent.
+    /// A shadow the plan keeps from the committed configuration that is not a move's target,
+    /// a restarted regular among them, is still asked: its report can name a divergence (B3).
+    /// A-R462: a given-up move's entry names no target, and with no committed record yet (a
+    /// reopen, before `Recovered`) nothing is known to be new, so every shadow is asked.
+    fn unwaited_shadows(&self, partition: PartitionId, members: &[Member]) -> BTreeSet<NodeId> {
+        let Some(committed) = self.committed.get(&partition) else {
+            return BTreeSet::new();
+        };
+        let pinned = committed.committed.pinned_config.members.as_slice();
+        let target = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.abandoned.is_none())
+            .map(|mv| mv.to);
+        members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::Shadow)
+            .filter(|member| {
+                Some(member.node) == target || !pinned.iter().any(|kept| kept.node == member.node)
+            })
+            .map(|member| member.node)
+            .collect()
     }
 
     /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
@@ -6106,8 +7096,12 @@ impl Host {
         let Some(committed) = self.committed.get(&partition) else {
             return;
         };
-        let members = &committed.committed.pinned_config.members;
+        let members = committed.committed.pinned_config.members.clone();
+        let members = &members;
         let epoch = committed.selected.root.owner_epoch;
+        if self.move_blocked(partition, replan, reason, members, epoch) {
+            return;
+        }
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         // A-R329: a re-add F1 blocks on is given up, and the commit's members are planned
         // again. The member stays left out at the boot it was planned at, so only another
@@ -6215,6 +7209,19 @@ impl Host {
             Some(Rejoin::Planned { generation, replan }) => (generation, replan),
             Some(Rejoin::Revoking { epoch, replan }) => {
                 let waited_ms = HostClock::millis_until(replan.since, now);
+                // T7: asked before A1 held a grant, so no proof is coming; ask again now that
+                // it holds one. `since` stays, so the pause counts from the first ask.
+                if self.authority.state().is_held() && self.revoke_unheld.contains(&partition) {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        epoch = epoch.0,
+                        waited_ms,
+                        "rejoin_revoke_reasked_held"
+                    );
+                    self.start_revoke(partition, epoch, replan);
+                    return;
+                }
                 if waited_ms >= self.peer_drop_after_millis {
                     tracing::warn!(
                         node = self.node.0,
@@ -6345,9 +7352,10 @@ impl Host {
         reply: RebuildReply,
     ) {
         use crate::admin::rebuild::{decide, kept, Asked, Ready, RebuildMode, Refused};
+        let me = self.node;
         let refuse = |reply: &RebuildReply, refused: Refused| {
             tracing::warn!(
-                node = self.node.0,
+                node = me.0,
                 partition = partition.0,
                 rebuild = node.0,
                 guard = refused.guard,
@@ -6374,18 +7382,20 @@ impl Host {
                     plan.anchor.lineage.generation,
                     RebuildBasis::Quarantined(Box::new((plan, fence))),
                 ),
+                // M-MC2 (final walk 7b4762b), A-R465: asked straight after a reopen, the owner is
+                // still recovering, so "ask the node that owns it" pointed at itself. The text
+                // names what this branch holds: no commit since this node started, and no
+                // quarantined run to rebuild from, said per F1 phase.
                 None => {
+                    let phase = self.recoveries.get(&partition).map(Recovery::phase);
                     return refuse(
                         &reply,
-                        Refused {
-                            guard: "owner",
-                            detail: format!(
-                                "node {} has committed no recovery of partition {}, so it cannot \
-                                 rebuild a copy: ask the node that owns it",
-                                self.node.0, partition.0
-                            ),
-                        },
-                    )
+                        crate::admin::rebuild::no_commit_refusal(
+                            self.node,
+                            partition,
+                            phase.as_ref(),
+                        ),
+                    );
                 }
             },
         };
@@ -6409,7 +7419,16 @@ impl Host {
                 },
             );
         }
-        let known: Vec<NodeId> = crate::admin::members().iter().map(|m| m.node).collect();
+        let mut known: Vec<NodeId> = crate::admin::members().iter().map(|m| m.node).collect();
+        // A-R456 (T12): a spare, configured and not pinned, is a node a rebuild may pin. This
+        // owner counts one configured when it holds a link to it at a boot.
+        let pinned = members.iter().any(|member| member.node == node);
+        let spare = !pinned
+            && (1..=crate::db::MAX_NODES).contains(&node.0)
+            && self.links.boot_of(node).is_some();
+        if spare && !known.contains(&node) {
+            known.push(node);
+        }
         let asked = Asked {
             node,
             owner: self.node,
@@ -6442,6 +7461,17 @@ impl Host {
             "rebuild_asked"
         );
         if mode == RebuildMode::NotPinned {
+            let left = self
+                .left_out
+                .get(&partition)
+                .is_some_and(|left| left.iter().any(|member| member.node == node));
+            if !left {
+                let pinned_now = members.to_vec();
+                if let Err(refused) = self.rebuild_spare(partition, node, &pinned_now) {
+                    return refuse(&reply, refused);
+                }
+            }
+            let members = &self.committed[&partition].committed.pinned_config.members;
             reply.send(Ok(Ready {
                 mode,
                 generation,
@@ -6574,6 +7604,228 @@ impl Host {
                 None,
             );
         }
+    }
+
+    /// M11 critic A4: an admin call (`move_step`, `rebuild_from_app`) is answered only by the
+    /// owner its last commit names, and only while it holds the grant. A deposed owner's commit
+    /// is stale: it is refused `NotPrimary`, naming no node, changing nothing.
+    fn answers_as_owner(
+        &self,
+        partition: PartitionId,
+        owner: Option<NodeId>,
+    ) -> Result<(), ApiError> {
+        let held = self.authority.state().is_held();
+        if owner == Some(self.node) && held {
+            return Ok(());
+        }
+        let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+            partition,
+            hint: if held { owner } else { None },
+        });
+        error.no_mutation = true;
+        Err(error)
+    }
+
+    /// M11 T12 over processes (lead ruling on dev-a item 1, tester T13): `admin rebuild node`
+    /// sent by an app with no node of its own. Only the pinned primary answers, as a move. A node
+    /// this commit pins is refused with nothing changed: dropping it is mode B or C, which needs
+    /// the owner's own process. Otherwise [`Self::rebuild_asked`] answers in this step (mode A):
+    /// a spare is noted for the free slot ([`Self::rebuild_spare`]), and a copy already left out
+    /// is answered as it is. Each answer names what the operator does next.
+    fn rebuild_from_app(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+    ) -> Result<String, ApiError> {
+        let process = |detail: String| {
+            Err(crate::db::rebuild_refused(crate::admin::rebuild::Refused {
+                guard: "process",
+                detail,
+            }))
+        };
+        if let Some(committed) = self.committed.get(&partition) {
+            let members = &committed.committed.pinned_config.members;
+            let owner = members
+                .iter()
+                .find(|member| member.role == ReplicaRole::Primary)
+                .map(|member| member.node);
+            self.answers_as_owner(partition, owner)?;
+            // A-R457 (c): a shadow is given up by the drop clock alone, not by a write.
+            if members
+                .iter()
+                .any(|member| member.node == node && member.role == ReplicaRole::Shadow)
+            {
+                return process(format!(
+                    "node {} is pinned as a shadow, catching up into a free slot: wait until it \
+                     is regular (`admin status` shows it). If node {} is lost, stop it (`lr stop \
+                     {}`): the owner gives up a shadow it cannot reach after {} ms, with no write \
+                     needed; then rebuild it; nothing was done",
+                    node.0, node.0, node.0, self.peer_drop_after_millis
+                ));
+            }
+            if members.iter().any(|member| member.node == node) {
+                return process(format!(
+                    "node {} is still pinned; under --nodes the owner cannot be asked to drop it: \
+                     stop it (`lr stop {}`), then send one write: the owner drops a stopped copy \
+                     about 10 s after a write finds it gone; then rebuild it; nothing was done",
+                    node.0, node.0
+                ));
+            }
+        }
+        if self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| matches!(f1.phase(), RecoveryPhase::Quarantined))
+        {
+            return process(format!(
+                "node {} (the owner) is quarantined; rebuilding out of a quarantine needs the \
+                 owner's own process (`admin rebuild {}` there); nothing was done",
+                self.node.0, node.0
+            ));
+        }
+        // A spare this owner noted is answered as a spare again: a re-run is safe (critic A5).
+        let noted = self
+            .spare_notes
+            .get(&partition)
+            .is_some_and(|notes| notes.contains(&node));
+        let left = !noted
+            && self
+                .left_out
+                .get(&partition)
+                .is_some_and(|left| left.iter().any(|member| member.node == node));
+        // Tester walk at d6483cc: the owner re-adds a left-out copy only into a free slot
+        // (shadows counted, A-R455). With every slot full a rebuild would wipe it for nothing
+        // and say it comes back, so it is refused before anything is stopped.
+        let full = self.committed.get(&partition).and_then(|committed| {
+            let members = &committed.committed.pinned_config.members;
+            (members.len() >= crate::admin::members().len()).then(|| member_list(members))
+        });
+        if let Some(list) = full.filter(|_| left) {
+            return Err(crate::db::rebuild_refused(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "node {} is left out and every slot is full (members: {list}): the owner \
+                     takes a left-out copy back only into a free slot, so a rebuild would not \
+                     bring it back. To use node {}, move a copy onto it: `admin move <source> \
+                     {}`; nothing was done",
+                    node.0, node.0, node.0
+                ),
+            }));
+        }
+        let (tx, answer) = mpsc::channel();
+        self.rebuild_asked(partition, node, Duration::ZERO, RebuildReply(tx));
+        match answer.try_recv() {
+            Ok(Ok(ready)) if left => Ok(format!(
+                "rebuild: node {} is left out by node {} (the owner) at generation {} (mode A); \
+                 restart it and the owner takes it back",
+                node.0, self.node.0, ready.generation.0
+            )),
+            Ok(Ok(ready)) => Ok(format!(
+                "rebuild: node {} is not pinned; node {} (the owner) noted it for the free slot at \
+                 generation {} (mode A), while node {} stays the owner (a new owner forgets the \
+                 note: run the rebuild again); restart it and the owner takes it back, first \
+                 as a shadow, then regular",
+                node.0, self.node.0, ready.generation.0, self.node.0
+            )),
+            Ok(Err(crate::admin::rebuild::Unready::Refused(refused))) => {
+                Err(crate::db::rebuild_refused(refused))
+            }
+            Ok(Err(crate::admin::rebuild::Unready::Failed(failed))) => {
+                Err(crate::db::rebuild_failed(failed))
+            }
+            Err(_) => Err(ApiError::host(&format!(
+                "node {}'s rebuild of node {} was not answered in its step",
+                self.node.0, node.0
+            ))),
+        }
+    }
+
+    /// M11 A-R456 (T12): `admin rebuild node` onto a spare, a node no commit pins and no drop
+    /// left out, is the way back from two copies. With a free slot (fewer members than rf3,
+    /// shadows counted, A-R455) and its copy id free, `node` is noted as left out at its live
+    /// boot, so once it restarts the re-add pins it as a shadow through the same commit CAS
+    /// (A-R450), and [`Self::shadow_duty`] promotes it. Refused, with nothing noted, otherwise.
+    fn rebuild_spare(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        members: &[Member],
+    ) -> Result<(), crate::admin::rebuild::Refused> {
+        let rf = crate::admin::members().len();
+        let list = member_list(members);
+        if members.len() >= rf {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "partition {} has no free slot for node {} (members: {list}): a rebuild \
+                     onto a spare fills a missing copy; to replace a copy, run `admin move \
+                     <source> {}`",
+                    partition.0, node.0, node.0
+                ),
+            });
+        }
+        // Critic A5: one note per free slot. A note is pending while its node is left out.
+        let left = self.left_out.get(&partition);
+        let pending: Vec<NodeId> = self
+            .spare_notes
+            .get(&partition)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|noted| *noted != node)
+            .filter(|noted| left.is_some_and(|left| left.iter().any(|m| m.node == *noted)))
+            .collect();
+        if let Some(noted) = pending
+            .first()
+            .filter(|_| members.len() + pending.len() >= rf)
+        {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "partition {}'s free slot is taken: node {} is already noted for it \
+                     (members: {list}); restart node {} and the owner pins it, then run \
+                     `admin move <source> {}` to replace a copy",
+                    partition.0, noted.0, noted.0, node.0
+                ),
+            });
+        }
+        let copy = move_copy_id(node).filter(|copy| !members.iter().any(|m| m.copy == *copy));
+        let Some(copy) = copy else {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "node {}'s copy id is taken in partition {} (members: {list}): name another \
+                     node",
+                    node.0, partition.0
+                ),
+            });
+        };
+        let Some(boot) = self.links.boot_of(node) else {
+            return Err(crate::admin::rebuild::Refused {
+                guard: "slot",
+                detail: format!(
+                    "node {} is not reachable from node {} (the owner): start it, then rebuild \
+                     it",
+                    node.0, self.node.0
+                ),
+            });
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            spare = node.0,
+            copy = copy.0,
+            boot = boot.0,
+            "rebuild_spare_noted"
+        );
+        self.left_out.entry(partition).or_default().push(Member {
+            copy,
+            node,
+            boot,
+            role: ReplicaRole::RegularSecondary,
+        });
+        self.spare_notes.entry(partition).or_default().insert(node);
+        Ok(())
     }
 
     /// #65: answer each `admin rebuild` waiting on a re-plan without its node: G5 once a newer
@@ -7695,8 +8947,19 @@ impl Host {
                     .iter()
                     .map(|copy| (*copy, holder_of(&plan.config.members, *copy)))
                     .collect();
+                let unwaited = self.unwaited_shadows(site.partition, &plan.config.members);
                 for (copy, holder) in holders {
                     match holder {
+                        Some(holder) if unwaited.contains(&holder) => {
+                            tracing::info!(
+                                node,
+                                partition = site.partition.0,
+                                copy = copy.0,
+                                holder = holder.0,
+                                "inventory_not_waited"
+                            );
+                            self.answer_here(site, RecoveryEvent::InventoryFailed { copy });
+                        }
                         Some(holder) => self.ask(holder, site, PeerAsk::Inventory { copy, anchor }),
                         None => self.answer_here(site, RecoveryEvent::InventoryFailed { copy }),
                     }
@@ -8007,21 +9270,14 @@ impl Host {
         }
         if with_history && !self.ladders.contains(&partition) {
             let started = Instant::now();
-            let built = self
-                .dormant_rungs(partition, seed.lineage.generation)
-                .and_then(|rungs| {
-                    self.replication
-                        .restore_history(node, partition, &rungs)
-                        .map(|()| rungs.len())
-                        .map_err(|_| "ladder_refused")
-                });
-            match built {
-                Ok(rungs) => {
+            match self.dormant_ladder(partition, seed) {
+                Ok((how, rungs)) => {
                     self.ladders.insert(partition);
                     tracing::info!(
                         node = node.0,
                         partition = partition.0,
                         rungs,
+                        how,
                         millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "dormant_ladder_built"
                     );
@@ -8086,14 +9342,260 @@ impl Host {
         partition: PartitionId,
         generation: Generation,
     ) -> Result<Vec<(Seq, Digest)>, &'static str> {
-        let head = self.engine.buffered_applied(partition, generation).0;
-        let mut rungs = Vec::with_capacity(usize::try_from(head + 1).unwrap_or(0));
-        rungs.push((Seq::ZERO, Digest::ROOT));
-        for seq in 1..=head {
+        let mut rungs = vec![(Seq::ZERO, Digest::ROOT)];
+        self.extend_rungs(partition, generation, &mut rungs, u64::MAX)?;
+        Ok(rungs)
+    }
+
+    /// Append to `rungs`, whose last rung is its tip, the verified digests after the tip
+    /// through this copy's head of `generation`, at most `most` of them.
+    fn extend_rungs(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        rungs: &mut Vec<(Seq, Digest)>,
+        most: u64,
+    ) -> Result<(), &'static str> {
+        let tip = rungs.last().map_or(0, |(seq, _)| seq.0);
+        let head = self
+            .engine
+            .buffered_applied(partition, generation)
+            .0
+            .min(tip.saturating_add(most));
+        rungs.reserve(usize::try_from(head.saturating_sub(tip)).unwrap_or(0));
+        for seq in tip + 1..=head {
             let (_, digest) = self.checked(partition, generation, Seq(seq))?;
             rungs.push((Seq(seq), digest));
         }
-        Ok(rungs)
+        Ok(())
+    }
+
+    /// A-R458: the kept dormant ladder of `partition` when its base still matches, or a new one
+    /// holding only `(0, ROOT)`, with which it is. The base is the generation, the plan's
+    /// primary (node and boot), and a tip whose digest this engine still holds; anything else
+    /// reads every record again.
+    fn kept_ladder(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        owner: Option<(NodeId, BootId)>,
+    ) -> (&'static str, KeptLadder) {
+        let kept = self.dormant_ladders.remove(&partition).filter(|ladder| {
+            ladder.generation == generation
+                && ladder.owner == owner
+                && self.holds_tip(partition, generation, ladder)
+        });
+        match kept {
+            Some(ladder) => ("extended", ladder),
+            None => (
+                "rebuilt",
+                KeptLadder {
+                    generation,
+                    owner,
+                    rungs: vec![(Seq::ZERO, Digest::ROOT)],
+                },
+            ),
+        }
+    }
+
+    /// Whether this engine holds `ladder`'s tip in `generation`, at or below its head and at the
+    /// same digest. The digests chain, so that proves every rung below the tip too.
+    fn holds_tip(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        ladder: &KeptLadder,
+    ) -> bool {
+        let head = self.engine.buffered_applied(partition, generation).0;
+        ladder.rungs.last().is_some_and(|&(seq, digest)| {
+            seq.0 <= head
+                && (seq == Seq::ZERO
+                    || self
+                        .checked(partition, generation, seq)
+                        .is_ok_and(|(_, held)| held == digest))
+        })
+    }
+
+    /// A-R461: the kept inventory ladder of `partition`, extended through this copy's head of
+    /// `generation` by at most `most` records, whether it was `extended` or `rebuilt` from
+    /// `(0, ROOT)`, and how many records it read. Kept across generations: a new generation links
+    /// the old one at its base, and the tip check ([`Self::holds_tip`]) reads through that link,
+    /// so the ladder of the generation a commit replaced is extended, not read again. Not put
+    /// back: the caller does that once it has used it, so a refused read drops it and the next
+    /// one rebuilds.
+    fn inventory_ladder(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        most: u64,
+    ) -> Result<(&'static str, KeptLadder, u64), &'static str> {
+        let kept = self
+            .inventory_ladders
+            .remove(&partition)
+            .filter(|ladder| self.holds_tip(partition, generation, ladder));
+        let (how, mut ladder) = match kept {
+            Some(ladder) => (
+                "extended",
+                KeptLadder {
+                    generation,
+                    ..ladder
+                },
+            ),
+            // Critic-s1b A1: a cold ladder (every one after a reopen) starts at the generation's
+            // base, as the inventory reads from there; below it is never asked for.
+            None => {
+                let base = self
+                    .engine
+                    .link(partition, generation)
+                    .map_or(Seq::ZERO, |link| link.base);
+                let digest = if base == Seq::ZERO {
+                    Digest::ROOT
+                } else {
+                    self.checked(partition, generation, base)?.1
+                };
+                (
+                    "rebuilt",
+                    KeptLadder {
+                        generation,
+                        owner: None,
+                        rungs: vec![(base, digest)],
+                    },
+                )
+            }
+        };
+        let tip = ladder.rungs.len();
+        self.extend_rungs(partition, generation, &mut ladder.rungs, most)?;
+        let read = u64::try_from(ladder.rungs.len() - tip).unwrap_or(u64::MAX);
+        Ok((how, ladder, read))
+    }
+
+    /// A-R461: read each held partition's inventory ladder ahead, at most [`WARM_RUNGS`]
+    /// records a duty across all of them, so the inventory a join asks of every member reads
+    /// only what arrived since instead of every record while writes are fenced. Each partition's
+    /// newest held generation is read. A refused read drops that ladder and is logged
+    /// `inventory_ladder_unwarmed{reason}`; the inventory then reads it whole, as before. Each
+    /// pass starts one partition further on (critic-s1b A2), so none starves.
+    fn ladder_duty(&mut self) {
+        let mut newest: BTreeMap<PartitionId, Generation> = BTreeMap::new();
+        for (partition, generation) in self.engine.lineages() {
+            let at = newest.entry(partition).or_insert(generation);
+            *at = (*at).max(generation);
+        }
+        self.inventory_ladders
+            .retain(|partition, _| newest.contains_key(partition));
+        let mut order: Vec<_> = newest.into_iter().collect();
+        if !order.is_empty() {
+            let by = self.ladder_passes % order.len();
+            order.rotate_left(by);
+        }
+        self.ladder_passes = self.ladder_passes.wrapping_add(1);
+        let mut budget = WARM_RUNGS;
+        for (partition, generation) in order {
+            if budget == 0 {
+                break;
+            }
+            match self.inventory_ladder(partition, generation, budget) {
+                Ok((_, ladder, read)) => {
+                    budget = budget.saturating_sub(read);
+                    self.inventory_ladders.insert(partition, ladder);
+                }
+                Err(reason) => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    reason,
+                    "inventory_ladder_unwarmed"
+                ),
+            }
+        }
+    }
+
+    /// The primary a configuration pins, node and boot: a kept ladder's owner.
+    fn ladder_owner(config: &PartitionConfig) -> Option<(NodeId, BootId)> {
+        config
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| (member.node, member.boot))
+    }
+
+    /// A-R458: give this node's dormant receiver of `partition` its ladder, and say whether the
+    /// kept one was `extended` or the ladder `rebuilt` from `(0, ROOT)` ([`Self::kept_ladder`]).
+    /// The ladder is dropped when a read or the receiver refuses it, so the next restore
+    /// rebuilds.
+    fn dormant_ladder(
+        &mut self,
+        partition: PartitionId,
+        seed: &DormantSeed,
+    ) -> Result<(&'static str, usize), &'static str> {
+        let generation = seed.lineage.generation;
+        let (how, mut ladder) =
+            self.kept_ladder(partition, generation, Self::ladder_owner(&seed.config));
+        self.extend_rungs(partition, generation, &mut ladder.rungs, u64::MAX)?;
+        self.replication
+            .restore_history(self.node, partition, &ladder.rungs)
+            .map_err(|_| "ladder_refused")?;
+        let rungs = ladder.rungs.len();
+        self.dormant_ladders.insert(partition, ladder);
+        Ok((how, rungs))
+    }
+
+    /// A-R458: while a move's shadow catches up, the owner reads its dormant ladder ahead, at
+    /// most [`WARM_RUNGS`] records a duty, so the promote re-plan's source restore reads only
+    /// what arrived since instead of every record inside the fence. The promote's seed names
+    /// this generation and this plan's primary, so the restore keeps what is read here. A
+    /// refused read drops the ladder and is logged `dormant_ladder_unwarmed{reason}`; the
+    /// restore then reads it whole, as before.
+    fn warm_dormant_ladder(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        owner: Option<(NodeId, BootId)>,
+    ) {
+        let (_, mut ladder) = self.kept_ladder(partition, generation, owner);
+        match self.extend_rungs(partition, generation, &mut ladder.rungs, WARM_RUNGS) {
+            Ok(()) => {
+                self.dormant_ladders.insert(partition, ladder);
+            }
+            Err(reason) => tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                reason,
+                "dormant_ladder_unwarmed"
+            ),
+        }
+    }
+
+    /// A-R458's proof, for the rows: whether the kept dormant ladder of `partition` equals a
+    /// full read of this engine at the same tip. `None` when no ladder is kept.
+    #[cfg(test)]
+    pub(crate) fn dormant_ladder_matches_rebuild(&self, partition: PartitionId) -> Option<bool> {
+        let ladder = self.dormant_ladders.get(&partition)?;
+        let full = self
+            .dormant_rungs(partition, ladder.generation)
+            .expect("a full read of the ladder's generation");
+        Some(full.get(..ladder.rungs.len()) == Some(ladder.rungs.as_slice()))
+    }
+
+    /// A-R461's proof, for the rows: whether the kept inventory ladder of `partition` equals a
+    /// full read of this engine at the same tip, and that tip. `None` when no ladder is kept.
+    #[cfg(test)]
+    pub(crate) fn inventory_ladder_matches_rebuild(
+        &self,
+        partition: PartitionId,
+    ) -> Option<(bool, Seq)> {
+        let ladder = self.inventory_ladders.get(&partition)?;
+        let full = self
+            .dormant_rungs(partition, ladder.generation)
+            .expect("a full read of the ladder's generation");
+        let tip = ladder.rungs.last().map_or(Seq::ZERO, |(seq, _)| *seq);
+        let first = ladder.rungs.first().map_or(0, |(seq, _)| seq.0);
+        let first = usize::try_from(first).expect("a ladder index");
+        Some((
+            full.get(first..first + ladder.rungs.len()) == Some(ladder.rungs.as_slice()),
+            tip,
+        ))
     }
 
     /// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired`. The primary here met a record it
@@ -8504,7 +10006,8 @@ impl Host {
     /// A-R337). A link above the base has no producer and is refused. A copy holding a newer
     /// generation of the
     /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
-    /// plan is made, never here.
+    /// plan is made, never here. Its ladder is the kept one, extended through the head
+    /// ([`Self::inventory_ladder`], A-R461), cut at the base.
     fn survivor(
         &mut self,
         partition: PartitionId,
@@ -8551,9 +10054,31 @@ impl Host {
         if head < anchor.base_seq {
             return Err("head_below_base");
         }
-        let ladder = (anchor.base_seq.0..=head.0)
-            .map(|seq| digest_at(Seq(seq)).map(|digest| (Seq(seq), digest)))
-            .collect::<Result<Vec<_>, _>>()?;
+        // A-R461: the kept ladder, extended through the head, not a fresh read of every record.
+        let started = Instant::now();
+        let (how, kept, read) = self.inventory_ladder(partition, generation, u64::MAX)?;
+        let first = kept.rungs.first().map_or(0, |(seq, _)| seq.0);
+        let from = anchor
+            .base_seq
+            .0
+            .checked_sub(first)
+            .and_then(|from| usize::try_from(from).ok())
+            .ok_or("base_out_of_range")?;
+        let ladder = match kept.rungs.get(from..) {
+            Some(rungs) if rungs.last().map(|(seq, _)| *seq) == Some(head) => rungs.to_vec(),
+            _ => return Err("ladder_short_of_head"),
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            how,
+            read,
+            rungs = ladder.len(),
+            millis = millis(started),
+            "inventory_ladder"
+        );
+        self.inventory_ladders.insert(partition, kept);
         let head_digest = ladder.last().map_or(anchor.base_digest, |(_, d)| *d);
         Ok(SurvivorInventory {
             copy,
@@ -8870,7 +10395,10 @@ impl Host {
         // nothing, so it never queues. Nor does a status query (F-014): P1 answers it in the
         // step that takes it, and it is how a caller resolves a put that may never be answered.
         let identity = match &client.call {
-            ClientCall::Compile { .. } | ClientCall::Status { .. } => None,
+            ClientCall::Compile { .. }
+            | ClientCall::Status { .. }
+            | ClientCall::Move { .. }
+            | ClientCall::Rebuild { .. } => None,
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
             | ClientCall::GetPrevious { identity, .. } => Some(*identity),
@@ -9003,6 +10531,30 @@ impl Host {
                 EventKind::Client(ClientEvent::Submit(request.clone())),
                 Some(PendingKind::Txn(request)),
             ),
+            // M11: answered in this step; it waits on nothing.
+            ClientCall::Move { from, to, .. } => {
+                let answer = match self.move_step(partition, from, to) {
+                    Ok(moved) => Answer::Moved(moved),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
+            // M11 T12 over processes: answered in this step, as a move is.
+            ClientCall::Rebuild { node, .. } => {
+                let answer = match self.rebuild_from_app(partition, node) {
+                    Ok(line) => Answer::Rebuilt(line),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
             ClientCall::Get {
                 identity,
                 object,
@@ -9832,6 +11384,24 @@ fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) 
 /// The regular secondaries among `members`: the copies outside a `ReadOnly` commit's barrier
 /// that M3's repair re-plans. A shadow is never one: L1 never counts it, and
 /// [`Host::shadow_duty`] promotes it.
+/// M11: the copy id a move pins node `node` under, as `admin::members` numbers nodes 1 to 3:
+/// node n holds copy n - 1. `None` for node 0 or past `u8`.
+fn move_copy_id(node: NodeId) -> Option<CopyId> {
+    node.0
+        .checked_sub(1)
+        .and_then(|copy| u8::try_from(copy).ok())
+        .map(CopyId)
+}
+
+/// `members` as `node role` words, for a refusal.
+fn member_list(members: &[Member]) -> String {
+    members
+        .iter()
+        .map(|member| format!("{} {:?}", member.node.0, member.role))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
     members
         .iter()
@@ -10334,8 +11904,10 @@ pub struct FenceFacts {
 ///
 /// `Ok` is that stored plan: the only plan the host gives F1 with a routed fence. A routed
 /// `Plan` is never pushed, so an app with only the link cert cannot choose the members, roles
-/// or boots a promote commits. The record is created once and never rewritten, and the commit
-/// CAS at `control_revision` pins the key it was read at.
+/// or boots a promote commits. This is about a promote only: a copy move or a rebuild does
+/// change the members, sent by an admin app over its link alone (A-R479). The record is
+/// created once and never rewritten, and the commit CAS at `control_revision` pins the key it
+/// was read at.
 pub(crate) fn bind_routed_fence(
     routed: PartitionId,
     proof: &FencingProof,

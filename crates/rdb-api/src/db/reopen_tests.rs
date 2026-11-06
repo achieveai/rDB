@@ -982,6 +982,40 @@ fn m10_cut_one_unbound_copy_with_data_is_refused_and_stays_unbound() {
     );
 }
 
+/// PR #74 question (whole-open lineage guard, A-R466b): a copy that holds data and names no
+/// instance is never an unfinished wipe, even beside an aside folder for its node and two copies
+/// that name one instance. The whole-database open refuses `WipeUnfinished` and binds nothing;
+/// the copy keeps its data. Only an empty unbound copy may finish a wipe.
+/// Cut: drop `!engine.lineages().is_empty()` from the resume predicate in `Db::check`, red (the
+/// open resumes the "wipe" of a copy that holds data).
+/// Integration (~1 s): one fresh open until ready, a raw marker delete, one refused reopen.
+#[config_log::retcd_test]
+fn pr74_q8_an_unbound_copy_with_data_beside_an_aside_is_not_a_wipe_to_finish() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let ours = marker(dir.path(), 1).expect("bound");
+    set_marker(dir.path(), 3, None);
+    let aside = dir.path().join("aside").join("node-3-boot-1-1000");
+    std::fs::create_dir_all(&aside).expect("an aside folder for node 3");
+
+    let refused = match open(&rt, dir.path(), &store) {
+        Err(error @ OpenError::WipeUnfinished { .. }) => error,
+        other => panic!("WipeUnfinished, not {:?}", other.map(|_| "Db")),
+    };
+    assert!(
+        refused.to_string().contains("node-3-boot-1-1000"),
+        "{refused}"
+    );
+    assert_eq!(
+        [1, 2, 3].map(|n| marker(dir.path(), n)),
+        [Some(ours), Some(ours), None],
+        "the refusal bound nothing"
+    );
+    assert!(aside.exists(), "the aside folder stays where it is");
+}
+
 /// A `MemStore` on which a second open counts in the gap between the first open's read of the
 /// counter and its CAS: the first `get` of `key` reads, then runs [`admin::count_open`] for the
 /// same instance on the inner store, then answers with what it read.
@@ -2391,30 +2425,500 @@ fn m10_s2_a_node_process_before_the_first_open_finishes_is_told_to_wait() {
     );
 }
 
-/// A-R328: a node that is not a member of partition 1 has no copy to rebuild, and the refusal
-/// names the members. `local_nodes` refuses such a node before any open reaches the check, so
-/// this calls the check itself. Integration (~1 s): one fresh open until ready.
+/// M11 WS A (was A-R328's refusal; ruling A-R450): a node past the formed members is a spare.
+/// Its check returns the owner and the formed instance, as a member's does, and logs
+/// `db_open_spare_copy` naming it; a member's check logs no spare. What a spare may and may not
+/// do is A-R450's rows `m11_q2_a_*` and `m11_q2_b_*`. Cut: refuse the spare again (or drop the
+/// log) and this goes red. Integration (~1 s): one fresh open until ready.
 #[config_log::retcd_test]
-fn m10_s2_a_node_that_is_not_a_member_is_refused_with_the_members() {
+fn m11_a_node_past_the_members_opens_as_a_spare() {
+    const METHOD: &str = "m11_a_node_past_the_members_opens_as_a_spare";
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     written_and_closed(&rt, dir.path(), &store);
-    match rt.block_on(formed_member(&store, &[NodeId(2), NodeId(4)])) {
-        Err(OpenError::Config(text)) => assert_eq!(
-            text,
-            "node 4 is not a member of partition 1 (its members are nodes 1, 2, 3), so it holds \
-             no copy to rebuild"
-        ),
-        other => panic!("Config, not {other:?}"),
-    }
     let (record, instance) = rt
         .block_on(formed_member(&store, &[NodeId(2)]))
         .expect("node 2 is a member");
+    assert!(
+        !messages(METHOD).iter().any(|m| m == "db_open_spare_copy"),
+        "a member is no spare"
+    );
+    let (spare_record, spare_instance) = rt
+        .block_on(formed_member(&store, &[NodeId(4)]))
+        .expect("node 4 opens as a spare");
     assert_eq!(
         (record.owner, Some(instance)),
         (OWNER, marker(dir.path(), 1)),
         "a member's check returns the owner and the formed instance"
+    );
+    assert_eq!(
+        (spare_record.owner, spare_instance),
+        (record.owner, instance),
+        "a spare's check returns the same owner and instance"
+    );
+    assert!(
+        messages(METHOD).iter().any(|m| m == "db_open_spare_copy"),
+        "the spare is logged"
+    );
+}
+
+/// M11 ruling A-R450 (a): only a configured node id opens as a spare. Node 9 and node 0 are
+/// refused before anything is created, naming the range. Cut: drop the range check in
+/// `local_nodes`, red (node 9 opens as a spare). Integration (~1 s): one fresh open.
+#[config_log::retcd_test]
+fn m11_q2_a_an_unknown_node_id_is_refused_not_opened_as_a_spare() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    for node in [9, 0] {
+        match open_node(&rt, dir.path(), &store, &[node]) {
+            Err(OpenError::Config(text)) => assert!(
+                text.contains(&format!("each from 1 to {MAX_NODES}")),
+                "node {node}: {text}"
+            ),
+            other => panic!("node {node}: Config, not {:?}", other.map(|_| "Db")),
+        }
+        assert!(
+            !dir.path().join("nodes").join(node.to_string()).exists(),
+            "node {node}: no copy was created"
+        );
+    }
+}
+
+/// M11 ruling A-R450 (b), (c): a spare holds no copy, has no vote and serves nothing until a
+/// commit pins it. Node 4 opens beside a formed database: `partitions/1` is not written by the
+/// open (same revision, nodes 1 to 3), and node 4 holds no lineage, recovered nothing and has
+/// no R1 role, also after a put lands on the members. Membership changes only through the
+/// commit's CAS on `partitions/1`: after `move 3 4` the record, at a later revision, pins
+/// nodes 1, 2 and 4, and node 4 then holds the partition. Cut: `local_nodes` takes node 4's
+/// process for a full open, red (it forms its own database and is refused `Mismatch`).
+/// Integration (~6 s): a fresh open, the spare's open, the move's two re-plans.
+#[config_log::retcd_test]
+fn m11_q2_b_a_spare_holds_no_copy_and_takes_no_part_until_a_commit_pins_it() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let revision = || {
+        rt.block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record
+        .expect("partitions/1")
+        .mod_revision
+    };
+    let links = Arc::new(Links::default());
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the open of nodes 1 to 3");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let formed = revision();
+    let mut spare = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(4)],
+                links: Some(links),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 4's process");
+    put_through_pauses(&db, b"a", b"1", "a put with node 4 a spare");
+    assert_eq!(revision(), formed, "the spare's open wrote partitions/1");
+    assert_eq!(pinned_nodes(&rt, &store), Some(vec![1, 2, 3]));
+    let four = |spare: &Db| {
+        spare
+            .node_status()
+            .into_iter()
+            .find(|status| status.node == NodeId(4))
+            .expect("node 4 answers a status look")
+    };
+    let idle = four(&spare);
+    assert_eq!(
+        (idle.holds.is_some(), idle.recovered, idle.role),
+        (false, None, "none"),
+        "a spare holds no copy and takes no part: {idle:?}"
+    );
+
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let deadline = std::time::Instant::now() + patience;
+    while !db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4").done {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "move 3 4 not done within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        revision() > formed,
+        "the move committed through partitions/1"
+    );
+    assert_eq!(pinned_nodes(&rt, &store), Some(vec![1, 2, 4]));
+    let pinned = four(&spare);
+    assert!(
+        pinned.holds.is_some(),
+        "node 4 holds the partition once pinned: {pinned:?}"
+    );
+    db.shutdown();
+    spare.shutdown();
+}
+
+/// The nodes `partitions/1` pins, in record order, or `None` for a record that names none.
+fn pinned_nodes(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> Option<Vec<u32>> {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record
+        .expect("partitions/1");
+    rdb_core::authority::partition::RecordMember::decode_all(&read.value)
+        .map(|members| members.iter().map(|m| m.node.0).collect())
+}
+
+/// M11 defect T6 (tester walk, scenario 6): after `admin move 3 4`, a reopen pinned nodes 1, 2
+/// and 3 again and dropped node 4, the member the record named. The heal built its plan from
+/// the fixed rf3 set instead of the record's members. If node 1's copy had been lost, the
+/// recovery would have read from node 3, which stopped at the move: acked writes gone. Here
+/// four nodes run in one process, node 3's copy moves to node 4, and the database reopens:
+/// the record still pins nodes 1, 2 and 4, and the write made after the move reads back.
+/// Integration (~6 s): a fresh open, the move's two re-plans, a reopen until ready.
+#[config_log::retcd_test]
+fn m11_t6_a_reopen_pins_the_members_the_record_names_not_nodes_1_to_3() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    // Nodes 1 to 3 form the database; node 4 runs as a node process on the same links.
+    // On the fresh open node 4 starts once the database is formed; on the reopen it starts
+    // with the rest, since the heal waits for every member the record pins.
+    let opened = |rt: &tokio::runtime::Runtime, fresh: bool| {
+        let links = Arc::new(Links::default());
+        let db = rt
+            .block_on(Db::open_with(
+                DbConfig {
+                    links: Some(Arc::clone(&links)),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("the open of nodes 1 to 3");
+        let ready = |db: &Db| {
+            db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+                .expect("ready");
+        };
+        if fresh {
+            ready(&db);
+        }
+        let spare = rt
+            .block_on(Db::open_with(
+                DbConfig {
+                    local: vec![NodeId(4)],
+                    links: Some(links),
+                    ..config(dir.path())
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("node 4's process");
+        if !fresh {
+            ready(&db);
+        }
+        (db, spare)
+    };
+    let (mut db, mut spare) = opened(&rt, true);
+    put_through_pauses(&db, b"before", b"1", "a put before the move");
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4");
+        if answer.done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "move 3 4 not done within {patience:?}: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(pinned_nodes(&rt, &store), Some(vec![1, 2, 4]), "the move");
+    put_through_pauses(&db, b"after", b"2", "a put after the move");
+    db.shutdown();
+    spare.shutdown();
+
+    let (db, _spare) = opened(&rt, false);
+    assert_eq!(
+        pinned_nodes(&rt, &store),
+        Some(vec![1, 2, 4]),
+        "the reopen pins the record's members"
+    );
+    assert_eq!(
+        read_bytes(&db, b"after"),
+        Some(b"2".to_vec()),
+        "the write after the move reads back"
+    );
+    assert_eq!(
+        read_bytes(&db, b"before"),
+        Some(b"1".to_vec()),
+        "the write before the move reads back"
+    );
+}
+
+/// The bytes `object` reads back as, `None` when absent (critic M3: `is_ok` cannot tell). A read
+/// that lands under a re-plan's commit is refused `GENERATION_CHANGED` (`Reconcile`, nothing
+/// done), and an app reconciles by reading again: so does this, within the patience. Seen in
+/// gate9 under the 4-CPU cap, `m11_q4`'s read straight after the resumed move's promote.
+fn read_bytes(db: &Db, object: &[u8]) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        match db.get(object) {
+            Ok(read) => return read.value.map(|(_, bytes)| bytes.to_vec()),
+            Err(refused)
+                if refused.kind == ErrorKind::GenerationChanged
+                    && refused.no_mutation
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(refused) => panic!("the read is answered: {refused:?}"),
+        }
+    }
+}
+
+/// The role `partitions/1` pins `node` as, if it pins it.
+fn pinned_role(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    node: u32,
+) -> Option<rdb_core::contracts::ids::ReplicaRole> {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .expect("get partitions/1")
+        .record?;
+    rdb_core::authority::partition::RecordMember::decode_all(&read.value)?
+        .into_iter()
+        .find(|member| member.node.0 == node)
+        .map(|member| member.role)
+}
+
+/// M11 defect T7 (tester walk, scenario 6): after `admin promote` with a move's shadow pinned,
+/// writes stayed refused about 10 s more. The new owner promoted the shadow as soon as it had
+/// recovered, before its A1 held a grant; A1 records a revocation persisted then but answers no
+/// `DrainProof`, so the promote's re-plan waited for the revocation's retry. Here node 4's
+/// frames to node 1 are lost, so `move 3 4` pins it as a shadow that never catches up there.
+/// Node 1 stops and node 2 is promoted: node 2 promotes the shadow, and the record pins node 4
+/// regular well inside the retry's 10 s.
+/// Integration (~8 s): a fresh open, the move's re-plan, the promote's grant wait, the shadow's.
+#[config_log::retcd_test]
+fn m11_t7_a_shadow_left_by_a_promote_is_promoted_without_the_revoke_retry() {
+    use rdb_core::contracts::ids::ReplicaRole;
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let links = Arc::new(Links::default());
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the open of nodes 1 to 3");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let mut spare = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(4)],
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 4's process");
+    put_through_pauses(&db, b"before", b"1", "a put before the move");
+
+    // Node 1 never hears node 4, so node 4 stays a shadow node 1 cannot promote.
+    links.drop_direction(NodeId(4), NodeId(1));
+    let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4");
+    assert!(!answer.done, "{answer:?}");
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + patience;
+    while pinned_role(&rt, &store, 4) != Some(ReplicaRole::Shadow) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 4 not pinned as a shadow within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    lock(&db.nodes)
+        .iter_mut()
+        .find(|handle| handle.node == OWNER)
+        .expect("node 1 runs here")
+        .stop();
+    let promoted = db.promote(NodeId(2), None).expect("promote 2");
+    assert_eq!(promoted.dropped, OWNER, "{promoted:?}");
+    let at = std::time::Instant::now();
+    // Under the revoke retry's 10 s even at the gate's deadline scale of 3.
+    let bound = crate::host::test_patience(Duration::from_millis(2_500));
+    while pinned_role(&rt, &store, 4) != Some(ReplicaRole::RegularSecondary) {
+        assert!(
+            at.elapsed() < bound,
+            "node 4 still not regular {bound:?} after the promote: {:?}",
+            pinned_role(&rt, &store, 4)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    tracing::info!(
+        waited_ms = at.elapsed().as_millis(),
+        "m11_t7_shadow_regular_after_promote"
+    );
+    // The new owner adopts its generation after the commit lands; a put sent before that is
+    // refused "no generation adopted yet" and changes nothing (2 of 7 runs).
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+    while !db
+        .node_status()
+        .iter()
+        .any(|status| status.node == NodeId(2) && status.admits == Some(true))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2 does not admit writes after the promote: {:?}",
+            db.node_status()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    put_through_pauses(&db, b"after", b"2", "a put after the promote");
+    db.shutdown();
+    spare.shutdown();
+}
+
+/// M11 ruling A-R452 (D2): a move's intent is the shadow the commit pins, so it survives the
+/// owner's restart. Node 4's frames to node 1 are lost, so `move 3 4` leaves node 4 pinned as a
+/// shadow; then every node restarts. The restarted owner holds no move and does not promote the
+/// shadow on its own (members stay nodes 1 to 3 regular, node 4 shadow); `move 3 4` asked again
+/// resumes the pinned move and ends it: nodes 1, 2 and 4, and the writes read back.
+/// Cut: `move_step` refuses a pinned-shadow target as `already` running, red.
+/// Integration (~8 s): a fresh open, the move's first re-plan, a reopen, the promote.
+#[config_log::retcd_test]
+fn m11_q4_a_move_resumes_after_the_owner_restarts_with_its_shadow_pinned() {
+    use rdb_core::contracts::ids::ReplicaRole;
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let opened = |rt: &tokio::runtime::Runtime, fresh: bool| {
+        let links = Arc::new(Links::default());
+        let open = |local: Vec<NodeId>, what: &str| {
+            let mut db_config = DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            };
+            if !local.is_empty() {
+                db_config.local = local;
+            }
+            rt.block_on(Db::open_with(
+                db_config,
+                Arc::clone(&store),
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect(what)
+        };
+        let ready = |db: &Db| {
+            db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+                .expect("ready");
+        };
+        // Critic A3: the reopen's heal leaves out a shadow whose node it does not know yet, so
+        // on the restart node 4's process is up before nodes 1 to 3 open and heal.
+        if fresh {
+            let db = open(Vec::new(), "the open of nodes 1 to 3");
+            ready(&db);
+            let spare = open(vec![NodeId(4)], "node 4's process");
+            (db, spare, links)
+        } else {
+            let spare = open(vec![NodeId(4)], "node 4's process");
+            let db = open(Vec::new(), "the open of nodes 1 to 3");
+            ready(&db);
+            (db, spare, links)
+        }
+    };
+    let (mut db, mut spare, links) = opened(&rt, true);
+    put_through_pauses(&db, b"before", b"1", "a put before the move");
+    links.drop_direction(NodeId(4), NodeId(1));
+    let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4");
+    assert!(!answer.done, "{answer:?}");
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + patience;
+    while pinned_role(&rt, &store, 4) != Some(ReplicaRole::Shadow) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 4 not pinned as a shadow within {patience:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    db.shutdown();
+    spare.shutdown();
+
+    let (db, _spare, _links) = opened(&rt, false);
+    put_through_pauses(&db, b"after", b"2", "a put after the restart");
+    assert_eq!(
+        pinned_role(&rt, &store, 4),
+        Some(ReplicaRole::Shadow),
+        "the restarted owner kept the move's shadow and did not promote it unasked"
+    );
+    assert_eq!(
+        pinned_role(&rt, &store, 3),
+        Some(ReplicaRole::RegularSecondary)
+    );
+    let deadline = std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    loop {
+        let answer = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4 again");
+        if answer.done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the move did not resume: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        pinned_nodes(&rt, &store),
+        Some(vec![1, 2, 4]),
+        "the resumed move"
+    );
+    assert_eq!(
+        read_bytes(&db, b"before"),
+        Some(b"1".to_vec()),
+        "before the move"
+    );
+    assert_eq!(
+        read_bytes(&db, b"after"),
+        Some(b"2".to_vec()),
+        "after the restart"
     );
 }
 
@@ -2941,17 +3445,17 @@ fn m10_s2_f009_a_node_process_whose_copy_is_staged_into_the_generation_never_joi
     );
 }
 
-/// A-R231(a): `DbConfig::local` names each of nodes 1-3 at most once, and a `Db` that runs no
-/// node needs `links`. Each is refused before anything opens. Unit (~10 ms).
+/// A-R231(a), M11: `DbConfig::local` names each node (1 to 8) at most once, and a `Db` that
+/// runs no node needs `links`. Each is refused before anything opens. Unit (~10 ms).
 #[config_log::retcd_test]
 fn m10_s2_a_repeated_or_unknown_local_node_and_an_app_open_without_links_are_refused() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    for nodes in [&[2, 2][..], &[4][..]] {
+    for nodes in [&[2, 2][..], &[9][..], &[0][..]] {
         match open_node(&rt, dir.path(), &store, nodes) {
             Err(OpenError::Config(text)) => assert!(
-                text.contains("name each of nodes 1, 2 and 3 at most once"),
+                text.contains("name each node at most once, each from 1 to 8"),
                 "{nodes:?}: {text}"
             ),
             other => panic!("{nodes:?} is Config, not {:?}", other.map(|_| "Db")),
@@ -4237,6 +4741,7 @@ fn m10_s2_a_promote_over_the_net_reaches_node_2_in_another_process_and_writes_la
                     dial: NetConfig::dial_lower(node, &addrs),
                     protocol_version: PROTOCOL_VERSION,
                     faults: Faults::new(),
+                    admin_apps: std::collections::BTreeSet::new(),
                 },
                 &links,
                 Some(listener),
@@ -4283,6 +4788,7 @@ fn m10_s2_a_promote_over_the_net_reaches_node_2_in_another_process_and_writes_la
             dial: addrs.clone(),
             protocol_version: PROTOCOL_VERSION,
             faults: Faults::new(),
+            admin_apps: std::collections::BTreeSet::new(),
         },
         &app_links,
         None,
@@ -4869,7 +5375,7 @@ mod guide_did_it_land {
 /// app follows with a new id.
 #[test]
 fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_host_fault() {
-    let lost = unanswered(false, NodeId(1), true);
+    let lost = unanswered(false, NodeId(1), Carries::Write);
     let text = lost.to_string();
     assert_eq!(
         (lost.kind, lost.retry, lost.no_mutation),
@@ -4890,7 +5396,7 @@ fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_hos
     assert!(!text.contains("try again"), "{text}");
     assert!(!text.contains("report this message"), "{text}");
     assert!(!text.contains("host fault"), "{text}");
-    let local = unanswered(true, NodeId(1), true).to_string();
+    let local = unanswered(true, NodeId(1), Carries::Write).to_string();
     assert!(
         local.contains("host fault: the owner dropped the call unanswered"),
         "{local}"

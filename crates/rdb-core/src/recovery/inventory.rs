@@ -70,6 +70,9 @@ pub(crate) struct Collecting {
     pub(crate) proof: FencingProof,
     pub(crate) window: Window,
     queried: BTreeSet<CopyId>,
+    /// The queried copies the plan pins as `Shadow`. Asked, since one may hold the longest
+    /// prefix (M7B-97), but one that fails never holds the window (A-R451).
+    shadows: BTreeSet<CopyId>,
     verified: BTreeMap<CopyId, VerifiedInventory>,
     lost: BTreeMap<CopyId, InventoryOutcome>,
     transfers: BTreeMap<CopyId, TransferWatch>,
@@ -77,7 +80,12 @@ pub(crate) struct Collecting {
 }
 
 impl Collecting {
-    pub(crate) fn new(proof: FencingProof, queried: BTreeSet<CopyId>, deadline: Tick) -> Self {
+    pub(crate) fn new(
+        proof: FencingProof,
+        queried: BTreeSet<CopyId>,
+        shadows: BTreeSet<CopyId>,
+        deadline: Tick,
+    ) -> Self {
         Self {
             proof,
             window: Window::Open {
@@ -85,6 +93,7 @@ impl Collecting {
                 extensions_used: 0,
             },
             queried,
+            shadows,
             verified: BTreeMap::new(),
             lost: BTreeMap::new(),
             transfers: BTreeMap::new(),
@@ -173,11 +182,14 @@ impl Collecting {
         }
     }
 
-    /// A queried copy could not report.
-    pub(crate) fn failed(&mut self, copy: CopyId, emit: &mut Emit<'_>) {
+    /// A queried copy could not report. `true` when it was a shadow, so the window may now
+    /// close early ([`Self::close_if_all_answered`]).
+    pub(crate) fn failed(&mut self, copy: CopyId, emit: &mut Emit<'_>) -> bool {
         if self.admits(copy, emit) {
             self.drop_source(copy, emit);
+            return self.shadows.contains(&copy);
         }
+        false
     }
 
     /// A source is still delivering its advertised prefix.
@@ -282,14 +294,15 @@ impl Collecting {
 
     /// Close the open window before its deadline (ruling A-R165), when every queried copy has
     /// answered, verified or ineligible; a copy still transferring has not. A copy that failed
-    /// keeps the window open to its deadline. `true` when it closed: the answer's own `Recorded`
+    /// keeps the window open to its deadline, unless the plan pins it as a `Shadow` (A-R451):
+    /// a move's empty target fails, and waiting on it paused writes for the whole window. `true` when it closed: the answer's own `Recorded`
     /// is withdrawn, and `CloseWindow` is the last effect this pushes, as on a deadline's close.
     pub(crate) fn close_if_all_answered(&mut self, emit: &mut Emit<'_>) -> bool {
         let answered = matches!(self.window, Window::Open { .. })
-            && !self
-                .lost
-                .values()
-                .any(|outcome| matches!(outcome, InventoryOutcome::Failed { .. }))
+            && !self.lost.values().any(|outcome| match outcome {
+                InventoryOutcome::Failed { copy, .. } => !self.shadows.contains(copy),
+                _ => false,
+            })
             && self
                 .queried
                 .iter()

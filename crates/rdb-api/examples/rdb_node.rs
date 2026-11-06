@@ -2,24 +2,30 @@
 //! three of them; run it by hand only to walk one start.
 //!
 //! ```text
-//! rdb_node --gen-certs --cert-dir C [--apps a,b]
+//! rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
 //! rdb_node --form --dir D --control E [--log-dir L]
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
-//!          [--ready-secs S]
+//!          [--ready-secs S] [--admin-apps a,b]
 //! ```
 //!
-//! * `--gen-certs` writes a fresh development CA and certificates for nodes 1-3 and each app
-//!   named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's
+//! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
+//!   (default 3) and each app named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's
 //!   certificates is how a walk presents a certificate this run's nodes do not trust.
 //! * `--form` makes the database once (ruling A-R231): all three copies in this process on
 //!   `--dir`, until ready, then shuts down. A node process only ever opens a formed database.
 //! * Otherwise the process runs node `N` of the database in `--dir`, holding only `nodes/N`.
+//!   `--peers` names every other node; with this one they are nodes 1 to K, K at least 3 (M11
+//!   WS A). Nodes past 3 are spares: they hold nothing until `admin move` pins them.
 //!   It serves its peers and apps on `--listen` and dials each lower-numbered node. Its boot is
 //!   `next_boot(--dir)`, the same value in the handshake and in the `Db` (ruling A-R227).
 //!   `--protocol-version` makes it speak another wire version, to walk the refusal.
 //!   `--faults` names the fault file it polls every 50 ms (`hold <n>|hold all|drop-request N|
 //!   drop-reply N|cut-control`). It stops cleanly when `--stop-file` appears.
+//!   `--admin-apps` names the apps whose certificate may send `admin move` and `admin rebuild`
+//!   (ruling A-R479); unset, it is `admin`, the app `lr` and `rdb_dev` run as. Any other app's
+//!   move or rebuild is refused before the node sees it. An empty value (`--admin-apps ''`)
+//!   lets no app move or rebuild.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -35,7 +41,7 @@ use std::time::Duration;
 
 use config_core::ConfigStore;
 use rdb_api::db::ReadyError;
-use rdb_api::db::{next_boot, ALL_NODES, DEFAULT_CLIENT};
+use rdb_api::db::{next_boot, ALL_NODES, DEFAULT_CLIENT, MAX_NODES};
 use rdb_api::net::faults::{CutStore, Faults};
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
@@ -58,13 +64,29 @@ struct Args {
     stop_file: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     ready_secs: Option<u64>,
+    /// `--gen-certs`: certificates for nodes 1 to this (M11 WS A); `None` is 3.
+    nodes: Option<u32>,
+    /// `--admin-apps`: the apps that may move or rebuild a copy (A-R479); `None` is `admin`.
+    admin_apps: Option<BTreeSet<String>>,
+}
+
+/// The admin app `--admin-apps` defaults to: the app `lr` and `rdb_dev` run as (A-R479).
+const DEFAULT_ADMIN_APP: &str = "admin";
+
+/// The apps this node lets move or rebuild a copy: `--admin-apps` as given (an empty value is
+/// none), or [`DEFAULT_ADMIN_APP`] when the flag is absent (A-R479).
+fn admin_apps(args: &Args) -> BTreeSet<String> {
+    args.admin_apps
+        .clone()
+        .unwrap_or_else(|| BTreeSet::from([DEFAULT_ADMIN_APP.to_owned()]))
 }
 
 const USAGE: &str = "usage:
-  rdb_node --gen-certs --cert-dir C [--apps a,b]
+  rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
   rdb_node --form --dir D --control E [--log-dir L]
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
+           [--admin-apps a,b]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -81,12 +103,21 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     .map(str::to_owned)
                     .collect();
             }
+            "--admin-apps" => {
+                args.admin_apps = Some(
+                    value("--admin-apps")?
+                        .split(',')
+                        .filter(|a| !a.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
             "--node" => {
                 let n: u32 = value("--node")?
                     .parse()
-                    .map_err(|_| "--node takes 1, 2 or 3".to_owned())?;
-                if !ALL_NODES.contains(&NodeId(n)) {
-                    return Err(format!("--node {n}: this database has nodes 1, 2 and 3"));
+                    .map_err(|_| format!("--node takes a node number, 1 to {MAX_NODES}"))?;
+                if !(1..=MAX_NODES).contains(&n) {
+                    return Err(format!("--node {n}: a node number is 1 to {MAX_NODES}"));
                 }
                 args.node = Some(n);
             }
@@ -121,6 +152,17 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--faults" => args.faults = Some(value("--faults")?.into()),
             "--stop-file" => args.stop_file = Some(value("--stop-file")?.into()),
             "--log-dir" => args.log_dir = Some(value("--log-dir")?.into()),
+            "--nodes" => {
+                let k: u32 = value("--nodes")?
+                    .parse()
+                    .map_err(|_| format!("--nodes takes a count, 3 to {MAX_NODES}"))?;
+                if !(3..=MAX_NODES).contains(&k) {
+                    return Err(format!(
+                        "--nodes {k}: a database has 3 to {MAX_NODES} nodes"
+                    ));
+                }
+                args.nodes = Some(k);
+            }
             "--ready-secs" => {
                 args.ready_secs = Some(
                     value("--ready-secs")?
@@ -201,9 +243,8 @@ fn gen_certs(args: &Args) -> ExitCode {
         eprintln!("rdb_node: --gen-certs needs --cert-dir");
         return ExitCode::from(2);
     };
-    let labels: Vec<Label> = ALL_NODES
-        .iter()
-        .map(|n| Label::Node(*n))
+    let labels: Vec<Label> = (1..=args.nodes.unwrap_or(3))
+        .map(|n| Label::Node(NodeId(n)))
         .chain(args.apps.iter().cloned().map(Label::App))
         .collect();
     match certs::generate(dir, &labels) {
@@ -283,16 +324,34 @@ fn report_ready(node: NodeId, waited: Result<(), ReadyError>) -> bool {
     }
 }
 
+/// The nodes `node` links to: every node `--peers` names. With `node` they must be nodes 1
+/// to K, K at least 3 (M11 WS A): each formed member, then any spares, with no gap.
+fn peer_set(node: NodeId, peers: &BTreeMap<NodeId, String>) -> Result<BTreeSet<NodeId>, String> {
+    for n in ALL_NODES {
+        if n != node && !peers.contains_key(&n) {
+            return Err(format!("--peers names no address for node {}", n.0));
+        }
+    }
+    // `lr` lists every node, this one included; its own address is not dialled.
+    let mut all: BTreeSet<NodeId> = peers.keys().copied().collect();
+    all.insert(node);
+    let k = u32::try_from(all.len()).unwrap_or(u32::MAX);
+    if all.iter().map(|n| n.0).ne(1..=k) {
+        return Err(format!(
+            "--peers and --node name nodes {:?}: they must be nodes 1 to K with no gap",
+            all.iter().map(|n| n.0).collect::<Vec<_>>()
+        ));
+    }
+    all.remove(&node);
+    Ok(all)
+}
+
 fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let node = NodeId(need(args.node.as_ref(), "--node")?);
     let dir = need(args.dir.as_ref(), "--dir")?;
     let listen = need(args.listen.as_ref(), "--listen")?;
     let cert_dir = need(args.cert_dir.as_ref(), "--cert-dir")?;
-    for n in ALL_NODES {
-        if n != node && !args.peers.contains_key(&n) {
-            return Err(format!("--peers names no address for node {}", n.0));
-        }
-    }
+    let peers = peer_set(node, &args.peers)?;
     let _entered = rt.enter();
     let faults = Faults::new();
     if let Some(path) = &args.faults {
@@ -306,7 +365,6 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         .block_on(tokio::net::TcpListener::bind(&listen))
         .map_err(|e| format!("--listen {listen}: {e}"))?;
     let links = Links::new();
-    let peers: BTreeSet<NodeId> = ALL_NODES.iter().copied().filter(|n| *n != node).collect();
     let net = Net::start(
         NetConfig {
             label,
@@ -316,6 +374,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
             dial: NetConfig::dial_lower(node, &args.peers),
             protocol_version: args.protocol_version.unwrap_or(PROTOCOL_VERSION),
             faults,
+            admin_apps: admin_apps(args),
         },
         &links,
         Some(listener),
@@ -374,4 +433,24 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     drop(net);
     println!("rdb_node stopped node={}", node.0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{admin_apps, parse};
+
+    fn apps(argv: &[&str]) -> Vec<String> {
+        let args = parse(argv.iter().map(|a| (*a).to_owned())).expect("parses");
+        admin_apps(&args).into_iter().collect()
+    }
+
+    /// Critic-479 A6 (A-R479): how `--admin-apps` is read. Unset is `admin`, the app `lr` runs
+    /// as; an empty value is no app at all, never the default; a list is that list. A
+    /// regression here fails open or locks `lr move` out without a word. Unit.
+    #[test]
+    fn pr74_r479_admin_apps_unset_is_admin_and_empty_is_none() {
+        assert_eq!(apps(&[]), ["admin"]);
+        assert_eq!(apps(&["--admin-apps", ""]), Vec::<String>::new());
+        assert_eq!(apps(&["--admin-apps", "ops,admin"]), ["admin", "ops"]);
+    }
 }
