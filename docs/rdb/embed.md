@@ -692,8 +692,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
       made a different node the owner. Run status before promoting again.
   - **Upgrade every node before you use `promote`.** A node built before issue #70 still
     trusts a plan sent to it directly.
-  - **The dropped node is added back automatically when it starts again, or at the next
-    reopen heal; membership is fixed at three nodes.**
+  - **The dropped node is added back automatically when it starts again, while the owner that
+    committed the drop keeps running; membership is fixed at three nodes.** A reopen does not
+    bring it back: the heal pins only the members `partitions/1` names, and the new owner does
+    not know the node was dropped. It stays left out until `admin rebuild N` takes it back
+    (with nodes in other processes, `lr rebuild N`, which also restarts it).
   - **After every node restarts, a promote still works,** even with the owner's copy lost.
     `partitions/1` keeps the member list and each member's role (record layout 4), and a
     promote plans from it.
