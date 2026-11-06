@@ -73,6 +73,14 @@ struct Args {
 /// The admin app `--admin-apps` defaults to: the app `lr` and `rdb_dev` run as (A-R479).
 const DEFAULT_ADMIN_APP: &str = "admin";
 
+/// The apps this node lets move or rebuild a copy: `--admin-apps` as given (an empty value is
+/// none), or [`DEFAULT_ADMIN_APP`] when the flag is absent (A-R479).
+fn admin_apps(args: &Args) -> BTreeSet<String> {
+    args.admin_apps
+        .clone()
+        .unwrap_or_else(|| BTreeSet::from([DEFAULT_ADMIN_APP.to_owned()]))
+}
+
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
   rdb_node --form --dir D --control E [--log-dir L]
@@ -366,10 +374,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
             dial: NetConfig::dial_lower(node, &args.peers),
             protocol_version: args.protocol_version.unwrap_or(PROTOCOL_VERSION),
             faults,
-            admin_apps: args
-                .admin_apps
-                .clone()
-                .unwrap_or_else(|| BTreeSet::from([DEFAULT_ADMIN_APP.to_owned()])),
+            admin_apps: admin_apps(&args),
         },
         &links,
         Some(listener),
@@ -428,4 +433,24 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     drop(net);
     println!("rdb_node stopped node={}", node.0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{admin_apps, parse};
+
+    fn apps(argv: &[&str]) -> Vec<String> {
+        let args = parse(argv.iter().map(|a| (*a).to_owned())).expect("parses");
+        admin_apps(&args).into_iter().collect()
+    }
+
+    /// Critic-479 A6 (A-R479): how `--admin-apps` is read. Unset is `admin`, the app `lr` runs
+    /// as; an empty value is no app at all, never the default; a list is that list. A
+    /// regression here fails open or locks `lr move` out without a word. Unit.
+    #[test]
+    fn pr74_r479_admin_apps_unset_is_admin_and_empty_is_none() {
+        assert_eq!(apps(&[]), ["admin"]);
+        assert_eq!(apps(&["--admin-apps", ""]), Vec::<String>::new());
+        assert_eq!(apps(&["--admin-apps", "ops,admin"]), ["admin", "ops"]);
+    }
 }

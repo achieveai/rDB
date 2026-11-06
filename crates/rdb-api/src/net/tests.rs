@@ -1409,10 +1409,16 @@ fn pr74_r479_only_an_admin_app_may_send_a_move_or_a_rebuild() {
             reason.contains("app pilot is not an admin app on node 1"),
             "{reason}"
         );
+        assert!(reason.contains("`lr` runs it as `admin`"), "{reason}");
+        // Critic-479 A6: app `admin` refused by a node whose list leaves it out is not told
+        // to run the call as `admin`, which it already is.
+        let reason =
+            super::sender_refused(&admin, msg, &none).expect("an empty list refuses admin");
         assert!(
-            super::sender_refused(&admin, msg, &none).is_some(),
-            "an empty list refuses the admin app too"
+            reason.contains("app admin is not an admin app on node 1"),
+            "{reason}"
         );
+        assert!(!reason.contains("as an admin app"), "{reason}");
     }
     assert_eq!(super::sender_refused(&pilot, &status, &none), None);
 }

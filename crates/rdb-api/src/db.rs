@@ -3471,12 +3471,12 @@ impl Db {
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
     /// text names `admin promote`), or, with the owner in another process, this app is not on
-    /// its node's admin apps (`NetConfig::admin_apps`, A-R479). `UNAVAILABLE`, nothing changed, for another guard or an
-    /// owner in another process. `UNAVAILABLE` with `no_mutation` false once the owner started
-    /// the drop: a re-plan that did not commit a serving partition without `node`, quarantined
-    /// again, or did not commit in time. A wipe the fence refuses restarts `node` on its own
-    /// folder and says so. An `UNAVAILABLE` with `no_mutation` false when `node` restarted but
-    /// is not pinned regular again in time.
+    /// its node's admin apps (`NetConfig::admin_apps`, A-R479). `UNAVAILABLE`, nothing
+    /// changed, for another guard or an owner in another process. `UNAVAILABLE` with
+    /// `no_mutation` false once the owner started the drop: a re-plan that did not commit a
+    /// serving partition without `node`, quarantined again, or did not commit in time. A wipe
+    /// the fence refuses restarts `node` on its own folder and says so. An `UNAVAILABLE` with
+    /// `no_mutation` false when `node` restarted but is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
         if !self.runs(self.route.owner()) && !self.runs(node) {
             if wipe {

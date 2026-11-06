@@ -246,7 +246,9 @@
 //!                                         again (a replayed plan) says `already moved ..`
 //!                                         and exits 0, while the owner that ran it serves.
 //!                                         The owner's copy is refused (promote first); a
-//!                                         refusal prints `err admin move ..`, exits 1
+//!                                         refusal prints `err admin move ..`, exits 1.
+//!                                         Only an admin app may run it (`rdb_node
+//!                                         --admin-apps`); `lr` runs as `admin`
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
 //!                                         and it may go: `absent`, `current` (the running
 //!                                         process's own), `cleared rev=R`, `conflict`, or
@@ -393,7 +395,9 @@
 //!                                         it notes for a free slot; `lr rebuild n
 //!                                         [--wipe]` then stops n, has the fence checked
 //!                                         (`--wipe --fence`), moves the folder aside
-//!                                         and starts n
+//!                                         and starts n. Under `--nodes`, only an admin
+//!                                         app may run it (`rdb_node --admin-apps`); `lr`
+//!                                         runs as `admin`
 //! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
 //!                                         n's head record as a validly chained different
 //!                                         one; `node restart n` then rejoins it and the

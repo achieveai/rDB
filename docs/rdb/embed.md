@@ -682,10 +682,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   An app holding only an rDB link certificate cannot choose or change a promote's plan. A
   copy move or rebuild is different: the owner finishes it with its own rEtcd access, so the
   app's certificate is the whole check. Only an admin app may send one (`rdb_node
-  --admin-apps`, default `admin`; `NetConfig::admin_apps`, empty by default). Another app's
-  move or rebuild is refused with `INVALID_ARGUMENT` and changes nothing. Once a
-  promoter has stored its plan, any node that can read rEtcd can finish that same stored plan,
-  on a node and at a time the sender picks. That is harmless: it is the promoter's own plan.
+  --admin-apps`, default `admin`; `NetConfig::admin_apps` is required, and empty means no app
+  may). Another app's move or rebuild is refused with `INVALID_ARGUMENT` and changes nothing.
+  Once a promoter has stored its plan, any node that can read rEtcd can finish that same
+  stored plan, on a node and at a time the sender picks. That is harmless: it is the
+  promoter's own plan.
   - **Wait for `promote` to answer before running it again.** A rerun while the earlier run is
     still committing (up to about 15 s) can cancel that run's commit. This costs time, not
     safety. The earlier run then answers one of three things:
@@ -697,7 +698,7 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - **Upgrade every node before you use `promote`.** A node built before issue #70 still
     trusts a plan sent to it directly.
   - **The dropped node is added back automatically when it starts again, while the owner that
-    committed the drop keeps running; membership is fixed at three nodes.** A reopen does not
+    committed the drop keeps running; a partition holds at most three copies.** A reopen does not
     bring it back: the heal pins only the members `partitions/1` names, and the new owner does
     not know the node was dropped. It stays left out until `admin rebuild N` takes it back
     (with nodes in other processes, `lr rebuild N`, which also restarts it).

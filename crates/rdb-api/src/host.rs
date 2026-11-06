@@ -11905,8 +11905,9 @@ pub struct FenceFacts {
 /// `Ok` is that stored plan: the only plan the host gives F1 with a routed fence. A routed
 /// `Plan` is never pushed, so an app with only the link cert cannot choose the members, roles
 /// or boots a promote commits. This is about a promote only: a copy move or a rebuild does
-/// change the members, sent by an admin app over its link alone (A-R479). The record is created once and never rewritten, and the commit
-/// CAS at `control_revision` pins the key it was read at.
+/// change the members, sent by an admin app over its link alone (A-R479). The record is
+/// created once and never rewritten, and the commit CAS at `control_revision` pins the key it
+/// was read at.
 pub(crate) fn bind_routed_fence(
     routed: PartitionId,
     proof: &FencingProof,
