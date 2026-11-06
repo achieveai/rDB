@@ -3,15 +3,16 @@
 //! write, C6 the key limit, C7 a refused conditional write, C9 empty is not absent, C11 one call
 //! line per call.
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::ConfigStore;
-use rdb_api::{Db, DbConfig, Timeouts};
+use rdb_api::{Db, DbConfig, NodeId, Timeouts};
 use rdb_server::pb::rdb_client::RdbClient;
 use rdb_server::pb::{self, GetRequest, PutRequest, StatusRequest, TxnPut, TxnRequest};
 use rdb_server::{rdb_error_of, Gateway};
 use tonic::transport::Channel;
+use tracing::Instrument as _;
 
 const MODULE: &str = module_path!();
 
@@ -41,18 +42,16 @@ async fn get(client: &mut RdbClient<Channel>, key: &[u8]) -> pb::GetReply {
         .into_inner()
 }
 
-/// Integration (a few seconds): one gateway over one `Db`, every slice-1 call.
-#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_gateway_serves_the_slice_1_contracts() {
-    const TEST: &str = "the_gateway_serves_the_slice_1_contracts";
+/// A ready `Db` of three in-process nodes over `MemStore`, with the default timeouts. Keep the
+/// directory alive as long as the `Db`.
+async fn open_db() -> (Arc<Db>, impl Sized) {
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    let timeouts = Timeouts::default();
     let config = DbConfig {
         ack_floor: true,
         dir: dir.path().to_path_buf(),
         hold: Vec::new(),
-        timeouts,
+        timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
         local: rdb_api::db::ALL_NODES.to_vec(),
@@ -71,7 +70,49 @@ async fn the_gateway_serves_the_slice_1_contracts() {
         .await
         .expect("join")
         .expect("ready");
+    (db, dir)
+}
 
+/// Shut `db` down once nothing else holds it: a stopped server's connection tasks drop their
+/// gateway clones only as their clients go.
+async fn shut_down(db: Arc<Db>) {
+    let until = Instant::now() + Duration::from_secs(30);
+    while Arc::strong_count(&db) > 1 {
+        assert!(Instant::now() < until, "the gateway still holds the Db");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the gateway still holds the Db"));
+    tokio::task::spawn_blocking(move || db.shutdown())
+        .await
+        .expect("shutdown");
+}
+
+/// Hold every peer link: a write then waits for its acks until the links heal.
+fn hold_all(db: &Db) {
+    for (a, b) in [(1, 2), (1, 3), (2, 3)] {
+        db.links().hold(NodeId(a), NodeId(b));
+    }
+}
+
+/// Wait until `gateway` runs exactly `calls` calls.
+async fn wait_running(gateway: &Gateway, calls: usize) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while gateway.running() != calls {
+        assert!(
+            Instant::now() < until,
+            "the gateway runs {} calls, not {calls}",
+            gateway.running()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Integration (a few seconds): one gateway over one `Db`, every slice-1 call.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gateway_serves_the_slice_1_contracts() {
+    const TEST: &str = "the_gateway_serves_the_slice_1_contracts";
+    let (db, _dir) = open_db().await;
+    let timeouts = Timeouts::default();
     let gateway = Gateway::new(
         Arc::clone(&db),
         rdb_api::db::DEFAULT_CLIENT.0,
@@ -271,11 +312,165 @@ async fn the_gateway_serves_the_slice_1_contracts() {
             .unwrap_or_else(|e| panic!("the largest value for {what}: {e:?}"));
     }
 
+    // PR #78 item 5: a write the server sent and then refused carries its request id, even with
+    // no_mutation; csharp.md says so. Two puts to one new key: the second's "absent" fails.
+    let twice = TxnPut {
+        object: Bytes::from_static(b"twice"),
+        value: Bytes::from_static(b"1"),
+        if_version: None,
+    };
+    let refused = client
+        .txn(TxnRequest {
+            puts: vec![twice.clone(), twice],
+            deadline_ms: 5_000,
+        })
+        .await
+        .expect_err("two puts to one new key");
+    let detail = rdb_error_of(&refused).expect("the server decided");
+    eprintln!("two puts to one new key: {detail:?}");
+    assert!(detail.no_mutation, "{refused:?}");
+    assert!(detail.request_id.is_some(), "{refused:?}");
+
+    // PR #78 item 10: a request past MAX_DECODE_BYTES is refused by tonic before the handler, so
+    // it carries no RdbError though the write never ran. The client checks the size before
+    // sending (RdbClient), so this refusal never reads as an unknown outcome there.
+    let huge = client
+        .put(PutRequest {
+            object: Bytes::from_static(b"huge"),
+            value: Bytes::from(vec![0_u8; rdb_server::MAX_DECODE_BYTES]),
+            if_version: None,
+        })
+        .await
+        .expect_err("a request past the decode limit");
+    eprintln!("a request past the decode limit: {huge:?}");
+    assert!(rdb_error_of(&huge).is_none(), "{huge:?}");
+    assert!(
+        !get(&mut client, b"huge").await.found,
+        "nothing was written"
+    );
+
     drop(client);
     stop.send(()).expect("server still running");
     server.await.expect("join").expect("serve");
-    let mut db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the gateway still holds the Db"));
-    tokio::task::spawn_blocking(move || db.shutdown())
+    shut_down(db).await;
+}
+
+/// PR #78 item 2 (F-004 with a real limit): a call held on one connection fills a limit of 1, a
+/// call on a second connection is refused `OVERLOADED`, and once the held call ends a call on
+/// the second connection is admitted.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_call_fills_the_limit_and_the_next_call_is_admitted_once_it_ends() {
+    let (db, _dir) = open_db().await;
+    let timeouts = Timeouts::default();
+    let gateway = Gateway::new(
+        Arc::clone(&db),
+        rdb_api::db::DEFAULT_CLIENT.0,
+        timeouts.put,
+        timeouts.read,
+    )
+    .with_max_in_flight(1);
+    let watch = gateway.clone();
+    let (listener, addr) = config_testkit::ports::ephemeral_listener().await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(rdb_server::serve(gateway, listener, async {
+        let _ = stopped.await;
+    }));
+    // Two channels: two connections.
+    let mut first = RdbClient::connect(format!("http://{addr}"))
         .await
-        .expect("shutdown");
+        .expect("connect first");
+    let mut second = RdbClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect second");
+
+    hold_all(&db);
+    let held = tokio::spawn(async move { put(&mut first, b"held", b"1", None).await });
+    wait_running(&watch, 1).await;
+    let refused = put(&mut second, b"second", b"2", None)
+        .await
+        .expect_err("a call past the limit");
+    let detail = rdb_error_of(&refused).expect("the server decided");
+    assert_eq!(detail.kind_name, "OVERLOADED", "{refused:?}");
+    assert!(detail.no_mutation, "{refused:?}");
+
+    db.links().heal_all();
+    held.await
+        .expect("join")
+        .expect("the held put lands once the links heal");
+    wait_running(&watch, 0).await;
+    put(&mut second, b"second", b"2", None)
+        .await
+        .expect("admitted once the held call ended");
+    assert_eq!(get(&mut second, b"second").await.value.as_ref(), b"2");
+
+    drop((second, watch));
+    stop.send(()).expect("server still running");
+    server.await.expect("join").expect("serve");
+    shut_down(db).await;
+}
+
+/// PR #78 item 9: a stop asked while a call is held ends within the gateway's stop bound, not
+/// when the call ends. The bound is shortened to 200 ms here; a put held this way runs about 2 s
+/// before the `Db` gives it up as unknown.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_with_a_call_held_ends_within_the_bound() {
+    const TEST: &str = "a_stop_with_a_call_held_ends_within_the_bound";
+    let bound = Duration::from_millis(200);
+    let (db, _dir) = open_db().await;
+    let timeouts = Timeouts::default();
+    let gateway = Gateway::new(
+        Arc::clone(&db),
+        rdb_api::db::DEFAULT_CLIENT.0,
+        timeouts.put,
+        timeouts.read,
+    )
+    .with_drain_max(bound);
+    let watch = gateway.clone();
+    let (listener, addr) = config_testkit::ports::ephemeral_listener().await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    // In the test's span, so the stop's own lines land in this test's log.
+    let serving = rdb_server::serve(gateway, listener, async {
+        let _ = stopped.await;
+    });
+    let server = tokio::spawn(serving.instrument(tracing::Span::current()));
+    let mut client = RdbClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+
+    hold_all(&db);
+    let held = tokio::spawn(async move { put(&mut client, b"held", b"1", None).await });
+    wait_running(&watch, 1).await;
+    let asked = Instant::now();
+    stop.send(()).expect("server still running");
+    let served = tokio::time::timeout(Duration::from_secs(30), server)
+        .await
+        .expect("serve ended within 30 s")
+        .expect("join");
+    let took = asked.elapsed();
+    db.links().heal_all();
+    let answer = held.await.expect("join");
+    eprintln!("stop took {took:?}; the held put ended {answer:?}");
+    served.expect("serve");
+    assert!(
+        took < bound + Duration::from_secs(1),
+        "stop took {took:?} with a call held; the bound is {bound:?}"
+    );
+
+    // The call still running at the cut is said, so an operator knows its line may be lost.
+    config_log::layer::flush_test_logs();
+    let lines = config_testkit::logs::lines_for_current_test(MODULE, TEST);
+    assert!(
+        lines.iter().any(|line| line["@m"] == "rdb_server_stop_cut"),
+        "no rdb_server_stop_cut line"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["@m"] == "rdb_server_drain_incomplete" && line["running"] == 1),
+        "no rdb_server_drain_incomplete line naming 1 running call"
+    );
+
+    wait_running(&watch, 0).await;
+    drop(watch);
+    shut_down(db).await;
 }

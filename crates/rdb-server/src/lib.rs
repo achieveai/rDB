@@ -57,8 +57,9 @@ pub const MAX_IN_FLIGHT: usize = 64;
 /// How soon an `OVERLOADED` refusal says a retry may be admitted.
 pub const OVERLOADED_RETRY_AFTER: Duration = Duration::from_millis(50);
 
-/// How long [`serve`] waits, after the listener stops, for running calls to end and write their
-/// lines: a transaction's longest deadline plus the host's waits around it.
+/// How long a stop may take, counted from the shutdown signal: [`serve`] waits this long in all
+/// for running calls to end and write their lines (a transaction's longest deadline plus the
+/// host's waits around it), then returns with any still running.
 pub const DRAIN_MAX: Duration = Duration::from_secs(45);
 
 /// `addr` as a socket address, or why it is refused. Only a loopback IP is served: apps reach
@@ -363,6 +364,8 @@ pub struct Gateway {
     /// `rdb_server_call` line is written, so [`serve`] drains by taking them all back.
     in_flight: Arc<tokio::sync::Semaphore>,
     max_in_flight: usize,
+    /// How long [`serve`] may take to stop ([`DRAIN_MAX`] unless a test shortens it).
+    drain_max: Duration,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -386,6 +389,7 @@ impl Gateway {
             span: tracing::Span::current(),
             in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
             max_in_flight: MAX_IN_FLIGHT,
+            drain_max: DRAIN_MAX,
         }
     }
 
@@ -395,6 +399,19 @@ impl Gateway {
         self.in_flight = Arc::new(tokio::sync::Semaphore::new(max));
         self.max_in_flight = max;
         self
+    }
+
+    /// The same gateway, stopping within `within` in place of [`DRAIN_MAX`].
+    #[must_use]
+    pub const fn with_drain_max(mut self, within: Duration) -> Self {
+        self.drain_max = within;
+        self
+    }
+
+    /// How many calls hold an in-flight permit now: admitted and not yet logged.
+    #[must_use]
+    pub fn running(&self) -> usize {
+        self.max_in_flight - self.in_flight.available_permits()
     }
 
     /// The tonic service, with the decode limit raised to [`MAX_DECODE_BYTES`].
@@ -408,7 +425,7 @@ impl Gateway {
     pub async fn drain(&self, within: Duration) -> bool {
         let all = u32::try_from(self.max_in_flight).unwrap_or(u32::MAX);
         let drained = tokio::time::timeout(within, self.in_flight.acquire_many(all)).await;
-        let running = self.max_in_flight - self.in_flight.available_permits();
+        let running = self.running();
         match drained {
             Ok(Ok(permits)) => {
                 drop(permits);
@@ -707,9 +724,11 @@ pub fn status_reply(status: &TxnStatus) -> pb::StatusReply {
     }
 }
 
-/// Serve `gateway` on `listener` until `shutdown` completes. Then wait, up to [`DRAIN_MAX`], for
-/// every running call to end and write its `rdb_server_call` line, including a call whose
-/// client has gone: that line is how an operator settles it. Each connection runs at most
+/// Serve `gateway` on `listener` until `shutdown` completes. From then, wait up to the gateway's
+/// stop bound ([`DRAIN_MAX`]) in all for every running call to end and write its
+/// `rdb_server_call` line, including a call whose client has gone: that line is how an operator
+/// settles it. A call still open at the bound is cut (`rdb_server_stop_cut`), and one still
+/// running is counted (`rdb_server_drain_incomplete`). Each connection runs at most
 /// [`MAX_IN_FLIGHT`] streams at once.
 ///
 /// # Errors
@@ -721,15 +740,39 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
     let draining = gateway.clone();
+    let bound = gateway.drain_max;
     let streams = u32::try_from(gateway.max_in_flight.max(1)).unwrap_or(u32::MAX);
-    let served = tonic::transport::Server::builder()
+    // The graceful shutdown waits for every open call, so a long call would hold the stop past the
+    // bound (PR #78 review). The bound counts from the shutdown signal: serving and the drain
+    // together end within it.
+    let (began, begun) = tokio::sync::oneshot::channel::<Instant>();
+    let shutdown = async move {
+        shutdown.await;
+        let _ = began.send(Instant::now());
+    };
+    let serving = tonic::transport::Server::builder()
         .max_concurrent_streams(streams)
         .add_service(gateway.into_service())
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             shutdown,
-        )
+        );
+    tokio::pin!(serving);
+    let (served, stop_by) = tokio::select! {
+        served = &mut serving => (served, Instant::now() + bound),
+        Ok(began) = begun => {
+            let stop_by = began + bound;
+            match tokio::time::timeout_at(stop_by.into(), &mut serving).await {
+                Ok(served) => (served, stop_by),
+                Err(_) => {
+                    tracing::warn!(ms = millis(bound), "rdb_server_stop_cut");
+                    (Ok(()), stop_by)
+                }
+            }
+        }
+    };
+    draining
+        .drain(stop_by.saturating_duration_since(Instant::now()))
         .await;
-    draining.drain(DRAIN_MAX).await;
     served
 }
