@@ -6737,6 +6737,39 @@ mod routed_fence {
         assert_eq!(crate::admin::decode_promote_plan(&bytes), Ok(plan));
     }
 
+    /// The version gate of `decode_promote_plan` as the PR #74 base build had it. Frozen from
+    /// 313f959 (`crates/rdb-api/src/admin.rs`, `PROMOTE_PLAN_VERSION` 1): only the gate is
+    /// copied, so the row tests what that build says, not this build's decoder. Never edit it.
+    fn frozen_313f959_promote_plan_version_gate(bytes: &[u8]) -> Result<(), String> {
+        const PROMOTE_PLAN_VERSION: u8 = 1;
+        let Some((&version, _body)) = bytes.split_first() else {
+            return Err("the record is empty".to_owned());
+        };
+        if version != PROMOTE_PLAN_VERSION {
+            return Err(format!(
+                "plan version {version}, this build reads {PROMOTE_PLAN_VERSION}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// PR #74 F-001 (Revobot R2, inline 4438738832), new to old: an older build (313f959, which
+    /// reads version 1) refuses this build's version 2 plan by name, never decodes it without
+    /// `must_hold`. Control: the same gate passes the v1 fixture.
+    /// Unit (<1 ms).
+    #[test]
+    fn pr74_r2_an_older_build_refuses_a_version_2_stored_plan_by_name() {
+        let mut plan = stored_plan();
+        plan.must_hold = [CopyId(3)].into_iter().collect();
+        let bytes = crate::admin::encode_promote_plan(&plan);
+        assert_eq!(
+            frozen_313f959_promote_plan_version_gate(&bytes),
+            Err("plan version 2, this build reads 1".to_owned())
+        );
+        let old = hex::decode(V1_STORED_PLAN).expect("hex");
+        assert_eq!(frozen_313f959_promote_plan_version_gate(&old), Ok(()));
+    }
+
     /// A-R447: the stored plan's key is tagged in bits 48..64, and a revision that would reach
     /// the tag is refused rather than wrapped into another operation's key.
     /// Cut: no range check, red.
