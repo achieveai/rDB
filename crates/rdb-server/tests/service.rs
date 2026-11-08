@@ -466,7 +466,12 @@ async fn a_stop_with_a_call_held_ends_within_the_bound() {
     // The links are still held, so only the cut can end the held call this soon.
     let answer = tokio::time::timeout(bound + Duration::from_secs(1) - took, held)
         .await
-        .unwrap_or_else(|_| panic!("the held call was still open {:?} after the stop", asked.elapsed()))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the held call was still open {:?} after the stop",
+                asked.elapsed()
+            )
+        })
         .expect("join");
     let ended = asked.elapsed();
     eprintln!("stop took {took:?}; the held put ended after {ended:?}: {answer:?}");
