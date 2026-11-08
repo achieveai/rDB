@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Rdb.Client</RootNamespace>
+    <AssemblyName>Rdb.Client</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <IsPackable>false</IsPackable>
+    <Description>C# client for rDB through the rdb-server gateway: put, get, transactions, status, typed errors.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.Net.Client" Version="2.66.0" />
+    <PackageReference Include="Google.Protobuf" Version="3.28.2" />
+    <PackageReference Include="Grpc.Tools" Version="2.66.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Client stubs only, internal, so the proto types are not part of the public API. -->
+    <Protobuf Include="../../../../proto/rdb/v1/rdb.proto"
+              ProtoRoot="../../../../proto"
+              GrpcServices="Client"
+              Access="Internal" />
+    <InternalsVisibleTo Include="Rdb.Client.Tests" />
+  </ItemGroup>
+
+</Project>

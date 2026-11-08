@@ -3566,6 +3566,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdb-server"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "config-client",
+ "config-core",
+ "config-gossip",
+ "config-log",
+ "config-log-macros",
+ "config-testkit",
+ "prost",
+ "protox",
+ "rdb-api",
+ "rdb-value",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+]
+
+[[package]]
 name = "rdb-sim"
 version = "0.1.0"
 dependencies = [
