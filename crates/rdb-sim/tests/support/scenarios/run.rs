@@ -856,6 +856,7 @@ fn recovery_plan(
             past_horizon: DenyReason::NoGrant,
         },
         retention_millis: RETENTION_MILLIS,
+        must_hold: std::collections::BTreeSet::new(),
         config,
     }
 }

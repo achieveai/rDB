@@ -1484,20 +1484,19 @@ impl Db {
         // record's members), so the open says which local copy is out and the step that brings
         // it back, while the partition pins fewer copies than its count.
         if pinned.len() < admin::members().len() {
-            let local: BTreeSet<&NodeId> = engines
-                .keys()
-                .chain(resume.iter().map(|(node, ..)| node))
+            let local: Vec<(NodeId, bool)> = engines
+                .iter()
+                .map(|(node, engine)| (*node, holds_partition(engine)))
+                .chain(resume.iter().map(|(node, ..)| (*node, true)))
                 .collect();
-            for node in local {
-                if !pinned.contains(node) {
-                    tracing::warn!(
-                        node = node.0,
-                        generation = record.generation.0,
-                        pinned = ?pinned.iter().map(|node| node.0).collect::<Vec<_>>(),
-                        step = %format!("admin rebuild {}", node.0),
-                        "db_open_copy_left_out"
-                    );
-                }
+            for node in left_out_copies(&local, &pinned) {
+                tracing::warn!(
+                    node = node.0,
+                    generation = record.generation.0,
+                    pinned = ?pinned.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    step = %format!("admin rebuild {}", node.0),
+                    "db_open_copy_left_out"
+                );
             }
         }
         if !resume.is_empty() {
@@ -1880,9 +1879,7 @@ impl Db {
         // (A-R287 P1, tester-s2 F-T1). Re-read `partitions/1` and, if it names a new owner,
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
-        // Only these two carry a write to the owner. A compile, a read and a status look write
-        // nothing, so losing the owner under one applied nothing (A-R394 E1).
-        let writes = matches!(call, ClientCall::Put { .. } | ClientCall::Resend { .. });
+        let carried = carries(&call);
         let mut sent = self.send_call(owner, call);
         if let (Err(_), Some(call)) = (&sent, spare) {
             self.refresh_owner();
@@ -1920,7 +1917,7 @@ impl Db {
                 error: unanswered(
                     lock(&self.nodes).iter().any(|handle| handle.node == owner),
                     owner,
-                    writes,
+                    carried,
                 ),
                 request: None,
             }),
@@ -3473,12 +3470,13 @@ impl Db {
     /// # Errors
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
-    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard or an
-    /// owner in another process. `UNAVAILABLE` with `no_mutation` false once the owner started
-    /// the drop: a re-plan that did not commit a serving partition without `node`, quarantined
-    /// again, or did not commit in time. A wipe the fence refuses restarts `node` on its own
-    /// folder and says so. An `UNAVAILABLE` with `no_mutation` false when `node` restarted but
-    /// is not pinned regular again in time.
+    /// text names `admin promote`), or, with the owner in another process, this app is not on
+    /// its node's admin apps (`NetConfig::admin_apps`, A-R479). `UNAVAILABLE`, nothing
+    /// changed, for another guard or an owner in another process. `UNAVAILABLE` with
+    /// `no_mutation` false once the owner started the drop: a re-plan that did not commit a
+    /// serving partition without `node`, quarantined again, or did not commit in time. A wipe
+    /// the fence refuses restarts `node` on its own folder and says so. An `UNAVAILABLE` with
+    /// `no_mutation` false when `node` restarted but is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
         if !self.runs(self.route.owner()) && !self.runs(node) {
             if wipe {
@@ -3561,6 +3559,8 @@ impl Db {
     ///
     /// The owner's refusal, which changed nothing and names the next step (`INVALID_ARGUMENT`
     /// for a move that cannot be made as asked, `UNAVAILABLE` for one to run again later);
+    /// `INVALID_ARGUMENT`, nothing changed, when this `Db` runs over links as an app the owner's
+    /// node does not list as an admin app (`NetConfig::admin_apps`, A-R479);
     /// `NOT_PRIMARY` when the node asked is not the owner; `UNAVAILABLE` when no answer came in
     /// the read timeout.
     pub fn move_copy(&self, from: NodeId, to: NodeId) -> Result<host::MoveAnswer, ApiError> {
@@ -3973,18 +3973,43 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
     error
 }
 
+/// What a call carries to the owner, so what an answer lost under it may hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carries {
+    /// A compile, a read or a status look writes nothing, so losing the owner under one
+    /// applied nothing (A-R394 E1).
+    Nothing,
+    /// A put or a resend: it may have applied, and its request id settles it.
+    Write,
+    /// A move or a rebuild changes the partition record and its copies (PR #74 F-004), and has
+    /// no request id: repeating the same admin call is how to settle it (R2).
+    Admin,
+}
+
+fn carries(call: &ClientCall) -> Carries {
+    match call {
+        ClientCall::Put { .. } | ClientCall::Resend { .. } => Carries::Write,
+        ClientCall::Move { .. } | ClientCall::Rebuild { .. } => Carries::Admin,
+        ClientCall::Compile { .. }
+        | ClientCall::Status { .. }
+        | ClientCall::Get { .. }
+        | ClientCall::GetPrevious { .. } => Carries::Nothing,
+    }
+}
+
 /// The refusal for a call `owner` dropped unanswered (F-001). A node of this process that drops
 /// one is a host fault. One in another process went out of reach, most often because its
 /// process stopped (`lr down`): `UNAVAILABLE`, wait and retry, never "report this" (tc1 D1).
-/// `writes`: the call carried a write, which may then have applied; a call that writes nothing
-/// (a compile, a read, a status look) applied nothing (A-R394 E1).
-fn unanswered(local: bool, owner: NodeId, writes: bool) -> ApiError {
+/// `carried`: a write or an admin call may then have applied; a call that writes nothing (a
+/// compile, a read, a status look) applied nothing (A-R394 E1).
+fn unanswered(local: bool, owner: NodeId, carried: Carries) -> ApiError {
     if local {
-        ApiError::host("the owner dropped the call unanswered")
-    } else if writes {
-        ApiError::owner_lost(owner)
-    } else {
-        ApiError::owner_lost_unsent(owner)
+        return ApiError::host("the owner dropped the call unanswered");
+    }
+    match carried {
+        Carries::Write => ApiError::owner_lost(owner),
+        Carries::Admin => ApiError::owner_lost_admin(owner),
+        Carries::Nothing => ApiError::owner_lost_unsent(owner),
     }
 }
 
@@ -4531,6 +4556,28 @@ fn open_engines(
     Ok((engines, absent))
 }
 
+/// Whether `engine`'s folder holds data of partition 1: proof that its node held a copy.
+fn holds_partition(engine: &RocksEngine) -> bool {
+    engine
+        .lineages()
+        .iter()
+        .any(|(partition, _)| *partition == PARTITION)
+}
+
+/// A-R467, A-R469: the local copies an open names as left out of `partitions/1`. `local` pairs
+/// each local node with whether it held a copy (its folder holds partition 1 data, or a wipe
+/// of it is being finished). A node that never held one is a spare and is never named.
+fn left_out_copies(local: &[(NodeId, bool)], pinned: &[NodeId]) -> Vec<NodeId> {
+    let mut out: Vec<NodeId> = local
+        .iter()
+        .filter(|(node, held)| *held && !pinned.contains(node))
+        .map(|(node, _)| *node)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The engines [`open_engines`] opened, and the copies it left to `Db::check`.
 type OpenedEngines = (BTreeMap<NodeId, RocksEngine>, Vec<Absent>);
 
@@ -4960,7 +5007,11 @@ mod tests {
     /// with `no_mutation` true wrote nothing, so the same put is sent again after a short wait.
     /// Any other refusal, or a pause that outlasts the patience, fails the row. For a put a row
     /// needs to land on a host whose fsyncs may outlast L1's pause age: A-R391 (every copy's
-    /// sync took 530-628 ms against 400 ms) and A-R392 (D18's puts before its stall).
+    /// sync took 530-628 ms against 400 ms) and A-R392 (D18's puts before its stall). A new
+    /// generation's `Unavailable` "not yet marked activated" refusal (A-R184) is sent again the
+    /// same way: it is `no_mutation` and lifts once the open counter marks the generation, which
+    /// a put right after a commit can beat under load (m11_t6 at adf72e7). A refusal that may
+    /// have mutated is never sent again.
     pub(super) fn put_through_pauses(db: &Db, object: &[u8], value: &[u8], case: &str) {
         let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
         let mut paused = 0_u32;
@@ -4968,8 +5019,10 @@ mod tests {
             match db.put(object, value, None) {
                 Ok(_) => break,
                 Err(refused)
-                    if refused.error.kind == ErrorKind::ProtectionPaused
-                        && refused.error.no_mutation
+                    if refused.error.no_mutation
+                        && (refused.error.kind == ErrorKind::ProtectionPaused
+                            || (refused.error.kind == ErrorKind::Unavailable
+                                && refused.error.detail.contains("not yet marked activated")))
                         && Instant::now() < deadline =>
                 {
                     paused += 1;
@@ -5502,6 +5555,98 @@ mod tests {
         unsent("status", &status);
         let get = db.get(b"a").expect_err("the get was dropped");
         unsent("get", &get);
+    }
+
+    /// PR #74 F-004: an admin move or rebuild sent to an owner in another process that goes out
+    /// of reach before answering may already have started (a revocation, a spare note), so the
+    /// lost reply is `no_mutation: false`, as a put's is, never "nothing was applied".
+    /// Cut: `carries` counts only `Put` and `Resend` as writes, red (`no_mutation` true). R2 cut:
+    /// `unanswered` gives an admin call `owner_lost`'s `Db::resend` step, red.
+    /// Unit (~10 ms): no node thread; the owner's mailbox is a link this test drops calls from.
+    #[test]
+    fn pr74_f004_a_lost_reply_to_an_admin_move_or_rebuild_may_have_applied() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (tx, mailbox) = mpsc::channel();
+        links.register(OWNER, tx, crate::host::BOOT);
+        std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                drop(msg);
+            }
+        });
+        let db = Db {
+            nodes: Mutex::new(Vec::new()),
+            respawn: None,
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts::default(),
+            next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
+            client: DEFAULT_CLIENT,
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+            route: Route::default(),
+        };
+        let moved = db
+            .move_copy(NodeId(3), NodeId(4))
+            .expect_err("the move was dropped");
+        assert_eq!(
+            (moved.kind, moved.no_mutation),
+            (ErrorKind::Unavailable, false),
+            "{moved}"
+        );
+        assert!(
+            !moved.to_string().contains("nothing was applied"),
+            "{moved}"
+        );
+        // Revobot R2 (thread 4433944765): an admin call has no request id, so the advice is to
+        // repeat the same admin call and check `admin status`, never `Db::resend`/`Db::status`.
+        let text = moved.explain();
+        assert!(
+            !text.contains("Db::resend") && !text.contains("Db::status"),
+            "{text}"
+        );
+        assert!(
+            text.contains("run the same `admin move` or `admin rebuild` again")
+                && text.contains("`admin status`"),
+            "{text}"
+        );
+        // Revobot R2 thread 4433944765, R3: a repeated move answers where it stands only on an
+        // owner that kept running; a restarted owner has forgotten the move it ran and refuses
+        // the repeat of one that finished (T1), so the text may not promise more.
+        assert!(
+            text.contains("only while the owner keeps running")
+                && text.contains("after a restart a repeat of a finished move is refused"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("answers where it stands or that it is done"),
+            "{text}"
+        );
+        assert_eq!(text.matches("; next: ").count(), 0, "said once: {text}");
+        // `Db::rebuild` looks at the owner first, so its call is checked at the classifier,
+        // and its lost reply gets the same admin advice.
+        let rebuild = ClientCall::Rebuild {
+            identity: db.identity(),
+            node: NodeId(4),
+        };
+        assert_eq!(
+            carries(&rebuild),
+            Carries::Admin,
+            "a lost rebuild reply may hide its spare note"
+        );
+        let lost = super::unanswered(false, OWNER, carries(&rebuild));
+        assert!(!lost.no_mutation, "{lost}");
+        assert_eq!(
+            lost.explain(),
+            text,
+            "one admin text for a move and a rebuild"
+        );
     }
 
     /// A-R394 P1 (tester tc2 S4 c): `wait_ready` with no link to the owner up (its process is
@@ -11685,6 +11830,7 @@ mod tests {
                 past_horizon: DenyReason::NoGrant,
             },
             retention_millis: 1_000,
+            must_hold: std::collections::BTreeSet::new(),
             config,
         };
         let fence = FencingProof {

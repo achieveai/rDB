@@ -160,6 +160,7 @@ pub(crate) fn recovery_plan(
             past_horizon: DenyReason::NoGrant,
         },
         retention_millis: RETENTION_MILLIS,
+        must_hold: std::collections::BTreeSet::new(),
         config,
     }
 }
@@ -2310,7 +2311,24 @@ pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
 
 /// The first byte of a stored promote plan: the layout of the postcard bytes after it. A build
 /// that reads another refuses it (`plan_unreadable`) instead of guessing at its fields.
-pub(crate) const PROMOTE_PLAN_VERSION: u8 = 1;
+///
+/// `2` (PR #74 F-001, ruling A-R477) appends [`RecoveryPlan::must_hold`]. postcard is not
+/// self-describing, so a field cannot be defaulted in: this build reads `1` as
+/// [`StoredPlanV1`] with `must_hold` empty, and a build that reads only `1` refuses `2` by this
+/// byte, naming both versions (`plan version 2, this build reads 1`).
+pub(crate) const PROMOTE_PLAN_VERSION: u8 = 2;
+
+/// The stored plan before `must_hold` ([`PROMOTE_PLAN_VERSION`] `1`): every field of
+/// [`RecoveryPlan`] but the last, in its order.
+#[derive(serde::Deserialize)]
+struct StoredPlanV1 {
+    anchor: LineageAnchor,
+    config: PartitionConfig,
+    candidates: Vec<Candidate>,
+    rebuild_required: std::collections::BTreeSet<CopyId>,
+    authority_view: AuthorityView,
+    retention_millis: u64,
+}
 
 /// The `operations/` key of the plan the promote that fenced `partitions/1` at `revision` stored
 /// (A-R447): `operations/{PROMOTE_OPERATION_BASE + revision}`.
@@ -2348,13 +2366,30 @@ pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> 
     let Some((&version, body)) = bytes.split_first() else {
         return Err("the record is empty".to_owned());
     };
-    if version != PROMOTE_PLAN_VERSION {
-        return Err(format!(
-            "plan version {version}, this build reads {PROMOTE_PLAN_VERSION}"
-        ));
-    }
-    let (plan, rest) =
-        postcard::take_from_bytes::<RecoveryPlan>(body).map_err(|error| error.to_string())?;
+    let (plan, rest) = match version {
+        PROMOTE_PLAN_VERSION => {
+            postcard::take_from_bytes::<RecoveryPlan>(body).map_err(|error| error.to_string())?
+        }
+        1 => {
+            let (old, rest) = postcard::take_from_bytes::<StoredPlanV1>(body)
+                .map_err(|error| error.to_string())?;
+            let plan = RecoveryPlan {
+                anchor: old.anchor,
+                config: old.config,
+                candidates: old.candidates,
+                rebuild_required: old.rebuild_required,
+                authority_view: old.authority_view,
+                retention_millis: old.retention_millis,
+                must_hold: std::collections::BTreeSet::new(),
+            };
+            (plan, rest)
+        }
+        _ => {
+            return Err(format!(
+                "plan version {version}, this build reads 1 and {PROMOTE_PLAN_VERSION}"
+            ))
+        }
+    };
     if !rest.is_empty() {
         return Err(format!("{} bytes after the plan", rest.len()));
     }

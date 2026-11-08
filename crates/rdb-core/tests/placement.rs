@@ -590,6 +590,43 @@ fn an_unrepairable_shared_machine_is_named_with_no_legal_move() {
     );
 }
 
+/// PR #74 F-002: primary 1 on machine A, copies 2 (B) and 3 (C) unhealthy, spare 4 on C, one
+/// failure domain. Copy 2 has no legal target (4 shares C with copy 3); copy 3 may move to 4.
+/// The repair moves copy 3 rather than stopping at copy 2, and names copy 2 alone as unmet.
+/// Cut: the loop ends at the first copy with no target, red (no step, both copies named).
+#[retcd_test]
+fn a_copy_with_no_legal_target_does_not_stop_a_later_copy_s_repair() {
+    let mut nodes: Vec<Node> = (1..=4).map(node).collect();
+    for n in &mut nodes {
+        n.domain = "d".to_owned();
+    }
+    nodes[1].state = NodeState::Unhealthy;
+    nodes[2].state = NodeState::Unhealthy;
+    nodes[3].machine = "m3".to_owned();
+    let input = inv(nodes, vec![part(1, &[1, 2, 3], 1)]);
+    let (plan, _) = checked(&input, usize::MAX, "later legal repair");
+    let moves: Vec<(u32, u32)> = plan.steps.iter().map(|s| (s.from, s.to)).collect();
+    assert_eq!(moves, vec![(3, 4)], "{:?}", plan.steps);
+    assert_eq!(
+        plan.steps[0].why,
+        Why::Repair(Rule::NodeState(NodeState::Unhealthy))
+    );
+    let unrepaired: Vec<(u32, Cause)> = plan
+        .residuals
+        .iter()
+        .filter_map(|r| match r {
+            Residual::Unrepaired { node, cause, .. } => Some((*node, *cause)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unrepaired,
+        vec![(2, Cause::NoLegalMove)],
+        "{:?}",
+        plan.residuals
+    );
+}
+
 #[retcd_test]
 fn the_move_budget_caps_the_plan_and_is_named() {
     let mut nodes: Vec<Node> = (1..=6).map(node).collect();
@@ -781,7 +818,7 @@ fn a_copy_never_lands_in_a_failure_domain_another_copy_uses_when_spread_is_feasi
 }
 
 /// Node 1 is draining and leads every partition, so the plan hands three primaries off and moves
-/// copies of partition 1 and of others. Only a live command may print as an `rdb_dev` line: an
+/// copies of partition 1 and of others. Only a live command may print as an `admin` line: an
 /// owner move is refused (D3), so a primary handoff prints as a plain `step:` line, and so does
 /// a copy move of a partition other than 1, which no live command takes.
 #[retcd_test]
@@ -796,9 +833,11 @@ fn a_primary_handoff_never_prints_as_an_rdb_dev_command_line() {
         assert!(line.ends_with(&why), "{line}");
         if step.primary {
             assert!(line.starts_with("step: "), "{line}");
+            assert!(!line.contains("admin move"), "{line}");
             assert!(!line.contains("rdb_dev"), "{line}");
         } else if step.partition == 1 {
-            let command = format!("rdb_dev admin move {} {} ", step.from, step.to);
+            // PR #74 F-003: the session line, which runs; `rdb_dev admin move` argv does not.
+            let command = format!("admin move {} {} ", step.from, step.to);
             assert!(line.starts_with(&command), "{line}");
             assert!(!line.contains("--"), "{line}");
         } else {

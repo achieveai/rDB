@@ -213,8 +213,10 @@ pub struct Step {
 
 impl Step {
     /// The step as `rdb_dev admin plan` prints it, ending `# <why>`. Only a line that is a live
-    /// command starts `rdb_dev`: a copy move of partition 1 prints as
-    /// `rdb_dev admin move <from> <to>`. Two steps have no live command and print as `step:`: a
+    /// command starts `admin`: a copy move of partition 1 prints as `admin move <from> <to>`, the
+    /// rdb_dev session line (`lr move <from> <to>` sends it on a local cluster). `rdb_dev` takes
+    /// no `admin move` argv form (PR #74 F-003). Two steps have no live command and print as
+    /// `step:`: a
     /// copy move of another partition (today's CLI moves partition 1 only, critic A2), and a
     /// primary handoff, because an owner move is refused (D3).
     #[must_use]
@@ -226,7 +228,7 @@ impl Step {
                 self.partition, self.from, self.to
             )
         } else if self.partition == 1 {
-            format!("rdb_dev admin move {} {}", self.from, self.to)
+            format!("admin move {} {}", self.from, self.to)
         } else {
             format!(
                 "step: move partition {}'s copy from node {} to node {} \
@@ -718,14 +720,17 @@ impl Planner {
             }
             loop {
                 let (copies, primary) = self.parts[&id].clone();
+                // PR #74 F-002: a copy with no legal target does not end the repair; a later
+                // broken copy that has one still moves.
                 let next = self
                     .violations(&copies, primary)
                     .into_iter()
-                    .find(|(node, rule)| *node != primary && *rule != Rule::PrimaryNotEligible);
-                let Some((from, rule)) = next else { break };
-                let Some(to) = self.best_copy_target(id, from, false) else {
-                    break;
-                };
+                    .filter(|(node, rule)| *node != primary && *rule != Rule::PrimaryNotEligible)
+                    .find_map(|(from, rule)| {
+                        self.best_copy_target(id, from, false)
+                            .map(|to| (from, rule, to))
+                    });
+                let Some((from, rule, to)) = next else { break };
                 if !self.take(Step {
                     partition: id,
                     from,

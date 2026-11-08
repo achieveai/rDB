@@ -3893,6 +3893,80 @@ fn m11_t10_a_move_target_lost_in_the_promote_barrier_is_given_up_at_once() {
     }
 }
 
+/// PR #74 F-001: the move target's inventory for the promote never reaches node 4, while every
+/// link stays up. F1 closes its window with nodes 1 and 2 only, and before the fix committed
+/// nodes 1, 2 and 4 with node 4 outside the barrier: node 3 left and `move_committed` said
+/// `moved`. A source-removing promote now needs its target in `required` (ruling A-R477): F1
+/// blocks with `BarrierIncomplete` naming node 4's copy, the move is given up, and node 3 stays
+/// regular. No commit ever leaves node 3 out.
+/// Cut: no `must_hold` check in F1's `select`, red (members 1, 2, 4; the move answers done).
+/// Integration (~6 s): bootstrap's window, the join, the promote's full window, the give-up.
+#[config_log::retcd_test]
+fn pr74_f001_a_move_target_whose_promote_inventory_is_withheld_keeps_the_source() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(1, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow)).then_some(())
+    });
+    // From here every inventory ask to node 4 is lost; frames and every other ask still flow.
+    let mut withheld = 0_u32;
+    let deadline = Instant::now() + test_patience(Trio::PATIENCE * 2);
+    let (why, members) = loop {
+        for (index, (host, _, rx)) in trio.nodes.iter_mut().enumerate() {
+            host.run_due();
+            host.drain();
+            while let Ok(msg) = rx.try_recv() {
+                if index == 3
+                    && matches!(
+                        &msg,
+                        Msg::PeerAsk {
+                            ask: PeerAsk::Inventory { .. },
+                            ..
+                        }
+                    )
+                {
+                    withheld += 1;
+                    continue;
+                }
+                host.handle(msg);
+            }
+            assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+        }
+        assert_ne!(
+            pinned_role(&trio, 3),
+            None,
+            "a commit left node 3 out with node 4's inventory withheld: {:?}",
+            commit_of(&trio)
+        );
+        let why = trio.nodes[0]
+            .0
+            .moves
+            .get(&PartitionId(1))
+            .and_then(|mv| mv.abandoned.clone());
+        if let Some((why, (_, _, members))) = why.zip(
+            commit_of(&trio)
+                .filter(|(_, _, members)| !members.contains(&4) && members.contains(&3)),
+        ) {
+            break (why, members);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the move was neither given up nor finished"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert!(withheld > 0, "no inventory ask to node 4 was withheld");
+    assert_eq!(members, vec![1, 2, 3], "node 3 keeps its copy");
+    assert_eq!(pinned_role(&trio, 3), Some(ReplicaRole::RegularSecondary));
+    // Node 4 stays linked, so a re-run would start the move afresh (T9); the reason is read
+    // from the give-up itself.
+    assert!(why.contains("node 3 keeps its copy"), "{why}");
+}
+
 /// M11 T12 (ruling A-R456): the way back from two copies is `admin rebuild` onto a spare. Node 3
 /// dies and is dropped, so the commit pins nodes 1 and 2. `move 2 4` is refused and names
 /// `admin rebuild 4`; the rebuild of spare node 4 is answered at once (mode A), and once node 4
@@ -4100,7 +4174,7 @@ fn m11_a5_a_free_slot_takes_one_spare_note() {
     for ask in ["rebuild 4", "rebuild 4 again"] {
         match owner.rebuild_from_app(PartitionId(1), NodeId(4)) {
             Ok(line) => assert!(
-                line.contains("node 4 is a spare")
+                line.contains("node 4 is not pinned")
                     && line.contains("while node 1 stays the owner")
                     && !line.contains("  "),
                 "{ask}: {line}"
@@ -4124,6 +4198,36 @@ fn m11_a5_a_free_slot_takes_one_spare_note() {
         .map(|member| member.node.0)
         .collect();
     assert!(!noted.contains(&5), "{noted:?}");
+}
+
+/// Ruling A-R471 (tester, bd5e8da r4sp.txt:132): after a full lr reopen the owner's
+/// in-memory left-out set is empty, so `admin rebuild 3` of the copy it dropped took the spare
+/// path and said "node 3 is a spare", which was false: node 3 held a copy. Not pinned is all
+/// the owner knows there, and that is all the answer says. Simulated here by clearing the set,
+/// as the owner's restart does. Cut: the spare wording back: red.
+/// Integration (~4 s): b1's drop, one ask.
+#[config_log::retcd_test]
+fn m11_r471_an_owner_without_the_left_out_set_does_not_call_a_copy_a_spare() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), tuned);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    let (before, _, _) = commit_of(&trio).expect("bootstrap committed");
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    let owner = &mut trio.nodes[0].0;
+    owner.left_out.clear();
+    match owner.rebuild_from_app(PartitionId(1), NodeId(3)) {
+        Ok(line) => assert!(
+            !line.contains("spare")
+                && line.contains("rebuild: node 3 is not pinned; node 1 (the owner) noted it")
+                && !line.contains("  "),
+            "{line}"
+        ),
+        Err(error) => panic!("rebuild 3: {error:?}"),
+    }
 }
 
 /// Critic M1 (a), ruling A-R457: a move whose shadow caught up after a regular copy was dropped

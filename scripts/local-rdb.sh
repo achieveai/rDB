@@ -259,11 +259,14 @@ start_node() { # n [stopped]: `stopped` skips the running check when the caller 
     rm -f "$RUN/stop/node-$n"
     out="$RUN/out/node-$n.out"
     err="$RUN/out/node-$n.err"
+    # `--admin-apps admin`: the app `lr move`/`rebuild`/`promote` run as (A-R480: unset is none).
+    # A later `--admin-apps` in LR_NODE_ARGS wins.
     # shellcheck disable=SC2086
     "$NODE_BIN" --node "$n" --dir "$RUN/db" --listen "127.0.0.1:$(node_port "$n")" \
         --peers "$(peers)" --control "$CONTROL" --cert-dir "${LR_CERT_DIR:-$RUN/certs}" \
         --faults "$RUN/faults/node-$n.txt" --stop-file "$RUN/stop/node-$n" \
-        --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
+        --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" --admin-apps admin \
+        ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
     pid=$!
     os="$(os_pid_of_child "$pid" rdb_node)" || { cat "$err" >&2; die "node $n exited at start"; }
     record_pid "node-$n" "$os"
@@ -552,6 +555,13 @@ start_all() { # nodes 1 to K, then the wait for each: the tail of `up` and `up -
     say "pilot: $(printf %q "$PILOT_BIN") --dir $(printf %q "$RUN/pilot") --control $CONTROL --nodes $(peers) --cert-dir $(printf %q "$RUN/certs") --put k=v --get k"
 }
 
+# No pids file: nothing was started in this run, so nothing runs. Said, never a silent exit:
+# awk on a missing file failed `pid_of` under pipefail, and `lr down` exited 2 (PR #74 R3).
+no_pids() {
+    [ -f "$RUN/pids" ] && return 1
+    say "nothing runs: run $RUN has no pids file"
+}
+
 down() {
     local n
     for n in $(all_nodes); do stop_node "$n"; done
@@ -565,7 +575,8 @@ down() {
 }
 
 clean() {
-    down
+    # No pids file: nothing runs to stop, so only the folder goes, under the same root check.
+    no_pids || down
     case "$RUN" in
         "$ROOT"/*) ;;
         *) die "refusing to remove $RUN: not under $ROOT" ;;
@@ -632,23 +643,31 @@ promote() {
 
 spare_hint() { # after a promote: the owner does not pin a running spare by itself (tester paper
     # cut, 7913fb8). With fewer than 3 copies pinned, name the rebuild that fills the free slot.
+    # With more than one running node unpinned, lr cannot tell which held a copy (A-R469), so
+    # it lists them and names none.
     local members k
     members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
-    k="$(spare_target "$members")"
-    [ -n "$k" ] || return 0
-    say "partition 1 has $(copies_of "$members") copies and node $k runs unpinned; to make it the third copy, run: scripts/local-rdb.sh rebuild $k --run $RUN"
+    k="$(unpinned_running "$members")"
+    case "$k" in
+        "") return 0 ;;
+        *" "*) say "partition 1 has $(copies_of "$members") copies and nodes $k run unpinned; to make one of them the third copy, run: scripts/local-rdb.sh rebuild <node> --run $RUN" ;;
+        *) say "partition 1 has $(copies_of "$members") copies and node $k runs unpinned; to make it the third copy, run: scripts/local-rdb.sh rebuild $k --run $RUN" ;;
+    esac
 }
 
 copies_of() { printf '%s' "$1" | sed -n 's/^members \([^;]*\);.*/\1/p' | { grep -o '[0-9]*=' || true; } | wc -l | tr -d ' '; }
 
-spare_target() { # members-line: the lowest running node the line leaves unpinned, while fewer
-    # than 3 copies are pinned; nothing when the line is missing or the slots are full
-    local k unpinned
+unpinned_running() { # members-line: the running nodes the line leaves unpinned, space-separated,
+    # while fewer than 3 copies are pinned; nothing when the line is missing or the slots are
+    # full. Reads both forms: `; not pinned 3 4 (` and, short of copies over lr (A-R469),
+    # `; partition 1 has 2 of 3 copies; not pinned: 3 4; ...`.
+    local k unpinned out=""
     [ -n "$1" ] && [ "$(copies_of "$1")" -lt 3 ] || return 0
-    unpinned=" $(printf '%s' "$1" | sed -n 's/.*; not pinned \([0-9 ]*\) (.*/\1/p') "
+    unpinned=" $(printf '%s' "$1" | sed -n -e 's/.*; not pinned: \([0-9 ]*\);.*/\1/p' -e 't' -e 's/.*; not pinned \([0-9 ]*\) (.*/\1/p') "
     for k in $(all_nodes); do
-        case "$unpinned" in *" $k "*) node_alive "$k" && { echo "$k"; return 0; } ;; esac
+        case "$unpinned" in *" $k "*) node_alive "$k" && out="$out${out:+ }$k" ;; esac
     done
+    printf '%s' "$out"
 }
 
 # Moves stopped node $1's folder to $RUN/db/aside/node-<n>-<UTC stamp> and says where; it is
@@ -698,7 +717,7 @@ rebuild() {
 
 case "$COMMAND" in
     up) up ;;
-    down) pick_run; down ;;
+    down) pick_run; no_pids || down ;;
     clean) pick_run; clean ;;
     status) pick_run; status ;;
     env) pick_run; cat "$RUN/run.env"; echo "RUN=$RUN"; echo "PEERS=$(peers)" ;;

@@ -665,7 +665,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **An older build cannot open a folder after this build wrote `partitions/1`.** This build
   writes that record with its member list (layout 4). A build without layout 4 reads it as
   undecodable and refuses the open (`Undecodable`), and keeps refusing. Run this build or a
-  newer one.
+  newer one. After an `admin move`, do not roll back to a build before moves (M11) either: it
+  reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
@@ -678,9 +679,16 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   (`operations/<tag + revision>`, where the revision is the promote's own `Fencing` write), and
   only on a fence its own reads of `partitions/1` and the old owner's grant prove true.
   Starting a promote needs rEtcd write access to `partitions/`, `grants/` and `operations/`.
-  An app holding only an rDB link certificate cannot choose or change a promote's plan. Once a
-  promoter has stored its plan, any node that can read rEtcd can finish that same stored plan,
-  on a node and at a time the sender picks. That is harmless: it is the promoter's own plan.
+  An app holding only an rDB link certificate cannot choose or change a promote's plan. A
+  copy move or rebuild is different: the owner finishes it with its own rEtcd access, so the
+  app's certificate is the whole check. Only an admin app may send one (`rdb_node
+  --admin-apps`; `NetConfig::admin_apps`). Unset or empty, no app may (ruling A-R480). `admin`
+  is the dev launchers' name: `lr` passes it, and `lr` and `rdb_dev` run as it. A production
+  node lists its operator apps. Another app's move or rebuild is refused with
+  `INVALID_ARGUMENT` and changes nothing.
+  Once a promoter has stored its plan, any node that can read rEtcd can finish that same
+  stored plan, on a node and at a time the sender picks. That is harmless: it is the
+  promoter's own plan.
   - **Wait for `promote` to answer before running it again.** A rerun while the earlier run is
     still committing (up to about 15 s) can cancel that run's commit. This costs time, not
     safety. The earlier run then answers one of three things:
@@ -691,8 +699,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
       made a different node the owner. Run status before promoting again.
   - **Upgrade every node before you use `promote`.** A node built before issue #70 still
     trusts a plan sent to it directly.
-  - **The dropped node is added back automatically when it starts again, or at the next
-    reopen heal; membership is fixed at three nodes.**
+  - **The dropped node is added back automatically when it starts again, while the owner that
+    committed the drop keeps running; a partition holds at most three regular copies, and a
+    move briefly adds a Shadow.** A reopen does not
+    bring it back: the heal pins only the members `partitions/1` names, and the new owner does
+    not know the node was dropped. It stays left out until `admin rebuild N` takes it back
+    (with nodes in other processes, `lr rebuild N`, which also restarts it).
   - **After every node restarts, a promote still works,** even with the owner's copy lost.
     `partitions/1` keeps the member list and each member's role (record layout 4), and a
     promote plans from it.

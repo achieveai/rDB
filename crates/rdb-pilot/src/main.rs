@@ -532,6 +532,8 @@ fn connect(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, Exit
                 dial,
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                // An app receives no calls (A-R479).
+                admin_apps: std::collections::BTreeSet::new(),
             },
             &links,
             None,

@@ -758,7 +758,9 @@ pub enum ClientCall {
         generation: Option<Generation>,
     },
     /// M11: move the copy on node `from` to node `to`, or say where that move stands
-    /// ([`Answer::Moved`]). Only the pinned primary takes it; asking again resumes a move.
+    /// ([`Answer::Moved`]). Only the pinned primary takes it; asking again resumes a move. It
+    /// changes who holds a copy, and the owner completes it with its own store credentials, so
+    /// over a link only an admin app may send it (`NetConfig::admin_apps`, A-R479).
     Move {
         /// The identity minted for it.
         identity: RequestIdentity,
@@ -770,7 +772,9 @@ pub enum ClientCall {
     /// M11 T12 over processes: `admin rebuild node` from an app with no node of its own
     /// ([`Answer::Rebuilt`]). Only the pinned primary takes it, and only for a node it does not
     /// pin: a spare is noted for the free slot, a copy already left out is answered as it is.
-    /// Dropping a pinned copy needs the owner's own process.
+    /// Dropping a pinned copy needs the owner's own process. A noted spare is pinned once it
+    /// restarts, so this changes membership too: over a link only an admin app may send it
+    /// (`NetConfig::admin_apps`, A-R479).
     Rebuild {
         /// The identity minted for it.
         identity: RequestIdentity,
@@ -5625,7 +5629,17 @@ impl Host {
         let version = ConfigVersion(pinned.config_version.0 + 1);
         let generation = root.generation.next();
         let boots: Vec<(u32, u64)> = members.iter().map(|m| (m.node.0, m.boot.0)).collect();
-        let plan = crate::admin::recovery_plan(
+        // PR #74 F-001 (ruling A-R477): a promote that leaves a copy out (a move's source) commits
+        // only with its rejoiner, the move's target, in the barrier. Otherwise F1 blocks naming
+        // it, and [`Self::move_blocked`] gives the move up with the source kept.
+        let must_hold: BTreeSet<CopyId> = replan
+            .rejoiner
+            .filter(|_| replan.promote && replan.drop.is_some())
+            .and_then(|node| members.iter().find(|member| member.node == node))
+            .map(|member| member.copy)
+            .into_iter()
+            .collect();
+        let mut plan = crate::admin::recovery_plan(
             anchor,
             version,
             members,
@@ -5633,6 +5647,7 @@ impl Host {
             view.grant_id,
             view.authority_generation,
         );
+        plan.must_hold = must_hold;
         let fence = FencingProof {
             partition,
             prior_generation: root.generation,
@@ -5658,6 +5673,7 @@ impl Host {
             readded = ?readded.map(|member| member.node.0),
             joining = ?joining.map(|member| member.node.0),
             shadowed = ?shadowed.map(|node| node.0),
+            must_hold = ?plan.must_hold.iter().map(|copy| copy.0).collect::<Vec<_>>(),
             "rejoin_plan"
         );
         self.rejoins
@@ -7705,7 +7721,7 @@ impl Host {
                 node.0, self.node.0, ready.generation.0
             )),
             Ok(Ok(ready)) => Ok(format!(
-                "rebuild: node {} is a spare; node {} (the owner) noted it for the free slot at \
+                "rebuild: node {} is not pinned; node {} (the owner) noted it for the free slot at \
                  generation {} (mode A), while node {} stays the owner (a new owner forgets the \
                  note: run the rebuild again); restart it and the owner takes it back, first \
                  as a shadow, then regular",
@@ -7779,7 +7795,7 @@ impl Host {
                 guard: "slot",
                 detail: format!(
                     "node {}'s copy id is taken in partition {} (members: {list}): name another \
-                     spare",
+                     node",
                     node.0, partition.0
                 ),
             });
@@ -11888,8 +11904,10 @@ pub struct FenceFacts {
 ///
 /// `Ok` is that stored plan: the only plan the host gives F1 with a routed fence. A routed
 /// `Plan` is never pushed, so an app with only the link cert cannot choose the members, roles
-/// or boots a promote commits. The record is created once and never rewritten, and the commit
-/// CAS at `control_revision` pins the key it was read at.
+/// or boots a promote commits. This is about a promote only: a copy move or a rebuild does
+/// change the members, sent by an admin app over its link alone (A-R479). The record is
+/// created once and never rewritten, and the commit CAS at `control_revision` pins the key it
+/// was read at.
 pub(crate) fn bind_routed_fence(
     routed: PartitionId,
     proof: &FencingProof,

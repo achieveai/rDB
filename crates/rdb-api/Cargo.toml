@@ -58,6 +58,11 @@ protox = { workspace = true }
 tonic-build = { workspace = true }
 
 [[example]]
+name = "rdb_node"
+# Its `--admin-apps` row runs under `cargo test -p rdb-api` (A-R479).
+test = true
+
+[[example]]
 name = "rdb_dev"
 # Run the example's poller tests under `cargo test -p rdb-api` (the stall-cleared line).
 test = true

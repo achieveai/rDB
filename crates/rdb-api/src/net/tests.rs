@@ -355,7 +355,7 @@ fn answers() -> Vec<Answer> {
         Answer::Compiled(zero()),
         Answer::Unchanged,
         Answer::Status(zero()),
-        Answer::Rebuilt("rebuild: node 4 is a spare".to_owned()),
+        Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
         Answer::Moved(MoveAnswer {
             done: true,
             line: "already moved: node 3 to node 4".to_owned(),
@@ -693,6 +693,8 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
             dial: spec.dial,
             protocol_version: spec.version,
             faults: Faults::new(),
+            // As `lr` starts its nodes (A-R479, A-R480).
+            admin_apps: admin_apps(),
         },
         &links,
         listener,
@@ -712,6 +714,11 @@ fn certs_for(dir: &FsPath, nodes: &[u32]) {
 }
 
 const PATIENCE: Duration = Duration::from_secs(5);
+
+/// The admin-app list `lr` passes to `rdb_node` (A-R479, A-R480).
+fn admin_apps() -> BTreeSet<String> {
+    BTreeSet::from(["admin".to_owned()])
+}
 
 /// Take the next message from `mail` on a blocking thread, so the runtime keeps serving the
 /// link while a row waits.
@@ -1086,6 +1093,209 @@ async fn an_app_link_never_delivers_a_peer_message() {
     );
 }
 
+/// A-R479: app `app`'s process sends node 1 `call` (a Move or a Rebuild), then a `Status`, a
+/// client call any app may send. Returns what node 1's node got first and the answer the app
+/// got for `call`. Node 1 runs with the admin-app list {admin}, as `lr` starts its nodes.
+async fn app_admin_call(app: &str, call: ClientCall) -> (Msg, Answer) {
+    let dir = config_testkit::fs::temp_dir();
+    let label = Label::App(app.to_owned());
+    certs::generate(dir.path(), &[Label::Node(NodeId(1)), label.clone()]).expect("certs");
+    let one = side(Spec::node(1, dir.path(), &[]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let sender = Spec {
+        claim: Some(label.clone()),
+        cert_of: Some(label),
+        ..Spec::node(9, dir.path(), &[1]).dialling(1, addr)
+    };
+    let sender = side(sender, false).await;
+    sender
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("app -> 1 up");
+    let (reply, answer) = mpsc::channel();
+    sender
+        .links
+        .post(
+            NodeId(1),
+            Msg::Client(Client {
+                partition: PartitionId(1),
+                call,
+                reply,
+            }),
+        )
+        .expect("posted");
+    let (status, _status_answer) = mpsc::channel();
+    sender
+        .links
+        .post(
+            NodeId(1),
+            Msg::Client(Client {
+                partition: PartitionId(1),
+                call: ClientCall::Status {
+                    identity: identity(9, 99),
+                    generation: None,
+                },
+                reply: status,
+            }),
+        )
+        .expect("posted");
+    let (got, mail) = next(one.mail).await;
+    // A call that reached node 1 is answered as its host would, so the app's wait ends.
+    let answered = tokio::task::spawn_blocking(move || {
+        if let Msg::Client(Client { reply, .. }) = &got {
+            reply
+                .send(Answer::Error {
+                    error: ApiError::host("node 1's node took the call"),
+                    request: None,
+                })
+                .expect("caller waits");
+        }
+        let answer = answer.recv_timeout(PATIENCE).expect("the app is answered");
+        drop(mail);
+        (got, answer)
+    })
+    .await
+    .expect("join");
+    drop(sender);
+    answered
+}
+
+/// Each client call row `test`'s node 1 took a request number for, as `(n, call)`, from its
+/// `net_client_request` lines.
+fn client_requests(test: &str) -> Vec<(u64, String)> {
+    config_testkit::logs::lines_for_current_test(module_path!(), test)
+        .iter()
+        .filter(|line| line["@m"].as_str() == Some("net_client_request"))
+        .map(|line| {
+            (
+                line["n"].as_u64().expect("n"),
+                line["call"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The refusal a non-admin app gets for `verb`: definitive, nothing done, and it says who
+/// decides and what to do (A-R465). Revobot R3 4489400309: the gate runs before the request
+/// number and its `net_client_request` event, so the refused call takes neither, and the
+/// `Status` sent after it is node 1's request 1 and its only request event.
+fn assert_not_admin(test: &str, got: &Msg, answer: &Answer, app: &str, verb: &str) {
+    assert!(
+        matches!(
+            got,
+            Msg::Client(Client {
+                call: ClientCall::Status { .. },
+                ..
+            })
+        ),
+        "an app not on the admin list never reaches node 1's node with a {verb}: {got:?}"
+    );
+    assert_eq!(
+        client_requests(test),
+        [(1, "status".to_owned())],
+        "a refused {verb} takes no request number and logs no request event"
+    );
+    let Answer::Error { error, request } = answer else {
+        panic!("a refusal: {answer:?}");
+    };
+    assert_eq!(request, &None);
+    assert_eq!(
+        (error.kind, error.retry, error.no_mutation),
+        (ErrorKind::InvalidArgument, RetryRule::Definitive, true),
+        "{error}"
+    );
+    let text = error.explain();
+    assert!(
+        text.contains(&format!("app {app} is not an admin app"))
+            && text.contains("--admin-apps")
+            && text.contains("as an admin app"),
+        "{text}"
+    );
+    assert!(text.contains("did nothing"), "{text}");
+    // Hand walk (lr, app pilot): the text carried the source's indentation as runs of spaces.
+    assert!(!text.contains("  "), "one space between words: {text:?}");
+}
+
+/// A-R479 (PR #74, Revobot R2 Q 4433944757): an app that is not on node 1's admin-app list
+/// sends a copy move. It never reaches node 1's node, so nothing moves, and the app is
+/// answered `INVALID_ARGUMENT`, no_mutation, naming the list and the admin app to use. Cut: no
+/// admin arm in `sender_refused`, red: node 1's first message is the move.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr74_r479_a_move_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::Move {
+            identity: identity(9, 1),
+            from: NodeId(3),
+            to: NodeId(4),
+        },
+    )
+    .await;
+    assert_not_admin(
+        "pr74_r479_a_move_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        &got,
+        &answer,
+        "pilot",
+        "move",
+    );
+}
+
+/// A-R479: as the row above, for `admin rebuild`: a spare note is a membership change too.
+/// Cut: as above, red.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::Rebuild {
+            identity: identity(9, 1),
+            node: NodeId(4),
+        },
+    )
+    .await;
+    assert_not_admin(
+        "pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        &got,
+        &answer,
+        "pilot",
+        "rebuild",
+    );
+}
+
+/// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with
+/// a move and a rebuild, so `lr move` and `lr rebuild` keep working. That the move then
+/// completes is the multi-process rows' and the `lr move` hand check's (T12's row runs its
+/// rebuild as `admin`). Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr74_r479_the_admin_app_still_reaches_the_owner_with_a_move_and_a_rebuild() {
+    for call in [
+        ClientCall::Move {
+            identity: identity(9, 1),
+            from: NodeId(3),
+            to: NodeId(4),
+        },
+        ClientCall::Rebuild {
+            identity: identity(9, 2),
+            node: NodeId(4),
+        },
+    ] {
+        let (got, _answer) = app_admin_call("admin", call.clone()).await;
+        let Msg::Client(Client { call: reached, .. }) = got else {
+            panic!("the admin app's {call:?} reaches node 1's node: {got:?}");
+        };
+        assert_eq!(format!("{reached:?}"), format!("{call:?}"));
+    }
+    // The control for `assert_not_admin`'s count: a call that passes the gate takes request 1.
+    let taken = client_requests(
+        "pr74_r479_the_admin_app_still_reaches_the_owner_with_a_move_and_a_rebuild",
+    );
+    for call in ["move", "rebuild"] {
+        assert!(taken.contains(&(1, call.to_owned())), "{taken:?}");
+    }
+}
+
 /// M10 S2 review-s2 F-008 row: which kinds each label may send, checked on every kind. An app
 /// may send a call, an `Inspect` and a promote's plan or fence, no other recovery event (C-3),
 /// and no catch-up, restore or landing (review-s2 F-008 gap, A-R418: each is listed, so an
@@ -1140,8 +1350,16 @@ fn a_sender_is_held_to_its_certificate_label() {
         seq: zero(),
     });
     for allowed in [&client, &inspect, &plan, &fence] {
-        assert_eq!(super::sender_refused(&app, allowed), None, "{allowed:?}");
-        assert_eq!(super::sender_refused(&node2, allowed), None, "{allowed:?}");
+        assert_eq!(
+            super::sender_refused(&app, allowed, &admin_apps()),
+            None,
+            "{allowed:?}"
+        );
+        assert_eq!(
+            super::sender_refused(&node2, allowed, &admin_apps()),
+            None,
+            "{allowed:?}"
+        );
     }
     let progress = on_wire(Msg::Routed {
         partition: PartitionId(1),
@@ -1190,14 +1408,103 @@ fn a_sender_is_held_to_its_certificate_label() {
         landing,
     ] {
         assert!(
-            super::sender_refused(&app, &peer).is_some(),
+            super::sender_refused(&app, &peer, &admin_apps()).is_some(),
             "app sends {peer:?}"
         );
-        assert_eq!(super::sender_refused(&node2, &peer), None, "{peer:?}");
+        assert_eq!(
+            super::sender_refused(&node2, &peer, &admin_apps()),
+            None,
+            "{peer:?}"
+        );
     }
     for forged in [on_wire(frame_from(3)), on_wire(ask_from(3))] {
-        let reason = super::sender_refused(&node2, &forged).expect("forged");
+        let reason = super::sender_refused(&node2, &forged, &admin_apps()).expect("forged");
         assert!(reason.contains("node 3"), "{reason}");
+    }
+}
+
+/// A-R479, the arm itself: a copy move and a rebuild pass only from an app on the admin list
+/// (or from a node); an empty list, a library caller's default, refuses every app's. Other
+/// calls from any app are untouched. Cut: no admin arm, red.
+/// Unit.
+#[test]
+fn pr74_r479_only_an_admin_app_may_send_a_move_or_a_rebuild() {
+    let call = |call: wire::WireCall| WireMsg::Client {
+        to: NodeId(1),
+        partition: PartitionId(1),
+        call,
+        reply: 1,
+    };
+    let moved = call(wire::WireCall::Move {
+        identity: identity(1, 1),
+        from: NodeId(3),
+        to: NodeId(4),
+    });
+    let rebuilt = call(wire::WireCall::Rebuild {
+        identity: identity(1, 1),
+        node: NodeId(4),
+    });
+    let status = call(wire::WireCall::Status {
+        identity: identity(1, 1),
+        generation: None,
+    });
+    let admin = Label::App("admin".to_owned());
+    let pilot = Label::App("pilot".to_owned());
+    let node2 = Label::Node(NodeId(2));
+    let none = BTreeSet::new();
+    for msg in [&moved, &rebuilt] {
+        assert_eq!(super::sender_refused(&admin, msg, &admin_apps()), None);
+        assert_eq!(super::sender_refused(&node2, msg, &none), None);
+        let reason = super::sender_refused(&pilot, msg, &admin_apps()).expect("pilot refused");
+        assert!(
+            reason.contains("app pilot is not an admin app on node 1"),
+            "{reason}"
+        );
+        assert!(reason.contains("`lr` runs it as `admin`"), "{reason}");
+        // Critic-479 A6: app `admin` refused by a node whose list leaves it out is not told
+        // to run the call as `admin`, which it already is.
+        let reason =
+            super::sender_refused(&admin, msg, &none).expect("an empty list refuses admin");
+        assert!(
+            reason.contains("app admin is not an admin app on node 1"),
+            "{reason}"
+        );
+        assert!(!reason.contains("as an admin app"), "{reason}");
+    }
+    assert_eq!(super::sender_refused(&pilot, &status, &none), None);
+}
+
+/// Revobot R3 4489400307: the gate reads the list, not the name `admin`. With the list {ops},
+/// app ops may send a move and a rebuild, and app admin is refused both, told to add itself to
+/// the node's admin apps. Cut: a gate that tests `app == "admin"`, red. Unit.
+#[test]
+fn pr74_r3_the_admin_list_names_who_may_move_not_the_name_admin() {
+    let call = |call: wire::WireCall| WireMsg::Client {
+        to: NodeId(1),
+        partition: PartitionId(1),
+        call,
+        reply: 1,
+    };
+    let moved = call(wire::WireCall::Move {
+        identity: identity(1, 1),
+        from: NodeId(3),
+        to: NodeId(4),
+    });
+    let rebuilt = call(wire::WireCall::Rebuild {
+        identity: identity(1, 1),
+        node: NodeId(4),
+    });
+    let ops_only = BTreeSet::from(["ops".to_owned()]);
+    let ops = Label::App("ops".to_owned());
+    let admin = Label::App("admin".to_owned());
+    for msg in [&moved, &rebuilt] {
+        assert_eq!(super::sender_refused(&ops, msg, &ops_only), None, "{msg:?}");
+        let reason = super::sender_refused(&admin, msg, &ops_only).expect("admin refused");
+        assert!(
+            reason.contains("app admin is not an admin app on node 1")
+                && reason.contains("add admin to the node's admin apps"),
+            "{reason}"
+        );
     }
 }
 
@@ -1557,6 +1864,7 @@ fn node_process(
                 dial: NetConfig::dial_lower(me, addrs),
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                admin_apps: admin_apps(),
             },
             &links,
             Some(listener),
@@ -1917,6 +2225,7 @@ fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
                 dial: addrs.clone(),
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                admin_apps: BTreeSet::new(),
             },
             &app_links,
             None,
@@ -1970,7 +2279,7 @@ fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
     one.db
         .put(b"after", b"1", None)
         .expect("a put with node 4 regular");
-    assert!(line.contains("spare"), "{line}");
+    assert!(line.contains("node 4 is not pinned"), "{line}");
 
     app.shutdown();
     drop(app_net);
@@ -1996,6 +2305,7 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
         .expect("runtime");
     let shared = Arc::new(super::Shared {
         label: Label::Node(NodeId(1)),
+        admin_apps: admin_apps(),
         boot: BootId(11),
         protocol_version: PROTOCOL_VERSION,
         faults: Faults::new(),

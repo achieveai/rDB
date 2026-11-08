@@ -261,6 +261,7 @@ fn plan(extra: &[Member]) -> RecoveryPlan {
             past_horizon: DenyReason::NoGrant,
         },
         retention_millis: RETENTION,
+        must_hold: std::collections::BTreeSet::new(),
     }
 }
 
@@ -813,6 +814,32 @@ fn the_last_answer_closes_the_window_unless_a_copy_failed() {
         failed.step(WINDOW, fired(1))[0],
         r(RecoveryEffect::CloseWindow)
     );
+}
+
+/// PR #74 F-001 (ruling A-R477): a copy the plan names in `must_hold` that did not report blocks
+/// selection with `BarrierIncomplete` naming it, instead of a commit without it. The same run
+/// with `must_hold` empty selects, as F1 did before the field.
+/// Cut: drop the `must_hold` check in `select`, red (the barrier starts without D).
+#[retcd_test]
+fn pr74_f001_a_missing_must_hold_copy_blocks_selection_named() {
+    let d = [member(D, ReplicaRole::RegularSecondary)];
+    let reports = || vec![inv(A, 20), inv(B, 20), inv(C, 20)];
+
+    let mut held = plan(&d);
+    held.must_hold = [D].into_iter().collect();
+    let mut f1 = fenced_on(held);
+    for inventory in reports() {
+        f1.report(WINDOW, inventory);
+    }
+    f1.rec(WINDOW, RecoveryEvent::InventoryFailed { copy: D });
+    let close = f1.step(WINDOW, fired(1));
+    // `Selected` is said first, as for every block at selection; nothing is sent after it.
+    assert_eq!(close.last(), Some(&block(incomplete(vec![D]))), "{close:?}");
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(incomplete(vec![D])));
+
+    let (free, close) = closed(&d, reports(), &[D]);
+    assert!(has_selected(&close), "{close:?}");
+    assert_ne!(free.phase(), RecoveryPhase::Blocked(incomplete(vec![D])));
 }
 
 /// M11 M2 (ruling A-R451): a copy the plan pins as `Shadow` that fails never holds the window.

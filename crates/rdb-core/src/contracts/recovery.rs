@@ -510,6 +510,12 @@ pub struct RecoveryPlan {
     pub authority_view: AuthorityView,
     /// How long a returning stale owner's suffix is kept (spec §8.4: seven days).
     pub retention_millis: u64,
+    /// **Added 2026-11-01 (PR #74 F-001, ruling A-R477):** copies selection must find among the
+    /// reporters. When `required` lacks one, F1 blocks with `BarrierIncomplete` naming each
+    /// missing copy instead of committing without it. The host names a move's target here for
+    /// the promote that leaves the source out; every other plan leaves it empty, which is what
+    /// F1 did before. Last, so a stored plan written before it is its prefix.
+    pub must_hold: BTreeSet<CopyId>,
 }
 
 /// Why a recovery quarantined (`design.md` §5.3, §5.4).
@@ -630,9 +636,12 @@ pub enum RecoveryEffect {
     ///
     /// **Amended 2026-10-23 (M10 S2, rulings A-R204, A-R225):** whether the block lasts is F1's
     /// phase after the step, not this effect (A-R102, A-R182); a host reads it from there. A
-    /// barrier deadline is retried first: `BarrierIncomplete` is emitted here only after
-    /// [`crate::recovery::BARRIER_ATTEMPTS`] attempts (1x, 2x and 4x the discovery window), so
-    /// writes stay paused for at most 7 windows before it.
+    /// barrier deadline is retried first: from a deadline, `BarrierIncomplete` is emitted here
+    /// only after [`crate::recovery::BARRIER_ATTEMPTS`] attempts (1x, 2x and 4x the discovery
+    /// window), so writes stay paused for at most 7 windows before it. **Amended 2026-11-01
+    /// (PR #74 F-001, ruling A-R477):** selection also emits it at once, at the first window
+    /// close, when a `RecoveryPlan::must_hold` copy is missing from the reporters; for a move
+    /// the host then gives the move up and keeps the source.
     BlockPromotion {
         /// Why.
         reason: BlockReason,

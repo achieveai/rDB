@@ -6,7 +6,7 @@
 //! rdb_node --form --dir D --control E [--log-dir L]
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
-//!          [--ready-secs S]
+//!          [--ready-secs S] [--admin-apps a,b]
 //! ```
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
@@ -22,6 +22,11 @@
 //!   `--protocol-version` makes it speak another wire version, to walk the refusal.
 //!   `--faults` names the fault file it polls every 50 ms (`hold <n>|hold all|drop-request N|
 //!   drop-reply N|cut-control`). It stops cleanly when `--stop-file` appears.
+//!   `--admin-apps` names the apps whose certificate may send `admin move` and `admin rebuild`
+//!   (ruling A-R479). Unset or empty, no app may (ruling A-R480), as in the library. `lr`
+//!   passes `--admin-apps admin`, the app `lr` and `rdb_dev` run as; a production node lists
+//!   its operator apps. Any other app's move or rebuild is refused before the node sees it.
+//!   Names are trimmed, so `ops, admin` lists `ops` and `admin`.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -62,6 +67,15 @@ struct Args {
     ready_secs: Option<u64>,
     /// `--gen-certs`: certificates for nodes 1 to this (M11 WS A); `None` is 3.
     nodes: Option<u32>,
+    /// `--admin-apps`: the apps that may move or rebuild a copy (A-R479); `None` is none
+    /// (A-R480).
+    admin_apps: Option<BTreeSet<String>>,
+}
+
+/// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
+/// flag is absent, as in the library (A-R479, A-R480).
+fn admin_apps(args: &Args) -> BTreeSet<String> {
+    args.admin_apps.clone().unwrap_or_default()
 }
 
 const USAGE: &str = "usage:
@@ -69,6 +83,7 @@ const USAGE: &str = "usage:
   rdb_node --form --dir D --control E [--log-dir L]
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
+           [--admin-apps a,b]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -84,6 +99,16 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     .filter(|a| !a.is_empty())
                     .map(str::to_owned)
                     .collect();
+            }
+            "--admin-apps" => {
+                args.admin_apps = Some(
+                    value("--admin-apps")?
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                );
             }
             "--node" => {
                 let n: u32 = value("--node")?
@@ -347,6 +372,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
             dial: NetConfig::dial_lower(node, &args.peers),
             protocol_version: args.protocol_version.unwrap_or(PROTOCOL_VERSION),
             faults,
+            admin_apps: admin_apps(args),
         },
         &links,
         Some(listener),
@@ -405,4 +431,35 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     drop(net);
     println!("rdb_node stopped node={}", node.0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{admin_apps, parse};
+
+    fn apps(argv: &[&str]) -> Vec<String> {
+        let args = parse(argv.iter().map(|a| (*a).to_owned())).expect("parses");
+        admin_apps(&args).into_iter().collect()
+    }
+
+    /// Critic-479 A6 (A-R479), ruling A-R480: how `--admin-apps` is read. Unset is no app, as
+    /// the library's empty `NetConfig::admin_apps` is, so a production node grants nobody a
+    /// move by default; `lr` passes `--admin-apps admin`. An empty value is no app too; a list
+    /// is that list. A regression here fails open without a word. Unit.
+    #[test]
+    fn pr74_r480_admin_apps_unset_and_empty_are_none() {
+        assert_eq!(apps(&[]), Vec::<String>::new());
+        assert_eq!(apps(&["--admin-apps", ""]), Vec::<String>::new());
+        assert_eq!(apps(&["--admin-apps", "ops,admin"]), ["admin", "ops"]);
+    }
+
+    /// Revobot R3 4489400304: each name is trimmed, so `--admin-apps "ops, admin"` lists
+    /// `admin`, not ` admin`, which the gate would refuse; a blank name is dropped, so a list
+    /// of blanks is still none. Unit.
+    #[test]
+    fn pr74_r3_admin_apps_names_are_trimmed_and_blanks_dropped() {
+        assert_eq!(apps(&["--admin-apps", "ops, admin"]), ["admin", "ops"]);
+        assert_eq!(apps(&["--admin-apps", " ops ,  admin "]), ["admin", "ops"]);
+        assert_eq!(apps(&["--admin-apps", " , "]), Vec::<String>::new());
+    }
 }

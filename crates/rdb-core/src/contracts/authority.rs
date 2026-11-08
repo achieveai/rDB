@@ -630,13 +630,16 @@ pub enum BlockReason {
     /// Recovery could not form its durability barrier before commit (team kernel-b `design.md`
     /// §5.6; lead ruling B-R41 F-a): a required copy was lost in `Synchronizing` or `Barrier`,
     /// or the barrier deadline passed with copies still owing a catch-up or a `DurableAt`
-    /// proof. Nothing was committed; the operator re-fences.
+    /// proof. **Also (PR #74 F-001, ruling A-R477):** at selection, the first window close,
+    /// when a copy the plan names in `RecoveryPlan::must_hold` is not among the reporters.
+    /// Nothing was committed. For a move's promote the host gives the move up and keeps the
+    /// source; otherwise the operator re-fences.
     ///
     /// Distinct from [`Self::NoEligibleRegular`], which is a recovery that *committed* with no
     /// copy left to serve. Here nothing committed, and the alert names who is missing.
     BarrierIncomplete {
-        /// The copies lost, or still owing their catch-up or proof when the deadline passed.
-        /// Sorted by copy id.
+        /// The copies lost, or still owing their catch-up or proof when the deadline passed, or
+        /// named in `must_hold` and missing at selection. Sorted by copy id.
         missing: Vec<CopyId>,
     },
 }

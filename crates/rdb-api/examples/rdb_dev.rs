@@ -246,7 +246,9 @@
 //!                                         again (a replayed plan) says `already moved ..`
 //!                                         and exits 0, while the owner that ran it serves.
 //!                                         The owner's copy is refused (promote first); a
-//!                                         refusal prints `err admin move ..`, exits 1
+//!                                         refusal prints `err admin move ..`, exits 1.
+//!                                         Only an admin app may run it (`rdb_node
+//!                                         --admin-apps`); `lr` runs as `admin`
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
 //!                                         and it may go: `absent`, `current` (the running
 //!                                         process's own), `cleared rev=R`, `conflict`, or
@@ -393,7 +395,9 @@
 //!                                         it notes for a free slot; `lr rebuild n
 //!                                         [--wipe]` then stops n, has the fence checked
 //!                                         (`--wipe --fence`), moves the folder aside
-//!                                         and starts n
+//!                                         and starts n. Under `--nodes`, only an admin
+//!                                         app may run it (`rdb_node --admin-apps`); `lr`
+//!                                         runs as `admin`
 //! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
 //!                                         n's head record as a validly chained different
 //!                                         one; `node restart n` then rejoins it and the
@@ -445,8 +449,9 @@
 //! `rdb_dev admin plan <inventory.json> [--max-moves K]` (M11, model only) starts nothing and
 //! talks to no cluster. It reads an inventory file (nodes, and where each partition's copies and
 //! primary are; format in `docs/rdb/placement-plan.md`), plans at most K steps (no limit without
-//! the flag), prints one line per step with its reason (`rdb_dev admin move <from> <to>` for a
-//! copy move of partition 1, a `step:` line for anything no live command takes), then
+//! the flag), prints one line per step with its reason (`admin move <from> <to>`, the session
+//! line above, for a copy move of partition 1, a `step:` line for anything no live command
+//! takes), then
 //! `after:` with the skews and one `residual:` line per claim left unmet. Nothing is applied. A file that does not read, or an inventory that does not add up,
 //! prints `rdb_dev admin plan: ..` to stderr and exits 2.
 
@@ -530,7 +535,8 @@ struct Args {
     nodes: std::collections::BTreeMap<NodeId, String>,
     /// `--cert-dir D`: the run's certificates, read for `--nodes`.
     cert_dir: Option<PathBuf>,
-    /// `--app NAME`: the app certificate `--nodes` dials as.
+    /// `--app NAME`: the app certificate `--nodes` dials as. `admin move` and `admin rebuild`
+    /// need an admin app (`rdb_node --admin-apps`, which `lr` sets to `admin`; A-R479, A-R480).
     app: String,
     /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
     help: bool,
@@ -1137,6 +1143,8 @@ fn connect_app(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, 
                 dial: args.nodes.clone(),
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                // An app receives no calls (A-R479).
+                admin_apps: std::collections::BTreeSet::new(),
             },
             &links,
             None,
@@ -1461,7 +1469,7 @@ fn ready_reason(
             )
         }
         Some(reason) => format!("{}; {note}", fence_line(owner, reason, held, dropped)),
-        None => format!("writes are not admitted now; if they come back, they {pause}"),
+        None => format!("if they come back, they {pause}"),
     })
 }
 
@@ -2317,13 +2325,19 @@ fn members_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) 
         Some(net) => net.states().keys().copied().collect(),
         None => vec![NodeId(1), NodeId(2), NodeId(3)],
     };
+    let in_process = db.links().net().is_none();
     let error = match db.pinned_members() {
         Ok((owner, pinned)) => {
             let pinned: Vec<(NodeId, ReplicaRole)> = pinned
                 .iter()
                 .map(|member| (member.node, member.role))
                 .collect();
-            return members_text(&pinned, &known, &format!("as node {} pins them", owner.0));
+            return members_text(
+                &pinned,
+                &known,
+                in_process,
+                &format!("as node {} pins them", owner.0),
+            );
         }
         Err(error) => error,
     };
@@ -2334,13 +2348,18 @@ fn members_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) 
         .ok()
         .and_then(|read| read.record)
         .map(|record| record.value);
-    body.and_then(|body| record_members_line(&body, &known, &error.to_string()))
+    body.and_then(|body| record_members_line(&body, &known, in_process, &error.to_string()))
         .unwrap_or_else(|| format!("members: unknown: {error}"))
 }
 
 /// The members line from a `partitions/1` body, for an owner that did not answer (`why`).
 /// `None` for a body that names no members (layout 3 and older).
-fn record_members_line(body: &[u8], known: &[NodeId], why: &str) -> Option<String> {
+fn record_members_line(
+    body: &[u8],
+    known: &[NodeId],
+    in_process: bool,
+    why: &str,
+) -> Option<String> {
     let members = rdb_core::authority::partition::RecordMember::decode_all(body)?;
     let pinned: Vec<(NodeId, ReplicaRole)> = members
         .iter()
@@ -2349,12 +2368,18 @@ fn record_members_line(body: &[u8], known: &[NodeId], why: &str) -> Option<Strin
     Some(members_text(
         &pinned,
         known,
+        in_process,
         &format!("as partitions/1 names them; {why}"),
     ))
 }
 
 /// `members 1=owner 2=regular 4=shadow; not pinned 3 (<source>)`.
-fn members_text(pinned: &[(NodeId, ReplicaRole)], known: &[NodeId], source: &str) -> String {
+fn members_text(
+    pinned: &[(NodeId, ReplicaRole)],
+    known: &[NodeId],
+    in_process: bool,
+    source: &str,
+) -> String {
     let roles = pinned
         .iter()
         .map(|(node, role)| {
@@ -2368,7 +2393,7 @@ fn members_text(pinned: &[(NodeId, ReplicaRole)], known: &[NodeId], source: &str
         .collect::<Vec<_>>()
         .join(" ");
     let pinned: Vec<NodeId> = pinned.iter().map(|(node, _)| *node).collect();
-    if let Some(out) = out_line(&pinned, known) {
+    if let Some(out) = out_line(&pinned, known, in_process) {
         return format!("members {roles}; {out} ({source})");
     }
     let out = known
@@ -2384,18 +2409,34 @@ fn members_text(pinned: &[(NodeId, ReplicaRole)], known: &[NodeId], source: &str
     format!("members {roles}; not pinned {out} ({source})")
 }
 
-/// A-R467: while partition 1 pins fewer copies than its copy count, each known node it leaves
-/// out is a copy to bring back, never a spare: `node 3 is out of partition 1: run `admin
-/// rebuild 3``. A reopen does not re-add a dropped copy (M11 T6 pins the record's members), so
-/// this is how the reader learns of it. `None` at the full count: an unpinned node is then a
-/// spare, which the members line says as `not pinned N`.
-fn out_line(pinned: &[NodeId], known: &[NodeId]) -> Option<String> {
-    if pinned.len() >= rdb_api::admin::members().len() {
+/// A-R467: while partition 1 pins fewer copies than its copy count, an unpinned node may be a
+/// copy to bring back. In process the three nodes are all copies and there are no spares, so
+/// each unpinned one is named: `node 3 is out of partition 1: run `admin rebuild 3``. A reopen
+/// does not re-add a dropped copy (M11 T6 pins the record's members), so this is how the reader
+/// learns of it. Over lr (`in_process` false) this process knows nodes only by their links and
+/// cannot tell a dropped copy from a spare (A-R469), so it names none and lists the unpinned
+/// ones; the dropped node's own open logs `db_open_copy_left_out`. `None` at the full count: an
+/// unpinned node is then a spare, which the members line says as `not pinned N`.
+fn out_line(pinned: &[NodeId], known: &[NodeId], in_process: bool) -> Option<String> {
+    let copies = rdb_api::admin::members().len();
+    if pinned.len() >= copies {
         return None;
     }
-    let out: Vec<String> = known
+    let unpinned: Vec<&NodeId> = known.iter().filter(|node| !pinned.contains(node)).collect();
+    if unpinned.is_empty() {
+        return None;
+    }
+    if !in_process {
+        let listed: Vec<String> = unpinned.iter().map(|node| node.0.to_string()).collect();
+        return Some(format!(
+            "partition 1 has {} of {copies} copies; not pinned: {}; if one of these held a copy, \
+             run `admin rebuild N` for it",
+            pinned.len(),
+            listed.join(" ")
+        ));
+    }
+    let out: Vec<String> = unpinned
         .iter()
-        .filter(|node| !pinned.contains(node))
         .map(|node| {
             format!(
                 "node {} is out of partition 1: run `admin rebuild {}`",
@@ -2403,7 +2444,7 @@ fn out_line(pinned: &[NodeId], known: &[NodeId]) -> Option<String> {
             )
         })
         .collect();
-    (!out.is_empty()).then(|| out.join("; "))
+    Some(out.join("; "))
 }
 
 /// [`out_line`] from the members `partitions/1` pins, which every commit writes: read at the
@@ -2414,6 +2455,7 @@ fn left_out_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore)
         Some(net) => net.states().keys().copied().collect(),
         None => vec![NodeId(1), NodeId(2), NodeId(3)],
     };
+    let in_process = db.links().net().is_none();
     let body = rt
         .block_on(store.get(GetRequest {
             key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
@@ -2425,7 +2467,7 @@ fn left_out_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore)
         .iter()
         .map(|member| member.node)
         .collect();
-    out_line(&pinned, &known)
+    out_line(&pinned, &known, in_process)
 }
 
 /// `admin rebuild`'s usage (#65).
@@ -6356,6 +6398,7 @@ mod tests {
                     (NodeId(2), ReplicaRole::RegularSecondary),
                 ],
                 &known[..3],
+                true,
                 "as node 1 pins them"
             ),
             "members 1=owner 2=regular; node 3 is out of partition 1: run `admin rebuild 3` (as \
@@ -6369,11 +6412,49 @@ mod tests {
                     (NodeId(3), ReplicaRole::RegularSecondary),
                 ],
                 &known,
+                true,
                 "as node 1 pins them"
             ),
             "members 1=owner 2=regular 3=regular; not pinned 4 (as node 1 pins them)"
         );
-        assert_eq!(out_line(&[NodeId(1), NodeId(2), NodeId(3)], &known), None);
+        assert_eq!(
+            out_line(&[NodeId(1), NodeId(2), NodeId(3)], &known, true),
+            None
+        );
+    }
+
+    /// A-R469 (tester D-R3-1): over lr this process knows nodes only by their links, so it
+    /// cannot tell a copy the record left out from a spare that never held one. With 2 of 3
+    /// pinned it names no node as out, and lists the unpinned ones with the step for the one
+    /// that held a copy; that node's own open log names it (`db_open_copy_left_out`). The
+    /// members line and `wait ready`'s warning use this same [`out_line`]. Cut: drop the
+    /// `in_process` test, so lr names node 3 and spare 4 as out: red. Unit.
+    #[test]
+    fn over_lr_a_short_partition_names_no_node_as_out() {
+        let known = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let line = out_line(&[NodeId(1), NodeId(2)], &known, false);
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "partition 1 has 2 of 3 copies; not pinned: 3 4; if one of these held a copy, \
+                 run `admin rebuild N` for it"
+            )
+        );
+        assert_eq!(
+            members_text(
+                &[
+                    (NodeId(1), ReplicaRole::Primary),
+                    (NodeId(2), ReplicaRole::RegularSecondary),
+                ],
+                &known,
+                false,
+                "as node 1 pins them"
+            ),
+            format!(
+                "members 1=owner 2=regular; {} (as node 1 pins them)",
+                line.unwrap()
+            )
+        );
     }
 
     /// M11 final walk: after a reopen every node starts at that open's base boot (65537 on the
@@ -6528,8 +6609,7 @@ mod tests {
                 unheld,
                 Some(note),
                 Some(format!(
-                    "not ready: writes not admitted: writes are not admitted now; if they come \
-                     back, they {}",
+                    "not ready: writes not admitted: if they come back, they {}",
                     pause(note)
                 )),
             ),
@@ -7976,15 +8056,20 @@ mod tests {
         let known = [1, 2, 3, 4].map(NodeId);
         let why = "node 1 (the owner) did not answer its status look";
         assert_eq!(
-            record_members_line(&record.encode_with_members(&root, &members), &known, why)
-                .as_deref(),
+            record_members_line(
+                &record.encode_with_members(&root, &members),
+                &known,
+                true,
+                why
+            )
+            .as_deref(),
             Some(
                 "members 1=owner 3=regular 4=regular; not pinned 2 (as partitions/1 names them; \
                  node 1 (the owner) did not answer its status look)"
             )
         );
         assert_eq!(
-            record_members_line(&record.encode_with(&root), &known, why),
+            record_members_line(&record.encode_with(&root), &known, true, why),
             None
         );
     }
