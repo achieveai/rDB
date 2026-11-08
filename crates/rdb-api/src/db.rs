@@ -5616,6 +5616,18 @@ mod tests {
                 && text.contains("`admin status`"),
             "{text}"
         );
+        // Revobot R2 thread 4433944765, R3: a repeated move answers where it stands only on an
+        // owner that kept running; a restarted owner has forgotten the move it ran and refuses
+        // the repeat of one that finished (T1), so the text may not promise more.
+        assert!(
+            text.contains("only while the owner keeps running")
+                && text.contains("after a restart a repeat of a finished move is refused"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("answers where it stands or that it is done"),
+            "{text}"
+        );
         assert_eq!(text.matches("; next: ").count(), 0, "said once: {text}");
         // `Db::rebuild` looks at the owner first, so its call is checked at the classifier,
         // and its lost reply gets the same admin advice.

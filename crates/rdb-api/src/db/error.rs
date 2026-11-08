@@ -35,7 +35,7 @@ const RUN_AGAIN: &str = "run it again to read where it stands";
 
 /// The tail of [`ApiError::owner_lost_admin`]: its detail names the step, and an admin call has
 /// no request id for the `Db::resend` / `Db::status` step a lost write gets (PR #74 R2).
-const ADMIN_LOST_STEP: &str = "then check with `admin status`";
+const ADMIN_LOST_STEP: &str = "so run `admin status`";
 
 /// The tail every `admin rebuild` error ends with (#65): its detail already names the step
 /// (stop it, send a write, promote first, restart it), which "retrying will not help" would
@@ -192,8 +192,10 @@ impl ApiError {
 
     /// [`Self::owner_lost`] for an admin move or rebuild (PR #74 F-004, R2). It may have
     /// started, so not `no_mutation`; but it carries no request id, so the step is to repeat
-    /// the same admin call, which is guarded: a move answers where it stands or that it is
-    /// done, and a rebuild answers its own spare note again.
+    /// the same admin call. A rebuild answers its own spare note again (a restarted owner has
+    /// none and notes it afresh). A move answers where it stands only while the owner keeps
+    /// running: `Host::moved` is memory only, so after a restart a repeat of a move that
+    /// finished is refused by T1's "holds no copy" arm, which says to run `admin status`.
     #[must_use]
     pub fn owner_lost_admin(node: NodeId) -> Self {
         Self {
@@ -203,9 +205,10 @@ impl ApiError {
             detail: format!(
                 "node {}, the owner, went out of reach while this admin call waited for its \
                  answer (its process may have stopped); the move or rebuild may have started: \
-                 once the owner is back, run the same `admin move` or `admin rebuild` again (a \
-                 move answers where it stands or that it is done, a rebuild recognises its own \
-                 note), {ADMIN_LOST_STEP}",
+                 once the owner is back, run the same `admin move` or `admin rebuild` again; a \
+                 rebuild recognises its own note. A move answers where it stands only while the \
+                 owner keeps running; after a restart a repeat of a finished move is refused, \
+                 {ADMIN_LOST_STEP}",
                 node.0
             ),
             retry_after: None,

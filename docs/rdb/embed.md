@@ -700,7 +700,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - **Upgrade every node before you use `promote`.** A node built before issue #70 still
     trusts a plan sent to it directly.
   - **The dropped node is added back automatically when it starts again, while the owner that
-    committed the drop keeps running; a partition holds at most three copies.** A reopen does not
+    committed the drop keeps running; a partition holds at most three regular copies, and a
+    move briefly adds a Shadow.** A reopen does not
     bring it back: the heal pins only the members `partitions/1` names, and the new owner does
     not know the node was dropped. It stays left out until `admin rebuild N` takes it back
     (with nodes in other processes, `lr rebuild N`, which also restarts it).
