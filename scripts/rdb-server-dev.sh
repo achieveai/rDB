@@ -74,6 +74,12 @@ load_run() { # reads `lr env` as data: CONTROL, PEERS, PROFILE, BASE_PORT, RUN
     [ -n "$LISTEN" ] || LISTEN="127.0.0.1:$((10#$BASE_PORT + 90))"
 }
 
+# No pids file: nothing was started in this run, so no gateway runs. Said, never a silent exit:
+# awk on a missing file failed `p="$(pid_of_gateway)"` under pipefail with exit 2 (PR #78).
+no_pids() {
+    [ -f "$RUN/pids" ] && return 1
+    say "no gateway runs: run $RUN has no pids file"
+}
 pid_of_gateway() { awk '$1 == "rdb-server" { print $2 }' "$RUN/pids" 2>/dev/null | tr -d '\r'; }
 gateway_alive() {
     local p; p="$(pid_of_gateway)"; [ -n "$p" ] || return 1
@@ -125,6 +131,7 @@ start_gateway() {
 
 kill_gateway() {
     load_run
+    no_pids && return 0
     local p; p="$(pid_of_gateway)"
     if [ -z "$p" ] || ! gateway_alive; then say "no gateway runs"; return 0; fi
     if is_msys; then taskkill //F //PID "$p" >/dev/null 2>&1 || true; else kill -9 "$p" 2>/dev/null || true; fi
@@ -135,6 +142,7 @@ kill_gateway() {
 # (it waits up to 45 s for running calls). Only past 60 s is it killed, and that is said.
 stop_gateway() {
     load_run
+    no_pids && return 0
     local p i; p="$(pid_of_gateway)"
     if [ -z "$p" ] || ! gateway_alive; then say "no gateway runs"; return 0; fi
     : > "$RUN/rdb-server.stop"
@@ -155,7 +163,8 @@ case "$COMMAND" in
     gateway) start_gateway ;;
     resume) "$LR" up --resume; start_gateway ;;
     kill) kill_gateway ;;
-    down) stop_gateway; "$LR" down ;;
+    # `lr down` exits 2 on a run with no pids file; nothing of that run is running to stop.
+    down) stop_gateway; if [ -f "$RUN/pids" ]; then "$LR" down; fi ;;
     clean) "$LR" clean ;;
     *) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
