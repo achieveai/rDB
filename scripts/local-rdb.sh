@@ -575,7 +575,8 @@ down() {
 }
 
 clean() {
-    down
+    # No pids file: nothing runs to stop, so only the folder goes, under the same root check.
+    no_pids || down
     case "$RUN" in
         "$ROOT"/*) ;;
         *) die "refusing to remove $RUN: not under $ROOT" ;;
