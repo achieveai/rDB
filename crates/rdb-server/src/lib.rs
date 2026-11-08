@@ -59,7 +59,9 @@ pub const OVERLOADED_RETRY_AFTER: Duration = Duration::from_millis(50);
 
 /// How long a stop may take, counted from the shutdown signal: [`serve`] waits this long in all
 /// for running calls to end and write their lines (a transaction's longest deadline plus the
-/// host's waits around it), then returns with any still running.
+/// host's waits around it), then shuts every open connection and returns. A call cut that way
+/// fails in transport, so its client reads it as unknown: a write already handed to the store
+/// may still land.
 pub const DRAIN_MAX: Duration = Duration::from_secs(45);
 
 /// `addr` as a socket address, or why it is refused. Only a loopback IP is served: apps reach
@@ -727,9 +729,10 @@ pub fn status_reply(status: &TxnStatus) -> pb::StatusReply {
 /// Serve `gateway` on `listener` until `shutdown` completes. From then, wait up to the gateway's
 /// stop bound ([`DRAIN_MAX`]) in all for every running call to end and write its
 /// `rdb_server_call` line, including a call whose client has gone: that line is how an operator
-/// settles it. A call still open at the bound is cut (`rdb_server_stop_cut`), and one still
-/// running is counted (`rdb_server_drain_incomplete`). Each connection runs at most
-/// [`MAX_IN_FLIGHT`] streams at once.
+/// settles it. At the bound every open connection is shut (`rdb_server_stop_cut`): a call open on
+/// it fails in transport and its client reads it as unknown, since a write already handed to the
+/// store may still land. A store call still running is counted (`rdb_server_drain_incomplete`).
+/// Each connection runs at most [`MAX_IN_FLIGHT`] streams at once.
 ///
 /// # Errors
 ///
@@ -750,13 +753,17 @@ pub async fn serve(
         shutdown.await;
         let _ = began.send(Instant::now());
     };
+    // Dropping `serving` does not end its connections: each runs in a task of its own, and a call
+    // held on one still answered after `serve` returned (PR #78 round 2). The cut shuts them.
+    let (cut, cut_seen) = tokio::sync::watch::channel(false);
+    let incoming = tokio_stream::StreamExt::map(
+        tokio_stream::wrappers::TcpListenerStream::new(listener),
+        move |accepted| accepted.map(|io| Cuttable::new(io, cut_seen.clone())),
+    );
     let serving = tonic::transport::Server::builder()
         .max_concurrent_streams(streams)
         .add_service(gateway.into_service())
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
-            shutdown,
-        );
+        .serve_with_incoming_shutdown(incoming, shutdown);
     tokio::pin!(serving);
     let (served, stop_by) = tokio::select! {
         served = &mut serving => (served, Instant::now() + bound),
@@ -766,6 +773,7 @@ pub async fn serve(
                 Ok(served) => (served, stop_by),
                 Err(_) => {
                     tracing::warn!(ms = millis(bound), "rdb_server_stop_cut");
+                    cut.send_replace(true);
                     (Ok(()), stop_by)
                 }
             }
@@ -775,4 +783,90 @@ pub async fn serve(
         .drain(stop_by.saturating_duration_since(Instant::now()))
         .await;
     served
+}
+
+/// An accepted connection that fails every read and write once [`serve`] cuts it at its stop
+/// bound, so a call still open on it ends in transport and its connection task ends.
+struct Cuttable {
+    io: tokio::net::TcpStream,
+    cut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    was_cut: bool,
+}
+
+impl Cuttable {
+    fn new(io: tokio::net::TcpStream, mut cut: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self {
+            io,
+            // A dropped sender means `serve` has returned: nothing is served after that either.
+            cut: Box::pin(async move {
+                let _ = cut.wait_for(|cut| *cut).await;
+            }),
+            was_cut: false,
+        }
+    }
+
+    /// An error once cut; polling registers the waker, so a read waiting on the client wakes.
+    fn poll_cut(&mut self, cx: &mut std::task::Context<'_>) -> std::io::Result<()> {
+        if !self.was_cut && self.cut.as_mut().poll(cx).is_ready() {
+            self.was_cut = true;
+        }
+        if self.was_cut {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "rdb-server stopped: the stop bound cut this connection",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl tokio::io::AsyncRead for Cuttable {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(cut) = self.poll_cut(cx) {
+            return std::task::Poll::Ready(Err(cut));
+        }
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Cuttable {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Err(cut) = self.poll_cut(cx) {
+            return std::task::Poll::Ready(Err(cut));
+        }
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(cut) = self.poll_cut(cx) {
+            return std::task::Poll::Ready(Err(cut));
+        }
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+impl tonic::transport::server::Connected for Cuttable {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.io.connect_info()
+    }
 }

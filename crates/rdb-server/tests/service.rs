@@ -412,6 +412,11 @@ async fn a_held_call_fills_the_limit_and_the_next_call_is_admitted_once_it_ends(
 /// PR #78 item 9: a stop asked while a call is held ends within the gateway's stop bound, not
 /// when the call ends. The bound is shortened to 200 ms here; a put held this way runs about 2 s
 /// before the `Db` gives it up as unknown.
+///
+/// Round 2 (ruling A-R481): at the bound every open connection is shut. Before that, the held
+/// call's connection outlived `serve` and the call still answered (once `Published`) after
+/// `serve` returned. Now it fails in transport, so the client reads it as unknown, and the
+/// gateway lets go of the `Db` once the store call ends, though the client is still open.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_with_a_call_held_ends_within_the_bound() {
     const TEST: &str = "a_stop_with_a_call_held_ends_within_the_bound";
@@ -433,12 +438,17 @@ async fn a_stop_with_a_call_held_ends_within_the_bound() {
         let _ = stopped.await;
     });
     let server = tokio::spawn(serving.instrument(tracing::Span::current()));
-    let mut client = RdbClient::connect(format!("http://{addr}"))
+    let client = RdbClient::connect(format!("http://{addr}"))
         .await
         .expect("connect");
+    // Kept open to the end: the gateway must let go of the `Db` though the client never goes.
+    let kept = client.clone();
 
     hold_all(&db);
-    let held = tokio::spawn(async move { put(&mut client, b"held", b"1", None).await });
+    let held = tokio::spawn(async move {
+        let mut client = client;
+        put(&mut client, b"held", b"1", None).await
+    });
     wait_running(&watch, 1).await;
     let asked = Instant::now();
     stop.send(()).expect("server still running");
@@ -447,13 +457,23 @@ async fn a_stop_with_a_call_held_ends_within_the_bound() {
         .expect("serve ended within 30 s")
         .expect("join");
     let took = asked.elapsed();
-    db.links().heal_all();
-    let answer = held.await.expect("join");
-    eprintln!("stop took {took:?}; the held put ended {answer:?}");
     served.expect("serve");
     assert!(
         took < bound + Duration::from_secs(1),
         "stop took {took:?} with a call held; the bound is {bound:?}"
+    );
+
+    // The links are still held, so only the cut can end the held call this soon.
+    let answer = tokio::time::timeout(bound + Duration::from_secs(1) - took, held)
+        .await
+        .unwrap_or_else(|_| panic!("the held call was still open {:?} after the stop", asked.elapsed()))
+        .expect("join");
+    let ended = asked.elapsed();
+    eprintln!("stop took {took:?}; the held put ended after {ended:?}: {answer:?}");
+    let failed = answer.expect_err("a call cut at the stop has no answer");
+    assert!(
+        rdb_error_of(&failed).is_none(),
+        "a call cut at the stop failed in transport, not by the server: {failed:?}"
     );
 
     // The call still running at the cut is said, so an operator knows its line may be lost.
@@ -470,7 +490,19 @@ async fn a_stop_with_a_call_held_ends_within_the_bound() {
         "no rdb_server_drain_incomplete line naming 1 running call"
     );
 
+    // The store call runs on to its end; then nothing of the gateway holds the `Db`.
+    db.links().heal_all();
     wait_running(&watch, 0).await;
     drop(watch);
+    let until = Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&db) > 1 {
+        assert!(
+            Instant::now() < until,
+            "the stopped gateway still holds the Db ({} holders) with its client open",
+            Arc::strong_count(&db)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(kept);
     shut_down(db).await;
 }

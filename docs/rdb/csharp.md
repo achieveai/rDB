@@ -31,8 +31,9 @@ unknown write from). Each write that landed also writes `rdb_server_write`: `met
 `generation`, `version`. A gateway past 64 running calls refuses more with `OVERLOADED`
 (`no_mutation`, retried by the client). A stop (Ctrl-C, or `down`) ends within 45 s of being
 asked, however long a call has left: it waits that long in all for running calls to end and write
-their lines, then logs any still open (`rdb_server_stop_cut`) or running
-(`rdb_server_drain_incomplete`), whose lines may be lost.
+their lines, then cuts every open connection (`rdb_server_stop_cut`) and logs the calls still
+running (`rdb_server_drain_incomplete`), whose lines may be lost. A cut call fails in transport,
+so the client reports an unknown outcome: a write already handed to the store may still land.
 
 ## The API
 
