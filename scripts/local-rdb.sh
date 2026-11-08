@@ -555,6 +555,13 @@ start_all() { # nodes 1 to K, then the wait for each: the tail of `up` and `up -
     say "pilot: $(printf %q "$PILOT_BIN") --dir $(printf %q "$RUN/pilot") --control $CONTROL --nodes $(peers) --cert-dir $(printf %q "$RUN/certs") --put k=v --get k"
 }
 
+# No pids file: nothing was started in this run, so nothing runs. Said, never a silent exit:
+# awk on a missing file failed `pid_of` under pipefail, and `lr down` exited 2 (PR #74 R3).
+no_pids() {
+    [ -f "$RUN/pids" ] && return 1
+    say "nothing runs: run $RUN has no pids file"
+}
+
 down() {
     local n
     for n in $(all_nodes); do stop_node "$n"; done
@@ -709,7 +716,7 @@ rebuild() {
 
 case "$COMMAND" in
     up) up ;;
-    down) pick_run; down ;;
+    down) pick_run; no_pids || down ;;
     clean) pick_run; clean ;;
     status) pick_run; status ;;
     env) pick_run; cat "$RUN/run.env"; echo "RUN=$RUN"; echo "PEERS=$(peers)" ;;
