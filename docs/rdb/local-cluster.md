@@ -29,8 +29,8 @@ Where things go:
   - `db/nodes/1..3`: each node's copy.
   - `ctl/`: rEtcd's data and logs.
   - `certs/`: the run's TLS certificates. Apps `pilot`, `pilot-a`, `pilot-b` and `admin` have one.
-    Only `admin` may move or rebuild a copy: the nodes run with `--admin-apps` unset, which
-    means `admin`. `lr move`, `lr rebuild` and `lr promote` run as `admin`.
+    Only `admin` may move or rebuild a copy: `lr` starts the nodes with `--admin-apps admin`
+    (unset, a node lets no app; A-R480). `lr move`, `lr rebuild` and `lr promote` run as `admin`.
   - `logs/rdb_node-N.jsonl`: node N's log. `out/node-N.out` and `.err`: its console.
   - `run.env`: the ports and binaries.
 - Ports: rEtcd uses `P+1` to `P+24`. Node N listens on `P+40+N`. `P` is 19800 unless you pass

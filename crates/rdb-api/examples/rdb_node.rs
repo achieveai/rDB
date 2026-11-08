@@ -23,9 +23,10 @@
 //!   `--faults` names the fault file it polls every 50 ms (`hold <n>|hold all|drop-request N|
 //!   drop-reply N|cut-control`). It stops cleanly when `--stop-file` appears.
 //!   `--admin-apps` names the apps whose certificate may send `admin move` and `admin rebuild`
-//!   (ruling A-R479); unset, it is `admin`, the app `lr` and `rdb_dev` run as. Any other app's
-//!   move or rebuild is refused before the node sees it. An empty value (`--admin-apps ''`)
-//!   lets no app move or rebuild.
+//!   (ruling A-R479). Unset or empty, no app may (ruling A-R480), as in the library. `lr`
+//!   passes `--admin-apps admin`, the app `lr` and `rdb_dev` run as; a production node lists
+//!   its operator apps. Any other app's move or rebuild is refused before the node sees it.
+//!   Names are trimmed, so `ops, admin` lists `ops` and `admin`.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -66,19 +67,15 @@ struct Args {
     ready_secs: Option<u64>,
     /// `--gen-certs`: certificates for nodes 1 to this (M11 WS A); `None` is 3.
     nodes: Option<u32>,
-    /// `--admin-apps`: the apps that may move or rebuild a copy (A-R479); `None` is `admin`.
+    /// `--admin-apps`: the apps that may move or rebuild a copy (A-R479); `None` is none
+    /// (A-R480).
     admin_apps: Option<BTreeSet<String>>,
 }
 
-/// The admin app `--admin-apps` defaults to: the app `lr` and `rdb_dev` run as (A-R479).
-const DEFAULT_ADMIN_APP: &str = "admin";
-
-/// The apps this node lets move or rebuild a copy: `--admin-apps` as given (an empty value is
-/// none), or [`DEFAULT_ADMIN_APP`] when the flag is absent (A-R479).
+/// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
+/// flag is absent, as in the library (A-R479, A-R480).
 fn admin_apps(args: &Args) -> BTreeSet<String> {
-    args.admin_apps
-        .clone()
-        .unwrap_or_else(|| BTreeSet::from([DEFAULT_ADMIN_APP.to_owned()]))
+    args.admin_apps.clone().unwrap_or_default()
 }
 
 const USAGE: &str = "usage:
@@ -445,12 +442,13 @@ mod tests {
         admin_apps(&args).into_iter().collect()
     }
 
-    /// Critic-479 A6 (A-R479): how `--admin-apps` is read. Unset is `admin`, the app `lr` runs
-    /// as; an empty value is no app at all, never the default; a list is that list. A
-    /// regression here fails open or locks `lr move` out without a word. Unit.
+    /// Critic-479 A6 (A-R479), ruling A-R480: how `--admin-apps` is read. Unset is no app, as
+    /// the library's empty `NetConfig::admin_apps` is, so a production node grants nobody a
+    /// move by default; `lr` passes `--admin-apps admin`. An empty value is no app too; a list
+    /// is that list. A regression here fails open without a word. Unit.
     #[test]
-    fn pr74_r479_admin_apps_unset_is_admin_and_empty_is_none() {
-        assert_eq!(apps(&[]), ["admin"]);
+    fn pr74_r480_admin_apps_unset_and_empty_are_none() {
+        assert_eq!(apps(&[]), Vec::<String>::new());
         assert_eq!(apps(&["--admin-apps", ""]), Vec::<String>::new());
         assert_eq!(apps(&["--admin-apps", "ops,admin"]), ["admin", "ops"]);
     }

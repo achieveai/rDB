@@ -125,8 +125,9 @@ pub struct NetConfig {
     /// The apps whose certificate may send a copy move or a rebuild (`ClientCall::Move`,
     /// `ClientCall::Rebuild`) to a node of this process (ruling A-R479). Required: there is no
     /// default. Empty means no app may: a move or rebuild from an app is then refused before a
-    /// node sees it. `rdb_node` defaults it to `admin` (`--admin-apps`), the app `lr`
-    /// and `rdb_dev` run as. An app's process receives no calls, so its own list is unused.
+    /// node sees it. `rdb_node --admin-apps` sets it, and unset is empty too (ruling A-R480);
+    /// `lr` passes `admin`, the app `lr` and `rdb_dev` run as. A production node lists its
+    /// operator apps. An app's process receives no calls, so its own list is unused.
     pub admin_apps: BTreeSet<String>,
 }
 
@@ -821,7 +822,7 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
     }
 }
 
-/// The app `lr` and `rdb_dev` run as, and `rdb_node --admin-apps` defaults to (A-R479).
+/// The app `lr` and `rdb_dev` run as, and `lr` passes to `rdb_node --admin-apps` (A-R480).
 const DEFAULT_LR_ADMIN: &str = "admin";
 
 /// Why a message may not come from `peer`, the label its connection's certificate names

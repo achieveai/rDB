@@ -682,8 +682,10 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   An app holding only an rDB link certificate cannot choose or change a promote's plan. A
   copy move or rebuild is different: the owner finishes it with its own rEtcd access, so the
   app's certificate is the whole check. Only an admin app may send one (`rdb_node
-  --admin-apps`, default `admin`; `NetConfig::admin_apps` is required, and empty means no app
-  may). Another app's move or rebuild is refused with `INVALID_ARGUMENT` and changes nothing.
+  --admin-apps`; `NetConfig::admin_apps`). Unset or empty, no app may (ruling A-R480). `admin`
+  is the dev launchers' name: `lr` passes it, and `lr` and `rdb_dev` run as it. A production
+  node lists its operator apps. Another app's move or rebuild is refused with
+  `INVALID_ARGUMENT` and changes nothing.
   Once a promoter has stored its plan, any node that can read rEtcd can finish that same
   stored plan, on a node and at a time the sender picks. That is harmless: it is the
   promoter's own plan.

@@ -693,7 +693,7 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
             dial: spec.dial,
             protocol_version: spec.version,
             faults: Faults::new(),
-            // As `rdb_node` defaults it (A-R479).
+            // As `lr` starts its nodes (A-R479, A-R480).
             admin_apps: admin_apps(),
         },
         &links,
@@ -715,7 +715,7 @@ fn certs_for(dir: &FsPath, nodes: &[u32]) {
 
 const PATIENCE: Duration = Duration::from_secs(5);
 
-/// The admin-app list `rdb_node` runs with unless told otherwise (A-R479).
+/// The admin-app list `lr` passes to `rdb_node` (A-R479, A-R480).
 fn admin_apps() -> BTreeSet<String> {
     BTreeSet::from(["admin".to_owned()])
 }

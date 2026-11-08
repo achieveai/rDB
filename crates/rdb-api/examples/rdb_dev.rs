@@ -536,7 +536,7 @@ struct Args {
     /// `--cert-dir D`: the run's certificates, read for `--nodes`.
     cert_dir: Option<PathBuf>,
     /// `--app NAME`: the app certificate `--nodes` dials as. `admin move` and `admin rebuild`
-    /// need an admin app (`rdb_node --admin-apps`, default `admin`; A-R479).
+    /// need an admin app (`rdb_node --admin-apps`, which `lr` sets to `admin`; A-R479, A-R480).
     app: String,
     /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
     help: bool,

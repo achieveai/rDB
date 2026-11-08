@@ -259,11 +259,14 @@ start_node() { # n [stopped]: `stopped` skips the running check when the caller 
     rm -f "$RUN/stop/node-$n"
     out="$RUN/out/node-$n.out"
     err="$RUN/out/node-$n.err"
+    # `--admin-apps admin`: the app `lr move`/`rebuild`/`promote` run as (A-R480: unset is none).
+    # A later `--admin-apps` in LR_NODE_ARGS wins.
     # shellcheck disable=SC2086
     "$NODE_BIN" --node "$n" --dir "$RUN/db" --listen "127.0.0.1:$(node_port "$n")" \
         --peers "$(peers)" --control "$CONTROL" --cert-dir "${LR_CERT_DIR:-$RUN/certs}" \
         --faults "$RUN/faults/node-$n.txt" --stop-file "$RUN/stop/node-$n" \
-        --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
+        --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" --admin-apps admin \
+        ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
     pid=$!
     os="$(os_pid_of_child "$pid" rdb_node)" || { cat "$err" >&2; die "node $n exited at start"; }
     record_pid "node-$n" "$os"
