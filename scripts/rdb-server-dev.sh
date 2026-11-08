@@ -48,6 +48,13 @@ export RDB_LR_ROOT="$ROOT"
 say() { echo "rdb-server-dev: $*"; }
 die() { echo "rdb-server-dev: $*" >&2; exit 1; }
 is_msys() { case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+# A line break in the root would split `lr env`'s RUN= line, and its second line would be read as
+# another variable, BASE_PORT included (PR #78 review).
+case "$ROOT" in *$'\n'* | *$'\r'*) die "--root must not contain a line break" ;; esac
+# A port is 1 to 5 decimal digits, 1..65445 (the gateway listens on P+90). Checked before any
+# arithmetic: bash evaluates a variable's text as an expression there, so a bad value ran.
+port_ok() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65445)); }
+port_ok "$BASE_PORT" || die "--base-port must be 1 to 65445, got '$BASE_PORT'"
 # Binaries started here run on CPUs 0-3, as cargo's runner does (AGENTS.md).
 [ -f "$HOME/.cargo/cap4.sh" ] && . "$HOME/.cargo/cap4.sh"
 
@@ -63,7 +70,8 @@ load_run() { # reads `lr env` as data: CONTROL, PEERS, PROFILE, BASE_PORT, RUN
             RUN | CONTROL | PEERS | PROFILE | BASE_PORT) printf -v "$name" '%s' "${line#*=}" ;;
         esac
     done <<<"$env"
-    [ -n "$LISTEN" ] || LISTEN="127.0.0.1:$((BASE_PORT + 90))"
+    port_ok "$BASE_PORT" || die "lr env gave BASE_PORT '$BASE_PORT', not a port in 1..65445"
+    [ -n "$LISTEN" ] || LISTEN="127.0.0.1:$((10#$BASE_PORT + 90))"
 }
 
 pid_of_gateway() { awk '$1 == "rdb-server" { print $2 }' "$RUN/pids" 2>/dev/null | tr -d '\r'; }
