@@ -176,4 +176,71 @@ public class GuardTests
         Assert.Contains("nothing was sent", e.Message);
         Assert.Empty(gateway.Calls);
     }
+
+    // PR #78 round 2: the size check's edges. A put whose encoded request is exactly the limit is sent; one byte
+    // more is refused before sending. Each row goes red if the check moves by one either way.
+    private static byte[] ValueForPutOf(int requestBytes)
+    {
+        // A one-byte key; the value's length prefix is 4 bytes at this size, so the framing is fixed.
+        var probe = new Pb.PutRequest { Object = Google.Protobuf.ByteString.CopyFrom((byte)'k'), Value = Google.Protobuf.ByteString.CopyFrom(new byte[requestBytes - 16]) };
+        var value = new byte[requestBytes - 16 + (requestBytes - probe.CalculateSize())];
+        var check = new Pb.PutRequest { Object = probe.Object, Value = Google.Protobuf.ByteString.CopyFrom(value) };
+        Assert.Equal(requestBytes, check.CalculateSize());
+        return value;
+    }
+
+    [Fact]
+    public async Task A_put_of_exactly_the_gateways_decode_limit_is_sent()
+    {
+        var (client, gateway, _) = Client(TimeSpan.FromSeconds(60));
+        gateway.Then(Wire.Written(requestId: 41));
+        var written = await client.PutAsync(new byte[] { (byte)'k' }, ValueForPutOf(RdbClient.MaxRequestBytes));
+        Assert.Equal(41UL, written.RequestId);
+        Assert.Single(gateway.Calls);
+    }
+
+    [Fact]
+    public async Task A_put_one_byte_over_the_gateways_decode_limit_is_refused_before_sending()
+    {
+        var (client, gateway, _) = Client(TimeSpan.FromSeconds(60));
+        gateway.Then(Wire.Lost(StatusCode.OutOfRange, "Error, decoded message length too large"));
+        var e = await Assert.ThrowsAsync<RdbException>(
+            () => client.PutAsync(new byte[] { (byte)'k' }, ValueForPutOf(RdbClient.MaxRequestBytes + 1)));
+        Assert.Equal(RdbErrorKind.InvalidArgument, e.Kind);
+        Assert.True(e.NoMutation);
+        Assert.False(e.FromServer);
+        Assert.Contains($"the request is {RdbClient.MaxRequestBytes + 1} bytes", e.Message);
+        Assert.Contains("nothing was sent", e.Message);
+        Assert.Empty(gateway.Calls);
+    }
+
+    [Fact]
+    public async Task An_oversized_transaction_is_refused_before_sending()
+    {
+        var (client, gateway, _) = Client(TimeSpan.FromSeconds(60));
+        gateway.Then(Wire.Lost(StatusCode.OutOfRange, "Error, decoded message length too large"));
+        var e = await Assert.ThrowsAsync<RdbException>(
+            () => client.TxnAsync(new[] { new RdbTxnPut(new byte[] { (byte)'a' }, new byte[RdbClient.MaxRequestBytes]) }));
+        Assert.Equal(RdbErrorKind.InvalidArgument, e.Kind);
+        Assert.True(e.NoMutation);
+        Assert.False(e.FromServer);
+        Assert.Contains("txn: the request is", e.Message);
+        Assert.Contains("nothing was sent", e.Message);
+        Assert.Empty(gateway.Calls);
+    }
+
+    // The limit csharp.md states is the client's constant: every nine-digit figure in it is that number.
+    [Fact]
+    public void The_decode_limit_in_the_csharp_guide_is_the_clients_constant()
+    {
+        var doc = File.ReadAllText(Path.Combine(RepoRoot(), "docs", "rdb", "csharp.md"));
+        var limit = RdbClient.MaxRequestBytes.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+        Assert.Contains($"decode limit ({limit} bytes)", doc);
+        var figures = System.Text.RegularExpressions.Regex.Matches(doc, @"\b\d{3},\d{3},\d{3}\b").Select(m => m.Value).ToList();
+        Assert.NotEmpty(figures);
+        Assert.All(figures, f => Assert.Equal(limit, f));
+    }
+
+    private static string RepoRoot([System.Runtime.CompilerServices.CallerFilePath] string here = "") =>
+        Path.GetFullPath(Path.Combine(Path.GetDirectoryName(here)!, "..", "..", "..", ".."));
 }

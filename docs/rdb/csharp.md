@@ -111,9 +111,10 @@ answer was lost with no request id (read the object, then decide).
 
 - Keys up to 1,024 bytes, up to 255 puts per transaction, a transaction deadline from 1 ms up to
   30 s. `TxnAsync` refuses a deadline under 1 ms (`ArgumentOutOfRangeException`) before sending.
-- A request over the gateway's decode limit (267,719,656 bytes) is refused by the client before
-  sending: `RdbException` with `Kind = InvalidArgument`, `NoMutation = true`. The gateway would
-  refuse it with no `RdbError`, which would read as an unknown outcome.
+- An oversized write, a put or transaction over the gateway's decode limit (267,719,656 bytes), is
+  refused by the client before sending: `RdbException` with `Kind = InvalidArgument`,
+  `NoMutation = true`. The gateway would refuse it with no `RdbError`, which would read as an
+  unknown outcome. Reads are not checked.
 - One write's whole record must fit 1 MiB (1,048,576 bytes), framing included. One put's
   largest value is **1,048,240 bytes minus the key's length, minus 1 per 0x00 byte in the key**,
   for a new key; 1 byte more for an existing key; the same with or without `ifVersion` (a 3-byte
