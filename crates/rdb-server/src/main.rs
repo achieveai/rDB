@@ -16,7 +16,7 @@
 //! Exits: 0 stopped by Ctrl-C or the stop file; 2 bad arguments, a non-loopback `--listen`, or setup; 3 the open
 //! or a link was refused; 5 not ready in time; 6 the listener could not bind.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -324,6 +324,8 @@ async fn connect(args: &Args) -> Result<(Arc<Links>, Arc<Net>), ExitCode> {
             dial,
             protocol_version: PROTOCOL_VERSION,
             faults: Faults::new(),
+            // The gateway is not an admin app: it may not Move or Rebuild.
+            admin_apps: BTreeSet::new(),
         },
         &links,
         None,
