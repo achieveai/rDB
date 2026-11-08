@@ -1093,9 +1093,9 @@ async fn an_app_link_never_delivers_a_peer_message() {
     );
 }
 
-/// A-R479: app `app`'s process sends node 1 `call` (a Move or a Rebuild), then an `Inspect`.
-/// Returns what node 1's node got first and the answer the app got for `call`. Node 1 runs
-/// with the admin-app list `rdb_node` defaults to, `admin`.
+/// A-R479: app `app`'s process sends node 1 `call` (a Move or a Rebuild), then a `Status`, a
+/// client call any app may send. Returns what node 1's node got first and the answer the app
+/// got for `call`. Node 1 runs with the admin-app list {admin}, as `lr` starts its nodes.
 async fn app_admin_call(app: &str, call: ClientCall) -> (Msg, Answer) {
     let dir = config_testkit::fs::temp_dir();
     let label = Label::App(app.to_owned());
@@ -1125,15 +1125,19 @@ async fn app_admin_call(app: &str, call: ClientCall) -> (Msg, Answer) {
             }),
         )
         .expect("posted");
-    let (inspect, _inspected) = mpsc::channel();
+    let (status, _status_answer) = mpsc::channel();
     sender
         .links
         .post(
             NodeId(1),
-            Msg::Inspect {
+            Msg::Client(Client {
                 partition: PartitionId(1),
-                reply: inspect,
-            },
+                call: ClientCall::Status {
+                    identity: identity(9, 99),
+                    generation: None,
+                },
+                reply: status,
+            }),
         )
         .expect("posted");
     let (got, mail) = next(one.mail).await;
@@ -1157,12 +1161,40 @@ async fn app_admin_call(app: &str, call: ClientCall) -> (Msg, Answer) {
     answered
 }
 
+/// Each client call row `test`'s node 1 took a request number for, as `(n, call)`, from its
+/// `net_client_request` lines.
+fn client_requests(test: &str) -> Vec<(u64, String)> {
+    config_testkit::logs::lines_for_current_test(module_path!(), test)
+        .iter()
+        .filter(|line| line["@m"].as_str() == Some("net_client_request"))
+        .map(|line| {
+            (
+                line["n"].as_u64().expect("n"),
+                line["call"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
 /// The refusal a non-admin app gets for `verb`: definitive, nothing done, and it says who
-/// decides and what to do (A-R465).
-fn assert_not_admin(got: &Msg, answer: &Answer, app: &str, verb: &str) {
+/// decides and what to do (A-R465). Revobot R3 4489400309: the gate runs before the request
+/// number and its `net_client_request` event, so the refused call takes neither, and the
+/// `Status` sent after it is node 1's request 1 and its only request event.
+fn assert_not_admin(test: &str, got: &Msg, answer: &Answer, app: &str, verb: &str) {
     assert!(
-        matches!(got, Msg::Inspect { .. }),
+        matches!(
+            got,
+            Msg::Client(Client {
+                call: ClientCall::Status { .. },
+                ..
+            })
+        ),
         "an app not on the admin list never reaches node 1's node with a {verb}: {got:?}"
+    );
+    assert_eq!(
+        client_requests(test),
+        [(1, "status".to_owned())],
+        "a refused {verb} takes no request number and logs no request event"
     );
     let Answer::Error { error, request } = answer else {
         panic!("a refusal: {answer:?}");
@@ -1201,7 +1233,13 @@ async fn pr74_r479_a_move_from_an_app_not_on_the_admin_list_is_refused_and_does_
         },
     )
     .await;
-    assert_not_admin(&got, &answer, "pilot", "move");
+    assert_not_admin(
+        "pr74_r479_a_move_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        &got,
+        &answer,
+        "pilot",
+        "move",
+    );
 }
 
 /// A-R479: as the row above, for `admin rebuild`: a spare note is a membership change too.
@@ -1217,7 +1255,13 @@ async fn pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_do
         },
     )
     .await;
-    assert_not_admin(&got, &answer, "pilot", "rebuild");
+    assert_not_admin(
+        "pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        &got,
+        &answer,
+        "pilot",
+        "rebuild",
+    );
 }
 
 /// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with
@@ -1242,6 +1286,13 @@ async fn pr74_r479_the_admin_app_still_reaches_the_owner_with_a_move_and_a_rebui
             panic!("the admin app's {call:?} reaches node 1's node: {got:?}");
         };
         assert_eq!(format!("{reached:?}"), format!("{call:?}"));
+    }
+    // The control for `assert_not_admin`'s count: a call that passes the gate takes request 1.
+    let taken = client_requests(
+        "pr74_r479_the_admin_app_still_reaches_the_owner_with_a_move_and_a_rebuild",
+    );
+    for call in ["move", "rebuild"] {
+        assert!(taken.contains(&(1, call.to_owned())), "{taken:?}");
     }
 }
 
@@ -1421,6 +1472,40 @@ fn pr74_r479_only_an_admin_app_may_send_a_move_or_a_rebuild() {
         assert!(!reason.contains("as an admin app"), "{reason}");
     }
     assert_eq!(super::sender_refused(&pilot, &status, &none), None);
+}
+
+/// Revobot R3 4489400307: the gate reads the list, not the name `admin`. With the list {ops},
+/// app ops may send a move and a rebuild, and app admin is refused both, told to add itself to
+/// the node's admin apps. Cut: a gate that tests `app == "admin"`, red. Unit.
+#[test]
+fn pr74_r3_the_admin_list_names_who_may_move_not_the_name_admin() {
+    let call = |call: wire::WireCall| WireMsg::Client {
+        to: NodeId(1),
+        partition: PartitionId(1),
+        call,
+        reply: 1,
+    };
+    let moved = call(wire::WireCall::Move {
+        identity: identity(1, 1),
+        from: NodeId(3),
+        to: NodeId(4),
+    });
+    let rebuilt = call(wire::WireCall::Rebuild {
+        identity: identity(1, 1),
+        node: NodeId(4),
+    });
+    let ops_only = BTreeSet::from(["ops".to_owned()]);
+    let ops = Label::App("ops".to_owned());
+    let admin = Label::App("admin".to_owned());
+    for msg in [&moved, &rebuilt] {
+        assert_eq!(super::sender_refused(&ops, msg, &ops_only), None, "{msg:?}");
+        let reason = super::sender_refused(&admin, msg, &ops_only).expect("admin refused");
+        assert!(
+            reason.contains("app admin is not an admin app on node 1")
+                && reason.contains("add admin to the node's admin apps"),
+            "{reason}"
+        );
+    }
 }
 
 /// The reason node 1's dialler holds for node `to`, once it is refused. Polls until the link is
