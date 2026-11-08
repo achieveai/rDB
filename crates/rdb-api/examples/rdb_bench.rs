@@ -4,7 +4,8 @@
 //! ```text
 //! cargo run --release -p rdb-api --example rdb_bench -- --dir D --log-dir L
 //!     [--dataset K] [--rate R] [--writers N] [--minutes M] [--keys K] [--value-bytes B] [--keep]
-//!     [--no-history] [--write-buffer-bytes N] [--memtable-budget-bytes N]
+//!     [--no-history] [--no-ack-floor] [--dedup-retention-secs S] [--write-buffer-bytes N]
+//!     [--memtable-budget-bytes N]
 //! cargo run --release -p rdb-api --example rdb_bench -- --build-dataset K --log-dir L
 //!     [--dataset-root P]
 //! ```
@@ -171,6 +172,11 @@ struct Args {
     value_bytes: usize,
     keep: bool,
     no_history: bool,
+    /// `--no-ack-floor`: open with `DbConfig::ack_floor` off, so every answer is kept for the
+    /// retention and the cap/retention limit applies (issue #86).
+    no_ack_floor: bool,
+    /// `--dedup-retention-secs S`: `DbConfig::dedup_retention`; default the spec's 24 h.
+    dedup_retention_secs: Option<u64>,
     write_buffer_bytes: Option<usize>,
     memtable_budget_bytes: Option<usize>,
     dataset: Option<u64>,
@@ -190,7 +196,8 @@ struct Args {
 
 fn usage() -> &'static str {
     "usage: rdb_bench --dir D --log-dir L [--dataset K] [--rate R] [--writers N] [--minutes M] \
-     [--keys K] [--value-bytes B] [--keep] [--no-history] [--write-buffer-bytes N] \
+     [--keys K] [--value-bytes B] [--keep] [--no-history] [--no-ack-floor] \
+     [--dedup-retention-secs S] [--write-buffer-bytes N] \
      [--memtable-budget-bytes N]\n       \
      rdb_bench --build-dataset K --log-dir L [--dataset-root P]\n       \
      rdb_bench --dir D --log-dir L --nodes 1=A,2=B,3=C --control E,E,E --cert-dir C \
@@ -212,6 +219,8 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
         value_bytes: 100,
         keep: false,
         no_history: false,
+        no_ack_floor: false,
+        dedup_retention_secs: None,
         write_buffer_bytes: None,
         memtable_budget_bytes: None,
         dataset: None,
@@ -248,6 +257,13 @@ fn parse(mut words: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--keep" => args.keep = true,
             "--no-history" => args.no_history = true,
+            "--no-ack-floor" => args.no_ack_floor = true,
+            "--dedup-retention-secs" => {
+                args.dedup_retention_secs = Some(positive(
+                    &value("--dedup-retention-secs")?,
+                    "--dedup-retention-secs",
+                )?);
+            }
             "--write-buffer-bytes" => {
                 let n = positive(&value("--write-buffer-bytes")?, "--write-buffer-bytes")?;
                 args.write_buffer_bytes = Some(
@@ -708,12 +724,12 @@ fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
             rt.block_on(restore_control(&*store, records, target))?;
         }
         let config = DbConfig {
-            ack_floor: true,
+            ack_floor: !args.no_ack_floor,
             dir: args.dir.join("db"),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
-            dedup_retention: None,
+            dedup_retention: args.dedup_retention_secs.map(Duration::from_secs),
             local: rdb_api::db::ALL_NODES.to_vec(),
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,
@@ -847,12 +863,12 @@ fn run_remote(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
         .map_err(|down| format!("links down: {down}"))?;
     println!("links up nodes={peers:?}");
     let config = DbConfig {
-        ack_floor: true,
+        ack_floor: !args.no_ack_floor,
         dir: args.dir.join("app"),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
         dedup_cap: None,
-        dedup_retention: None,
+        dedup_retention: args.dedup_retention_secs.map(Duration::from_secs),
         local: Vec::new(),
         links: Some(links),
         client: rdb_api::db::DEFAULT_CLIENT,
