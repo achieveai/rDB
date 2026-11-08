@@ -107,6 +107,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.admin_apps = Some(
                     value("--admin-apps")?
                         .split(',')
+                        .map(str::trim)
                         .filter(|a| !a.is_empty())
                         .map(str::to_owned)
                         .collect(),
@@ -452,5 +453,15 @@ mod tests {
         assert_eq!(apps(&[]), ["admin"]);
         assert_eq!(apps(&["--admin-apps", ""]), Vec::<String>::new());
         assert_eq!(apps(&["--admin-apps", "ops,admin"]), ["admin", "ops"]);
+    }
+
+    /// Revobot R3 4489400304: each name is trimmed, so `--admin-apps "ops, admin"` lists
+    /// `admin`, not ` admin`, which the gate would refuse; a blank name is dropped, so a list
+    /// of blanks is still none. Unit.
+    #[test]
+    fn pr74_r3_admin_apps_names_are_trimmed_and_blanks_dropped() {
+        assert_eq!(apps(&["--admin-apps", "ops, admin"]), ["admin", "ops"]);
+        assert_eq!(apps(&["--admin-apps", " ops ,  admin "]), ["admin", "ops"]);
+        assert_eq!(apps(&["--admin-apps", " , "]), Vec::<String>::new());
     }
 }
