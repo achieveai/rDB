@@ -857,6 +857,7 @@ fn recovery_plan(
         },
         retention_millis: RETENTION_MILLIS,
         must_hold: std::collections::BTreeSet::new(),
+        prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
         config,
     }
 }

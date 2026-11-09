@@ -793,6 +793,21 @@ impl GrpcClient {
         self.cache().remove(&(endpoint.to_string(), verify_as));
     }
 
+    /// Later operations start at the endpoint after `endpoint`, if they would have started there.
+    ///
+    /// A connection that failed during a request says the node is suspect, and a dial cannot
+    /// clear it: a stopped process's kernel still accepts TCP, so the connect phase succeeds and
+    /// the client would keep returning to it (issue #80). This operation is not moved, because
+    /// its outcome may be unknown; only the next one is. A leader hint corrects a wrong guess.
+    fn move_start_past(&self, endpoint: &str) {
+        let start = self.start.load(Ordering::Relaxed);
+        if self.endpoints.get(start).is_some_and(|e| e == endpoint) {
+            let next = (start + 1) % self.endpoints.len();
+            self.start.store(next, Ordering::Relaxed);
+            tracing::debug!(from = %endpoint, to = %self.endpoints[next], "client start moved");
+        }
+    }
+
     fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<ChannelKey, Channel>> {
         self.channels.lock().expect("channel cache poisoned")
     }
@@ -1035,6 +1050,11 @@ impl GrpcClient {
                 // was, the connection is suspect; the next operation re-runs the connect phase
                 // rather than inheriting it.
                 self.forget_channel(&endpoint, verify_as);
+                // The connection itself died, which keepalive reports as `UNAVAILABLE`. The
+                // call's own timeout is not that: the node may simply be slow.
+                if status.code() == tonic::Code::Unavailable {
+                    self.move_start_past(&endpoint);
+                }
             }
 
             let error = classify(&status, is_mutation, &endpoint);
@@ -1380,6 +1400,22 @@ fn conservative_capabilities(tls: &TlsMode) -> Capabilities {
     }
 }
 
+/// How often a connection is pinged while it is up (HTTP/2 keepalive). Matches A1's renewal
+/// cadence, so a dead connection is found before the next renewal needs it (issue #80).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a ping may go unanswered before the connection is closed. With
+/// [`KEEPALIVE_INTERVAL`], a silent server is noticed within 1.5 s, not at the request deadline.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+/// Ping a connection with no call in flight too: a renewal is due every 500 ms, and one that
+/// meets a connection already known dead costs nothing.
+const KEEPALIVE_WHILE_IDLE: bool = true;
+
+/// The longest a TCP dial may take. TCP only: a server that accepts TCP and stalls in TLS is
+/// bounded by the operation's dial budget instead (see `attempts_at`).
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(1_000);
+
 /// A validated, not-yet-dialled endpoint.
 ///
 /// `domain` pins the name the server certificate must carry; `None` keeps whatever the TLS
@@ -1396,6 +1432,11 @@ fn build_endpoint(
             detail: e.to_string(),
         })?
         .tcp_nodelay(true);
+    ep = ep
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(KEEPALIVE_WHILE_IDLE)
+        .connect_timeout(CONNECT_TIMEOUT);
     if let TlsMode::MutualTls(cfg) = tls {
         let profile = match domain {
             Some(d) => cfg.client_tls_config_for(d),

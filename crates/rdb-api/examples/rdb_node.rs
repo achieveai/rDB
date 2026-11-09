@@ -7,6 +7,7 @@
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
+//!          [--clock-offset-ms M] [--clock-step-file F]
 //! ```
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
@@ -29,6 +30,10 @@
 //!   passes `--admin-apps admin`, the app `lr` and `rdb_dev` run as; a production node lists
 //!   its operator apps. Any other app's move or rebuild is refused before the node sees it.
 //!   Names are trimmed, so `ops, admin` lists `ops` and `admin`.
+//!   `--clock-offset-ms` shifts this process's `Tick` once at start, real skew (#80 S2c).
+//!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
+//!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
+//!   `kill -CONT` is a frozen-clock pause.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -74,6 +79,8 @@ struct Args {
     admin_apps: Option<BTreeSet<String>>,
     /// `--partitions`: the partition count (issue #79); `None` reads it from the control store.
     partitions: Option<u32>,
+    clock_offset_ms: i64,
+    clock_step_file: Option<PathBuf>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -88,6 +95,7 @@ const USAGE: &str = "usage:
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
            [--admin-apps a,b] [--partitions P]
+           [--clock-offset-ms M] [--clock-step-file F]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -179,11 +187,36 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                         .map_err(|_| "--ready-secs takes whole seconds".to_owned())?,
                 );
             }
+            "--clock-offset-ms" => {
+                args.clock_offset_ms = value("--clock-offset-ms")?
+                    .parse()
+                    .map_err(|_| "--clock-offset-ms takes whole milliseconds".to_owned())?;
+            }
+            "--clock-step-file" => args.clock_step_file = Some(value("--clock-step-file")?.into()),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
     }
     Ok(args)
+}
+
+/// Poll `file`: whole milliseconds in it step this process's `Tick` back once. A file that
+/// does not parse is said out loud and removed, not read as zero.
+fn watch_clock_step(file: PathBuf, links: Arc<Links>) {
+    std::thread::spawn(move || loop {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            match text.trim().parse::<u64>() {
+                Ok(millis) => links.clock().step_back(millis),
+                Err(e) => {
+                    tracing::error!(file = %file.display(), error = %e, "clock_step_file_bad")
+                }
+            }
+            if let Err(e) = std::fs::remove_file(&file) {
+                tracing::error!(file = %file.display(), error = %e, "clock_step_file_stuck");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    });
 }
 
 fn need<T: Clone>(value: Option<&T>, name: &str) -> Result<T, String> {
@@ -374,7 +407,10 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let listener = rt
         .block_on(tokio::net::TcpListener::bind(&listen))
         .map_err(|e| format!("--listen {listen}: {e}"))?;
-    let links = Links::new();
+    let links = Links::with_clock_offset(args.clock_offset_ms);
+    if let Some(file) = args.clock_step_file.clone() {
+        watch_clock_step(file, Arc::clone(&links));
+    }
     let net = Net::start(
         NetConfig {
             label,

@@ -2794,6 +2794,11 @@ mod semantic_runs {
             lifecycle: PartitionLifecycle::Serving,
         };
         let mut plan = RunPlan::new(ClusterConfig::default());
+        // #80 S2d: pinned. These rows' arithmetic is about relationships between budgets; it does not state the product default.
+        plan.overrides = vec![rdb_sim::harness::manifest::BudgetOverride {
+            name: rdb_core::contracts::trace::BudgetName::Grant,
+            millis: 3_000,
+        }];
         plan.control_records = vec![(ControlKey::Partition(PART), record.encode())];
         plan.seed = vec![seed(
             10,

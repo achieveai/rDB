@@ -67,16 +67,16 @@ this paragraph is normative rather than advisory.
 `grants/{node}` (spec §7.1) carries: grant id, authority generation, allowed boot UUID, expiry
 `E`, renewal version, mode. Per-partition `owner_epoch` lives in `partitions/{id}`.
 
-- Default grant duration **3 s**; renewal every **500 ms** (§7.2).
+- Default grant duration **6 s** (3 s until issue #80); renewal every **500 ms** (§7.2).
 - **Renewal is a single-record CAS against the unfrozen grant revision.** Not a lease refresh
   primitive — rEtcd has none — but `Put { expected_mod_revision: <the exact observed revision> }`.
 - **The renewed expiry is computed, and this is the rule.** `E_new = extrapolated_utc(at the tick
   the renewal CAS is **dispatched**) + grant_duration_ms`, computed in the one module allowed to
   touch `E`. Three consequences, all normative:
-  - It is **never** `E + grant_duration_ms`. Renewing every 500 ms while adding 3 s per renewal
-    drives `E` ahead of real time at 6× without bound. That is safe — a larger `E` only delays
+  - It is **never** `E + grant_duration_ms`. Renewing every 500 ms while adding 6 s per renewal
+    drives `E` ahead of real time at 12× without bound. That is safe — a larger `E` only delays
     takeover — but it destroys the bounded takeover wait §7.3 exists to provide, because the old
-    owner self-fences 3 s after its last commit while a candidate must wait out `E + ε + δ`.
+    owner self-fences one grant duration after its last commit while a candidate must wait out `E + ε + δ`.
   - Anchoring at **dispatch** rather than completion makes `E_new` conservative against the
     control round trip.
   - When the clock sample is invalid or stale there is **no `E_new`**, so no renewal CAS is
@@ -152,12 +152,24 @@ transition rather than left as an absent guard.
 
 **Denying and fencing are different outcomes.** Not every uncertainty is on the list above. A
 clock sample that is merely **stale** (older than the configured maximum age, but valid and
-within the bound) denies every check and recovers when a fresh sample arrives; a control-plane
-`Unavailable` denies; an unknown CAS outcome denies. None of them end the grant. Conflating the
-two produced two real defects in the first draft: a node with no established bound would acquire
+within the bound) denies every check and recovers when a fresh sample arrives. Neither ends the
+grant. Conflating the two produced two real defects in the first draft: a node with no established bound would acquire
 and burn a grant id per tick, and one late clock sample would terminally fence a healthy primary
 and drain its queue. The maximum sample age is therefore its own configured constant at **at
 least twice the sample period**, not a reuse of the renewal interval.
+
+**A control-plane `Unavailable` and an unknown CAS outcome neither deny nor fence (amended for
+issue #80).** They used to deny every check while the grant was still good, so an rEtcd leader
+election stopped writes on every node for about a second, and no safety property needed it.
+No-overlap rests on the grant alone: this node stops admitting at `E - ε - δ` whatever it can
+read, and a new owner waits for `E + ε + δ` after a linearizable read of the frozen expiry.
+Admission therefore continues while `local_ok` and `utc_ok` hold, and at the horizon the node
+fences `Expired`. A read answering `Unavailable` with no renewal in flight re-arms `Renew`, by
+the same rule as a healthy read-back: a deadline still ahead is kept, a passed one becomes
+`now + renew`. The default grant moved from 3 s to 6 s in the same change, so a control failover
+leaves a renewal inside the horizon.
+
+What this costs, as three separate limits and never one figure: With clocks in bound, rDB serves no stale reads. If a host's clock stops during a VM pause, after it resumes it can serve for up to 5.8 s of its own running time, and the data can be as old as the pause was long. `G + ε + δ` (6.2 s) is the new owner's wait, not a staleness limit.
 
 The deny-versus-fence distinction is about the **immediate** outcome. A stale sample also
 withholds renewals (§2: no sample, no `E_new`), so if staleness persists the local anchor stops
@@ -306,8 +318,9 @@ makes the system correct.
    New membership, generation and owner epoch install in **one** authoritative partition record —
    one record, therefore one CAS.
 5. The selected lineage is recovered and durably established before `READ_ONLY` or `ACTIVE`.
-6. Control-quorum loss prohibits new grants and promotions; existing grant-backed service lasts
-   only until conservative local expiry. This is the natural behaviour of ADR-0009's barrier: a
+6. Control-quorum loss prohibits new grants and promotions; existing grant-backed service
+   continues, for writes and reads, until conservative local expiry (amended for issue #80:
+   it no longer denies before that). This is the natural behaviour of ADR-0009's barrier: a
    partitioned rEtcd node returns `Unavailable` rather than serving a stale read, and cannot
    commit a write.
 

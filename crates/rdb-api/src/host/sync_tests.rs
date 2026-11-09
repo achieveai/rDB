@@ -725,7 +725,7 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
 /// A-R317 (5), b2: a sync stuck on node 1 (held 8 s, past the 5 s stuck limit) faults node 1
 /// node-wide (`wal_sync_stuck`, then `host_fault`) no sooner than the limit, so A1 renews no
 /// more and the grant lapses. A promote to node 2 then lands writes there within the limit plus
-/// the grant's 2.9 s plus 3 s to find and promote. Node 1 is still faulted after its sync
+/// the grant's 5.9 s (6 s since #80 S2d) plus 3 s to find and promote. Node 1 is still faulted after its sync
 /// returns: a late sync does not unfault a node. That late sync is finished, not reported lost at
 /// stop, and node 1 faults once.
 /// Cut: no stuck check (`stuck_sync` never faults), red (node 1 never faults).
@@ -776,7 +776,7 @@ fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
     };
     let took_over = held.elapsed();
     assert_eq!(put.generation, promoted.generation, "{put:?}");
-    let bound = test_patience(Duration::from_millis(5_000 + 2_900 + 3_000));
+    let bound = test_patience(Duration::from_millis(5_000 + 5_900 + 3_000));
     assert!(
         took_over <= bound,
         "node 2 took writes {took_over:?} after node 1's sync stuck; bound {bound:?}"

@@ -340,11 +340,6 @@ pub struct Held {
     /// from `served`, the entry itself absent. No key is in both this and `served`.
     removed_revisions: BTreeMap<PartitionId, Revision>,
     partitions_revision: Revision,
-    /// The last linearizable read of `grants/{node}` answered `Unavailable`, and no quorum has
-    /// answered since. Denies `ControlUnavailable` without ending the grant (`design.md` §2.4
-    /// property 6; M7A-59). Cleared by the next read that finds our record, or by a committed
-    /// renewal, which is itself a quorum answer (A-R78 F1).
-    control_unavailable: bool,
 }
 
 impl Held {
@@ -1164,9 +1159,6 @@ impl Authority {
         }
         if let Err(reason) = utc_ok(&self.clock, held.expiry_utc_ms, now, budgets) {
             return Verdict::Deny(reason);
-        }
-        if held.control_unavailable {
-            return Verdict::Deny(DenyReason::ControlUnavailable);
         }
         held.partition_deny(lineage, &self.revoked_epochs, &self.storage_fenced)
             .map_or(Verdict::Admit, Verdict::Deny)
@@ -2762,7 +2754,6 @@ impl Authority {
             served_revisions: BTreeMap::new(),
             removed_revisions: BTreeMap::new(),
             partitions_revision: Revision::default(),
-            control_unavailable: false,
         });
         self.cursors.insert(ControlPrefix::Grants, revision);
         let renew = self.arm(
@@ -2883,7 +2874,6 @@ impl Authority {
                     held.expiry_utc_ms = renewal.e_new;
                     held.record_revision = revision;
                     held.renewed_at = renewal.dispatched_at;
-                    held.control_unavailable = false;
                 }
                 renewal
             }
@@ -2934,8 +2924,8 @@ impl Authority {
     ///     row does. A re-arm at `now` fired at once, went `Unknown` again and read back again:
     ///     about 1,400 control calls a second from one owner (M9 S3 W3-D1, ruling A-R107).
     ///     It spends the window no faster than the `Unavailable` row does: each retry comes one
-    ///     `renew_millis` after the last answer, and with the spec budgets (grant 3 000 ms, renew
-    ///     500 ms) four retries still fit before the window, renewed at `renewed_at`, lapses.
+    ///     `renew_millis` after the last answer, and with the spec budgets (grant 6 000 ms, renew
+    ///     500 ms) about ten retries still fit before the window, renewed at `renewed_at`, lapses.
     fn on_held_grant_record(
         &mut self,
         ctx: &StepCtx<'_>,
@@ -2944,10 +2934,6 @@ impl Authority {
         revision: Revision,
     ) -> Vec<Effect> {
         let renew_millis = ctx.budgets.renew_millis;
-        // A read found our record: control answers again (M7A-59).
-        if let AuthorityState::Held(held) = &mut self.state {
-            held.control_unavailable = false;
-        }
         let Some(held) = self.state.held() else {
             return Vec::new();
         };
@@ -3032,19 +3018,32 @@ impl Authority {
             ReadOutcome::Absent { .. } => {
                 Ok(self.fence(ctx, event, FenceScope::Node, DenyReason::Revoked))
             }
-            // Control quorum was lost. A **deny**, never "probably still fine" — and never a
-            // fence: the grant has not ended, we simply cannot see it (property 6). The deny is
-            // remembered until a read finds our record (M7A-59; lead ruling A-R77a). Views are
-            // not republished: published service ends at local expiry (ADR-rdb-0008, "Control-
-            // quorum loss denies"), and the deny is a check-time answer only.
+            // Control quorum is out of reach, as it is during a control leader election. Neither
+            // a deny nor a fence: admission rests on the proved grant, which `local_ok` and
+            // `utc_ok` end at `E - ε - δ`, and a new owner waits for `E + ε + δ` whatever this
+            // node can read (issue #80, ADR-rdb-0007 as amended; M7A-59).
+            //
+            // With no renewal in flight, one is scheduled. An `Unknown` renewal issues only this
+            // read, so without the arm nothing renews again and the grant runs out on a store
+            // that came back (critic R4-2). The rule is `on_held_grant_record`'s: a renewal
+            // already due at `renewed_at + renew` keeps that deadline, and one past it backs off
+            // to `now + renew`, never `now` (A-R107).
             ReadOutcome::Unavailable => {
-                if let AuthorityState::Held(held) = &mut self.state {
-                    held.control_unavailable = true;
-                }
-                Ok(vec![Self::ignored(
+                let mut effects = vec![Self::ignored(
                     event,
                     AuthorityIgnoreReason::AdmissionSuspended,
-                )])
+                )];
+                if let Some(held) = self.state.held().filter(|held| held.renewal.is_none()) {
+                    let renew_millis = ctx.budgets.renew_millis;
+                    let due = held.renewed_at.plus_millis(renew_millis);
+                    let at = if due > ctx.now {
+                        due
+                    } else {
+                        ctx.now.plus_millis(renew_millis)
+                    };
+                    effects.push(self.arm(event, AuthorityTimer::Renew, at));
+                }
+                Ok(effects)
             }
             ReadOutcome::Found { revision, value } => {
                 let Some(record) = GrantRecord::decode(value) else {

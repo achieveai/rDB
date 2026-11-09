@@ -34,14 +34,16 @@ use config_core::{
 };
 use futures::StreamExt;
 use rdb_core::authority::grant::GrantRecord;
+use rdb_core::authority::partition::{committed_without_of, PartitionRecord};
 use rdb_core::contracts::authority::FencingProof;
 use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
     ControlRecord, ReadOutcome, WatchCursor, WatchTermination,
 };
 use rdb_core::contracts::ids::{
-    BootId, ControlRequestId, CorrelationId, NodeId, PartitionId, Revision,
+    BootId, ControlRequestId, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId, Revision,
 };
+use rdb_core::contracts::recovery::CommittedWithout;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
@@ -358,6 +360,63 @@ impl ControlAdapter {
         calls.push(task);
     }
 
+    /// #80 S5n, design R8-3: read `partitions/{partition}` for a re-plan whose held note is
+    /// behind the commit it plans from, and answer [`Msg::ReplanNote`] with the note the record
+    /// holds once it is at or past `generation`. A failed read or one behind `generation` is
+    /// retried, so a plan is never built on a note older than the record's. Tracked with the
+    /// node's calls, so a restart abandons it.
+    pub fn read_replan_note(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        generation: Generation,
+    ) {
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                let mut attempt = 0_u32;
+                let note = loop {
+                    attempt += 1;
+                    let failed = match note_of(&*store, partition).await {
+                        Ok((read, note)) if read >= generation => break note,
+                        Ok((read, _)) => format!(
+                            "the record is at generation {}, behind {}",
+                            read.0, generation.0
+                        ),
+                        Err(error) => error,
+                    };
+                    tracing::warn!(
+                        node = node.0,
+                        partition = partition.0,
+                        generation = generation.0,
+                        attempt,
+                        error = %failed,
+                        "replan_note_read_failed"
+                    );
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                };
+                let msg = Msg::ReplanNote {
+                    boot,
+                    partition,
+                    epoch,
+                    generation,
+                    note,
+                };
+                if links.post(node, msg).is_err() {
+                    tracing::debug!(node = node.0, "control_completion_unclaimed");
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
     /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
     /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
     /// puts its count back to 0 before it answers, and the only reloads ever stopped early are
@@ -597,7 +656,7 @@ async fn fence_facts(
     partition: PartitionId,
     revision: Revision,
 ) -> Result<FenceFacts, String> {
-    let (record, root, _, mod_revision, _) = crate::admin::read_partition(store, partition)
+    let (record, root, _, mod_revision, _, _) = crate::admin::read_partition(store, partition)
         .await
         .map_err(|error| error.to_string())?;
     let key = ControlKey::Grant(record.owner).encode();
@@ -632,6 +691,30 @@ async fn fence_facts(
         grant,
         plan,
     })
+}
+
+/// The generation and note `partitions/{partition}` holds now.
+async fn note_of(
+    store: &dyn ConfigStore,
+    partition: PartitionId,
+) -> Result<(Generation, CommittedWithout), String> {
+    let key = ControlKey::Partition(partition).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| format!("get {key}: {error}"))?;
+    let found = read.record.ok_or_else(|| format!("{key} is absent"))?;
+    PartitionRecord::decode(&found.value)
+        .map(|record| record.generation)
+        .zip(committed_without_of(&found.value))
+        .ok_or_else(|| {
+            format!(
+                "{key} at revision {} is not a partition record",
+                found.mod_revision
+            )
+        })
 }
 
 /// How long to wait after failed attempt `attempt` (1-based): 50, 100, 200 ms ... capped at 2 s.

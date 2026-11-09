@@ -5704,6 +5704,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         }
     }
 
@@ -5830,10 +5833,10 @@ mod tests {
     /// renewal interval to spare, so the renewal sent to it commits before the horizon.
     ///
     /// The slack this relies on (review F-004): with `CONTROL_TIMERS` and the spec budgets it is
-    /// 1500 ms (1000 ms failover + 500 ms renewal) against the 2299 ms horizon, so 799 ms. The
+    /// 1500 ms (1000 ms failover + 500 ms renewal) against the 5299 ms horizon, so 3799 ms. The
     /// floor already takes off one renewal for the age of the last one, and the added renewal
     /// covers the 500 ms renewal tick. Nothing here counts the renewal's RPC and commit time
-    /// on the new leader: those must fit in the 799 ms, and no term is added for them.
+    /// on the new leader: those must fit in the 3799 ms, and no term is added for them.
     #[test]
     fn control_failover_leaves_a_renewal_inside_the_write_horizon() {
         let budgets = Budgets::SPEC_DEFAULTS;
@@ -5844,6 +5847,30 @@ mod tests {
             renewed_by < horizon,
             "a control failover of up to {failover} ms plus one renewal ({renewed_by} ms) \
              outlasts the {horizon} ms A1 still admits after the leader stops"
+        );
+    }
+
+    /// Issue #80, design row 17: the product's own timers. `control_failover_leaves_a_renewal_...`
+    /// uses `rdb_dev`'s faster ones, and those hid that a 3000 ms grant cannot cover a failover
+    /// on `RaftTimers::default()` (`TestTimers::DEFAULT` is the same three values; this crate has
+    /// no `config-engine` dependency, by ADR-rdb-0002). Holds at the default; red at 3000.
+    #[test]
+    fn the_grant_covers_a_control_failover_under_default_timers() {
+        let failover_and_renewal = |budgets: &Budgets| {
+            control_failover_millis(TestTimers::DEFAULT) + u128::from(budgets.renew_millis)
+        };
+        let spec = Budgets::SPEC_DEFAULTS;
+        assert_eq!(spec.grant_millis, 6_000, "the row is about the default");
+        assert_eq!(write_horizon_floor_millis(&spec), 5_299);
+        assert!(failover_and_renewal(&spec) < write_horizon_floor_millis(&spec));
+
+        let old = Budgets {
+            grant_millis: 3_000,
+            ..spec
+        };
+        assert!(
+            failover_and_renewal(&old) >= write_horizon_floor_millis(&old),
+            "a 3000 ms grant does not cover it; this comparison is what the default answers"
         );
     }
 
@@ -8339,7 +8366,7 @@ mod tests {
         let why = "node 1 (the owner) did not answer its status look";
         assert_eq!(
             record_members_line(
-                &record.encode_with_members(&root, &members),
+                &record.encode_with_members(&root, &members, None),
                 &known,
                 true,
                 why

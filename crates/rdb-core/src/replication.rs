@@ -67,7 +67,8 @@ use crate::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName, StepCtx,
 };
 use crate::contracts::ids::{
-    AppliedSeq, DurableSeq, NodeId, PartitionId, ReceivedSeq, ReplicaRole, Seq, TimerVersion,
+    AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq, ReplicaRole, Seq,
+    TimerVersion,
 };
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::membership::CopyId;
@@ -158,6 +159,15 @@ impl Replication {
     ) {
         if let Some(receiver) = self.receivers.get_mut(&(node, partition)) {
             receiver.keep_recovery_plan(plan);
+        }
+    }
+
+    /// Seal the receiver at `(node, partition)` through `generation`, because this copy is
+    /// answering a recovery inventory anchored there (#80 R4-1). A node with no receiver there,
+    /// such as an old primary's own copy, has nothing to seal.
+    pub fn seal(&mut self, node: NodeId, partition: PartitionId, generation: Generation) {
+        if let Some(receiver) = self.receivers.get_mut(&(node, partition)) {
+            receiver.seal(generation);
         }
     }
 

@@ -25,8 +25,10 @@ use crate::contracts::authority::{
     AuthorityView, BlockReason, FenceCredential, FencingProof, Lineage, PartitionMode,
 };
 use crate::contracts::digest::Digest;
-use crate::contracts::ids::{BootId, DurableSeq, Generation, PartitionId, Revision, Seq};
-use crate::contracts::membership::{CopyId, PartitionConfig};
+use crate::contracts::ids::{
+    BootId, DurableSeq, Generation, NodeId, PartitionId, ReplicaRole, Revision, Seq,
+};
+use crate::contracts::membership::{CopyId, Member, PartitionConfig};
 use crate::contracts::time::Tick;
 use crate::contracts::trace::QuarantineReason;
 
@@ -514,8 +516,129 @@ pub struct RecoveryPlan {
     /// reporters. When `required` lacks one, F1 blocks with `BarrierIncomplete` naming each
     /// missing copy instead of committing without it. The host names a move's target here for
     /// the promote that leaves the source out; every other plan leaves it empty, which is what
-    /// F1 did before. Last, so a stored plan written before it is its prefix.
+    /// F1 did before. Before [`Self::prior`], so a stored plan of version 2 is a prefix of today's.
     pub must_hold: BTreeSet<CopyId>,
+    /// What the record this plan supersedes said: whom it pinned and its note (#80 S5n).
+    pub prior: PriorRecord,
+}
+
+/// The most recoveries a [`CommittedWithout`] names. The oldest beyond this is trimmed and its
+/// generation goes in [`CommittedWithout::dropped_through`].
+pub const MAX_NOTE_ENTRIES: usize = 4;
+
+/// One recovery that committed without some of the members its old record pinned (#80 S5n).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WithoutEntry {
+    /// The generation the recovery committed.
+    pub generation: Generation,
+    /// The last sequence it kept.
+    pub cutoff: Seq,
+    /// The old members it committed without, as a set keyed by the pair, in order.
+    pub copies: Vec<(CopyId, NodeId)>,
+}
+
+/// "These recoveries committed without these members, so a scan may be needed." It claims
+/// nothing about whether a write was lost (#80 design 5.4.1). Kept in `partitions/{p}`, so it
+/// is as durable as the commit that wrote it; rDB never clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CommittedWithout {
+    /// One per recovery that left someone out, oldest first, the newest
+    /// [`MAX_NOTE_ENTRIES`] kept.
+    pub entries: Vec<WithoutEntry>,
+    /// The highest generation trimmed from [`Self::entries`]; zero when none was.
+    pub dropped_through: Generation,
+}
+
+impl CommittedWithout {
+    /// Whether no recovery has left anyone out, so nothing is written for it.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// This note with `entry` merged in. Entries are keyed by generation, so a repeat replaces
+    /// and never adds; past [`MAX_NOTE_ENTRIES`] the oldest goes, and `dropped_through` rises.
+    #[must_use]
+    pub fn with(mut self, mut entry: WithoutEntry) -> Self {
+        entry.copies.sort_unstable();
+        entry.copies.dedup();
+        self.entries
+            .retain(|held| held.generation != entry.generation);
+        self.entries.push(entry);
+        self.entries.sort_by_key(|held| held.generation);
+        while self.entries.len() > MAX_NOTE_ENTRIES {
+            let trimmed = self.entries.remove(0);
+            self.dropped_through = self.dropped_through.max(trimmed.generation);
+        }
+        self
+    }
+}
+
+/// One member the old record pinned: a [`crate::contracts::membership::Member`] without its
+/// boot, which a record never holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PriorMember {
+    /// The slot.
+    pub copy: CopyId,
+    /// The node filling it.
+    pub node: NodeId,
+    /// What the slot may do.
+    pub role: ReplicaRole,
+}
+
+impl PriorMember {
+    /// `member`, without its boot.
+    #[must_use]
+    pub const fn of(member: &Member) -> Self {
+        Self {
+            copy: member.copy,
+            node: member.node,
+            role: member.role,
+        }
+    }
+}
+
+/// What a recovery needs from the record it supersedes (#80 S5n).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PriorRecord {
+    /// The members the old record pinned, or `None` when it names none (layout 2 or 3): "not
+    /// known", never an empty set. F1 then judges against the plan's own members and warns.
+    pub members: Option<Vec<PriorMember>>,
+    /// The old record's note, carried into the new record.
+    pub note: CommittedWithout,
+}
+
+impl PriorRecord {
+    /// A partition with no earlier members: a first commit at generation 0 has nobody to miss.
+    #[must_use]
+    pub const fn fresh() -> Self {
+        Self {
+            members: Some(Vec::new()),
+            note: CommittedWithout {
+                entries: Vec::new(),
+                dropped_through: Generation(0),
+            },
+        }
+    }
+}
+
+/// What a node can say about a partition's note (`NodeStatus::committed_without`, #80 S5n).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteState {
+    /// This node has no note for the generation it adopted: a non-owner, or a restarted owner
+    /// before its heal commits. **Never** read this as "no note": ask the primary.
+    Unknown,
+    /// The note as of `generation`, which this node committed. An empty `note` means no recovery
+    /// so far left anyone out.
+    Known {
+        /// The generation the note is current for.
+        generation: Generation,
+        /// The rDB instance the generation belongs to: re-forming a database restarts
+        /// generations.
+        instance: [u8; 16],
+        /// The note.
+        note: CommittedWithout,
+    },
 }
 
 /// Why a recovery quarantined (`design.md` §5.3, §5.4).
@@ -696,5 +819,16 @@ pub enum RecoveryEffect {
         copy: CopyId,
         /// The committed root.
         root: LineageAnchor,
+    },
+    /// The note the recovery CAS just wrote: every bound commit emits it, an empty note
+    /// included (#80 S5n), before its `Recovered`. Boxed note: this is the rare path of a
+    /// widely held type.
+    CommittedWithout {
+        /// The generation committed.
+        generation: Generation,
+        /// The rDB instance.
+        instance: [u8; 16],
+        /// The whole merged note.
+        note: Box<CommittedWithout>,
     },
 }

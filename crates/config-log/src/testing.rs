@@ -88,7 +88,7 @@ pub fn init_test_logging() {
         let filter = std::env::var("RETCD_TEST_LOG").unwrap_or_else(|_| {
             "info,config_log=trace,config_core=trace,config_storage=trace,config_engine=trace,\
              config_gossip=trace,config_grpc=trace,config_client=trace,config_server=trace,\
-             config_testkit=trace,openraft=debug"
+             config_testkit=trace,openraft=debug,rdb_api::authority_check=debug"
                 .to_string()
         });
         let cfg = LogConfig {

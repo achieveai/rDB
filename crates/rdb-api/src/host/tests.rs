@@ -2088,12 +2088,48 @@ fn each_node_fence_queues_an_acquire_at_the_current_timer_version() {
 }
 
 /// Msg 8, F-001: `admits` is A1's own admission verdict, not "L1 allows and A1 is `Held`".
-/// While the control store is down A1 still holds, but denies `ControlUnavailable` before
-/// it fences, and status said `admits=true` there. After the store returns, `admits=true`
-/// means a put lands.
-/// Integration (~2 s): bootstrap's discovery window, then one store outage on a 600 ms grant.
+/// A1 holds its grant and refuses the served epoch once that epoch is revoked, and status must
+/// say `admits=false` there. Until issue #80 a control outage produced this state; A1 no longer
+/// denies through one, which left only the few milliseconds between the horizon and the fence,
+/// and the row went red under load. The revocation is queued directly, so no timing is involved.
+/// Trio (~2 s): bootstrap, then one queued event.
 #[config_log::retcd_test]
 fn admits_follows_a1s_verdict_while_the_grant_is_still_held() {
+    use rdb_core::contracts::authority::AuthorityEvent;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let revoked = AuthorityEvent::EpochRevocationPersisted {
+        partition: PartitionId(1),
+        epoch: OwnerEpoch(1),
+    };
+    trio.nodes[0].0.push(
+        Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(901),
+        },
+        EventKind::Kernel(KernelEvent::Authority(revoked)),
+        false,
+        Some(ModuleName::Authority),
+    );
+    let denied = trio.until("node 1 stops admitting", |trio| {
+        let status = trio.status(0);
+        (status.admits != Some(true)).then_some(status)
+    });
+    assert!(
+        denied.authority.starts_with("held("),
+        "admits went false on A1's verdict, with the grant still held: {denied:?}"
+    );
+    assert_eq!(denied.admits, Some(false), "{denied:?}");
+}
+
+/// Msg 8, F-001, second half: after a control outage has ended the grant, `admits=true` means
+/// a put lands. When the outage stops admission, status shows either the moment past the horizon
+/// before the wake fences, or the `Expired` fence; which one is timing and does not matter here.
+/// Integration (~2 s): bootstrap's discovery window, then one store outage on a 600 ms grant.
+#[config_log::retcd_test]
+fn admits_true_after_a_control_outage_means_a_put_lands() {
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), |host| {
         Trio::fast(host);
@@ -2112,8 +2148,8 @@ fn admits_follows_a1s_verdict_while_the_grant_is_still_held() {
     });
     trio.mem.stop_failing();
     assert!(
-        denied.authority.starts_with("held("),
-        "admits went false before the fence, while the grant is still held: {denied:?}"
+        denied.authority.starts_with("held(") || denied.authority == "fenced(Expired)",
+        "the outage ends admission only at the grant's horizon: {denied:?}"
     );
     assert_eq!(denied.admits, Some(false), "{denied:?}");
     trio.until("node 1 admits again", |trio| {
@@ -4076,32 +4112,36 @@ fn a_write_held_past_the_retention_ages_from_its_publication_not_its_commit() {
 
 /// U1 (ruling A-R109): a check A1 refuses is logged `authority_check_denied` with its
 /// reason, which the client's refusal does not carry. The positive control for that line:
-/// with the control store down, A1 still holds its grant but denies `ControlUnavailable`,
-/// and a put's dispatch check is refused for that reason.
-/// Trio (~2 s): bootstrap, then one store outage on a 100 ms renewal.
+/// a dispatch check naming a lineage node 1 does not serve is refused `GenerationChanged`
+/// while the grant is held. The check is queued directly, so no outage or timing is involved.
+/// Trio (~2 s): bootstrap, then one queued check.
 #[config_log::retcd_test]
 fn a_dispatch_check_a1_denies_is_logged_with_its_reason() {
+    use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint, Lineage};
     const METHOD: &str = "a_dispatch_check_a1_denies_is_logged_with_its_reason";
     let dir = config_testkit::fs::temp_dir();
-    let mut trio = Trio::new(dir.path(), |host| {
-        Trio::fast(host);
-        host.budgets.renew_millis = 100;
-    });
+    let mut trio = Trio::new(dir.path(), Trio::fast);
     trio.bootstrap();
     trio.ready();
     assert!(logged!(METHOD, "authority_check_denied").is_empty());
-    // A stall on this thread past the grant lapses it (#50): ask with time left on it.
-    trio.admits_for(1_000);
-    trio.mem
-        .failing_with(config_core::ConfigError::Unavailable {
-            reason: "the control store is down".to_owned(),
-        });
-    trio.until("node 1 stops admitting", |trio| {
-        (trio.status(0).admits != Some(true)).then_some(())
-    });
-    let refused = trio.ask(put(1, b"a", b"1", None));
-    trio.mem.stop_failing();
-    assert!(matches!(refused, Answer::Error { .. }), "{refused:?}");
+    let check = AuthorityEvent::Check {
+        checkpoint: Checkpoint::StorageDispatch,
+        lineage: Lineage {
+            partition: PartitionId(1),
+            generation: Generation(99),
+            owner_epoch: OwnerEpoch(99),
+        },
+        correlation: CorrelationId(900),
+    };
+    trio.nodes[0].0.push(
+        Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(900),
+        },
+        EventKind::Kernel(KernelEvent::Authority(check)),
+        false,
+        Some(ModuleName::Authority),
+    );
     let lines = trio.until("authority_check_denied", |_| {
         let lines = logged!(METHOD, "authority_check_denied");
         (!lines.is_empty()).then_some(lines)
@@ -4109,54 +4149,68 @@ fn a_dispatch_check_a1_denies_is_logged_with_its_reason() {
     assert!(
         lines.iter().any(|line| line["node"] == 1
             && line["checkpoint"] == "StorageDispatch"
-            && line["reason"] == "ControlUnavailable"),
+            && line["reason"] == "GenerationChanged"),
         "{lines:?}"
     );
 }
 
-/// Ruling A-R285: a put A1 refuses at dispatch for `ControlUnavailable` (control quorum lost,
-/// grant still held) reaches the client as `PROTECTION_PAUSED` with its no-mutation proof, not
-/// `LEASE_EXPIRED`. Under load on 3 processes an rEtcd election showed 19 such refusals as
-/// `LEASE_EXPIRED`, which reads as a lost grant (dev-perf, lr R=30 run 2, 2026-10-24).
-/// Trio (~2 s): bootstrap, then one store outage on a 100 ms renewal.
+/// Issue #80, design row 19; replaces the row for ruling A-R285's `ControlUnavailable` deny,
+/// which A1 no longer gives at a write's checks. With the control store failing, writes keep
+/// being acked inside the grant, and stop with `LEASE_EXPIRED` and an `Expired` fence at its
+/// horizon. The refusal's mapping stays pinned by `transaction_t1`'s deny-reason rows.
+/// Trio (~3 s): bootstrap, then one store outage on a 1 s grant with a 100 ms renewal.
 #[config_log::retcd_test]
-fn a_control_unavailable_deny_reaches_the_client_as_protection_paused() {
-    const METHOD: &str = "a_control_unavailable_deny_reaches_the_client_as_protection_paused";
+fn writes_keep_being_acked_through_a_control_outage_and_stop_expired_at_the_horizon() {
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), |host| {
         Trio::fast(host);
+        host.budgets.grant_millis = 1_000;
         host.budgets.renew_millis = 100;
     });
     trio.bootstrap();
     trio.ready();
-    // A stall on this thread past the grant lapses it (#50): ask with time left on it.
-    trio.admits_for(1_000);
+    // At least this much of the grant is left at the moment the store fails.
+    const LEFT_MILLIS: u64 = 400;
+    trio.admits_for(LEFT_MILLIS);
+    let outage = Instant::now();
     trio.mem
         .failing_with(config_core::ConfigError::Unavailable {
             reason: "the control store is down".to_owned(),
         });
-    trio.until("node 1 stops admitting", |trio| {
-        (trio.status(0).admits != Some(true)).then_some(())
-    });
-    let refused = trio.ask(put(1, b"a", b"1", None));
-    trio.mem.stop_failing();
-    let lines = trio.until("authority_check_denied", |_| {
-        let lines = logged!(METHOD, "authority_check_denied");
-        (!lines.is_empty()).then_some(lines)
-    });
+
+    let mut request = 0;
+    let mut acked = 0;
+    let (refused, stopped_after) = loop {
+        request += 1;
+        match trio.ask(put(request, b"a", b"1", None)) {
+            Answer::Txn { .. } => acked += 1,
+            other => break (other, outage.elapsed()),
+        }
+    };
     assert!(
-        lines.iter().any(|line| line["node"] == 1
-            && line["checkpoint"] == "StorageDispatch"
-            && line["reason"] == "ControlUnavailable"),
-        "the refusal is A1's ControlUnavailable deny at dispatch: {lines:?}"
+        stopped_after >= Duration::from_millis(LEFT_MILLIS - 100),
+        "writes stopped {stopped_after:?} into the outage, with {LEFT_MILLIS} ms of grant left \
+         when it began; {acked} acked: {refused:?}"
     );
+    assert!(acked >= 2, "writes were acked inside the grant: {acked}");
+    // A put admitted just inside the horizon can reach its reply check past it. It was applied
+    // by then, so its refusal is `UNKNOWN_OUTCOME`, and the next put is the one refused up front.
+    let refused = match refused {
+        Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {
+            trio.ask(put(request + 1, b"a", b"1", None))
+        }
+        other => other,
+    };
     match refused {
         Answer::Error { error, .. } => {
-            assert_eq!(error.kind, ErrorKind::ProtectionPaused, "{error:?}");
+            assert_eq!(error.kind, ErrorKind::LeaseExpired, "{error:?}");
             assert!(error.no_mutation, "refused before apply: {error:?}");
         }
-        other => panic!("a put while control is unavailable: {other:?}"),
+        other => panic!("a put past the horizon: {other:?}"),
     }
+    let fence = trio.until("node 1 fences", |trio| trio.status(0).fence);
+    trio.mem.stop_failing();
+    assert_eq!(fence, DenyReason::Expired);
 }
 
 /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
@@ -6366,7 +6420,9 @@ mod routed_fence {
         PartitionId, ReplicaRole, Revision, Seq,
     };
     use rdb_core::contracts::membership::{CopyId, Member};
-    use rdb_core::contracts::recovery::{LineageAnchor, RecoveryPlan};
+    use rdb_core::contracts::recovery::{
+        CommittedWithout, LineageAnchor, PriorRecord, RecoveryPlan, WithoutEntry,
+    };
     use rdb_core::contracts::time::Tick;
 
     use crate::clock::HostClock;
@@ -6457,6 +6513,7 @@ mod routed_fence {
             BootId(7),
             GrantId(1),
             AuthorityGeneration(1),
+            rdb_core::contracts::recovery::PriorRecord::fresh(),
         )
     }
 
@@ -6722,23 +6779,62 @@ mod routed_fence {
         assert_eq!(old[0], 1);
         let plan = crate::admin::decode_promote_plan(&old).expect("a version 1 plan");
         assert!(plan.must_hold.is_empty());
-        assert_eq!(plan, stored_plan());
+        assert_eq!(plan, with_prior_unknown(stored_plan()));
         let (proof, mut facts) = true_fence();
         facts.plan = Some(bytes::Bytes::from(old));
         assert_eq!(bind(&proof, facts), Ok(()));
     }
 
-    /// PR #74 F-001 (ruling A-R477), new: a plan with `must_hold` set is stored as version 2 and
-    /// reads back whole. A build that reads only 1 refuses the version byte by name
-    /// (`plan version 2, this build reads 1`, `plan_unreadable`).
+    /// PR #74 F-001 (ruling A-R477), new: a plan with `must_hold` set is stored at the current
+    /// version, 3 since #80 S5n, and reads back whole, its `prior` too. A build that reads only
+    /// 1 refuses the version byte by name (`plan version 3, this build reads 1`,
+    /// `plan_unreadable`).
     /// Unit (<1 ms).
     #[test]
-    fn pr74_f001_a_version_2_stored_plan_round_trips_must_hold() {
+    fn pr74_f001_a_stored_plan_round_trips_must_hold_and_prior() {
         let mut plan = stored_plan();
         plan.must_hold = [CopyId(3)].into_iter().collect();
+        plan.prior.members = None;
+        plan.prior.note = plan.prior.note.with(WithoutEntry {
+            generation: Generation(7),
+            cutoff: Seq(9),
+            copies: vec![(CopyId(2), NodeId(2))],
+        });
         let bytes = crate::admin::encode_promote_plan(&plan);
-        assert_eq!(bytes[0], 2);
+        assert_eq!(bytes[0], 3);
         assert_eq!(crate::admin::decode_promote_plan(&bytes), Ok(plan));
+    }
+
+    /// `stored_plan()` with `must_hold` {3} as #79 (57d15ca, `PROMOTE_PLAN_VERSION` 2) stored it:
+    /// version byte `2`, version 1's fields, then `must_hold`. Kept as bytes like
+    /// [`V1_STORED_PLAN`].
+    const V2_STORED_PLAN: &str = "0201030209000000000000000000000000000000000000000000000000000000000000000001050201020100020301010102010101010102000101010201020103020107010501ffffffffffffffffff0100e8070103";
+
+    /// #80 merge onto #79, old to new: a plan #79 stored (version 2, `must_hold` and no `prior`)
+    /// decodes with its `must_hold`, `prior` unknown, and still binds a routed fence.
+    /// Unit (<1 ms).
+    #[test]
+    fn s5n_a_version_2_stored_plan_decodes_with_must_hold_and_prior_unknown() {
+        let old = hex::decode(V2_STORED_PLAN).expect("hex");
+        assert_eq!(old[0], 2);
+        let plan = crate::admin::decode_promote_plan(&old).expect("a version 2 plan");
+        let mut expected = with_prior_unknown(stored_plan());
+        expected.must_hold = [CopyId(3)].into_iter().collect();
+        assert_eq!(plan, expected);
+        let (proof, mut facts) = true_fence();
+        facts.plan = Some(bytes::Bytes::from(old));
+        assert_eq!(bind(&proof, facts), Ok(()));
+    }
+
+    /// `plan` as a version 1 or 2 record decodes: those builds named no prior.
+    fn with_prior_unknown(plan: RecoveryPlan) -> RecoveryPlan {
+        RecoveryPlan {
+            prior: PriorRecord {
+                members: None,
+                note: CommittedWithout::default(),
+            },
+            ..plan
+        }
     }
 
     /// The version gate of `decode_promote_plan` as the PR #74 base build had it. Frozen from
@@ -6758,17 +6854,17 @@ mod routed_fence {
     }
 
     /// PR #74 F-001 (Revobot R2, inline 4438738832), new to old: an older build (313f959, which
-    /// reads version 1) refuses this build's version 2 plan by name, never decodes it without
+    /// reads version 1) refuses this build's version 3 plan by name, never decodes it without
     /// `must_hold`. Control: the same gate passes the v1 fixture.
     /// Unit (<1 ms).
     #[test]
-    fn pr74_r2_an_older_build_refuses_a_version_2_stored_plan_by_name() {
+    fn pr74_r2_an_older_build_refuses_a_newer_stored_plan_by_name() {
         let mut plan = stored_plan();
         plan.must_hold = [CopyId(3)].into_iter().collect();
         let bytes = crate::admin::encode_promote_plan(&plan);
         assert_eq!(
             frozen_313f959_promote_plan_version_gate(&bytes),
-            Err("plan version 2, this build reads 1".to_owned())
+            Err("plan version 3, this build reads 1".to_owned())
         );
         let old = hex::decode(V1_STORED_PLAN).expect("hex");
         assert_eq!(frozen_313f959_promote_plan_version_gate(&old), Ok(()));

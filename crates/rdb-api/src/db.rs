@@ -1346,9 +1346,9 @@ impl Db {
         Ok(Self {
             nodes: Mutex::new(Vec::new()),
             respawn: None,
+            clock: links.clock(),
             links,
             control,
-            clock: HostClock::start(),
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
             ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
@@ -1507,8 +1507,8 @@ impl Db {
             request_floor = request_floor(n),
             "db_open_found"
         );
-        let clock = HostClock::start();
         let links = config.links.clone().unwrap_or_default();
+        let clock = links.clock();
         let control = ControlAdapter::new(Arc::clone(&store), rt.clone(), Arc::clone(&links));
         for (a, b) in &config.hold {
             links.hold(*a, *b);
@@ -5891,6 +5891,8 @@ fn wipe_crashes(folder: &Path, at: WipeCrash) -> bool {
 }
 
 #[cfg(test)]
+mod clock_guard_tests;
+#[cfg(test)]
 mod reopen_tests;
 
 #[cfg(test)]
@@ -5903,6 +5905,11 @@ mod partition_tests;
 mod tests {
     use super::*;
     use crate::test_store::{Script, Scripted};
+
+    /// What a reopen's first admission gets, before the scale. A reopen with no grant to wait
+    /// out admits in about one spec grant (6 s since #80 S2d), and [`admits`]'s 5 s was shorter than
+    /// that at scale 1. The wait still ends the moment node 1 admits.
+    const REOPEN_PATIENCE: Duration = Duration::from_secs(15);
 
     /// Wait until node 1 admits writes, failing at once if any node is stuck in discovery.
     fn admits(db: &Db, phase: &str) {
@@ -9186,6 +9193,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -9271,6 +9281,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
         let remote = |blocked_looks: usize| {
@@ -9365,6 +9378,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
         lock(&db.nodes).clear();
@@ -9462,6 +9478,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -9573,6 +9592,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
         // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
@@ -10313,6 +10335,9 @@ mod tests {
                 lengths: None,
                 pinned: Vec::new(),
                 config_version: None,
+                qualifying_copy: None,
+                clock_bound_lost: false,
+                committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -11366,6 +11391,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {
@@ -12037,7 +12065,7 @@ mod tests {
         }
 
         let mut db = open();
-        admits(&db, "the reopen");
+        admits_within(&db, "the reopen", REOPEN_PATIENCE);
         let patience = crate::host::test_patience(Duration::from_secs(10));
         let deadline = std::time::Instant::now() + patience;
         for request in [FIRST, FIRST + SEEDED - 1] {
@@ -12158,7 +12186,7 @@ mod tests {
         drop(db);
 
         let mut db = open();
-        admits(&db, "the reopen");
+        admits_within(&db, "the reopen", REOPEN_PATIENCE);
         let patience = crate::host::test_patience(Duration::from_secs(5));
         let deadline = std::time::Instant::now() + patience;
         loop {
@@ -12187,7 +12215,7 @@ mod tests {
         }
 
         let mut db = open();
-        admits(&db, "the second reopen");
+        admits_within(&db, "the second reopen", REOPEN_PATIENCE);
         db.put(b"d", b"1", None)
             .expect("generation 1's rows are gone from disk, so the cap has room at once");
         db.shutdown();
@@ -12413,7 +12441,7 @@ mod tests {
             .expect("cut node 1's WAL");
 
         let mut db = open_held(&rt, dir.path(), &store, Vec::new());
-        admits(&db, "the reopen");
+        admits_within(&db, "the reopen", REOPEN_PATIENCE);
         db.put(b"d", b"1", None).expect("put d");
         for key in [&b"a"[..], b"b", b"c", b"d"] {
             let read = db.get(key).unwrap_or_else(|e| panic!("get {key:?}: {e:?}"));
@@ -12669,7 +12697,7 @@ mod tests {
         drop(db);
 
         let mut db = open();
-        admits(&db, "the reopen");
+        admits_within(&db, "the reopen", REOPEN_PATIENCE);
         land(
             &db,
             b"after",
@@ -12818,6 +12846,7 @@ mod tests {
             },
             retention_millis: 1_000,
             must_hold: std::collections::BTreeSet::new(),
+            prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
             config,
         };
         let fence = FencingProof {
@@ -14092,7 +14121,7 @@ mod tests {
         drop(db);
 
         let mut db = open();
-        admits(&db, "the reopen");
+        admits_within(&db, "the reopen", REOPEN_PATIENCE);
         for n in 0..5_u32 {
             let ok = db
                 .put(b"c", &n.to_le_bytes(), None)

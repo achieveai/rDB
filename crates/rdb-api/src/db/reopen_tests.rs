@@ -10,7 +10,7 @@
 use super::tests::{digest_at, owner_status, owner_when, put_through_pauses, stored_root};
 use super::*;
 
-fn config(dir: &Path) -> DbConfig {
+pub(super) fn config(dir: &Path) -> DbConfig {
     DbConfig {
         partitions: None,
         ack_floor: true,
@@ -27,7 +27,7 @@ fn config(dir: &Path) -> DbConfig {
     }
 }
 
-fn runtime() -> tokio::runtime::Runtime {
+pub(super) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -42,7 +42,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// is, so the window is the spec's 2 s times `deadline_scale()`. Unscaled, one 3.2 s mail step
 /// on node 2 under gate load closed it and a reopen went `Blocked` (k435). The product default
 /// stays the spec's.
-fn fast() -> Budgets {
+pub(super) fn fast() -> Budgets {
     Budgets {
         discovery_window_millis: Budgets::SPEC_DEFAULTS.discovery_window_millis
             * u64::from(config_testkit::poll::deadline_scale()),
@@ -64,7 +64,11 @@ fn open(
 }
 
 /// A fresh open, ready, with one write, then shut down: the copies hold generation 1.
-fn written_and_closed(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStore>) {
+pub(super) fn written_and_closed(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    store: &Arc<dyn ConfigStore>,
+) {
     let mut db = open(rt, dir, store).expect("the fresh open");
     db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
         .expect("the fresh open is ready");
@@ -201,6 +205,73 @@ fn m10_a_reopen_of_an_older_copy_says_to_open_the_current_one_and_logs_the_refus
         vec![("Warning".to_owned(), "Stale".to_owned())],
         "one db_open_refused naming the kind"
     );
+}
+
+/// #80 S5n row 32, through `Db`: a restart of every node keeps a recovery's note. The reopen's
+/// heal reads it from the record, F1 writes it back, the owner says `Known` with it and the
+/// two others say `Unknown`. Cut: the heal plans with `PriorRecord::fresh()`: the note is gone, red.
+/// Integration (~8 s): one fresh open, one reopen.
+#[config_log::retcd_test]
+fn s5n_32_a_note_on_the_record_survives_a_reopen_of_every_node() {
+    use rdb_core::authority::partition::{committed_without_of, RecordMember};
+    use rdb_core::contracts::membership::CopyId;
+    use rdb_core::contracts::recovery::{CommittedWithout, NoteState, WithoutEntry};
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+
+    let key = Bytes::from(ControlKey::Partition(PartitionId(1)).encode());
+    let found = rt
+        .block_on(store.get(config_core::GetRequest { key: key.clone() }))
+        .expect("get")
+        .record
+        .expect("partitions/1");
+    let head = PartitionRecord::decode(&found.value).expect("a record");
+    let note = CommittedWithout::default().with(WithoutEntry {
+        generation: head.generation,
+        cutoff: Seq(1),
+        copies: vec![(CopyId(2), NodeId(3))],
+    });
+    let root = PartitionRoot::decode(&found.value).expect("a root");
+    let members = RecordMember::decode_all(&found.value).expect("members");
+    rt.block_on(store.put(config_core::PutRequest {
+        key: key.clone(),
+        value: head.encode_with_members(&root, &members, Some(&note)),
+        expected_mod_revision: Some(found.mod_revision),
+        dedup: None,
+    }))
+    .expect("the noted record");
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    for status in db.node_status() {
+        match (status.role, &status.committed_without) {
+            (
+                "primary",
+                NoteState::Known {
+                    generation,
+                    note: held,
+                    ..
+                },
+            ) => {
+                assert!(*generation > head.generation, "{status:?}");
+                assert_eq!(held, &note, "the owner reads what the record held");
+            }
+            ("primary", NoteState::Unknown) => panic!("the healed owner does not know: {status:?}"),
+            (_, NoteState::Unknown) => {}
+            (role, known) => panic!("a {role} claims a note: {known:?}"),
+        }
+    }
+    let after = rt
+        .block_on(store.get(config_core::GetRequest { key }))
+        .expect("get")
+        .record
+        .expect("partitions/1");
+    assert_eq!(after.value[0], 5);
+    assert_eq!(committed_without_of(&after.value), Some(note));
+    db.shutdown();
 }
 
 /// M10 R3a case B (A-R171), end to end through `Db`: node 1's grant record is gone when the
@@ -1925,7 +1996,7 @@ fn app_config(dir: &Path, links: &Arc<Links>, client: ClientId) -> DbConfig {
     }
 }
 
-fn open_app(
+pub(super) fn open_app(
     rt: &tokio::runtime::Runtime,
     store: &Arc<dyn ConfigStore>,
     links: &Arc<Links>,
@@ -3889,7 +3960,7 @@ fn partition_owner(
 
 /// `partitions/1` and `grants/1` as a promote reads them: the record, its root, its revision,
 /// and node 1's grant with its revision.
-fn partition_and_grant(
+pub(super) fn partition_and_grant(
     rt: &tokio::runtime::Runtime,
     store: &Arc<dyn ConfigStore>,
 ) -> (
@@ -3899,7 +3970,7 @@ fn partition_and_grant(
     rdb_core::authority::grant::GrantRecord,
     u64,
 ) {
-    let (record, root, _, revision, _) = rt
+    let (record, root, _, revision, _, _) = rt
         .block_on(admin::read_partition(&**store, PARTITION))
         .expect("partitions/1");
     let grant = rt
@@ -3938,6 +4009,7 @@ fn plan_over(
         db.links().boot_of(NodeId(2)).expect("node 2 runs"),
         rdb_core::contracts::ids::GrantId(1),
         rdb_core::contracts::ids::AuthorityGeneration(1),
+        rdb_core::contracts::recovery::PriorRecord::fresh(),
     )
 }
 

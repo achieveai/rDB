@@ -45,7 +45,11 @@ use rdb_sim::sim::cluster::{ClusterConfig, NodeSpec, PartitionSpec};
 use rdb_sim::storage::snapshot::EmptySnapshot;
 
 /// The budgets every row runs under unless it says otherwise.
-pub const BUDGETS: Budgets = Budgets::SPEC_DEFAULTS;
+// #80 S2d: pinned. These rows' arithmetic is about relationships between budgets; it does not state the product default.
+pub const BUDGETS: Budgets = Budgets {
+    grant_millis: 3_000,
+    ..Budgets::SPEC_DEFAULTS
+};
 
 /// An empty snapshot of a fresh engine, for stepping a module with no data behind it.
 pub const SNAPSHOT: EmptySnapshot = EmptySnapshot::new();

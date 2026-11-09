@@ -110,7 +110,7 @@ There is no multi-key transaction in rEtcd and rDB must not pretend otherwise.
 | `ResourceExhausted { resumable: true }` | broadcast lag or per-stream queue/byte budget (1,024 items / 16 MiB) | same reload path; treat as a gap |
 | `ResourceExhausted { resumable: false }` | admission limit (1,000 streams/node, 100/principal) | back off; **do not** reload in a loop; this is a capacity error, not a gap |
 | `NotLeader { validated_hint }` | leadership moved | re-establish the watch; read before believing anything |
-| `Unavailable` | node stopped / hub shut down | treated as control-quorum loss for admission purposes |
+| `Unavailable` | node stopped / hub shut down | control-quorum loss: no new grant or promotion; admission continues on the proved grant to its horizon (issue #80) |
 
 - `WatchItem::Progress { revision }` (default every 5 s, carrying only the revision) is rDB's
   cache freshness watermark. It conveys no authority and no key material.
@@ -130,8 +130,9 @@ Two things follow for free and must not be re-implemented:
 
 - §7.2's "after a linearizable read of the final frozen expiry" is the default, not a special mode.
 - §7.3's "control-quorum loss prohibits new grants and promotions" is the surface's own behaviour:
-  a partitioned node cannot read and cannot commit. rDB's job is only to classify `Unavailable`
-  as a **deny**, never as a "probably still fine".
+  a partitioned node cannot read and cannot commit. `Unavailable` proves nothing about a grant, so
+  rDB never treats it as a renewal or as a reason to extend `E`. Service rests on the grant
+  already proved and ends at its conservative local expiry (ADR-rdb-0007 as amended, issue #80).
 
 Note for the seam: ADR-0009 also records that the barrier is bounded by the server's own
 `read_timeout`, independent of the caller's deadline. A control read can therefore return
@@ -227,7 +228,7 @@ Rows in `docs/testing/test-plan-m7-kernel-a.md` (`M7A-NN`); tests in
 | Watch never grants | an adversarial trace delivering watch events that *claim* a widened grant, with the control read withheld: assert no admission occurs |
 | Gap forces coherent reload | inject `RevisionCompacted` and `LaggedResumable` ⇒ family reload + re-watch from `snapshot_revision`; assert no partial reconciliation |
 | Admission-limit gap is not a reload loop | inject `resumable: false` ⇒ backoff, bounded reload attempts |
-| Control-quorum loss denies | `Unavailable` on reads and writes ⇒ no new grant, no promotion; existing service ends at conservative local expiry (feeds **V2**) |
+| Control-quorum loss stops new grants | `Unavailable` on reads and writes ⇒ no new grant, no promotion; existing service continues and ends at conservative local expiry, `Expired` (feeds **V2**) |
 | No reload without a termination | a kernel-side assertion over a trace with a healthy watch: the effect log contains no `ReadFamily`. Replaces the "fake has no silent gap" row, which could only be checked by inspecting the fixture |
 | Late completion after expiry | deliver a renewal's `APPLIED` after the conservative expiry has passed: assert the node is fenced and that the completion changes nothing (§7 requirement 7; shared row with ADR-rdb-0007) |
 | Dropped control operation | issue a renewal whose completion never arrives: assert the expiry fence still fires, a superseding authority view is published **already past its horizon** (`valid_through_tick` is the previous tick, past-horizon reason `Expired`), the transaction queue drains **and the publication module's waiting readers drain at the fence** (§7 requirement 8; both consumers of the fence, not one; shared row with ADR-rdb-0007 "Every fence publishes an already-past view") |

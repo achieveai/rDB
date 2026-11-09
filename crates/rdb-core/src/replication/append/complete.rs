@@ -26,7 +26,11 @@ impl AppendReceiver {
         self.staged = None;
         self.applied_head = staged.head;
         self.history.insert(staged.head.seq, staged.head.digest);
-        Some(vec![self.ack_or_withhold(staged.reply_to, staged.request)])
+        Some(vec![self.ack_or_withhold(
+            staged.reply_to,
+            staged.request,
+            staged.credentialed,
+        )])
     }
 
     /// `CommitFailed`: whole batch or none, so the staging slot is dropped — which is the whole
@@ -69,7 +73,7 @@ impl AppendReceiver {
                 ReplicaIgnoreReason::RecoveryOnly,
             ))]);
         }
-        Some(vec![self.ack_or_withhold(primary, UNSOLICITED)])
+        Some(vec![self.ack_or_withhold(primary, UNSOLICITED, false)])
     }
 
     /// `Recovered` (design §3.3): the only event that rewrites a receiver wholesale, and one in a
@@ -212,9 +216,11 @@ impl AppendReceiver {
         self.authority_seq = view.authority_seq;
     }
 
-    /// The current ACK to `to`, or — from a quarantined or retired copy — a named refusal to
-    /// send one. A retired copy names the generation it adopted (lead ruling B-R58a, F4).
-    fn ack_or_withhold(&self, to: NodeId, request: MessageId) -> EffectKind {
+    /// The current ACK to `to`, or — from a quarantined, retired or sealed copy — a named refusal
+    /// to send one. A retired copy names the generation it adopted (lead ruling B-R58a, F4). A
+    /// sealed copy acknowledges only what came under a credential (#80 R4-1): withheld, not
+    /// lowered, so no sequence or digest the old primary reads is rewritten.
+    fn ack_or_withhold(&self, to: NodeId, request: MessageId, credentialed: bool) -> EffectKind {
         if self.quarantine.is_some() {
             return ignored(KernelIgnoredReason::AppendRejected(
                 AppendReject::Quarantined,
@@ -225,6 +231,11 @@ impl AppendReceiver {
                 AppendReject::StaleGeneration {
                     current: self.lineage.generation,
                 },
+            ));
+        }
+        if self.sealed() && !credentialed {
+            return ignored(KernelIgnoredReason::AppendRejected(
+                AppendReject::StaleFence,
             ));
         }
         self.send(to, request, AppendOutcome::Accepted(self.current_ack()))
