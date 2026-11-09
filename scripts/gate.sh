@@ -77,6 +77,11 @@ run_drift() { scripts/drift-check.sh; }
 # the reason the drift stage gives above — two copies of a rule drift apart.
 run_purity() { scripts/purity-check.sh; }
 run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings; }
+# Every other stage builds with debug assertions on, so code that names a
+# `#[cfg(debug_assertions)]` item without the same cfg passes all of them and breaks a consumer's
+# release build. `Msg::Damage`'s arm in net/wire.rs did exactly that (found 2026-11-08). The
+# examples are here because `local-rdb.sh up --release` builds them.
+run_release() { echo "== release check"; cargo check --release -p rdb-api --lib --examples; }
 # `--workspace` is dropped when the caller names a package. Cargo treats `--workspace -p x` as
 # the workspace: the `-p` is not an error, it is ignored, and a "scoped" run on 2026-09-21 ran
 # rdb-sim's suite under the name `-p config-server`. The wrapper's exit code also hid cargo's
@@ -134,13 +139,14 @@ case "$stage" in
   drift) run_drift ;;
   purity) run_purity ;;
   lint)  run_lint ;;
+  release) run_release ;;
   test)  run_test "$@" ;;
   perf)  run_perf "$@" ;;
   # One stage per line, never an `&&` chain: bash ignores `set -e` inside one, so a failed
   # stage ended the chain and the script still printed "all OK" and exited 0, with no
   # clippy and no tests run. Observed 2026-10-01 with a drift failure.
-  all)   run_fmt; run_deps; run_drift; run_purity; run_lint; run_test ;;
-  *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, lint, test, perf or all)" >&2; exit 1 ;;
+  all)   run_fmt; run_deps; run_drift; run_purity; run_lint; run_release; run_test ;;
+  *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, lint, release, test, perf or all)" >&2; exit 1 ;;
 esac
 
 echo "gate: $stage OK"

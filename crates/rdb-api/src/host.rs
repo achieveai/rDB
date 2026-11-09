@@ -51,7 +51,7 @@ use rdb_core::contracts::event::{
 use rdb_core::contracts::ids::{
     AffinityId, AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket,
     Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId,
-    RequestIdentity, Revision, Seq, SnapshotHandle, TimerId, TimerVersion,
+    RequestIdentity, Revision, Seq, SnapshotHandle, TenantId, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -68,10 +68,11 @@ use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
 use rdb_core::contracts::txn::{Condition, Mutation, TxnRequest, TxnResult, TxnStatus};
 use rdb_core::contracts::version::{API_VERSION, ENVELOPE_VERSION};
+use rdb_core::partition_map::{affinity_hash, partition_of};
 use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
-use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+use rdb_core::replication::append::{AppendReceiver, CatchUpPlan, Head, ReceiverInit};
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
@@ -376,6 +377,10 @@ pub(crate) fn assert_not_blocked(status: &NodeStatus, window_millis: u64) {
 /// A message to a node thread.
 #[derive(Debug)]
 pub enum Msg {
+    /// Block the node's thread until the sender answers or is dropped: a paused process
+    /// (SIGSTOP, a frozen VM). Crate tests only.
+    #[cfg(test)]
+    Stall(std::sync::mpsc::Receiver<()>),
     /// A control call or watch completed. A node drops one whose `boot` is not its own: the
     /// effect was asked for by an earlier process of the node (M9 S2b, critic M2).
     Control {
@@ -737,6 +742,8 @@ pub enum ClientCall {
     Get {
         /// The identity minted for it.
         identity: RequestIdentity,
+        /// The affinity group the object lives in.
+        group: AffinityId,
         /// The object id.
         object: Bytes,
         /// What to read of it.
@@ -1217,6 +1224,7 @@ pub fn spawn(
         Limits::default(),
         BOOT,
         StorageOptions::default(),
+        1,
     )
 }
 
@@ -1235,11 +1243,14 @@ pub(crate) fn spawn_with(
     limits: Limits,
     boot: BootId,
     storage: StorageOptions,
+    partitions: u32,
 ) -> Result<NodeHandle, String> {
     // The open's storage options, on a restart too (A-R253).
     let engine = RocksEngine::open_with(&dir, storage)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
-    spawn_on(node, engine, links, control, clock, budgets, limits, boot)
+    spawn_on(
+        node, engine, links, control, clock, budgets, limits, boot, partitions,
+    )
 }
 
 /// [`spawn_with`] on an engine the caller already opened (M10, arch R3b): `Db::open` opens all
@@ -1255,6 +1266,7 @@ pub(crate) fn spawn_on(
     budgets: Budgets,
     limits: Limits,
     boot: BootId,
+    partitions: u32,
 ) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone(), boot);
@@ -1263,6 +1275,7 @@ pub(crate) fn spawn_on(
     host.syncer = Some(Syncer::start(node, path, tx.clone())?);
     host.boot = boot;
     host.budgets = budgets;
+    host.partition_count = partitions;
     host.transaction = Transaction::with_limits(limits);
     // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
     // reads its own nodes' lines from its own file rather than the shared untagged one.
@@ -2018,6 +2031,9 @@ struct Host {
     control: Arc<ControlAdapter>,
     clock: HostClock,
     budgets: Budgets,
+    /// How many partitions the database has (#79). Above 1, this node refuses a client call
+    /// addressed to a partition its group does not map to.
+    partition_count: u32,
 
     authority: Authority,
     transaction: Transaction,
@@ -2301,6 +2317,7 @@ impl Host {
             control,
             clock,
             budgets: Budgets::SPEC_DEFAULTS,
+            partition_count: 1,
             authority: Authority::new(),
             transaction: Transaction::default(),
             replication: Replication::default(),
@@ -3037,6 +3054,11 @@ impl Host {
                 Ok(())
             }
             Msg::Synced(done) => self.on_synced(done),
+            #[cfg(test)]
+            Msg::Stall(release) => {
+                let _ = release.recv();
+                Ok(())
+            }
             Msg::Stop => Ok(()),
         };
         if let Err(fault) = outcome {
@@ -7485,7 +7507,7 @@ impl Host {
             self.recoveries.remove(&partition);
             // The dropped F1's discovery timer goes with it: the fresh F1 arms the same id from
             // version 1, which the host refuses over a live higher version.
-            let timer = rdb_core::recovery::DISCOVERY_TIMER;
+            let timer = rdb_core::recovery::discovery_timer(partition);
             if self
                 .timers
                 .get(&timer)
@@ -9201,7 +9223,10 @@ impl Host {
 
     /// Restore R1's dormant receiver for this node's copy of `partition` (A-R173), from the
     /// engine's lineage at the seed's generation and the seed's epoch, revision and
-    /// configuration. A node already running a live receiver keeps it. `with_history` also gives
+    /// configuration. A node already running a live receiver keeps it, and a target restore
+    /// (`with_history` false) hands any held receiver the seed as its recovery plan, so a
+    /// restarted recoverer's boot is admitted under that recovery's credential (#79 S3b).
+    /// `with_history` also gives
     /// the receiver its verified ladder, `(0, ROOT)` through its head, once (critic-d7 F2).
     ///
     /// A live primary is no reason to skip a source (A-R278, A-R314): a live owner re-planning
@@ -9215,11 +9240,21 @@ impl Host {
     /// F1's deadline ends the recovery with a named `Blocked`.
     fn restore_dormant(&mut self, partition: PartitionId, seed: &DormantSeed, with_history: bool) {
         let node = self.node;
-        let held = self.replication.receiver(node, partition);
         let serving = self
             .replication
             .primary(node, partition)
             .is_some_and(|primary| !primary.tracker().retired());
+        // Above the live-receiver return, which a live copy must not skip (#79 S3b). Never beside
+        // a serving primary: the plan would let recovery appends into its store (A-R314, A-R323).
+        if !with_history && !serving {
+            let plan = CatchUpPlan {
+                config: seed.config.clone(),
+                lineage: seed.lineage,
+                revision: seed.revision,
+            };
+            self.replication.keep_recovery_plan(node, partition, plan);
+        }
+        let held = self.replication.receiver(node, partition);
         // D10 (A-R398): an owner promoted from a secondary still holds that side's receiver,
         // retired by the promote's `Recovered` (B-R58a). R1 sources no catch-up from a retired
         // receiver, so a source restore replaces it as if none were held.
@@ -10557,10 +10592,18 @@ impl Host {
             }
             ClientCall::Get {
                 identity,
+                group,
                 object,
                 look,
             } => {
-                let root = root_key(identity.tenant, AFFINITY, &object);
+                if let Some(error) = self.misrouted(partition, identity.tenant, group) {
+                    let _ = reply.send(Answer::Error {
+                        error,
+                        request: None,
+                    });
+                    return Ok(());
+                }
+                let root = root_key(identity.tenant, group, &object);
                 (
                     identity,
                     EventKind::Client(ClientEvent::Read {
@@ -10671,6 +10714,37 @@ impl Host {
     /// `None` is a compile with nothing to write, which is never sent. A compile that read a
     /// faulted view faults the node too (A-R164): its conditions were read from a view that was
     /// not whole.
+    /// The refusal for a call in `group` addressed to `partition`, when the group does not map
+    /// there (#79). Never at one partition. `None` is a call that may go on.
+    fn misrouted(
+        &self,
+        partition: PartitionId,
+        tenant: TenantId,
+        group: AffinityId,
+    ) -> Option<ApiError> {
+        if self.partition_count <= 1 {
+            return None;
+        }
+        let right = partition_of(affinity_hash(tenant, group), self.partition_count);
+        if right == partition {
+            return None;
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            right = right.0,
+            group = group.0,
+            "client_call_misrouted"
+        );
+        let mut error = ApiError::from_kernel(&RdbError::RouteChanged { partition });
+        error.no_mutation = true;
+        error.detail = format!(
+            "group {} belongs to partition {}, not partition {}; nothing was sent",
+            group.0, right.0, partition.0
+        );
+        Some(error)
+    }
+
     fn compile(
         &mut self,
         partition: PartitionId,
@@ -10692,6 +10766,12 @@ impl Host {
         puts: &[PutOp],
         remaining_millis: u64,
     ) -> Result<Result<Option<TxnRequest>, ApiError>, Fault> {
+        if let Some(error) = puts
+            .first()
+            .and_then(|put| self.misrouted(partition, identity.tenant, put.group))
+        {
+            return Ok(Err(error));
+        }
         // A node that knows it is a secondary (it receives this partition's appends and is not
         // its primary) sends the caller to the owner: `NOT_PRIMARY`, before the guard below,
         // which would otherwise answer a retryable `UNAVAILABLE` and keep an app routed here
@@ -12055,6 +12135,8 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Fork { .. } => "fork",
         Msg::Rebuild { .. } => "rebuild",
         Msg::Synced(_) => "synced",
+        #[cfg(test)]
+        Msg::Stall(_) => "stall",
         Msg::Stop => "stop",
     }
 }

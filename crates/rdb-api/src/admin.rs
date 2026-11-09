@@ -43,11 +43,12 @@ use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::{Budgets, EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
     AuthorityGeneration, BootId, ConfigVersion, CorrelationId, Generation, GrantId, NodeId,
-    OperationId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
+    OperationId, OwnerEpoch, PartitionId, RangeId, ReplicaRole, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
 use rdb_core::contracts::time::Tick;
+use rdb_core::partition_map::RoutesRoot;
 
 use crate::clock::HostClock;
 use crate::db::{ApiError, Db};
@@ -71,11 +72,13 @@ const BOOTSTRAP: CorrelationId = CorrelationId(1);
 /// Why the bootstrap did not start.
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
-    /// `partitions/1` already exists in the control store and is not one this bootstrap can
-    /// adopt: it differs from this bootstrap's record, or it has been written since it was
-    /// created.
-    #[error("partitions/{} already exists at revision {current}: refusing to bootstrap twice", PARTITION.0)]
+    /// A partition's record, or `routes/0`, already exists in the control store and is not one
+    /// this bootstrap can adopt: it differs from what this bootstrap writes, or it has been
+    /// written since it was created.
+    #[error("{key} already exists at revision {current}: refusing to bootstrap twice")]
     AlreadyExists {
+        /// The control key.
+        key: String,
         /// Its revision.
         current: u64,
     },
@@ -113,6 +116,31 @@ pub fn members_at(boot: BootId) -> Vec<Member> {
     members()
         .into_iter()
         .map(|member| Member { boot, ..member })
+        .collect()
+}
+
+/// The owner a partition is formed with: round robin over the three formed nodes, so partition
+/// 1 is node 1's and partition 2 is node 2's (issue #79). `partition` is at least 1.
+#[must_use]
+pub const fn initial_owner(partition: PartitionId) -> NodeId {
+    NodeId((partition.0 - 1) % 3 + 1)
+}
+
+/// [`members_at`] for `partition`: each node keeps its copy number, and the Primary role sits on
+/// [`initial_owner`].
+#[must_use]
+pub fn members_for(partition: PartitionId, boot: BootId) -> Vec<Member> {
+    let owner = initial_owner(partition);
+    members_at(boot)
+        .into_iter()
+        .map(|member| Member {
+            role: if member.node == owner {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::RegularSecondary
+            },
+            ..member
+        })
         .collect()
 }
 
@@ -190,38 +218,105 @@ pub async fn bootstrap_at(
     boot: BootId,
     send: impl Fn(Msg) -> Result<(), NodeStopped>,
 ) -> Result<Revision, BootstrapError> {
-    let record = PartitionRecord {
-        partition: PARTITION,
-        owner: OWNER,
-        generation: Generation(0),
-        owner_epoch: OwnerEpoch(0),
-        config_version: CONFIG_VERSION,
-        lifecycle: PartitionLifecycle::Serving,
-    };
-    let key = ControlKey::Partition(PARTITION).encode();
-    let value = record.encode();
+    form(store, now, boot, 1, |_, msg| send(msg)).await
+}
+
+/// Form a database of `partitions` partitions, every node at `boot`, sending each partition's
+/// recovery to its [`initial_owner`] through `send` (issue #79). In order: `routes/0` at N>1 (none
+/// at N=1), then every partition's record, then every plan. Answers partition 1's revision.
+///
+/// # Errors
+///
+/// As [`bootstrap`], for any partition or `routes/0`.
+pub(crate) async fn form(
+    store: &Arc<dyn ConfigStore>,
+    now: Tick,
+    boot: BootId,
+    partitions: u32,
+    send: impl Fn(NodeId, Msg) -> Result<(), NodeStopped>,
+) -> Result<Revision, BootstrapError> {
+    if partitions > 1 {
+        let key = ControlKey::Route(RangeId(0)).encode();
+        let value = RoutesRoot {
+            partition_count: partitions,
+        }
+        .encode();
+        let revision = create_or_adopt(store, &key, &value).await?;
+        tracing::info!(key = %key, revision = revision.0, partitions, "bootstrap_routes_root");
+    }
+    let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
+    let written = write_records(store, &all).await?;
+    for (partition, revision) in &written {
+        start_recovery(now, boot, *partition, *revision, &send)?;
+    }
+    Ok(written[0].1)
+}
+
+/// Create the generation-0 record of each of `partitions`, or adopt one an earlier attempt
+/// wrote (issue #79): the half of [`form`] before any plan goes out. Answers each one's revision.
+///
+/// # Errors
+///
+/// As [`bootstrap`].
+pub(crate) async fn write_records(
+    store: &Arc<dyn ConfigStore>,
+    partitions: &[PartitionId],
+) -> Result<Vec<(PartitionId, Revision)>, BootstrapError> {
+    let mut written = Vec::with_capacity(partitions.len());
+    for partition in partitions.iter().copied() {
+        let record = PartitionRecord {
+            partition,
+            owner: initial_owner(partition),
+            generation: Generation(0),
+            owner_epoch: OwnerEpoch(0),
+            config_version: CONFIG_VERSION,
+            lifecycle: PartitionLifecycle::Serving,
+        };
+        let key = ControlKey::Partition(partition).encode();
+        written.push((
+            partition,
+            create_or_adopt(store, &key, &record.encode()).await?,
+        ));
+    }
+    Ok(written)
+}
+
+/// Create `key` with `value`, or adopt it when an earlier attempt's create landed (F-004).
+async fn create_or_adopt(
+    store: &Arc<dyn ConfigStore>,
+    key: &str,
+    value: &Bytes,
+) -> Result<Revision, BootstrapError> {
     let created = store
         .put(PutRequest {
-            key: Bytes::from(key.clone()),
+            key: Bytes::from(key.to_owned()),
             value: value.clone(),
             expected_mod_revision: Some(0),
             dedup: None,
         })
         .await;
-    let revision = match created {
+    match created {
         Ok(response) if response.outcome == MutationOutcome::Applied => {
             let revision = Revision(response.revision);
             tracing::info!(key = %key, revision = revision.0, "bootstrap_partition_record");
-            revision
+            Ok(revision)
         }
-        Ok(_) | Err(ConfigError::DeadlineExceededUnknownOutcome) => {
-            adopt(store, &key, &value).await?
-        }
-        Err(error) => return Err(BootstrapError::Control(error.to_string())),
-    };
+        Ok(_) | Err(ConfigError::DeadlineExceededUnknownOutcome) => adopt(store, key, value).await,
+        Err(error) => Err(BootstrapError::Control(error.to_string())),
+    }
+}
 
+/// Send `partition`'s bootstrap plan and fence to its [`initial_owner`].
+fn start_recovery(
+    now: Tick,
+    boot: BootId,
+    partition: PartitionId,
+    revision: Revision,
+    send: &impl Fn(NodeId, Msg) -> Result<(), NodeStopped>,
+) -> Result<(), BootstrapError> {
+    let owner = initial_owner(partition);
     let lineage = Lineage {
-        partition: PARTITION,
+        partition,
         generation: Generation(0),
         owner_epoch: OwnerEpoch(0),
     };
@@ -233,13 +328,13 @@ pub async fn bootstrap_at(
     let plan = recovery_plan(
         anchor,
         CONFIG_VERSION,
-        members_at(boot),
+        members_for(partition, boot),
         boot,
         GrantId(1),
         AuthorityGeneration(1),
     );
     let fence = FencingProof {
-        partition: PARTITION,
+        partition,
         prior_generation: Generation(0),
         prior_owner_epoch: OwnerEpoch(0),
         prior_grant_id: GrantId(1),
@@ -254,19 +349,22 @@ pub async fn bootstrap_at(
         RecoveryEvent::Plan(Box::new(plan)),
         RecoveryEvent::FenceProven(Box::new(fence)),
     ] {
-        send(Msg::Inject {
-            partition: PARTITION,
-            correlation: BOOTSTRAP,
-            kind: EventKind::Kernel(KernelEvent::Recovery(event)),
-        })
+        send(
+            owner,
+            Msg::Inject {
+                partition,
+                correlation: BOOTSTRAP,
+                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+            },
+        )
         .map_err(|_| BootstrapError::NodeStopped)?;
     }
     tracing::info!(
-        partition = PARTITION.0,
-        owner = OWNER.0,
+        partition = partition.0,
+        owner = owner.0,
         "bootstrap_recovery_started"
     );
-    Ok(revision)
+    Ok(())
 }
 
 /// Read `key` back after a create that was not reported applied, and return its revision when
@@ -289,6 +387,7 @@ async fn adopt(
     };
     if found.value != *value || found.create_revision != found.mod_revision {
         return Err(BootstrapError::AlreadyExists {
+            key: key.to_owned(),
             current: found.mod_revision,
         });
     }
@@ -723,6 +822,171 @@ pub async fn activate(
     }
 }
 
+/// The version byte of a partition's activation mark.
+const ACTIVATED_LAYOUT: u8 = 1;
+
+/// The key of `partition`'s activation mark (issue #79). Partition 1's lives in the open counter
+/// ([`Count::activated`]); a later partition's is its own key.
+#[must_use]
+pub fn activated_key(instance: &[u8; INSTANCE_LEN], partition: PartitionId) -> String {
+    format!("{}/activated/{}", instance_key(instance), partition.0)
+}
+
+fn encode_activated(generation: Generation) -> Bytes {
+    let mut out = Vec::with_capacity(9);
+    out.push(ACTIVATED_LAYOUT);
+    out.extend_from_slice(&generation.0.to_le_bytes());
+    Bytes::from(out)
+}
+
+fn decode_activated(body: &[u8]) -> Option<Generation> {
+    match body {
+        [ACTIVATED_LAYOUT, rest @ ..] => {
+            Some(Generation(u64::from_le_bytes(rest.try_into().ok()?)))
+        }
+        _ => None,
+    }
+}
+
+/// The newest generation of `partition` (above 1) a host marked activated, and the revision of
+/// the mark: `Generation(0)` at revision 0 when no host has marked one.
+///
+/// # Errors
+///
+/// [`CounterError::Unreadable`], or [`CounterError::Control`] when the read fails.
+pub async fn read_activated(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    partition: PartitionId,
+) -> Result<(Generation, u64), CounterError> {
+    let key = activated_key(instance, partition);
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| CounterError::Control(format!("get {key}: {error}")))?;
+    let Some(found) = read.record else {
+        return Ok((Generation(0), 0));
+    };
+    let generation = decode_activated(&found.value).ok_or(CounterError::Unreadable {
+        key,
+        revision: found.mod_revision,
+    })?;
+    Ok((generation, found.mod_revision))
+}
+
+/// A roll-forward of `partition` (above 1) claims its decision (ruling A-R184, issue #79): a CAS
+/// of the mark at exactly the `revision` the decision read, with the value it read. Partition 1
+/// gets this from [`count_open_at`]; a later partition's mark is its own key, so a host that
+/// marks the generation after the decision read must lose to this CAS or win against it.
+///
+/// # Errors
+///
+/// [`CounterError::Moved`] when the mark moved, or [`CounterError::Control`] when the store
+/// refuses or does not answer: nothing was linked, so opening again decides again.
+pub async fn claim_roll(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    partition: PartitionId,
+    revision: u64,
+    activated: Generation,
+) -> Result<(), CounterError> {
+    let key = activated_key(instance, partition);
+    let written = store
+        .put(PutRequest {
+            key: Bytes::from(key.clone()),
+            value: encode_activated(activated),
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        })
+        .await;
+    match written {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            tracing::info!(key = %key, revision = response.revision, "open_roll_claimed");
+            Ok(())
+        }
+        Ok(_) | Err(ConfigError::Conflict { .. }) => Err(CounterError::Moved {
+            key,
+            read: revision,
+        }),
+        Err(error) => Err(CounterError::Control(format!("put {key}: {error}"))),
+    }
+}
+
+/// [`activate`] for `partition`: partition 1 in the open counter, a later one in its own mark
+/// (issue #79). Retries as [`activate`] does, and logs the same events with `partition`.
+///
+/// # Errors
+///
+/// [`CounterError::Absent`] or [`CounterError::Unreadable`]: no read again changes them.
+pub async fn activate_in(
+    store: &dyn ConfigStore,
+    instance: &[u8; INSTANCE_LEN],
+    partition: PartitionId,
+    generation: Generation,
+) -> Result<(), CounterError> {
+    if partition == PARTITION {
+        return activate(store, instance, generation).await.map(|_| ());
+    }
+    let key = activated_key(instance, partition);
+    let mut wait = Duration::from_millis(50);
+    loop {
+        let error = match store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => {
+                let (held, revision) = match &read.record {
+                    None => (Generation(0), 0),
+                    Some(found) => (
+                        decode_activated(&found.value).ok_or_else(|| CounterError::Unreadable {
+                            key: key.clone(),
+                            revision: found.mod_revision,
+                        })?,
+                        found.mod_revision,
+                    ),
+                };
+                if read.record.is_some() && held >= generation {
+                    return Ok(());
+                }
+                let written = store
+                    .put(PutRequest {
+                        key: Bytes::from(key.clone()),
+                        value: encode_activated(generation),
+                        expected_mod_revision: Some(revision),
+                        dedup: None,
+                    })
+                    .await;
+                match written {
+                    Ok(response) if response.outcome == MutationOutcome::Applied => {
+                        tracing::info!(
+                            partition = partition.0,
+                            generation = generation.0,
+                            revision = response.revision,
+                            "open_activated"
+                        );
+                        return Ok(());
+                    }
+                    Ok(_) => format!("CAS at {revision} was not applied"),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!(
+            partition = partition.0,
+            generation = generation.0,
+            error = %error,
+            "open_activate_retry"
+        );
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(1));
+    }
+}
+
 /// What a reopen's heal proved and handed node 1 (M10, arch R3a, ruling A-R163).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Healed {
@@ -837,6 +1101,14 @@ pub(crate) struct HealCtx {
     /// (arch-s2 B1, B2). The heal clears its grant alone and plans it primary; after a promote
     /// it is not node 1, and node 1's frozen grant stays as the promote left it.
     pub(crate) owner_node: NodeId,
+    /// The partitions that node owns, all healed by this one heal (issue #79): a heal each would
+    /// meet the grant the first partition's recovery had already acquired again.
+    pub(crate) partitions: Vec<PartitionId>,
+    /// How many partitions the database has: what a frozen grant's next step says depends on it.
+    pub(crate) partition_count: u32,
+    /// The partitions of that node still to form, each with its record's revision (design 7.2):
+    /// their plans go out after the clear, so a bootstrap F1 cannot acquire before it.
+    pub(crate) bootstrap: Vec<(PartitionId, Revision)>,
     /// How long clearing the old grants may take.
     pub(crate) within: Duration,
     /// The boot each member runs at: this open's for a node this process runs, the one its
@@ -879,80 +1151,136 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // put a copy on node 4; re-pinning node 3 would recover from a copy the move left behind.
     let pinned = pinned_members(&ctx).await?;
     // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
-    // fence's reads and decision tick as fresh as they were.
-    let members = member_boots(&ctx, &pinned, deadline).await?;
+    // fence's reads and decision tick as fresh as they were. One union over the partitions.
+    let boots = member_boots(&ctx, &member_union(&pinned), deadline).await?;
     // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
-    // promote that moved the partition off it, which only that promote may settle.
+    // promote that moved the partition off it, which only that promote may settle. Once, for
+    // every partition this node owns (issue #79).
     let gone = clear_until(&ctx, ctx.owner_node, deadline).await?;
     // Only now, after the owner's delete was acknowledged or its absence read (A-R163).
-    let read = ctx
-        .store
-        .get(GetRequest {
-            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-        })
-        .await
-        .map_err(|error| HealError::Control(format!("get partitions/1: {error}")))?;
+    let (read_revision, records) = heal_records(&ctx).await?;
     let cleared = match &gone {
         Gone::Deleted(revision, _) => GrantCleared::Deleted(*revision),
         Gone::Absent(revision) => GrantCleared::Absent(*revision),
     };
-    if Revision(read.read_revision) < cleared.revision() {
+    if Revision(read_revision) < cleared.revision() {
         return Err(match cleared {
             GrantCleared::Deleted(deleted) => HealError::ReadBeforeDelete {
-                read: read.read_revision,
+                read: read_revision,
                 deleted: deleted.0,
             },
             GrantCleared::Absent(absent) => HealError::ReadBeforeAbsence {
-                read: read.read_revision,
+                read: read_revision,
                 absent: absent.0,
             },
         });
     }
-    let found = read
-        .record
-        .ok_or_else(|| HealError::Record("absent".to_owned()))?;
+    let read = HealRead {
+        read_revision,
+        cleared,
+        now: ctx.clock.now(),
+    };
+    // Every record is judged before any plan goes out, so a heal that fails here has sent
+    // nothing and `heal_retrying`'s premise holds (issue #79, design 7.1).
+    let mut planned = Vec::with_capacity(records.len());
+    for ((partition, found), was) in ctx.partitions.iter().copied().zip(&records).zip(&pinned) {
+        planned.push(plan_heal(
+            &ctx, partition, found, was, &boots, &gone, &read,
+        )?);
+    }
+    // An owner with only partitions to form has no record to report on.
+    let healed = planned.first().map_or(
+        Healed {
+            cleared,
+            read_revision: Revision(read_revision),
+            control_revision: Revision(read_revision),
+        },
+        |plan| plan.0,
+    );
+    for (_, partition, events) in planned {
+        for event in events {
+            ctx.owner
+                .send(Msg::Inject {
+                    partition,
+                    correlation: HEAL,
+                    kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+                })
+                .map_err(|_| HealError::NodeStopped {
+                    node: ctx.owner_node,
+                })?;
+        }
+    }
+    for (partition, revision) in ctx.bootstrap.iter().copied() {
+        let send = |_, msg| ctx.owner.send(msg).map_err(|_| NodeStopped(ctx.owner_node));
+        start_recovery(ctx.clock.now(), ctx.boot, partition, revision, &send).map_err(|_| {
+            HealError::NodeStopped {
+                node: ctx.owner_node,
+            }
+        })?;
+    }
+    Ok(healed)
+}
+
+/// What one heal's reads settled for every partition it plans.
+struct HealRead {
+    read_revision: u64,
+    cleared: GrantCleared,
+    now: Tick,
+}
+
+/// One partition of a heal: its record judged, and its plan and fence built, nothing sent.
+fn plan_heal(
+    ctx: &HealCtx,
+    partition: PartitionId,
+    found: &config_core::Record,
+    was: &[RecordMember],
+    boots: &[Member],
+    gone: &Gone,
+    read: &HealRead,
+) -> Result<(Healed, PartitionId, [RecoveryEvent; 2]), HealError> {
+    let name = partition.0;
     let (Some(record), Some(root)) = (
         PartitionRecord::decode(&found.value),
         PartitionRoot::decode(&found.value),
     ) else {
         return Err(HealError::Record(format!(
-            "the record at revision {} carries no root (layout 3)",
+            "the record of partition {name} at revision {} carries no root (layout 3)",
             found.mod_revision
         )));
     };
     // T6: the plan pins the members read before the boots were awaited; a record that changed
     // them since is not the one the plan describes.
-    if pinned_of(&found.value)?.is_some_and(|now| now != pinned) {
+    if pinned_of(partition, &found.value)?.is_some_and(|now| now != was) {
         return Err(HealError::Record(format!(
-            "the members partitions/1 pins changed at revision {} while this open waited for their nodes: open again",
+            "the members partitions/{name} pins changed at revision {} while this open waited for their nodes: open again",
             found.mod_revision
         )));
     }
     // B2: the grant cleared above must be the owner's this record names.
     if record.owner != ctx.owner_node {
         return Err(HealError::Record(format!(
-            "the record at revision {} names owner node {}, but this open found node {}: open \
-             again",
+            "the record of partition {name} at revision {} names owner node {}, but this open \
+             found node {}: open again",
             found.mod_revision, record.owner.0, ctx.owner_node.0
         )));
     }
     let healed = Healed {
-        cleared,
+        cleared: read.cleared,
         read_revision: Revision(read.read_revision),
         control_revision: Revision(found.mod_revision),
     };
     // R3a, both cases: the prior boot is the owner the F1 commit pinned (R5 row 8: never 0).
     if root.owner_boot == BootId(0) {
         return Err(HealError::Record(format!(
-            "the record at revision {} names owner boot 0",
+            "the record of partition {name} at revision {} names owner boot 0",
             found.mod_revision
         )));
     }
     let prior_boot = root.owner_boot;
-    let now = ctx.clock.now();
+    let now = read.now;
     // The plan's view: case A carries the old grant, as before; case B has none, so it takes
     // bootstrap's. A1 replaces the view at its first acquire either way.
-    let (prior_grant, view_grant, view_generation, revocation) = match &gone {
+    let (prior_grant, view_grant, view_generation, revocation) = match gone {
         Gone::Deleted(_, held) => {
             let sample = HostClock::control_time(now, &ctx.budgets);
             let revocation = Revocation::ExpiryProven {
@@ -962,7 +1290,6 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
                 epsilon_ms: u32::try_from(ctx.budgets.clock_error_millis).unwrap_or(u32::MAX),
                 delta_ms: u32::try_from(ctx.budgets.dispatch_margin_millis).unwrap_or(u32::MAX),
             };
-            let held = *held;
             (
                 held.grant,
                 held.grant,
@@ -978,7 +1305,7 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         }
     };
     let lineage = Lineage {
-        partition: PARTITION,
+        partition,
         generation: record.generation,
         owner_epoch: record.owner_epoch,
     };
@@ -991,13 +1318,13 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     let plan = recovery_plan(
         anchor,
         version,
-        members,
+        members_at_boots(was, boots),
         ctx.boot,
         view_grant,
         view_generation,
     );
     let fence = FencingProof {
-        partition: PARTITION,
+        partition,
         prior_generation: record.generation,
         prior_owner_epoch: record.owner_epoch,
         prior_grant_id: prior_grant,
@@ -1006,8 +1333,9 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         control_revision: healed.control_revision,
         decision_tick: now,
     };
-    match cleared {
+    match read.cleared {
         GrantCleared::Deleted(deleted) => tracing::info!(
+            partition = name,
             variant = "ExpiryProven",
             control_revision = healed.control_revision.0,
             prior_boot = prior_boot.0,
@@ -1017,6 +1345,7 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
             "heal_takeover_authorized"
         ),
         GrantCleared::Absent(absent) => tracing::info!(
+            partition = name,
             variant = "NoGrantHeld",
             control_revision = healed.control_revision.0,
             prior_boot = prior_boot.0,
@@ -1026,21 +1355,86 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
             "heal_takeover_authorized"
         ),
     }
-    for event in [
-        RecoveryEvent::Plan(Box::new(plan)),
-        RecoveryEvent::FenceProven(Box::new(fence)),
-    ] {
-        ctx.owner
-            .send(Msg::Inject {
-                partition: PARTITION,
-                correlation: HEAL,
-                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
-            })
-            .map_err(|_| HealError::NodeStopped {
-                node: ctx.owner_node,
-            })?;
+    Ok((
+        healed,
+        partition,
+        [
+            RecoveryEvent::Plan(Box::new(plan)),
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ],
+    ))
+}
+
+/// Every node `pinned` names once, in first-seen order. A node that is a `Shadow` in one
+/// partition and a regular copy in another counts as regular: the heal must wait for it.
+fn member_union(pinned: &[Vec<RecordMember>]) -> Vec<RecordMember> {
+    let mut union: Vec<RecordMember> = Vec::new();
+    for member in pinned.iter().flatten() {
+        match union.iter_mut().find(|seen| seen.node == member.node) {
+            Some(seen) if seen.role == ReplicaRole::Shadow => *seen = *member,
+            Some(_) => {}
+            None => union.push(*member),
+        }
     }
-    Ok(healed)
+    union
+}
+
+/// `was`, in record order, each at the boot `boots` names for its node; a member `boots` left
+/// out (a shadow whose node is unknown) stays out.
+fn members_at_boots(was: &[RecordMember], boots: &[Member]) -> Vec<Member> {
+    was.iter()
+        .filter_map(|member| {
+            let boot = boots.iter().find(|known| known.node == member.node)?.boot;
+            Some(member.at(boot))
+        })
+        .collect()
+}
+
+/// The records of `ctx.partitions`, in that order, and the store revision they were read at. One
+/// read for all of them: a `Get` for partition 1 alone, otherwise one `list` of `partitions/`
+/// (issue #79). A failed or truncated list is never read as a complete one.
+async fn heal_records(ctx: &HealCtx) -> Result<(u64, Vec<config_core::Record>), HealError> {
+    if ctx.partitions == [PARTITION] {
+        let read = ctx
+            .store
+            .get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            })
+            .await
+            .map_err(|error| HealError::Control(format!("get partitions/1: {error}")))?;
+        let found = read
+            .record
+            .ok_or_else(|| HealError::Record("absent".to_owned()))?;
+        return Ok((read.read_revision, vec![found]));
+    }
+    let prefix = ControlPrefix::Partitions.encode();
+    let listed = ctx
+        .store
+        .list(ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| HealError::Control(format!("list {prefix}: {error}")))?;
+    if listed.truncated {
+        return Err(HealError::Control(format!(
+            "list {prefix} came back truncated at revision {}",
+            listed.read_revision
+        )));
+    }
+    let mut records = Vec::with_capacity(ctx.partitions.len());
+    for partition in &ctx.partitions {
+        let key = ControlKey::Partition(*partition).encode();
+        let found = listed
+            .records
+            .iter()
+            .find(|record| record.key.as_ref() == key.as_bytes())
+            .cloned()
+            .ok_or_else(|| HealError::Record(format!("{key} is absent")))?;
+        records.push(found);
+    }
+    Ok((listed.read_revision, records))
 }
 
 /// The first wait between two heal attempts that found a peer's boot unknown.
@@ -1064,6 +1458,8 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
             store: Arc::clone(&ctx.store),
             owner: ctx.owner.clone(),
             member_boot: Arc::clone(&ctx.member_boot),
+            partitions: ctx.partitions.clone(),
+            bootstrap: ctx.bootstrap.clone(),
             ..ctx
         };
         match heal(again).await {
@@ -1088,47 +1484,44 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
 /// The members `partitions/1` pins (M11 T6): a layout-4 record's own, in record order. A layout
 /// 2 or 3 record predates members in the record (bug bash #64), when every database was nodes
 /// 1 to 3, so it gets [`members`] with this open's owner primary, as every heal did before.
-async fn pinned_members(ctx: &HealCtx) -> Result<Vec<RecordMember>, HealError> {
-    let read = ctx
-        .store
-        .get(GetRequest {
-            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-        })
-        .await
-        .map_err(|error| HealError::Control(format!("get partitions/1: {error}")))?;
-    let found = read
-        .record
-        .ok_or_else(|| HealError::Record("absent".to_owned()))?;
-    let pinned = pinned_of(&found.value)?;
-    let fixed = pinned.is_none();
-    let pinned = pinned.unwrap_or_else(|| {
-        members()
-            .iter()
-            .map(|member| RecordMember {
-                role: if member.node == ctx.owner_node {
-                    ReplicaRole::Primary
-                } else {
-                    ReplicaRole::RegularSecondary
-                },
-                ..RecordMember::of(member)
-            })
-            .collect()
-    });
-    tracing::info!(
-        source = if fixed { "rf3_before_layout_4" } else { "record" },
-        members = ?pinned.iter().map(|m| (m.node.0, m.copy.0)).collect::<Vec<_>>(),
-        "heal_members"
-    );
-    Ok(pinned)
+async fn pinned_members(ctx: &HealCtx) -> Result<Vec<Vec<RecordMember>>, HealError> {
+    let (_, records) = heal_records(ctx).await?;
+    let mut all = Vec::with_capacity(records.len());
+    for (partition, found) in ctx.partitions.iter().zip(&records) {
+        let pinned = pinned_of(*partition, &found.value)?;
+        let fixed = pinned.is_none();
+        let pinned = pinned.unwrap_or_else(|| {
+            members()
+                .iter()
+                .map(|member| RecordMember {
+                    role: if member.node == ctx.owner_node {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::RegularSecondary
+                    },
+                    ..RecordMember::of(member)
+                })
+                .collect()
+        });
+        tracing::info!(
+            partition = partition.0,
+            source = if fixed { "rf3_before_layout_4" } else { "record" },
+            members = ?pinned.iter().map(|m| (m.node.0, m.copy.0)).collect::<Vec<_>>(),
+            "heal_members"
+        );
+        all.push(pinned);
+    }
+    Ok(all)
 }
 
 /// The members a record body pins: `None` for a layout 2 or 3 body, an error for a layout-4
 /// body that pins none.
-fn pinned_of(body: &[u8]) -> Result<Option<Vec<RecordMember>>, HealError> {
+fn pinned_of(partition: PartitionId, body: &[u8]) -> Result<Option<Vec<RecordMember>>, HealError> {
     match RecordMember::decode_all(body) {
-        Some(members) if members.is_empty() => {
-            Err(HealError::Record("partitions/1 pins no members".to_owned()))
-        }
+        Some(members) if members.is_empty() => Err(HealError::Record(format!(
+            "partitions/{} pins no members",
+            partition.0
+        ))),
         found => Ok(found),
     }
 }
@@ -1201,14 +1594,14 @@ fn names_in_words(nodes: &[u32]) -> String {
 
 /// [`PromoteError::Superseded`]'s text: the other run's owner when it is not this run's `to`,
 /// else the nodes it dropped, else that `partitions/1` changed (A-R448 F-001, F-002).
-fn superseded_text(owner: Option<u32>, dropped: &[u32], generation: u64) -> String {
+fn superseded_text(partition: u32, owner: Option<u32>, dropped: &[u32], generation: u64) -> String {
     match owner {
         Some(owner) => format!(
             "another promote committed instead: node {owner} is the owner, generation \
              {generation}; run status before promoting again"
         ),
         None if dropped.is_empty() => format!(
-            "partitions/1 changed again after a promote (generation {generation}); run status \
+            "partitions/{partition} changed again after a promote (generation {generation}); run status \
              before promoting again"
         ),
         None => format!(
@@ -1252,7 +1645,11 @@ async fn clear_until(
                 tracing::warn!(node = node.0, "heal_grant_frozen");
                 return Err(HealError::Frozen {
                     node: node.0,
-                    step: kept_in_words(clearance, node, ctx.clock.now()),
+                    step: if ctx.partition_count > 1 {
+                        frozen_step(node, &ctx.partitions)
+                    } else {
+                        kept_in_words(clearance, node, ctx.clock.now())
+                    },
                 });
             }
             Ok((clearance, ..)) => last = kept_in_words(clearance, node, ctx.clock.now()),
@@ -1272,6 +1669,18 @@ async fn clear_until(
         within_ms: ctx.within.as_millis(),
         last,
     })
+}
+
+/// The next step for a frozen grant above one partition (issue #79 S3): each partition the
+/// node still owns is moved by its own promote; a node that owns none opens with no heal.
+fn frozen_step(node: NodeId, partitions: &[PartitionId]) -> String {
+    let names: Vec<u32> = partitions.iter().map(|partition| partition.0).collect();
+    format!(
+        "a takeover from node {} is unfinished and it still owns partition {}; move each with \
+         `admin promote <the node you chose> --partition <p>`, then open again",
+        node.0,
+        names_in_words(&names)
+    )
 }
 
 /// The next step when another process may still hold the grant (A-R191b, tester w3a03).
@@ -1643,7 +2052,9 @@ fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError 
 /// What an admin promote did (arch-s2 "Promote", ruling A-R256).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Promoted {
-    /// The node that owns partition 1 now.
+    /// The partition that moved.
+    pub partition: PartitionId,
+    /// The node that owns it now.
     pub owner: NodeId,
     /// The node that owned it before the promote.
     pub prior_owner: NodeId,
@@ -1673,17 +2084,21 @@ pub enum PromoteError {
         /// A regular member to name instead.
         instead: u32,
     },
-    /// The node holds no copy of partition 1.
-    #[error("node {node} holds no copy of partition 1; name a node that does")]
+    /// The node holds no copy of the partition.
+    #[error("node {node} holds no copy of partition {partition}; name a node that does")]
     NotAMember {
         /// The node named.
         node: u32,
+        /// The partition.
+        partition: u32,
     },
-    /// The node owns partition 1 already.
-    #[error("node {node} already owns partition 1; nothing was changed")]
+    /// The node owns the partition already.
+    #[error("node {node} already owns partition {partition}; nothing was changed")]
     AlreadyOwner {
         /// The node named.
         node: u32,
+        /// The partition.
+        partition: u32,
     },
     /// The node to drop is the node to promote.
     #[error(
@@ -1711,17 +2126,19 @@ pub enum PromoteError {
     #[error(
         "node {node} holds no configuration since its restart, so the promote cannot tell which \
          members are still catching up; nothing was changed. A promote needs a node that has \
-         landed a configuration since it started: start the node that owned partition 1, or \
+         landed a configuration since it started: start the node that owned partition {partition}, or \
          promote a node that has not restarted since that node stopped"
     )]
     Unconfigured {
         /// The node asked for.
         node: u32,
+        /// The partition.
+        partition: u32,
     },
     /// `to`'s configuration is not the one `partitions/1` names, so its roles may be out of
     /// date (A-R415 C-2). Nothing was written.
     #[error(
-        "node {node} holds configuration version {held}, but partitions/1 is at version \
+        "node {node} holds configuration version {held}, but partitions/{partition} is at version \
          {current}, so its members' roles may be out of date; nothing was changed. Wait until \
          node {node} has landed version {current}, then promote again"
     )]
@@ -1732,6 +2149,8 @@ pub enum PromoteError {
         held: u64,
         /// `partitions/1`'s version.
         current: u64,
+        /// The partition.
+        partition: u32,
     },
     /// The control store refused, or the promote ran out of time after it wrote: the detail
     /// says which, and the step.
@@ -1742,8 +2161,10 @@ pub enum PromoteError {
     Record(String),
     /// Another promote committed instead of this one (A-R448): it fenced over this run after
     /// this run had sent its plan, and F1 committed its plan. A promote did happen.
-    #[error("{}", superseded_text(*.owner, .dropped, *.generation))]
+    #[error("{}", superseded_text(*.partition, *.owner, .dropped, *.generation))]
     Superseded {
+        /// The partition.
+        partition: u32,
         /// The node that owns partition 1 by that commit, when it is not the node this run
         /// promoted; `None` when it is.
         owner: Option<u32>,
@@ -1755,11 +2176,70 @@ pub enum PromoteError {
     },
     /// The new owner's node could not be sent the plan.
     #[error(
-        "node {node} could not be sent the new plan; partition 1 takes no writes until a promote \
-         finishes: check that node {node} runs, then promote again"
+        "node {node} could not be sent the new plan; partition {partition} takes no writes until \
+         a promote finishes: check that node {node} runs, then promote again"
     )]
     Unreachable {
         /// The node.
+        node: u32,
+        /// The partition.
+        partition: u32,
+    },
+    /// The node to promote holds a frozen grant, from a takeover away from it. Nothing clears
+    /// one, so it could never admit writes: the partition would be stranded. Nothing was
+    /// changed. Bringing a frozen node back to lead is not built (#61 critic Y3).
+    #[error(
+        "node {node}'s grant is frozen by an earlier takeover, so it cannot lead partition \
+         {partition}; nothing was changed: {step}",
+        step = crate::db::error::PROMOTE_FROZEN_STEP
+    )]
+    TargetFrozen {
+        /// The node asked for.
+        node: u32,
+        /// The partition.
+        partition: u32,
+    },
+    /// Above one partition, the owner is alive: it answered, or its grant is still being
+    /// renewed. A promote freezes the whole node's grant and moves one partition, so it would
+    /// fence the node's other partitions (issue #79 S3). Nothing was changed. A live owner's
+    /// promote is #61 slice S7.
+    #[error(
+        "node {node} is alive and owns partition {partition} ({evidence}): a promote of one \
+         partition from a live node is not built, because it would stop every partition node \
+         {node} owns; nothing was changed: {step}",
+        step = crate::db::error::PROMOTE_ALIVE_STEP
+    )]
+    OwnerAlive {
+        /// The owner.
+        node: u32,
+        /// The partition asked for.
+        partition: u32,
+        /// What shows it is alive.
+        evidence: String,
+    },
+    /// The partition asked for is not one this database has.
+    #[error(
+        "this database has no partition {partition}: it has partitions 1 to {partitions}; \
+         nothing was changed"
+    )]
+    NoSuchPartition {
+        /// The partition asked for.
+        partition: u32,
+        /// How many this database has.
+        partitions: u32,
+    },
+    /// This `Db` has no control store to run the promote against.
+    #[error(
+        "this Db was opened without a control store, so it cannot run admin commands such as \
+         promote: open it with Db::open, which connects it to one"
+    )]
+    NoControlStore,
+    /// The promote gave no answer in time, and may have written.
+    #[error(
+        "the promote of node {node} did not answer in time; it may have written: promote again"
+    )]
+    Unanswered {
+        /// The node asked to take the partition.
         node: u32,
     },
 }
@@ -1777,6 +2257,10 @@ impl PromoteError {
                 | Self::PeersUnknown { .. }
                 | Self::Unconfigured { .. }
                 | Self::StaleMembers { .. }
+                | Self::OwnerAlive { .. }
+                | Self::TargetFrozen { .. }
+                | Self::NoSuchPartition { .. }
+                | Self::NoControlStore
         )
     }
 }
@@ -1793,10 +2277,15 @@ impl From<PromoteError> for ApiError {
             PromoteError::Shadow { .. }
             | PromoteError::NotAMember { .. }
             | PromoteError::AlreadyOwner { .. }
-            | PromoteError::DropIsTarget => return Self::invalid(error.to_string()),
+            | PromoteError::DropIsTarget
+            | PromoteError::NoSuchPartition { .. } => return Self::invalid(error.to_string()),
             PromoteError::Record(_)
             | PromoteError::Unconfigured { .. }
-            | PromoteError::Superseded { .. } => RetryRule::NotWired,
+            | PromoteError::OwnerAlive { .. }
+            | PromoteError::TargetFrozen { .. }
+            | PromoteError::Superseded { .. }
+            | PromoteError::NoControlStore
+            | PromoteError::Unanswered { .. } => RetryRule::NotWired,
             PromoteError::PeersUnknown { .. }
             | PromoteError::StaleMembers { .. }
             | PromoteError::Unreachable { .. }
@@ -1817,6 +2306,13 @@ pub(crate) struct PromoteCtx {
     pub(crate) store: Arc<dyn ConfigStore>,
     pub(crate) budgets: Budgets,
     pub(crate) clock: HostClock,
+    /// The partition to move.
+    pub(crate) partition: PartitionId,
+    /// Refuse an owner that is alive ([`PromoteError::OwnerAlive`]): true above one partition,
+    /// where the freeze would stop the node's other partitions (issue #79 S3).
+    pub(crate) owner_must_be_dead: bool,
+    /// How long the owner gets to answer a look before it counts as not answering.
+    pub(crate) look_within: Duration,
     /// The node to make the owner.
     pub(crate) to: NodeId,
     /// The member to leave out; `None` leaves out the prior owner.
@@ -1848,6 +2344,7 @@ pub(crate) struct PromoteCtx {
 /// - [`PromoteError::Unconfigured`] when it answered holding no configuration: it has landed
 ///   none since its restart (A-R415 C-1, A-R416).
 pub(crate) fn promote_members(
+    partition: PartitionId,
     to: NodeId,
     looked: Option<crate::host::NodeStatus>,
     within: Duration,
@@ -1861,7 +2358,10 @@ pub(crate) fn promote_members(
             config_version: Some(version),
             ..
         }) if !pinned.is_empty() => return Ok((pinned, version)),
-        Some(_) => PromoteError::Unconfigured { node: to.0 },
+        Some(_) => PromoteError::Unconfigured {
+            node: to.0,
+            partition: partition.0,
+        },
         None => PromoteError::PeersUnknown {
             nodes: vec![to.0],
             within_ms: within.as_millis(),
@@ -1882,7 +2382,7 @@ pub(crate) async fn promote(ctx: PromoteCtx) -> Result<Promoted, PromoteError> {
     promote_looked(ctx, None).await
 }
 
-/// Make `ctx.to` the owner of partition 1 while its owner is dead or cut off (arch-s2
+/// Make `ctx.to` the owner of `ctx.partition` while its owner is dead or cut off (arch-s2
 /// "Promote", A-R256). In order:
 ///
 /// 1. Read `partitions/1`. Plan with the members it pins when it is layout 4, else with
@@ -1928,7 +2428,9 @@ pub(crate) async fn promote_looked(
     refused: Option<PromoteError>,
 ) -> Result<Promoted, PromoteError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
-    let (record, root, stored, mod_revision, _) = read_partition(&*ctx.store).await?;
+    let partition = ctx.partition.0;
+    let (record, root, stored, mod_revision, _) =
+        read_partition(&*ctx.store, ctx.partition).await?;
     let (planned, planned_version) = match (&stored, refused) {
         // `to` did not answer at all: it is refused before anything is written whatever the
         // record pins, so no owner is fenced toward a node that is not there (A-R412).
@@ -1958,7 +2460,10 @@ pub(crate) async fn promote_looked(
     let prior = record.owner;
     let dropped = ctx.drop.unwrap_or(prior);
     let member = |node: NodeId| planned.iter().find(|member| member.node == node);
-    let target = member(ctx.to).ok_or(PromoteError::NotAMember { node: ctx.to.0 })?;
+    let target = member(ctx.to).ok_or(PromoteError::NotAMember {
+        node: ctx.to.0,
+        partition,
+    })?;
     if target.role == ReplicaRole::Shadow {
         let instead = planned
             .iter()
@@ -1970,19 +2475,26 @@ pub(crate) async fn promote_looked(
         });
     }
     if ctx.to == prior {
-        return Err(PromoteError::AlreadyOwner { node: ctx.to.0 });
+        return Err(PromoteError::AlreadyOwner {
+            node: ctx.to.0,
+            partition,
+        });
     }
     if planned_version != record.config_version {
         return Err(PromoteError::StaleMembers {
             node: ctx.to.0,
             held: planned_version.0,
             current: record.config_version.0,
+            partition,
         });
     }
     if dropped == ctx.to {
         return Err(PromoteError::DropIsTarget);
     }
-    member(dropped).ok_or(PromoteError::NotAMember { node: dropped.0 })?;
+    member(dropped).ok_or(PromoteError::NotAMember {
+        node: dropped.0,
+        partition,
+    })?;
     tracing::info!(
         to = ctx.to.0,
         prior = prior.0,
@@ -1991,6 +2503,7 @@ pub(crate) async fn promote_looked(
         lifecycle = ?record.lifecycle,
         "promote_started"
     );
+    refuse_frozen_target(&ctx).await?;
     // What the Fencing CAS writes and step 6 expects: every member, the dropped one included,
     // in its role before this promote (A-R426 M1).
     let written: Vec<RecordMember> = planned.iter().map(RecordMember::of).collect();
@@ -1999,6 +2512,14 @@ pub(crate) async fn promote_looked(
         members = ?members.iter().map(|m| (m.node.0, m.boot.0, m.role)).collect::<Vec<_>>(),
         "promote_members_kept"
     );
+
+    // Above one partition the freeze below is the whole node's, so only a dead owner goes on
+    // (issue #79 S3). The grant revision read here is what step 4 must still find.
+    let dead_at = if ctx.owner_must_be_dead {
+        Some(owner_dead(&ctx, prior, deadline).await?)
+    } else {
+        None
+    };
 
     // 3. Fencing, written by this run even when a stopped run already wrote it (A-R447): the
     // identical bytes still move `mod_revision`, so each run fences at a revision of its own,
@@ -2010,7 +2531,7 @@ pub(crate) async fn promote_looked(
     };
     let fenced_at = cas(
         &*ctx.store,
-        &ControlKey::Partition(PARTITION).encode(),
+        &ControlKey::Partition(ctx.partition).encode(),
         fencing.encode_with_members(&root, &written),
         mod_revision,
     )
@@ -2018,7 +2539,22 @@ pub(crate) async fn promote_looked(
     tracing::info!(revision = fenced_at.0, "promote_fencing");
 
     // 4. Freeze the prior owner's grant.
-    let (frozen, frozen_at) = freeze(&ctx, prior, root.owner_boot, deadline).await?;
+    let (frozen, frozen_at) = match freeze(&ctx, prior, root.owner_boot, dead_at, deadline).await {
+        // The owner came back between the look and the Fencing write: nothing is frozen, so
+        // the record goes back to what it was and the refusal is true (issue #79 S3).
+        Err(alive @ PromoteError::OwnerAlive { .. }) => {
+            cas(
+                &*ctx.store,
+                &ControlKey::Partition(ctx.partition).encode(),
+                record.encode_with_members(&root, &written),
+                fenced_at.0,
+            )
+            .await?;
+            tracing::warn!(owner = prior.0, partition, "promote_fencing_undone");
+            return Err(alive);
+        }
+        frozen => frozen?,
+    };
 
     // 5. Its expiry, proven past.
     let (revocation, decided) = loop {
@@ -2030,7 +2566,7 @@ pub(crate) async fn promote_looked(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(PromoteError::Control(format!(
-                "the expiry of grants/{} was not proven past within {} seconds; partition 1 \
+                "the expiry of grants/{} was not proven past within {} seconds; partition {partition} \
                  takes no writes until a promote finishes: promote again",
                 prior.0,
                 seconds_in_words(ctx.within.as_millis())
@@ -2062,10 +2598,10 @@ pub(crate) async fn promote_looked(
 
     // 6. The record again, after the freeze, and the plan.
     let (fenced, fenced_root, fenced_members, control_revision, read_revision) =
-        read_partition(&*ctx.store).await?;
+        read_partition(&*ctx.store, ctx.partition).await?;
     if read_revision < frozen_at.0 {
         return Err(PromoteError::Control(format!(
-            "partitions/1 was read at revision {read_revision}, before the freeze at {}; promote \
+            "partitions/{partition} was read at revision {read_revision}, before the freeze at {}; promote \
              again",
             frozen_at.0
         )));
@@ -2076,20 +2612,20 @@ pub(crate) async fn promote_looked(
     };
     if fenced != expected || fenced_root != root || fenced_members.as_ref() != Some(&written) {
         return Err(PromoteError::Control(format!(
-            "partitions/1 changed during the promote (owner {}, generation {}, {:?}); promote \
+            "partitions/{partition} changed during the promote (owner {}, generation {}, {:?}); promote \
              again",
             fenced.owner.0, fenced.generation.0, fenced.lifecycle
         )));
     }
     if control_revision != fenced_at.0 {
         return Err(PromoteError::Control(format!(
-            "partitions/1 was fenced again at revision {control_revision} after this promote \
+            "partitions/{partition} was fenced again at revision {control_revision} after this promote \
              fenced it at {}: another promote is running; promote again",
             fenced_at.0
         )));
     }
     let lineage = Lineage {
-        partition: PARTITION,
+        partition: ctx.partition,
         generation: record.generation,
         owner_epoch: record.owner_epoch,
     };
@@ -2116,12 +2652,12 @@ pub(crate) async fn promote_looked(
         GrantId(1),
         AuthorityGeneration(1),
     );
-    store_plan(&*ctx.store, fenced_at, &plan).await?;
+    store_plan(&*ctx.store, ctx.partition, fenced_at, &plan).await?;
     // What F1 pins in `partitions/1` when it commits this plan (A-R448): step 7 answers Ok only
     // for a commit that carries it.
     let own: Vec<NodeId> = sorted_nodes(&RecordMember::pinned(&plan.config));
     let fence = FencingProof {
-        partition: PARTITION,
+        partition: ctx.partition,
         prior_generation: record.generation,
         prior_owner_epoch: record.owner_epoch,
         prior_grant_id: frozen.grant,
@@ -2140,18 +2676,21 @@ pub(crate) async fn promote_looked(
         (ctx.send)(
             ctx.to,
             Msg::Routed {
-                partition: PARTITION,
+                partition: ctx.partition,
                 correlation: PROMOTE,
                 kind: KernelEvent::Recovery(event),
             },
         )
-        .map_err(|_| PromoteError::Unreachable { node: ctx.to.0 })?;
+        .map_err(|_| PromoteError::Unreachable {
+            node: ctx.to.0,
+            partition,
+        })?;
     }
 
     // 7. The commit, and that it is this run's (A-R448): another promote that fenced over this
     // one after it sent may be the one F1 committed.
     loop {
-        let (now, _, pinned, committed_at, _) = read_partition(&*ctx.store).await?;
+        let (now, _, pinned, committed_at, _) = read_partition(&*ctx.store, ctx.partition).await?;
         let committed = pinned.as_deref().map(sorted_nodes);
         let left_out = |committed: &[NodeId]| -> Vec<u32> {
             written
@@ -2171,6 +2710,7 @@ pub(crate) async fn promote_looked(
                 "promote_superseded"
             );
             return Err(PromoteError::Superseded {
+                partition,
                 owner: Some(now.owner.0),
                 dropped: committed.as_deref().map(left_out).unwrap_or_default(),
                 generation: now.generation.0,
@@ -2189,6 +2729,7 @@ pub(crate) async fn promote_looked(
                         "promote_superseded"
                     );
                     return Err(PromoteError::Superseded {
+                        partition,
                         owner: None,
                         dropped,
                         generation: now.generation.0,
@@ -2208,6 +2749,7 @@ pub(crate) async fn promote_looked(
                 "promote_committed"
             );
             return Ok(Promoted {
+                partition: ctx.partition,
                 owner: ctx.to,
                 prior_owner: prior,
                 dropped,
@@ -2218,8 +2760,8 @@ pub(crate) async fn promote_looked(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(PromoteError::Control(format!(
-                "node {} did not commit partition 1 within {} seconds (partitions/1 names owner \
-                 {} at generation {}); partition 1 takes no writes until a promote finishes. If \
+                "node {} did not commit partition {partition} within {} seconds (partitions/{partition} names owner \
+                 {} at generation {}); partition {partition} takes no writes until a promote finishes. If \
                  node {} refused the fence, its log has a routed_fence_refused line saying why: \
                  promote again",
                 ctx.to.0,
@@ -2233,10 +2775,11 @@ pub(crate) async fn promote_looked(
     }
 }
 
-/// `partitions/1` as a rooted record, the members it pins (`None` for layout 3), its
+/// `partitions/{partition}` as a rooted record, the members it pins (`None` for layout 3), its
 /// `mod_revision` and the read's store revision.
 pub(crate) async fn read_partition(
     store: &dyn ConfigStore,
+    partition: PartitionId,
 ) -> Result<
     (
         PartitionRecord,
@@ -2249,15 +2792,18 @@ pub(crate) async fn read_partition(
 > {
     let read = store
         .get(GetRequest {
-            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            key: Bytes::from(ControlKey::Partition(partition).encode()),
         })
         .await
         .map_err(|error| {
-            PromoteError::Control(format!("get partitions/1: {error}; promote again"))
+            PromoteError::Control(format!(
+                "get partitions/{}: {error}; promote again",
+                partition.0
+            ))
         })?;
     let found = read
         .record
-        .ok_or_else(|| PromoteError::Record("partitions/1 is absent".to_owned()))?;
+        .ok_or_else(|| PromoteError::Record(format!("partitions/{} is absent", partition.0)))?;
     match (
         PartitionRecord::decode(&found.value),
         PartitionRoot::decode(&found.value),
@@ -2270,8 +2816,8 @@ pub(crate) async fn read_partition(
             read.read_revision,
         )),
         _ => Err(PromoteError::Record(format!(
-            "partitions/1 at revision {} carries no root (layout 3 or 4)",
-            found.mod_revision
+            "partitions/{} at revision {} carries no root (layout 3 or 4)",
+            partition.0, found.mod_revision
         ))),
     }
 }
@@ -2402,6 +2948,7 @@ pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> 
 /// revision. The node that commits reads its plan from here.
 async fn store_plan(
     store: &dyn ConfigStore,
+    partition: PartitionId,
     fenced_at: Revision,
     plan: &RecoveryPlan,
 ) -> Result<(), PromoteError> {
@@ -2426,9 +2973,10 @@ async fn store_plan(
         }
         Err(error @ ConfigError::PermissionDenied { .. }) => {
             return Err(PromoteError::Control(format!(
-                "create {key}: {error}; partition 1 is fencing and takes no writes until a \
+                "create {key}: {error}; partition {} is fencing and takes no writes until a \
                  promote finishes. A promote needs rEtcd write access to operations/ as well as \
-                 partitions/ and grants/: grant it, then promote again"
+                 partitions/ and grants/: grant it, then promote again",
+                partition.0
             )))
         }
         Err(error) => {
@@ -2549,17 +3097,171 @@ async fn kept_boots(
     }
 }
 
+/// Whether `prior` answers a look at `ctx.partition` within `ctx.look_within`.
+async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> bool {
+    let (reply, answer) = std::sync::mpsc::channel();
+    let asked = (ctx.send)(
+        prior,
+        Msg::Inspect {
+            partition: ctx.partition,
+            reply,
+        },
+    );
+    if asked.is_err() {
+        return false;
+    }
+    let within = ctx.look_within;
+    tokio::task::spawn_blocking(move || answer.recv_timeout(within).is_ok())
+        .await
+        .unwrap_or(false)
+}
+
+/// Refuse `ctx.to` when its grant is frozen: a promote there would commit, and the new owner
+/// could never admit (#61 critic Y3).
+async fn refuse_frozen_target(ctx: &PromoteCtx) -> Result<(), PromoteError> {
+    let key = ControlKey::Grant(ctx.to).encode();
+    let read = ctx
+        .store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| PromoteError::Control(format!("get {key}: {error}; promote again")))?;
+    let frozen = read
+        .record
+        .and_then(|found| GrantRecord::decode(&found.value))
+        .is_some_and(|grant| grant.frozen);
+    if frozen {
+        tracing::warn!(
+            to = ctx.to.0,
+            partition = ctx.partition.0,
+            "promote_target_frozen"
+        );
+        return Err(PromoteError::TargetFrozen {
+            node: ctx.to.0,
+            partition: ctx.partition.0,
+        });
+    }
+    Ok(())
+}
+
+/// Show that `prior`, which owns `ctx.partition` above one partition, is dead: it does not
+/// answer a look, and its grant is not being renewed and has run out. A just-killed owner is
+/// waited out, not refused. Returns the `mod_revision` of the grant record judged, 0 for none.
+///
+/// The freeze is the node's, so this keeps it to nodes with nothing left to stop (issue #79
+/// S3).
+///
+/// # Errors
+///
+/// [`PromoteError::OwnerAlive`] when it answers or its expiry moves; [`PromoteError::Control`]
+/// when the store does not answer or the wait runs out. Nothing has been written either way.
+async fn owner_dead(
+    ctx: &PromoteCtx,
+    prior: NodeId,
+    deadline: tokio::time::Instant,
+) -> Result<u64, PromoteError> {
+    let alive = |evidence: &str| PromoteError::OwnerAlive {
+        node: prior.0,
+        partition: ctx.partition.0,
+        evidence: evidence.to_owned(),
+    };
+    let key = ControlKey::Grant(prior).encode();
+    let mut first_expiry = None;
+    let mut looked = false;
+    loop {
+        let read = ctx
+            .store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+            .map_err(|error| PromoteError::Control(format!("get {key}: {error}; promote again")))?;
+        let found = match read.record {
+            Some(found) => {
+                let held = GrantRecord::decode(&found.value).ok_or_else(|| {
+                    PromoteError::Record(format!(
+                        "{key} at revision {} is not a grant record",
+                        found.mod_revision
+                    ))
+                })?;
+                Some((found.mod_revision, held))
+            }
+            None => None,
+        };
+        // A frozen grant never comes back, so a node that still answers has nothing left to
+        // lose: it serves nothing, and its partitions must be able to leave it.
+        if let Some((revision, held)) = found.filter(|(_, held)| held.frozen) {
+            tracing::info!(
+                owner = prior.0,
+                grant = held.grant.0,
+                "promote_owner_frozen"
+            );
+            return Ok(revision);
+        }
+        if !looked {
+            looked = true;
+            if owner_answers(ctx, prior).await {
+                tracing::warn!(owner = prior.0, "promote_owner_answered");
+                return Err(alive("it answered a look"));
+            }
+        }
+        let Some((revision, held)) = found else {
+            tracing::info!(owner = prior.0, "promote_owner_no_grant");
+            return Ok(0);
+        };
+        if *first_expiry.get_or_insert(held.expiry_utc_ms) != held.expiry_utc_ms {
+            tracing::warn!(
+                owner = prior.0,
+                grant = held.grant.0,
+                "promote_owner_renewing"
+            );
+            return Err(alive("its grant is still being renewed"));
+        }
+        let now = ctx.clock.now();
+        let mut view = ClockView::new();
+        view.accept(HostClock::control_time(now, &ctx.budgets));
+        if expiry_proven(&view, held.expiry_utc_ms, now, &ctx.budgets).is_some() {
+            tracing::info!(
+                owner = prior.0,
+                expiry = held.expiry_utc_ms,
+                "promote_owner_dead"
+            );
+            return Ok(revision);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PromoteError::Control(format!(
+                "the expiry of grants/{} was not proven past within {} seconds; nothing was \
+                 changed: promote again",
+                prior.0,
+                seconds_in_words(ctx.within.as_millis())
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Freeze `grants/{prior}`: CAS it `frozen` at the revision read, or create it frozen when it is
 /// absent, with `GrantId(0)` ("none held"), the prior owner's boot and control time now as `E`.
 /// A record already frozen is kept. Returns the frozen record and the revision of the write or
 /// of the read that found it frozen.
+///
+/// `dead_at`, above one partition, is the grant revision [`owner_dead`] judged. A record that
+/// is not frozen and is no longer at it was written by an owner that came back:
+/// [`PromoteError::OwnerAlive`], with nothing frozen.
 async fn freeze(
     ctx: &PromoteCtx,
     prior: NodeId,
     prior_boot: BootId,
+    dead_at: Option<u64>,
     deadline: tokio::time::Instant,
 ) -> Result<(GrantRecord, Revision), PromoteError> {
     let key = ControlKey::Grant(prior).encode();
+    let returned = || PromoteError::OwnerAlive {
+        node: prior.0,
+        partition: ctx.partition.0,
+        evidence: "it came back during the promote".to_owned(),
+    };
     loop {
         let read = ctx
             .store
@@ -2584,6 +3286,9 @@ async fn freeze(
                     );
                     return Ok((held, Revision(read.read_revision)));
                 }
+                if dead_at.is_some_and(|judged| judged != found.mod_revision) {
+                    return Err(returned());
+                }
                 (
                     GrantRecord {
                         frozen: true,
@@ -2594,6 +3299,9 @@ async fn freeze(
                 )
             }
             None => {
+                if dead_at.is_some_and(|judged| judged != 0) {
+                    return Err(returned());
+                }
                 let now = ctx.clock.now();
                 let sample = HostClock::control_time(now, &ctx.budgets);
                 (
@@ -2971,7 +3679,7 @@ mod tests {
         assert_eq!(*sent.lock().expect("count"), 2, "Plan and FenceProven");
         put(&store, &rt, record(0).encode(), first.0);
         match rt.block_on(bootstrap(&store, Tick(0), send)) {
-            Err(BootstrapError::AlreadyExists { current }) => assert!(current > first.0),
+            Err(BootstrapError::AlreadyExists { current, .. }) => assert!(current > first.0),
             other => panic!("over a rewritten record: {other:?}"),
         }
         assert_eq!(*sent.lock().expect("count"), 2, "the refusal sent nothing");
@@ -3096,8 +3804,30 @@ mod tests {
         rt: &tokio::runtime::Runtime,
         within: Duration,
     ) -> (Result<Healed, HealError>, Vec<Msg>) {
+        heal_over(store, rt, within, vec![PARTITION])
+    }
+
+    /// [`heal_once_within`] over `partitions`.
+    fn heal_over(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+        partitions: Vec<PartitionId>,
+    ) -> (Result<Healed, HealError>, Vec<Msg>) {
+        heal_forming(store, rt, within, partitions, Vec::new())
+    }
+
+    /// [`heal_over`] with `bootstrap`, the partitions this owner still has to form.
+    fn heal_forming(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+        partitions: Vec<PartitionId>,
+        bootstrap: Vec<(PartitionId, Revision)>,
+    ) -> (Result<Healed, HealError>, Vec<Msg>) {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
+            partition_count: 1,
             store,
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -3106,9 +3836,193 @@ mod tests {
             within,
             member_boot: Arc::new(|_| Some(OPEN_2)),
             owner_node: OWNER,
+            partitions,
+            bootstrap,
         };
         let healed = rt.block_on(heal(ctx));
         (healed, mailbox.try_iter().collect())
+    }
+
+    /// Issue #79: a copy of `partitions/1` as `partition`, owned by `owner`.
+    fn rooted_copy(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+        partition: PartitionId,
+        owner: NodeId,
+    ) {
+        let value = rt
+            .block_on(store.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get partitions/1")
+            .record
+            .expect("partitions/1")
+            .value;
+        let root = PartitionRoot::decode(&value).expect("a root");
+        let record = PartitionRecord {
+            partition,
+            owner,
+            ..PartitionRecord::decode(&value).expect("a record")
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Partition(partition).encode()),
+            value: record.encode_with(&root),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put the copy");
+    }
+
+    /// Issue #79, the single-heal rule: a node has one grant, so a second heal for the same owner
+    /// meets the grant the first heal's partition already took, this open's own boot, and is
+    /// refused `NotCleared`. One heal over both partitions clears it once and plans both. Cut:
+    /// `clear_until` accepts a grant naming this open's boot. Unit (~300 ms): the heal's bound.
+    #[test]
+    fn a_second_heal_for_one_owner_meets_the_grant_the_first_one_led_to() {
+        let rt = runtime();
+        let four = PartitionId(4);
+        let within = Duration::from_millis(300);
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        rooted_copy(&*store, &rt, four, OWNER);
+
+        let (first, sent) = heal_over(Arc::clone(&store), &rt, within, vec![PARTITION]);
+        first.expect("the first partition's heal");
+        assert_eq!(sent.len(), 2, "a Plan and a proof");
+
+        // What that partition's F1 does next: its node takes the grant, at this open's boot.
+        let grants = Bytes::from(ControlKey::Grant(OWNER).encode());
+        let taken = GrantRecord {
+            grant: GrantId(1),
+            node: OWNER,
+            boot: OPEN_2,
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: 0,
+            frozen: false,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: grants.clone(),
+            value: taken.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("the grant is taken");
+
+        let (second, sent) = heal_over(Arc::clone(&store), &rt, within, vec![four]);
+        assert!(
+            matches!(second, Err(HealError::NotCleared { node: 1, .. })),
+            "{second:?}"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+
+        rt.block_on(store.delete(DeleteRequest {
+            key: grants,
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the grant is gone");
+        let (one, sent) = heal_over(store, &rt, within, vec![PARTITION, four]);
+        one.expect("one heal over both");
+        assert_eq!(sent.len(), 4, "a Plan and a proof each");
+    }
+
+    /// Issue #79: one heal covers every partition its owner holds. Each gets a plan and a proof;
+    /// a later record that is wrong or missing refuses the whole heal before any is sent. Cut:
+    /// `heal` sends each partition's plan as it validates it. Unit: `MemStore`.
+    #[test]
+    fn a_heal_over_two_partitions_validates_both_before_it_sends_anything() {
+        let rt = runtime();
+        let two = PartitionId(2);
+        let within = Duration::from_millis(500);
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        rooted_copy(&*store, &rt, two, OWNER);
+        let (healed, sent) = heal_over(Arc::clone(&store), &rt, within, vec![PARTITION, two]);
+        healed.expect("both heal");
+        assert_eq!(sent.len(), 4, "a Plan and a proof each");
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        rooted_copy(&*store, &rt, two, NodeId(2));
+        let (healed, sent) = heal_over(Arc::clone(&store), &rt, within, vec![PARTITION, two]);
+        match healed {
+            Err(HealError::Record(text)) => assert!(text.contains("partition 2"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (healed, sent) = heal_over(Arc::clone(&store), &rt, within, vec![PARTITION, two]);
+        assert!(healed.is_err(), "a partition with no record");
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// Design 7.2 (Critic R2): a partition still to form joins its owner's heal, after the
+    /// rooted partitions' plans, and nothing goes out until the grant is cleared. An owner with
+    /// only partitions to form heals too. Cut: bootstrap plans sent before the clear.
+    #[test]
+    fn a_heal_sends_a_forming_partitions_plan_only_after_the_clear() {
+        let rt = runtime();
+        let two = PartitionId(2);
+        let within = Duration::from_millis(300);
+        let forming = vec![(two, Revision(4))];
+        let order = |sent: &[Msg]| -> Vec<u32> {
+            sent.iter()
+                .map(|msg| match msg {
+                    Msg::Inject { partition, .. } => partition.0,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (healed, sent) = heal_forming(
+            Arc::clone(&store),
+            &rt,
+            within,
+            vec![PARTITION],
+            forming.clone(),
+        );
+        healed.expect("the rooted partition heals");
+        assert_eq!(
+            order(&sent),
+            [1, 1, 2, 2],
+            "rooted first, a Plan and a proof each"
+        );
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let (healed, sent) =
+            heal_forming(Arc::clone(&store), &rt, within, Vec::new(), forming.clone());
+        healed.expect("nothing to clear, nothing rooted");
+        assert_eq!(order(&sent), [2, 2], "the plans of the partition to form");
+
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let taken = GrantRecord {
+            grant: GrantId(1),
+            node: OWNER,
+            boot: OPEN_2,
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: 0,
+            frozen: false,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            value: taken.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("the grant is taken");
+        let (healed, sent) =
+            heal_forming(Arc::clone(&store), &rt, within, vec![PARTITION], forming);
+        assert!(
+            matches!(healed, Err(HealError::NotCleared { .. })),
+            "{healed:?}"
+        );
+        assert!(sent.is_empty(), "{} messages before the clear", sent.len());
     }
 
     /// The `FencingProof` a heal sent node 1, if it sent one.
@@ -3471,6 +4385,272 @@ mod tests {
         }
     }
 
+    /// A store whose `grants/1` moves under a promote: at every read of it (`on_get`, an owner
+    /// still renewing), or when `partitions/1` is written `Fencing` (`on_fencing`, an owner that
+    /// came back after the look).
+    struct MovingGrant {
+        inner: config_testkit::MemStore,
+        on_get: bool,
+        on_fencing: bool,
+    }
+
+    impl MovingGrant {
+        async fn renew(&self) {
+            let key = Bytes::from(ControlKey::Grant(OWNER).encode());
+            let found = self
+                .inner
+                .get(GetRequest { key: key.clone() })
+                .await
+                .expect("get")
+                .record
+                .expect("a grant");
+            let held = GrantRecord::decode(&found.value).expect("a grant");
+            let renewed = GrantRecord {
+                expiry_utc_ms: held.expiry_utc_ms + 500,
+                ..held
+            };
+            self.inner
+                .put(PutRequest {
+                    key,
+                    value: renewed.encode(),
+                    expected_mod_revision: Some(found.mod_revision),
+                    dedup: None,
+                })
+                .await
+                .expect("renew");
+        }
+    }
+
+    impl ConfigStore for MovingGrant {
+        fn get<'a, 'b>(&'a self, request: GetRequest) -> Reply<'b, config_core::GetResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async move {
+                if self.on_get && request.key == ControlKey::Grant(OWNER).encode().as_bytes() {
+                    self.renew().await;
+                }
+                self.inner.get(request).await
+            })
+        }
+
+        fn list<'a, 'b>(&'a self, request: ListRequest) -> Reply<'b, config_core::ListResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.list(request)
+        }
+
+        fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async move {
+                let fencing = request.key == ControlKey::Partition(PARTITION).encode().as_bytes()
+                    && PartitionRecord::decode(&request.value)
+                        .is_some_and(|record| record.lifecycle == PartitionLifecycle::Fencing);
+                let answer = self.inner.put(request).await;
+                if fencing && self.on_fencing {
+                    self.renew().await;
+                }
+                answer
+            })
+        }
+
+        fn delete<'a, 'b>(
+            &'a self,
+            request: DeleteRequest,
+        ) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.delete(request)
+        }
+
+        fn capabilities(&self) -> config_core::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn watch<'a, 'b>(
+            &'a self,
+            request: config_core::WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.watch(request)
+        }
+    }
+
+    /// A promote above one partition over `store`, with node 1, the owner, unreachable.
+    fn promote_above_one(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+    ) -> PromoteError {
+        let ctx = PromoteCtx {
+            partition: PARTITION,
+            owner_must_be_dead: true,
+            look_within: Duration::from_millis(1),
+            store,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            to: NodeId(2),
+            drop: None,
+            within: Duration::from_secs(1),
+            members: members(),
+            members_version: CONFIG_VERSION,
+            member_boot: all_known(),
+            send: Arc::new(|_, _| Err(NodeStopped(OWNER))),
+        };
+        rt.block_on(promote(ctx)).expect_err("refused")
+    }
+
+    fn unfrozen_and_serving(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime) {
+        let grant = rt
+            .block_on(store.get(GetRequest {
+                key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("a grant");
+        assert!(!GrantRecord::decode(&grant.value).expect("a grant").frozen);
+        let (record, ..) = rt.block_on(read_partition(store, PARTITION)).expect("read");
+        assert_eq!(record.lifecycle, PartitionLifecycle::Serving, "{record:?}");
+    }
+
+    /// An owner with no link whose grant is still being renewed is alive: refused, nothing
+    /// written (issue #79 S3). Unit (~60 ms): `MemStore`.
+    #[test]
+    fn above_one_partition_an_owner_still_renewing_is_refused() {
+        let rt = runtime();
+        let store = Arc::new(MovingGrant {
+            inner: config_testkit::MemStore::new(),
+            on_get: true,
+            on_fencing: false,
+        });
+        rooted(&store.inner, &rt, BootId(5));
+        old_grant(&store.inner, &rt, GrantId(4));
+        let expiry = i64::try_from(
+            HostClock::control_time(HostClock::start().now(), &Budgets::SPEC_DEFAULTS)
+                .estimate
+                .0,
+        )
+        .expect("in range")
+            + 60_000;
+        put_grant_expiry(&store.inner, &rt, expiry);
+        let refused = promote_above_one(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        assert!(
+            matches!(&refused, PromoteError::OwnerAlive { evidence, .. } if evidence.contains("renewed")),
+            "{refused:?}"
+        );
+        let told = ApiError::from(refused).explain();
+        assert!(
+            told.ends_with("stop that node first, then promote again")
+                && !told.contains("retrying will not help"),
+            "{told}"
+        );
+        unfrozen_and_serving(&store.inner, &rt);
+    }
+
+    /// An owner that comes back after the look and before the freeze leaves nothing behind: the
+    /// `Fencing` write is undone and the promote refused (issue #79 S3). Unit (~20 ms): `MemStore`.
+    #[test]
+    fn above_one_partition_an_owner_back_after_the_look_undoes_the_fencing() {
+        let rt = runtime();
+        let store = Arc::new(MovingGrant {
+            inner: config_testkit::MemStore::new(),
+            on_get: false,
+            on_fencing: true,
+        });
+        rooted(&store.inner, &rt, BootId(5));
+        old_grant(&store.inner, &rt, GrantId(4));
+        let refused = promote_above_one(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        assert!(
+            matches!(&refused, PromoteError::OwnerAlive { evidence, .. } if evidence.contains("came back")),
+            "{refused:?}"
+        );
+        unfrozen_and_serving(&store.inner, &rt);
+    }
+
+    /// A promote onto a node whose grant is frozen would commit a partition no one can serve:
+    /// nothing clears that record, so its new owner never admits. Refused by name, before
+    /// anything is written (#61 critic Y3). Unit (~20 ms): `MemStore`.
+    #[test]
+    fn a_promote_onto_a_node_with_a_frozen_grant_is_refused_by_name() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        old_grant(&*store, &rt, GrantId(4));
+        let frozen = GrantRecord {
+            grant: GrantId(9),
+            node: NodeId(2),
+            boot: BootId(7),
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: 1,
+            frozen: true,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(NodeId(2)).encode()),
+            value: frozen.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/2");
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            all_known(),
+            Duration::from_secs(1),
+        );
+        let refused = answer.expect_err("node 2 cannot serve");
+        assert!(
+            matches!(refused, PromoteError::TargetFrozen { node: 2, .. }),
+            "{refused:?}"
+        );
+        assert!(refused.no_mutation(), "{refused:?}");
+        assert!(sent.is_empty(), "nothing sent: {}", sent.len());
+        let told = ApiError::from(refused).explain();
+        assert!(
+            told.ends_with("promote another node") && !told.contains("retrying will not help"),
+            "{told}"
+        );
+        let (record, ..) = rt
+            .block_on(read_partition(&*store, PARTITION))
+            .expect("read");
+        assert_eq!(record.lifecycle, PartitionLifecycle::Serving, "{record:?}");
+    }
+
+    fn put_grant_expiry(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, expiry_utc_ms: i64) {
+        let key = Bytes::from(ControlKey::Grant(OWNER).encode());
+        let found = rt
+            .block_on(store.get(GetRequest { key: key.clone() }))
+            .expect("get")
+            .record
+            .expect("a grant");
+        let held = GrantRecord::decode(&found.value).expect("a grant");
+        rt.block_on(
+            store.put(PutRequest {
+                key,
+                value: GrantRecord {
+                    expiry_utc_ms,
+                    ..held
+                }
+                .encode(),
+                expected_mod_revision: Some(found.mod_revision),
+                dedup: None,
+            }),
+        )
+        .expect("put");
+    }
+
     /// A-R163's read-before guards (A-R175): a `partitions/1` read served below the revision of
     /// the grant delete (case A) or of the read that found the grant absent (case B) is a
     /// lagging answer, so the heal refuses it and sends node 1 nothing. Unit (~20 ms):
@@ -3519,6 +4699,7 @@ mod tests {
         rooted(&*store, &rt, BootId(5));
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
+            partition_count: 1,
             store: Arc::clone(&store),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -3527,6 +4708,8 @@ mod tests {
             within: Duration::from_millis(100),
             member_boot: Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2)),
             owner_node: OWNER,
+            partitions: vec![PARTITION],
+            bootstrap: Vec::new(),
         };
         let refused = rt
             .block_on(heal(ctx))
@@ -3562,6 +4745,9 @@ mod tests {
         let sent: Sent = Arc::default();
         let log = Arc::clone(&sent);
         let ctx = PromoteCtx {
+            partition: PARTITION,
+            owner_must_be_dead: false,
+            look_within: Duration::from_secs(1),
             store: Arc::clone(store),
             budgets: Budgets::SPEC_DEFAULTS,
             clock: HostClock::start(),
@@ -3854,6 +5040,9 @@ mod tests {
                 old_grant(&*store, &rt, grant);
             }
             let ctx = PromoteCtx {
+                partition: PARTITION,
+                owner_must_be_dead: false,
+                look_within: Duration::from_secs(1),
                 store: Arc::clone(&store),
                 budgets: Budgets::SPEC_DEFAULTS,
                 clock: HostClock::start(),
@@ -3869,7 +5058,7 @@ mod tests {
                 .block_on(promote(ctx))
                 .expect_err("node 2 is unreachable");
             assert!(
-                matches!(refused, PromoteError::Unreachable { node: 2 }),
+                matches!(refused, PromoteError::Unreachable { node: 2, .. }),
                 "{held:?}: {refused:?}"
             );
             assert!(!refused.no_mutation(), "it wrote Fencing and the freeze");
@@ -3948,6 +5137,7 @@ mod tests {
         let (owner, mailbox) = std::sync::mpsc::channel();
         drop(mailbox);
         let ctx = HealCtx {
+            partition_count: 1,
             store: Arc::clone(&store),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -3956,6 +5146,8 @@ mod tests {
             within: Duration::from_millis(500),
             member_boot: Arc::new(|_| Some(OPEN_2)),
             owner_node: NodeId(2),
+            partitions: vec![PARTITION],
+            bootstrap: Vec::new(),
         };
         let stopped = rt.block_on(heal(ctx)).expect_err("node 2's thread is gone");
         assert_eq!(
@@ -4366,6 +5558,9 @@ mod tests {
         let sent: Sent = Arc::default();
         let log = Arc::clone(&sent);
         let ctx = PromoteCtx {
+            partition: PARTITION,
+            owner_must_be_dead: false,
+            look_within: Duration::from_secs(1),
             store: Arc::clone(store),
             budgets: Budgets::SPEC_DEFAULTS,
             clock: HostClock::start(),
@@ -4555,6 +5750,7 @@ mod tests {
         assert_eq!(
             superseded,
             PromoteError::Superseded {
+                partition: 1,
                 owner: None,
                 dropped: vec![3],
                 generation: 4
@@ -4641,7 +5837,7 @@ mod tests {
             .recv_timeout(patience)
             .expect("(5) the run sends its fence");
         let (record, root, pinned, fenced_at, _) = rt
-            .block_on(read_partition(&*store))
+            .block_on(read_partition(&*store, PARTITION))
             .expect("(5) partitions/1");
         let readded = PartitionRecord {
             owner: NodeId(2),
@@ -4663,6 +5859,7 @@ mod tests {
         assert_eq!(
             changed,
             PromoteError::Superseded {
+                partition: 1,
                 owner: None,
                 dropped: vec![],
                 generation: 4
@@ -4688,6 +5885,7 @@ mod tests {
         assert_eq!(
             superseded,
             PromoteError::Superseded {
+                partition: 1,
                 owner: Some(3),
                 dropped: vec![1],
                 generation: 4
@@ -4737,6 +5935,7 @@ mod tests {
         let (owner, _mailbox) = std::sync::mpsc::channel();
         let within = Duration::from_secs(10);
         let ctx = HealCtx {
+            partition_count: 1,
             store: Arc::new(config_testkit::MemStore::new()),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -4745,6 +5944,8 @@ mod tests {
             within,
             member_boot: Arc::new(|node| (node != NodeId(4)).then_some(OPEN_2)),
             owner_node: OWNER,
+            partitions: vec![PARTITION],
+            bootstrap: Vec::new(),
         };
         let pinned = [
             (1, ReplicaRole::Primary),

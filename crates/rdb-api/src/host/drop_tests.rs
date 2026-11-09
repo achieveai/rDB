@@ -52,6 +52,7 @@ fn key(request: u64) -> Bytes {
 fn present(trio: &mut Trio, request: u64, asked_as: u64) -> bool {
     let get = ClientCall::Get {
         identity: identity(asked_as),
+        group: AffinityId(1),
         object: key(request),
         look: Look::Doc,
     };
@@ -2578,10 +2579,17 @@ fn promote_in(
     within: Duration,
 ) -> Result<crate::admin::Promoted, crate::admin::PromoteError> {
     let at = usize::try_from(to - 1).expect("a trio node");
-    let (members, members_version) =
-        crate::admin::promote_members(NodeId(to), Some(trio.status(at)), Duration::from_secs(1))?;
+    let (members, members_version) = crate::admin::promote_members(
+        crate::admin::PARTITION,
+        NodeId(to),
+        Some(trio.status(at)),
+        Duration::from_secs(1),
+    )?;
     let links = Arc::clone(&trio.links);
     let ctx = crate::admin::PromoteCtx {
+        partition: crate::admin::PARTITION,
+        owner_must_be_dead: false,
+        look_within: Duration::from_secs(1),
         store: Arc::clone(store),
         budgets: trio.nodes[0].0.budgets,
         clock: trio.clock,
@@ -2692,7 +2700,7 @@ fn m10_s2_c2_a_promote_from_an_older_configuration_is_refused_before_it_writes()
     assert!(
         matches!(
             refused,
-            crate::admin::PromoteError::StaleMembers { node: 2, held: h, current: c }
+            crate::admin::PromoteError::StaleMembers { node: 2, held: h, current: c, partition: 1 }
                 if h == held && c == held + 1
         ),
         "{refused:?}"

@@ -48,6 +48,9 @@ struct Inner {
     buffered: BTreeMap<(NodeId, NodeId), VecDeque<Msg>>,
     /// Dropped directions, `(from, to)`: what is sent on one is lost.
     dropped: BTreeSet<(NodeId, NodeId)>,
+    /// [`Links::drop_next_restore`].
+    #[cfg(test)]
+    drop_next_restore: BTreeSet<NodeId>,
 }
 
 const fn pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
@@ -140,6 +143,11 @@ impl Links {
             tracing::info!(from = from.0, to = to.0, "link_dropped");
             return Ok(());
         }
+        #[cfg(test)]
+        if matches!(msg, Msg::Restore { .. }) && inner.drop_next_restore.remove(&to) {
+            tracing::info!(from = from.0, to = to.0, "link_restore_dropped");
+            return Ok(());
+        }
         if inner.held.contains(&pair(from, to)) {
             let queue = inner.buffered.entry((from, to)).or_default();
             queue.push_back(msg);
@@ -181,6 +189,12 @@ impl Links {
         let inner = self.lock();
         let mailbox = inner.mailboxes.get(&to).ok_or(LinkFault::Unreachable)?;
         mailbox.send(msg).map_err(|_| LinkFault::Unreachable)
+    }
+
+    /// Lose the next `Msg::Restore` sent to `to`, once: a catch-up's frame then beats its plan.
+    #[cfg(test)]
+    pub(crate) fn drop_next_restore(&self, to: NodeId) {
+        self.lock().drop_next_restore.insert(to);
     }
 
     /// Hold the link between `a` and `b`, both directions. Holding a held link is a no-op.
@@ -333,6 +347,7 @@ mod tests {
         // The spec holds a resume for 5 s; a restart waits for ready, so cut that short.
         let fast = crate::host::test_budgets();
         let config = DbConfig {
+            partitions: None,
             ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),

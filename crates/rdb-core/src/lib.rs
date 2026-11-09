@@ -40,6 +40,7 @@
 
 pub mod authority;
 pub mod contracts;
+pub mod partition_map;
 pub mod placement;
 pub mod protection;
 pub mod publication;

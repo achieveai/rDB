@@ -148,6 +148,19 @@ impl Replication {
             .restore_history(rungs)
     }
 
+    /// Keep F1's `plan` on the receiver for `(node, partition)`, live or dormant, if one is
+    /// installed (#79 S3b): see [`AppendReceiver::keep_recovery_plan`].
+    pub fn keep_recovery_plan(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        plan: append::CatchUpPlan,
+    ) {
+        if let Some(receiver) = self.receivers.get_mut(&(node, partition)) {
+            receiver.keep_recovery_plan(plan);
+        }
+    }
+
     /// Give the primary for `(node, partition)` the digests its own engine holds, on demand
     /// (K3, lead ruling A-R223): the consumer of `SnapshotCatchupRequired` calls this once per
     /// copy and barrier, and the copy's next `NeedPrefix` walks it record by record instead of
@@ -545,15 +558,13 @@ impl Replication {
                     }
                 }
             }
-            Some(own) => {
-                if !self.receivers.contains_key(&key) {
-                    match fresh_receiver(own.copy, result) {
-                        Some(receiver) => self.install_receiver(receiver),
-                        None => refused = Some(ReplicaIgnoreReason::InvalidConfig),
-                    }
+            Some(own) if !self.receivers.contains_key(&key) => {
+                match fresh_receiver(own.copy, result) {
+                    Some(receiver) => self.install_receiver(receiver),
+                    None => refused = Some(ReplicaIgnoreReason::InvalidConfig),
                 }
             }
-            None => {}
+            _ => {}
         }
         let receiver = self.receivers.get_mut(&key);
         let primary = self.primaries.get_mut(&key);

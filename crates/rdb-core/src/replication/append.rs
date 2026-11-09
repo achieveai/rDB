@@ -153,6 +153,33 @@ pub struct AppendReceiver {
     /// `Recovered` (lead ruling A-R173): it serves recovery appends and catch-up sourcing only,
     /// and fences every plain append. `Recovered` drops it and builds today's side instead.
     dormant: bool,
+    /// The plan F1 delivered for a recovery in flight (#79 S3b): whom this copy may take that
+    /// recovery's credentialed appends from. In memory only, and only ever read under a
+    /// credential it [names](CatchUpPlan::names); `Recovered` clears it.
+    recovery_plan: Option<CatchUpPlan>,
+}
+
+/// F1's plan for a recovery, as `Msg::Restore` delivers it to a copy it is about to catch up:
+/// the configuration naming this open's boots, and the prior lineage and control revision of
+/// the credential that recovery's appends carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpPlan {
+    /// The plan's configuration.
+    pub config: PartitionConfig,
+    /// The prior lineage.
+    pub lineage: Lineage,
+    /// The control revision of the fence.
+    pub revision: Revision,
+}
+
+impl CatchUpPlan {
+    /// Whether this is the plan of the recovery `fence` belongs to: generation, epoch and
+    /// control revision all match.
+    fn names(&self, fence: &FenceCredential) -> bool {
+        self.lineage.generation == fence.prior_generation
+            && self.lineage.owner_epoch == fence.prior_owner_epoch
+            && self.revision == fence.control_revision
+    }
 }
 
 /// What the ladder decided. Only `Accept` and `Quarantine` write state.
@@ -214,6 +241,7 @@ impl AppendReceiver {
             authority_seq: 0,
             retired: false,
             dormant: false,
+            recovery_plan: None,
         })
     }
 
@@ -267,7 +295,21 @@ impl AppendReceiver {
             authority_seq: 0,
             retired: false,
             dormant: true,
+            recovery_plan: None,
         })
+    }
+
+    /// Keep F1's `plan` for the recovery in flight, replacing any plan held (#79 S3b). A
+    /// credentialed append that plan names is checked against the plan's boots instead of the
+    /// pin; nothing else reads it.
+    pub fn keep_recovery_plan(&mut self, plan: CatchUpPlan) {
+        self.recovery_plan = Some(plan);
+    }
+
+    /// The plan held for a recovery in flight, if any.
+    #[must_use]
+    pub const fn recovery_plan(&self) -> Option<&CatchUpPlan> {
+        self.recovery_plan.as_ref()
     }
 
     /// Give a dormant receiver the digests its engine verified, `(0, ROOT)` through its applied
@@ -649,14 +691,41 @@ impl AppendReceiver {
 
     /// Row 6's sender half: the authenticated peer is the pinned primary. Under a fence, row
     /// 6R′: the peer is the copy the credential names, and that copy is not a shadow.
+    ///
+    /// Under a credential the boot compared is the one in the plan F1 delivered for that
+    /// credential, or the pin when no plan matches (#79 S3b): the pin still names a restarted
+    /// recoverer's dead boot, and a plan names the boot it runs now. A plain append never reads
+    /// the plan.
     fn sender_admitted(&self, from: &PeerLabel, fence: Option<&FenceCredential>) -> bool {
-        let Some(member) = self.config.copy_of(from) else {
-            return false;
+        let Some(fence) = fence else {
+            return self
+                .config
+                .copy_of(from)
+                .is_some_and(|member| member.role == ReplicaRole::Primary);
         };
-        match fence {
-            None => member.role == ReplicaRole::Primary,
-            Some(fence) => member.copy == fence.sender && member.role != ReplicaRole::Shadow,
+        let plan = self.recovery_plan.as_ref().filter(|plan| plan.names(fence));
+        let config = plan.map_or(&self.config, |plan| &plan.config);
+        let admitted = config.copy_of(from).is_some_and(|member| {
+            member.copy == fence.sender && member.role != ReplicaRole::Shadow
+        });
+        if !admitted {
+            let boot_in = |config: &PartitionConfig| {
+                config
+                    .members
+                    .iter()
+                    .find(|member| member.node == from.node)
+                    .map(|member| member.boot.0)
+            };
+            tracing::warn!(
+                partition = self.lineage.partition.0,
+                from = from.node.0,
+                from_boot = from.boot.0,
+                plan_boot = ?plan.map(|plan| boot_in(&plan.config)),
+                pinned_boot = ?boot_in(&self.config),
+                "recovery_append_not_admitted"
+            );
         }
+        admitted
     }
 
     /// Row 8: sequence and ancestry, against the accept head.

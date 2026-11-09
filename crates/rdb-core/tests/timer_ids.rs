@@ -14,7 +14,7 @@ use rdb_core::authority::AuthorityTimer;
 use rdb_core::contracts::ids::{PartitionId, TimerId};
 use rdb_core::protection::HEALTH_EVAL_TIMER;
 use rdb_core::publication::post_apply_timer;
-use rdb_core::recovery::DISCOVERY_TIMER;
+use rdb_core::recovery::{discovery_timer, DISCOVERY_TIMER};
 use rdb_core::replication::catchup::retransmit_timer;
 use rdb_core::replication::primary::keepalive_timer;
 
@@ -40,7 +40,7 @@ fn modules() -> Vec<(&'static str, Vec<TimerId>)> {
         ("A1", AuthorityTimer::ALL.iter().map(|k| k.id()).collect()),
         ("L1", vec![HEALTH_EVAL_TIMER]),
         ("P1", per_partition(post_apply_timer)),
-        ("F1", vec![DISCOVERY_TIMER]),
+        ("F1", per_partition(discovery_timer)),
         (
             "R1",
             [

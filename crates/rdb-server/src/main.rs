@@ -192,6 +192,7 @@ async fn run_async(args: &Args, rt: &tokio::runtime::Runtime) -> ExitCode {
     };
     let timeouts = Timeouts::default();
     let config = DbConfig {
+        partitions: None,
         ack_floor: true,
         // An app holds no copy and claims no folder: `dir` is not used.
         dir: args.log_dir.clone(),

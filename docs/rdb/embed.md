@@ -111,6 +111,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let store: Arc<dyn config_core::ConfigStore> = Arc::new(client);
     let config = DbConfig {
+        partitions: None,
         ack_floor: true,
         dir: "C:/my-app/data".into(),
         hold: Vec::new(),
@@ -244,6 +245,104 @@ fn profile(db: &Db) -> Result<Vec<(Value, Value)>, Box<dyn Error>> {
 - Sets work the same way with `Change::Set` and `ElemOp::Add` / `ElemOp::Remove`.
 - This code is compiled and run by the rows in `crates/rdb-api/src/db/reopen_tests.rs`
   (`guide_sample`), so it matches this release.
+
+### How big a transaction can be
+
+A transaction must fit one record of at most 1,048,576 bytes
+(`rdb_core::replication::append::MAX_ENVELOPE_BYTES`). For byte writes (`put`, `put_in`, `txn`,
+`txn_as`), this sum is exact:
+
+```text
+record = 265 + for each put: value_len + id_len + zero_bytes_in_id + 65 + head + create
+```
+
+- **265** is the cost of the transaction, however many puts it has.
+- **65** is the cost of each key: 15 for its key layout, 10 for its write framing, 40 for the
+  object header.
+- **head** is the value's length prefix: 1 byte under 24 bytes, 2 under 256, 3 under 65,536,
+  and 5 from there up.
+- **create** is 1 when the object does not exist yet and `if_version` is `None`, otherwise 0.
+- A zero byte in an object id is stored as two bytes, so it counts twice.
+
+To size a cap, use the upper bound for every put: `value_len + id_len + zero_bytes_in_id + 71`.
+
+- 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
+  ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
+- The largest single value is 1,048,240 bytes less the id's length, for a create.
+
+A transaction one byte over is refused with `INVALID_ARGUMENT`, and nothing is written:
+
+| Over the limit | Refused by | Detail |
+|---|---|---|
+| One put, alone | the compile, with the kernel's `record_len` | `over the 1 MiB limit for the whole write` |
+| Only all the puts together | the kernel's admission check | `envelope_bytes` |
+
+- A single value of 1 MiB or more can get a different detail, naming the 1,048,536-byte limit for
+  one value (`rdb_value::envelope::MAX_PAYLOAD`). Sent to an owner in another process, it reads
+  `a value cannot be carried`. Both are `INVALID_ARGUMENT`. The record limit above is always the
+  lower one.
+- The ack floor uses only the room a transaction leaves, so it is not part of the sum.
+- `write` (`Change::Doc`, maps, sets, lists and blob chunks) has the same limit, but its overhead
+  differs, so this sum does not apply to it.
+
+### More than one partition
+
+`DbConfig::partitions` sets how many partitions a database is formed with, 1 to 512
+(`Some(1)` and `None` form one). The count is fixed when the database is formed. An open that
+asks for a different count is refused with `OpenError::Mismatch`.
+
+Above one partition, every call must say which affinity group it is in:
+
+- Use `put_in`, `get_in`, `read_in`, `write_in`, `write_as_in` and `status_in`.
+- `txn` and `txn_as` already carry the group, on each `TxnPut`. The first put's group picks the
+  partition. Mixed groups are still `CROSS_AFFINITY`.
+- A call with no group is refused with `INVALID_ARGUMENT`, naming the call and what to use.
+- `get_previous` has no group form, so it is refused.
+- `promote` is refused above one partition. Use `promote_partition`, below.
+- `move_copy`, `pinned_members`, `rebuild` and the dev damage tools are refused for now.
+
+The key map is a compatibility promise. `rdb_api::affinity_hash(TENANT, group)` gives the same
+answer in every rDB version, so you may store it. Store the group and this hash, never a
+partition id. `partition_of(hash, n)` is only valid while the database has its original
+partitions; a partition that later splits can leave it naming the parent of a key.
+
+Do not open such a database with an older build: that build knows nothing of the extra
+partitions and would treat it as partition 1.
+
+**Seeing and moving partitions.** `db.readiness()` returns one `PartitionReady` per partition:
+its owner, whether it is ready, and if not, why (`NoLink`, `NoAnswer`, `Recovering`, `Paused`,
+`Fenced`, `Faulted`). It asks every owner at once and waits at most `Timeouts::read`.
+
+`db.promote_partition(partition, to, drop)` moves one partition off a **dead** owner. Any `Db`
+can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_dev
+`admin promote 3 --partition 2`).
+
+- **It waits out the owner's grant.** About 3.2 s after the owner died, with the default 3 s
+  grant. If the promote is already waiting and the app retries at once, a partition's writes
+  stop for up to the grant plus about 0.45 s (measured 3.0 to 3.4 s). The app's own pause
+  between retries adds to that (measured 3.2 to 3.6 s with one).
+- **A live owner is refused**, as `PromoteError::OwnerAlive`, and nothing is written. The owner
+  must not answer a look, and its grant must not be renewing. `promote_partition` returns
+  `PromoteError`, so match on it: do not retry `OwnerAlive` while that node lives.
+- **Run them at once.** Promotes of different partitions do not wait for each other, and they
+  share the one grant wait. Give each its own thread: the call blocks.
+- **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
+  partition it still owns stops for good until that partition is moved too. Move each one. If
+  the node comes back first, its open fails with `HealError::Frozen`, naming what it still owns;
+  those partitions can still be moved while it runs.
+- **A frozen node cannot lead again** in this release. It can start and hold copies once it owns
+  nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`.
+- **Other partitions that had a copy on the dead node pause too.** A partition keeps writing for
+  about 2 s after losing a copy, then pauses. It drops that copy by itself about 12 s after the
+  node died and resumes. That is not caused by a promote and a promote does not shorten it.
+- **While a node is down, a surviving node that restarts cannot finish opening until the dead
+  node returns or the partitions it co-owns are promoted with `--drop`, which costs that
+  surviving node its leadership.** Its open keeps logging `heal_retry` for the dead node. The
+  way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
+  it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
+  node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
+  copies from then on and cannot lead again in this release, and the moved partition stays
+  paused until its other copy is back, because that copy was on the stopped node.
 
 ## 5. Reopening your folder
 

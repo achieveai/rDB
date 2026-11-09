@@ -26,6 +26,7 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn config(dir: &std::path::Path) -> DbConfig {
     DbConfig {
+        partitions: None,
         ack_floor: true,
         dir: dir.to_path_buf(),
         hold: Vec::new(),

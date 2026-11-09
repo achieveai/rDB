@@ -79,7 +79,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireCall::Rebuild` and `WireAnswer::Rebuilt` (M11 T12 over processes) were added under `4`
 /// too: no released build speaks it. So was `RecoveryPlan::must_hold` (PR #74, A-R477), which a
 /// routed `Plan` carries: a build speaking `3` is refused before it could misread one.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -172,6 +172,9 @@ struct Conn {
     /// Frames a hold keeps back, oldest first.
     held: Mutex<VecDeque<Frame>>,
     faults: Arc<Faults>,
+    /// Run once between the two halves of [`close`], so a row can place a call in between.
+    #[cfg(test)]
+    between_close_halves: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -321,7 +324,7 @@ impl Net {
             .max_decoding_message_size(MAX_FRAME)
             .max_encoding_message_size(MAX_FRAME);
             let tls = config.tls.server_tls_config();
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let incoming = accepted_streams(listener);
             let label = config.label.clone();
             tasks.push(tokio::spawn(
                 async move {
@@ -705,10 +708,10 @@ fn close(shared: &Shared, conn: &Arc<Conn>, reason: &str) {
     if lock(&shared.conns).remove(&conn.id).is_none() {
         return;
     }
-    let dropped = std::mem::take(&mut *lock(&conn.pending)).len();
-    // End the stream too, not only this side's record of it: a replaced link the peer still
-    // holds up is one it never dials again, and this side keeps no route to it (A-R320).
-    lock(&conn.tx).take();
+    // The route goes first. `Net::send` adds a waiter only under the routes lock and only to the
+    // link its route names, so after this nothing can join `pending`: a call either got in
+    // before, and the take below lets it go, or finds no link and is refused at once. Taken the
+    // other way round, a call in between waited on a dead link for its whole timeout.
     if let Label::Node(node) = &conn.peer {
         // Only free a route that still points here; a replaced link's route is already the
         // new one. Never called holding the routes lock: `install` closes after letting it go.
@@ -718,7 +721,28 @@ fn close(shared: &Shared, conn: &Arc<Conn>, reason: &str) {
             }
         }
     }
+    #[cfg(test)]
+    if let Some(between) = lock(&conn.between_close_halves).take() {
+        between();
+    }
+    let dropped = std::mem::take(&mut *lock(&conn.pending)).len();
+    // End the stream too, not only this side's record of it: a replaced link the peer still
+    // holds up is one it never dials again, and this side keeps no route to it (A-R320).
+    lock(&conn.tx).take();
     tracing::info!(peer = %conn.peer, conn = conn.id, dropped, reason, "net_link_down");
+}
+
+/// The sockets a node's listener accepts, each with Nagle off. tonic's own `tcp_nodelay` does
+/// not reach `serve_with_incoming`, which takes the sockets as given.
+fn accepted_streams(
+    listener: tokio::net::TcpListener,
+) -> impl tokio_stream::Stream<Item = std::io::Result<tokio::net::TcpStream>> {
+    tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
+        if let Ok(stream) = &accepted {
+            config_grpc::server::set_accepted_nodelay("rdb-net", stream);
+        }
+        accepted
+    })
 }
 
 fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<Conn> {
@@ -730,6 +754,8 @@ fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<
         next: AtomicU64::new(0),
         held: Mutex::new(VecDeque::new()),
         faults: Arc::clone(&shared.faults),
+        #[cfg(test)]
+        between_close_halves: Mutex::new(None),
     });
     lock(&shared.conns).insert(conn.id, Arc::clone(&conn));
     conn
@@ -1171,7 +1197,8 @@ async fn dial_once(
         .map_err(|error| format!("bad address {address}: {error}"))?
         .tls_config(tls.client_tls_config_for(&certs::node_domain(node)))
         .map_err(|error| format!("tls config: {error}"))?
-        .connect_timeout(CONNECT);
+        .connect_timeout(CONNECT)
+        .tcp_nodelay(true);
     let failed = match tokio::time::timeout(CONNECT, endpoint.connect()).await {
         Ok(Ok(channel)) => Ok(channel),
         Ok(Err(error)) if tls_refused(&error) => {

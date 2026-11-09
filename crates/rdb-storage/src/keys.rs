@@ -167,7 +167,9 @@ pub(crate) fn decode_publish_marks(raw: &[u8]) -> Option<Vec<PublishMark>> {
     if !raw.len().is_multiple_of(PUBLISH_MARK_LEN) {
         return None;
     }
-    raw.chunks_exact(PUBLISH_MARK_LEN)
+    raw.as_chunks::<PUBLISH_MARK_LEN>()
+        .0
+        .iter()
         .map(|mark| {
             Some(PublishMark {
                 generation: Generation(decode_mark(&mark[0..8])?),
@@ -208,7 +210,9 @@ pub(crate) fn decode_revoked(raw: &[u8]) -> Option<BTreeSet<OwnerEpoch>> {
     if raw.is_empty() || !raw.len().is_multiple_of(8) {
         return None;
     }
-    raw.chunks_exact(8)
+    raw.as_chunks::<8>()
+        .0
+        .iter()
         .map(|epoch| decode_mark(epoch).map(OwnerEpoch))
         .collect()
 }

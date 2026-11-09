@@ -23,15 +23,16 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use config_core::ConfigStore;
 use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN};
-use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
-    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, RequestId,
-    RequestIdentity, Seq, TenantId,
+    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RangeId,
+    RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
+use rdb_core::partition_map::{affinity_hash, partition_of, RoutesRoot, MAX_PARTITIONS};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
 use rdb_storage::RocksEngine;
 /// The storage engine's options, set per open through [`DbConfig::storage`] (ruling A-R248).
@@ -57,7 +58,7 @@ const OWNER: NodeId = admin::OWNER;
 
 /// The only tenant S0 writes as. Not settable by a caller (lead ruling, 2026-10-07: no raw
 /// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
-const TENANT: TenantId = TenantId(1);
+pub const TENANT: TenantId = TenantId(1);
 
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads. A [`TxnPut`] names it
 /// as its `group` to write where `put` and `get` do.
@@ -140,6 +141,11 @@ pub struct DbConfig {
     /// The data directory. Each node's RocksDB goes under `<dir>/nodes/<n>`. Must not hold a
     /// `nodes/` yet, even an empty one: an open claims it by creating it.
     pub dir: PathBuf,
+    /// How many partitions the database has (issue #79), fixed when it is formed: 1 to
+    /// [`MAX_PARTITIONS`]. `None` takes the count the control store holds, and forms one
+    /// partition when it holds none. `Some(n)` that differs from what is formed is
+    /// [`OpenError::Mismatch`]. Above 1, a group-less call is refused: use the `_in` forms.
+    pub partitions: Option<u32>,
     /// Peer links to hold from the start, as `(a, b)` node pairs.
     pub hold: Vec<(NodeId, NodeId)>,
     /// Call timeouts.
@@ -251,6 +257,7 @@ impl DbConfig {
     /// [`OpenError::Config`] when [`Self::ack_floor`] is on and [`Self::dedup_cap`] is below
     /// [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`].
     pub fn check(&self) -> Result<(), OpenError> {
+        partitions_refusal(self.partitions).map_err(open_refused)?;
         limits(self.dedup_cap, self.ack_floor)
             .map(|_| ())
             .map_err(open_refused)
@@ -276,6 +283,8 @@ pub struct TxnPut<'a> {
 pub struct PutOk {
     /// The request id, for `status` and `retry`.
     pub request: RequestId,
+    /// The partition it landed in.
+    pub partition: PartitionId,
     /// The generation it published in.
     pub generation: Generation,
     /// The owner epoch that ran it.
@@ -556,30 +565,99 @@ const OWNER_REREAD_GAP: Duration = Duration::from_millis(250);
 /// Where a `Db` sends its calls (ruling A-R226 h2): the owner `partitions/1` names, and, for a
 /// `Db` that can look again, the store and runtime it reads the record with.
 struct Route {
-    /// The node calls go to.
-    owner: std::sync::atomic::AtomicU32,
+    /// The node calls go to, per partition: index `p - 1`, one entry at N=1.
+    owners: Vec<std::sync::atomic::AtomicU32>,
     /// What a `NOT_PRIMARY` answer, or an owner that cannot be reached, re-reads `partitions/1`
     /// with. `None`: the owner is fixed.
     refresh: Option<(Arc<dyn ConfigStore>, Handle)>,
-    /// When `refresh` last read `partitions/1`. A read within [`OWNER_REREAD_GAP`] of it is not
-    /// made: the call goes on with the owner that read named (A-R299).
-    last_read: Mutex<Option<Instant>>,
+    /// When `refresh` last read each partition's record, by partition number. A read within
+    /// [`OWNER_REREAD_GAP`] of it is not made: the call goes on with the owner that read named
+    /// (A-R299).
+    last_read: Mutex<BTreeMap<u32, Instant>>,
 }
 
 impl Default for Route {
     fn default() -> Self {
         Self {
-            owner: std::sync::atomic::AtomicU32::new(OWNER.0),
+            owners: vec![std::sync::atomic::AtomicU32::new(OWNER.0)],
             refresh: None,
-            last_read: Mutex::new(None),
+            last_read: Mutex::new(BTreeMap::new()),
         }
     }
 }
 
 impl Route {
+    /// Partition 1's owner.
     fn owner(&self) -> NodeId {
-        NodeId(self.owner.load(Ordering::Relaxed))
+        self.owner_of(PARTITION)
     }
+
+    /// `partition`'s owner. A partition this `Db` was not opened with never reaches here:
+    /// [`Db::partition_for`] maps into `1..=N`, and every other caller names [`PARTITION`].
+    fn owner_of(&self, partition: PartitionId) -> NodeId {
+        NodeId(self.owners[partition.0 as usize - 1].load(Ordering::Relaxed))
+    }
+
+    fn partitions(&self) -> u32 {
+        u32::try_from(self.owners.len()).expect("at most MAX_PARTITIONS owners")
+    }
+}
+
+/// One partition's state as [`Db::readiness`] saw it (issue #79).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionReady {
+    /// The partition.
+    pub partition: PartitionId,
+    /// The node asked, the owner this `Db` knows.
+    pub owner: NodeId,
+    /// Whether the owner admits writes now.
+    pub ready: bool,
+    /// Why not; `None` when ready.
+    pub reason: Option<NotReady>,
+}
+
+/// Why a partition is not ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NotReady {
+    /// No link to the owner.
+    NoLink,
+    /// The owner did not answer within the read timeout.
+    NoAnswer,
+    /// The owner is still recovering it, in this phase.
+    Recovering(String),
+    /// Its protection does not admit writes, in this mode.
+    Paused(String),
+    /// The owner is fenced, for this reason.
+    Fenced(String),
+    /// The owner's host faulted, with this text.
+    Faulted(String),
+}
+
+/// Why `status` is not ready, `None` when it admits writes.
+fn not_ready(status: &NodeStatus) -> Option<NotReady> {
+    if status.admits == Some(true) {
+        return None;
+    }
+    Some(if let Some(fault) = &status.fault {
+        NotReady::Faulted(fault.clone())
+    } else if let Some(fence) = &status.fence {
+        NotReady::Fenced(format!("{fence:?}"))
+    } else if status.admits.is_none() {
+        NotReady::Recovering(
+            status
+                .recovery
+                .clone()
+                .unwrap_or_else(|| NO_RECOVERY.to_owned()),
+        )
+    } else {
+        NotReady::Paused(
+            status
+                .protection
+                .clone()
+                .unwrap_or_else(|| NO_RECOVERY.to_owned()),
+        )
+    })
 }
 
 /// The kind a node refused a call with, for a put's or a status look's error and a read's
@@ -604,17 +682,18 @@ const fn rereads_owner(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::NotPrimary | ErrorKind::LeaseExpired)
 }
 
-/// The node `partitions/1` names as owner, its instance, and the record's mod revision.
+/// The node `partitions/{partition}` names as owner and its instance.
 ///
 /// # Errors
 ///
 /// [`OpenError::Control`] when the store does not answer, and [`OpenError::Config`] when it
-/// holds no `partitions/1` yet: a node process must form the database first.
+/// holds no such record yet: a node process must form the database first.
 /// [`OpenError::Undecodable`] when the record, or its instance, does not decode.
 async fn read_owner(
     store: &Arc<dyn ConfigStore>,
+    partition: PartitionId,
 ) -> Result<(NodeId, [u8; INSTANCE_LEN]), OpenError> {
-    let key = ControlKey::Partition(PARTITION).encode();
+    let key = ControlKey::Partition(partition).encode();
     let read = store
         .get(config_core::GetRequest {
             key: Bytes::from(key.clone()),
@@ -625,25 +704,208 @@ async fn read_owner(
                 config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
                 _ => "",
             };
-            OpenError::Control(format!("get partitions/1: {error}{step}"))
+            OpenError::Control(format!("get partitions/{}: {error}{step}", partition.0))
         })?;
     let found = read.record.ok_or_else(|| {
-        OpenError::Config(
-            "the control store holds no partitions/1, so no node serves this database yet: \
-             form the database first (lr up), then open again"
-                .to_owned(),
-        )
+        OpenError::Config(format!(
+            "the control store holds no partitions/{}, so no node serves this database yet: \
+             form the database first (lr up), then open again",
+            partition.0
+        ))
     })?;
     let record = PartitionRecord::decode(&found.value)
         .ok_or_else(|| undecodable(&key, "not a partition record this build reads"))?;
     let root = PartitionRoot::decode(&found.value).ok_or_else(|| {
-        OpenError::Config(
-            "partitions/1 names no instance yet, so the database is still forming: wait for \
-             its first open (lr up) to finish, then open again"
-                .to_owned(),
-        )
+        OpenError::Config(format!(
+            "partitions/{} names no instance yet, so the database is still forming: wait for \
+             its first open (lr up) to finish, then open again",
+            partition.0
+        ))
     })?;
     Ok((record.owner, root.instance))
+}
+
+/// The refusal of a partition count no database can have (issue #79, ruling Q3): 0, or above
+/// [`MAX_PARTITIONS`]. Run before anything is created or written.
+fn partitions_refusal(partitions: Option<u32>) -> Result<(), OpenError> {
+    match partitions {
+        Some(n) if !(1..=MAX_PARTITIONS).contains(&n) => Err(OpenError::Config(format!(
+            "partitions {n} is out of range: a database has 1 to {MAX_PARTITIONS} partitions; \
+             nothing was created"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// What `routes/0` says the partition count is, `None` when the store holds no such key.
+///
+/// # Errors
+///
+/// [`OpenError::Control`] when the store does not answer, [`OpenError::Undecodable`] when the
+/// value is not a root this build reads.
+async fn read_partition_count(store: &Arc<dyn ConfigStore>) -> Result<Option<u32>, OpenError> {
+    let key = ControlKey::Route(RangeId(0)).encode();
+    let read = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| {
+            let step = match error {
+                config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
+                _ => "",
+            };
+            OpenError::Control(format!("get {key}: {error}{step}"))
+        })?;
+    read.record
+        .map(|found| {
+            RoutesRoot::decode(&found.value)
+                .map(|root| root.partition_count)
+                .ok_or_else(|| undecodable(&key, "not a routes root this build reads"))
+        })
+        .transpose()
+}
+
+/// The partition count an open runs with (issue #79, design section 2), from what it `asked`
+/// for, what `routes/0` holds, and whether this open forms the database (`fresh`).
+///
+/// # Errors
+///
+/// [`OpenError::Mismatch`] when the ask differs from what is formed. [`OpenError::Config`] for
+/// what this build cannot do above one partition yet: a node process, or reopening.
+async fn open_partition_count(
+    store: &Arc<dyn ConfigStore>,
+    asked: Option<u32>,
+    fresh: bool,
+) -> Result<u32, OpenError> {
+    let stored = read_partition_count(store).await?;
+    let count = match (asked, stored) {
+        (Some(asked), Some(stored)) if asked != stored => {
+            return Err(OpenError::Mismatch(format!(
+                "this open asks for {asked} partitions and the control store's routes/0 says \
+                 {stored}: the count is fixed when a database is formed"
+            )));
+        }
+        (Some(asked), None) if asked > 1 && !fresh => {
+            return Err(OpenError::Mismatch(format!(
+                "this open asks for {asked} partitions and the database was formed with one: \
+                 the count is fixed when a database is formed"
+            )));
+        }
+        (_, Some(stored)) => stored,
+        (asked, None) => asked.unwrap_or(1),
+    };
+    Ok(count)
+}
+
+/// How the control store holds one partition (issue #79, design 7.2).
+enum PartitionState {
+    /// No record: the formation never wrote it.
+    Absent,
+    /// A record that names no instance yet. `untouched` when it was written once, at generation
+    /// 0, as the formation wrote it.
+    Unrooted { untouched: bool },
+    /// A record with a root.
+    Rooted(PartitionRecord, PartitionRoot),
+}
+
+/// The step for a formation that did not finish.
+const RERUN_FORM: &str =
+    "run the command that formed it again, with the same --dir, --control and --partitions";
+
+/// How partition 1 to `count` each stand, in that order, from one `list` of `partitions/` (issue
+/// #79). A failed or truncated list is never read as a complete one.
+///
+/// # Errors
+///
+/// [`OpenError::Control`] when the store does not answer or truncates, and
+/// [`OpenError::Undecodable`] for a record that does not decode.
+async fn partition_states(
+    store: &Arc<dyn ConfigStore>,
+    count: u32,
+) -> Result<Vec<(PartitionId, PartitionState)>, OpenError> {
+    let prefix = ControlPrefix::Partitions.encode();
+    let listed = store
+        .list(config_core::ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| OpenError::Control(format!("list {prefix}: {error}")))?;
+    if listed.truncated {
+        return Err(OpenError::Control(format!(
+            "list {prefix} came back truncated at revision {}",
+            listed.read_revision
+        )));
+    }
+    let mut states = Vec::with_capacity(count as usize);
+    for id in 1..=count {
+        let partition = PartitionId(id);
+        let key = ControlKey::Partition(partition).encode();
+        let Some(found) = listed
+            .records
+            .iter()
+            .find(|record| record.key.as_ref() == key.as_bytes())
+        else {
+            states.push((partition, PartitionState::Absent));
+            continue;
+        };
+        let record = PartitionRecord::decode(&found.value)
+            .ok_or_else(|| undecodable(&key, "not a partition record this build reads"))?;
+        let state = match PartitionRoot::decode(&found.value) {
+            Some(root) => PartitionState::Rooted(record, root),
+            None => PartitionState::Unrooted {
+                untouched: found.create_revision == found.mod_revision
+                    && record.generation == Generation(0),
+            },
+        };
+        states.push((partition, state));
+    }
+    Ok(states)
+}
+
+/// Why a process that does not form the database cannot use `partition`, which `state` shows
+/// is still forming. `None` when it has a root.
+fn unformed_refusal(
+    partition: PartitionId,
+    count: u32,
+    state: &PartitionState,
+) -> Option<OpenError> {
+    let key = ControlKey::Partition(partition).encode();
+    match state {
+        PartitionState::Absent => Some(OpenError::Config(format!(
+            "the control store holds no {key} and the database has {count} partitions: its \
+             formation did not finish; {RERUN_FORM}"
+        ))),
+        PartitionState::Unrooted { .. } => Some(OpenError::Config(format!(
+            "{key} names no instance yet, so the database is still forming: wait for its first \
+             open (lr up) to finish, then open again; if that open stopped, {RERUN_FORM}"
+        ))),
+        PartitionState::Rooted(..) => None,
+    }
+}
+
+/// One record per partition 1 to `count`, in that order (issue #79).
+///
+/// # Errors
+///
+/// As [`partition_states`], and [`OpenError::Config`] for a partition with no record or no
+/// instance: its formation did not finish.
+async fn partition_records(
+    store: &Arc<dyn ConfigStore>,
+    count: u32,
+) -> Result<Vec<(PartitionId, PartitionRecord, PartitionRoot)>, OpenError> {
+    let mut records = Vec::with_capacity(count as usize);
+    for (partition, state) in partition_states(store, count).await? {
+        if let Some(refused) = unformed_refusal(partition, count, &state) {
+            return Err(refused);
+        }
+        if let PartitionState::Rooted(record, root) = state {
+            records.push((partition, record, root));
+        }
+    }
+    Ok(records)
 }
 
 /// Whether node processes for `nodes` may start on empty copies (ruling A-R328, narrowing
@@ -680,7 +942,7 @@ async fn formed_member(
     let Some(found) = read.record else {
         return Err(OpenError::Config(format!(
             "database not formed: the control store holds no partitions/1, so node {named} has \
-             no database to rejoin. Run lr up to form it"
+             no database to rejoin. Run lr up to form it; if a form stopped, {RERUN_FORM}"
         )));
     };
     let record = PartitionRecord::decode(&found.value)
@@ -688,7 +950,7 @@ async fn formed_member(
     let Some(root) = PartitionRoot::decode(&found.value) else {
         return Err(OpenError::Config(format!(
             "database not formed yet: partitions/1 names no instance. Wait for its first open \
-             (lr up) to finish, then start node {named} again"
+             (lr up) to finish, then start node {named} again; if that open stopped, {RERUN_FORM}"
         )));
     };
     // M11 WS A: a node past the formed members is a spare. Its empty copy binds the instance
@@ -995,6 +1257,7 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
+        partitions_refusal(config.partitions).map_err(open_refused)?;
         if config.local.is_empty() {
             return Self::open_app(config, store, rt, budgets)
                 .await
@@ -1026,8 +1289,10 @@ impl Db {
             store,
             rt,
             budgets,
-            move |node, engine, links, control, clock, boot| {
-                host::spawn_on(node, engine, links, control, clock, budgets, limits, boot)
+            move |node, engine, links, control, clock, boot, partitions| {
+                host::spawn_on(
+                    node, engine, links, control, clock, budgets, limits, boot, partitions,
+                )
             },
         )
         .await
@@ -1055,7 +1320,17 @@ impl Db {
                     .to_owned(),
             )
         })?;
-        let (owner, instance) = read_owner(&store).await?;
+        let (owner, instance) = read_owner(&store, PARTITION).await?;
+        let partitions = open_partition_count(&store, config.partitions, false).await?;
+        let owners = if partitions > 1 {
+            partition_records(&store, partitions)
+                .await?
+                .into_iter()
+                .map(|(_, record, _)| std::sync::atomic::AtomicU32::new(record.owner.0))
+                .collect()
+        } else {
+            vec![std::sync::atomic::AtomicU32::new(owner.0)]
+        };
         let n = admin::count_open(&*store, &instance, false, admin::COUNT_WITHIN)
             .await
             .map_err(|error| counter_refused(&instance, error))?;
@@ -1085,9 +1360,9 @@ impl Db {
                 ..Opened::default()
             },
             route: Route {
-                owner: std::sync::atomic::AtomicU32::new(owner.0),
+                owners,
                 refresh: Some((store, rt)),
-                last_read: Mutex::new(None),
+                last_read: Mutex::new(BTreeMap::new()),
             },
         })
     }
@@ -1106,6 +1381,7 @@ impl Db {
             Arc<ControlAdapter>,
             HostClock,
             BootId,
+            u32,
         ) -> Result<NodeHandle, String>,
     ) -> Result<Self, OpenError> {
         std::fs::create_dir_all(&config.dir)?;
@@ -1148,8 +1424,15 @@ impl Db {
             engines,
             created: created.then(|| nodes_dir.clone()),
         };
-        let found =
+        let mut found =
             Self::check(&mut claim.engines, absent, config.storage, &store, partial).await?;
+        let partitions = open_partition_count(&store, config.partitions, found.fresh).await?;
+        // Whenever `routes/0` exists: a partition 1 still to form says nothing of the others.
+        if partitions > 1 && (!found.fresh || read_partition_count(&store).await?.is_some()) {
+            found.others =
+                Self::check_others(&claim.engines, &store, partial, partitions, &found.instance)
+                    .await?;
+        }
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
             None => admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
@@ -1173,24 +1456,7 @@ impl Db {
                     },
                     other => refused(other),
                 })?;
-                for node in &roll.copies {
-                    // #62: a crash part way through the roll-forward, in one process.
-                    #[cfg(test)]
-                    if roll_stops_before(&config.dir, *node) {
-                        return Err(OpenError::Node(format!(
-                            "test hook: roll forward stopped before node {}",
-                            node.0
-                        )));
-                    }
-                    claim
-                        .engines
-                        .get_mut(node)
-                        .ok_or_else(|| OpenError::Node(format!("node {}: no engine", node.0)))?
-                        .inherit(PARTITION, roll.from, roll.to, roll.base)
-                        .map_err(|error| {
-                            OpenError::Node(format!("node {}: roll forward: {error}", node.0))
-                        })?;
-                }
+                Self::link_roll(&mut claim.engines, &config.dir, PARTITION, roll)?;
                 tracing::info!(
                     generation = roll.to.0,
                     from = roll.from.0,
@@ -1202,6 +1468,33 @@ impl Db {
                 n
             }
         };
+        for (partition, other) in &found.others {
+            let Some(roll) = &other.roll else { continue };
+            admin::claim_roll(
+                &*store,
+                &found.instance,
+                *partition,
+                roll.revision,
+                roll.count.activated,
+            )
+            .await
+            .map_err(|error| match error {
+                moved @ admin::CounterError::Moved { .. } => OpenError::Stale {
+                    generation: roll.to.0,
+                    detail: format!("not rolled forward: {moved}"),
+                },
+                other => refused(other),
+            })?;
+            Self::link_roll(&mut claim.engines, &config.dir, *partition, roll)?;
+            tracing::info!(
+                partition = partition.0,
+                generation = roll.to.0,
+                from = roll.from.0,
+                base = roll.base.0,
+                copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
+                "db_open_rolled_forward"
+            );
+        }
         let engines = std::mem::take(&mut claim.engines);
         let unwind = claim.created.take();
         drop(claim);
@@ -1243,9 +1536,22 @@ impl Db {
                 ..Opened::default()
             },
             route: Route {
-                owner: std::sync::atomic::AtomicU32::new(found.owner.0),
+                owners: if partitions > 1 && found.fresh && found.others.is_empty() {
+                    (1..=partitions)
+                        .map(|id| {
+                            std::sync::atomic::AtomicU32::new(
+                                admin::initial_owner(PartitionId(id)).0,
+                            )
+                        })
+                        .collect()
+                } else {
+                    found
+                        .owners()
+                        .map(|(_, owner)| std::sync::atomic::AtomicU32::new(owner.0))
+                        .collect()
+                },
                 refresh: partial.then(|| (Arc::clone(&store), rt.clone())),
-                last_read: Mutex::new(None),
+                last_read: Mutex::new(BTreeMap::new()),
             },
         };
         let mut failed = None;
@@ -1257,6 +1563,7 @@ impl Db {
                 Arc::clone(&db.control),
                 db.clock,
                 boot,
+                partitions,
             ) {
                 Ok(handle) => lock(&db.nodes).push(handle),
                 Err(detail) => {
@@ -1269,13 +1576,33 @@ impl Db {
         if let Some(detail) = failed {
             return Err(OpenError::Node(detail));
         }
-        if found.fresh {
-            admin::bootstrap_at(&store, db.clock.now(), boot, |msg| db.send_to(OWNER, msg)).await?;
-        } else if config.local.contains(&found.owner) {
-            db.start_heal(&store, &rt, budgets, boot, found.owner, &config.local)?;
+        if found.fresh && found.others.iter().all(|(_, other)| other.forms) {
+            admin::form(&store, db.clock.now(), boot, partitions, |node, msg| {
+                db.send_to(node, msg)
+            })
+            .await?;
         } else {
-            // The owner's process heals (arch-s2 B1): this one only runs its copy.
-            tracing::info!(owner = found.owner.0, "db_open_not_owner");
+            // A partition still to form joins its owner's heal, after the clear (design 7.2):
+            // its recovery must not acquire the grant the heal has yet to clear.
+            let forming = found.forming();
+            let formed = admin::write_records(&store, &forming).await?;
+            // One heal per owner this process runs, over all its partitions (issue #79).
+            let mut heals: BTreeMap<NodeId, OwnerHeal> = BTreeMap::new();
+            for (partition, owner) in found.owners() {
+                if config.local.contains(&owner) {
+                    let (rooted, to_form) = heals.entry(owner).or_default();
+                    match formed.iter().find(|(id, _)| *id == partition) {
+                        Some(written) => to_form.push(*written),
+                        None => rooted.push(partition),
+                    }
+                }
+            }
+            if heals.is_empty() {
+                // The owner's process heals (arch-s2 B1): this one only runs its copy.
+                tracing::info!(owner = found.owner.0, "db_open_not_owner");
+            } else {
+                db.start_heal(&store, &rt, budgets, boot, heals, &config.local)?;
+            }
         }
         db.unwind = None;
         Ok(db)
@@ -1317,11 +1644,15 @@ impl Db {
                 }
             }
             if engines.contains_key(&record.owner) {
-                return Err(OpenError::Config(format!(
-                    "the copy of node {} holds no data, and partition {} names it owner: promote \
-                     another node first (lr promote), then start node {} again",
-                    record.owner.0, PARTITION.0, record.owner.0
-                )));
+                let Some((_, PartitionState::Rooted(record, root))) =
+                    partition_states(store, PARTITION.0).await?.pop()
+                else {
+                    return Err(OpenError::Config(format!(
+                        "partition {} has not finished forming; {RERUN_FORM}",
+                        PARTITION.0
+                    )));
+                };
+                return Err(empty_owner_refusal(store, &instance, &record, &root).await);
             }
             for (node, engine) in engines.iter_mut() {
                 engine
@@ -1339,6 +1670,7 @@ impl Db {
                 fresh: false,
                 owner: record.owner,
                 roll: None,
+                others: Vec::new(),
             });
         }
         // A wipe that stopped after its move and before its synced bind (ruling A-R466) left an
@@ -1425,17 +1757,31 @@ impl Db {
             fresh: true,
             owner: OWNER,
             roll: None,
+            others: Vec::new(),
         };
         let untouched = read
             .record
             .as_ref()
             .is_some_and(|found| found.create_revision == found.mod_revision);
-        let (record, root) = match (holds_data, root) {
+        // Partition 1 alone (issue #79): a later partition may have landed first.
+        let holds_first = engines.values().any(holds_partition);
+        // A node process never forms (ruling A-R231(a)).
+        let form = || {
+            if partial {
+                Err(OpenError::Config(format!(
+                    "partition {} has not finished forming; {RERUN_FORM}",
+                    PARTITION.0
+                )))
+            } else {
+                Ok(fresh)
+            }
+        };
+        let (record, root) = match (holds_first, root) {
             // Nothing written yet: the bootstrap creates `partitions/1`, or adopts an untouched
             // generation-0 one, its own whose reply was lost.
-            (false, None) => return Ok(fresh),
+            (false, None) => return form(),
             (false, Some((record, None))) if untouched && record.generation == Generation(0) => {
-                return Ok(fresh)
+                return form()
             }
             // Another database's history (tester D1).
             (false, Some((_, None))) => {
@@ -1522,11 +1868,106 @@ impl Db {
                 engines.insert(node, engine);
             }
         }
+        let decided = Self::decide_partition(
+            engines, store, &instance, partial, PARTITION, &record, &root,
+        )
+        .await?;
+        Ok(Found {
+            instance,
+            fresh: false,
+            owner: decided.owner,
+            roll: decided.roll,
+            others: Vec::new(),
+        })
+    }
+
+    /// [`Self::check`] for partitions 2 to `count` (issue #79): one `list`, each record must name
+    /// this database's instance, and each partition is decided on its own.
+    async fn check_others(
+        engines: &BTreeMap<NodeId, RocksEngine>,
+        store: &Arc<dyn ConfigStore>,
+        partial: bool,
+        count: u32,
+        instance: &[u8; INSTANCE_LEN],
+    ) -> Result<Vec<(PartitionId, PartitionFound)>, OpenError> {
+        let mut others = Vec::with_capacity(count as usize - 1);
+        for (partition, state) in partition_states(store, count).await? {
+            if partition == PARTITION {
+                continue;
+            }
+            if partial {
+                if let Some(refused) = unformed_refusal(partition, count, &state) {
+                    return Err(refused);
+                }
+            }
+            let holds = engines
+                .values()
+                .flat_map(RocksEngine::lineages)
+                .any(|(held, _)| held == partition);
+            let key = ControlKey::Partition(partition).encode();
+            let (record, root) = match state {
+                PartitionState::Absent | PartitionState::Unrooted { untouched: true } if !holds => {
+                    let found = PartitionFound {
+                        owner: admin::initial_owner(partition),
+                        roll: None,
+                        forms: true,
+                    };
+                    others.push((partition, found));
+                    continue;
+                }
+                PartitionState::Absent => {
+                    return Err(OpenError::Mismatch(error::not_this_store_text(&format!(
+                        "the copies hold partition {}, but the store has no {key}",
+                        partition.0
+                    ))))
+                }
+                PartitionState::Unrooted { .. } if holds => {
+                    return Err(OpenError::Mismatch(error::not_this_store_text(&format!(
+                        "the copies hold partition {}, but {key} names no instance",
+                        partition.0
+                    ))))
+                }
+                PartitionState::Unrooted { .. } => {
+                    return Err(OpenError::Mismatch(another_database(
+                        instance,
+                        "an older database that names no instance",
+                    )))
+                }
+                PartitionState::Rooted(record, root) => (record, root),
+            };
+            if root.instance != *instance {
+                return Err(OpenError::Mismatch(error::not_this_store_text(&format!(
+                    "the copies name instance {}, partitions/{} names {}",
+                    admin::instance_hex(instance),
+                    partition.0,
+                    admin::instance_hex(&root.instance)
+                ))));
+            }
+            let decided = Self::decide_partition(
+                engines, store, instance, partial, partition, &record, &root,
+            )
+            .await?;
+            others.push((partition, decided));
+        }
+        Ok(others)
+    }
+
+    /// What this open does with `partition`, whose `record` and `root` were read from the store:
+    /// the copies serve it, they join behind it, or it rolls forward; otherwise a refusal.
+    async fn decide_partition(
+        engines: &BTreeMap<NodeId, RocksEngine>,
+        store: &Arc<dyn ConfigStore>,
+        instance: &[u8; INSTANCE_LEN],
+        partial: bool,
+        partition: PartitionId,
+        record: &PartitionRecord,
+        root: &PartitionRoot,
+    ) -> Result<PartitionFound, OpenError> {
         // PR #60 review F1: a copy staged into the generation and never switched in does not
         // hold it, so it does not stop the roll-forward that resumes it.
         let holds = engines
             .values()
-            .any(|engine| serves(engine, record.generation));
+            .any(|engine| serves(engine, partition, record.generation));
         // arch-s2 B1 case 2 (the lr up race): a node process whose copy is only behind the
         // record joins. The live owner's heal links it again; refusing it Stale here left a node
         // started after the owner's reopen out for good. A copy ahead of the record still falls
@@ -1536,37 +1977,40 @@ impl Db {
         let behind: Vec<u64> = engines
             .values()
             .flat_map(RocksEngine::lineages)
-            .filter(|(partition, _)| *partition == PARTITION)
+            .filter(|(held, _)| *held == partition)
             .map(|(_, held)| held.0)
             .collect();
+        if partial && behind.is_empty() && engines.contains_key(&record.owner) {
+            return Err(empty_owner_refusal(store, instance, record, root).await);
+        }
         if !holds
             && partial
             && !engines.contains_key(&record.owner)
             && behind.iter().all(|held| *held < record.generation.0)
         {
             tracing::info!(
+                partition = partition.0,
                 generation = record.generation.0,
                 owner = record.owner.0,
                 copies = ?behind,
                 "db_open_joining"
             );
-            return Ok(Found {
-                instance,
-                fresh: false,
+            return Ok(PartitionFound {
                 owner: record.owner,
                 roll: None,
+                forms: false,
             });
         }
         if !holds {
-            // Ruling A-R184: roll forward only what the open counter proves no host activated.
-            let (count, revision) = admin::read_count(&**store, &instance)
+            // Ruling A-R184: roll forward only what the open counter, or for a later partition
+            // its own mark, proves no host activated.
+            let (count, revision) = read_mark(store, instance, partition)
                 .await
-                .map_err(|error| counter_refused(&instance, error))?;
-            return match roll_forward_copies(engines, record.generation, &root, count) {
-                Ok(copies) => Ok(Found {
-                    instance,
-                    fresh: false,
+                .map_err(|error| counter_refused(instance, error))?;
+            return match roll_forward_copies(engines, partition, record.generation, root, count) {
+                Ok(copies) => Ok(PartitionFound {
                     owner: record.owner,
+                    forms: false,
                     roll: Some(Roll {
                         count,
                         revision,
@@ -1579,24 +2023,52 @@ impl Db {
                 Err(why) => Err(OpenError::Stale {
                     generation: record.generation.0,
                     detail: format!(
-                        "partitions/1 is {:?} at generation {}, the copies hold {:?}; {why}",
+                        "partitions/{} is {:?} at generation {}, the copies hold {:?}; {why}",
+                        partition.0,
                         root.mode,
                         record.generation.0,
                         engines
                             .values()
                             .flat_map(RocksEngine::lineages)
+                            .filter(|(held, _)| *held == partition)
                             .map(|(_, generation)| generation.0)
                             .collect::<BTreeSet<_>>()
                     ),
                 }),
             };
         }
-        Ok(Found {
-            instance,
-            fresh: false,
+        Ok(PartitionFound {
             owner: record.owner,
             roll: None,
+            forms: false,
         })
+    }
+
+    /// Link `roll` on each of its copies, once the decision is claimed.
+    fn link_roll(
+        engines: &mut BTreeMap<NodeId, RocksEngine>,
+        #[cfg_attr(not(test), allow(unused_variables))] dir: &Path,
+        partition: PartitionId,
+        roll: &Roll,
+    ) -> Result<(), OpenError> {
+        for node in &roll.copies {
+            // #62: a crash part way through the roll-forward, in one process.
+            #[cfg(test)]
+            if roll_stops_before(dir, *node) {
+                return Err(OpenError::Node(format!(
+                    "test hook: roll forward stopped before node {}",
+                    node.0
+                )));
+            }
+            engines
+                .get_mut(node)
+                .ok_or_else(|| OpenError::Node(format!("node {}: no engine", node.0)))?
+                .inherit(partition, roll.from, roll.to, roll.base)
+                .map_err(|error| {
+                    OpenError::Node(format!("node {}: roll forward: {error}", node.0))
+                })?;
+        }
+        Ok(())
     }
 
     /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
@@ -1609,50 +2081,79 @@ impl Db {
         rt: &Handle,
         budgets: Budgets,
         boot: BootId,
-        owner: NodeId,
+        heals: BTreeMap<NodeId, OwnerHeal>,
         local: &[NodeId],
     ) -> Result<(), OpenError> {
-        let (sender, started) = {
+        let (senders, started) = {
             let nodes = lock(&self.nodes);
-            let sender = nodes
+            let senders: BTreeMap<NodeId, _> = nodes
                 .iter()
-                .find(|handle| handle.node == owner)
-                .map(NodeHandle::sender);
-            (sender, nodes.len())
+                .map(|handle| (handle.node, handle.sender()))
+                .collect();
+            (senders, nodes.len())
         };
-        let sender = sender.ok_or_else(|| OpenError::Node("no owner node".into()))?;
         tracing::info!(nodes_started = started, boot = boot.0, "db_heal_started");
         // This open's nodes all run at `boot`; another process's node at the boot its last
         // handshake reported (arch-s2 B1).
         let links = Arc::clone(&self.links);
         let local = local.to_vec();
-        let member_boot = move |node: NodeId| {
-            if local.contains(&node) {
-                Some(boot)
-            } else {
-                links.boot_of(node)
-            }
-        };
-        let ctx = admin::HealCtx {
-            store: Arc::clone(store),
-            boot,
-            budgets,
-            clock: self.clock,
-            owner: sender,
-            within: heal_within(&budgets),
-            member_boot: Arc::new(member_boot),
-            owner_node: owner,
-        };
+        let member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> =
+            Arc::new(move |node: NodeId| {
+                if local.contains(&node) {
+                    Some(boot)
+                } else {
+                    links.boot_of(node)
+                }
+            });
+        let mut ctxs = Vec::with_capacity(heals.len());
+        for (owner, (partitions, bootstrap)) in heals {
+            let sender = senders
+                .get(&owner)
+                .cloned()
+                .ok_or_else(|| OpenError::Node("no owner node".into()))?;
+            tracing::info!(
+                owner = owner.0,
+                partitions = ?partitions.iter().map(|p| p.0).collect::<Vec<_>>(),
+                forming = ?bootstrap.iter().map(|(p, _)| p.0).collect::<Vec<_>>(),
+                "db_heal_owner"
+            );
+            ctxs.push(admin::HealCtx {
+                store: Arc::clone(store),
+                boot,
+                budgets,
+                clock: self.clock,
+                owner: sender,
+                within: heal_within(&budgets),
+                member_boot: Arc::clone(&member_boot),
+                owner_node: owner,
+                partitions,
+                partition_count: self.route.partitions(),
+                bootstrap,
+            });
+        }
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
         self.opened.heal_task = Some(rt.spawn(async move {
-            let ended = admin::heal_retrying(ctx).await;
-            if let Err(error) = &ended {
-                tracing::error!(%error, "heal_failed");
+            // One after another: every grant expires on its own clock, so the later heals
+            // find theirs already expired.
+            let mut first = None;
+            let mut ended = Ok(());
+            for ctx in ctxs {
+                match admin::heal_retrying(ctx).await {
+                    Ok(healed) => {
+                        first.get_or_insert(healed);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "heal_failed");
+                        ended = Err(error);
+                        break;
+                    }
+                }
             }
-            *lock(&state) = match ended {
-                Ok(healed) => HealState::Handed(healed),
-                Err(error) => HealState::Failed(error),
+            *lock(&state) = match (ended, first) {
+                (Ok(()), Some(healed)) => HealState::Handed(healed),
+                (Err(error), _) => HealState::Failed(error),
+                (Ok(()), None) => HealState::NotNeeded,
             };
         }));
         Ok(())
@@ -1684,6 +2185,18 @@ impl Db {
         let mut phase = String::from(NO_ANSWER);
         let mut remote_blocked: Option<String> = None;
         let mut remote_faulted: Option<String> = None;
+        // Each partition is looked at until it admits, in order (issue #79): every one for an
+        // app or a single partition, otherwise the ones the nodes here lead (ruling Q4).
+        let lead_only = self.route.partitions() > 1 && !lock(&self.nodes).is_empty();
+        let mut waiting = (1..=self.route.partitions())
+            .map(PartitionId)
+            .filter(|partition| !lead_only || self.runs(self.route.owner_of(*partition)))
+            .collect::<Vec<_>>()
+            .into_iter();
+        let Some(mut partition) = waiting.next() else {
+            self.ready_seen.store(true, Ordering::Relaxed);
+            return Ok(());
+        };
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                 return Err(ReadyError::Heal(error.clone()));
@@ -1691,17 +2204,21 @@ impl Db {
             if let Some(note) = self.restart_note().filter(|_| self.owner_restarted()) {
                 return Err(ReadyError::Stopped { note });
             }
-            let looked = self.look(self.route.owner());
+            let looked = self.look_in(partition, self.route.owner_of(partition));
             if looked == Err(Unlooked::NoLink) {
                 // What is known now: the owner is not reachable, whatever an earlier look saw.
                 NO_LINK.clone_into(&mut phase);
                 // A promote may have moved the partition away from it (bug bash #64): read the
                 // owner again, at most once per `OWNER_REREAD_GAP`, so the next look asks the
                 // owner `partitions/1` names now.
-                self.refresh_owner();
+                self.refresh_owner(partition);
             }
             if let Ok(owner) = looked {
                 if owner.admits == Some(true) {
+                    if let Some(next) = waiting.next() {
+                        partition = next;
+                        continue;
+                    }
                     self.ready_seen.store(true, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -1751,8 +2268,12 @@ impl Db {
             if std::time::Instant::now() >= deadline {
                 return Err(ReadyError::TimedOut {
                     within_ms: within.as_millis(),
-                    owner: self.route.owner(),
-                    phase,
+                    owner: self.route.owner_of(partition),
+                    phase: if self.route.partitions() > 1 {
+                        format!("partition {}: {phase}", partition.0)
+                    } else {
+                        phase
+                    },
                 });
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1763,6 +2284,127 @@ impl Db {
     #[must_use]
     pub fn heal_state(&self) -> HealState {
         lock(&self.opened.heal).clone()
+    }
+
+    /// How many partitions this database has (issue #79).
+    #[must_use]
+    pub fn partition_count(&self) -> u32 {
+        self.route.partitions()
+    }
+
+    /// Every partition's state now, one entry each in partition order (issue #79 S3). An owner
+    /// with no link is `NoLink` at once; the rest share one read timeout. A partition with no
+    /// link has its record read once more, so one moved by another process is asked at its new
+    /// owner rather than reported lost. Holds no state between calls.
+    #[must_use]
+    pub fn readiness(&self) -> Vec<PartitionReady> {
+        let all: Vec<PartitionId> = (1..=self.route.partitions()).map(PartitionId).collect();
+        let mut seen = self.look_at(&all);
+        let unlinked: Vec<PartitionId> = seen
+            .iter()
+            .filter(|ready| ready.reason == Some(NotReady::NoLink))
+            .map(|ready| ready.partition)
+            .collect();
+        self.refresh_owners(&unlinked);
+        let moved: Vec<PartitionId> = unlinked
+            .into_iter()
+            .filter(|partition| {
+                self.route.owner_of(*partition) != seen[partition.0 as usize - 1].owner
+            })
+            .collect();
+        for ready in self.look_at(&moved) {
+            let index = ready.partition.0 as usize - 1;
+            seen[index] = ready;
+        }
+        seen
+    }
+
+    /// Inspect each of `partitions` at its owner: every question goes out first, then the
+    /// answers are collected against one read timeout.
+    fn look_at(&self, partitions: &[PartitionId]) -> Vec<PartitionReady> {
+        let asked: Vec<_> = partitions
+            .iter()
+            .map(|partition| {
+                let owner = self.route.owner_of(*partition);
+                let (reply, answer) = mpsc::channel();
+                let sent = self.send_to(
+                    owner,
+                    Msg::Inspect {
+                        partition: *partition,
+                        reply,
+                    },
+                );
+                (*partition, owner, sent.map(|()| answer))
+            })
+            .collect();
+        let deadline = Instant::now() + self.timeouts.read;
+        asked
+            .into_iter()
+            .map(|(partition, owner, sent)| {
+                let reason = match sent {
+                    Err(_) => Some(NotReady::NoLink),
+                    Ok(answer) => answer
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .map_or(Some(NotReady::NoAnswer), |status| not_ready(&status)),
+                };
+                PartitionReady {
+                    partition,
+                    owner,
+                    ready: reason.is_none(),
+                    reason,
+                }
+            })
+            .collect()
+    }
+
+    /// The node this `Db` sends `partition`'s calls to, or `None` for a partition it does not
+    /// have.
+    #[must_use]
+    pub fn owner_of(&self, partition: PartitionId) -> Option<NodeId> {
+        (1..=self.route.partitions())
+            .contains(&partition.0)
+            .then(|| self.route.owner_of(partition))
+    }
+
+    /// The partition `group` lives in.
+    fn partition_for(&self, group: AffinityId) -> PartitionId {
+        partition_of(affinity_hash(TENANT, group), self.route.partitions())
+    }
+
+    /// The refusal of a group-less `call` above one partition (issue #79, ruling Q6): which
+    /// partition it means is not known, so it is never guessed. `None` at one partition.
+    fn refuse_groupless(&self, call: &str, instead: &str) -> Option<ApiError> {
+        let partitions = self.route.partitions();
+        if partitions <= 1 {
+            return None;
+        }
+        tracing::warn!(call, instead, partitions, "db_call_refused_groupless");
+        let mut error = ApiError::invalid(format!(
+            "{call} names no group and this database has {partitions} partitions: {instead}; \
+             nothing was sent"
+        ));
+        error.no_mutation = true;
+        Some(error)
+    }
+
+    /// [`Self::refuse_groupless`] for a call answering [`PutError`].
+    fn refuse_groupless_write(&self, call: &str, instead: &str) -> Result<(), PutError> {
+        self.refuse_groupless(call, instead)
+            .map_or(Ok(()), |error| {
+                Err(PutError {
+                    error,
+                    request: None,
+                })
+            })
+    }
+
+    /// A transaction with no puts above one partition (issue #79, critic note 4): no put names a
+    /// group, so no partition can be picked.
+    fn refuse_empty_txn(&self, puts: &[TxnPut<'_>]) -> Result<(), PutError> {
+        if puts.is_empty() {
+            self.refuse_groupless_write("txn with no puts", "name at least one put")?;
+        }
+        Ok(())
     }
 
     /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
@@ -1861,33 +2503,34 @@ impl Db {
     fn send_call(
         &self,
         node: NodeId,
+        partition: PartitionId,
         call: ClientCall,
     ) -> Result<mpsc::Receiver<Answer>, NodeStopped> {
         let (reply, answer) = mpsc::channel();
         let msg = Msg::Client(Client {
-            partition: PARTITION,
+            partition,
             call,
             reply,
         });
         self.send_to(node, msg).map(|()| answer)
     }
 
-    fn call(&self, call: ClientCall, wait: Duration) -> Option<Answer> {
-        let mut owner = self.route.owner();
+    fn call(&self, partition: PartitionId, call: ClientCall, wait: Duration) -> Option<Answer> {
+        let mut owner = self.route.owner_of(partition);
         // A `Db` that can look again keeps a copy for one resend: when the owner cannot be
         // reached it may have been promoted away by another process, which told nobody here
         // (A-R287 P1, tester-s2 F-T1). Re-read `partitions/1` and, if it names a new owner,
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
         let carried = carries(&call);
-        let mut sent = self.send_call(owner, call);
+        let mut sent = self.send_call(owner, partition, call);
         if let (Err(_), Some(call)) = (&sent, spare) {
-            self.refresh_owner();
-            let now = self.route.owner();
+            self.refresh_owner(partition);
+            let now = self.route.owner_of(partition);
             if now != owner {
                 tracing::info!(was = owner.0, owner = now.0, "db_call_rerouted");
                 owner = now;
-                sent = self.send_call(owner, call);
+                sent = self.send_call(owner, partition, call);
             }
         }
         let Ok(answer) = sent else {
@@ -1906,7 +2549,7 @@ impl Db {
         match answer.recv_timeout(wait) {
             Ok(answer) => {
                 if refusal_kind(&answer).is_some_and(rereads_owner) {
-                    self.refresh_owner();
+                    self.refresh_owner(partition);
                 }
                 Some(answer)
             }
@@ -1925,45 +2568,83 @@ impl Db {
     }
 
     /// After a `NOT_PRIMARY` answer, or a send the owner could not take (A-R287 P1), read the
-    /// owner `partitions/1` names now, so the next call, or the caller's retry that
+    /// owner `partition`'s record names now, so the next call, or the caller's retry that
     /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout.
-    /// A `Db` whose owner is fixed reads nothing. At most one read per [`OWNER_REREAD_GAP`]
-    /// (A-R299): an outage is when the control plane is weakest, and every call would read
-    /// otherwise; a call inside the gap goes on with the owner the last read named. A read that
-    /// fails keeps the owner it had and logs why: the next such answer past the gap reads again.
-    fn refresh_owner(&self) {
+    fn refresh_owner(&self, partition: PartitionId) {
+        self.refresh_owners(&[partition]);
+    }
+
+    /// [`Self::refresh_owner`] for several partitions under one read timeout. A `Db` whose owner
+    /// is fixed reads nothing. At most one read per partition per [`OWNER_REREAD_GAP`] (A-R299):
+    /// an outage is when the control plane is weakest, and every call would read otherwise; a
+    /// call inside the gap goes on with the owner the last read named. A read that fails keeps
+    /// the owner it had and logs why: the next such answer past the gap reads again.
+    fn refresh_owners(&self, partitions: &[PartitionId]) {
         let Some((store, rt)) = &self.route.refresh else {
             return;
         };
-        {
+        let due: Vec<PartitionId> = {
             let mut last = lock(&self.route.last_read);
             let now = Instant::now();
-            if last.is_some_and(|at| now.duration_since(at) < OWNER_REREAD_GAP) {
-                return;
-            }
-            *last = Some(now);
+            partitions
+                .iter()
+                .copied()
+                .filter(|partition| {
+                    let recent = last
+                        .get(&partition.0)
+                        .is_some_and(|at| now.duration_since(*at) < OWNER_REREAD_GAP);
+                    if !recent {
+                        last.insert(partition.0, now);
+                    }
+                    !recent
+                })
+                .collect()
+        };
+        if due.is_empty() {
+            return;
         }
         let (done, read) = mpsc::channel();
         let store = Arc::clone(store);
+        let asked = due.clone();
         rt.spawn(async move {
-            // The receiver may have given up; then nobody needs the answer.
-            let _ = done.send(read_owner(&store).await);
+            for partition in asked {
+                // The receiver may have given up; then nobody needs the answers.
+                if done
+                    .send((partition, read_owner(&store, partition).await))
+                    .is_err()
+                {
+                    return;
+                }
+            }
         });
-        let was = self.route.owner();
-        match read.recv_timeout(self.timeouts.read) {
-            Ok(Ok((owner, _))) => {
-                self.route.owner.store(owner.0, Ordering::Relaxed);
-                tracing::info!(was = was.0, owner = owner.0, "db_owner_refreshed");
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(was = was.0, error = %error, "db_owner_refresh_failed");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    was = was.0,
-                    error = "no answer within the read timeout",
-                    "db_owner_refresh_failed"
-                );
+        let deadline = Instant::now() + self.timeouts.read;
+        for _ in &due {
+            let answer = read.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            match answer {
+                Ok((partition, Ok((owner, _)))) => {
+                    let was = self.route.owner_of(partition);
+                    self.route.owners[partition.0 as usize - 1].store(owner.0, Ordering::Relaxed);
+                    tracing::info!(
+                        partition = partition.0,
+                        was = was.0,
+                        owner = owner.0,
+                        "db_owner_refreshed"
+                    );
+                }
+                Ok((partition, Err(error))) => {
+                    tracing::warn!(
+                        partition = partition.0,
+                        error = %error,
+                        "db_owner_refresh_failed"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        error = "no answer within the read timeout",
+                        "db_owner_refresh_failed"
+                    );
+                    return;
+                }
             }
         }
     }
@@ -1981,8 +2662,24 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
+        self.refuse_groupless_write("put", "use put_in")?;
+        self.put_in(GROUP, object, value, if_version)
+    }
+
+    /// [`Self::put`] in affinity group `group`, on the partition that group maps to (issue #79).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`].
+    pub fn put_in(
+        &self,
+        group: AffinityId,
+        object: &[u8],
+        value: &[u8],
+        if_version: Option<u64>,
+    ) -> Result<PutOk, PutError> {
         let identity = self.write_identity()?;
-        let answer = self.put_identified(identity, object, value, if_version);
+        let answer = self.put_identified(identity, group, object, value, if_version);
         self.finished(identity.request, answer)
     }
 
@@ -2007,16 +2704,18 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
+        self.refuse_groupless_write("put_as", "use txn_as with one TxnPut")?;
         let identity = self.app_identity(request)?;
         self.retried(
             request,
-            self.put_identified(identity, object, value, if_version),
+            self.put_identified(identity, GROUP, object, value, if_version),
         )
     }
 
     fn put_identified(
         &self,
         identity: RequestIdentity,
+        group: AffinityId,
         object: &[u8],
         value: &[u8],
         if_version: Option<u64>,
@@ -2026,7 +2725,7 @@ impl Db {
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
         let put = PutOp {
-            group: GROUP,
+            group,
             object: Bytes::copy_from_slice(object),
             change: byte_doc(value),
             expect: if_version.map(Expected::Version),
@@ -2049,6 +2748,7 @@ impl Db {
     /// `deadline` plus twice [`TXN_WAITER_MARGIN_MILLIS`], so the host's own expiry,
     /// `UNKNOWN_OUTCOME` at `deadline` plus one margin, answers first.
     pub fn txn(&self, puts: &[TxnPut<'_>], deadline: Duration) -> Result<PutOk, PutError> {
+        self.refuse_empty_txn(puts)?;
         if let Some(error) = deadline_refusal(deadline) {
             return Err(PutError {
                 error,
@@ -2081,6 +2781,7 @@ impl Db {
         puts: &[TxnPut<'_>],
         deadline: Duration,
     ) -> Result<PutOk, PutError> {
+        self.refuse_empty_txn(puts)?;
         let identity = self.app_identity(request)?;
         let answer = match deadline_refusal(deadline) {
             Some(error) => Err(PutError {
@@ -2195,8 +2896,25 @@ impl Db {
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
+        self.refuse_groupless_write("write", "use write_in")?;
+        self.write_in(GROUP, object, change, expect)
+    }
+
+    /// [`Self::write`] in affinity group `group`, on the partition that group maps to (issue
+    /// #79).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`].
+    pub fn write_in(
+        &self,
+        group: AffinityId,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
         let identity = self.write_identity()?;
-        let answer = self.write_identified(identity, object, change, expect);
+        let answer = self.write_identified(identity, group, object, change, expect);
         self.finished(identity.request, answer)
     }
 
@@ -2224,22 +2942,41 @@ impl Db {
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
+        self.refuse_groupless_write("write_as", "use write_as_in")?;
+        self.write_as_in(GROUP, request, object, change, expect)
+    }
+
+    /// [`Self::write_as`] in affinity group `group`. The same group reaches the same partition,
+    /// and dedup is per partition, so a repeat of `request` finds its first send's answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_as`].
+    pub fn write_as_in(
+        &self,
+        group: AffinityId,
+        request: RequestId,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
         let identity = self.app_identity(request)?;
         self.retried(
             request,
-            self.write_identified(identity, object, change, expect),
+            self.write_identified(identity, group, object, change, expect),
         )
     }
 
     fn write_identified(
         &self,
         identity: RequestIdentity,
+        group: AffinityId,
         object: &[u8],
         change: Change,
         expect: Option<Expected>,
     ) -> Result<Option<PutOk>, PutError> {
         let put = PutOp {
-            group: GROUP,
+            group,
             object: Bytes::copy_from_slice(object),
             change,
             expect,
@@ -2264,6 +3001,9 @@ impl Db {
                 request: None,
             });
         }
+        let partition = puts
+            .first()
+            .map_or(PARTITION, |put| self.partition_for(put.group));
         // Compile first, send second (defect w24): the request is in hand before anything is
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
@@ -2285,7 +3025,7 @@ impl Db {
         };
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
-        match self.call(call, self.timeouts.put) {
+        match self.call(partition, call, self.timeouts.put) {
             Some(Answer::Compiled(mut request)) => {
                 // The ack floor rides the first send and every resend of it unchanged; it is
                 // not part of the request's digest (A-R252). Only this `Db`'s own write ids
@@ -2375,9 +3115,14 @@ impl Db {
             ClientCall::Resend { request } => request.identity.request,
             _ => RequestId(0),
         };
-        let answered = match self.call(call, wait) {
+        let partition = match &call {
+            ClientCall::Resend { request } => self.partition_for(request.affinity),
+            _ => PARTITION,
+        };
+        let answered = match self.call(partition, call, wait) {
             Some(Answer::Txn { result, request }) => Ok(PutOk {
                 request: identity,
+                partition: result.partition,
                 generation: result.generation,
                 owner_epoch: result.owner_epoch,
                 seq: result.seq,
@@ -2432,8 +3177,21 @@ impl Db {
     /// `INVALID_ARGUMENT` when the object is a document that is not a byte string, or another
     /// kind: read those with [`Self::read`].
     pub fn get(&self, object: &[u8]) -> Result<GetOk, ApiError> {
+        if let Some(error) = self.refuse_groupless("get", "use get_in") {
+            return Err(error);
+        }
+        self.get_in(GROUP, object)
+    }
+
+    /// [`Self::get`] in affinity group `group`, on the partition that group maps to (issue #79).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get`].
+    pub fn get_in(&self, group: AffinityId, object: &[u8]) -> Result<GetOk, ApiError> {
         self.read_call(ClientCall::Get {
             identity: self.identity(),
+            group,
             object: Bytes::copy_from_slice(object),
             look: Look::Doc,
         })
@@ -2448,6 +3206,9 @@ impl Db {
     /// [`ApiError`]: P1's refusal (`UNAVAILABLE` before any view is kept), or `UNAVAILABLE`
     /// when no answer came in time. As [`Self::get`] for an object that is not a byte string.
     pub fn get_previous(&self, object: &[u8]) -> Result<GetOk, ApiError> {
+        if let Some(error) = self.refuse_groupless("get_previous", "it has no group form") {
+            return Err(error);
+        }
         self.read_call(ClientCall::GetPrevious {
             identity: self.identity(),
             object: Bytes::copy_from_slice(object),
@@ -2466,8 +3227,27 @@ impl Db {
     /// newer build, named before anything else about that record (M9 S7); a page that stops
     /// before that record answers as usual.
     pub fn read(&self, object: &[u8], look: Look) -> Result<ReadOk, ApiError> {
+        if let Some(error) = self.refuse_groupless("read", "use read_in") {
+            return Err(error);
+        }
+        self.read_in(GROUP, object, look)
+    }
+
+    /// [`Self::read`] in affinity group `group`, on the partition that group maps to (issue
+    /// #79).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    pub fn read_in(
+        &self,
+        group: AffinityId,
+        object: &[u8],
+        look: Look,
+    ) -> Result<ReadOk, ApiError> {
         self.read_call(ClientCall::Get {
             identity: self.identity(),
+            group,
             object: Bytes::copy_from_slice(object),
             look,
         })
@@ -2478,7 +3258,11 @@ impl Db {
         if let Some(error) = read_refusal(&call) {
             return Err(error);
         }
-        let answered = match self.call(call, self.timeouts.read) {
+        let partition = match &call {
+            ClientCall::Get { group, .. } => self.partition_for(*group),
+            _ => PARTITION,
+        };
+        let answered = match self.call(partition, call, self.timeouts.read) {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
                 ..
@@ -2538,12 +3322,40 @@ impl Db {
         request: RequestId,
         generation: Option<Generation>,
     ) -> Result<TxnStatus, ApiError> {
+        if let Some(error) = self.refuse_groupless("status", "use status_in") {
+            return Err(error);
+        }
+        self.status_at(PARTITION, request, generation)
+    }
+
+    /// [`Self::status`] of a request written in `group`: the status lives in that group's
+    /// partition, and asked anywhere else it would say `Unknown` for ever.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::status`].
+    pub fn status_in(
+        &self,
+        group: AffinityId,
+        request: RequestId,
+        generation: Option<Generation>,
+    ) -> Result<TxnStatus, ApiError> {
+        self.status_at(self.partition_for(group), request, generation)
+    }
+
+    fn status_at(
+        &self,
+        partition: PartitionId,
+        request: RequestId,
+        generation: Option<Generation>,
+    ) -> Result<TxnStatus, ApiError> {
         let identity = RequestIdentity {
             tenant: TENANT,
             client: self.client,
             request,
         };
         let answered = match self.call(
+            partition,
             ClientCall::Status {
                 identity,
                 generation,
@@ -2602,6 +3414,9 @@ impl Db {
         ns: rdb_core::contracts::storage::Namespace,
         key: &[u8],
     ) -> Result<(), String> {
+        if let Some(error) = self.refuse_groupless("damage_record", "it runs on partition 1 only") {
+            return Err(error.detail);
+        }
         let (reply, answer) = mpsc::channel();
         let msg = Msg::Damage {
             partition: PARTITION,
@@ -2645,6 +3460,9 @@ impl Db {
     /// not answering within the read timeout.
     #[cfg(debug_assertions)]
     pub fn fork_record(&self, node: NodeId, generation: Generation) -> Result<u64, String> {
+        if let Some(error) = self.refuse_groupless("fork_record", "it runs on partition 1 only") {
+            return Err(error.detail);
+        }
         let (reply, answer) = mpsc::channel();
         let msg = Msg::Fork {
             partition: PARTITION,
@@ -2873,19 +3691,18 @@ impl Db {
     /// could not be sent (no link to `node` is up), [`Unlooked::NoAnswer`] when it was sent and
     /// not answered in the read timeout (tester tc2 P1, A-R394).
     fn look(&self, node: NodeId) -> Result<NodeStatus, Unlooked> {
+        self.look_in(PARTITION, node)
+    }
+
+    /// [`Self::look`] at `partition`'s state on `node`.
+    fn look_in(&self, partition: PartitionId, node: NodeId) -> Result<NodeStatus, Unlooked> {
         let (reply, answer) = mpsc::channel();
-        self.send_to(
-            node,
-            Msg::Inspect {
-                partition: PARTITION,
-                reply,
-            },
-        )
-        .map_err(|_| Unlooked::NoLink)?;
+        self.send_to(node, Msg::Inspect { partition, reply })
+            .map_err(|_| Unlooked::NoLink)?;
         let status = answer
             .recv_timeout(self.timeouts.read)
             .map_err(|_| Unlooked::NoAnswer)?;
-        if node == self.route.owner() {
+        if partition == PARTITION && node == self.route.owner() {
             // review-s2 F-005: an owner in another process is not ended by a blocked recovery;
             // it re-plans a rejoin (A-R282) and `wait_ready` waits it out, so a refusal must not
             // say "retrying will not help". A quarantine is final wherever the owner runs.
@@ -3026,6 +3843,7 @@ impl Db {
                 limits,
                 boot,
                 config.storage,
+                1,
             )
             .map_err(OpenError::Node)?;
             lock(&db.nodes).push(handle);
@@ -3058,31 +3876,66 @@ impl Db {
     /// apply when `partitions/1` pins its members (layout 4, bug bash #64).
     /// `UNAVAILABLE` for anything else, with the step; `no_mutation` says whether the promote
     /// wrote. A promote that stopped after it wrote leaves partition 1 taking no writes; running
-    /// it again picks up where it stopped.
+    /// it again picks up where it stopped. `INVALID_ARGUMENT`, nothing changed, above one
+    /// partition, where [`Self::promote_partition`] says which one (issue #79).
     pub fn promote(&self, to: NodeId, drop: Option<NodeId>) -> Result<admin::Promoted, ApiError> {
-        let PromoteStore(store, rt, budgets) =
-            self.opened.control.clone().ok_or_else(|| ApiError {
-                kind: ErrorKind::Unavailable,
-                retry: RetryRule::NotWired,
-                no_mutation: true,
-                detail: "this Db was opened without a control store, so it cannot run admin \
-                         commands such as promote: open it with Db::open, which connects it to \
-                         one"
-                .to_owned(),
-                retry_after: None,
-            })?;
+        if let Some(error) = self.refuse_groupless(
+            "promote",
+            "say which partition moves, with promote_partition",
+        ) {
+            return Err(error);
+        }
+        self.promote_partition(PARTITION, to, drop)
+            .map_err(ApiError::from)
+    }
+
+    /// [`Self::promote`] of one partition, from any `Db` with a control store: a peer's running
+    /// `Db` or an app's, with the owner dead.
+    ///
+    /// Above one partition the owner must be dead, because the freeze is the whole node's. A
+    /// just-killed owner is waited out for up to its grant's length. The other partitions the
+    /// node owned stay `NoLink` until each has its own promote; the node's next open fails
+    /// [`admin::HealError::Frozen`] while it still owns any, naming them, and heals nothing
+    /// for a partition it no longer owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`admin::PromoteError`] so a caller can match the refusal, most of all
+    /// [`admin::PromoteError::OwnerAlive`], which must not be retried while the owner lives.
+    /// [`ApiError::from`] gives the same refusal as [`Self::promote`] reports it.
+    pub fn promote_partition(
+        &self,
+        partition: PartitionId,
+        to: NodeId,
+        drop: Option<NodeId>,
+    ) -> Result<admin::Promoted, admin::PromoteError> {
+        if self.owner_of(partition).is_none() {
+            return Err(admin::PromoteError::NoSuchPartition {
+                partition: partition.0,
+                partitions: self.route.partitions(),
+            });
+        }
+        let PromoteStore(store, rt, budgets) = self
+            .opened
+            .control
+            .clone()
+            .ok_or(admin::PromoteError::NoControlStore)?;
         // The roles come from `partitions/1` when it pins them (layout 4), else from `to`'s own
         // pinned configuration, read before anything is written (review-s2 F-004, A-R412). A
         // refused look is the answer only for a layout-3 record (bug bash #64, A-R431).
-        let (members, members_version, refused) =
-            match admin::promote_members(to, self.look(to).ok(), self.timeouts.read) {
-                Ok((members, version)) => (members, version, None),
-                Err(refused) => (
-                    Vec::new(),
-                    rdb_core::contracts::ids::ConfigVersion(0),
-                    Some(refused),
-                ),
-            };
+        let (members, members_version, refused) = match admin::promote_members(
+            partition,
+            to,
+            self.look_in(partition, to).ok(),
+            self.timeouts.read,
+        ) {
+            Ok((members, version)) => (members, version, None),
+            Err(refused) => (
+                Vec::new(),
+                rdb_core::contracts::ids::ConfigVersion(0),
+                Some(refused),
+            ),
+        };
         let (senders, boots): (
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
@@ -3113,6 +3966,9 @@ impl Db {
             store,
             budgets,
             clock: self.clock,
+            partition,
+            owner_must_be_dead: self.route.partitions() > 1,
+            look_within: self.timeouts.read,
             to,
             drop,
             within,
@@ -3130,30 +3986,22 @@ impl Db {
             Ok(Ok(promoted)) => promoted,
             Ok(Err(error)) => {
                 tracing::warn!(
+                    partition = partition.0,
                     to = to.0,
                     %error,
                     no_mutation = error.no_mutation(),
                     "db_promote_failed"
                 );
-                return Err(error.into());
+                return Err(error);
             }
             Err(_) => {
                 tracing::warn!(to = to.0, "db_promote_unanswered");
-                return Err(ApiError {
-                    kind: ErrorKind::Unavailable,
-                    retry: RetryRule::NotWired,
-                    no_mutation: false,
-                    detail: format!(
-                        "the promote of node {} did not answer in time; it may have written: \
-                         promote again",
-                        to.0
-                    ),
-                    retry_after: None,
-                });
+                return Err(admin::PromoteError::Unanswered { node: to.0 });
             }
         };
-        self.route.owner.store(to.0, Ordering::Relaxed);
+        self.route.owners[partition.0 as usize - 1].store(to.0, Ordering::Relaxed);
         tracing::info!(
+            partition = partition.0,
             owner = to.0,
             prior = promoted.prior_owner.0,
             dropped = promoted.dropped.0,
@@ -3303,6 +4151,7 @@ impl Db {
                 respawn.limits,
                 boot,
                 respawn.storage,
+                self.route.partitions(),
             )
         };
         match started {
@@ -3414,6 +4263,7 @@ impl Db {
             respawn.budgets,
             respawn.limits,
             boot,
+            self.route.partitions(),
         )
     }
 
@@ -3478,6 +4328,9 @@ impl Db {
     /// the fence refuses restarts `node` on its own folder and says so. An `UNAVAILABLE` with
     /// `no_mutation` false when `node` restarted but is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
+        if let Some(error) = self.refuse_groupless("rebuild", "it runs on one partition only") {
+            return Err(error);
+        }
         if !self.runs(self.route.owner()) && !self.runs(node) {
             if wipe {
                 return Err(rebuild_refused(admin::rebuild::Refused {
@@ -3495,6 +4348,7 @@ impl Db {
             // and said "restart it" for one the owner would never take back.
             self.left_out(node)?;
             return match self.call(
+                PARTITION,
                 ClientCall::Rebuild {
                     identity: self.identity(),
                     node,
@@ -3564,7 +4418,11 @@ impl Db {
     /// `NOT_PRIMARY` when the node asked is not the owner; `UNAVAILABLE` when no answer came in
     /// the read timeout.
     pub fn move_copy(&self, from: NodeId, to: NodeId) -> Result<host::MoveAnswer, ApiError> {
+        if let Some(error) = self.refuse_groupless("move_copy", "it runs on one partition only") {
+            return Err(error);
+        }
         match self.call(
+            PARTITION,
             ClientCall::Move {
                 identity: self.identity(),
                 from,
@@ -3593,6 +4451,10 @@ impl Db {
     pub fn pinned_members(
         &self,
     ) -> Result<(NodeId, Vec<rdb_core::contracts::membership::Member>), ApiError> {
+        if let Some(error) = self.refuse_groupless("pinned_members", "it reads one partition only")
+        {
+            return Err(error);
+        }
         let owner = self.route.owner();
         self.look(owner)
             .map(|status| (owner, status.pinned))
@@ -4102,6 +4964,51 @@ struct Found {
     owner: NodeId,
     /// Set when no copy holds the record's generation and it may be rolled forward (A-R184).
     roll: Option<Roll>,
+    /// Partitions 2 to N, in order, once `routes/0` exists (issue #79). Otherwise empty.
+    others: Vec<(PartitionId, PartitionFound)>,
+}
+
+impl Found {
+    /// Each partition with its owner, partition 1 first.
+    fn owners(&self) -> impl Iterator<Item = (PartitionId, NodeId)> + '_ {
+        std::iter::once((PARTITION, self.owner)).chain(
+            self.others
+                .iter()
+                .map(|(partition, found)| (*partition, found.owner)),
+        )
+    }
+
+    /// The partitions this open forms: no root, and no copy holds them.
+    fn forming(&self) -> Vec<PartitionId> {
+        let first = self.fresh.then_some(PARTITION);
+        first
+            .into_iter()
+            .chain(
+                self.others
+                    .iter()
+                    .filter(|(_, found)| found.forms)
+                    .map(|(partition, _)| *partition),
+            )
+            .collect()
+    }
+}
+
+/// One owner's part of a reopen's heal: the partitions with a root, then those it still has to
+/// form, each with its record's revision.
+type OwnerHeal = (
+    Vec<PartitionId>,
+    Vec<(PartitionId, rdb_core::contracts::ids::Revision)>,
+);
+
+/// What [`Db::decide_partition`] found for one partition.
+#[derive(Debug, Clone)]
+struct PartitionFound {
+    /// The owner its record names.
+    owner: NodeId,
+    /// Set when no copy holds the record's generation and it may be rolled forward (A-R184).
+    roll: Option<Roll>,
+    /// Set when this open forms it (design 7.2 rows 1 and 2).
+    forms: bool,
 }
 
 /// A reopen's roll-forward, decided by [`Db::check`] (ruling A-R184): count the open at exactly
@@ -4120,9 +5027,66 @@ struct Roll {
 /// staged into it and never switched in, its `copying` record still there, is not that
 /// generation, only the start of one: its keys are partial and it has no link (PR #60 review
 /// F1). Counted as held, it stopped the roll-forward that resumes it, and no open succeeded.
-fn serves(engine: &RocksEngine, generation: Generation) -> bool {
-    engine.lineages().contains(&(PARTITION, generation))
-        && engine.staging(PARTITION, generation).is_none()
+fn serves(engine: &RocksEngine, partition: PartitionId, generation: Generation) -> bool {
+    engine.lineages().contains(&(partition, generation))
+        && engine.staging(partition, generation).is_none()
+}
+
+/// The roll-forward decision's read (ruling A-R184): partition 1's open counter, a later
+/// partition's own mark (issue #79), and the revision either was read at.
+async fn read_mark(
+    store: &Arc<dyn ConfigStore>,
+    instance: &[u8; INSTANCE_LEN],
+    partition: PartitionId,
+) -> Result<(admin::Count, u64), admin::CounterError> {
+    if partition == PARTITION {
+        admin::read_count(&**store, instance).await
+    } else {
+        admin::read_activated(&**store, instance, partition)
+            .await
+            .map(|(activated, revision)| (admin::Count { n: 0, activated }, revision))
+    }
+}
+
+/// Why a node process cannot run the empty copy of the owner of `record`'s partition. A formation
+/// that stopped right after the partition's first commit (design 7.2 row 4) is finished by running
+/// it again; anything else needs another owner.
+async fn empty_owner_refusal(
+    store: &Arc<dyn ConfigStore>,
+    instance: &[u8; INSTANCE_LEN],
+    record: &PartitionRecord,
+    root: &PartitionRoot,
+) -> OpenError {
+    let count = match read_mark(store, instance, record.partition).await {
+        Ok((count, _)) => count,
+        Err(error) => return counter_refused(instance, error),
+    };
+    if root.predecessor_generation == Generation(0)
+        && root.predecessor_cutoff == Seq::ZERO
+        && !count.may_have_admitted(record.generation)
+    {
+        return OpenError::Config(format!(
+            "partition {} has not finished forming; {RERUN_FORM}",
+            record.partition.0
+        ));
+    }
+    match read_partition_count(store).await {
+        Ok(Some(partitions)) if partitions > 1 => {
+            return OpenError::Config(format!(
+                "the copy of node {} holds no data, and partition {} names it owner: from a peer, \
+                 move it with `admin promote <the node you chose> --partition {}`, then start \
+                 node {} again",
+                record.owner.0, record.partition.0, record.partition.0, record.owner.0
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return error,
+    }
+    OpenError::Config(format!(
+        "the copy of node {} holds no data, and partition {} names it owner: promote another node \
+         first (lr promote), then start node {} again",
+        record.owner.0, record.partition.0, record.owner.0
+    ))
 }
 
 /// Ruling A-R184 (arch R3b check 4, critic-rollfwd F2): the copies a reopen may roll forward to
@@ -4132,6 +5096,7 @@ fn serves(engine: &RocksEngine, generation: Generation) -> bool {
 /// itself. Otherwise why not. Each copy's verdict is logged as `db_open_roll_forward_copy`.
 fn roll_forward_copies(
     engines: &BTreeMap<NodeId, RocksEngine>,
+    partition: PartitionId,
     generation: Generation,
     root: &PartitionRoot,
     count: admin::Count,
@@ -4153,13 +5118,13 @@ fn roll_forward_copies(
     }
     // critic-rollfwd A1: a root naming boot 0 was never written by an owner.
     if root.owner_boot == BootId(0) {
-        return Err("partitions/1 names owner boot 0".to_owned());
+        return Err(format!("partitions/{} names owner boot 0", partition.0));
     }
     let (from, cutoff) = (root.predecessor_generation, root.predecessor_cutoff);
     if from >= generation || root.base_seq != cutoff {
         return Err(format!(
-            "partitions/1's root does not start at generation {} seq {}",
-            from.0, cutoff.0
+            "partitions/{}'s root does not start at generation {} seq {}",
+            partition.0, from.0, cutoff.0
         ));
     }
     // A copy that holds a generation after `from` saw the database move on from it, so this
@@ -4167,7 +5132,7 @@ fn roll_forward_copies(
     // Except `generation` itself staged from this root's base and never switched in (PR #60
     // review F1): a flatten cut short there. The roll-forward's inherit re-runs it.
     let resumable = |engine: &RocksEngine, held: Generation| {
-        held == generation && engine.staging(PARTITION, held) == Some((from, cutoff))
+        held == generation && engine.staging(partition, held) == Some((from, cutoff))
     };
     if let Some(newer) = engines
         .values()
@@ -4175,8 +5140,8 @@ fn roll_forward_copies(
             engine
                 .lineages()
                 .into_iter()
-                .filter(move |&(partition, held)| {
-                    partition == PARTITION && held > from && !resumable(engine, held)
+                .filter(move |&(held_partition, held)| {
+                    held_partition == partition && held > from && !resumable(engine, held)
                 })
         })
         .map(|(_, held)| held)
@@ -4188,17 +5153,21 @@ fn roll_forward_copies(
         ));
     }
     let holds_base = |engine: &RocksEngine| -> Result<(), &'static str> {
-        if !engine.lineages().contains(&(PARTITION, from)) {
+        // Formation's own step (design 7.2 row 4): a root over the empty base, whose copies
+        // were never linked because the crash came right after the commit. The mark check above
+        // still proves no host activated it.
+        let empty_base = from == Generation(0) && cutoff == Seq::ZERO;
+        if !engine.lineages().contains(&(partition, from)) && !empty_base {
             return Err("predecessor_absent");
         }
-        if engine.buffered_applied(PARTITION, from).0 < cutoff.0 {
+        if engine.buffered_applied(partition, from).0 < cutoff.0 {
             return Err("predecessor_below_cutoff");
         }
         let digest = if cutoff == Seq::ZERO {
             Digest::ROOT
         } else {
             let (bytes, _) = engine
-                .history_at(PARTITION, from, cutoff)
+                .history_at(partition, from, cutoff)
                 .map_err(|_| "history_read_failed")?
                 .ok_or("no_record_at_cutoff")?;
             let envelope = ReplicationEnvelope::decode(&bytes).map_err(|_| "undecodable")?;
@@ -4780,6 +5749,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
             identity,
             object,
             look,
+            ..
         } => (identity, object, Some(look)),
         ClientCall::GetPrevious { identity, object } => (identity, object, None),
         ClientCall::Put { .. }
@@ -4927,6 +5897,9 @@ mod reopen_tests;
 mod rebuild_tests;
 
 #[cfg(test)]
+mod partition_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_store::{Script, Scripted};
@@ -5049,6 +6022,7 @@ mod tests {
 
     fn config(dir: &std::path::Path) -> DbConfig {
         DbConfig {
+            partitions: None,
             ack_floor: true,
             dir: dir.to_path_buf(),
             hold: Vec::new(),
@@ -5089,6 +6063,7 @@ mod tests {
         // The pause must answer UNKNOWN well inside the 5 s put timeout, at every scale.
         let budgets = fast_pause();
         let config = DbConfig {
+            partitions: None,
             ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
@@ -5178,6 +6153,7 @@ mod tests {
             ..Budgets::SPEC_DEFAULTS
         };
         let config = DbConfig {
+            partitions: None,
             ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
@@ -5310,6 +6286,7 @@ mod tests {
         };
         let patience = crate::host::test_patience(Duration::from_secs(5));
         let config = DbConfig {
+            partitions: None,
             ack_floor: true,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
@@ -5907,7 +6884,7 @@ mod tests {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot| {
+        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot, partitions| {
             if node == NodeId(2) {
                 return Err("node 2: injected".to_owned());
             }
@@ -5920,6 +6897,7 @@ mod tests {
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
                 boot,
+                partitions,
             )
         };
 
@@ -6012,7 +6990,7 @@ mod tests {
                 let race = Arc::clone(&race);
                 std::thread::spawn(move || {
                     let other = 1 - me;
-                    let spawn = |node: NodeId, engine, links, control, clock, boot| {
+                    let spawn = |node: NodeId, engine, links, control, clock, boot, partitions| {
                         if node == NodeId(1) {
                             race.mark(me, |state| state.0 = true);
                             race.wait("the other opener reaches node 1 or returns", other, |s| {
@@ -6028,6 +7006,7 @@ mod tests {
                             fast(),
                             Limits::default(),
                             boot,
+                            partitions,
                         )?;
                         if node == NodeId(3) {
                             race.wait("the loser returns while these nodes run", other, |s| s.1);
@@ -6099,11 +7078,12 @@ mod tests {
         let cases = [
             (
                 "(a) applied",
-                // M10: the open reads partitions/1 and its counter, and puts the counter, first.
+                // M10: the open reads partitions/1, routes/0 (#79) and its counter, and puts the
+                // counter, first.
                 Script {
                     pass_puts: 1,
                     lose_put_replies: 1,
-                    pass_gets: 2,
+                    pass_gets: 3,
                     fail_gets: 1,
                     ..Script::default()
                 },
@@ -8616,7 +9596,7 @@ mod tests {
 
         // A promote moved the route to node 2, which no link reaches here: the text names it,
         // and says it is not reachable rather than busy (A-R394 P1).
-        db.route.owner.store(2, Ordering::Relaxed);
+        db.route.owners[0].store(2, Ordering::Relaxed);
         let promoted = db.wait_ready(Duration::from_millis(60));
         assert!(
             matches!(
@@ -8806,9 +9786,9 @@ mod tests {
         let within = crate::host::test_patience(Duration::from_secs(1));
         let promoted_at = std::time::Instant::now();
         let old = loop {
-            db.route.owner.store(OWNER.0, Ordering::Relaxed);
+            db.route.owners[0].store(OWNER.0, Ordering::Relaxed);
             let old = db.put(b"c", b"3", None);
-            db.route.owner.store(2, Ordering::Relaxed);
+            db.route.owners[0].store(2, Ordering::Relaxed);
             let old = old.expect_err("node 1 took a put after the promote");
             assert!(
                 matches!(
@@ -8833,9 +9813,9 @@ mod tests {
         // redirect's own text is pinned in host/tests.rs
         // (`m10_s2_a_fenced_owner_cut_from_control_answers_not_primary_once_it_reads_the_new_owner`).
         let request = old.request.expect("a refused put keeps its request");
-        db.route.owner.store(OWNER.0, Ordering::Relaxed);
+        db.route.owners[0].store(OWNER.0, Ordering::Relaxed);
         let again = db.resend(*request);
-        db.route.owner.store(2, Ordering::Relaxed);
+        db.route.owners[0].store(2, Ordering::Relaxed);
         let again = again.expect_err("node 1 took a resend after the promote");
         let text = again.error.explain();
         assert!(
@@ -9029,6 +10009,13 @@ mod tests {
         }
         let stop = std::sync::atomic::AtomicBool::new(false);
         let landed = std::sync::atomic::AtomicU64::new(0);
+        // Paced so the writer stays clear of the dedup cap. An app-chosen id is kept for the 24 h
+        // retention, so an unthrottled writer fills `RETENTION_CAP_ENTRIES` (65,536) in about
+        // 50 s and every later put is refused, which is not what this row is about. Catching the
+        // 32-record promote gate under a heavy writer is a separate question. This rate sends
+        // at most 20,000 puts over the row's whole patience, under a third of the cap at any
+        // deadline scale, and the writer keeps going throughout the re-add.
+        let pace = patience / 20_000;
         std::thread::scope(|scope| {
             let _stop = StopOnDrop(&stop);
             scope.spawn(|| {
@@ -9042,7 +10029,7 @@ mod tests {
                         landed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     sent += 1;
-                    std::thread::yield_now();
+                    std::thread::sleep(pace);
                 }
             });
             while landed.load(std::sync::atomic::Ordering::Relaxed) < 3 {
@@ -11085,14 +12072,14 @@ mod tests {
             remaining_millis: 5_000,
         };
         let wait = Duration::from_secs(5);
-        match db.call(compile(1), wait) {
+        match db.call(PARTITION, compile(1), wait) {
             Some(Answer::Compiled(_)) => {}
             other => panic!("the warm-up compile: {other:?}"),
         }
         let bar = crate::host::test_patience(Duration::from_secs(1));
         let started = std::time::Instant::now();
         for request in 2..=101 {
-            match db.call(compile(request), wait) {
+            match db.call(PARTITION, compile(request), wait) {
                 Some(Answer::Compiled(_)) => {}
                 other => panic!("compile {request}: {other:?}"),
             }

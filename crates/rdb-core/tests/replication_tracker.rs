@@ -60,7 +60,7 @@ use rdb_core::contracts::txn::{Durability, Outcome, TxnResult};
 use rdb_core::contracts::version::ENVELOPE_VERSION;
 use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{AppliedCandidate, PubConfig, PubEffect, PubEvent, PubKernel};
-use rdb_core::recovery::{Recovery, RecoveryPhase, DISCOVERY_TIMER};
+use rdb_core::recovery::{discovery_timer, Recovery, RecoveryPhase};
 use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_core::replication::catchup::{
     retransmit_timer, CatchupCursor, MAX_PROBE_ROUNDS, RETRANSMIT_MS,
@@ -4607,7 +4607,7 @@ fn f1_rebuilding() -> (Recovery, RecoveryResult) {
         &mut f1,
         window,
         EventKind::Timer(TimerFired {
-            id: DISCOVERY_TIMER,
+            id: discovery_timer(P),
             version: TimerVersion(1),
             scheduled_at: Tick::ZERO,
         }),

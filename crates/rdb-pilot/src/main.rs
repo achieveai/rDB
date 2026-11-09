@@ -453,6 +453,7 @@ fn run(args: &Args) -> ExitCode {
         }
     };
     let config = DbConfig {
+        partitions: None,
         ack_floor: true,
         dir: args.dir.clone(),
         hold: Vec::new(),

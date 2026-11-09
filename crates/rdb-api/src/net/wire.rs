@@ -380,6 +380,9 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Synced(_)
         | Msg::Stop) => return Err(Box::new((WireError::LocalOnly(local_name(&local)), local))),
         #[cfg(debug_assertions)]
+        #[cfg(test)]
+        local @ Msg::Stall(_) => return Err(Box::new((WireError::LocalOnly("Stall"), local))),
+        #[cfg(debug_assertions)]
         local @ Msg::Damage { .. } => {
             return Err(Box::new((WireError::LocalOnly("Damage"), local)))
         }
@@ -399,6 +402,8 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Inject { .. } => "Inject",
         Msg::PeerBooted { .. } => "PeerBooted",
         Msg::Rebuild { .. } => "Rebuild",
+        #[cfg(test)]
+        Msg::Stall(_) => "Stall",
         Msg::Stop => "Stop",
         Msg::Synced(_) => "Synced",
         _ => "a peer message",
@@ -718,6 +723,7 @@ pub enum WireCall {
     },
     Get {
         identity: RequestIdentity,
+        group: AffinityId,
         object: Bytes,
         look: WireLook,
     },
@@ -807,10 +813,12 @@ impl TryFrom<&ClientCall> for WireCall {
             },
             ClientCall::Get {
                 identity,
+                group,
                 object,
                 look,
             } => Self::Get {
                 identity: *identity,
+                group: *group,
                 object: object.clone(),
                 look: WireLook::try_from(look)?,
             },
@@ -871,10 +879,12 @@ impl TryFrom<WireCall> for ClientCall {
             WireCall::Resend { request } => Self::Resend { request },
             WireCall::Get {
                 identity,
+                group,
                 object,
                 look,
             } => Self::Get {
                 identity,
+                group,
                 object,
                 look: look.try_into()?,
             },

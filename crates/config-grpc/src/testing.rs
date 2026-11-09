@@ -16,7 +16,7 @@ use crate::tls::MtlsConfig;
 
 /// The DNS name the generated leaf claims. Unit tests never dial it, so any name will do as
 /// long as there is one — rustls requires an end-entity certificate to name something.
-const TEST_DNS: &str = "retcd.test";
+pub(crate) const TEST_DNS: &str = "retcd.test";
 
 /// A throwaway CA and one leaf signed by it.
 pub(crate) struct TlsFixture {

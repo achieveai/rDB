@@ -3,10 +3,10 @@
 //!
 //! ```text
 //! rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
-//! rdb_node --form --dir D --control E [--log-dir L]
+//! rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
-//!          [--ready-secs S] [--admin-apps a,b]
+//!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
 //! ```
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
@@ -14,6 +14,8 @@
 //!   certificates is how a walk presents a certificate this run's nodes do not trust.
 //! * `--form` makes the database once (ruling A-R231): all three copies in this process on
 //!   `--dir`, until ready, then shuts down. A node process only ever opens a formed database.
+//!   `--partitions` is how many partitions the database is formed with (issue #79), fixed from
+//!   then on. Unset, a new database has one and a node process reads the count from the store.
 //! * Otherwise the process runs node `N` of the database in `--dir`, holding only `nodes/N`.
 //!   `--peers` names every other node; with this one they are nodes 1 to K, K at least 3 (M11
 //!   WS A). Nodes past 3 are spares: they hold nothing until `admin move` pins them.
@@ -70,6 +72,8 @@ struct Args {
     /// `--admin-apps`: the apps that may move or rebuild a copy (A-R479); `None` is none
     /// (A-R480).
     admin_apps: Option<BTreeSet<String>>,
+    /// `--partitions`: the partition count (issue #79); `None` reads it from the control store.
+    partitions: Option<u32>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -80,10 +84,10 @@ fn admin_apps(args: &Args) -> BTreeSet<String> {
 
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
-  rdb_node --form --dir D --control E [--log-dir L]
+  rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
-           [--admin-apps a,b]
+           [--admin-apps a,b] [--partitions P]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -118,6 +122,13 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     return Err(format!("--node {n}: a node number is 1 to {MAX_NODES}"));
                 }
                 args.node = Some(n);
+            }
+            "--partitions" => {
+                args.partitions = Some(
+                    value("--partitions")?
+                        .parse()
+                        .map_err(|_| "--partitions takes a partition count".to_owned())?,
+                );
             }
             "--dir" => args.dir = Some(value("--dir")?.into()),
             "--listen" => args.listen = Some(value("--listen")?),
@@ -279,6 +290,7 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let dir = need(args.dir.as_ref(), "--dir")?;
     let store = control(args)?;
     let config = DbConfig {
+        partitions: args.partitions,
         ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
@@ -385,6 +397,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     );
 
     let config = DbConfig {
+        partitions: args.partitions,
         ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),

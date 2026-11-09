@@ -35,6 +35,8 @@ struct Script {
     hang: Option<Arc<tokio::sync::Notify>>,
     /// What a watch delivers before it ends.
     watch_items: Vec<WatchItem>,
+    /// Errors for the next calls, one per call, ahead of `error`.
+    first_errors: std::collections::VecDeque<ConfigError>,
 }
 
 /// A `ConfigStore` that answers with whatever the test scripted.
@@ -51,6 +53,7 @@ impl FakeStore {
                 mutation: MutationResponse::applied_put(11),
                 hang: None,
                 watch_items: Vec::new(),
+                first_errors: std::collections::VecDeque::new(),
             }),
             calls: AtomicU64::new(0),
         })
@@ -58,6 +61,11 @@ impl FakeStore {
 
     pub fn set_error(&self, error: Option<ConfigError>) {
         self.script.lock().unwrap().error = error;
+    }
+
+    /// Answer the next calls with `errors`, one each, then fall back to `set_error`.
+    pub fn fail_first(&self, errors: Vec<ConfigError>) {
+        self.script.lock().unwrap().first_errors = errors.into();
     }
 
     pub fn set_mutation(&self, mutation: MutationResponse) {
@@ -81,8 +89,9 @@ impl FakeStore {
     async fn answer(&self) -> Result<MutationResponse, ConfigError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let (error, mutation, hang) = {
-            let s = self.script.lock().unwrap();
-            (s.error.clone(), s.mutation.clone(), s.hang.clone())
+            let mut s = self.script.lock().unwrap();
+            let error = s.first_errors.pop_front().or_else(|| s.error.clone());
+            (error, s.mutation.clone(), s.hang.clone())
         };
         if let Some(notify) = hang {
             notify.notified().await;
@@ -339,6 +348,8 @@ impl DeadlineSpy {
         }
     }
 
+    // `tonic::Status` is large and is the error type the gRPC trait fixes.
+    #[allow(clippy::result_large_err)]
     async fn answer<T>(&self) -> Result<tonic::Response<T>, tonic::Status> {
         let scripted = self.answer.lock().unwrap().clone();
         match scripted {
