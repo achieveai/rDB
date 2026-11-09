@@ -44,6 +44,9 @@
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
+// `tonic::Status` is a large error type and it is the error type of the admin RPCs these
+// helpers forward, so the lint fires on signatures this crate does not choose.
+#![allow(clippy::result_large_err)]
 
 pub mod cluster;
 pub mod conformance;

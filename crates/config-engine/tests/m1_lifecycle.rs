@@ -246,13 +246,7 @@ async fn single_node_round_trip(expected: tokio::runtime::RuntimeFlavor) {
 /// `Handle::try_current()` check — it returns `Err(NoRuntime)` on the first poll and can never
 /// park, so a `Pending` would itself be the bug and is reported as one.
 fn poll_once_off_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
-    struct Noop;
-    impl std::task::Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = std::task::Waker::from(Arc::new(Noop));
-    let mut cx = std::task::Context::from_waker(&waker);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     match Box::pin(future).as_mut().poll(&mut cx) {
         std::task::Poll::Ready(v) => v,
         std::task::Poll::Pending => {

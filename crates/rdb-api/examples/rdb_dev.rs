@@ -1064,7 +1064,8 @@ fn answer(line: &str) -> bool {
 
 /// [`answer`] for an answer of several lines: says them all, and is false if any is an error.
 fn answer_all(lines: &[String]) -> bool {
-    lines.iter().fold(true, |ok, line| answer(line) && ok)
+    // Counted, not `all`: `all` stops at the first error and the rest would go unsaid.
+    lines.iter().filter(|line| !answer(line)).count() == 0
 }
 
 /// What the poller has seen.

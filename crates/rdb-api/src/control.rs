@@ -877,6 +877,9 @@ fn cas_outcome(
 /// open less than the longest wait, else none. A watch that stayed open that long is not a
 /// tight loop, even when its family was quiet the whole time; without that, an idle family
 /// whose stream ends at each rEtcd leader change would creep to the 2 s wait over a day.
+// `fetch_update` is deprecated in favour of `try_update` from Rust 1.99; the workspace still
+// builds on older toolchains, where `try_update` does not exist.
+#[allow(deprecated)]
 fn count_end(unserved: &AtomicU32, served: bool, opened: tokio::time::Instant) {
     let long = opened.elapsed() >= std::time::Duration::from_millis(RETRY_BACKOFF_CAP_MILLIS);
     if served || long {

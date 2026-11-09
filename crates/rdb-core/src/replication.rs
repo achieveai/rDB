@@ -545,15 +545,13 @@ impl Replication {
                     }
                 }
             }
-            Some(own) => {
-                if !self.receivers.contains_key(&key) {
-                    match fresh_receiver(own.copy, result) {
-                        Some(receiver) => self.install_receiver(receiver),
-                        None => refused = Some(ReplicaIgnoreReason::InvalidConfig),
-                    }
+            Some(own) if !self.receivers.contains_key(&key) => {
+                match fresh_receiver(own.copy, result) {
+                    Some(receiver) => self.install_receiver(receiver),
+                    None => refused = Some(ReplicaIgnoreReason::InvalidConfig),
                 }
             }
-            None => {}
+            _ => {}
         }
         let receiver = self.receivers.get_mut(&key);
         let primary = self.primaries.get_mut(&key);

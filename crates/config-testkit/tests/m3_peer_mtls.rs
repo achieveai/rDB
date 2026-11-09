@@ -110,7 +110,8 @@ fn dummy_vote(from: u64) -> PeerRequest {
 /// `tls` is the client TLS config to dial with (whatever certificate/CA the row needs);
 /// `verify_domain` is the DNS name to verify the *server* against (the real target's domain,
 /// even when the envelope's `to_node_id` lies about who that is).
-#[allow(clippy::too_many_arguments)]
+// `tonic::Status` is large and is the error type of the call under test.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn raw_peer_call(
     endpoint: &str,
     verify_domain: &str,

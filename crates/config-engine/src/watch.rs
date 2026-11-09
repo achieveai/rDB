@@ -1153,6 +1153,9 @@ impl Stream for QueueStream {
 /// Saturating rather than a bare `fetch_sub`: the producer and the consumer are different
 /// tasks, and an accounting slip should cost a stream its precision, never wrap its budget
 /// to `u64::MAX` and disable the bound it exists to enforce.
+// `fetch_update` is deprecated in favour of `try_update` from Rust 1.99; the workspace still
+// builds on older toolchains, where `try_update` does not exist.
+#[allow(deprecated)]
 fn release_bytes(occupancy: &AtomicU64, cost: u64) {
     if cost == 0 {
         return;

@@ -364,6 +364,10 @@ impl GrpcClient {
     /// `(principal, client_id, request_id)` to a node that retains it cannot - the second
     /// submission is either the first one's original outcome or its first application. One
     /// retry, not a loop: a second unknown outcome is a state the caller has to reason about.
+    /// The one repetition is while the resubmit finds no leader at all (`Unavailable` or
+    /// `NotLeader`, so nothing was applied): it asks again, paced, for up to one request
+    /// budget, because the usual cause of the first unknown outcome is the leader's death and
+    /// its successor is not elected yet.
     ///
     /// **Size the server's window against this client's concurrency.** [`Self::clone`] shares
     /// one id sequence, so several in-flight mutations mint consecutive ids and arrive in
@@ -381,6 +385,44 @@ impl GrpcClient {
     /// The deduplication namespace this client stamps mutations with, if any.
     pub fn dedup_client_id(&self) -> Option<[u8; 16]> {
         self.dedup.as_ref().map(|d| d.client_id)
+    }
+
+    /// The automatic resubmit of a mutation whose first attempt ended in an unknown outcome
+    /// (see [`GrpcClient::with_dedup`]).
+    ///
+    /// The unknown outcome is usually a node that just died, and the resubmit runs
+    /// immediately: the survivors have not elected a leader yet and answer `Unavailable`
+    /// ("leader unknown") or `NotLeader` with no usable hint. Both mean nothing was applied
+    /// ([`ConfigError::is_safe_to_resubmit`]), and the resubmit carries the original dedup
+    /// key, so asking again cannot apply twice. It therefore asks again, pausing 100 ms
+    /// doubling to 500 ms, until a typed answer arrives or one request budget has passed
+    /// since the resubmit began. Any other answer, including a second unknown outcome, ends
+    /// it as before, and the last error is returned when the budget runs out.
+    async fn resubmit<Res, Attempt, Fut>(&self, attempt: Attempt) -> Result<Res, ConfigError>
+    where
+        Attempt: Fn() -> Fut,
+        Fut: Future<Output = Result<Res, ConfigError>>,
+    {
+        let started = Instant::now();
+        let mut wait = RESUBMIT_WAIT_MIN;
+        loop {
+            match attempt().await {
+                Err(error) if error.is_safe_to_resubmit() => {
+                    let left = self.opts.request_deadline.saturating_sub(started.elapsed());
+                    if left <= wait {
+                        return Err(error);
+                    }
+                    tracing::debug!(
+                        wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                        %error,
+                        "dedup resubmit found no leader yet; asking again"
+                    );
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(RESUBMIT_WAIT_MAX);
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Whether resubmitting an unknown outcome is safe against the configured server.
@@ -1107,6 +1149,10 @@ impl PageWalk<'_> {
     }
 }
 
+/// The pause between asks of a dedup resubmit that found no leader, doubling up to the maximum.
+const RESUBMIT_WAIT_MIN: Duration = Duration::from_millis(100);
+const RESUBMIT_WAIT_MAX: Duration = Duration::from_millis(500);
+
 /// Whether an attempt tells the server its remaining budget as `grpc-timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireDeadline {
@@ -1410,8 +1456,12 @@ impl ConfigStore for GrpcClient {
             .await
         {
             Err(ConfigError::DeadlineExceededUnknownOutcome) if self.dedup_retry_allowed() => {
-                self.execute("put", true, wire, |mut c, r| async move { c.put(r).await })
-                    .await?
+                self.resubmit(|| {
+                    self.execute("put", true, wire.clone(), |mut c, r| async move {
+                        c.put(r).await
+                    })
+                })
+                .await?
             }
             other => other?,
         };
@@ -1430,12 +1480,11 @@ impl ConfigStore for GrpcClient {
             .await
         {
             Err(ConfigError::DeadlineExceededUnknownOutcome) if self.dedup_retry_allowed() => {
-                self.execute(
-                    "delete",
-                    true,
-                    wire,
-                    |mut c, r| async move { c.delete(r).await },
-                )
+                self.resubmit(|| {
+                    self.execute("delete", true, wire.clone(), |mut c, r| async move {
+                        c.delete(r).await
+                    })
+                })
                 .await?
             }
             other => other?,
