@@ -1416,6 +1416,9 @@ cited it. Marker moved below after this re-read, not before it.
 
 <!-- drift-basis: 2fddd61c9ef3624abf970e816f0f1d35e211e6fe -->
 
+**Re-read (2026-11-09, lead, issue #79), basis moves tree `d3e30c9` → tree `346ec25`.** `346ec25` is the contracts tree of commit `57d15ca`, which this entry should have accompanied: that commit's drift stage was red. `git diff d3e30c9 346ec25` is three inserted lines in `digest.rs`: the variant `Domain::Route = 7` at the end of `Domain`, with its doc comment. It removes or renames nothing, and it moves no line of any other contracts file; in `digest.rs`, whatever sits below `Domain` moved down by three lines. `Route` hashes a key to a partition and no row in this plan reads it. `M7F-02(i)` compares named pairs of domains and claims nothing about the whole set, and the row that pins `Route`'s hash is in `crates/rdb-core/tests/partition_map.rs`.
+
+
 **Foundation asks still open after this round: none.** Rows 1 and 21 were the last two, and both
 landed at `6893442` — in foundation's *first* code round, the same round that received them.
 Verification has **zero open contract shape asks**. Three documents said the opposite for four
