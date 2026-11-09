@@ -19,6 +19,7 @@ const PUTS_BEFORE_PAUSE: u64 = 2_000;
 fn tuned(host: &mut Host) {
     Trio::fast_pause(host);
     host.peer_drop_after_millis = DROP_AFTER_MILLIS;
+    host.unreachable_drop_after_millis = DROP_AFTER_MILLIS;
 }
 
 fn identity(request: u64) -> RequestIdentity {
@@ -463,6 +464,7 @@ fn m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped() {
     let (mut trio, before) = started(dir.path(), |host| {
         tuned(host);
         host.peer_drop_after_millis = CLOCK;
+        host.unreachable_drop_after_millis = CLOCK;
         host.budgets.resume_hold_millis = CLOCK * 6 / 10;
     });
     let held = trio.clock.now();
@@ -3344,6 +3346,80 @@ fn m10_bb_67_r3_a_half_open_member_is_dropped_on_the_paused_clock_only() {
     assert_eq!(planned[0]["clock"], "paused", "{planned:?}");
     assert_eq!(planned[0]["unreachable_ms"], "None", "{planned:?}");
     assert!(logged!(METHOD, "member_unreachable").is_empty());
+}
+
+/// S4f (#94): the unreachable clock has its own value, and the paused clock keeps
+/// `peer_drop_after_millis`. r3's half-open member stays linked, so only the paused clock can
+/// drop it, and with the unreachable clock a fifth as long it is still blamed for the whole
+/// paused clock.
+/// Cut: the paused check in `drop_duty` reads `unreachable_drop_after_millis` (the fields
+/// shared), red (`blamed_ms` about 200).
+/// Integration (~3 s): bootstrap, the pause, the drop.
+#[config_log::retcd_test]
+fn s4f_the_paused_clock_keeps_its_value_under_a_shorter_unreachable_clock() {
+    const METHOD: &str = "s4f_the_paused_clock_keeps_its_value_under_a_shorter_unreachable_clock";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), |host| {
+        tuned(host);
+        host.unreachable_drop_after_millis = DROP_AFTER_MILLIS / 5;
+    });
+    trio.links.drop_direction(NodeId(3), NodeId(1));
+    trio.links.drop_direction(NodeId(3), NodeId(2));
+    put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    let planned = drops_planned(METHOD);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["clock"], "paused", "{planned:?}");
+    let blamed_ms = planned[0]["blamed_ms"].as_u64().expect("blamed_ms");
+    assert!(blamed_ms >= DROP_AFTER_MILLIS, "{planned:?}");
+}
+
+/// S4f (#94): a member restarted inside a configured unreachable clock longer than the paused
+/// one is not dropped. Node 3's links are held and the host counts it unreachable, it restarts
+/// at under half the clock, and the row then waits past the clock's original end with all three
+/// pinned and no drop planned.
+/// Cut: the clock too short (`unreachable_drop_after_millis` 100 ms below), red (dropped).
+/// Integration (~4 s): bootstrap, half the clock, the restart's re-plan, the rest of the clock.
+#[config_log::retcd_test]
+fn s4f_a_restart_inside_the_configured_clock_is_not_dropped() {
+    const METHOD: &str = "s4f_a_restart_inside_the_configured_clock_is_not_dropped";
+    const CLOCK: u64 = 3 * DROP_AFTER_MILLIS;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), |host| {
+        tuned(host);
+        host.unreachable_drop_after_millis = CLOCK;
+    });
+    hold_three(&trio);
+    let since = three_unreachable_since(&mut trio);
+    pass(&mut trio, CLOCK * 4 / 10);
+    let reboot = restart(&mut trio, dir.path(), 3);
+    trio.links.heal_all();
+    assert!(
+        trio.clock.now() < since.plus_millis(CLOCK),
+        "the harness restarted past node 3's clock, not inside it"
+    );
+    until_through_blocks(
+        &mut trio,
+        "node 1 pins node 3 regular at its new boot",
+        |trio| {
+            let committed = trio.nodes[0].0.committed.get(&PartitionId(1))?;
+            let members = &committed.committed.pinned_config.members;
+            (members.len() == 3
+                && members.iter().any(|member| {
+                    member.node == NodeId(3)
+                        && member.boot == reboot
+                        && member.role == ReplicaRole::RegularSecondary
+                }))
+            .then_some(())
+        },
+    );
+    let past = since.plus_millis(CLOCK + DROP_AFTER_MILLIS / 2);
+    trio.until("host time to pass the clock's end", |trio| {
+        (trio.clock.now() >= past).then_some(())
+    });
+    let planned = drops_planned(METHOD);
+    assert!(planned.is_empty(), "{planned:?}");
+    assert_eq!(commit_of(&trio).map(|(.., members)| members.len()), Some(3));
 }
 
 /// #67 (A-R438 condition 3): b8 at its timing before A-R435. Node 3 is held from before the

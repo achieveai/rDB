@@ -567,6 +567,7 @@ fn run_host(steps: &[Step]) -> (Vec<Reply>, (Generation, Seq)) {
         timeouts: Timeouts {
             put: Duration::from_millis(DEADLINE_MILLIS),
             read: Duration::from_millis(DEADLINE_MILLIS),
+            ..Timeouts::default()
         },
         dedup_cap: None,
         dedup_retention: None,

@@ -124,6 +124,12 @@ pub struct Timeouts {
     pub put: Duration,
     /// A read or a status query.
     pub read: Duration,
+    /// How long the owner has had no link to a copy before it re-plans the partition without
+    /// that copy. Under 2 s ([`host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`]) is refused at open
+    /// with [`OpenError::Config`]. A dropped copy returns only when its node restarts, so a
+    /// shorter value pauses writes for less and drops more copies over a slow restart. Each
+    /// process running a node reads its own; set it to the same value on every node.
+    pub unreachable_drop_after: Duration,
 }
 
 impl Default for Timeouts {
@@ -131,6 +137,7 @@ impl Default for Timeouts {
         Self {
             put: Duration::from_secs(5),
             read: Duration::from_secs(1),
+            unreachable_drop_after: Duration::from_millis(host::UNREACHABLE_DROP_AFTER_MILLIS),
         }
     }
 }
@@ -255,9 +262,11 @@ impl DbConfig {
     /// [`OpenError::DedupCap`] when [`Self::dedup_cap`] is above [`RETENTION_CAP_ENTRIES`];
     /// it is also logged as `db_open_refused` with `kind=DedupCap`, as every refused open is.
     /// [`OpenError::Config`] when [`Self::ack_floor`] is on and [`Self::dedup_cap`] is below
-    /// [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`].
+    /// [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`], or when [`Timeouts::unreachable_drop_after`] is under
+    /// [`host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`].
     pub fn check(&self) -> Result<(), OpenError> {
         partitions_refusal(self.partitions).map_err(open_refused)?;
+        unreachable_drop_refusal(self.timeouts.unreachable_drop_after).map_err(open_refused)?;
         limits(self.dedup_cap, self.ack_floor)
             .map(|_| ())
             .map_err(open_refused)
@@ -740,6 +749,19 @@ fn partitions_refusal(partitions: Option<u32>) -> Result<(), OpenError> {
     }
 }
 
+/// [`Timeouts::unreachable_drop_after`] under the least an open takes.
+fn unreachable_drop_refusal(after: Duration) -> Result<(), OpenError> {
+    let least = host::MIN_UNREACHABLE_DROP_AFTER_MILLIS;
+    if after < Duration::from_millis(least) {
+        return Err(OpenError::Config(format!(
+            "unreachable_drop_after {} ms is too short: the least is {least} ms; nothing was \
+             created",
+            after.as_millis()
+        )));
+    }
+    Ok(())
+}
+
 /// What `routes/0` says the partition count is, `None` when the store holds no such key.
 ///
 /// # Errors
@@ -1199,6 +1221,7 @@ struct Respawn {
     nodes_dir: PathBuf,
     budgets: Budgets,
     limits: Limits,
+    unreachable_drop_after_millis: u64,
     /// The folder a restart takes [`next_boot`] of, when the open was given its boot
     /// ([`DbConfig::boot`]). `None`: a restart adds one to the boot it replaces.
     boots: Option<PathBuf>,
@@ -1261,6 +1284,7 @@ impl Db {
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
         partitions_refusal(config.partitions).map_err(open_refused)?;
+        unreachable_drop_refusal(config.timeouts.unreachable_drop_after).map_err(open_refused)?;
         if config.local.is_empty() {
             return Self::open_app(config, store, rt, budgets)
                 .await
@@ -1275,15 +1299,18 @@ impl Db {
                 }),
             ..budgets
         };
+        let unreachable_drop_after_millis = millis_of(config.timeouts.unreachable_drop_after);
         tracing::info!(
             dedup_cap = limits.dedup_cap,
             dedup_retention_ms = budgets.dedup_retention_millis,
+            unreachable_drop_after_ms = unreachable_drop_after_millis,
             "db_open"
         );
         let respawn = Respawn {
             nodes_dir: config.dir.join("nodes"),
             budgets,
             limits,
+            unreachable_drop_after_millis,
             boots: config.boot.map(|_| config.dir.clone()),
             storage: config.storage,
         };
@@ -1294,7 +1321,16 @@ impl Db {
             budgets,
             move |node, engine, links, control, clock, boot, partitions| {
                 host::spawn_on(
-                    node, engine, links, control, clock, budgets, limits, boot, partitions,
+                    node,
+                    engine,
+                    links,
+                    control,
+                    clock,
+                    budgets,
+                    limits,
+                    unreachable_drop_after_millis,
+                    boot,
+                    partitions,
                 )
             },
         )
@@ -3876,6 +3912,7 @@ impl Db {
                 nodes_dir,
                 budgets,
                 limits: Limits::default(),
+                unreachable_drop_after_millis: host::UNREACHABLE_DROP_AFTER_MILLIS,
                 boots: None,
                 storage: StorageOptions::default(),
             }),
@@ -3914,6 +3951,7 @@ impl Db {
                 nodes_dir: nodes_dir.clone(),
                 budgets,
                 limits,
+                unreachable_drop_after_millis: millis_of(config.timeouts.unreachable_drop_after),
                 boots: None,
                 storage: config.storage,
             }),
@@ -3938,6 +3976,7 @@ impl Db {
                 db.clock,
                 budgets,
                 limits,
+                millis_of(config.timeouts.unreachable_drop_after),
                 boot,
                 config.storage,
                 1,
@@ -4246,6 +4285,7 @@ impl Db {
                 self.clock,
                 respawn.budgets,
                 respawn.limits,
+                respawn.unreachable_drop_after_millis,
                 boot,
                 respawn.storage,
                 self.route.partitions(),
@@ -4359,6 +4399,7 @@ impl Db {
             self.clock,
             respawn.budgets,
             respawn.limits,
+            respawn.unreachable_drop_after_millis,
             boot,
             self.route.partitions(),
         )
@@ -5691,6 +5732,11 @@ fn remove_claim(dir: &Path) {
 /// newest answer and a floor record, and a new write needs one more (A-R274).
 pub const MIN_DEDUP_CAP_WITH_ACK_FLOOR: usize = 3;
 
+/// `after` in whole milliseconds, the most a `u64` holds when it does not fit.
+fn millis_of(after: Duration) -> u64 {
+    u64::try_from(after.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// T1's limits for a `dedup_cap` option: the spec's, with only the dedup cap lowered. With the
 /// ack floor on, a cap below [`MIN_DEDUP_CAP_WITH_ACK_FLOOR`] is refused: it would fill and stay
 /// full.
@@ -6269,6 +6315,7 @@ mod tests {
             timeouts: Timeouts {
                 put: Duration::from_millis(300),
                 read: Duration::from_secs(1),
+                ..Timeouts::default()
             },
             dedup_cap: None,
             dedup_retention: None,
@@ -6402,6 +6449,7 @@ mod tests {
             timeouts: Timeouts {
                 put: patience,
                 read: patience,
+                ..Timeouts::default()
             },
             dedup_cap: None,
             dedup_retention: None,
@@ -7005,6 +7053,7 @@ mod tests {
                 clock,
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
+                host::UNREACHABLE_DROP_AFTER_MILLIS,
                 boot,
                 partitions,
             )
@@ -7114,6 +7163,7 @@ mod tests {
                             clock,
                             fast(),
                             Limits::default(),
+                            host::UNREACHABLE_DROP_AFTER_MILLIS,
                             boot,
                             partitions,
                         )?;
@@ -8394,6 +8444,7 @@ mod tests {
         let short = Timeouts {
             put: Duration::from_millis(20),
             read: Duration::from_millis(20),
+            ..Timeouts::default()
         };
         let mut db = Db::by_hand(vec![owner], store, rt.handle(), short, None);
         let kinds = [
@@ -14245,6 +14296,39 @@ mod tests {
             other => panic!("the first open's last put: {other:?}"),
         }
         db.shutdown();
+    }
+
+    /// S4f (#94): an unreachable drop clock under 2,000 ms is refused before anything starts, by
+    /// `check` and by `open`, in words that name the least; `nodes/` is not created. 2,000 ms is
+    /// taken. Cut: the comparison in `unreachable_drop_refusal`, red (the open goes on).
+    #[test]
+    fn s4f_an_unreachable_drop_clock_under_two_seconds_is_refused_at_open() {
+        let dir = config_testkit::fs::temp_dir();
+        let with = |millis| DbConfig {
+            timeouts: Timeouts {
+                unreachable_drop_after: Duration::from_millis(millis),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let refused = |result: Result<(), OpenError>| match result {
+            Err(OpenError::Config(text)) => assert_eq!(
+                text,
+                "unreachable_drop_after 1999 ms is too short: the least is 2000 ms; nothing was \
+                 created"
+            ),
+            other => panic!("1,999 ms: {other:?}"),
+        };
+        refused(with(1_999).check());
+        assert!(with(2_000).check().is_ok(), "2,000 ms is the least taken");
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let opened = rt.block_on(Db::open(with(1_999), store, rt.handle().clone()));
+        refused(opened.map(|_db| ()));
+        assert!(
+            !dir.path().join("nodes").exists(),
+            "a refused open created nodes/"
+        );
     }
 
     /// A-R274 F1: with the ack floor on, a dedup cap below 3 is refused before anything starts,

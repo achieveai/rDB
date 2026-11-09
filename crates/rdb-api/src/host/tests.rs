@@ -644,6 +644,7 @@ fn a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled() {
     // A-R379: the drop clock too. A stalled host stretched the asks past it, node 1 dropped
     // node 3, and the re-plan began F1's count again (loader run 2026-10-24).
     host.peer_drop_after_millis = 600_000;
+    host.unreachable_drop_after_millis = 600_000;
     rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
         tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
     }))

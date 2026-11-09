@@ -213,15 +213,26 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
 /// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
-/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282). Two clocks
-/// share it (the host's drop duty). A reachable copy's clock starts at the later of the last
+/// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282): the paused
+/// clock of the host's drop duty. A reachable copy's clock starts at the later of the last
 /// admit and the last membership commit, and starts again whenever the blamed copy changes or
-/// its durable sequence advances, so a copy still catching up is never dropped. A member the
-/// owner has had no link to counts from the first check that found it unreachable, through
-/// rejoins and commits, until it links again or reports another boot (#67, A-R435). Either
-/// drops only while writes are paused. Longer than a process restart (2-5 s), which rejoins by
-/// `PeerBooted` instead, and 2x L1's 5 s resume hold. Crate tests set the host field directly.
+/// its durable sequence advances, so a copy still catching up is never dropped. 2x L1's 5 s
+/// resume hold. Also how long a shadow may stay unreachable before it is given up, and how
+/// often a blocked re-plan or an unanswered revocation is sent again. Crate tests set the host
+/// field directly. The unreachable clock has its own value,
+/// [`UNREACHABLE_DROP_AFTER_MILLIS`].
 pub const PEER_DROP_AFTER_MILLIS: u64 = 10_000;
+
+/// How long the owner has had no link to a regular secondary before it re-plans the partition
+/// without that copy, the default of `Timeouts::unreachable_drop_after` (#94, S4f). The member
+/// counts from the first check that found it unreachable, through rejoins and commits, until
+/// it links again or reports another boot (#67, A-R435). Longer than a process restart, which
+/// rejoins by `PeerBooted` instead. Crate tests set the host field directly.
+pub const UNREACHABLE_DROP_AFTER_MILLIS: u64 = 10_000;
+
+/// The shortest `Timeouts::unreachable_drop_after` an open takes. A shorter clock drops a copy
+/// over a restart or a brief link loss, and the copy then waits for a restart to come back.
+pub const MIN_UNREACHABLE_DROP_AFTER_MILLIS: u64 = 2_000;
 
 /// Critic M2 (A-R442): how many records behind the primary's head a shadow may be when the owner
 /// promotes it. The promote's barrier replays the rest inside the fence, where writes pause, so
@@ -1334,13 +1345,15 @@ pub fn spawn(
         clock,
         Budgets::SPEC_DEFAULTS,
         Limits::default(),
+        UNREACHABLE_DROP_AFTER_MILLIS,
         BOOT,
         StorageOptions::default(),
         1,
     )
 }
 
-/// [`spawn`] with `budgets` in place of the spec's, T1's `limits`, and `boot`. Crate tests
+/// [`spawn`] with `budgets` in place of the spec's, T1's `limits`, the unreachable drop
+/// clock, and `boot`. Crate tests
 /// shorten the budgets, so a start is ready in well under a second; nothing outside the crate
 /// can. `Db` lowers only `limits.dedup_cap`, as its `dedup_cap` option asks, and passes a boot
 /// above [`BOOT`] only when it restarts the node.
@@ -1353,6 +1366,7 @@ pub(crate) fn spawn_with(
     clock: HostClock,
     budgets: Budgets,
     limits: Limits,
+    unreachable_drop_after_millis: u64,
     boot: BootId,
     storage: StorageOptions,
     partitions: u32,
@@ -1361,7 +1375,16 @@ pub(crate) fn spawn_with(
     let engine = RocksEngine::open_with(&dir, storage)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
     spawn_on(
-        node, engine, links, control, clock, budgets, limits, boot, partitions,
+        node,
+        engine,
+        links,
+        control,
+        clock,
+        budgets,
+        limits,
+        unreachable_drop_after_millis,
+        boot,
+        partitions,
     )
 }
 
@@ -1377,6 +1400,7 @@ pub(crate) fn spawn_on(
     clock: HostClock,
     budgets: Budgets,
     limits: Limits,
+    unreachable_drop_after_millis: u64,
     boot: BootId,
     partitions: u32,
 ) -> Result<NodeHandle, String> {
@@ -1387,6 +1411,7 @@ pub(crate) fn spawn_on(
     host.syncer = Some(Syncer::start(node, path, tx.clone())?);
     host.boot = boot;
     host.budgets = budgets;
+    host.unreachable_drop_after_millis = unreachable_drop_after_millis;
     host.partition_count = partitions;
     host.transaction = Transaction::with_limits(limits);
     // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
@@ -2483,6 +2508,9 @@ struct Host {
     next_drop_check: Tick,
     /// [`PEER_DROP_AFTER_MILLIS`]; crate tests set it directly.
     peer_drop_after_millis: u64,
+    /// `Timeouts::unreachable_drop_after`, read only by [`Self::unreachable_past_clock`];
+    /// crate tests set it directly.
+    unreachable_drop_after_millis: u64,
     /// [`MOVE_CATCH_UP_MILLIS`]; crate tests set it directly.
     move_catch_up_millis: u64,
     /// D9 (A-R398): a restart re-plan from an `Active` commit pins the restarted secondary as a
@@ -2658,6 +2686,7 @@ impl Host {
             blocked_seen: BTreeMap::new(),
             next_drop_check: now.plus_millis(DROP_CHECK_EVERY_MILLIS),
             peer_drop_after_millis: PEER_DROP_AFTER_MILLIS,
+            unreachable_drop_after_millis: UNREACHABLE_DROP_AFTER_MILLIS,
             move_catch_up_millis: MOVE_CATCH_UP_MILLIS,
             restart_shadow: true,
             instance: engine_instance,
@@ -6601,14 +6630,14 @@ impl Host {
         }
     }
 
-    /// M10 S2 part (b): re-plan a partition without a copy. Two clocks, each
-    /// `peer_drop_after_millis`:
-    /// - Unreachable (#67, A-R435; D1, #93): a regular secondary this owner has had no link to
-    ///   for the clock ([`Self::count_unreachable`]) goes first, when every member the drop
-    ///   keeps is linked ([`Self::unreachable_past_clock`]), while [`Self::may_drop_unreachable`]
-    ///   holds, so an idle partition too. A rejoin or a commit does not restart it.
-    /// - Paused (rulings A-R281 M1, A-R282 N1): only while writes are paused now
-    ///   ([`Self::holding_up`]), a reachable copy's clock, for the copy L1
+    /// M10 S2 part (b): re-plan a partition without a copy. Two clocks:
+    /// - Unreachable (#67, A-R435; D1, #93), `unreachable_drop_after_millis`: a regular
+    ///   secondary this owner has had no link to for the clock ([`Self::count_unreachable`])
+    ///   goes first, when every member the drop keeps is linked
+    ///   ([`Self::unreachable_past_clock`]), while [`Self::may_drop_unreachable`] holds, so an
+    ///   idle partition too. A rejoin or a commit does not restart it.
+    /// - Paused (rulings A-R281 M1, A-R282 N1), `peer_drop_after_millis`: only while writes are
+    ///   paused now ([`Self::holding_up`]), a reachable copy's clock, for the copy L1
     ///   refuses writes on account of. It starts again on an admit, a membership commit, a
     ///   different blamed copy, or that copy's durable sequence advancing, so a copy still
     ///   catching up is never dropped.
@@ -6838,7 +6867,7 @@ impl Host {
 
     /// #67 (A-R435 G3-G5): the copy to drop on the unreachable clock, with how long it has been
     /// unreachable. Called only while [`Self::may_drop_unreachable`] holds. The member unreachable longest past
-    /// `peer_drop_after_millis` (a tie to the lower copy id), and only when every member the
+    /// `unreachable_drop_after_millis` (a tie to the lower copy id), and only when every member the
     /// drop keeps is linked and [`drop_target`] takes it. Otherwise `None`, and the paused
     /// clock decides as before (two down, say).
     fn unreachable_past_clock(&self, partition: PartitionId, now: Tick) -> Option<(Blame, u64)> {
@@ -6848,7 +6877,7 @@ impl Host {
             .iter()
             .filter_map(|member| {
                 let count = self.unreachable.get(&(partition, member.node))?;
-                (HostClock::millis_until(count.since, now) >= self.peer_drop_after_millis)
+                (HostClock::millis_until(count.since, now) >= self.unreachable_drop_after_millis)
                     .then_some((count.since, member.copy, member.node))
             })
             .min_by_key(|(since, copy, _)| (since.0, copy.0))?;

@@ -622,8 +622,20 @@ read with `recovery_mode` true. Anything else starts the pass again. This compar
 fence, and can cost one extra pass at seq 0. A barrier never holds up a write.
 
 A copy that stops answering ends a barrier in `DURABILITY_UNCONFIRMED` at its timeout if that comes
-before the copy is dropped. With a timeout under `PEER_DROP_AFTER_MILLIS` (10 s), expect
-that, not `GENERATION_CHANGED`, and treat either as "read back".
+before the copy is dropped. With a timeout under the drop time, expect that, not
+`GENERATION_CHANGED`, and treat either as "read back".
+
+Two clocks decide when a copy is dropped:
+
+| Clock | Default | Set by | Applies to |
+|---|---|---|---|
+| `Timeouts::unreachable_drop_after` | 10 s | `DbConfig::timeouts`, or `rdb_node --unreachable-drop-after-ms` | The owner has no link to a copy, because its process died or its links are cut. An idle partition drops it too. |
+| `PEER_DROP_AFTER_MILLIS` | 10 s | Fixed | A copy that is still linked but holds writes up. |
+
+`Timeouts::unreachable_drop_after` under 2,000 ms is refused at open with `OpenError::Config`.
+Set it to the same value on every node. A lower value pauses writes for less when a node dies,
+but a restart or link loss longer than the value drops the copy from every partition that owner
+holds, and that copy comes back only when its node restarts.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
