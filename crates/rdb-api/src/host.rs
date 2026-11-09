@@ -2338,6 +2338,9 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// S4a: each left-out copy `copy_left_out_until_restart` has been logged for, so the line
+    /// comes once per partition, node and boot.
+    left_out_warned: BTreeSet<(PartitionId, NodeId, BootId)>,
     /// Per partition, the spares `admin rebuild` noted in `left_out` for a free slot (M11
     /// A-R456, critic A5). A slot takes one note; a note is pending while its node is still left
     /// out. Memory only: a new owner starts with none, so the operator re-runs the rebuild.
@@ -2572,6 +2575,7 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
+            left_out_warned: BTreeSet::new(),
             spare_notes: BTreeMap::new(),
             moves: BTreeMap::new(),
             moved: BTreeMap::new(),
@@ -6032,6 +6036,7 @@ impl Host {
     /// is already re-added. Only a boot newer than the one the drop recorded counts. That is the
     /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
     /// rejoiner) is re-added at once, and a copy dropped at its live boot waits for a restart.
+    /// A left-out entry at `UNLINKED_BOOT` is no proof of a restart and is skipped (S4-20).
     fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
         // A-R455 (T11): a shadow holds a slot too, so a re-add pins only up to the free slots;
         // an extra left-out node stays out rather than becoming a shadow with no slot to fill.
@@ -6046,7 +6051,12 @@ impl Host {
             // An `admin rebuild` waiting on this drop is not undone by a re-add: the node
             // comes back only once restarted on its wiped folder (M11, b3).
             let rebuilding = self.rebuild_asks.values().any(|ask| ask.node == left.node);
-            !pinned
+            // S4-20: `UNLINKED_BOOT` is what a promote pins a copy at when it could not see
+            // the copy's boot. No process runs at it, so any live boot is "newer" and the
+            // comparison would prove nothing. [`Self::restore_left_out`] records the live boot
+            // at first sight, and only a boot newer than that re-adds.
+            left.boot != crate::admin::UNLINKED_BOOT
+                && !pinned
                 && !rebuilding
                 && self
                     .links
@@ -6499,13 +6509,14 @@ impl Host {
         }
     }
 
-    /// M10 S2 part (b): re-plan a partition without a copy while L1 refuses its writes. Two
-    /// clocks, each `peer_drop_after_millis`, and only while writes are paused now
-    /// ([`Self::holding_up`]):
-    /// - Unreachable (#67, A-R435): a regular secondary this owner has had no link to for the
-    ///   clock ([`Self::count_unreachable`]) goes first, when every member the drop keeps is
-    ///   linked ([`Self::unreachable_past_clock`]). A rejoin or a commit does not restart it.
-    /// - Paused (rulings A-R281 M1, A-R282 N1): a reachable copy's clock, for the copy L1
+    /// M10 S2 part (b): re-plan a partition without a copy. Two clocks, each
+    /// `peer_drop_after_millis`:
+    /// - Unreachable (#67, A-R435; D1, #93): a regular secondary this owner has had no link to
+    ///   for the clock ([`Self::count_unreachable`]) goes first, when every member the drop
+    ///   keeps is linked ([`Self::unreachable_past_clock`]), while [`Self::may_drop_unreachable`]
+    ///   holds, so an idle partition too. A rejoin or a commit does not restart it.
+    /// - Paused (rulings A-R281 M1, A-R282 N1): only while writes are paused now
+    ///   ([`Self::holding_up`]), a reachable copy's clock, for the copy L1
     ///   refuses writes on account of. It starts again on an admit, a membership commit, a
     ///   different blamed copy, or that copy's durable sequence advancing, so a copy still
     ///   catching up is never dropped.
@@ -6520,20 +6531,164 @@ impl Host {
             self.move_target_lost_duty(partition);
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
+            self.restore_left_out(partition);
+            self.warn_left_out(partition);
+            // D1 (#93): ahead of the gate below, so an idle partition, which L1 never pauses,
+            // drops a dead copy too.
+            if self.may_drop_unreachable(partition, now) {
+                if let Some((blame, unreachable_ms)) = self.unreachable_past_clock(partition, now) {
+                    self.drop_copy(partition, blame, unreachable_ms, DropClock::Unreachable);
+                    continue;
+                }
+            }
             let Some((copy, durable)) = self.holding_up(partition, now) else {
                 self.blamed.remove(&partition);
                 continue;
             };
-            if let Some((blame, unreachable_ms)) = self.unreachable_past_clock(partition, now) {
-                self.drop_copy(partition, blame, unreachable_ms, DropClock::Unreachable);
-                continue;
-            }
             let blame = Blame::next(self.blamed.get(&partition), copy, durable, now);
             self.blamed.insert(partition, blame);
             let blamed_ms = HostClock::millis_until(blame.since, now);
             if blamed_ms >= self.peer_drop_after_millis {
                 self.drop_copy(partition, blame, blamed_ms, DropClock::Paused);
             }
+        }
+    }
+
+    /// Whether this node's last commit of `partition` pins it primary.
+    fn is_pinned_primary(&self, partition: PartitionId) -> bool {
+        self.committed.get(&partition).is_some_and(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .any(|member| member.node == self.node && member.role == ReplicaRole::Primary)
+        })
+    }
+
+    /// D1 (#93): whether the unreachable clock may drop a copy of `partition` now. Writes need
+    /// not be paused, but it never runs through a rejoin, on a `ReadOnly` commit (A-R381), or
+    /// when L1 refuses for anything but a pause, such as a divergence.
+    fn may_drop_unreachable(&self, partition: PartitionId, now: Tick) -> bool {
+        if self.rejoins.contains_key(&partition) || !self.is_pinned_primary(partition) {
+            return false;
+        }
+        if self
+            .committed
+            .get(&partition)
+            .is_none_or(|committed| committed.mode == PartitionMode::ReadOnly)
+        {
+            return false;
+        }
+        self.l1
+            .get(&partition)
+            .and_then(|l1| l1.protection.admission_state(now))
+            .is_some_and(|state| state.allow || state.reason == Some(ErrorKind::ProtectionPaused))
+    }
+
+    /// S4a: rebuild what `left_out`, memory only, lost in a restart of this owner, and give a
+    /// `UNLINKED_BOOT` entry its first real boot (S4-20). The boot recorded is always a live
+    /// one, so [`Self::readd_candidate`]'s `live > left.boot` still means a real restart: a
+    /// node up now waits for its next restart, which the runbook says to do after the owner
+    /// is up.
+    fn restore_left_out(&mut self, partition: PartitionId) {
+        for left in self.left_out.get_mut(&partition).into_iter().flatten() {
+            if left.boot != crate::admin::UNLINKED_BOOT {
+                continue;
+            }
+            if let Some(live) = self.links.boot_of(left.node) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    left_out = left.node.0,
+                    boot = live.0,
+                    "left_out_boot_recorded"
+                );
+                left.boot = live;
+            }
+        }
+        if self.rejoins.contains_key(&partition) || !self.is_pinned_primary(partition) {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        let seats = crate::admin::members();
+        if members.len() >= seats.len() {
+            return;
+        }
+        let left_out = self.left_out.entry(partition).or_default();
+        for seat in seats {
+            let taken = members
+                .iter()
+                .chain(left_out.iter())
+                .any(|member| member.node == seat.node || member.copy == seat.copy);
+            if taken {
+                continue;
+            }
+            let Some(live) = self.links.boot_of(seat.node) else {
+                continue;
+            };
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                left_out = seat.node.0,
+                copy = seat.copy.0,
+                boot = live.0,
+                "left_out_restored"
+            );
+            left_out.push(Member {
+                boot: live,
+                role: ReplicaRole::RegularSecondary,
+                ..seat
+            });
+        }
+    }
+
+    /// S4a: say once per partition, node and boot that a left-out copy with a free slot stays
+    /// out until it is restarted. Not for a boot [`Self::readd_candidate`] takes (the re-add is
+    /// coming), an `admin rebuild`'s node, or a boot not yet seen.
+    fn warn_left_out(&mut self, partition: PartitionId) {
+        if !self.is_pinned_primary(partition) {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let members = &committed.committed.pinned_config.members;
+        if members.len() >= crate::admin::members().len() {
+            return;
+        }
+        let Some(left_out) = self.left_out.get(&partition) else {
+            return;
+        };
+        for left in left_out {
+            let pinned = members.iter().any(|member| member.node == left.node);
+            let rebuilding = self.rebuild_asks.values().any(|ask| ask.node == left.node);
+            let restarted = self
+                .links
+                .boot_of(left.node)
+                .is_some_and(|live| live > left.boot);
+            if pinned
+                || rebuilding
+                || restarted
+                || left.boot == crate::admin::UNLINKED_BOOT
+                || !self
+                    .left_out_warned
+                    .insert((partition, left.node, left.boot))
+            {
+                continue;
+            }
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                left_out = left.node.0,
+                copy = left.copy.0,
+                boot = left.boot.0,
+                action = %format!("restart node {} to bring it back", left.node.0),
+                "copy_left_out_until_restart"
+            );
         }
     }
 
@@ -6590,7 +6745,7 @@ impl Host {
     }
 
     /// #67 (A-R435 G3-G5): the copy to drop on the unreachable clock, with how long it has been
-    /// unreachable. Called only while writes are paused. The member unreachable longest past
+    /// unreachable. Called only while [`Self::may_drop_unreachable`] holds. The member unreachable longest past
     /// `peer_drop_after_millis` (a tie to the lower copy id), and only when every member the
     /// drop keeps is linked and [`drop_target`] takes it. Otherwise `None`, and the paused
     /// clock decides as before (two down, say).

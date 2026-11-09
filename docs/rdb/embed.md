@@ -609,6 +609,9 @@ Both ask only the nodes this process runs. **An app-only `Db` runs none, so both
 list there, every time.** That does not mean the database has no nodes, and it says nothing about
 a partition's note. In a `Db` that runs nodes, an empty list means none of them answered.
 
+`committed_without` is `Known` only on the partition's owner. Any other node answers `Unknown`,
+which never means "no note": read it from a process that runs the owner.
+
 **To know a write is on disk, use `db.wait_durable(group, (generation, seq), timeout)`** with the
 `generation` and `seq` of a `PutOk`. It makes every regular copy sync and answers `Ok` when all
 have. `Ok` proves every record in the current history at or below that position, and says nothing
@@ -617,6 +620,10 @@ durable, finish only when each key's read `generation`, each rewrite's `PutOk.ge
 marker's `PutOk.generation` are equal and the barrier on the marker answers `Ok`, and reject any
 read with `recovery_mode` true. Anything else starts the pass again. This comparison is not a
 fence, and can cost one extra pass at seq 0. A barrier never holds up a write.
+
+A copy that stops answering ends a barrier in `DURABILITY_UNCONFIRMED` at its timeout if that comes
+before the copy is dropped. With a timeout under `peer_drop_after_millis` (10 s by default), expect
+that, not `GENERATION_CHANGED`, and treat either as "read back".
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -660,6 +667,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   copies. Healing the link alone does not add it back. Restart that node: `lr restart N` with
   three processes, or `db.restart_node(NodeId(N))` embedded. It comes back as a standby first,
   then as a full copy.
+  The same goes for a copy that drops while nothing is being written: rDB no longer waits for a
+  write to pause before it stops waiting for an unreachable copy. The owner logs
+  `copy_left_out_until_restart` once, naming the node. **Restart the left-out node after the
+  owner is up:** an owner that restarted relearns who is left out from the live boot it sees
+  (`left_out_restored`), so a node that restarted before that needs one more restart.
 - **A restarted copy waits about 5 s before it counts again.** Once it has caught up, it must
   stay within 250 ms of the owner for 5 s in a row before writes resume (`resume_hold_millis`
   and `resume_lag_millis`). Falling behind again restarts the 5 s. That wait was most of the
