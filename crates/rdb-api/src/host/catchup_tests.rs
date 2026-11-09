@@ -1,7 +1,9 @@
 //! Host catch-up and landing rows: inventory, `land_link`, the missed-generation links and
 //! the D7 catch-up wiring. Moved out of `host.rs` (M10 S2 event 0).
 
-use super::trio::{current_thread, host_over, logged, write_chain, write_chain_after, Trio};
+use super::trio::{
+    current_thread, host_over, logged, write_chain, write_chain_after, write_chain_in, Trio,
+};
 use super::*;
 
 /// M9 serves only an empty copy, so a copy that holds anything must answer
@@ -1688,5 +1690,71 @@ fn m10_s2_mat2_a_retired_receiver_beside_a_serving_primary_is_replaced_for_a_sou
             .iter()
             .any(|line| line["node"] == 1),
         "node 1 restored no dormant receiver"
+    );
+}
+
+/// Critic-s1b A1: a node with no kept inventory ladder (every node after a reopen) read its
+/// first one from seq 0, not from its generation's base, so a reopen's first inventory read
+/// the whole history before the base and kept it in memory for good. Here node 2 holds 40
+/// records of generation 1 and an inventory for generation 2 links it at base 40: the ladder
+/// starts at the base and reads nothing below it.
+/// Cut: a cold ladder starts at `(0, ROOT)`, red (first rung seq 0, 40 records read).
+#[config_log::retcd_test]
+fn m11_a1_a_a_reopened_node_reads_its_first_ladder_from_the_base() {
+    const METHOD: &str = "m11_a1_a_a_reopened_node_reads_its_first_ladder_from_the_base";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        40,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 40, digests[39])) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(40), digests[39]));
+            assert_eq!(inventory.ladder, vec![(Seq(40), digests[39])]);
+        }
+        other => panic!("expected a report, got {other:?}"),
+    }
+    let rungs = &host.inventory_ladders[&PartitionId(1)].rungs;
+    assert_eq!(rungs.first(), Some(&(Seq(40), digests[39])), "{rungs:?}");
+    assert_eq!(rungs.len(), 1, "{rungs:?}");
+    let read = logged!(METHOD, "inventory_ladder");
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0]["read"], 0, "{read:?}");
+    assert_eq!(
+        host.inventory_ladder_matches_rebuild(PartitionId(1)),
+        Some((true, Seq(40)))
+    );
+}
+
+/// Critic-s1b A2: `ladder_duty` warmed partitions in a fixed order, [`WARM_RUNGS`] records a
+/// pass across all of them, so while partition 1 had more to read than that, partition 2 was
+/// never reached. Here partition 1 holds two passes' worth and partition 2 holds 10 records:
+/// the second pass starts at partition 2, which is then warmed through its head.
+/// Cut: no rotation, red (partition 2 has no ladder after two passes).
+#[test]
+fn m11_a2_a_the_ladder_duty_starves_no_partition() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 2 * WARM_RUNGS + 1);
+        write_chain_in(&mut engine, PartitionId(2), Generation(1), Vec::new(), 10);
+    }
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    host.ladder_duty();
+    assert!(
+        !host.inventory_ladders.contains_key(&PartitionId(2)),
+        "control: the first pass spends its budget on partition 1"
+    );
+    host.ladder_duty();
+    assert_eq!(
+        host.inventory_ladder_matches_rebuild(PartitionId(2)),
+        Some((true, Seq(10))),
+        "the second pass warms partition 2 through its head"
     );
 }

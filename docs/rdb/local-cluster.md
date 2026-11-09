@@ -29,6 +29,8 @@ Where things go:
   - `db/nodes/1..3`: each node's copy.
   - `ctl/`: rEtcd's data and logs.
   - `certs/`: the run's TLS certificates. Apps `pilot`, `pilot-a`, `pilot-b` and `admin` have one.
+    Only `admin` may move or rebuild a copy: `lr` starts the nodes with `--admin-apps admin`
+    (unset, a node lets no app; A-R480). `lr move`, `lr rebuild` and `lr promote` run as `admin`.
   - `logs/rdb_node-N.jsonl`: node N's log. `out/node-N.out` and `.err`: its console.
   - `run.env`: the ports and binaries.
 - Ports: rEtcd uses `P+1` to `P+24`. Node N listens on `P+40+N`. `P` is 19800 unless you pass
@@ -61,12 +63,15 @@ works as written. `--run DIR` picks another run.
 | `kill N` | Kills node N at once, like a crash. Prints `lr: node N killed (pid ...)`. |
 | `hold A-B` | Holds every frame between nodes A and B: a cut link (a delay, never a loss). |
 | `heal A-B` | Lifts that hold. If the cut lasted long enough that a copy was dropped, `heal` alone does not add it back. Writes keep working on the other two copies. Run `lr restart N` for the dropped node; it comes back as a standby first, then as a full copy. |
-| `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. The node left out is added back automatically when it starts again. |
+| `promote N` | Makes node N the owner, through rEtcd. Done is `promoted: node N owns partition 1 at generation G ...`. `--drop M` names the node to leave out. An open app follows it; no reopen. The node left out is added back when it starts again, but only while the owner that dropped it keeps running. After that owner restarts, it stays out until `lr rebuild N`. |
 | `down` | Stops the nodes and rEtcd. The run folder stays, with its data and logs. |
 | `up --resume` | Starts the last run again after a `down`: its rEtcd, then nodes 1, 2 and 3, with its own ports and binary paths (a later `up` rebuilds those binaries in place). The data written before `down` is still there. A run that is still up is refused: "the run is up; 'lr down' first". Plain `up` always makes a **new**, empty run. |
 | `clean` | `down`, then deletes the run folder, **its logs included**: copy what you need first. Prints `lr: removed <run folder>`. |
 
 `scripts/local-rdb.sh` with no verb lists every verb, including the fault verbs.
+
+To plan copy moves from an inventory file (model only; it applies nothing), see
+[placement-plan.md](placement-plan.md).
 
 ## 3. Your app
 
@@ -132,6 +137,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 dial,
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                // An app receives no calls (A-R479).
+                admin_apps: std::collections::BTreeSet::new(),
             },
             &links,
             None,

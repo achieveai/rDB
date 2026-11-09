@@ -23,6 +23,7 @@
 #   scripts/gate.sh                                   fmt + deps + drift + purity + clippy + test
 #   scripts/gate.sh fmt|deps|drift|purity|lint|test   one stage
 #   scripts/gate.sh test -p config-engine --test m4_watch    extra args go to cargo
+#   scripts/gate.sh perf                              the wall-clock perf rows, one at a time
 
 set -euo pipefail
 
@@ -96,6 +97,16 @@ run_test() {
   # before its process ended. A failing run keeps its data for inspection.
   if [ "$gate_owns_data" = 1 ]; then rm -rf "$RETCD_TEST_DATA_DIR"; fi
 }
+# Wall-clock bounds (a pause under 300 ms at 20k records) are `#[ignore = "perf: ..."]` rows,
+# so the test stage stays deterministic under the host's 4-CPU cap, where every test binary
+# shares CPUs 0-3. This stage runs them alone, one thread, so no row starves another. It is not
+# part of `all`; run it on its own. Only rdb-api holds perf rows today: add a crate here when
+# another gains one.
+run_perf() {
+  echo "== perf"
+  cargo test -p rdb-api --lib --no-fail-fast "$@" -- --ignored --test-threads=1
+  if [ "$gate_owns_data" = 1 ]; then rm -rf "$RETCD_TEST_DATA_DIR"; fi
+}
 # perl with JSON::PP ships with every Git for Windows and every Linux perl; no jq needed.
 run_deps() {
   echo "== deps"
@@ -124,11 +135,12 @@ case "$stage" in
   purity) run_purity ;;
   lint)  run_lint ;;
   test)  run_test "$@" ;;
+  perf)  run_perf "$@" ;;
   # One stage per line, never an `&&` chain: bash ignores `set -e` inside one, so a failed
   # stage ended the chain and the script still printed "all OK" and exited 0, with no
   # clippy and no tests run. Observed 2026-10-01 with a drift failure.
   all)   run_fmt; run_deps; run_drift; run_purity; run_lint; run_test ;;
-  *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, lint, test or all)" >&2; exit 1 ;;
+  *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, lint, test, perf or all)" >&2; exit 1 ;;
 esac
 
 echo "gate: $stage OK"

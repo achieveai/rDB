@@ -229,7 +229,26 @@
 //!                                         until the first `ready`
 //! admin status                            read-only: the partitions/ and grants/ records
 //!                                         through this Db's store, as `control` prints them,
-//!                                         then each `--nodes` link's `link node=N ..` line
+//!                                         and the members line (M11): `members 1=owner
+//!                                         2=regular 4=shadow; not pinned 3 (as node 1 pins
+//!                                         them)`, or `(as partitions/1 names them; ..)` when
+//!                                         the owner does not answer, then each `--nodes`
+//!                                         link's `link node=N ..` line
+//! admin move <from> <to>                  M11: move partition 1's copy from node <from> to
+//!                                         node <to> (a spare, `lr up --nodes K`): <to> joins
+//!                                         as a shadow, catches up from seq 1, then one
+//!                                         commit pins it regular and leaves <from> out.
+//!                                         Prints `moving: ..` lines until `moved: node <to>
+//!                                         regular, node <from> left out; partition 1 is at
+//!                                         generation G now` (G is the current generation,
+//!                                         which a later restart moves on).
+//!                                         Asking again resumes. A finished move asked
+//!                                         again (a replayed plan) says `already moved ..`
+//!                                         and exits 0, while the owner that ran it serves.
+//!                                         The owner's copy is refused (promote first); a
+//!                                         refusal prints `err admin move ..`, exits 1.
+//!                                         Only an admin app may run it (`rdb_node
+//!                                         --admin-apps`); `lr` runs as `admin`
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
 //!                                         and it may go: `absent`, `current` (the running
 //!                                         process's own), `cleared rev=R`, `conflict`, or
@@ -370,11 +389,15 @@
 //!                                         folder. Refused, nothing done, for the owner
 //!                                         (promote first), a re-plan running, a partition
 //!                                         on two copies, or a quarantine whose evidence
-//!                                         does not name n. Under `--nodes` it only checks
-//!                                         that n is already left out; `lr rebuild n
+//!                                         does not name n. Under `--nodes` it asks the
+//!                                         owner, which takes only a node it does not pin:
+//!                                         one already left out, or a spare (M11), which
+//!                                         it notes for a free slot; `lr rebuild n
 //!                                         [--wipe]` then stops n, has the fence checked
 //!                                         (`--wipe --fence`), moves the folder aside
-//!                                         and starts n
+//!                                         and starts n. Under `--nodes`, only an admin
+//!                                         app may run it (`rdb_node --admin-apps`); `lr`
+//!                                         runs as `admin`
 //! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
 //!                                         n's head record as a validly chained different
 //!                                         one; `node restart n` then rejoins it and the
@@ -422,6 +445,15 @@
 //! then, logged as `control_store_rebind`.
 //!
 //! The JSONL log goes to `<log-dir>/rdb_dev.jsonl`; its path is printed to stderr as `log=`.
+//!
+//! `rdb_dev admin plan <inventory.json> [--max-moves K]` (M11, model only) starts nothing and
+//! talks to no cluster. It reads an inventory file (nodes, and where each partition's copies and
+//! primary are; format in `docs/rdb/placement-plan.md`), plans at most K steps (no limit without
+//! the flag), prints one line per step with its reason (`admin move <from> <to>`, the session
+//! line above, for a copy move of partition 1, a `step:` line for anything no live command
+//! takes), then
+//! `after:` with the skews and one `residual:` line per claim left unmet. Nothing is applied. A file that does not read, or an inventory that does not add up,
+//! prints `rdb_dev admin plan: ..` to stderr and exits 2.
 
 #[path = "support/hostile_store.rs"]
 mod hostile_store;
@@ -457,7 +489,9 @@ use rdb_core::contracts::authority::DenyReason;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::RetryRule;
 use rdb_core::contracts::event::Budgets;
-use rdb_core::contracts::ids::{AffinityId, BootId, Generation, NodeId, PartitionId, RequestId};
+use rdb_core::contracts::ids::{
+    AffinityId, BootId, Generation, NodeId, PartitionId, ReplicaRole, RequestId,
+};
 use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
 use sha2::{Digest as _, Sha256};
 
@@ -501,7 +535,8 @@ struct Args {
     nodes: std::collections::BTreeMap<NodeId, String>,
     /// `--cert-dir D`: the run's certificates, read for `--nodes`.
     cert_dir: Option<PathBuf>,
-    /// `--app NAME`: the app certificate `--nodes` dials as.
+    /// `--app NAME`: the app certificate `--nodes` dials as. `admin move` and `admin rebuild`
+    /// need an admin app (`rdb_node --admin-apps`, which `lr` sets to `admin`; A-R479, A-R480).
     app: String,
     /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
     help: bool,
@@ -617,7 +652,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                         .trim()
                         .split_once('=')
                         .ok_or_else(|| format!("--nodes: {pair:?} is not N=host:port"))?;
-                    let node = parse_node(node).map_err(|e| format!("--nodes: {e}"))?;
+                    let node = parse_any_node(node).map_err(|e| format!("--nodes: {e}"))?;
                     parsed.nodes.insert(node, addr.trim().to_owned());
                 }
             }
@@ -673,6 +708,16 @@ fn is_host_port(text: &str) -> bool {
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
 }
 
+/// A node of a run with spares (M11 WS A): 1 to [`rdb_api::db::MAX_NODES`]. [`parse_node`]
+/// keeps 1 to 3 for every command that acts on a member.
+fn parse_any_node(text: &str) -> Result<NodeId, String> {
+    let max = rdb_api::db::MAX_NODES;
+    match text.trim().parse::<u32>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(NodeId(n)),
+        _ => Err(format!("{text:?}: a node is 1 to {max}")),
+    }
+}
+
 fn parse_node(text: &str) -> Result<NodeId, String> {
     match text.trim().parse::<u32>() {
         Ok(n @ 1..=3) => Ok(NodeId(n)),
@@ -703,8 +748,97 @@ fn parse_pair(text: &str) -> Result<(NodeId, NodeId), String> {
     Ok((a, b))
 }
 
+/// `admin plan <file> [--max-moves K]`: reads an inventory, prints the plan, applies nothing.
+/// Runs before any argument parsing, log or cluster: it reads one file and writes stdout.
+fn admin_plan(rest: &[String]) -> ExitCode {
+    use rdb_core::placement;
+    const USAGE: &str = "usage: rdb_dev admin plan <inventory.json> [--max-moves K]";
+    let fail = |message: String| {
+        eprintln!("rdb_dev admin plan: {message}");
+        ExitCode::from(2)
+    };
+    let mut file = None;
+    let mut max_moves = None;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--max-moves" => match words.next().map(|k| k.parse::<usize>()) {
+                Some(Ok(k)) => max_moves = Some(k),
+                _ => return fail(format!("--max-moves takes a whole number; {USAGE}")),
+            },
+            other if other.starts_with("--") || file.is_some() => {
+                return fail(format!("unexpected {other:?}; {USAGE}"));
+            }
+            other => file = Some(other.to_owned()),
+        }
+    }
+    let Some(file) = file else {
+        return fail(format!("no inventory file; {USAGE}"));
+    };
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) => return fail(format!("{file}: {e}")),
+    };
+    let inventory: placement::Inventory = match serde_json::from_str(&text) {
+        Ok(inventory) => inventory,
+        Err(e) => return fail(format!("{file}: not an inventory: {e}")),
+    };
+    let plan = match placement::plan(&inventory, max_moves.unwrap_or(usize::MAX)) {
+        Ok(plan) => plan,
+        Err(e) => return fail(format!("{file}: {e}")),
+    };
+    println!(
+        "plan: {} nodes, {} partitions, max moves {}; model only, nothing is applied",
+        inventory.nodes.len(),
+        inventory.partitions.len(),
+        max_moves.map_or_else(|| "none".to_owned(), |k| k.to_string())
+    );
+    println!(
+        "before: copy skew {}, primary skew {}",
+        placement::copy_skew(&inventory),
+        placement::primary_skew(&inventory)
+    );
+    for step in &plan.steps {
+        println!("{}", step.line());
+    }
+    println!(
+        "after: {} moves, copy skew {}, primary skew {}",
+        plan.steps.len(),
+        placement::copy_skew(&plan.after),
+        placement::primary_skew(&plan.after)
+    );
+    let counts = |counts: std::collections::BTreeMap<u32, usize>| {
+        counts
+            .iter()
+            .map(|(node, count)| format!("{node}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    println!(
+        "after: copies per node {}",
+        counts(placement::copy_counts(&plan.after))
+    );
+    println!(
+        "after: primaries per node {}",
+        counts(placement::primary_counts(&plan.after))
+    );
+    for residual in &plan.residuals {
+        println!("residual: {}", residual.describe());
+    }
+    if plan.residuals.is_empty() {
+        println!("residual: none");
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
-    let args = match parse(std::env::args().skip(1)) {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if let [admin, plan, rest @ ..] = raw.as_slice() {
+        if admin == "admin" && plan == "plan" {
+            return admin_plan(rest);
+        }
+    }
+    let args = match parse(raw.into_iter()) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("rdb_dev: {message}");
@@ -885,6 +1019,10 @@ where
         say("bootstrap: partition 1 recovery started");
     } else {
         say("reopen: partition 1 takes over from the last run (heal started)");
+        // A-R467: a reopen does not re-add a dropped copy, so the open says so.
+        if let Some(out) = left_out_line(&db, &rt, &*store) {
+            say(&format!("reopen: {out}"));
+        }
     }
     let progress = Progress::default();
     let stop = AtomicBool::new(false);
@@ -1005,6 +1143,8 @@ fn connect_app(rt: &tokio::runtime::Runtime, args: &Args) -> Result<Arc<Links>, 
                 dial: args.nodes.clone(),
                 protocol_version: PROTOCOL_VERSION,
                 faults: Faults::new(),
+                // An app receives no calls (A-R479).
+                admin_apps: std::collections::BTreeSet::new(),
             },
             &links,
             None,
@@ -1117,8 +1257,8 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
 /// poller's "writes pause soon ... because node N restarted" is then stale, so it is not said
 /// (bug bash #65: it stayed the last word after `rebuilt` pinned node 3 again). The refusals'
 /// restart note is the `Db`'s and still names the restart.
-fn rejoined(owner: &NodeStatus, boot_of: impl Fn(NodeId) -> Option<BootId>) -> bool {
-    let restarted = restarted_nodes(&boot_of);
+fn rejoined(owner: &NodeStatus, base: BootId, boot_of: impl Fn(NodeId) -> Option<BootId>) -> bool {
+    let restarted = restarted_nodes(base, &boot_of);
     !restarted.is_empty()
         && !restarted.contains(&owner.node)
         && restarted.iter().all(|&node| {
@@ -1200,9 +1340,10 @@ fn poll_once(db: &Db, progress: &Progress) {
         let admits = owner.admits == Some(true);
         if let Some(line) = ready_step(
             &mut seen,
+            db.base_boot(),
             owner,
             db.restart_note()
-                .filter(|_| !rejoined(owner, |node| db.boot_of(node)))
+                .filter(|_| !rejoined(owner, db.base_boot(), |node| db.boot_of(node)))
                 .as_deref(),
             &db.links().held(),
             &db.links().dropped(),
@@ -1265,6 +1406,7 @@ const RESUMES: &str = "writes are paused and resume by themselves once the owner
 /// self-replace, or a restart with L1 refusing. After a restart, the pause follows the resume.
 fn ready_reason(
     owner: &NodeStatus,
+    base: BootId,
     admits: bool,
     restart_note: Option<&str>,
     held: &[(NodeId, NodeId)],
@@ -1304,7 +1446,9 @@ fn ready_reason(
     if admits {
         return Some(format!("writes {pause}"));
     }
-    if owner.boot != rdb_api::host::BOOT {
+    // M11 final walk: against this open's base boot, never boot 1, or every node of a reopened
+    // folder reads as a restarted owner and a secondary's rebuild printed this line.
+    if owner.boot != base {
         return Some(format!("{note}; {STUCK}"));
     }
     // M10 (bb #65 paper cut, #69 walk r4): a copy out no longer stops writes for the run. The
@@ -1326,7 +1470,7 @@ fn ready_reason(
             )
         }
         Some(reason) => format!("{}; {note}", fence_line(owner, reason, held, dropped)),
-        None => format!("writes are not admitted now; if they come back, they {pause}"),
+        None => format!("if they come back, they {pause}"),
     })
 }
 
@@ -1527,6 +1671,7 @@ const fn never_replaced(reason: DenyReason) -> bool {
 /// r6_3200: the fence's resume line stayed the last word after A1 stopped, `unheld`).
 fn ready_step(
     seen: &mut Seen,
+    base: BootId,
     owner: &NodeStatus,
     restart_note: Option<&str>,
     held: &[(NodeId, NodeId)],
@@ -1537,7 +1682,7 @@ fn ready_step(
     step_line(
         seen,
         admits,
-        ready_reason(owner, admits, restart_note, held, dropped),
+        ready_reason(owner, base, admits, restart_note, held, dropped),
     )
 }
 
@@ -1977,8 +2122,11 @@ fn repl<'scope, 'env>(
                 bad |= !answer_all(&admin_status_lines(rt, db, store));
                 Ok(())
             }
+            ["admin", "move", from, to] => parse_any_node(from).and_then(|from| {
+                parse_any_node(to).map(|to| bad |= !move_lines(db, from, to, &say))
+            }),
             ["admin", ..] => Err(format!(
-                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
                  clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
@@ -2040,6 +2188,13 @@ fn repl<'scope, 'env>(
                         } else {
                             wait_recovered(progress, within, || db.heal_state())
                         };
+                        // A-R467: ready below the copy count says which copy is out.
+                        let waited = waited.map(|line| {
+                            match left_out_line(db, rt, store).filter(|_| line.starts_with("reached ready")) {
+                                Some(out) => format!("{line}; warning: {out}"),
+                                None => line,
+                            }
+                        });
                         match waited {
                             Ok(line) => say(&line),
                             // A script must see that this open will never be ready (A-R191).
@@ -2085,15 +2240,15 @@ fn not_built(words: &[&str]) -> Option<&'static str> {
 }
 
 /// `admin promote`'s usage (A-R245).
-const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are 1, 2 or 3; without \
+const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are nodes 1 to 8; without \
                              --drop the prior owner is dropped";
 
 /// `admin promote N [--drop M]`'s words after `promote`: the node to own partition 1, and the
 /// node to drop, `None` for `Db::promote`'s default, the prior owner. A node cannot be both.
 fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
     let (to, drop) = match rest {
-        [to] => (parse_node(to)?, None),
-        [to, "--drop", drop] => (parse_node(to)?, Some(parse_node(drop)?)),
+        [to] => (parse_any_node(to)?, None),
+        [to, "--drop", drop] => (parse_any_node(to)?, Some(parse_any_node(drop)?)),
         _ => return Err(PROMOTE_USAGE.to_owned()),
     };
     if drop == Some(to) {
@@ -2105,8 +2260,219 @@ fn parse_promote(rest: &[&str]) -> Result<(NodeId, Option<NodeId>), String> {
     Ok((to, drop))
 }
 
+/// `admin move`'s usage (M11).
+const MOVE_USAGE: &str =
+    "admin move <from> <to>: move partition 1's copy from node <from> to node <to> (1 to 8)";
+
+/// How long `admin move` follows a move before it hands back; a move resumes when asked again.
+const MOVE_FOLLOW: Duration = Duration::from_secs(120);
+
+/// `admin move <from> <to>` (M11): ask the owner, then ask again about every 500 ms, saying
+/// each new line, until the move is done, refused, or [`MOVE_FOLLOW`] passes. A `NOT_PRIMARY`
+/// answer is asked again: the `Db` has read the new owner. `true` when the move is done.
+fn move_lines(db: &Db, from: NodeId, to: NodeId, say: &dyn Fn(&str)) -> bool {
+    let started = Instant::now();
+    let mut last = String::new();
+    let mut first = true;
+    loop {
+        match db.move_copy(from, to) {
+            Ok(moved) => {
+                let line = if moved.done && first {
+                    format!("already {}", moved.line)
+                } else {
+                    moved.line
+                };
+                if line != last {
+                    tracing::info!(from = from.0, to = to.0, done = moved.done, line = %line, "repl_move");
+                    say(&line);
+                    last = line;
+                }
+                if moved.done {
+                    return true;
+                }
+            }
+            Err(error)
+                if error.kind == rdb_api::ErrorKind::NotPrimary
+                    && started.elapsed() < MOVE_FOLLOW =>
+            {
+                tracing::info!(from = from.0, to = to.0, error = %error, "repl_move_reroute");
+            }
+            Err(error) => {
+                tracing::warn!(from = from.0, to = to.0, error = %error, "repl_move_refused");
+                say(&format!("err admin move {} {}: {error}", from.0, to.0));
+                return false;
+            }
+        }
+        first = false;
+        if started.elapsed() >= MOVE_FOLLOW {
+            say(&format!(
+                "err admin move {} {}: not done after {:?}; it keeps running on the owner: run \
+                 `admin move {} {}` again to follow it",
+                from.0, to.0, MOVE_FOLLOW, from.0, to.0
+            ));
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// `admin status`'s members line (M11): each node the owner's commit pins, with its role, then
+/// each node this process knows of that it does not pin: a spare or a copy left out. When the
+/// owner does not answer, as when it is lost and `lr` prints the promote that ends the wait,
+/// the members come from `partitions/1`, which every commit writes through its CAS, and the
+/// line says so (lead ruling on dev-a item 3: `promote_hint` names only a node with a copy).
+fn members_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) -> String {
+    let known: Vec<NodeId> = match db.links().net() {
+        Some(net) => net.states().keys().copied().collect(),
+        None => vec![NodeId(1), NodeId(2), NodeId(3)],
+    };
+    let in_process = db.links().net().is_none();
+    let error = match db.pinned_members() {
+        Ok((owner, pinned)) => {
+            let pinned: Vec<(NodeId, ReplicaRole)> = pinned
+                .iter()
+                .map(|member| (member.node, member.role))
+                .collect();
+            return members_text(
+                &pinned,
+                &known,
+                in_process,
+                &format!("as node {} pins them", owner.0),
+            );
+        }
+        Err(error) => error,
+    };
+    let body = rt
+        .block_on(store.get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .ok()
+        .and_then(|read| read.record)
+        .map(|record| record.value);
+    body.and_then(|body| record_members_line(&body, &known, in_process, &error.to_string()))
+        .unwrap_or_else(|| format!("members: unknown: {error}"))
+}
+
+/// The members line from a `partitions/1` body, for an owner that did not answer (`why`).
+/// `None` for a body that names no members (layout 3 and older).
+fn record_members_line(
+    body: &[u8],
+    known: &[NodeId],
+    in_process: bool,
+    why: &str,
+) -> Option<String> {
+    let members = rdb_core::authority::partition::RecordMember::decode_all(body)?;
+    let pinned: Vec<(NodeId, ReplicaRole)> = members
+        .iter()
+        .map(|member| (member.node, member.role))
+        .collect();
+    Some(members_text(
+        &pinned,
+        known,
+        in_process,
+        &format!("as partitions/1 names them; {why}"),
+    ))
+}
+
+/// `members 1=owner 2=regular 4=shadow; not pinned 3 (<source>)`.
+fn members_text(
+    pinned: &[(NodeId, ReplicaRole)],
+    known: &[NodeId],
+    in_process: bool,
+    source: &str,
+) -> String {
+    let roles = pinned
+        .iter()
+        .map(|(node, role)| {
+            let role = match role {
+                ReplicaRole::Primary => "owner",
+                ReplicaRole::RegularSecondary => "regular",
+                ReplicaRole::Shadow => "shadow",
+            };
+            format!("{}={role}", node.0)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pinned: Vec<NodeId> = pinned.iter().map(|(node, _)| *node).collect();
+    if let Some(out) = out_line(&pinned, known, in_process) {
+        return format!("members {roles}; {out} ({source})");
+    }
+    let out = known
+        .iter()
+        .filter(|node| !pinned.contains(node))
+        .map(|node| node.0.to_string())
+        .collect::<Vec<_>>();
+    let out = if out.is_empty() {
+        "none".to_owned()
+    } else {
+        out.join(" ")
+    };
+    format!("members {roles}; not pinned {out} ({source})")
+}
+
+/// A-R467: while partition 1 pins fewer copies than its copy count, an unpinned node may be a
+/// copy to bring back. In process the three nodes are all copies and there are no spares, so
+/// each unpinned one is named: `node 3 is out of partition 1: run `admin rebuild 3``. A reopen
+/// does not re-add a dropped copy (M11 T6 pins the record's members), so this is how the reader
+/// learns of it. Over lr (`in_process` false) this process knows nodes only by their links and
+/// cannot tell a dropped copy from a spare (A-R469), so it names none and lists the unpinned
+/// ones; the dropped node's own open logs `db_open_copy_left_out`. `None` at the full count: an
+/// unpinned node is then a spare, which the members line says as `not pinned N`.
+fn out_line(pinned: &[NodeId], known: &[NodeId], in_process: bool) -> Option<String> {
+    let copies = rdb_api::admin::members().len();
+    if pinned.len() >= copies {
+        return None;
+    }
+    let unpinned: Vec<&NodeId> = known.iter().filter(|node| !pinned.contains(node)).collect();
+    if unpinned.is_empty() {
+        return None;
+    }
+    if !in_process {
+        let listed: Vec<String> = unpinned.iter().map(|node| node.0.to_string()).collect();
+        return Some(format!(
+            "partition 1 has {} of {copies} copies; not pinned: {}; if one of these held a copy, \
+             run `admin rebuild N` for it",
+            pinned.len(),
+            listed.join(" ")
+        ));
+    }
+    let out: Vec<String> = unpinned
+        .iter()
+        .map(|node| {
+            format!(
+                "node {} is out of partition 1: run `admin rebuild {}`",
+                node.0, node.0
+            )
+        })
+        .collect();
+    Some(out.join("; "))
+}
+
+/// [`out_line`] from the members `partitions/1` pins, which every commit writes: read at the
+/// open, before the owner has recovered, and after `wait ready`. `None` when the record is not
+/// read, names no members (layout 3 and older), or leaves nothing out.
+fn left_out_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) -> Option<String> {
+    let known: Vec<NodeId> = match db.links().net() {
+        Some(net) => net.states().keys().copied().collect(),
+        None => vec![NodeId(1), NodeId(2), NodeId(3)],
+    };
+    let in_process = db.links().net().is_none();
+    let body = rt
+        .block_on(store.get(GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(1)).encode()),
+        }))
+        .ok()?
+        .record?
+        .value;
+    let pinned: Vec<NodeId> = rdb_core::authority::partition::RecordMember::decode_all(&body)?
+        .iter()
+        .map(|member| member.node)
+        .collect();
+    out_line(&pinned, &known, in_process)
+}
+
 /// `admin rebuild`'s usage (#65).
-const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is 1, 2 or 3, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
+const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is a node of the cluster, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
 
 /// What `admin rebuild` was asked: in this process, or the fence `lr rebuild N --wipe` checks
 /// once it has stopped N.
@@ -2118,7 +2484,7 @@ enum RebuildAsk {
 
 /// `admin rebuild N [--wipe [--fence]]`'s words after `rebuild`.
 fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, RebuildAsk), String> {
-    let node = |n: &str| parse_node(n).map_err(|e| format!("{e}; {REBUILD_USAGE}"));
+    let node = |n: &str| parse_any_node(n).map_err(|e| format!("{e}; {REBUILD_USAGE}"));
     match rest {
         [n] => Ok((node(n)?, RebuildAsk::Here { wipe: false })),
         [n, "--wipe"] => Ok((node(n)?, RebuildAsk::Here { wipe: true })),
@@ -4256,7 +4622,7 @@ fn status_line(db: &Db, sent: &Sent, words: &[&str]) -> Result<bool, String> {
                 .iter()
                 .find(|node| node.node == NodeId(1))
                 .map(|owner| owner.in_flight == Some(RequestId(request)));
-            let restarted = restarted_nodes(|node| db.boot_of(node));
+            let restarted = restarted_nodes(db.base_boot(), |node| db.boot_of(node));
             let note = db.restart_note();
             let ours = sent.by_id.contains_key(&request);
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
@@ -4297,11 +4663,11 @@ fn known_status_line(request: u64, status: &TxnStatus) -> String {
 /// The nodes that restarted, from each node's boot (`boot_of`), never from the nodes that
 /// answered `node_status`: that leaves out a node whose restart failed, and `status` of a write
 /// in flight then said it waits for M10 while the other secondary could still take it.
-fn restarted_nodes(boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
+fn restarted_nodes(base: BootId, boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
     [1, 2, 3]
         .map(NodeId)
         .into_iter()
-        .filter(|&node| boot_of(node).is_some_and(|boot| boot != rdb_api::host::BOOT))
+        .filter(|&node| boot_of(node).is_some_and(|boot| boot != base))
         .collect()
 }
 
@@ -4492,6 +4858,7 @@ fn admin_status_lines(
     store: &dyn ConfigStore,
 ) -> Vec<String> {
     let mut lines = record_lines(rt, store, "admin status");
+    lines.push(members_line(db, rt, store));
     match db.links().net() {
         Some(net) => lines.extend(link_lines(&net.states())),
         None => lines.push("links: the three nodes run in this process".to_owned()),
@@ -5085,16 +5452,16 @@ mod tests {
             member(2, base, ReplicaRole::RegularSecondary),
             member(3, base, ReplicaRole::RegularSecondary),
         ];
-        assert!(!rejoined(&owner, boots));
+        assert!(!rejoined(&owner, BootId(base), boots));
         // Back as a shadow: not yet.
         owner.pinned[2] = member(3, base + 1, ReplicaRole::Shadow);
-        assert!(!rejoined(&owner, boots));
+        assert!(!rejoined(&owner, BootId(base), boots));
         owner.pinned[2] = member(3, base + 1, ReplicaRole::RegularSecondary);
-        assert!(rejoined(&owner, boots));
+        assert!(rejoined(&owner, BootId(base), boots));
         // Nothing restarted: no note to drop.
-        assert!(!rejoined(&owner, |_| Some(BootId(base))));
+        assert!(!rejoined(&owner, BootId(base), |_| Some(BootId(base))));
         // The owner itself restarted: never dropped.
-        assert!(!rejoined(&owner, |_| Some(BootId(base + 1))));
+        assert!(!rejoined(&owner, BootId(base), |_| Some(BootId(base + 1))));
     }
 
     /// Bug bash #65 walk (tester, #65 thumbs-up): after `admin promote 2` the `nodes` line still
@@ -5262,7 +5629,14 @@ mod tests {
             (fenced.clone(), Some(note)),
             (owner(None, true), None),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart, &[], &[]));
+            lines.extend(ready_step(
+                &mut seen,
+                rdb_api::host::BOOT,
+                &node,
+                restart,
+                &[],
+                &[],
+            ));
         }
         assert_eq!(
             lines,
@@ -5325,7 +5699,14 @@ mod tests {
             for polling in [true, false] {
                 let mut seen = Seen::default();
                 assert_eq!(
-                    ready_step(&mut seen, &fenced(reason, polling), None, &[], &[]),
+                    ready_step(
+                        &mut seen,
+                        rdb_api::host::BOOT,
+                        &fenced(reason, polling),
+                        None,
+                        &[],
+                        &[]
+                    ),
                     Some(stuck(name)),
                     "{name}, polling={polling}"
                 );
@@ -5342,7 +5723,7 @@ mod tests {
             fenced(DenyReason::Expired, false),
         ]
         .iter()
-        .filter_map(|node| ready_step(&mut seen, node, None, &[], &[]))
+        .filter_map(|node| ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], &[]))
         .collect();
         assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
     }
@@ -5386,7 +5767,9 @@ mod tests {
             ),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .skip(2)
         .collect();
         assert_eq!(lines, [blocked]);
@@ -5397,7 +5780,14 @@ mod tests {
         healthy.protection = Some("healthy".to_owned());
         for node in [stuck, healthy] {
             assert_eq!(
-                ready_step(&mut Seen::default(), &node, Some(note), &[], &[]),
+                ready_step(
+                    &mut Seen::default(),
+                    rdb_api::host::BOOT,
+                    &node,
+                    Some(note),
+                    &[],
+                    &[]
+                ),
                 Some(format!("{blocked}; {note}")),
                 "{node:?}"
             );
@@ -5438,7 +5828,9 @@ mod tests {
             (serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .skip(2)
         .collect();
         assert_eq!(
@@ -5449,7 +5841,9 @@ mod tests {
             ]
         );
 
-        let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[], &[]);
+        let reason = |node: &NodeStatus, note| {
+            ready_reason(node, rdb_api::host::BOOT, false, note, &[], &[])
+        };
         let note = "node 2 restarted (now boot 2); a restarted copy rejoins by itself once the \
                     owner re-plans";
         let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
@@ -5525,7 +5919,9 @@ mod tests {
             (&serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .collect();
         let not_ready = |why: &str| format!("not ready: writes not admitted: {why}");
         assert_eq!(
@@ -5569,7 +5965,9 @@ mod tests {
             };
             let lines: Vec<String> = [&fenced, &stopped, &stopped]
                 .iter()
-                .filter_map(|node| ready_step(&mut seen, node, restart, &[], &[]))
+                .filter_map(|node| {
+                    ready_step(&mut seen, rdb_api::host::BOOT, node, restart, &[], &[])
+                })
                 .skip(1)
                 .collect();
             let want = restart.map_or_else(
@@ -5583,7 +5981,14 @@ mod tests {
         fenced_stopped.fence_polling = false;
         fenced_stopped.replace_stopped = true;
         assert_eq!(
-            ready_step(&mut Seen::default(), &fenced_stopped, None, &[], &[]),
+            ready_step(
+                &mut Seen::default(),
+                rdb_api::host::BOOT,
+                &fenced_stopped,
+                None,
+                &[],
+                &[]
+            ),
             Some(
                 "not ready: writes not admitted: node 1's grant is fenced(Expired); nothing in M9 \
                  replaces it, so writes stay stopped for this run: to write again, quit and \
@@ -5604,7 +6009,7 @@ mod tests {
         };
         let lines: Vec<String> = [fenced, unheld.clone(), unheld]
             .iter()
-            .filter_map(|node| ready_step(&mut seen, node, None, &[], &[]))
+            .filter_map(|node| ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], &[]))
             .collect();
         assert_eq!(
             lines,
@@ -5650,7 +6055,9 @@ mod tests {
             (&serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, dropped)| ready_step(&mut seen, node, None, &[], dropped))
+        .filter_map(|(node, dropped)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], dropped)
+        })
         .collect();
         assert_eq!(
             lines,
@@ -5669,7 +6076,7 @@ mod tests {
 
         let resolving = paused("held(grant 2)", "ActivationUnresolved", None);
         assert_eq!(
-            ready_reason(&resolving, false, None, &[], &DROPPED),
+            ready_reason(&resolving, rdb_api::host::BOOT, false, None, &[], &DROPPED),
             Some(
                 "node 1's recovery is waiting for the control store to confirm activation, \
                  l1=paused and links 2->1, 3->1 are dropped; writes resume only once the store \
@@ -5681,6 +6088,7 @@ mod tests {
         assert_eq!(
             ready_reason(
                 &regranted,
+                rdb_api::host::BOOT,
                 false,
                 None,
                 &[(NodeId(1), NodeId(2))],
@@ -5718,7 +6126,9 @@ mod tests {
         let mut seen = Seen::default();
         let lines: Vec<String> = [&paused, &admitting, &thawed]
             .iter()
-            .filter_map(|node| ready_step(&mut seen, node, None, &[], &DROPPED))
+            .filter_map(|node| {
+                ready_step(&mut seen, rdb_api::host::BOOT, node, None, &[], &DROPPED)
+            })
             .collect();
         let waits = "partition 1 waits on request 2's outcome (seq 3), which node 1 applied and \
                      has not published, and links 2->1, 3->1 are dropped; writes resume once it \
@@ -5732,7 +6142,7 @@ mod tests {
             "L1 admitting does not make it ready"
         );
         assert_eq!(
-            ready_reason(&paused, false, None, &HELD, &[]),
+            ready_reason(&paused, rdb_api::host::BOOT, false, None, &HELD, &[]),
             Some(
                 "partition 1 waits on request 2's outcome (seq 3), which node 1 applied and has \
                  not published, and links 1-2, 1-3 are held; writes resume once it publishes, \
@@ -5765,7 +6175,14 @@ mod tests {
             node.fence_polling = true;
             node.protection = Some(mode.to_owned());
             assert_eq!(
-                ready_step(&mut Seen::default(), &node, None, &HELD, &[]),
+                ready_step(
+                    &mut Seen::default(),
+                    rdb_api::host::BOOT,
+                    &node,
+                    None,
+                    &HELD,
+                    &[]
+                ),
                 Some(format!(
                     "not ready: writes not admitted: node 1's grant is fenced(Expired), \
                      l1={mode} and links 1-2, 1-3 are held; writes resume only once the old \
@@ -5777,7 +6194,14 @@ mod tests {
             );
             for held in [&[][..], &[(NodeId(2), NodeId(3))][..]] {
                 assert_eq!(
-                    ready_step(&mut Seen::default(), &node, None, held, &[]),
+                    ready_step(
+                        &mut Seen::default(),
+                        rdb_api::host::BOOT,
+                        &node,
+                        None,
+                        held,
+                        &[]
+                    ),
                     Some(
                         "not ready: writes not admitted: node 1's grant is fenced(Expired); \
                          writes resume by themselves once the old grant's expiry is proven, so \
@@ -5815,11 +6239,25 @@ mod tests {
         };
         let mut startup = Seen::default();
         assert_eq!(
-            ready_step(&mut startup, &held("paused", false), None, &[], &[]),
+            ready_step(
+                &mut startup,
+                rdb_api::host::BOOT,
+                &held("paused", false),
+                None,
+                &[],
+                &[]
+            ),
             None
         );
         assert_eq!(
-            ready_step(&mut startup, &held("reprotecting", false), None, &[], &[]),
+            ready_step(
+                &mut startup,
+                rdb_api::host::BOOT,
+                &held("reprotecting", false),
+                None,
+                &[],
+                &[]
+            ),
             None
         );
         let wait = "not ready: writes not admitted: l1=paused and links 1-2, 1-3 are held: \
@@ -5838,7 +6276,9 @@ mod tests {
             (held("healthy", true), &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
+        .filter_map(|(node, links)| {
+            ready_step(&mut seen, rdb_api::host::BOOT, node, None, links, &[])
+        })
         .collect();
         assert_eq!(
             lines,
@@ -5877,7 +6317,14 @@ mod tests {
             (owner(None, true), Some(note)),
             (paused, Some(note)),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart, &[], &[]));
+            lines.extend(ready_step(
+                &mut seen,
+                rdb_api::host::BOOT,
+                &node,
+                restart,
+                &[],
+                &[],
+            ));
         }
         assert_eq!(
             lines,
@@ -5889,6 +6336,150 @@ mod tests {
                 ),
                 format!("not ready: writes not admitted: {note}; l1=paused: {RESUMES}"),
             ]
+        );
+    }
+
+    /// Critic round 2 (mc2-modec.txt lines 43 and 83): after a reopen every node starts at the
+    /// open's base boot, so counting restarts from boot 1 named all three nodes. The poller
+    /// then said "writes pause soon ... because node 3 restarted" right after `rebuilt`
+    /// (`rejoined` was never true, node 1 counting as restarted), and `status` Unknown waited
+    /// for "a restarted owner". Counted from the base, only node 3 restarted: once node 1 pins
+    /// it at its boot the pause note is not said, and `status` names node 2. Cut: compare with
+    /// `host::BOOT` in `restarted_nodes` again: every assert reads all three nodes, red. Unit.
+    #[test]
+    fn after_a_reopen_only_a_node_restarted_in_this_open_counts() {
+        use rdb_core::contracts::ids::ReplicaRole;
+        use rdb_core::contracts::membership::{CopyId, Member};
+        let base = BootId(65_537);
+        let boots = |node: NodeId| {
+            Some(if node == NodeId(3) {
+                BootId(65_538)
+            } else {
+                base
+            })
+        };
+        assert_eq!(restarted_nodes(base, boots), [NodeId(3)]);
+        let member = |node: u32, boot: BootId, role| Member {
+            copy: CopyId(u8::try_from(node - 1).expect("small")),
+            node: NodeId(node),
+            boot,
+            role,
+        };
+        let mut owner = owner(None, true);
+        owner.boot = base;
+        owner.pinned = vec![
+            member(1, base, ReplicaRole::Primary),
+            member(2, base, ReplicaRole::RegularSecondary),
+            member(3, BootId(65_538), ReplicaRole::RegularSecondary),
+        ];
+        assert!(rejoined(&owner, base, boots), "rebuilt node 3 is back");
+        let note = "node 3 restarted (now boot 65538); a restarted copy rejoins by itself once \
+                    the owner re-plans";
+        assert_eq!(
+            unknown_line(true, Some(true), &restarted_nodes(base, boots), Some(note)),
+            format!(
+                "status Unknown (not evidence of a lost write: it resolves once node 2, which \
+                 did not restart, can take it; {note})"
+            )
+        );
+    }
+
+    /// A-R467: a copy the record leaves out while the partition pins fewer than its three
+    /// copies is named with the step that brings it back, and reads differently from a spare,
+    /// which the full count leaves `not pinned`. The open's line and `wait ready`'s warning use
+    /// the same [`out_line`]. Cut: `out_line` answers `None`: the first assert reads `not
+    /// pinned 3`, red. Unit.
+    #[test]
+    fn a_left_out_copy_is_named_with_its_step_and_a_spare_is_not() {
+        let known = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        assert_eq!(
+            members_text(
+                &[
+                    (NodeId(1), ReplicaRole::Primary),
+                    (NodeId(2), ReplicaRole::RegularSecondary),
+                ],
+                &known[..3],
+                true,
+                "as node 1 pins them"
+            ),
+            "members 1=owner 2=regular; node 3 is out of partition 1: run `admin rebuild 3` (as \
+             node 1 pins them)"
+        );
+        assert_eq!(
+            members_text(
+                &[
+                    (NodeId(1), ReplicaRole::Primary),
+                    (NodeId(2), ReplicaRole::RegularSecondary),
+                    (NodeId(3), ReplicaRole::RegularSecondary),
+                ],
+                &known,
+                true,
+                "as node 1 pins them"
+            ),
+            "members 1=owner 2=regular 3=regular; not pinned 4 (as node 1 pins them)"
+        );
+        assert_eq!(
+            out_line(&[NodeId(1), NodeId(2), NodeId(3)], &known, true),
+            None
+        );
+    }
+
+    /// A-R469 (tester D-R3-1): over lr this process knows nodes only by their links, so it
+    /// cannot tell a copy the record left out from a spare that never held one. With 2 of 3
+    /// pinned it names no node as out, and lists the unpinned ones with the step for the one
+    /// that held a copy; that node's own open log names it (`db_open_copy_left_out`). The
+    /// members line and `wait ready`'s warning use this same [`out_line`]. Cut: drop the
+    /// `in_process` test, so lr names node 3 and spare 4 as out: red. Unit.
+    #[test]
+    fn over_lr_a_short_partition_names_no_node_as_out() {
+        let known = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let line = out_line(&[NodeId(1), NodeId(2)], &known, false);
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "partition 1 has 2 of 3 copies; not pinned: 3 4; if one of these held a copy, \
+                 run `admin rebuild N` for it"
+            )
+        );
+        assert_eq!(
+            members_text(
+                &[
+                    (NodeId(1), ReplicaRole::Primary),
+                    (NodeId(2), ReplicaRole::RegularSecondary),
+                ],
+                &known,
+                false,
+                "as node 1 pins them"
+            ),
+            format!(
+                "members 1=owner 2=regular; {} (as node 1 pins them)",
+                line.unwrap()
+            )
+        );
+    }
+
+    /// M11 final walk: after a reopen every node starts at that open's base boot (65537 on the
+    /// second open), so a secondary's rebuild restart while L1 pauses printed "writes stay
+    /// stopped for this run" and then, half a second later, "rebuilt ... writes are admitted
+    /// again". The owner restarted only when its boot differs from the open's base. Cut: compare
+    /// with `host::BOOT` again: the first assert reads the stuck line, red. Unit.
+    #[test]
+    fn a_reopened_owner_at_its_base_boot_is_not_stuck() {
+        let base = BootId(65_537);
+        let note = "node 3 restarted (now boot 65538); a restarted copy rejoins by itself once \
+                    the owner re-plans";
+        let mut paused = owner(None, false);
+        paused.boot = base;
+        paused.protection = Some("paused".to_owned());
+        assert_eq!(
+            ready_reason(&paused, base, false, Some(note), &[], &[]),
+            Some(format!("{note}; l1=paused: {RESUMES}"))
+        );
+        let mut restarted = paused.clone();
+        restarted.boot = BootId(65_538);
+        assert_eq!(
+            ready_reason(&restarted, base, false, Some(note), &[], &[]),
+            Some(format!("{note}; {STUCK}"))
         );
     }
 
@@ -6019,8 +6610,7 @@ mod tests {
                 unheld,
                 Some(note),
                 Some(format!(
-                    "not ready: writes not admitted: writes are not admitted now; if they come \
-                     back, they {}",
+                    "not ready: writes not admitted: if they come back, they {}",
                     pause(note)
                 )),
             ),
@@ -6067,7 +6657,7 @@ mod tests {
                 ..Seen::default()
             };
             assert_eq!(
-                ready_step(&mut seen, &node, restart, &[], &[]),
+                ready_step(&mut seen, rdb_api::host::BOOT, &node, restart, &[], &[]),
                 line,
                 "state {state}"
             );
@@ -6184,7 +6774,7 @@ mod tests {
                 BootId(1)
             })
         };
-        let restarted = restarted_nodes(boots);
+        let restarted = restarted_nodes(rdb_api::host::BOOT, boots);
         assert_eq!(
             restarted,
             [NodeId(2)],
@@ -6233,7 +6823,14 @@ mod tests {
     /// `seen` after a `ready` line, as the poller holds it before a failure.
     fn lines_ready(seen: &mut Seen) {
         assert_eq!(
-            ready_step(seen, &owner(None, true), None, &[], &[]),
+            ready_step(
+                seen,
+                rdb_api::host::BOOT,
+                &owner(None, true),
+                None,
+                &[],
+                &[]
+            ),
             Some("ready".to_owned())
         );
     }
@@ -7420,6 +8017,64 @@ mod tests {
         assert_eq!(partition_body(b"\x09junk"), None);
     }
 
+    /// Lead ruling on dev-a item 3 (`promote_hint` named a node with no copy): with the owner
+    /// lost, `admin status` said only `members: unknown`, so `lr` had nothing to pick a promote
+    /// target from. The members line now comes from `partitions/1`'s members, says it does,
+    /// and names each known node not pinned. A layout-3 body names none and gives `None`.
+    /// Cut: `record_members_line` answers `None` always, and the first assert goes red. Unit.
+    #[test]
+    fn the_members_line_comes_from_the_record_when_the_owner_does_not_answer() {
+        use rdb_core::authority::partition::{PartitionRoot, RecordMember, RecordMode};
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::ids::{Revision, Seq};
+        use rdb_core::contracts::membership::CopyId;
+        let record = PartitionRecord {
+            partition: PartitionId(1),
+            owner: NodeId(1),
+            generation: Generation(4),
+            ..PartitionRecord::default()
+        };
+        let root = PartitionRoot {
+            mode: RecordMode::Committed,
+            owner_boot: BootId(5),
+            base_seq: Seq(7),
+            base_digest: Digest([0; 32]),
+            predecessor_generation: Generation(3),
+            predecessor_cutoff: Seq(6),
+            instance: [0x11; 16],
+            run: Revision(42),
+        };
+        let member = |copy: u8, node: u32, role: ReplicaRole| RecordMember {
+            copy: CopyId(copy),
+            node: NodeId(node),
+            role,
+        };
+        let members = [
+            member(1, 1, ReplicaRole::Primary),
+            member(3, 3, ReplicaRole::RegularSecondary),
+            member(4, 4, ReplicaRole::RegularSecondary),
+        ];
+        let known = [1, 2, 3, 4].map(NodeId);
+        let why = "node 1 (the owner) did not answer its status look";
+        assert_eq!(
+            record_members_line(
+                &record.encode_with_members(&root, &members),
+                &known,
+                true,
+                why
+            )
+            .as_deref(),
+            Some(
+                "members 1=owner 3=regular 4=regular; not pinned 2 (as partitions/1 names them; \
+                 node 1 (the owner) did not answer its status look)"
+            )
+        );
+        assert_eq!(
+            record_members_line(&record.encode_with(&root), &known, true, why),
+            None
+        );
+    }
+
     /// tester-s2 paper cut 1: a bare `status` said `usage: unknown command "status"`. It
     /// answers `status`'s own usage, as a bad request id or extra word does. Unit.
     /// Cut: `parse_status` answers "unknown command" when bare, and this row fails.
@@ -7734,10 +8389,8 @@ mod tests {
                 "--cert-dir is read only with --nodes",
             ),
             (vec!["--app", "ops"], "--app is read only with --nodes"),
-            (
-                vec!["--nodes", "4=a:1"],
-                "--nodes: \"4\": a node is 1, 2 or 3",
-            ),
+            // M11 WS A: a run with spares links nodes 1 to 8.
+            (vec!["--nodes", "9=a:1"], "--nodes: \"9\": a node is 1 to 8"),
             (
                 vec!["--nodes", "1:a"],
                 "--nodes: \"1:a\" is not N=host:port",
@@ -7830,7 +8483,13 @@ mod tests {
                 "node 2 cannot be promoted and dropped at once; {PROMOTE_USAGE}"
             ))
         );
-        for bad in ["", "4", "2 --drop", "2 3", "2 --drop 3 x"] {
+        // M11 T5 (tester walk): after a move a member can be node 4 to 8; a promote of one was
+        // refused "a node is 1, 2 or 3", so losing the owner left no way to serve.
+        assert_eq!(
+            parse_promote(&words("5 --drop 1")),
+            Ok((NodeId(5), Some(NodeId(1))))
+        );
+        for bad in ["", "9", "2 --drop 9", "2 --drop", "2 3", "2 --drop 3 x"] {
             assert!(parse_promote(&words(bad)).is_err(), "{bad:?}");
         }
         let promoted = admin::Promoted {
@@ -7849,7 +8508,11 @@ mod tests {
 
     /// bb #65: `admin rebuild N [--wipe]` runs in process; `lr rebuild N --wipe` adds `--fence`
     /// once it has stopped N, and only after `--wipe` is it the fence check (A-R441 F2).
-    /// Cut: accept `--fence` without `--wipe` and the `3 --fence` line goes red. Unit.
+    /// M11 T2: `parse_rebuild` takes any configured node 1 to 8 (`MAX_NODES`), a spare or a
+    /// node past 3; before T2 it took 1 to 3, so `lr start 4 --wipe` was refused as usage and
+    /// this row rejected `4`. The lead accepted the wider contract. 0 and 9 are still refused.
+    /// Cut: accept `--fence` without `--wipe` and the `3 --fence` line goes red. Cut: parse
+    /// with `parse_node` (1 to 3) and the `4 --wipe` line goes red. Unit.
     #[test]
     fn admin_rebuild_reads_its_node_and_the_fence_flag() {
         fn words(line: &str) -> Vec<&str> {
@@ -7867,7 +8530,11 @@ mod tests {
             parse_rebuild(&words("3 --wipe --fence")),
             Ok((NodeId(3), RebuildAsk::Fence))
         );
-        for bad in ["", "4", "3 --fence", "3 --fence --wipe", "3 --wipe x"] {
+        assert_eq!(
+            parse_rebuild(&words("4 --wipe")),
+            Ok((NodeId(4), RebuildAsk::Here { wipe: true }))
+        );
+        for bad in ["", "0", "9", "3 --fence", "3 --fence --wipe", "3 --wipe x"] {
             assert!(parse_rebuild(&words(bad)).is_err(), "{bad:?}");
         }
     }

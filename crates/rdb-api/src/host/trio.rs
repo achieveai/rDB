@@ -26,6 +26,17 @@ pub(super) fn write_chain(engine: &mut RocksEngine, generation: Generation, n: u
 pub(super) fn write_chain_after(
     engine: &mut RocksEngine,
     generation: Generation,
+    digests: Vec<Digest>,
+    n: u64,
+) -> Vec<Digest> {
+    write_chain_in(engine, PartitionId(1), generation, digests, n)
+}
+
+/// [`write_chain_after`] in `partition`.
+pub(super) fn write_chain_in(
+    engine: &mut RocksEngine,
+    partition: PartitionId,
+    generation: Generation,
     mut digests: Vec<Digest>,
     n: u64,
 ) -> Vec<Digest> {
@@ -40,7 +51,7 @@ pub(super) fn write_chain_after(
         let mut env = ReplicationEnvelope {
             header: EnvelopeHeader {
                 protocol_version: ENVELOPE_VERSION,
-                partition: PartitionId(1),
+                partition,
                 generation,
                 config_version: ConfigVersion(1),
                 owner_epoch: OwnerEpoch(generation.0),
@@ -82,7 +93,7 @@ pub(super) fn write_chain_after(
         engine
             .commit(Batch {
                 id: BatchId(seq),
-                partition: PartitionId(1),
+                partition,
                 generation,
                 seq: Seq(seq),
                 writes,
@@ -131,6 +142,12 @@ impl Trio {
 
     /// Three hosts on `dir`, each tuned by `tune`, not yet bootstrapped.
     pub(super) fn new(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> Self {
+        Self::with_nodes(dir, tune, 3)
+    }
+
+    /// [`Self::new`] with hosts 1..=`count`. Bootstrap pins nodes 1 to 3; a host past them is
+    /// a spare that holds no copy until a move pins it (M11, A-R450).
+    pub(super) fn with_nodes(dir: &std::path::Path, tune: impl Fn(&mut Host), count: u32) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -142,7 +159,7 @@ impl Trio {
         let control =
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
         let clock = HostClock::capped(Self::CLOCK_STEP_CAP_MILLIS);
-        let nodes = (1..=3u32)
+        let nodes = (1..=count)
             .map(|n| {
                 let engine = RocksEngine::open(dir.join(n.to_string())).expect("open engine");
                 let (tx, rx) = mpsc::channel();

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::ConfigStore;
-use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, INSTANCE_LEN};
+use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN};
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
@@ -234,6 +234,12 @@ pub const DEFAULT_CLIENT: ClientId = ClientId(1);
 /// this process.
 pub const ALL_NODES: [NodeId; 3] = [NodeId(1), NodeId(2), NodeId(3)];
 
+/// The highest node number a node process may run (M11 WS A). Nodes past [`ALL_NODES`] are
+/// spares: a formed database's spare opens an empty copy bound to its instance and holds
+/// nothing until `admin move` pins it. Eight, the most members a `partitions/1` record pins
+/// (`MAX_RECORD_MEMBERS`).
+pub const MAX_NODES: u32 = 8;
+
 impl DbConfig {
     /// The checks [`Db::open`] makes before it starts anything, so a caller can make them
     /// before starting what the open needs, such as the control store.
@@ -373,6 +379,22 @@ pub enum OpenError {
          other copies"
     )]
     Unbound(PathBuf),
+    /// A copy that names no instance, of a node a wipe moved aside, that this open does not bind
+    /// (ruling A-R466): it is a node process, or the copy holds data, or no other copy names
+    /// an instance. Either the wipe stopped before its bind, or an older build restarted the
+    /// node on the emptied folder without binding it (D-MC1); the text holds for both. Nothing
+    /// was started or removed.
+    #[error(
+        "{copy} names no rDB instance, and a wipe moved that node's earlier folder to {aside}; \
+         this open does not bind {copy}. To go back to the folder from before the wipe, remove \
+         {copy} if it is there, move {aside} back to {copy}, then open the folder again"
+    )]
+    WipeUnfinished {
+        /// The copy the wipe emptied, `nodes/<n>`.
+        copy: PathBuf,
+        /// Where the wipe moved its old folder.
+        aside: PathBuf,
+    },
     /// The copies and the control store do not belong together: the copies name different
     /// instances, or the store's `partitions/1` or open counter does not name this one.
     #[error("this directory and the control store do not belong together: {0}")]
@@ -499,6 +521,10 @@ struct Opened {
     /// open sets it, an app-only one too (A-R261). `None` only in a `Db` a crate test builds by
     /// hand.
     control: Option<PromoteStore>,
+    /// The rDB instance this open's copies name. A wiped node's empty folder is bound to it
+    /// before the node starts again (D-MC1), or the next open refuses it `Unbound`. `None`
+    /// only in an app-only open, which runs no node, and a `Db` a crate test builds by hand.
+    instance: Option<[u8; INSTANCE_LEN]>,
 }
 
 /// The control store, runtime and budgets [`Db::promote`] runs on.
@@ -519,6 +545,7 @@ impl Default for Opened {
             heal_task: None,
             stuck: Mutex::new(None),
             control: None,
+            instance: None,
         }
     }
 }
@@ -664,19 +691,20 @@ async fn formed_member(
              (lr up) to finish, then start node {named} again"
         )));
     };
+    // M11 WS A: a node past the formed members is a spare. Its empty copy binds the instance
+    // and holds nothing until `admin move` pins it; no commit names it, so it takes no part.
     let members: Vec<NodeId> = admin::members().iter().map(|member| member.node).collect();
-    if let Some(stranger) = nodes.iter().find(|node| !members.contains(node)) {
-        return Err(OpenError::Config(format!(
-            "node {} is not a member of partition {} (its members are nodes {}), so it holds \
-             no copy to rebuild",
-            stranger.0,
-            PARTITION.0,
-            members
-                .iter()
-                .map(|node| node.0.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    let spares: Vec<u32> = nodes
+        .iter()
+        .filter(|node| !members.contains(node))
+        .map(|node| node.0)
+        .collect();
+    if !spares.is_empty() {
+        tracing::info!(
+            partition = PARTITION.0,
+            spares = ?spares,
+            "db_open_spare_copy"
+        );
     }
     Ok((record, root.instance))
 }
@@ -1105,8 +1133,8 @@ impl Db {
         // Opening the engines takes their `LOCK`s, so of two opens racing on one directory one
         // is refused `InUse` here (F-001). Only an open that created `nodes/` and holds node 1's
         // `LOCK` may remove it.
-        let engines = match open_engines(&nodes_dir, &config.local, config.storage) {
-            Ok(engines) => engines,
+        let (engines, absent) = match open_engines(&nodes_dir, &config.local, config.storage) {
+            Ok(opened) => opened,
             Err((error, held_owner)) => {
                 if created && held_owner {
                     remove_claim(&nodes_dir);
@@ -1120,7 +1148,8 @@ impl Db {
             engines,
             created: created.then(|| nodes_dir.clone()),
         };
-        let found = Self::check(&mut claim.engines, &store, partial).await?;
+        let found =
+            Self::check(&mut claim.engines, absent, config.storage, &store, partial).await?;
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
             None => admin::count_open(&*store, &found.instance, found.fresh, admin::COUNT_WITHIN)
@@ -1210,6 +1239,7 @@ impl Db {
             opened: Opened {
                 base_boot: boot,
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
+                instance: Some(found.instance),
                 ..Opened::default()
             },
             route: Route {
@@ -1258,6 +1288,8 @@ impl Db {
     /// binding anything: only a formed database's copy opens there (ruling A-R231(a)).
     async fn check(
         engines: &mut BTreeMap<NodeId, RocksEngine>,
+        absent: Vec<Absent>,
+        storage: StorageOptions,
         store: &Arc<dyn ConfigStore>,
         partial: bool,
     ) -> Result<Found, OpenError> {
@@ -1309,19 +1341,48 @@ impl Db {
                 roll: None,
             });
         }
+        // A wipe that stopped after its move and before its synced bind (ruling A-R466) left an
+        // aside folder and a copy that is missing (`absent`) or empty and unbound. Such a copy
+        // may finish the wipe only on a whole-database open whose other copies name one
+        // instance; whether it does waits for `partitions/1` below (A-R466b). Nothing binds it
+        // before then.
+        let mut resume: Vec<(NodeId, PathBuf, PathBuf)> = Vec::new();
+        let unfinished = |node: NodeId, aside: PathBuf| OpenError::WipeUnfinished {
+            copy: PathBuf::from(format!("nodes/{}", node.0)),
+            aside,
+        };
         if holds_data {
-            if let Some((node, _)) = engines.iter().find(|(_, e)| e.instance().is_none()) {
-                return Err(OpenError::Unbound(PathBuf::from(format!(
-                    "nodes/{}",
-                    node.0
-                ))));
+            for (node, engine) in engines.iter().filter(|(_, e)| e.instance().is_none()) {
+                let Some(aside) = engine
+                    .path()
+                    .parent()
+                    .and_then(|nodes| wipe_aside(nodes, *node))
+                else {
+                    return Err(OpenError::Unbound(PathBuf::from(format!(
+                        "nodes/{}",
+                        node.0
+                    ))));
+                };
+                if partial || !engine.lineages().is_empty() || bound.len() != 1 {
+                    return Err(unfinished(*node, aside));
+                }
+                resume.push((*node, one_separator(engine.path()), aside));
             }
+        }
+        for gone in &absent {
+            if partial || bound.len() != 1 {
+                return Err(unfinished(gone.node, gone.aside.clone()));
+            }
+            resume.push((gone.node, one_separator(&gone.dir), gone.aside.clone()));
         }
         let instance = bound
             .first()
             .copied()
             .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
         for (node, engine) in engines.iter_mut() {
+            if resume.iter().any(|(held, ..)| held == node) {
+                continue;
+            }
             engine
                 .bind_instance(instance)
                 .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
@@ -1407,6 +1468,59 @@ impl Db {
                 admin::instance_hex(&instance),
                 admin::instance_hex(&root.instance)
             ))));
+        }
+        // A-R466b: the wipe finishes only when `partitions/1` leaves its node out, as every
+        // wipe's drop commit does before the move. A copy the record still pins was lost some
+        // other way, even with an aside from a wipe long finished: refused as missing or empty.
+        let pinned: Vec<NodeId> = read
+            .record
+            .as_ref()
+            .and_then(|found| RecordMember::decode_all(&found.value))
+            .map_or_else(
+                || ALL_NODES.to_vec(),
+                |members| members.iter().map(|member| member.node).collect(),
+            );
+        // A-R467: a reopen does not re-add a copy the record left out (M11 T6 pins the
+        // record's members), so the open says which local copy is out and the step that brings
+        // it back, while the partition pins fewer copies than its count.
+        if pinned.len() < admin::members().len() {
+            let local: Vec<(NodeId, bool)> = engines
+                .iter()
+                .map(|(node, engine)| (*node, holds_partition(engine)))
+                .chain(resume.iter().map(|(node, ..)| (*node, true)))
+                .collect();
+            for node in left_out_copies(&local, &pinned) {
+                tracing::warn!(
+                    node = node.0,
+                    generation = record.generation.0,
+                    pinned = ?pinned.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    step = %format!("admin rebuild {}", node.0),
+                    "db_open_copy_left_out"
+                );
+            }
+        }
+        if !resume.is_empty() {
+            if let Some((_, dir, _)) = resume.iter().find(|(node, ..)| pinned.contains(node)) {
+                return Err(OpenError::CopyMissing(dir.clone()));
+            }
+            for (node, dir, aside) in resume {
+                let mut engine = match engines.remove(&node) {
+                    Some(engine) => engine,
+                    None => RocksEngine::open_with(&dir, storage).map_err(|error| {
+                        OpenError::Node(format!("open {}: {error}", dir.display()))
+                    })?,
+                };
+                engine
+                    .bind_instance(instance)
+                    .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+                tracing::warn!(
+                    node = node.0,
+                    aside = %aside.display(),
+                    generation = record.generation.0,
+                    "node_wipe_resumed"
+                );
+                engines.insert(node, engine);
+            }
         }
         // PR #60 review F1: a copy staged into the generation and never switched in does not
         // hold it, so it does not stop the roll-forward that resumes it.
@@ -1765,9 +1879,7 @@ impl Db {
         // (A-R287 P1, tester-s2 F-T1). Re-read `partitions/1` and, if it names a new owner,
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
-        // Only these two carry a write to the owner. A compile, a read and a status look write
-        // nothing, so losing the owner under one applied nothing (A-R394 E1).
-        let writes = matches!(call, ClientCall::Put { .. } | ClientCall::Resend { .. });
+        let carried = carries(&call);
         let mut sent = self.send_call(owner, call);
         if let (Err(_), Some(call)) = (&sent, spare) {
             self.refresh_owner();
@@ -1805,7 +1917,7 @@ impl Db {
                 error: unanswered(
                     lock(&self.nodes).iter().any(|handle| handle.node == owner),
                     owner,
-                    writes,
+                    carried,
                 ),
                 request: None,
             }),
@@ -2576,6 +2688,13 @@ impl Db {
         self.clock.now()
     }
 
+    /// The boot every node of this open started at. A node whose [`Self::boot_of`] differs
+    /// restarted in this open; after a reopen this is not [`host::BOOT`].
+    #[must_use]
+    pub const fn base_boot(&self) -> BootId {
+        self.opened.base_boot
+    }
+
     /// The boot `node`'s running process has, or `None` for a node this `Db` does not run. After
     /// a restart that failed, the boot that restart gave it: no process runs it, and the old
     /// boot is retired either way (F-013).
@@ -2924,9 +3043,10 @@ impl Db {
     /// The members and their roles are `to`'s own: the newest configuration it landed, read
     /// from it before anything is written. A shadow kept stays a shadow.
     ///
-    /// Membership is fixed at three nodes (A-R256 known limit for M10): a dropped node rejoins
-    /// as a secondary at the next reopen heal. An app-only `Db` promotes too, over its links
-    /// (A-R261).
+    /// A dropped node stays out across reopens: since M11 T6 the reopen's heal pins the members
+    /// `partitions/1` names, not nodes 1 to 3 as in M10 (A-R256), so the open logs
+    /// `db_open_copy_left_out` and `admin rebuild <n>` brings it back (A-R467). An app-only
+    /// `Db` promotes too, over its links (A-R261).
     ///
     /// # Errors
     ///
@@ -3163,23 +3283,28 @@ impl Db {
         let folder = respawn.nodes_dir.join(node.0.to_string());
         // M5: the record is read after the stop, so nothing can take the node back between the
         // check and the move.
+        let wiping = aside.is_some();
         let unmoved = aside.and_then(|aside| {
             match self.wipe_fenced(node, aside.generation, Some((aside.boot, old_boot))) {
                 Some(refused) => Some(refused),
                 None => move_aside(node, &folder, &aside.to).err(),
             }
         });
-        let started = host::spawn_with(
-            node,
-            folder,
-            Arc::clone(&self.links),
-            Arc::clone(&self.control),
-            self.clock,
-            respawn.budgets,
-            respawn.limits,
-            boot,
-            respawn.storage,
-        );
+        let started = if wiping && unmoved.is_none() {
+            self.start_emptied(node, &folder, respawn, boot)
+        } else {
+            host::spawn_with(
+                node,
+                folder,
+                Arc::clone(&self.links),
+                Arc::clone(&self.control),
+                self.clock,
+                respawn.budgets,
+                respawn.limits,
+                boot,
+                respawn.storage,
+            )
+        };
         match started {
             Ok(started) => {
                 *handle = started;
@@ -3227,6 +3352,71 @@ impl Db {
         }
     }
 
+    /// Start `node` at `boot` on the empty `folder` its wipe left (D-MC1): open the engine,
+    /// bind it to this open's instance with a synced write, then start the node on it. Without
+    /// the binding the copy fills from the others, and the next open refuses the folder
+    /// `Unbound`. A `Db` that names no instance cannot bind, so the node is not started.
+    fn start_emptied(
+        &self,
+        node: NodeId,
+        folder: &Path,
+        respawn: &Respawn,
+        boot: BootId,
+    ) -> Result<NodeHandle, String> {
+        // Every open that runs nodes sets it; only a `Db` a crate test builds by hand does not.
+        debug_assert!(
+            self.opened.instance.is_some(),
+            "a Db that restarts nodes names its instance"
+        );
+        let instance = self.opened.instance.ok_or_else(|| {
+            format!(
+                "node {}: this Db names no rDB instance, so its emptied folder {} cannot be \
+                 bound; reopen the directory to start it",
+                node.0,
+                folder.display()
+            )
+        })?;
+        #[cfg(test)]
+        if wipe_crashes(folder, WipeCrash::AfterMove) {
+            return Err(format!(
+                "node {}: test hook: the wipe stopped after the move",
+                node.0
+            ));
+        }
+        let mut engine = RocksEngine::open_with(folder, respawn.storage)
+            .map_err(|e| format!("node {}: open {}: {e}", node.0, folder.display()))?;
+        #[cfg(test)]
+        if wipe_crashes(folder, WipeCrash::AfterCreate) {
+            return Err(format!(
+                "node {}: test hook: the wipe stopped before the bind",
+                node.0
+            ));
+        }
+        engine.bind_instance(instance).map_err(|error| {
+            format!(
+                "node {}: bind the emptied folder {}: {error}",
+                node.0,
+                folder.display()
+            )
+        })?;
+        tracing::info!(
+            node = node.0,
+            boot = boot.0,
+            instance_hex = %admin::instance_hex(&instance),
+            "node_emptied_folder_bound"
+        );
+        host::spawn_on(
+            node,
+            engine,
+            Arc::clone(&self.links),
+            Arc::clone(&self.control),
+            self.clock,
+            respawn.budgets,
+            respawn.limits,
+            boot,
+        )
+    }
+
     /// Why `node`'s wipe is refused after its stop, or `None` (critic-bb M5): `partitions/1`
     /// must be at or above `generation` and leave `node` out, and with `boots` (the boot when
     /// the wipe was asked, the boot as of the stop) `node` must not have restarted between.
@@ -3272,17 +3462,21 @@ impl Db {
     /// when `node` is pinned, re-plans without it and waits for that commit; a quarantined owner
     /// replaces its F1 first, and its rebuild always wipes. Then `node` restarts at a new boot,
     /// its folder moved aside when wiped (never deleted), and the owner takes it back, first as
-    /// a shadow. Returns the accept line once the owner pins `node` regular again.
+    /// a shadow. Returns the accept line once the owner pins `node` regular again. With the owner
+    /// in another process (`--nodes`) the owner is asked over its link and takes only a node it
+    /// does not pin (M11 T12): one already left out, or a spare it notes for a free slot. The
+    /// line then says to restart `node`; `lr rebuild` does that.
     ///
     /// # Errors
     ///
     /// `INVALID_ARGUMENT`, nothing changed: `node` holds no copy, or owns the partition (the
-    /// text names `admin promote`). `UNAVAILABLE`, nothing changed, for another guard or an
-    /// owner in another process. `UNAVAILABLE` with `no_mutation` false once the owner started
-    /// the drop: a re-plan that did not commit a serving partition without `node`, quarantined
-    /// again, or did not commit in time. A wipe the fence refuses restarts `node` on its own
-    /// folder and says so. An `UNAVAILABLE` with `no_mutation` false when `node` restarted but
-    /// is not pinned regular again in time.
+    /// text names `admin promote`), or, with the owner in another process, this app is not on
+    /// its node's admin apps (`NetConfig::admin_apps`, A-R479). `UNAVAILABLE`, nothing
+    /// changed, for another guard or an owner in another process. `UNAVAILABLE` with
+    /// `no_mutation` false once the owner started the drop: a re-plan that did not commit a
+    /// serving partition without `node`, quarantined again, or did not commit in time. A wipe
+    /// the fence refuses restarts `node` on its own folder and says so. An `UNAVAILABLE` with
+    /// `no_mutation` false when `node` restarted but is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
         if !self.runs(self.route.owner()) && !self.runs(node) {
             if wipe {
@@ -3295,12 +3489,28 @@ impl Db {
                     ),
                 }));
             }
-            let (owner, generation) = self.left_out(node)?;
-            return Ok(format!(
-                "rebuild: node {} is left out by node {} (the owner) at generation {} (mode A); \
-                 restart it and the owner takes it back",
-                node.0, owner.0, generation.0
-            ));
+            // The guards a status look answers are checked here first; then the owner itself is
+            // asked over its link (M11 T12, tester T13): it notes a spare for the free slot, or
+            // says the copy is already left out. The status look alone could not note a spare,
+            // and said "restart it" for one the owner would never take back.
+            self.left_out(node)?;
+            return match self.call(
+                ClientCall::Rebuild {
+                    identity: self.identity(),
+                    node,
+                },
+                self.timeouts.read,
+            ) {
+                Some(Answer::Rebuilt(line)) => Ok(line),
+                Some(Answer::Error { error, .. }) => Err(error),
+                Some(other) => Err(ApiError::host(&format!(
+                    "a rebuild was answered with {other:?}"
+                ))),
+                None => Err(ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!("no answer to the rebuild in {:?}", self.timeouts.read),
+                )),
+            };
         }
         self.rebuild_with(node, wipe).map(|rebuilt| rebuilt.line())
     }
@@ -3339,6 +3549,64 @@ impl Db {
         ))
     }
 
+    /// M11: ask the owner to move partition 1's copy on node `from` to node `to`, or say where
+    /// that move stands. Asking again resumes it and answers `done` once `to` is pinned
+    /// regular and `from` is left out. The move that last finished is answered `done` each
+    /// time it is asked again, so a replayed plan passes, while the owner that ran it serves.
+    /// The answer comes at once; the move runs on the owner.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal, which changed nothing and names the next step (`INVALID_ARGUMENT`
+    /// for a move that cannot be made as asked, `UNAVAILABLE` for one to run again later);
+    /// `INVALID_ARGUMENT`, nothing changed, when this `Db` runs over links as an app the owner's
+    /// node does not list as an admin app (`NetConfig::admin_apps`, A-R479);
+    /// `NOT_PRIMARY` when the node asked is not the owner; `UNAVAILABLE` when no answer came in
+    /// the read timeout.
+    pub fn move_copy(&self, from: NodeId, to: NodeId) -> Result<host::MoveAnswer, ApiError> {
+        match self.call(
+            ClientCall::Move {
+                identity: self.identity(),
+                from,
+                to,
+            },
+            self.timeouts.read,
+        ) {
+            Some(Answer::Moved(moved)) => Ok(moved),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a move was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no answer to the move in {:?}", self.timeouts.read),
+            )),
+        }
+    }
+
+    /// M11: the owner this `Db` routes to, and the members its commit pins, as it answers its
+    /// status look.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` when the owner cannot be reached or does not answer in the read timeout.
+    pub fn pinned_members(
+        &self,
+    ) -> Result<(NodeId, Vec<rdb_core::contracts::membership::Member>), ApiError> {
+        let owner = self.route.owner();
+        self.look(owner)
+            .map(|status| (owner, status.pinned))
+            .map_err(|_| {
+                ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {} (the owner) did not answer its status look",
+                        owner.0
+                    ),
+                )
+            })
+    }
+
     /// The guards an app with no node of its own can check against the owner's status: `node`
     /// holds a copy (G1), is not the owner (G2), the owner is not quarantined (mode C needs the
     /// owner's process) and already leaves `node` out (mode A). Returns the owner and the
@@ -3348,10 +3616,14 @@ impl Db {
         let refuse = |guard: &'static str, detail: String| {
             Err(rebuild_refused(admin::rebuild::Refused { guard, detail }))
         };
-        if !ALL_NODES.contains(&node) {
+        // M11 T2: any node of the cluster, a spare or a node past 3, may be named.
+        if !(1..=MAX_NODES).contains(&node.0) {
             return refuse(
                 "G1",
-                format!("node {} holds no copy of partition 1", node.0),
+                format!(
+                    "node {} is not a node of the cluster (1 to {MAX_NODES})",
+                    node.0
+                ),
             );
         }
         if node == owner {
@@ -3384,6 +3656,21 @@ impl Db {
                     "node {} (the owner) is quarantined; rebuilding out of a quarantine needs the \
                      owner's own process (`admin rebuild {}` there); nothing was done",
                     owner.0, node.0
+                ),
+            );
+        }
+        // A-R457 (c): a shadow is given up by the owner's drop clock alone, not by a write.
+        if status.pinned.iter().any(|member| {
+            member.node == node && member.role == rdb_core::contracts::ids::ReplicaRole::Shadow
+        }) {
+            return refuse(
+                "process",
+                format!(
+                    "node {} is pinned as a shadow, catching up into a free slot: wait until it \
+                     is regular (`admin status` shows it). If node {} is lost, stop it (`lr stop \
+                     {}`): the owner gives up a shadow it cannot reach after about 10 s, with no \
+                     write needed; then rebuild it; nothing was done",
+                    node.0, node.0, node.0
                 ),
             );
         }
@@ -3686,18 +3973,43 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
     error
 }
 
+/// What a call carries to the owner, so what an answer lost under it may hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carries {
+    /// A compile, a read or a status look writes nothing, so losing the owner under one
+    /// applied nothing (A-R394 E1).
+    Nothing,
+    /// A put or a resend: it may have applied, and its request id settles it.
+    Write,
+    /// A move or a rebuild changes the partition record and its copies (PR #74 F-004), and has
+    /// no request id: repeating the same admin call is how to settle it (R2).
+    Admin,
+}
+
+fn carries(call: &ClientCall) -> Carries {
+    match call {
+        ClientCall::Put { .. } | ClientCall::Resend { .. } => Carries::Write,
+        ClientCall::Move { .. } | ClientCall::Rebuild { .. } => Carries::Admin,
+        ClientCall::Compile { .. }
+        | ClientCall::Status { .. }
+        | ClientCall::Get { .. }
+        | ClientCall::GetPrevious { .. } => Carries::Nothing,
+    }
+}
+
 /// The refusal for a call `owner` dropped unanswered (F-001). A node of this process that drops
 /// one is a host fault. One in another process went out of reach, most often because its
 /// process stopped (`lr down`): `UNAVAILABLE`, wait and retry, never "report this" (tc1 D1).
-/// `writes`: the call carried a write, which may then have applied; a call that writes nothing
-/// (a compile, a read, a status look) applied nothing (A-R394 E1).
-fn unanswered(local: bool, owner: NodeId, writes: bool) -> ApiError {
+/// `carried`: a write or an admin call may then have applied; a call that writes nothing (a
+/// compile, a read, a status look) applied nothing (A-R394 E1).
+fn unanswered(local: bool, owner: NodeId, carried: Carries) -> ApiError {
     if local {
-        ApiError::host("the owner dropped the call unanswered")
-    } else if writes {
-        ApiError::owner_lost(owner)
-    } else {
-        ApiError::owner_lost_unsent(owner)
+        return ApiError::host("the owner dropped the call unanswered");
+    }
+    match carried {
+        Carries::Write => ApiError::owner_lost(owner),
+        Carries::Admin => ApiError::owner_lost_admin(owner),
+        Carries::Nothing => ApiError::owner_lost_unsent(owner),
     }
 }
 
@@ -3935,6 +4247,7 @@ fn open_refused(error: OpenError) -> OpenError {
         OpenError::InUse(_) => "InUse",
         OpenError::CopyMissing(_) => "CopyMissing",
         OpenError::Unbound(_) => "Unbound",
+        OpenError::WipeUnfinished { .. } => "WipeUnfinished",
         OpenError::Mismatch(_) => "Mismatch",
         OpenError::Undecodable { .. } => "Undecodable",
         OpenError::Config(_) => "Config",
@@ -4042,7 +4355,7 @@ pub(crate) struct Aside {
 /// pass once that changes, so it is `RetryAfterRecovery`; only "process" (this process cannot
 /// run it) is `NotWired`. Each ends with [`error::REBUILD_STEP`], since its detail names the
 /// step.
-fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
+pub(crate) fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
     tracing::warn!(guard = refused.guard, detail = %refused.detail, "db_rebuild_refused");
     if matches!(refused.guard, "G1" | "G2") {
         ApiError::invalid(refused.to_string())
@@ -4059,7 +4372,7 @@ fn rebuild_refused(refused: admin::rebuild::Refused) -> ApiError {
 /// Revobot #73 finding 3: the owner failed a rebuild after it started the drop (a revocation
 /// queued, or the quarantined F1 replaced). The kind and retry rule are a refusal's; it never
 /// claims `no_mutation`.
-fn rebuild_failed(failed: admin::rebuild::Refused) -> ApiError {
+pub(crate) fn rebuild_failed(failed: admin::rebuild::Refused) -> ApiError {
     ApiError {
         no_mutation: false,
         ..rebuild_refused(failed)
@@ -4089,6 +4402,28 @@ fn aside_path(nodes_dir: &Path, node: NodeId, boot: BootId) -> PathBuf {
         .unwrap_or(nodes_dir)
         .join("aside")
         .join(format!("node-{}-boot-{}-{millis}", node.0, boot.0))
+}
+
+/// The newest folder a wipe of `node` moved aside under `nodes_dir`'s `aside/`, by its trailing
+/// unix ms (see [`aside_path`]); `None` when there is none.
+fn wipe_aside(nodes_dir: &Path, node: NodeId) -> Option<PathBuf> {
+    let prefix = format!("node-{}-boot-", node.0);
+    let entries = std::fs::read_dir(nodes_dir.parent().unwrap_or(nodes_dir).join("aside")).ok()?;
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let millis: u128 = name
+                .strip_prefix(&prefix)?
+                .rsplit('-')
+                .next()?
+                .parse()
+                .ok()?;
+            Some((millis, entry.path()))
+        })
+        .max_by_key(|(millis, _)| *millis)
+        .map(|(_, path)| one_separator(&path))
 }
 
 /// Move `folder` to `to`, creating `to`'s parent. Never deletes (critic-bb G7).
@@ -4136,20 +4471,21 @@ fn heal_within(budgets: &Budgets) -> Duration {
     )
 }
 
-/// Whether `local` names only some of the three nodes: a node process (ruling A-R231(a)).
+/// Whether `local` is not exactly the three nodes of [`ALL_NODES`]: a node process (ruling
+/// A-R231(a)). A spare past them (M11, up to [`MAX_NODES`]) is a node process too.
 ///
 /// # Errors
 ///
-/// [`OpenError::Config`] when it names a node twice or a node partition 1 does not have.
+/// [`OpenError::Config`] when it names a node twice or a node outside 1 to [`MAX_NODES`].
 fn local_nodes(local: &[NodeId]) -> Result<bool, OpenError> {
     let named: BTreeSet<NodeId> = local.iter().copied().collect();
-    if named.len() != local.len() || !named.iter().all(|node| ALL_NODES.contains(node)) {
+    if named.len() != local.len() || !named.iter().all(|node| (1..=MAX_NODES).contains(&node.0)) {
         return Err(OpenError::Config(format!(
-            "DbConfig::local is {:?}: name each of nodes 1, 2 and 3 at most once",
+            "DbConfig::local is {:?}: name each node at most once, each from 1 to {MAX_NODES}",
             local.iter().map(|node| node.0).collect::<Vec<_>>()
         )));
     }
-    Ok(named.len() < ALL_NODES.len())
+    Ok(named != ALL_NODES.iter().copied().collect::<BTreeSet<NodeId>>())
 }
 
 /// `path` written with one separator: a folder given with `/` and joined with `nodes` and a node
@@ -4160,13 +4496,14 @@ fn one_separator(path: &Path) -> PathBuf {
 
 /// Open the copies of `local` under `nodes_dir`, taking their `LOCK`s. Copies that hold a database
 /// open first, in node order, so a racing open meets node 1's `LOCK` before anything else. A
-/// missing copy is created only while no copy holds data. On error, says whether node 1's
+/// missing copy is created only while no copy holds data, or when a wipe moved it aside
+/// (ruling A-R466). On error, says whether node 1's
 /// `LOCK` was held, which is what lets a claim be removed; every engine is closed by then.
 fn open_engines(
     nodes_dir: &Path,
     local: &[NodeId],
     storage: StorageOptions,
-) -> Result<BTreeMap<NodeId, RocksEngine>, (OpenError, bool)> {
+) -> Result<OpenedEngines, (OpenError, bool)> {
     let refused = |dir: &Path, error: rdb_storage::OpenError| match error {
         rdb_storage::OpenError::Locked { .. } => OpenError::InUse(one_separator(dir)),
         rdb_storage::OpenError::NoDatabase { .. } => OpenError::CopyMissing(one_separator(dir)),
@@ -4190,10 +4527,19 @@ fn open_engines(
             }
         }
     }
-    if let Some((_, dir)) = missing.first() {
-        if engines.values().any(|engine| !engine.lineages().is_empty()) {
-            let held = engines.contains_key(&OWNER);
-            return Err((OpenError::CopyMissing(one_separator(dir)), held));
+    // While another copy holds data, a missing copy a wipe moved aside is left to `Db::check`,
+    // which creates it only once `partitions/1` shows the wipe's drop (rulings A-R466,
+    // A-R466b); any other missing copy is refused here.
+    let mut absent = Vec::new();
+    if engines.values().any(|engine| !engine.lineages().is_empty()) {
+        for (node, dir) in std::mem::take(&mut missing) {
+            match wipe_aside(nodes_dir, node) {
+                Some(aside) => absent.push(Absent { node, dir, aside }),
+                None => {
+                    let held = engines.contains_key(&OWNER);
+                    return Err((OpenError::CopyMissing(one_separator(&dir)), held));
+                }
+            }
         }
     }
     for (node, dir) in missing {
@@ -4207,7 +4553,42 @@ fn open_engines(
             }
         }
     }
-    Ok(engines)
+    Ok((engines, absent))
+}
+
+/// Whether `engine`'s folder holds data of partition 1: proof that its node held a copy.
+fn holds_partition(engine: &RocksEngine) -> bool {
+    engine
+        .lineages()
+        .iter()
+        .any(|(partition, _)| *partition == PARTITION)
+}
+
+/// A-R467, A-R469: the local copies an open names as left out of `partitions/1`. `local` pairs
+/// each local node with whether it held a copy (its folder holds partition 1 data, or a wipe
+/// of it is being finished). A node that never held one is a spare and is never named.
+fn left_out_copies(local: &[(NodeId, bool)], pinned: &[NodeId]) -> Vec<NodeId> {
+    let mut out: Vec<NodeId> = local
+        .iter()
+        .filter(|(node, held)| *held && !pinned.contains(node))
+        .map(|(node, _)| *node)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The engines [`open_engines`] opened, and the copies it left to `Db::check`.
+type OpenedEngines = (BTreeMap<NodeId, RocksEngine>, Vec<Absent>);
+
+/// A local copy that is missing while another copy holds data, and that a wipe moved aside:
+/// [`open_engines`] leaves it to `Db::check` (rulings A-R466, A-R466b).
+struct Absent {
+    node: NodeId,
+    /// Where the copy belongs, `nodes/<n>`.
+    dir: PathBuf,
+    /// The newest folder a wipe of `node` moved aside.
+    aside: PathBuf,
 }
 
 /// An open's engines and the `nodes/` it created, between opening the engines and handing them
@@ -4404,7 +4785,9 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         ClientCall::Put { .. }
         | ClientCall::Compile { .. }
         | ClientCall::Resend { .. }
-        | ClientCall::Status { .. } => return None,
+        | ClientCall::Status { .. }
+        | ClientCall::Move { .. }
+        | ClientCall::Rebuild { .. } => return None,
     };
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {
@@ -4508,6 +4891,35 @@ fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
     stops.len() != before
 }
 
+/// Test-only (A-R466): where a wipe of a node's folder stops, as a process that crashed there
+/// would. `AfterMove`: the old folder is aside and no engine exists. `AfterCreate`: the new
+/// engine exists and names no instance.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WipeCrash {
+    AfterMove,
+    AfterCreate,
+}
+
+/// Test-only: the folders whose next wipe stops, and where.
+#[cfg(test)]
+static WIPE_CRASH: Mutex<Vec<(PathBuf, WipeCrash)>> = Mutex::new(Vec::new());
+
+/// Test-only: the next wipe of `folder` stops at `at`.
+#[cfg(test)]
+pub(crate) fn crash_wipe(folder: &Path, at: WipeCrash) {
+    lock(&WIPE_CRASH).push((folder.to_path_buf(), at));
+}
+
+/// Whether the wipe of `folder` stops at `at`; a hit disarms the hook.
+#[cfg(test)]
+fn wipe_crashes(folder: &Path, at: WipeCrash) -> bool {
+    let mut crashes = lock(&WIPE_CRASH);
+    let before = crashes.len();
+    crashes.retain(|(dir, point)| !(dir == folder && *point == at));
+    crashes.len() != before
+}
+
 #[cfg(test)]
 mod reopen_tests;
 
@@ -4595,7 +5007,11 @@ mod tests {
     /// with `no_mutation` true wrote nothing, so the same put is sent again after a short wait.
     /// Any other refusal, or a pause that outlasts the patience, fails the row. For a put a row
     /// needs to land on a host whose fsyncs may outlast L1's pause age: A-R391 (every copy's
-    /// sync took 530-628 ms against 400 ms) and A-R392 (D18's puts before its stall).
+    /// sync took 530-628 ms against 400 ms) and A-R392 (D18's puts before its stall). A new
+    /// generation's `Unavailable` "not yet marked activated" refusal (A-R184) is sent again the
+    /// same way: it is `no_mutation` and lifts once the open counter marks the generation, which
+    /// a put right after a commit can beat under load (m11_t6 at adf72e7). A refusal that may
+    /// have mutated is never sent again.
     pub(super) fn put_through_pauses(db: &Db, object: &[u8], value: &[u8], case: &str) {
         let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
         let mut paused = 0_u32;
@@ -4603,8 +5019,10 @@ mod tests {
             match db.put(object, value, None) {
                 Ok(_) => break,
                 Err(refused)
-                    if refused.error.kind == ErrorKind::ProtectionPaused
-                        && refused.error.no_mutation
+                    if refused.error.no_mutation
+                        && (refused.error.kind == ErrorKind::ProtectionPaused
+                            || (refused.error.kind == ErrorKind::Unavailable
+                                && refused.error.detail.contains("not yet marked activated")))
                         && Instant::now() < deadline =>
                 {
                     paused += 1;
@@ -5137,6 +5555,98 @@ mod tests {
         unsent("status", &status);
         let get = db.get(b"a").expect_err("the get was dropped");
         unsent("get", &get);
+    }
+
+    /// PR #74 F-004: an admin move or rebuild sent to an owner in another process that goes out
+    /// of reach before answering may already have started (a revocation, a spare note), so the
+    /// lost reply is `no_mutation: false`, as a put's is, never "nothing was applied".
+    /// Cut: `carries` counts only `Put` and `Resend` as writes, red (`no_mutation` true). R2 cut:
+    /// `unanswered` gives an admin call `owner_lost`'s `Db::resend` step, red.
+    /// Unit (~10 ms): no node thread; the owner's mailbox is a link this test drops calls from.
+    #[test]
+    fn pr74_f004_a_lost_reply_to_an_admin_move_or_rebuild_may_have_applied() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (tx, mailbox) = mpsc::channel();
+        links.register(OWNER, tx, crate::host::BOOT);
+        std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                drop(msg);
+            }
+        });
+        let db = Db {
+            nodes: Mutex::new(Vec::new()),
+            respawn: None,
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts::default(),
+            next_request: AtomicU64::new(1),
+            ack_floor: hand_tracker(),
+            client: DEFAULT_CLIENT,
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+            opened: Opened::default(),
+            route: Route::default(),
+        };
+        let moved = db
+            .move_copy(NodeId(3), NodeId(4))
+            .expect_err("the move was dropped");
+        assert_eq!(
+            (moved.kind, moved.no_mutation),
+            (ErrorKind::Unavailable, false),
+            "{moved}"
+        );
+        assert!(
+            !moved.to_string().contains("nothing was applied"),
+            "{moved}"
+        );
+        // Revobot R2 (thread 4433944765): an admin call has no request id, so the advice is to
+        // repeat the same admin call and check `admin status`, never `Db::resend`/`Db::status`.
+        let text = moved.explain();
+        assert!(
+            !text.contains("Db::resend") && !text.contains("Db::status"),
+            "{text}"
+        );
+        assert!(
+            text.contains("run the same `admin move` or `admin rebuild` again")
+                && text.contains("`admin status`"),
+            "{text}"
+        );
+        // Revobot R2 thread 4433944765, R3: a repeated move answers where it stands only on an
+        // owner that kept running; a restarted owner has forgotten the move it ran and refuses
+        // the repeat of one that finished (T1), so the text may not promise more.
+        assert!(
+            text.contains("only while the owner keeps running")
+                && text.contains("after a restart a repeat of a finished move is refused"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("answers where it stands or that it is done"),
+            "{text}"
+        );
+        assert_eq!(text.matches("; next: ").count(), 0, "said once: {text}");
+        // `Db::rebuild` looks at the owner first, so its call is checked at the classifier,
+        // and its lost reply gets the same admin advice.
+        let rebuild = ClientCall::Rebuild {
+            identity: db.identity(),
+            node: NodeId(4),
+        };
+        assert_eq!(
+            carries(&rebuild),
+            Carries::Admin,
+            "a lost rebuild reply may hide its spare note"
+        );
+        let lost = super::unanswered(false, OWNER, carries(&rebuild));
+        assert!(!lost.no_mutation, "{lost}");
+        assert_eq!(
+            lost.explain(),
+            text,
+            "one admin text for a move and a rebuild"
+        );
     }
 
     /// A-R394 P1 (tester tc2 S4 c): `wait_ready` with no link to the owner up (its process is
@@ -11320,6 +11830,7 @@ mod tests {
                 past_horizon: DenyReason::NoGrant,
             },
             retention_millis: 1_000,
+            must_hold: std::collections::BTreeSet::new(),
             config,
         };
         let fence = FencingProof {

@@ -1,0 +1,189 @@
+// rDB's app wire (slice 1): the gateway `rdb-server` serves this over loopback gRPC, and the C#
+// client `Rdb.Client` calls it. Every call goes through `rdb_api::Db`, so the wire runs the same
+// request checks the embedded API does (ADR-rdb-0013 decision 11).
+//
+// Values are opaque bytes in slice 1: the bytes `Db::put`, `Db::get` and `Db::txn` take. The
+// app picks the format. The server never parses them.
+//
+// Errors are standard gRPC rich status: the `grpc-status-details-bin` trailer holds a
+// `google.rpc.Status` whose details hold one `RdbError` (type URL
+// `type.googleapis.com/rdb.v1.RdbError`). `RpcStatus` and `AnyDetail` below are wire-identical
+// to `google.rpc.Status` and `google.protobuf.Any`, so any gRPC tool decodes them. An error with
+// no `RdbError` was not decided by the server: the transport made it. A write that ends that way
+// has an unknown outcome.
+
+syntax = "proto3";
+
+package rdb.v1;
+
+option csharp_namespace = "Rdb.V1";
+
+service Rdb {
+  // Whether the database admits writes now (`Db::wait_ready` with a short bound).
+  rpc Ready(ReadyRequest) returns (ReadyReply);
+  // Replace one object's bytes (`Db::put`).
+  rpc Put(PutRequest) returns (WriteReply);
+  // Read one object's bytes (`Db::get`).
+  rpc Get(GetRequest) returns (GetReply);
+  // Write every put, or none (`Db::txn`, in the default group).
+  rpc Txn(TxnRequest) returns (WriteReply);
+  // What became of a write (`Db::status`). Settles an UNKNOWN_OUTCOME.
+  rpc Status(StatusRequest) returns (StatusReply);
+}
+
+message ReadyRequest {
+  // How long the server waits for ready. 0: the server's default (1000 ms). At most 10000.
+  uint32 within_ms = 1;
+}
+
+message ReadyReply {
+  bool ready = 1;
+  // Why not ready, in words with the next step. Empty when ready.
+  string detail = 2;
+  // The client id every write of this gateway is sent as.
+  uint32 client_id = 3;
+  // The server's own waits, so a client can set each attempt's deadline above them.
+  uint32 put_timeout_ms = 4;
+  uint32 read_timeout_ms = 5;
+  uint32 max_txn_deadline_ms = 6;
+}
+
+message PutRequest {
+  bytes object = 1;
+  bytes value = 2;
+  // Write only if the object is at this version.
+  optional uint64 if_version = 3;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  // Applied and published.
+  PUBLISHED = 1;
+  // Found in retained history after a recovery.
+  RECOVERED_APPLIED = 2;
+}
+
+message WriteReply {
+  uint64 request_id = 1;
+  uint64 generation = 2;
+  // The write's position: the object's new version.
+  uint64 version = 3;
+  Outcome outcome = 4;
+}
+
+message GetRequest {
+  bytes object = 1;
+}
+
+message GetReply {
+  bool found = 1;
+  uint64 version = 2;
+  bytes value = 3;
+  uint64 generation = 4;
+  uint64 at = 5;
+  // Served from a recovery read-only generation: it may lack writes acknowledged just before a loss.
+  bool recovery_mode = 6;
+}
+
+message TxnPut {
+  bytes object = 1;
+  bytes value = 2;
+  optional uint64 if_version = 3;
+}
+
+message TxnRequest {
+  repeated TxnPut puts = 1;
+  // The kernel deadline. 0: 5000 ms. At most 30000.
+  uint32 deadline_ms = 2;
+}
+
+message StatusRequest {
+  uint64 request_id = 1;
+  // The generation the write's reply or error named. Without it a dropped answer says UNKNOWN.
+  optional uint64 generation = 2;
+}
+
+enum StatusState {
+  STATUS_STATE_UNSPECIFIED = 0;
+  // It landed: the fields below say where.
+  RESOLVED = 1;
+  // Not known yet. Not proof it did not run: ask again, or read the object.
+  UNKNOWN = 2;
+  // Too old to say. Not proof it did not run: read the object.
+  EXPIRED = 3;
+}
+
+message StatusReply {
+  StatusState state = 1;
+  uint64 generation = 2;
+  uint64 version = 3;
+  Outcome outcome = 4;
+}
+
+// The error kinds of spec §5.4, one per `rdb_api::ErrorKind`.
+enum ErrorKind {
+  ERROR_KIND_UNSPECIFIED = 0;
+  NOT_PRIMARY = 1;
+  ROUTE_CHANGED = 2;
+  LEASE_EXPIRED = 3;
+  RECOVERY_READ_ONLY = 4;
+  PROTECTION_PAUSED = 5;
+  CONDITION_FAILED = 6;
+  CROSS_AFFINITY = 7;
+  INVALID_ARGUMENT = 8;
+  OVERLOADED = 9;
+  DEADLINE_BEFORE_ADMISSION = 10;
+  UNKNOWN_OUTCOME = 11;
+  GENERATION_CHANGED = 12;
+  REQUEST_ID_REUSE = 13;
+  STALE_CONTINUATION = 14;
+  CORRUPT_HISTORY = 15;
+  INCOMPATIBLE_VERSION = 16;
+  STATUS_EXPIRED = 17;
+  DIVERGENCE_REQUIRES_OPERATOR = 18;
+  UNAVAILABLE = 19;
+  UPLOAD_CHUNK_CONFLICT = 20;
+  CORRUPT_BLOB = 21;
+}
+
+// What the caller may do, one per `rdb_api::RetryRule`.
+enum RetryRule {
+  RETRY_RULE_UNSPECIFIED = 0;
+  REFRESH_ROUTE = 1;
+  RETRY_AFTER_RECOVERY = 2;
+  DEFINITIVE = 3;
+  BOUNDED_JITTER = 4;
+  QUERY_STATUS = 5;
+  RECONCILE = 6;
+  QUARANTINE = 7;
+  NOT_WIRED = 8;
+}
+
+// The server's decision, in the rich status details. Present means the server decided.
+message RdbError {
+  ErrorKind kind = 1;
+  // The §5.4 name, e.g. CONDITION_FAILED. Kept so a client that does not know a newer kind
+  // still shows it.
+  string kind_name = 2;
+  RetryRule retry = 3;
+  // This submission provably mutated nothing.
+  bool no_mutation = 4;
+  // The write's request id and generation, when one was sent: ask Status with them.
+  optional uint64 request_id = 5;
+  optional uint64 generation = 6;
+  // The soonest a retry can be admitted, when known.
+  optional uint64 retry_after_ms = 7;
+}
+
+// Wire-identical to google.rpc.Status.
+message RpcStatus {
+  int32 code = 1;
+  string message = 2;
+  repeated AnyDetail details = 3;
+}
+
+// Wire-identical to google.protobuf.Any.
+message AnyDetail {
+  string type_url = 1;
+  bytes value = 2;
+}

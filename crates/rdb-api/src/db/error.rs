@@ -33,10 +33,21 @@ const OPEN_AGAIN: &str = "open the folder again";
 /// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
 const RUN_AGAIN: &str = "run it again to read where it stands";
 
+/// The tail of [`ApiError::owner_lost_admin`]: its detail names the step, and an admin call has
+/// no request id for the `Db::resend` / `Db::status` step a lost write gets (PR #74 R2).
+const ADMIN_LOST_STEP: &str = "so run `admin status`";
+
 /// The tail every `admin rebuild` error ends with (#65): its detail already names the step
 /// (stop it, send a write, promote first, restart it), which "retrying will not help" would
 /// contradict (bb walk paper cut).
 pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this says";
+
+/// The tail every `admin move` refusal ends with (M11): its detail names the step.
+pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
+
+/// The tail of a move's answer when the move ended by filling a free slot (A-R457 (a)): its
+/// detail says what the move did and the step to move the source's copy.
+pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
 
 /// The tail of [`super::ReadyError::Quarantined`]'s text, which a refusal carries while the
 /// owner's recovery is quarantined ([`super::Db::explained`]). It already says what to do, which
@@ -179,6 +190,31 @@ impl ApiError {
         }
     }
 
+    /// [`Self::owner_lost`] for an admin move or rebuild (PR #74 F-004, R2). It may have
+    /// started, so not `no_mutation`; but it carries no request id, so the step is to repeat
+    /// the same admin call. A rebuild answers its own spare note again (a restarted owner has
+    /// none and notes it afresh). A move answers where it stands only while the owner keeps
+    /// running: `Host::moved` is memory only, so after a restart a repeat of a move that
+    /// finished is refused by T1's "holds no copy" arm, which says to run `admin status`.
+    #[must_use]
+    pub fn owner_lost_admin(node: NodeId) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry: RetryRule::RetryAfterRecovery,
+            no_mutation: false,
+            detail: format!(
+                "node {}, the owner, went out of reach while this admin call waited for its \
+                 answer (its process may have stopped); the move or rebuild may have started: \
+                 once the owner is back, run the same `admin move` or `admin rebuild` again; a \
+                 rebuild recognises its own note. A move answers where it stands only while the \
+                 owner keeps running; after a restart a repeat of a finished move is refused, \
+                 {ADMIN_LOST_STEP}",
+                node.0
+            ),
+            retry_after: None,
+        }
+    }
+
     /// [`Self::owner_lost`] for a call that writes nothing: a read, a status look, or a write's
     /// compile, which answers before the write itself is sent (tester tc2 E1, A-R394). Nothing
     /// was applied, so `no_mutation`, and there is no request to resend.
@@ -255,6 +291,9 @@ impl ApiError {
         if reopen
             || self.detail.ends_with(RUN_AGAIN)
             || self.detail.ends_with(REBUILD_STEP)
+            || self.detail.ends_with(MOVE_STEP)
+            || self.detail.ends_with(MOVE_ENDED)
+            || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
         {

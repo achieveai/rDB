@@ -22,6 +22,7 @@ the code or the docs (ADR-rdb-0000).
 | [`implementation-spikes.md`](implementation-spikes.md) | **The plan for the current correctness spike (M7).** File ownership, the six core seams, package ids, acceptance rows, budgets | you are writing code this milestone |
 | [`validation-plan.md`](validation-plan.md) | The validation gates V1–V5 and what evidence closes each | you are deciding whether something is done |
 | [`local-cluster.md`](local-cluster.md) | How to run rDB as three node processes on one machine (`scripts/local-rdb.sh`) and point an app at them | you want to run or try rDB by hand |
+| [`placement-plan.md`](placement-plan.md) | `rdb_dev admin plan`: the inventory file and what a plan promises (M11, model only) | you want a list of copy moves for a set of nodes |
 | [`value-layer-decision-review.md`](value-layer-decision-review.md) | A provisional recommendation on the value layer, **not yet selected** | it is open; do not build against it |
 
 Decisions live in [`../ADRs/rdb/`](../ADRs/rdb/), indexed by

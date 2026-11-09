@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run rDB as three real processes with one command (M10 S2, W4): `lr`.
 #
-#   scripts/local-rdb.sh up [--release] [--base-port P] [--root DIR] [--timeout-sec N]
+#   scripts/local-rdb.sh up [--nodes K] [--release] [--base-port P] [--root DIR] [--timeout-sec N]
 #   scripts/local-rdb.sh up --resume                              [--run DIR]
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
 #   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
@@ -11,6 +11,7 @@
 #   scripts/local-rdb.sh cut-control N | uncut-control N          [--run DIR]
 #   scripts/local-rdb.sh promote N [--drop M]                     [--run DIR]
 #   scripts/local-rdb.sh rebuild N [--wipe]                       [--run DIR]
+#   scripts/local-rdb.sh move FROM TO                             [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
@@ -18,6 +19,10 @@
 # each holding only its own copy, and waits for each to say ready. Ctrl-C or a failed step brings
 # everything it started back down. `up --resume` starts a run that is down again (its rEtcd,
 # then nodes 1-3) with its ports and binary paths; nothing is formed anew.
+#
+# `up --nodes K` (3 to 8, default 3) starts nodes 4 to K too, as spares (M11): each opens an
+# empty copy, is a member of nothing, and says ready like the others. `move FROM TO` runs
+# rdb_dev `admin move FROM TO`, which moves FROM's copy of partition 1 onto TO.
 #
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
 # it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
@@ -36,7 +41,7 @@
 #   faults/node-N.txt the fault file node N polls every 50 ms
 #   logs/rdb_node-N.jsonl, out/node-N.out|.err
 #
-# Ports: rEtcd takes P+1..P+24 (local-cluster.sh layout), node N listens on P+40+N. P defaults to
+# Ports: rEtcd takes P+1..P+24 (local-cluster.sh layout), node N listens on P+40+N (N up to K). P defaults to
 # 19800. A range that holds 27021 or 27031 (mongod on this host) is refused, and so is a port
 # something already listens on.
 #
@@ -67,20 +72,33 @@ BASE_PORT=19800
 ROOT="${RDB_LR_ROOT:-C:/rdb_test_data/lr}"
 RUN=""
 TIMEOUT_SEC=90
+# A node prints its first `not-ready ... (retrying)` line after this many seconds and keeps
+# waiting; `await_ready` reads that line for the promote hint, so the hint comes then, not after
+# TIMEOUT_SEC (tester paper cut, 7913fb8). `rdb_node` alone waits 60 s.
+FIRST_WAIT_SEC=15
 WIPE=0
 RESUME=0
 ARG=""
+ARG2=""
 FAULT_NODE=1
 DROP=""
 PROFILE=debug
+NODES_ARG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --base-port) BASE_PORT="$2"; shift 2 ;;
+        --base-port)
+            # Decimal from here on: `$((021800 + 1))` reads a leading 0 as octal and fails on 8 or 9.
+            case "${2:-}" in '' | *[!0-9]*) echo "lr: --base-port takes a port number, got '${2:-}'" >&2; exit 2 ;; esac
+            BASE_PORT=$((10#$2)); shift 2 ;;
         --root) ROOT="$2"; shift 2 ;;
         --run) RUN="$2"; shift 2 ;;
         --timeout-sec) TIMEOUT_SEC="$2"; shift 2 ;;
         --wipe) WIPE=1; shift ;;
+        --nodes)
+            [ "$COMMAND" = up ] || { echo "lr: --nodes goes with 'up' only; other verbs use the run's (run.env)" >&2; exit 2; }
+            case "${2:-}" in [3-8]) NODES_ARG="$2" ;; *) echo "lr: --nodes takes 3 to 8, got '${2:-}'" >&2; exit 2 ;; esac
+            shift 2 ;;
         --resume)
             [ "$COMMAND" = up ] || { echo "lr: --resume goes with 'up' only" >&2; exit 2; }
             RESUME=1; shift ;;
@@ -94,13 +112,14 @@ while [ $# -gt 0 ]; do
             PROFILE=release; shift ;;
         -*) echo "lr: unknown option $1" >&2; exit 2 ;;
         *)
+            if [ -n "$ARG" ] && [ "$COMMAND" = move ] && [ -z "$ARG2" ]; then ARG2="$1"; shift; continue; fi
             [ -z "$ARG" ] || { echo "lr: one argument only, got '$ARG' and '$1'" >&2; exit 2; }
             ARG="$1"; shift ;;
     esac
 done
 
 usage() {
-    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -147,14 +166,21 @@ pick_run() {
         RUN="$(cat "$ROOT/current")"
     fi
     [ -d "$RUN" ] || die "run folder $RUN is gone"
+    # `down` and `clean` handle a run with neither run.env nor pids themselves (`no_pids`);
+    # every other case needs run.env, as before.
+    case "$COMMAND" in down | clean) [ -f "$RUN/run.env" ] || [ -f "$RUN/pids" ] || return 0 ;; esac
     # shellcheck disable=SC1091
     . "$RUN/run.env"
+    NODES="${NODES:-3}" # a run from before M11 has no NODES line: three nodes
 }
+
+NODES="${NODES_ARG:-3}"
+all_nodes() { seq 1 "$NODES"; }
 
 node_port() { echo $((BASE_PORT + 40 + $1)); }
 peers() {
     local n out=""
-    for n in 1 2 3; do out="$out${out:+,}$n=127.0.0.1:$(node_port "$n")"; done
+    for n in $(all_nodes); do out="$out${out:+,}$n=127.0.0.1:$(node_port "$n")"; done
     printf '%s' "$out"
 }
 control_endpoints() {
@@ -163,7 +189,10 @@ control_endpoints() {
 }
 
 check_node_arg() {
-    case "$1" in 1 | 2 | 3) ;; *) die "node must be 1, 2 or 3, got '${1:-}'" ;; esac
+    case "${1:-}" in
+        [1-8]) [ "$1" -le "$NODES" ] || die "node must be 1 to $NODES (this run has $NODES nodes), got '$1'" ;;
+        *) die "node must be 1 to $NODES, got '${1:-}'" ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------------------
@@ -236,11 +265,14 @@ start_node() { # n [stopped]: `stopped` skips the running check when the caller 
     rm -f "$RUN/stop/node-$n"
     out="$RUN/out/node-$n.out"
     err="$RUN/out/node-$n.err"
+    # `--admin-apps admin`: the app `lr move`/`rebuild`/`promote` run as (A-R480: unset is none).
+    # A later `--admin-apps` in LR_NODE_ARGS wins.
     # shellcheck disable=SC2086
     "$NODE_BIN" --node "$n" --dir "$RUN/db" --listen "127.0.0.1:$(node_port "$n")" \
         --peers "$(peers)" --control "$CONTROL" --cert-dir "${LR_CERT_DIR:-$RUN/certs}" \
         --faults "$RUN/faults/node-$n.txt" --stop-file "$RUN/stop/node-$n" \
-        --log-dir "$RUN/logs" ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
+        --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" --admin-apps admin \
+        ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
     pid=$!
     os="$(os_pid_of_child "$pid" rdb_node)" || { cat "$err" >&2; die "node $n exited at start"; }
     record_pid "node-$n" "$os"
@@ -259,13 +291,21 @@ settled_line() { # file: the last ready or final not-ready line. A not-ready lin
 }
 
 await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an exit or a timeout is 1
-    local n="$1" os line deadline out
+    local n="$1" os line deadline out hinted=""
     out="$RUN/out/node-$n.out"
     os="$(pid_of "node-$n")"
     deadline=$(( $(date +%s) + TIMEOUT_SEC ))
     while [ "$(date +%s)" -lt "$deadline" ] && os_pid_is "$os" rdb_node; do
         line="$(settled_line "$out")"
         [ -n "$line" ] && break
+        if [ -z "$hinted" ]; then # once, at the first retrying line naming an unreachable owner
+            hinted="$(owner_lost_line "$out")"
+            if [ -n "$hinted" ]; then
+                say "node $n: $hinted"
+                promote_hint "$n" "$hinted"
+                say "node $n: still waiting for ready (up to ${TIMEOUT_SEC}s in all)"
+            fi
+        fi
         sleep 0.2
     done
     line="$(settled_line "$out")"
@@ -279,21 +319,40 @@ await_ready() { # n: 0 only on `rdb_node ready`; a final `not-ready` line, an ex
     line="$(grep "^rdb_node not-ready" "$out" 2>/dev/null | tail -n1 || true)"
     if os_pid_is "$os" rdb_node; then
         say "node $n: not ready within ${TIMEOUT_SEC}s${line:+; last: $line} (see $RUN/out/node-$n.err)"
-        promote_hint "$n" "$line"
+        [ -n "$hinted" ] || promote_hint "$n" "$line"
     else
         say "node $n: exited before it was ready${line:+; last: $line} (see $RUN/out/node-$n.err)"
     fi
     return 1
 }
 
+owner_lost_line() { # file: the first `(retrying)` not-ready line that names an owner no link reaches
+    { grep "^rdb_node not-ready.*is not reachable from this process.*(retrying)$" "$1" 2>/dev/null || true; } \
+        | head -n1
+}
+
 promote_hint() { # n line: a node that gave up waiting for an owner no link reaches names the
-    # promote that ends the wait (bug bash #64): the lowest running node but the lost one.
-    local n="$1" gone k
+    # promote that ends the wait (bug bash #64): the lowest running node but the lost one that
+    # holds a regular copy, by `admin status`'s members line, which comes from partitions/1 when
+    # the owner does not answer. A spare or a left-out node is never named: a promote refuses
+    # it (lead ruling on dev-a item 3).
+    local n="$1" gone k members
     gone="$(printf '%s' "$2" | sed -n 's/.*node \([0-9]\) is not reachable from this process.*/\1/p')"
     { [ -n "$gone" ] && [ "$gone" != "$n" ]; } || return 0
-    for k in 1 2 3; do
-        if [ "$k" != "$gone" ] && node_alive "$k"; then
-            say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
+    members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
+    k="$(promote_target "$gone" "$members")"
+    if [ -n "$k" ]; then
+        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
+    else
+        say "node $n waits for node $gone, the owner, and no link reaches it. No running node holds a regular copy to promote (${members:-admin status gave no members line})"
+    fi
+}
+
+promote_target() { # gone members-line: the lowest running node but `gone` the line names regular
+    local k
+    for k in $(all_nodes); do
+        if [ "$k" != "$1" ] && node_alive "$k" && printf '%s' "$2" | grep -Eq " $k=regular[ ;]"; then
+            echo "$k"
             return 0
         fi
     done
@@ -372,7 +431,8 @@ fault_remove() { # n line
 }
 pair() { # A-B -> "A B"
     case "$1" in
-        [123]-[123]) [ "${1%-*}" != "${1#*-}" ] || die "a pair names two nodes, got $1"
+        [1-8]-[1-8]) [ "${1%-*}" != "${1#*-}" ] || die "a pair names two nodes, got $1"
+                     check_node_arg "${1%-*}"; check_node_arg "${1#*-}"
                      echo "${1%-*} ${1#*-}" ;;
         *) die "want a pair like 1-3, got '${1:-}'" ;;
     esac
@@ -410,7 +470,7 @@ up() {
         pick_run
         # A run still up says so before the port checks below, which would otherwise blame
         # the base port: a resume cannot change it, run.env sets it (critic-w5g A1).
-        for n in 1 2 3; do
+        for n in $(all_nodes); do
             node_alive "$n" && die "node $n of $RUN still runs: the run is up; 'lr down' first"
         done
         for role in $(awk '$1 ~ /^retcd-/ { print $1 }' "$RUN/pids" 2>/dev/null); do
@@ -419,7 +479,7 @@ up() {
         done
         fix="stop what holds it: this run's ports are fixed in $RUN/run.env"
     fi
-    lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 43))
+    lo=$((BASE_PORT + 1)) hi=$((BASE_PORT + 40 + NODES))
     for p in 27021 27031; do
         [ "$p" -lt "$lo" ] || [ "$p" -gt "$hi" ] || die "ports $lo-$hi hold $p (mongod on this host); pick another --base-port"
     done
@@ -449,6 +509,7 @@ BASE_PORT=$BASE_PORT
 CONTROL=$CONTROL
 SHA=$sha
 PROFILE=$PROFILE
+NODES=$NODES
 NODE_BIN=$(printf '%q' "$NODE_BIN")
 PILOT_BIN=$(printf '%q' "$PILOT_BIN")
 EOF
@@ -475,8 +536,8 @@ start_retcd() { # rEtcd of $RUN, with the trap that takes the run down if `up` s
 }
 
 form_and_start() {
-    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --apps pilot,pilot-a,pilot-b,admin >/dev/null
-    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs-other" --apps pilot >/dev/null
+    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --nodes "$NODES" --apps pilot,pilot-a,pilot-b,admin >/dev/null
+    "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs-other" --nodes "$NODES" --apps pilot >/dev/null
     say "certificates in $RUN/certs (a second CA in $RUN/certs-other)"
     "$NODE_BIN" --form --dir "$RUN/db" --control "$CONTROL" --log-dir "$RUN/logs" \
         --ready-secs "$TIMEOUT_SEC" >"$RUN/out/form.out" 2>"$RUN/out/form.err" \
@@ -485,11 +546,11 @@ form_and_start() {
     start_all
 }
 
-start_all() { # nodes 1-3, then the wait for each: the tail of `up` and `up --resume`
+start_all() { # nodes 1 to K, then the wait for each: the tail of `up` and `up --resume`
     local n
-    for n in 1 2 3; do start_node "$n"; done
+    for n in $(all_nodes); do start_node "$n"; done
     local ok=1
-    for n in 1 2 3; do await_ready "$n" || ok=0; done
+    for n in $(all_nodes); do await_ready "$n" || ok=0; done
     UP_DONE=1
     if [ "$ok" != 1 ]; then
         # Left running so it can be looked at; the exit says it is not up.
@@ -500,9 +561,32 @@ start_all() { # nodes 1-3, then the wait for each: the tail of `up` and `up --re
     say "pilot: $(printf %q "$PILOT_BIN") --dir $(printf %q "$RUN/pilot") --control $CONTROL --nodes $(peers) --cert-dir $(printf %q "$RUN/certs") --put k=v --get k"
 }
 
+# No pids file: lr cannot name this run's processes, so it asks the run's ports (run.env's
+# BASE_PORT and NODES, the span `up` checks). A port in use may be a live node of this run
+# whose pids file was lost: refuse, keep the folder (PR #74 R3, Revobot #78). Free ports:
+# nothing runs. No ports in run.env: say so; only the folder can go. Said, never a silent
+# exit: awk on a missing file failed `pid_of` under pipefail, and `lr down` exited 2.
+no_pids() {
+    [ -f "$RUN/pids" ] && return 1
+    local base nodes lo hi p
+    base="$({ sed -n 's/^BASE_PORT=//p' "$RUN/run.env" 2>/dev/null || true; } | tr -d '\r' | tail -n1)"
+    case "$base" in
+        '' | *[!0-9]*)
+            say "run $RUN has no pids file and no BASE_PORT in run.env: lr cannot check its ports"
+            return 0 ;;
+    esac
+    nodes="$({ sed -n 's/^NODES=//p' "$RUN/run.env" 2>/dev/null || true; } | tr -d '\r' | tail -n1)"
+    case "$nodes" in [3-8]) ;; *) nodes=3 ;; esac
+    lo=$((10#$base + 1)) hi=$((10#$base + 40 + nodes))
+    for p in $(seq "$lo" "$hi"); do
+        port_free "$p" || die "port $p of run $RUN is in use and its pids file is missing; stop what holds it, then 'lr $COMMAND'"
+    done
+    say "nothing runs: run $RUN has no pids file and its ports $lo-$hi are free"
+}
+
 down() {
     local n
-    for n in 1 2 3; do stop_node "$n"; done
+    for n in $(all_nodes); do stop_node "$n"; done
     if [ -d "$RUN/ctl" ]; then
         "$REPO/scripts/local-cluster.sh" down --dir "$RUN/ctl" >"$RUN/out/ctl-down.out" 2>&1 \
             || cat "$RUN/out/ctl-down.out" >&2
@@ -513,7 +597,9 @@ down() {
 }
 
 clean() {
-    down
+    # No pids file: `no_pids` refuses while a run port is held; else only the folder goes,
+    # under the same root check.
+    no_pids || down
     case "$RUN" in
         "$ROOT"/*) ;;
         *) die "refusing to remove $RUN: not under $ROOT" ;;
@@ -537,7 +623,7 @@ status() {
     local n os state
     echo "run      $RUN"
     echo "control  $CONTROL"
-    for n in 1 2 3; do
+    for n in $(all_nodes); do
         os="$(pid_of "node-$n")"
         if os_pid_is "$os" rdb_node; then state="running pid $os"; else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
@@ -573,7 +659,39 @@ admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its e
         --control "$CONTROL" --nodes "$(peers)" --cert-dir "$RUN/certs" --app admin
 }
 
-promote() { admin_line "admin promote $ARG${DROP:+ --drop $DROP}"; }
+promote() {
+    admin_line "admin promote $ARG${DROP:+ --drop $DROP}" || exit $?
+    spare_hint
+}
+
+spare_hint() { # after a promote: the owner does not pin a running spare by itself (tester paper
+    # cut, 7913fb8). With fewer than 3 copies pinned, name the rebuild that fills the free slot.
+    # With more than one running node unpinned, lr cannot tell which held a copy (A-R469), so
+    # it lists them and names none.
+    local members k
+    members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
+    k="$(unpinned_running "$members")"
+    case "$k" in
+        "") return 0 ;;
+        *" "*) say "partition 1 has $(copies_of "$members") copies and nodes $k run unpinned; to make one of them the third copy, run: scripts/local-rdb.sh rebuild <node> --run $RUN" ;;
+        *) say "partition 1 has $(copies_of "$members") copies and node $k runs unpinned; to make it the third copy, run: scripts/local-rdb.sh rebuild $k --run $RUN" ;;
+    esac
+}
+
+copies_of() { printf '%s' "$1" | sed -n 's/^members \([^;]*\);.*/\1/p' | { grep -o '[0-9]*=' || true; } | wc -l | tr -d ' '; }
+
+unpinned_running() { # members-line: the running nodes the line leaves unpinned, space-separated,
+    # while fewer than 3 copies are pinned; nothing when the line is missing or the slots are
+    # full. Reads both forms: `; not pinned 3 4 (` and, short of copies over lr (A-R469),
+    # `; partition 1 has 2 of 3 copies; not pinned: 3 4; ...`.
+    local k unpinned out=""
+    [ -n "$1" ] && [ "$(copies_of "$1")" -lt 3 ] || return 0
+    unpinned=" $(printf '%s' "$1" | sed -n -e 's/.*; not pinned: \([0-9 ]*\);.*/\1/p' -e 't' -e 's/.*; not pinned \([0-9 ]*\) (.*/\1/p') "
+    for k in $(all_nodes); do
+        case "$unpinned" in *" $k "*) node_alive "$k" && out="$out${out:+ }$k" ;; esac
+    done
+    printf '%s' "$out"
+}
 
 # Moves stopped node $1's folder to $RUN/db/aside/node-<n>-<UTC stamp> and says where; it is
 # never deleted (A-R441, A-R445). Returns 1, folder left in place, when the move fails.
@@ -587,8 +705,8 @@ move_aside() {
     say "node $n's old folder moved aside to $aside"
 }
 
-# bb #65 over processes: only mode A (node N already left out by the owner) runs here, since
-# dropping N needs the owner's own process. rdb_dev checks the guards against the owner first,
+# bb #65 over processes: only mode A (node N already left out by the owner, or a spare it notes
+# for a free slot, M11) runs here, since dropping N needs the owner's own process. rdb_dev checks the guards against the owner first,
 # before anything is stopped, so a refusal touches nothing (A-R441 F1). With --wipe, N is then
 # stopped and rdb_dev checks the fence, read after the stop: the owner's live pin does not name N
 # in any role and partitions/1 leaves it out (A-R441 F2). Only then is N's folder moved aside,
@@ -622,7 +740,7 @@ rebuild() {
 
 case "$COMMAND" in
     up) up ;;
-    down) pick_run; down ;;
+    down) pick_run; no_pids || down ;;
     clean) pick_run; clean ;;
     status) pick_run; status ;;
     env) pick_run; cat "$RUN/run.env"; echo "RUN=$RUN"; echo "PEERS=$(peers)" ;;
@@ -636,7 +754,7 @@ case "$COMMAND" in
             node_alive "$ARG" && die "node $ARG runs; stop it before --wipe"
             # A pinned copy is never wiped before the owner drops it (bb #65, A-R441 A3).
             admin_line "admin rebuild $ARG" ||
-                die "start $ARG --wipe refused: the owner still pins node $ARG, or did not answer; nothing was moved aside. Use \`lr rebuild $ARG --wipe\`"
+                die "start $ARG --wipe refused: rdb_dev's answer above says why; nothing was moved aside and node $ARG was not started"
             # Then the fence, as `rebuild --wipe` checks it, and the folder goes aside, never
             # deleted (A-R445).
             admin_line "admin rebuild $ARG --wipe --fence" ||
@@ -664,6 +782,9 @@ case "$COMMAND" in
         fi
         promote ;;
     rebuild) pick_run; check_node_arg "$ARG"; rebuild ;;
+    move)
+        pick_run; check_node_arg "$ARG"; check_node_arg "$ARG2"
+        admin_line "admin move $ARG $ARG2" ;;
     "") usage ;;
     *) echo "lr: unknown verb '$COMMAND'; the verbs are:" >&2; usage ;;
 esac
