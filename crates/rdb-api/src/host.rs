@@ -2485,6 +2485,10 @@ struct Host {
     /// be, so P1 withholds the reply (F-014 rows).
     #[cfg(test)]
     deny_reply_checks: bool,
+    /// The next answer to P1's Publication check is turned into a deny, once: the write stays
+    /// applied and unanswered, as a revocation staged after its dispatch leaves it (S4c).
+    #[cfg(test)]
+    deny_next_publication_check: bool,
     /// Each module offer, and the synced write of a clean stop's final marks, first sleep this
     /// long, so a row can see a slow step logged (PR #60 review F8, F9).
     #[cfg(test)]
@@ -2620,6 +2624,8 @@ impl Host {
             fail_step_view: false,
             #[cfg(test)]
             deny_reply_checks: false,
+            #[cfg(test)]
+            deny_next_publication_check: false,
             #[cfg(test)]
             step_pause: Duration::ZERO,
         }
@@ -5045,6 +5051,8 @@ impl Host {
         } = queued;
         #[cfg(test)]
         let event = self.deny_reply_check(event);
+        #[cfg(test)]
+        let event = self.deny_next_publication_check(event);
         self.revocation_persisted = match &event.kind {
             EventKind::Kernel(KernelEvent::Authority(
                 AuthorityEvent::EpochRevocationPersisted { epoch, .. },
@@ -5144,6 +5152,22 @@ impl Host {
         {
             if self.deny_reply_checks && answer.checkpoint == Checkpoint::Reply {
                 answer.verdict = Verdict::Deny(DenyReason::Expired);
+            }
+        }
+        event
+    }
+
+    /// [`Self::deny_next_publication_check`]: A1's next answer to P1's Publication check, turned
+    /// into a deny.
+    #[cfg(test)]
+    fn deny_next_publication_check(&mut self, mut event: Event) -> Event {
+        use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint};
+        if let EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Answer(answer))) =
+            &mut event.kind
+        {
+            if self.deny_next_publication_check && answer.checkpoint == Checkpoint::Publication {
+                answer.verdict = Verdict::Deny(DenyReason::Expired);
+                self.deny_next_publication_check = false;
             }
         }
         event

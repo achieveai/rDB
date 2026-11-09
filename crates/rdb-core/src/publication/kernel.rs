@@ -1579,6 +1579,33 @@ impl PubKernel {
 
     // ---- A1 and R1 mode inputs ----------------------------------------------------------------
 
+    /// A new lineage ends every write this generation still owes an answer: no later check or
+    /// deadline of this generation can reach it, so without this its client waits out its whole
+    /// timeout. `Unknown`, never `GenerationChanged`: the write was applied, so nothing proves it
+    /// did not happen. Never `Published`: no check admitted the candidate. Status tells them
+    /// apart, and `fold_recovered` has already run. A write the deadline answered is skipped,
+    /// and the kernel's start record has no client (M9 S0 rule 5).
+    fn recovery_unknown_replies(&self) -> Vec<PubEffect> {
+        let awaiting = self
+            .awaiting_reply
+            .values()
+            .filter(|awaiting| !awaiting.replied)
+            .map(|awaiting| awaiting.request);
+        let pending = self
+            .pending
+            .as_ref()
+            .filter(|pending| !pending.replied)
+            .map(|pending| pending.cand.request)
+            .filter(|request| *request != RequestIdentity::START_RECORD);
+        awaiting
+            .chain(pending)
+            .map(|request| PubEffect::Reply {
+                request,
+                outcome: ReplyOutcome::Unknown,
+            })
+            .collect()
+    }
+
     fn withhold_awaiting(&mut self, why: Withheld) -> Vec<PubEffect> {
         let withheld = self.awaiting_reply.len();
         self.awaiting_reply.clear();
@@ -1895,7 +1922,8 @@ impl PubKernel {
             retained_through: result.retained_status_map.retained_through,
             map: result.retained_status_map,
         });
-        let mut effects = self.withhold_awaiting(Withheld::Recovery);
+        let mut effects = self.recovery_unknown_replies();
+        effects.extend(self.withhold_awaiting(Withheld::Recovery));
         // The predecessor's view is not a prefix of the new lineage (A-R69a), so it is released
         // and one at the cutoff asked for: design §4.2 rebases `published_snapshot` here, and
         // `PreviousPublished` answers from it once admitted, in a mode that allows it (A-R71 F6,

@@ -5255,3 +5255,63 @@ fn s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_ab
         "the next commit moved node 2 above its seal"
     );
 }
+
+/// S4c: a put P1 can no longer publish, stranded by the rejoin that ends its generation, answers
+/// `UNKNOWN_OUTCOME` when the new lineage arrives, through the `Failed` reply. Before, nothing
+/// answered it and the client waited out its whole 5 s. The Publication check is denied to put
+/// the write in that state on demand, as a revocation staged after its dispatch does. Timed on
+/// the trio's own clock, the one the post-apply deadline runs on, so the answer cannot be that
+/// deadline's. Status then says the write is applied.
+/// Cut: remove the emit in `PubKernel::recovery_unknown_replies`, red (answered after 5,500 ms,
+/// the host's waiter expiry: the recovery has also dropped the candidate's deadline).
+/// Integration (~2 s): bootstrap, the pause age, one rejoin.
+#[config_log::retcd_test]
+fn s4c_a_put_stranded_by_a_rejoin_answers_unknown_outcome_at_the_new_lineage() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[0].0.deny_next_publication_check = true;
+    let sent = trio.clock.now();
+    let stranded = trio.call(put(1));
+    trio.until("node 1 denied the put's Publication check", |trio| {
+        (!trio.nodes[0].0.deny_next_publication_check).then_some(())
+    });
+    assert!(stranded.try_recv().is_err(), "the deny answers nobody");
+
+    restart_as(&mut trio, dir.path(), 3, false);
+    let answer = trio.until("the stranded put answers", |_| stranded.try_recv().ok());
+    let waited = trio.clock.now().0 - sent.0;
+    tracing::info!(waited, "s4c_stranded_put_answered");
+    match answer {
+        Answer::Error { error, .. } => assert_eq!(
+            (error.name(), error.retry, error.no_mutation),
+            ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus, false),
+            "{error:?}"
+        ),
+        other => panic!("the stranded put: {other:?}"),
+    }
+    assert!(
+        waited < rdb_core::publication::POST_APPLY_DEADLINE_MILLIS,
+        "answered after {waited} ms: not by the recovery"
+    );
+    let (after, _, _) = commit_of(&trio).expect("node 1 committed the rejoin");
+    assert!(after > before, "{after:?}");
+
+    trio.ready();
+    let patience = Instant::now() + test_patience(Trio::PATIENCE);
+    let status = loop {
+        match trio.ask(ClientCall::Status {
+            identity: identity(1),
+            generation: None,
+        }) {
+            Answer::Status(TxnStatus::Resolved(result)) => break result,
+            Answer::Status(TxnStatus::Unknown | TxnStatus::Unresolved { .. }) => {}
+            other => panic!("status of the stranded put: {other:?}"),
+        }
+        assert!(Instant::now() < patience, "the stranded put never resolved");
+    };
+    assert_eq!(
+        status.outcome,
+        rdb_core::contracts::txn::Outcome::RecoveredApplied,
+        "{status:?}"
+    );
+}
