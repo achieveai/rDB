@@ -79,6 +79,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireCall::Rebuild` and `WireAnswer::Rebuilt` (M11 T12 over processes) were added under `4`
 /// too: no released build speaks it. So was `RecoveryPlan::must_hold` (PR #74, A-R477), which a
 /// routed `Plan` carries: a build speaking `3` is refused before it could misread one.
+/// `5` came with issue #79: `WireCall::Get` names the `group` it reads.
 pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.

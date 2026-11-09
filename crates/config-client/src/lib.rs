@@ -365,9 +365,11 @@ impl GrpcClient {
     /// submission is either the first one's original outcome or its first application. One
     /// retry, not a loop: a second unknown outcome is a state the caller has to reason about.
     /// The one repetition is while the resubmit finds no leader at all (`Unavailable` or
-    /// `NotLeader`, so nothing was applied): it asks again, paced, for up to one request
-    /// budget, because the usual cause of the first unknown outcome is the leader's death and
-    /// its successor is not elected yet.
+    /// `NotLeader`, so that ask applied nothing): it asks again, paced, within one request budget
+    /// for all of those asks together, because the usual cause of the first unknown outcome is
+    /// the leader's death and its successor is not elected yet. When the budget ends that way
+    /// the caller gets [`ConfigError::DeadlineExceededUnknownOutcome`]: the asks settled nothing
+    /// about the first attempt.
     ///
     /// **Size the server's window against this client's concurrency.** [`Self::clone`] shares
     /// one id sequence, so several in-flight mutations mint consecutive ids and arrive in
@@ -392,25 +394,35 @@ impl GrpcClient {
     ///
     /// The unknown outcome is usually a node that just died, and the resubmit runs
     /// immediately: the survivors have not elected a leader yet and answer `Unavailable`
-    /// ("leader unknown") or `NotLeader` with no usable hint. Both mean nothing was applied
+    /// ("leader unknown") or `NotLeader` with no usable hint. Both mean that ask applied nothing
     /// ([`ConfigError::is_safe_to_resubmit`]), and the resubmit carries the original dedup
     /// key, so asking again cannot apply twice. It therefore asks again, pausing 100 ms
     /// doubling to 500 ms, until a typed answer arrives or one request budget has passed
-    /// since the resubmit began. Any other answer, including a second unknown outcome, ends
-    /// it as before, and the last error is returned when the budget runs out.
+    /// since the resubmit began. That budget is one deadline for every ask: it is checked
+    /// before each one, and each ask gets only what is left of it, for its connect and its RPC
+    /// timeout alike. Any other answer, including a second unknown outcome, ends it as before.
+    /// When the budget runs out after safe failures the result is
+    /// [`ConfigError::DeadlineExceededUnknownOutcome`], never the last `Unavailable` or
+    /// `NotLeader`: those speak only for the asks, the first attempt may still have applied,
+    /// and a caller told "safe to resubmit" would send it again under a new dedup key. An ask
+    /// still unanswered at the deadline was submitted, so it stays an unknown outcome too.
     async fn resubmit<Res, Attempt, Fut>(&self, attempt: Attempt) -> Result<Res, ConfigError>
     where
-        Attempt: Fn() -> Fut,
+        Attempt: Fn(Duration) -> Fut,
         Fut: Future<Output = Result<Res, ConfigError>>,
     {
-        let started = Instant::now();
+        let deadline = Instant::now() + self.opts.request_deadline;
         let mut wait = RESUBMIT_WAIT_MIN;
         loop {
-            match attempt().await {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() {
+                return Err(ConfigError::DeadlineExceededUnknownOutcome);
+            }
+            match attempt(budget).await {
                 Err(error) if error.is_safe_to_resubmit() => {
-                    let left = self.opts.request_deadline.saturating_sub(started.elapsed());
-                    if left <= wait {
-                        return Err(error);
+                    if deadline.saturating_duration_since(Instant::now()) <= wait {
+                        tracing::debug!(%error, "dedup resubmit found no leader within its budget");
+                        return Err(ConfigError::DeadlineExceededUnknownOutcome);
                     }
                     tracing::debug!(
                         wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
@@ -597,6 +609,7 @@ impl GrpcClient {
                 "watch_leader",
                 false,
                 WireDeadline::Omit,
+                self.opts.request_deadline,
                 wire_watch_request(&request, history),
                 |mut c, r| async move {
                     let response = c.watch(r).await?;
@@ -841,21 +854,50 @@ impl GrpcClient {
         Call: Fn(ConfigServiceClient<Channel>, tonic::Request<Req>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
     {
+        self.execute_within(op, is_mutation, request, self.opts.request_deadline, call)
+            .await
+    }
+
+    /// [`Self::execute`] with `budget` as the whole operation's budget. A dedup resubmit passes
+    /// what is left of its one deadline.
+    async fn execute_within<Req, Res, Call, Fut>(
+        &self,
+        op: &'static str,
+        is_mutation: bool,
+        request: Req,
+        budget: Duration,
+        call: Call,
+    ) -> Result<Res, ConfigError>
+    where
+        Req: Clone,
+        Call: Fn(ConfigServiceClient<Channel>, tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
+    {
         let ctx = TraceContext::current_or_root().child();
         let span = ctx.span(op);
         // `.instrument`, never `span.enter()`: this future yields at every await, and a guard
         // held across a yield attributes whatever the runtime schedules next to this
         // operation's span (ADR-0013).
-        self.attempts(op, is_mutation, WireDeadline::Send, request, call, &ctx)
-            .instrument(span)
-            .await
+        self.attempts(
+            op,
+            is_mutation,
+            WireDeadline::Send,
+            budget,
+            request,
+            call,
+            &ctx,
+        )
+        .instrument(span)
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Each is one independent fact about the attempt.
     async fn attempts<Req, Res, Call, Fut>(
         &self,
         op: &'static str,
         is_mutation: bool,
         wire_deadline: WireDeadline,
+        budget: Duration,
         request: Req,
         call: Call,
         ctx: &TraceContext,
@@ -865,18 +907,20 @@ impl GrpcClient {
         Call: Fn(ConfigServiceClient<Channel>, tonic::Request<Req>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
     {
-        self.attempts_at(op, is_mutation, wire_deadline, request, call, ctx)
+        self.attempts_at(op, is_mutation, wire_deadline, budget, request, call, ctx)
             .await
             .map(|(response, _)| response)
     }
 
     /// [`Self::attempts`], with the endpoint that answered: a watch stream names it when its
     /// connection fails later (A-R238).
+    #[allow(clippy::too_many_arguments)] // Each is one independent fact about the attempt.
     async fn attempts_at<Req, Res, Call, Fut>(
         &self,
         op: &'static str,
         is_mutation: bool,
         wire_deadline: WireDeadline,
+        budget: Duration,
         request: Req,
         call: Call,
         ctx: &TraceContext,
@@ -887,7 +931,6 @@ impl GrpcClient {
         Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
     {
         let started = Instant::now();
-        let budget = self.opts.request_deadline;
         let left = || budget.saturating_sub(started.elapsed());
         // Every endpoint a connect failed at in this operation, with its reason, so the error
         // names them all and not just the last (M10 D14). Only used when the operation ends on
@@ -1458,8 +1501,8 @@ impl ConfigStore for GrpcClient {
             .await
         {
             Err(ConfigError::DeadlineExceededUnknownOutcome) if self.dedup_retry_allowed() => {
-                self.resubmit(|| {
-                    self.execute("put", true, wire.clone(), |mut c, r| async move {
+                self.resubmit(|budget| {
+                    self.execute_within("put", true, wire.clone(), budget, |mut c, r| async move {
                         c.put(r).await
                     })
                 })
@@ -1482,10 +1525,14 @@ impl ConfigStore for GrpcClient {
             .await
         {
             Err(ConfigError::DeadlineExceededUnknownOutcome) if self.dedup_retry_allowed() => {
-                self.resubmit(|| {
-                    self.execute("delete", true, wire.clone(), |mut c, r| async move {
-                        c.delete(r).await
-                    })
+                self.resubmit(|budget| {
+                    self.execute_within(
+                        "delete",
+                        true,
+                        wire.clone(),
+                        budget,
+                        |mut c, r| async move { c.delete(r).await },
+                    )
                 })
                 .await?
             }

@@ -268,7 +268,9 @@ To size a cap, use the upper bound for every put: `value_len + id_len + zero_byt
 
 - 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
   ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
-- The largest single value is 1,048,240 bytes less the id's length, for a create.
+- The largest single value, for a create, is 1,048,240 bytes less the id's length and less
+  one more for each zero byte in the id. For a one-byte id that is a zero byte, it is 1,048,238
+  bytes.
 
 A transaction one byte over is refused with `INVALID_ARGUMENT`, and nothing is written:
 

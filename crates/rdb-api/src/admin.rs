@@ -3127,10 +3127,19 @@ async fn refuse_frozen_target(ctx: &PromoteCtx) -> Result<(), PromoteError> {
         })
         .await
         .map_err(|error| PromoteError::Control(format!("get {key}: {error}; promote again")))?;
-    let frozen = read
-        .record
-        .and_then(|found| GrantRecord::decode(&found.value))
-        .is_some_and(|grant| grant.frozen);
+    let frozen = match &read.record {
+        Some(found) => {
+            GrantRecord::decode(&found.value)
+                .ok_or_else(|| {
+                    PromoteError::Record(format!(
+                        "{key} at revision {} is not a grant record",
+                        found.mod_revision
+                    ))
+                })?
+                .frozen
+        }
+        None => false,
+    };
     if frozen {
         tracing::warn!(
             to = ctx.to.0,
@@ -3926,6 +3935,134 @@ mod tests {
         assert_eq!(sent.len(), 4, "a Plan and a proof each");
     }
 
+    /// PR #102 review: a truncated `partitions/` list is never read as complete, even when every
+    /// requested partition came back. Only the heal's first list read, the one `pinned_members`
+    /// makes before the grant is looked at, comes back truncated; every later list is whole. The
+    /// heal stops there: a `Control` error, nothing sent, and the grant and partition records
+    /// unchanged. Cut: the `truncated` check in `heal_records`, and the later reads go on, the
+    /// grant is deleted and the heal plans both partitions. Unit: `MemStore` underneath.
+    #[test]
+    fn a_truncated_partition_list_fails_the_heal_before_the_grant_is_read() {
+        let rt = runtime();
+        let short = Arc::new(FirstListShort {
+            inner: config_testkit::MemStore::new(),
+            lists: std::sync::atomic::AtomicU32::new(0),
+        });
+        let store: Arc<dyn ConfigStore> = short.clone();
+        rooted(&*store, &rt, BootId(5));
+        rooted_copy(&*store, &rt, PartitionId(2), OWNER);
+        let granted = old_grant(&*store, &rt, GrantId(4));
+        let read_all = || {
+            [
+                ControlKey::Grant(OWNER),
+                ControlKey::Partition(PARTITION),
+                ControlKey::Partition(PartitionId(2)),
+            ]
+            .map(|key| {
+                let record = rt
+                    .block_on(store.get(GetRequest {
+                        key: Bytes::from(key.encode()),
+                    }))
+                    .expect("get")
+                    .record
+                    .expect("the record is there");
+                (record.mod_revision, record.value)
+            })
+        };
+        let before = read_all();
+        let (answer, sent) = heal_over(
+            Arc::clone(&store),
+            &rt,
+            Duration::from_millis(500),
+            vec![PARTITION, PartitionId(2)],
+        );
+        let detail = match answer {
+            Err(HealError::Control(detail)) => detail,
+            other => panic!("a truncated list is a control error: {other:?}"),
+        };
+        assert!(detail.contains("truncated"), "{detail}");
+        assert_eq!(
+            short.lists.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the heal stopped at its first list"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+        assert_eq!(
+            read_all(),
+            before,
+            "the grant and the records are unchanged"
+        );
+        assert_eq!(before[0].0, granted);
+    }
+
+    /// A control store whose first `list` answers every record but says it is truncated; every
+    /// later list is whole. Everything else is the `MemStore` underneath.
+    struct FirstListShort {
+        inner: config_testkit::MemStore,
+        lists: std::sync::atomic::AtomicU32,
+    }
+
+    impl ConfigStore for FirstListShort {
+        fn get<'a, 'b>(&'a self, request: GetRequest) -> Reply<'b, config_core::GetResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.get(request)
+        }
+
+        fn list<'a, 'b>(&'a self, request: ListRequest) -> Reply<'b, config_core::ListResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            let first = self
+                .lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0;
+            let listed = self.inner.list(request);
+            Box::pin(async move {
+                let mut listed = listed.await?;
+                listed.truncated |= first;
+                Ok(listed)
+            })
+        }
+
+        fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.put(request)
+        }
+
+        fn delete<'a, 'b>(
+            &'a self,
+            request: DeleteRequest,
+        ) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.delete(request)
+        }
+
+        fn capabilities(&self) -> config_core::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn watch<'a, 'b>(
+            &'a self,
+            request: config_core::WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.watch(request)
+        }
+    }
+
     /// Issue #79: one heal covers every partition its owner holds. Each gets a plan and a proof;
     /// a later record that is wrong or missing refuses the whole heal before any is sent. Cut:
     /// `heal` sends each partition's plan as it validates it. Unit: `MemStore`.
@@ -4575,6 +4712,42 @@ mod tests {
             "{refused:?}"
         );
         unfrozen_and_serving(&store.inner, &rt);
+    }
+
+    /// A target's `grants/` record that does not decode says nothing about whether it is frozen,
+    /// so it is refused as the other grant reads refuse it, not read as "not frozen". Nothing is
+    /// written and nothing sent. Cut: an undecodable record reads as not frozen, and the promote
+    /// goes on. Unit (~20 ms): `MemStore`.
+    #[test]
+    fn a_promote_onto_a_node_with_an_undecodable_grant_is_refused() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        old_grant(&*store, &rt, GrantId(4));
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(NodeId(2)).encode()),
+            value: Bytes::from_static(b"not a grant"),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/2");
+        let (answer, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            all_known(),
+            Duration::from_secs(1),
+        );
+        let refused = answer.expect_err("the target's grant is unreadable");
+        assert!(matches!(refused, PromoteError::Record(_)), "{refused:?}");
+        assert!(
+            refused.to_string().contains("is not a grant record"),
+            "{refused}"
+        );
+        assert!(sent.is_empty(), "nothing sent: {}", sent.len());
+        unfrozen_and_serving(&*store, &rt);
     }
 
     /// A promote onto a node whose grant is frozen would commit a partition no one can serve:

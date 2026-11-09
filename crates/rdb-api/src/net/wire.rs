@@ -379,7 +379,6 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Rebuild { .. }
         | Msg::Synced(_)
         | Msg::Stop) => return Err(Box::new((WireError::LocalOnly(local_name(&local)), local))),
-        #[cfg(debug_assertions)]
         #[cfg(test)]
         local @ Msg::Stall(_) => return Err(Box::new((WireError::LocalOnly("Stall"), local))),
         #[cfg(debug_assertions)]

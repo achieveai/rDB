@@ -1937,7 +1937,8 @@ fn repl<'scope, 'env>(
             continue;
         }
         if let Some(why) = needs_group(&words, db.partition_count()) {
-            tracing::warn!(line, "repl_needs_group");
+            // Only the fixed message: the line can carry a value (ADR-0013, as `log_command`).
+            tracing::warn!("repl_needs_group");
             say(&format!("err {line}: {why}"));
             bad = true;
             continue;
@@ -2023,17 +2024,19 @@ fn repl<'scope, 'env>(
                 let answer = db.txn(&txn_puts(&ops), deadline);
                 bad |= !put_line(db, answer, Some((&mut sent, Kind::Txn)));
             }),
-            ["txn&", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
-                say("bg txn: queued");
-                scope.spawn(move || {
-                    let answer = db.txn(&txn_puts(&ops), deadline);
-                    if answer.is_err() {
-                        bg_failed.store(true, Ordering::Relaxed);
-                    }
-                    say(&format!("bg txn: {}", put_text(&answer)));
-                    bg_note(db, "bg txn", &answer);
-                });
-            }),
+            ["txn&", rest @ ..] => groupless_op(rest, db.partition_count())
+                .and_then(|()| parse_txn(rest, deadline))
+                .map(|(deadline, ops)| {
+                    say("bg txn: queued");
+                    scope.spawn(move || {
+                        let answer = db.txn(&txn_puts(&ops), deadline);
+                        if answer.is_err() {
+                            bg_failed.store(true, Ordering::Relaxed);
+                        }
+                        say(&format!("bg txn: {}", put_text(&answer)));
+                        bg_note(db, "bg txn", &answer);
+                    });
+                }),
             ["retry", rest @ .., "--payload", value] => {
                 sent.pick(rest).and_then(|(request, kind)| {
                     let id = request.identity.request;
@@ -9025,6 +9028,127 @@ mod tests {
             Some("not ready: writes not admitted"),
             "a later change is still said"
         );
+    }
+
+    /// The child of [`a_background_txn_with_no_group_is_refused_above_one_partition`]: one
+    /// rdb_dev run of the parent's script, whose answers the parent reads from stdout. Passes at
+    /// once unless the parent started it.
+    #[test]
+    fn zz_script_child() {
+        let (Ok(dir), Ok(script), Ok(partitions)) = (
+            std::env::var(SCRIPT_CHILD_DIR),
+            std::env::var(SCRIPT_CHILD_SCRIPT),
+            std::env::var(SCRIPT_CHILD_PARTITIONS),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let args = Args {
+            log_dir: dir.with_extension("child-logs"),
+            script: Some(PathBuf::from(script)),
+            partitions: Some(partitions.parse().expect("a partition count")),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let args = Args { dir, ..args };
+        let code = run(&args, Db::open);
+        // Passed on stdout: a libtest child cannot exit with `run`'s code.
+        let code = if code == ExitCode::SUCCESS { 0 } else { 1 };
+        say(&format!("SCRIPT_CHILD_EXIT={code}"));
+    }
+
+    const SCRIPT_CHILD_DIR: &str = "RDB_DEV_SCRIPT_CHILD_DIR";
+    const SCRIPT_CHILD_SCRIPT: &str = "RDB_DEV_SCRIPT_CHILD_SCRIPT";
+    const SCRIPT_CHILD_PARTITIONS: &str = "RDB_DEV_SCRIPT_CHILD_PARTITIONS";
+
+    /// One rdb_dev run of `script` at `partitions` partitions in a child process, and what it
+    /// said on stdout. The answers of a run are stdout's alone, so a child is how a row reads them.
+    fn script_output(root: &std::path::Path, name: &str, partitions: u32, script: &str) -> String {
+        let path = root.join(format!("{name}.txt"));
+        std::fs::write(&path, script).expect("write the script");
+        let child = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args(["tests::zz_script_child", "--exact", "--test-threads=1"])
+            .env(SCRIPT_CHILD_DIR, root.join(name))
+            .env(SCRIPT_CHILD_SCRIPT, &path)
+            .env(SCRIPT_CHILD_PARTITIONS, partitions.to_string())
+            .output()
+            .expect("spawn the run");
+        String::from_utf8_lossy(&child.stdout).into_owned()
+    }
+
+    /// PR #102 review: a groupless `txn&` was queued at two partitions, where it is sent to
+    /// partition 2 and its answer arrives later. It is now refused before it is queued, as the
+    /// foreground `txn` is: with and without `--deadline-ms`, and the object is absent. A named
+    /// group still writes, and one partition still takes the groupless form. Cut: the groupless
+    /// check off the `txn&` arm, and `zqa` is queued. Integration (~3 s): two child runs with
+    /// three real rEtcd voters each.
+    #[test]
+    fn a_background_txn_with_no_group_is_refused_above_one_partition() {
+        let root = config_testkit::fs::temp_dir();
+        let said = script_output(
+            root.path(),
+            "two",
+            2,
+            "wait ready 60\ntxn& zqa=v\ntxn& --deadline-ms 1000 zqb=v\ntxn& 1:zqc=v\nsleep 1500\n\
+             get --group 1 zqa\nget --group 1 zqb\nquit\n",
+        );
+        assert_eq!(said.matches("names no group").count(), 2, "{said}");
+        assert_eq!(said.matches("bg txn: queued").count(), 1, "{said}");
+        assert_eq!(said.matches("bg txn: ok p=2").count(), 1, "{said}");
+        let absent = said.lines().filter(|l| l.starts_with("absent ")).count();
+        assert_eq!(absent, 2, "{said}");
+        assert!(
+            said.contains("SCRIPT_CHILD_EXIT=1"),
+            "refused lines exit 1: {said}"
+        );
+
+        let said = script_output(root.path(), "one", 1, "wait ready 60\ntxn& zqd=v\nquit\n");
+        assert_eq!(said.matches("bg txn: ok p=1").count(), 1, "{said}");
+        assert!(said.contains("SCRIPT_CHILD_EXIT=0"), "{said}");
+    }
+
+    /// PR #102 review: the `repl_needs_group` warning logged the whole rejected line, and a line
+    /// can carry a value. A `put`, a `put&` and a `put --as` with a marker value are each refused
+    /// at two partitions, and no record of the test's log holds the marker. The warning itself
+    /// is there, so the log was read. Cut: put `line` back on the warning. Integration (~2 s):
+    /// three real rEtcd voters.
+    #[config_log::retcd_test]
+    fn a_line_refused_for_its_group_logs_no_value() {
+        const METHOD: &str = "a_line_refused_for_its_group_logs_no_value";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let script = root.path().join("script.txt");
+        std::fs::write(
+            &script,
+            "wait ready 60\nput zqobj1 mkv7secret\nput& zqobj2 mkv7secret\n\
+             put --as 7 zqobj3 mkv7secret\nquit\n",
+        )
+        .expect("write the script");
+        let args = Args {
+            dir: root.path().join("run"),
+            log_dir: root.path().join("logs"),
+            script: Some(script),
+            partitions: Some(2),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        assert_eq!(
+            run(&args, Db::open),
+            ExitCode::from(1),
+            "refused lines exit 1"
+        );
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let warned = lines
+            .iter()
+            .filter(|line| line["@m"] == "repl_needs_group")
+            .count();
+        assert_eq!(warned, 3, "one warning per refused line");
+        let leaked: Vec<String> = lines
+            .iter()
+            .map(ToString::to_string)
+            .filter(|text| text.contains("mkv7secret"))
+            .collect();
+        assert!(leaked.is_empty(), "the value was logged: {leaked:#?}");
     }
 
     /// The child of [`abort_after_commit_aborts_and_the_next_open_rolls_forward`]: one rdb_dev
