@@ -122,7 +122,7 @@ pub enum WireReply {
     /// A client call's answer.
     Answer(WireAnswer),
     /// An `Inspect`'s answer.
-    Status(WireNodeStatus),
+    Status(Box<WireNodeStatus>),
     /// The node dropped the call's waiter unanswered. The caller sees its channel close, as it
     /// would in one process.
     Dropped,
@@ -1802,6 +1802,18 @@ pub struct WireNodeStatus {
     pub clock_bound_lost: bool,
     /// Added under version 4 (#80 S5n), with S2c's two fields: no released build speaks 4.
     pub committed_without: rdb_core::contracts::recovery::NoteState,
+    /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
+    pub tail_refused: Option<WireTailRefused>,
+}
+
+/// [`crate::host::TailRefused`] on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireTailRefused {
+    pub generation: Generation,
+    pub head: Seq,
+    pub base: Seq,
+    pub reason: String,
 }
 
 /// The role words a host reports (`host::Node::status`).
@@ -1838,6 +1850,12 @@ impl From<&NodeStatus> for WireNodeStatus {
             qualifying_copy: status.qualifying_copy,
             clock_bound_lost: status.clock_bound_lost,
             committed_without: status.committed_without.clone(),
+            tail_refused: status.tail_refused.map(|tail| WireTailRefused {
+                generation: tail.generation,
+                head: tail.head,
+                base: tail.base,
+                reason: tail.reason.to_owned(),
+            }),
         }
     }
 }
@@ -1879,6 +1897,23 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
             qualifying_copy: status.qualifying_copy,
             clock_bound_lost: status.clock_bound_lost,
             committed_without: status.committed_without,
+            tail_refused: status
+                .tail_refused
+                .map(|tail| {
+                    let reason = crate::host::TAIL_REFUSED_REASONS
+                        .iter()
+                        .find(|reason| **reason == tail.reason)
+                        .ok_or_else(|| {
+                            WireError::Value(format!("unknown tail reason {:?}", tail.reason))
+                        })?;
+                    Ok(crate::host::TailRefused {
+                        generation: tail.generation,
+                        head: tail.head,
+                        base: tail.base,
+                        reason,
+                    })
+                })
+                .transpose()?,
             lengths: None,
         })
     }

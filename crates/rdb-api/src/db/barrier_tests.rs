@@ -486,3 +486,120 @@ fn s5d_42_barrier_latency_at_256_partitions_per_node() {
         over(1000.0),
     );
 }
+
+/// Row "loop ends" on the original schedule (#79 S4d, S5d-B1, row 47's first form): K2 is on node
+/// 3 only, the owner and node 3 are cut from node 2, and a promote commits `ReadOnly` at a
+/// cutoff below K2. Node 3 is linked again and its landing refuses `held_past_base`. Before S4d
+/// this loop committed `ReadOnly` every 5 to 60 s for good. Now node 2 holds the repair and names
+/// the copy and reason once, and for 30 s nothing recommits.
+/// Cut: remove the hold in `repair_duty`, red (more repairs, generation moves within 30 s).
+/// Integration (~50 s): the grant wait, the promote, and the 30 s window.
+#[config_log::retcd_test]
+fn s4d_a_lone_survivor_with_a_tail_holds_its_repair_and_stops_recommitting() {
+    const METHOD: &str = "s4d_a_lone_survivor_with_a_tail_holds_its_repair_and_stops_recommitting";
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let mut formed = opened(&rt, dir.path(), &store);
+    formed.shutdown();
+    drop(formed);
+
+    let links = Links::new();
+    let nodes: Vec<Db> = [1, 2, 3]
+        .map(|node| open_process(&rt, dir.path(), &store, node, &links))
+        .into();
+    for db in &nodes {
+        db.wait_ready(patience).expect("each node is ready");
+    }
+    let app_dir = config_testkit::fs::temp_dir();
+    let app = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::clone(&links)),
+                client: ClientId(2),
+                ..config(app_dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the app opens");
+    app.wait_ready(patience).expect("the app sees the owner");
+
+    let k1 = app.put(b"k1", b"one", None).expect("k1 in G");
+    app.wait_durable(GROUP_OF, position(&k1), LONG)
+        .expect("k1 is on every disk");
+    links.hold(NodeId(1), NodeId(2));
+    links.hold(NodeId(2), NodeId(3));
+    let k2 = app
+        .put(b"k2", b"two", None)
+        .expect("k2 in G, on node 3 only");
+    links.hold(NodeId(1), NodeId(3));
+    app.promote(NodeId(2), None).expect("the promote commits");
+    links.heal(NodeId(2), NodeId(3));
+
+    let status_of = |db: &Db| db.node_status().into_iter().next().expect("its own status");
+    let deadline = Instant::now() + patience;
+    let tail = loop {
+        if let Some(tail) = status_of(&nodes[2]).tail_refused {
+            break tail;
+        }
+        assert!(Instant::now() < deadline, "node 3 reported no refusal");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(tail.head.0 >= k2.seq.0, "{tail:?} {k2:?}");
+    assert!(tail.base.0 < tail.head.0, "{tail:?}");
+    let held = |reason: &str| {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| {
+                line["@m"] == "membership_repair_held" && line["reason"].as_str() == Some(reason)
+            })
+            .collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + patience;
+    let lines = loop {
+        let lines = held(tail.reason);
+        if !lines.is_empty() {
+            break lines;
+        }
+        assert!(Instant::now() < deadline, "no membership_repair_held");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(lines[0]["copy_node"], 3, "{lines:?}");
+    assert_eq!(lines[0]["node"], 2, "{lines:?}");
+    assert_eq!(lines[0]["head"], tail.head.0, "{lines:?}");
+
+    let settled = status_of(&nodes[1]).recovered;
+    let repairs = || {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "membership_repair_planned" && line["node"] == 2)
+            .count()
+    };
+    let repairs_after_hold = repairs();
+    let window = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < window {
+        assert_eq!(
+            status_of(&nodes[1]).recovered,
+            settled,
+            "the repair recommitted"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(repairs() <= 1, "more than one repair: {}", repairs());
+    assert_eq!(repairs(), repairs_after_hold, "a repair ran after the hold");
+    assert_eq!(held(tail.reason).len(), 1, "logged once");
+
+    let refused = app.put(b"k3", b"three", None).expect_err("still read-only");
+    assert_eq!(
+        refused.error.kind,
+        ErrorKind::RecoveryReadOnly,
+        "{refused:?}"
+    );
+    let text = refused.error.explain();
+    assert!(text.contains("on node 3"), "{text}");
+    assert!(text.contains("held_past_base"), "{text}");
+}

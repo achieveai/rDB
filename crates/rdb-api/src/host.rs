@@ -251,6 +251,15 @@ pub const MOVE_CATCH_UP_MILLIS: u64 = 90_000;
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
 const DROP_CHECK_EVERY_MILLIS: u64 = 200;
 
+/// `inventory_failed` reasons a normal join can give: a copy that missed the anchor's generation
+/// or holds a different head than it asks for (#101). They log at Info; any other reason means
+/// something is wrong and stays Error.
+const INVENTORY_FAILED_EXPECTED: [&str; 3] = [
+    "anchor_generation_absent",
+    "missed_generation_held_below_base",
+    "missed_generation_held_past_base",
+];
+
 /// How long a repair that ended `ReadOnly` again waits before it runs again with nothing about
 /// its members moved (A-R353, amending A-R346): it doubles at each such retry, up to
 /// [`REPAIR_RETRY_CAP_MILLIS`], so a transient F1 miss never leaves the partition read-only for
@@ -1107,6 +1116,29 @@ impl Answer {
     }
 }
 
+/// The reasons a copy reports [`TailRefused`]: its own history, not a passing condition, stops a
+/// repair from taking it back (#79 S4d).
+pub const TAIL_REFUSED_REASONS: [&str; 3] = [
+    "held_past_base",
+    "missed_generation_held_past_base",
+    "interrupted_copy",
+];
+
+/// A copy's own history stops a repair from taking it back, so re-planning cannot help: it holds
+/// a tail above a generation's base, or a copy interrupted part way through staging (#79 S4d). A
+/// repair holds when every member that answered reports this. Crosses the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailRefused {
+    /// The generation the copy could not join.
+    pub generation: Generation,
+    /// The newest sequence this copy holds (of the staged copy's parent, when it was interrupted).
+    pub head: Seq,
+    /// The generation's base: the copy holds seqs past it that no surviving history agrees on.
+    pub base: Seq,
+    /// One of [`TAIL_REFUSED_REASONS`].
+    pub reason: &'static str,
+}
+
 /// One node's state for one partition, for `nodes` and the ready poller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -1185,6 +1217,11 @@ pub struct NodeStatus {
     /// committed the generation it has adopted. `Unknown` is not "no note"; ask the primary.
     /// Crosses the wire.
     pub committed_without: NoteState,
+    /// Why a repair cannot take this copy back, when its history stops it (#79 S4d). `None` while
+    /// nothing does. Built when the status is, from the refusal recorded at the landing or the
+    /// inventory, or from a staged child on the newest lineage, so a restart cannot hide one.
+    /// Crosses the wire.
+    pub tail_refused: Option<TailRefused>,
 }
 
 /// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
@@ -2064,6 +2101,14 @@ struct RepairMark {
     durable: DurableSeq,
 }
 
+/// One copy a held repair names (#79 S4d): the member and the refusal it answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TailHold {
+    node: NodeId,
+    copy: CopyId,
+    refused: TailRefused,
+}
+
 /// One `Inspect` a repair check sent (A-R350): the node, and where its answer arrives.
 type RepairProbe = (NodeId, Receiver<NodeStatus>);
 
@@ -2395,6 +2440,13 @@ struct Host {
     /// Per partition, the `Inspect` probes the last repair check sent to the members it would
     /// repair for, and when (A-R350): a repair runs only for a member that answered one.
     repair_probes: BTreeMap<PartitionId, (Tick, Vec<RepairProbe>)>,
+    /// Per partition, the refusal recorded when this copy's own landing or inventory could not
+    /// join a generation because of a tail past its base (#79 S4d). In memory only: a restart
+    /// loses it, and the next landing or inventory records it again. Cleared by a successful land.
+    tail_refused: BTreeMap<PartitionId, TailRefused>,
+    /// Per partition, the refusals a repair is held on, as last logged (#79 S4d). Read back to
+    /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
+    tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
     /// The copies F1 named in `RebuildStalled` during the step being run, per partition.
     stall_step: BTreeMap<PartitionId, BTreeSet<CopyId>>,
     /// Per partition, the copies F1's latest `RebuildStalled` step named, with the watched
@@ -2593,6 +2645,8 @@ impl Host {
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
+            tail_refused: BTreeMap::new(),
+            tail_holds: BTreeMap::new(),
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
             boot_seen_while_planned: BTreeMap::new(),
@@ -4698,6 +4752,9 @@ impl Host {
     /// `BoundedJitter` promises safety, not timing.
     fn refusal(&self, partition: PartitionId, error: &RdbError) -> ApiError {
         let refused = ApiError::from_kernel(error);
+        if matches!(error, RdbError::RecoveryReadOnly { .. }) {
+            return self.named_read_only(partition, refused);
+        }
         if !matches!(error, RdbError::Overloaded { .. }) {
             return refused;
         }
@@ -4712,6 +4769,41 @@ impl Host {
             Some(Some(after)) => refused.with_retry_after(after),
             _ => refused,
         }
+    }
+
+    /// A read-only refusal's detail, with the copies a held repair names and the step this owner
+    /// can actually give (#79 S4d), when that is why it stays read-only. Unchanged otherwise.
+    fn named_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let Some(holds) = self.tail_holds.get(&partition) else {
+            return refused;
+        };
+        let named = holds
+            .iter()
+            .map(|hold| {
+                let (copy, node) = (hold.copy.0, hold.node.0);
+                let (head, base) = (hold.refused.head.0, hold.refused.base.0);
+                if hold.refused.reason == "interrupted_copy" {
+                    format!(
+                        "copy {copy} on node {node} holds an interrupted copy ({})",
+                        hold.refused.reason
+                    )
+                } else {
+                    format!(
+                        "copy {copy} on node {node} holds seqs {}..={head} past cutoff {base} ({})",
+                        base + 1,
+                        hold.refused.reason
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let step = if refused.no_mutation {
+            crate::db::error::TAIL_HELD_NEW_WRITE
+        } else {
+            crate::db::error::TAIL_HELD_RESEND
+        };
+        refused.detail = format!("{}: {named}; {step}", refused.detail);
+        refused
     }
 
     /// A-R399 (tester-final D3): a fenced node whose after-fence read of `partitions/{p}` named
@@ -6806,6 +6898,13 @@ impl Host {
     /// `Inspect` and the next check reads the answers: an answer must arrive within one check.
     /// The repair runs for the members that answered, and the rest are probed again. A
     /// half-open link never repairs, so it never fences reads for nothing.
+    ///
+    /// Held (#79 S4d). When every member that answered reports [`TailRefused`], a repair cannot
+    /// take any of them back: `land_link` and `survivor` would refuse it again and F1 would
+    /// commit `ReadOnly` again, so the loop would never end. Nothing is planned, the copies and
+    /// reasons are logged `membership_repair_held` once per change, and the check runs again a
+    /// hold later. A member that answers without a refusal runs the repair at once. Other
+    /// refusals keep the back-off above.
     fn repair_duty(&mut self, partition: PartitionId, now: Tick) {
         let read_only = self
             .committed
@@ -6813,6 +6912,7 @@ impl Host {
             .is_some_and(|committed| committed.mode == PartitionMode::ReadOnly);
         if !read_only {
             self.repaired.remove(&partition);
+            self.tail_holds.remove(&partition);
         }
         let outside = self.read_only_outside(partition);
         // A-R383 as ruled by critic-bb (A-R426 M8): while F1's rebuild is pinned and F1 has
@@ -6884,23 +6984,24 @@ impl Host {
         // half-open link, a stalled process) is probed again, and nothing is fenced for it. In
         // this process the answer comes back over its own channel, not over `Links`, so a member
         // whose direction back to this node is dropped is counted as not answering (A-R353).
-        let answered: Vec<NodeId> = match self.repair_probes.remove(&partition) {
+        let answers: Vec<(NodeId, NodeStatus)> = match self.repair_probes.remove(&partition) {
             Some((sent, probes))
                 if HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS =>
             {
                 let dropped = self.links.dropped();
                 probes
                     .into_iter()
-                    .filter(|(node, answer)| {
-                        linked.contains(node)
-                            && !dropped.contains(&(*node, self.node))
-                            && answer.try_recv().is_ok()
+                    .filter(|(node, _)| {
+                        linked.contains(node) && !dropped.contains(&(*node, self.node))
                     })
-                    .map(|(node, _)| node)
+                    .filter_map(|(node, answer)| {
+                        answer.try_recv().ok().map(|status| (node, status))
+                    })
                     .collect()
             }
             _ => Vec::new(),
         };
+        let answered: Vec<NodeId> = answers.iter().map(|(node, _)| *node).collect();
         if answered.is_empty() {
             let probes: Vec<RepairProbe> = linked
                 .iter()
@@ -6938,6 +7039,30 @@ impl Host {
             );
             return;
         }
+        // #79 S4d: every member that answered holds a tail or an interrupted copy, so a repair
+        // cannot take any of them back; it would only commit `ReadOnly` again. It waits another
+        // hold, and a member that answers without a refusal runs the repair then.
+        if let Some(refused) = answers
+            .iter()
+            .map(|(node, status)| status.tail_refused.map(|refused| (*node, refused)))
+            .collect::<Option<Vec<_>>>()
+        {
+            let holds: Vec<TailHold> = refused
+                .into_iter()
+                .filter_map(|(node, refused)| {
+                    let copy = members.iter().find(|member| member.node == node)?.copy;
+                    Some(TailHold {
+                        node,
+                        copy,
+                        refused,
+                    })
+                })
+                .collect();
+            self.hold_for_tails(partition, generation, holds);
+            self.repair_since.insert(partition, now);
+            return;
+        }
+        self.tail_holds.remove(&partition);
         self.repair_since.remove(&partition);
         self.repaired.insert(
             partition,
@@ -6959,6 +7084,33 @@ impl Host {
             "membership_repair_planned"
         );
         self.revoke(partition, epoch, None, None);
+    }
+
+    /// A repair is held because every member that answered reports a [`TailRefused`] (#79 S4d):
+    /// log `membership_repair_held` for each copy, once per change of what is held.
+    fn hold_for_tails(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        holds: Vec<TailHold>,
+    ) {
+        if self.tail_holds.get(&partition) == Some(&holds) {
+            return;
+        }
+        for hold in &holds {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                copy = hold.copy.0,
+                copy_node = hold.node.0,
+                head = hold.refused.head.0,
+                base = hold.refused.base.0,
+                reason = hold.refused.reason,
+                "membership_repair_held"
+            );
+        }
+        self.tail_holds.insert(partition, holds);
     }
 
     /// [`RepairMark`]s for `nodes` of `partition`, as this node sees them now.
@@ -9052,6 +9204,7 @@ impl Host {
         self.end_barriers_below(partition, landed_generation);
         if first && barrier {
             self.inherit(partition, &result)?;
+            self.tail_refused.remove(&partition);
         }
         // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
         // generation now, before `Recovered` re-anchors its receiver, so it never carries an
@@ -9201,6 +9354,7 @@ impl Host {
         };
         match self.land_at(partition, anchor) {
             Ok((from, head, at)) => {
+                self.tail_refused.remove(&partition);
                 self.land_linked.insert((partition, generation));
                 // Arm 3 (arch-s2, A-R224 item 3): behind the cutoff, linked at its own head.
                 let behind = head < cutoff;
@@ -10937,6 +11091,18 @@ impl Host {
                     );
                     RecoveryEvent::InventoryFailed { copy }
                 }
+                Err(reason) if INVENTORY_FAILED_EXPECTED.contains(&reason) => {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        reason,
+                        "inventory_failed"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
                 Err(reason) => {
                     tracing::error!(
                         node = self.node.0,
@@ -11107,6 +11273,15 @@ impl Host {
             return Err("missed_generation_held_below_base");
         }
         if head > base {
+            self.tail_refused.insert(
+                partition,
+                TailRefused {
+                    generation: to,
+                    head,
+                    base,
+                    reason: "missed_generation_held_past_base",
+                },
+            );
             return Err("missed_generation_held_past_base");
         }
         let digest = if base == Seq::ZERO {
@@ -11124,7 +11299,10 @@ impl Host {
         match self.engine.inherit(partition, from, to, base) {
             // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
             // generation is held, so `survivor` never calls here. Kept as success (A-R179).
-            Ok(Inherited::Linked | Inherited::AlreadyInherited) => Ok(from),
+            Ok(Inherited::Linked | Inherited::AlreadyInherited) => {
+                self.tail_refused.remove(&partition);
+                Ok(from)
+            }
             Ok(Inherited::Copied { .. }) => Err("missed_generation_copied"),
             Err(_) => Err("missed_generation_link_refused"),
         }
@@ -11182,6 +11360,15 @@ impl Host {
         };
         let head = Seq(self.engine.buffered_applied(partition, from).0);
         if head > base {
+            self.tail_refused.insert(
+                partition,
+                TailRefused {
+                    generation: to,
+                    head,
+                    base,
+                    reason: "held_past_base",
+                },
+            );
             return Err("held_past_base");
         }
         let at = if head == Seq::ZERO {
@@ -12210,6 +12397,24 @@ impl Host {
 
     // ------------------------------------------------------------------ inspection
 
+    /// Why a repair cannot take this copy back now (#79 S4d): an interrupted copy on the
+    /// partition's newest lineage, which a restart cannot hide, or the refusal recorded at this
+    /// copy's last landing or inventory. Only the newest lineage counts, so a remnant below a
+    /// serving generation does not hold a repair.
+    fn tail_refused_of(&self, partition: PartitionId) -> Option<TailRefused> {
+        if let Some(newest) = self.engine.newest_generation(partition) {
+            if let Some((parent, base)) = self.engine.staging(partition, newest) {
+                return Some(TailRefused {
+                    generation: newest,
+                    head: Seq(self.engine.buffered_applied(partition, parent).0),
+                    base,
+                    reason: "interrupted_copy",
+                });
+            }
+        }
+        self.tail_refused.get(&partition).copied()
+    }
+
     fn status(&self, partition: PartitionId) -> NodeStatus {
         let adopted = self.adopted(partition);
         let now = self.clock.now();
@@ -12315,6 +12520,7 @@ impl Host {
                 .stalled
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
+            tail_refused: self.tail_refused_of(partition),
             reload_pending: None,
             lengths: Some(IndexLengths {
                 dedup: self

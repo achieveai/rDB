@@ -5788,3 +5788,237 @@ fn s4a_a_node_late_past_the_clock_is_dropped_and_its_arrival_re_adds_it() {
         other => panic!("a put on three copies: {other:?}"),
     }
 }
+
+/// #79 S4d: b19's read-only commit on {1, 2}, node 3 gone and node 2 still held. Node 2 is given a
+/// tail of 500 records past every later cutoff, as an unreplicated owner write would be, so its
+/// landing of that commit refuses when its link heals. Returns the commit's generation.
+fn read_only_with_a_tail(trio: &mut Trio, before: Generation) -> Generation {
+    kill(trio, 3, &[1, 2]);
+    put_until_paused(trio, 1);
+    trio.until("node 3 blamed for half the drop clock", |trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&PartitionId(1))
+            .filter(|blame| HostClock::millis_until(blame.since, now) >= DROP_AFTER_MILLIS / 2)
+            .map(|_| ())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    let read_only = trio.until("node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(
+        read_only,
+        (before.next(), PartitionMode::ReadOnly, vec![1, 2]),
+        "node 2 unheard through the drop's discovery"
+    );
+    let two = &mut trio.nodes[1].0;
+    let held = two
+        .engine
+        .lineages()
+        .into_iter()
+        .filter(|(p, _)| *p == PartitionId(1))
+        .map(|(_, g)| g)
+        .max()
+        .expect("node 2 holds a generation");
+    let head = Seq(two.engine.buffered_applied(PartitionId(1), held).0);
+    let mut digests = vec![Digest::ROOT; usize::try_from(head.0).expect("a small head")];
+    if let Some(last) = digests.last_mut() {
+        *last = two.checked(PartitionId(1), held, head).expect("its head").1;
+    }
+    super::trio::write_chain_after(&mut two.engine, held, digests, 500);
+    read_only.0
+}
+
+/// Row "loop ends" on stepped hosts, and "error text" (#79 S4d, S5d-B1): a copy that lands a
+/// `ReadOnly` commit with a tail past its base is refused for good, so the repair holds instead
+/// of committing `ReadOnly` again: node 2's status says why, node 1 logs one
+/// `membership_repair_held` naming the copy and the reason, no repair is planned over many
+/// retry periods, and a refused put's text names the copy, the seq range and the next step.
+/// Cuts: remove the hold in `repair_duty`, red (a `membership_repair_planned`); keep
+/// `step_for`'s text, red (no copy in the error).
+/// Integration (~4 s): b1's pause and drop, then a window of retries.
+#[config_log::retcd_test]
+fn s4d_a_tail_past_the_cutoff_holds_the_repair_and_names_the_copy() {
+    const METHOD: &str = "s4d_a_tail_past_the_cutoff_holds_the_repair_and_names_the_copy";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[0].0.repair_retry_first_millis = 100;
+    let read_only = read_only_with_a_tail(&mut trio, before);
+    let commit = commit_of(&trio);
+    trio.links.heal(NodeId(1), NodeId(2));
+
+    let tail = trio.until("node 2 reports its refused tail", |trio| {
+        trio.status(1).tail_refused
+    });
+    assert_eq!(
+        (tail.generation, tail.reason),
+        (read_only, "held_past_base"),
+        "{tail:?}"
+    );
+    assert!(tail.head > tail.base, "{tail:?}");
+    let held = trio.until("node 1 holds the repair", |_| {
+        let lines = logged!(METHOD, "membership_repair_held");
+        let tails: Vec<_> = lines
+            .into_iter()
+            .filter(|line| line["reason"] == "held_past_base")
+            .collect();
+        (!tails.is_empty()).then_some(tails)
+    });
+    assert_eq!(held[0]["copy_node"], 2, "{held:?}");
+    assert_eq!(held[0]["head"], tail.head.0, "{held:?}");
+    assert_eq!(held[0]["base"], tail.base.0, "{held:?}");
+    assert_eq!(held[0]["@l"], "Warning", "{held:?}");
+
+    // Well past the 5 s first back-off's worth of retries at this row's 100 ms first wait.
+    let until = trio.clock.now().plus_millis(1_500);
+    trio.until("a window of repair retries", |trio| {
+        (trio.clock.now() >= until).then_some(())
+    });
+    assert_eq!(commit_of(&trio), commit, "the repair committed again");
+    assert_eq!(logged!(METHOD, "membership_repair_planned").len(), 0);
+    let held = logged!(METHOD, "membership_repair_held");
+    let tails = held
+        .iter()
+        .filter(|line| line["reason"] == "held_past_base")
+        .count();
+    assert_eq!(tails, 1, "logged once per change: {held:?}");
+
+    let answer = trio.ask(put(9_000));
+    let Answer::Error { error, .. } = answer else {
+        panic!("a put while read-only: {answer:?}");
+    };
+    assert_eq!(error.name(), "RECOVERY_READ_ONLY", "{error:?}");
+    let text = error.explain();
+    assert!(text.contains("copy "), "{text}");
+    assert!(text.contains("on node 2"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "seqs {}..={} past cutoff {}",
+            tail.base.0 + 1,
+            tail.head.0,
+            tail.base.0
+        )),
+        "{text}"
+    );
+    assert!(text.contains("held_past_base"), "{text}");
+    assert!(text.contains("do not wipe or rebuild the node"), "{text}");
+    assert!(error.next_step().is_none(), "{text}");
+    assert!(!text.contains("lost copies are back"), "{text}");
+}
+
+/// Row "other reason" (#79 S4d): an inventory refused for a reason that can pass is no tail, so
+/// the repair keeps its A-R353 back-off: it runs again after its short wait, no
+/// `membership_repair_held` names a reason, and node 2 reports no `tail_refused`.
+/// Cut: `Host::inventory` records every failure as a tail, red (one repair, then held).
+/// Integration (~3 s): b1's drop, two short repair waits.
+#[config_log::retcd_test]
+fn s4d_a_refusal_that_can_pass_still_retries() {
+    const METHOD: &str = "s4d_a_refusal_that_can_pass_still_retries";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[0].0.repair_retry_first_millis = 100;
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    trio.until("node 3 blamed for half the drop clock", |trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&PartitionId(1))
+            .filter(|blame| HostClock::millis_until(blame.since, now) >= DROP_AFTER_MILLIS / 2)
+            .map(|_| ())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    let read_only = trio.until("node 1 committed without node 3", |trio| {
+        commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+    });
+    assert_eq!(read_only.0, before.next(), "{read_only:?}");
+
+    trio.nodes[1].0.refuse_inventories = true;
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.until("two repairs ran", |_| {
+        (logged!(METHOD, "membership_repair_planned").len() >= 2).then_some(())
+    });
+    assert_eq!(trio.status(1).tail_refused, None);
+    let tails: Vec<_> = logged!(METHOD, "membership_repair_held")
+        .into_iter()
+        .filter(|line| !line["reason"].is_null())
+        .collect();
+    assert!(tails.is_empty(), "a passing refusal held: {tails:?}");
+}
+
+/// Row "returned member" (#79 S4d): one member answering without a refusal runs the repair, even
+/// with another still refused, since that one may be enough to carry writes. Only the input is
+/// planted: node 1's commit is marked `ReadOnly` with all three pinned, as
+/// `s5d_40_read_only_refuses_only_at_the_current_generation` does, and node 2 given a recorded
+/// refusal. A real `ReadOnly` commit with two linked regular members and a tail on one needs an
+/// owner restart the trio cannot do. `repair_duty`, the probes and node 3's `Inspect` are real.
+/// Cut: hold when any member is refused, red (no `membership_repair_planned`).
+/// Integration (~2 s): the trio's start and one repair decision.
+#[config_log::retcd_test]
+fn s4d_a_member_answering_without_a_refusal_runs_the_repair() {
+    const METHOD: &str = "s4d_a_member_answering_without_a_refusal_runs_the_repair";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let committed = trio.nodes[0]
+        .0
+        .committed
+        .get_mut(&PartitionId(1))
+        .expect("node 1's commit");
+    committed.mode = PartitionMode::ReadOnly;
+    trio.nodes[1].0.tail_refused.insert(
+        PartitionId(1),
+        TailRefused {
+            generation: before,
+            head: Seq(3),
+            base: Seq(2),
+            reason: "held_past_base",
+        },
+    );
+    trio.until("the repair ran", |_| {
+        (!logged!(METHOD, "membership_repair_planned").is_empty()).then_some(())
+    });
+    let tails: Vec<_> = logged!(METHOD, "membership_repair_held")
+        .into_iter()
+        .filter(|line| !line["reason"].is_null())
+        .collect();
+    assert!(tails.is_empty(), "held with one answering: {tails:?}");
+}
+
+/// #79 S4d: a full copy that stopped part way leaves a staged child, which no landing or inventory
+/// will ever succeed on. The status says so as `interrupted_copy` (so a restart, which loses the
+/// recorded refusals, cannot hide it), for the newest lineage only: a remnant below a newer
+/// lineage does not hold a repair.
+/// Cut: `Host::tail_refused_of` reads every lineage, or stops checking `staging`, red.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s4d_a_staged_copy_on_the_newest_lineage_is_reported_and_a_remnant_is_not() {
+    use rdb_storage::InjectedFault;
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(dir.path(), &rt);
+    let (g1, g2) = (Generation(1), Generation(2));
+    super::trio::write_chain(&mut host.engine, g1, 3);
+    host.engine.inject_fault(InjectedFault::Switch);
+    assert!(host.engine.inherit(PartitionId(1), g1, g2, Seq(2)).is_err());
+    assert_eq!(host.engine.staging(PartitionId(1), g2), Some((g1, Seq(2))));
+
+    assert_eq!(
+        host.tail_refused_of(PartitionId(1)),
+        Some(TailRefused {
+            generation: g2,
+            head: Seq(3),
+            base: Seq(2),
+            reason: "interrupted_copy",
+        })
+    );
+
+    super::trio::write_chain(&mut host.engine, Generation(5), 1);
+    assert_eq!(
+        host.tail_refused_of(PartitionId(1)),
+        None,
+        "a remnant below"
+    );
+}

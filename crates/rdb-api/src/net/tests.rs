@@ -422,6 +422,12 @@ fn status() -> NodeStatus {
                 dropped_through: Generation(0),
             },
         },
+        tail_refused: Some(crate::host::TailRefused {
+            generation: Generation(9),
+            head: rdb_core::contracts::ids::Seq(3),
+            base: rdb_core::contracts::ids::Seq(2),
+            reason: "held_past_base",
+        }),
     }
 }
 
@@ -606,7 +612,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
     let status = status();
     let bytes = wire::encode(&Frame::Reply {
         correlation: 2,
-        reply: WireReply::Status(wire::WireNodeStatus::from(&status)),
+        reply: WireReply::Status(Box::new(wire::WireNodeStatus::from(&status))),
     });
     let Ok(Frame::Reply {
         reply: WireReply::Status(back),
@@ -615,6 +621,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
     else {
         panic!("not a status reply");
     };
+    let back = *back;
     let mut odd = back.clone();
     assert_eq!(
         format!("{:?}", NodeStatus::try_from(back).expect("lands")),
@@ -1635,7 +1642,7 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 7");
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 8");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a

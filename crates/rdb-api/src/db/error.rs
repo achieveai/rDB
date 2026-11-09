@@ -60,6 +60,21 @@ pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
 /// the step, which "retrying will not help: report this" would contradict (#79 S3 P2).
 pub(crate) const PROMOTE_ALIVE_STEP: &str = "stop that node first, then promote again";
 
+/// The tails of a `RECOVERY_READ_ONLY` refusal whose repair is held on a copy's tail (#79 S4d).
+/// "Writes return when the lost copies are back" is false there: the copy is back, and its tail
+/// is why it cannot rejoin. One per way the refused send can be sent again.
+pub(crate) const TAIL_HELD_NEW_WRITE: &str = "reads still work and nothing was discarded; \
+    writes stay refused, and this release has no command that lifts this: restarting a node may \
+    not; do not wipe or rebuild the node named here, or those seqs may be gone; \
+    `Db::node_status` shows this as `tail_refused`; this send wrote nothing: when writes return, \
+    send the write again as a new write, not with `Db::resend`";
+pub(crate) const TAIL_HELD_RESEND: &str = "reads still work and nothing was discarded; writes \
+    stay refused, and this release has no command that lifts this: restarting a node may not; \
+    do not wipe or rebuild the node named here, or those seqs may be gone; `Db::node_status` \
+    shows this as `tail_refused`; an earlier send may have applied: when writes return, send \
+    the same request again with `Db::resend`, or ask `Db::status`; never send it under a new \
+    request id";
+
 /// The tail of [`crate::admin::PromoteError::TargetFrozen`], for the same reason.
 pub(crate) const PROMOTE_FROZEN_STEP: &str = "promote another node";
 
@@ -313,6 +328,8 @@ impl ApiError {
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
             || self.detail.ends_with(PROMOTE_ALIVE_STEP)
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
+            || self.detail.ends_with(TAIL_HELD_NEW_WRITE)
+            || self.detail.ends_with(TAIL_HELD_RESEND)
         {
             return None;
         }

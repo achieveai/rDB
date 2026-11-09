@@ -99,7 +99,9 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// free number at that merge, and any build handed to a customer counts as released. No branch
 /// reserves a number. The same number with different types passes the handshake, and a frame
 /// that does not decode ends the connection.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// `8` came with #79 S4d: `WireNodeStatus::tail_refused`.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -635,7 +637,7 @@ impl Net {
             &conn,
             Frame::Reply {
                 correlation,
-                reply: WireReply::Status(status),
+                reply: WireReply::Status(Box::new(status)),
             },
         );
         (handled, rx)
@@ -882,7 +884,7 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
                     let _ = tx.send(answer.land());
                 }
                 (Waiter::Status(tx), WireReply::Status(status)) => {
-                    match NodeStatus::try_from(status) {
+                    match NodeStatus::try_from(*status) {
                         Ok(status) => {
                             let _ = tx.send(status);
                         }
@@ -1156,7 +1158,7 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
             shared.rt.spawn_blocking(move || {
                 let _entered = span.enter();
                 let reply_frame = match rx.recv() {
-                    Ok(status) => WireReply::Status(wire::WireNodeStatus::from(&status)),
+                    Ok(status) => WireReply::Status(Box::new(wire::WireNodeStatus::from(&status))),
                     Err(_) => WireReply::Dropped,
                 };
                 conn.out(Frame::Reply {
