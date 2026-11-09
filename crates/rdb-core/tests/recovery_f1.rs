@@ -261,6 +261,7 @@ fn plan(extra: &[Member]) -> RecoveryPlan {
             past_horizon: DenyReason::NoGrant,
         },
         retention_millis: RETENTION,
+        prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
     }
 }
 
@@ -7515,4 +7516,247 @@ fn m10_s2_boot_a_proof_from_a_restarted_copy_blocks_at_once_named() {
         })
         .collect();
     assert_eq!(changed, vec![(2, 1, 2)]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// #80 S5n: "committed without copy X" (design 5.4.1, rows 31, 32 and 35).
+// ---------------------------------------------------------------------------------------------
+
+use rdb_core::authority::partition::committed_without_of;
+use rdb_core::contracts::recovery::{CommittedWithout, PriorMember, PriorRecord, WithoutEntry};
+
+/// The members [`plan`] pins, as the old record held them.
+fn old_members() -> Vec<PriorMember> {
+    plan(&[])
+        .config
+        .members
+        .iter()
+        .map(PriorMember::of)
+        .collect()
+}
+
+fn prior_with(note: CommittedWithout) -> PriorRecord {
+    PriorRecord {
+        members: Some(old_members()),
+        note,
+    }
+}
+
+fn without(generation: u64, copies: &[(CopyId, u32)]) -> WithoutEntry {
+    WithoutEntry {
+        generation: Generation(generation),
+        cutoff: Seq(5),
+        copies: copies
+            .iter()
+            .map(|(copy, node)| (*copy, NodeId(*node)))
+            .collect(),
+    }
+}
+
+/// One bound run over `prior` in which only `answered` report. The run, its commit's bytes and
+/// the effects of the step that committed.
+fn run_over(prior: PriorRecord, answered: &[CopyId]) -> (F1, Bytes, Vec<EffectKind>) {
+    let mut f1 = F1 {
+        module: Recovery::bound_to(Some([7; INSTANCE_LEN])),
+        log: Vec::new(),
+        requests: Vec::new(),
+    };
+    let mut planned = plan(&[]);
+    planned.prior = prior;
+    f1.rec(0, RecoveryEvent::Plan(Box::new(planned)));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    for copy in [A, B, C] {
+        if answered.contains(&copy) {
+            f1.report(WINDOW, inv(copy, 20));
+        } else {
+            f1.rec(WINDOW, RecoveryEvent::InventoryFailed { copy });
+        }
+    }
+    if f1.phase() != RecoveryPhase::Barrier {
+        f1.step(WINDOW, fired(1));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    for copy in answered {
+        f1.rec(3_000, durable(*copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    let commit = proposed_bytes(&f1);
+    let effects = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    (f1, commit, effects)
+}
+
+/// The one `CommittedWithout` effect in `effects`: its generation and note.
+fn note_effect(effects: &[EffectKind]) -> (Generation, CommittedWithout) {
+    let found: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::CommittedWithout {
+                generation,
+                note,
+                ..
+            })) => Some((*generation, (**note).clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one CommittedWithout in {effects:?}");
+    found[0].clone()
+}
+
+/// This test's own lines whose message is `message`, as `publication_p1` reads them: rdb-core
+/// has no `config-testkit` dev-dependency.
+fn own_lines(method: &str, message: &str) -> usize {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read test log {}: {e}", path.display()))
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|parsed| parsed["@m"] == message)
+        })
+        .count()
+}
+
+/// Row 31: every old member verified writes layout 4, and the effect still fires, with an empty
+/// note and the run's generation: `Host` keeps it on every commit.
+#[retcd_test]
+fn s5n_31_every_old_member_verified_commits_layout_4_and_fires_an_empty_note() {
+    let (_, commit, effects) = run_over(prior_with(CommittedWithout::default()), &[A, B, C]);
+    assert_eq!(commit[0], 4, "no note, no layout 5");
+    let (generation, note) = note_effect(&effects);
+    assert_eq!(generation, recovered(&effects).new_generation);
+    assert_eq!(note, CommittedWithout::default());
+}
+
+/// Row 31: a lost member is named, by copy and node, in the commit's record and the effect.
+#[retcd_test]
+fn s5n_31_a_lost_member_commits_layout_5_and_names_each_copy_and_node() {
+    let (_, commit, effects) = run_over(prior_with(CommittedWithout::default()), &[A]);
+    assert_eq!(commit[0], 5, "the commit's record carries the note");
+    let (generation, note) = note_effect(&effects);
+    assert_eq!(generation, recovered(&effects).new_generation);
+    assert_eq!(note.entries.len(), 1);
+    assert_eq!(note.entries[0].generation, generation);
+    assert_eq!(
+        note.entries[0].copies,
+        vec![(B, NodeId(2)), (C, NodeId(3))],
+        "the two that did not report, not the one that did"
+    );
+    assert_eq!(committed_without_of(&commit), Some(note));
+}
+
+/// Row 31: a shadow was never a member a write relied on, so losing one is not news. A copy that
+/// reported from another node than the old record pinned is not the old member.
+#[retcd_test]
+fn s5n_31_a_shadow_is_not_missed_and_a_copy_on_another_node_is() {
+    let mut members = old_members();
+    members.push(PriorMember {
+        copy: CopyId(9),
+        node: NodeId(9),
+        role: ReplicaRole::Shadow,
+    });
+    let at = members.iter().position(|m| m.copy == B).expect("B");
+    members[at].node = NodeId(77);
+    let (_, commit, effects) = run_over(
+        PriorRecord {
+            members: Some(members),
+            note: CommittedWithout::default(),
+        },
+        &[A, B, C],
+    );
+    let (_, note) = note_effect(&effects);
+    assert_eq!(note.entries.len(), 1, "{note:?}");
+    assert_eq!(note.entries[0].copies, vec![(B, NodeId(77))]);
+    assert_eq!(commit[0], 5);
+}
+
+/// Row 32: the activation CAS writes the same note the commit did.
+#[retcd_test]
+fn s5n_32_the_activation_cas_keeps_the_note() {
+    let (mut f1, commit, _) = run_over(prior_with(CommittedWithout::default()), &[A]);
+    let note = committed_without_of(&commit).expect("a record");
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    for copy in [A, B, C] {
+        f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    let activation = proposed_bytes(&f1);
+    assert_eq!(activation[0], 5);
+    assert_eq!(committed_without_of(&activation), Some(note));
+}
+
+/// Row 32: a later recovery adds its entry after the earlier one.
+#[retcd_test]
+fn s5n_32_a_later_recovery_adds_an_entry_and_keeps_the_earlier_one() {
+    let earlier = CommittedWithout::default().with(without(1, &[(A, 1)]));
+    let (_, commit, effects) = run_over(prior_with(earlier.clone()), &[A]);
+    let (_, note) = note_effect(&effects);
+    assert_eq!(note.entries.len(), 2);
+    assert_eq!(note.entries[0], earlier.entries[0]);
+    assert_eq!(note.dropped_through, Generation(0));
+    assert_eq!(committed_without_of(&commit), Some(note));
+}
+
+/// Row 32: the fifth entry trims the oldest and says how far the trim reached.
+#[retcd_test]
+fn s5n_32_a_fifth_entry_trims_the_oldest_and_sets_dropped_through() {
+    let four = (1..=4).fold(CommittedWithout::default(), |note, generation| {
+        note.with(without(generation, &[(A, 1)]))
+    });
+    assert_eq!(four.entries.len(), 4);
+    let (_, _, effects) = run_over(prior_with(four.clone()), &[A]);
+    let (generation, note) = note_effect(&effects);
+    assert_eq!(note.entries.len(), 4, "{note:?}");
+    assert_eq!(note.entries[0], four.entries[1], "the oldest went");
+    assert_eq!(note.entries[3].generation, generation);
+    assert_eq!(note.dropped_through, Generation(1));
+}
+
+/// Row 32: a run repeated at one generation holds one entry for it, the newer run's.
+#[retcd_test]
+fn s5n_32_a_repeat_at_one_generation_adds_nothing() {
+    let (_, _, effects) = run_over(prior_with(CommittedWithout::default()), &[A]);
+    let (generation, first) = note_effect(&effects);
+    let earlier = CommittedWithout::default().with(without(generation.0, &[(B, 2)]));
+    let (_, _, effects) = run_over(prior_with(earlier), &[A]);
+    let (_, note) = note_effect(&effects);
+    assert_eq!(note.entries.len(), 1, "{note:?}");
+    assert_eq!(note, first);
+}
+
+/// Row 32: a layout 2 or 3 prior names no members, so F1 says it could not tell, compares against
+/// the plan's own members, and writes layout 4 when those all reported. Its earlier note,
+/// which such a layout cannot hold, is empty.
+#[retcd_test]
+fn s5n_32_a_prior_with_no_members_logs_unknown_and_reads_the_plan() {
+    const METHOD: &str = "s5n_32_a_prior_with_no_members_logs_unknown_and_reads_the_plan";
+    let unknown = PriorRecord {
+        members: None,
+        note: CommittedWithout::default(),
+    };
+    let (_, commit, effects) = run_over(unknown.clone(), &[A, B, C]);
+    config_log::layer::flush_test_logs();
+    assert_eq!(own_lines(METHOD, "committed_without_prior_unknown"), 1);
+    assert_eq!(commit[0], 4);
+    assert_eq!(note_effect(&effects).1, CommittedWithout::default());
+    let (_, _, effects) = run_over(unknown, &[A]);
+    let (_, note) = note_effect(&effects);
+    assert_eq!(
+        note.entries[0].copies,
+        vec![(B, NodeId(2)), (C, NodeId(3))],
+        "the plan's members stand in for the old record's"
+    );
+}
+
+/// Row 35: a recovery that left nobody out writes the earlier entries back, at layout 5.
+#[retcd_test]
+fn s5n_35_a_recovery_that_left_nobody_out_keeps_earlier_entries() {
+    let earlier = CommittedWithout::default().with(without(1, &[(A, 1)]));
+    let (_, commit, effects) = run_over(prior_with(earlier.clone()), &[A, B, C]);
+    assert_eq!(commit[0], 5);
+    assert_eq!(committed_without_of(&commit), Some(earlier.clone()));
+    assert_eq!(note_effect(&effects).1, earlier);
 }

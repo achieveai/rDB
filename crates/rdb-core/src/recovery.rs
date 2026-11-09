@@ -125,6 +125,7 @@ use crate::contracts::recovery::{
     RecoveryBarrier, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
     RetainedStatusMap, SelectedLineage,
 };
+use crate::contracts::recovery::{CommittedWithout, PriorMember, WithoutEntry};
 use crate::contracts::time::{Tick, TimerEffect, TimerFired};
 
 pub use commit::RECOVERY_CONTROL_REQUEST_BASE;
@@ -238,6 +239,8 @@ struct Decided {
     /// The eligible regular copies: the barrier's `required` set.
     required: BTreeSet<CopyId>,
     loss: LossRecord,
+    /// The merged note both CASes write; set when the barrier completes (#80 S5n).
+    note: CommittedWithout,
     /// When the current attempt at synchronising and the barrier ends (ruling F-a): the last
     /// attempt gives up and names who is missing, an earlier one retries.
     deadline: Tick,
@@ -273,6 +276,8 @@ struct Committed {
     record: PartitionRecord,
     /// The root the recovery CAS wrote, if any. The activation CAS writes it again as `Active`.
     root: Option<PartitionRoot>,
+    /// The note the recovery CAS wrote. The activation CAS writes it again (#80 S5n).
+    note: CommittedWithout,
     anchor: LineageAnchor,
     retention_millis: u64,
     rebuild: Option<Rebuild>,
@@ -891,11 +896,13 @@ impl Recovery {
         let (cutoff, digest) = (decided.selected.cutoff_seq, decided.selected.cutoff_digest);
         match RecoveryBarrier::try_new(&held, &decided.required, cutoff, digest) {
             Ok(barrier) => {
+                decided.note = note_after(&decided);
                 let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
                 let cas = Cas::new(
                     decided.record,
                     decided.root,
                     crate::authority::partition::RecordMember::pinned(&decided.plan.config),
+                    decided.note.clone(),
                     decided.proof.prior_owner_epoch,
                     self.requests.mint(),
                     deadline,
@@ -1197,6 +1204,7 @@ impl Recovery {
                         crate::authority::partition::RecordMember::pinned(
                             &committed.result.committed.pinned_config,
                         ),
+                        committed.note.clone(),
                         committed.record.owner_epoch,
                         self.requests.mint(),
                         deadline,
@@ -1406,6 +1414,53 @@ fn is_regular(config: &PartitionConfig, copy: CopyId) -> bool {
         .is_some_and(|member| member.role != ReplicaRole::Shadow)
 }
 
+/// The note the commit writes (#80 S5n, design 5.4.1): the old record's, with an entry naming
+/// every old non-shadow member this recovery did not verify. A member counts as verified only
+/// when its slot is required and the plan still pins that slot on the same node: a replacement
+/// answering in the slot says nothing for the node that left it. Nobody missing: the note
+/// unchanged. The old membership unknown (layout 2 or 3): the plan's, and a warning.
+fn note_after(decided: &Decided) -> CommittedWithout {
+    let plan = &decided.plan;
+    let unknown;
+    let old: &[PriorMember] = match &plan.prior.members {
+        Some(members) => members,
+        None => {
+            tracing::warn!(
+                partition = plan.config.partition.0,
+                generation = decided.selected.root.generation.0,
+                "committed_without_prior_unknown"
+            );
+            unknown = plan
+                .config
+                .members
+                .iter()
+                .map(PriorMember::of)
+                .collect::<Vec<_>>();
+            &unknown
+        }
+    };
+    let verified = |member: &PriorMember| {
+        decided.required.contains(&member.copy)
+            && plan
+                .config
+                .member(member.copy)
+                .is_some_and(|pinned| pinned.node == member.node)
+    };
+    let copies: Vec<_> = old
+        .iter()
+        .filter(|member| member.role != ReplicaRole::Shadow && !verified(member))
+        .map(|member| (member.copy, member.node))
+        .collect();
+    if copies.is_empty() {
+        return plan.prior.note.clone();
+    }
+    plan.prior.note.clone().with(WithoutEntry {
+        generation: decided.selected.root.generation,
+        cutoff: decided.selected.cutoff_seq,
+        copies,
+    })
+}
+
 /// A selection was made: pick the leader, then send the prefix to every regular that lacks it
 /// (`design.md` §5.4, §5.6). The leader's transfer is `CatchUpBeforeGrant` (spec §8.3).
 fn select(
@@ -1487,6 +1542,7 @@ fn select(
         record,
         root,
         required,
+        note: CommittedWithout::default(),
         deadline,
         attempt: 1,
         catch_ups,
@@ -1562,6 +1618,7 @@ fn commit(
         root,
         required,
         loss,
+        note,
         deadline: _,
         attempt: _,
         catch_ups: _,
@@ -1603,6 +1660,13 @@ fn commit(
         },
         retained_status_map,
     };
+    if let Some(root) = &root {
+        emit.recovery(RecoveryEffect::CommittedWithout {
+            generation: selected.root.generation,
+            instance: root.instance,
+            note: Box::new(note.clone()),
+        });
+    }
     emit.kind(EffectKind::Kernel(KernelEffect::Recovered(Box::new(
         result.clone(),
     ))));
@@ -1616,6 +1680,7 @@ fn commit(
         result,
         record,
         root,
+        note,
         rebuild,
         activation: None,
         held: None,

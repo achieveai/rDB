@@ -81,7 +81,11 @@ const GEN: Generation = Generation(7);
 const C1: ConfigVersion = ConfigVersion(1);
 const TENANT: TenantId = TenantId(3);
 const AFF: AffinityId = AffinityId(9);
-const BUDGETS: Budgets = Budgets::SPEC_DEFAULTS;
+// #80 S2d: pinned. These rows' arithmetic is about relationships between budgets; it does not state the product default.
+const BUDGETS: Budgets = Budgets {
+    grant_millis: 3_000,
+    ..Budgets::SPEC_DEFAULTS
+};
 const CORR: CorrelationId = CorrelationId(42);
 
 /// A snapshot whose `User` versions a test sets, and whose `Dedup` rows a seed scans.

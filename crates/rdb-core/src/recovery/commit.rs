@@ -31,6 +31,7 @@ use crate::authority::partition::{PartitionRecord, PartitionRoot, RecordMember};
 use crate::contracts::authority::BlockReason;
 use crate::contracts::control::{CasOutcome, ControlEffect, ControlKey, ReadOutcome};
 use crate::contracts::ids::{ControlRequestId, OwnerEpoch, PartitionId, Revision};
+use crate::contracts::recovery::CommittedWithout;
 use crate::contracts::time::Tick;
 
 /// The first [`ControlRequestId`] F1 owns: F1's tag in bits 48..64, as for its timers
@@ -87,6 +88,8 @@ pub(crate) struct Cas {
     /// The members the plan pins, written after the root as layout 4 (bug bash #64, ruling
     /// A-R426). Only with a root: a record with no root stays layout 2.
     members: Vec<RecordMember>,
+    /// The merged note both CASes write, so an activation never drops it (#80 S5n).
+    note: CommittedWithout,
     /// The owner epoch this proposal supersedes. A record above it on the re-read is a peer's.
     prior_epoch: OwnerEpoch,
     rereading: bool,
@@ -98,12 +101,13 @@ pub(crate) struct Cas {
 }
 
 impl Cas {
-    /// A proposal of `record`, with `root` when there is one, and `members` after it, over
-    /// ownership at `prior_epoch`, sent as `request`, unanswered at `deadline` read as `Unknown`.
+    /// A proposal of `record`, with `root` when there is one, and `members` and `note` after
+    /// it, over ownership at `prior_epoch`, sent as `request`, unanswered at `deadline` read as `Unknown`.
     pub(crate) const fn new(
         record: PartitionRecord,
         root: Option<PartitionRoot>,
         members: Vec<RecordMember>,
+        note: CommittedWithout,
         prior_epoch: OwnerEpoch,
         request: ControlRequestId,
         deadline: Tick,
@@ -112,6 +116,7 @@ impl Cas {
             record,
             root,
             members,
+            note,
             prior_epoch,
             rereading: false,
             request,
@@ -134,12 +139,15 @@ impl Cas {
         }
     }
 
-    /// The bytes this proposal writes: layout 4 with its root and members (A-R426 M1), or
-    /// layout 2 without a root.
+    /// The bytes this proposal writes: layout 4 with its root and members (A-R426 M1), layout
+    /// 5 when its note has an entry (#80 S5n), or layout 2 without a root.
     fn body(&self) -> Bytes {
         self.root.map_or_else(
             || self.record.encode(),
-            |root| self.record.encode_with_members(&root, &self.members),
+            |root| {
+                self.record
+                    .encode_with_members(&root, &self.members, Some(&self.note))
+            },
         )
     }
 

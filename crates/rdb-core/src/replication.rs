@@ -67,7 +67,8 @@ use crate::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName, StepCtx,
 };
 use crate::contracts::ids::{
-    AppliedSeq, DurableSeq, NodeId, PartitionId, ReceivedSeq, ReplicaRole, Seq, TimerVersion,
+    AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq, ReplicaRole, Seq,
+    TimerVersion,
 };
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::membership::CopyId;
@@ -146,6 +147,15 @@ impl Replication {
             .get_mut(&(node, partition))
             .ok_or(RdbError::InvalidArgument { field: "receiver" })?
             .restore_history(rungs)
+    }
+
+    /// Seal the receiver at `(node, partition)` through `generation`, because this copy is
+    /// answering a recovery inventory anchored there (#80 R4-1). A node with no receiver there,
+    /// such as an old primary's own copy, has nothing to seal.
+    pub fn seal(&mut self, node: NodeId, partition: PartitionId, generation: Generation) {
+        if let Some(receiver) = self.receivers.get_mut(&(node, partition)) {
+            receiver.seal(generation);
+        }
     }
 
     /// Give the primary for `(node, partition)` the digests its own engine holds, on demand
@@ -545,15 +555,13 @@ impl Replication {
                     }
                 }
             }
-            Some(own) => {
-                if !self.receivers.contains_key(&key) {
-                    match fresh_receiver(own.copy, result) {
-                        Some(receiver) => self.install_receiver(receiver),
-                        None => refused = Some(ReplicaIgnoreReason::InvalidConfig),
-                    }
+            Some(own) if !self.receivers.contains_key(&key) => {
+                match fresh_receiver(own.copy, result) {
+                    Some(receiver) => self.install_receiver(receiver),
+                    None => refused = Some(ReplicaIgnoreReason::InvalidConfig),
                 }
             }
-            None => {}
+            _ => {}
         }
         let receiver = self.receivers.get_mut(&key);
         let primary = self.primaries.get_mut(&key);

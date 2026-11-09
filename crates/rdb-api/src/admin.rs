@@ -32,7 +32,7 @@ use config_core::{
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
 use rdb_core::authority::partition::{
-    PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
+    prior_of, PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
 };
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
@@ -46,7 +46,9 @@ use rdb_core::contracts::ids::{
     OperationId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
-use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
+use rdb_core::contracts::recovery::{
+    Candidate, LineageAnchor, PriorRecord, RecoveryEvent, RecoveryPlan,
+};
 use rdb_core::contracts::time::Tick;
 
 use crate::clock::HostClock;
@@ -133,6 +135,7 @@ pub(crate) fn recovery_plan(
     boot: BootId,
     grant: GrantId,
     generation: AuthorityGeneration,
+    prior: PriorRecord,
 ) -> RecoveryPlan {
     let config = PartitionConfig::new(anchor.lineage.partition, version, members);
     RecoveryPlan {
@@ -161,6 +164,7 @@ pub(crate) fn recovery_plan(
         },
         retention_millis: RETENTION_MILLIS,
         config,
+        prior,
     }
 }
 
@@ -236,6 +240,7 @@ pub async fn bootstrap_at(
         boot,
         GrantId(1),
         AuthorityGeneration(1),
+        PriorRecord::fresh(),
     );
     let fence = FencingProof {
         partition: PARTITION,
@@ -907,9 +912,10 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     let found = read
         .record
         .ok_or_else(|| HealError::Record("absent".to_owned()))?;
-    let (Some(record), Some(root)) = (
+    let (Some(record), Some(root), Some(prior)) = (
         PartitionRecord::decode(&found.value),
         PartitionRoot::decode(&found.value),
+        prior_of(&found.value),
     ) else {
         return Err(HealError::Record(format!(
             "the record at revision {} carries no root (layout 3)",
@@ -942,7 +948,7 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // bootstrap's. A1 replaces the view at its first acquire either way.
     let (prior_grant, view_grant, view_generation, revocation) = match &gone {
         Gone::Deleted(_, held) => {
-            let sample = HostClock::control_time(now, &ctx.budgets);
+            let sample = ctx.clock.sample(now, &ctx.budgets);
             let revocation = Revocation::ExpiryProven {
                 frozen_expiry_utc_ms: held.expiry_utc_ms,
                 authority_utc_ms: i64::try_from(sample.estimate.0).unwrap_or(i64::MAX),
@@ -983,6 +989,7 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         ctx.boot,
         view_grant,
         view_generation,
+        prior,
     );
     let fence = FencingProof {
         partition: PARTITION,
@@ -1435,7 +1442,7 @@ async fn judge(
     }
     let partitions = list_partitions(store).await?;
     let now = clock.now();
-    let sample = HostClock::control_time(now, &budgets);
+    let sample = clock.sample(now, &budgets);
     let verdict = clear_verdict(node, &record, boot, sample, now, &budgets, || {
         Ok::<_, std::convert::Infallible>(partitions)
     })
@@ -1799,6 +1806,8 @@ pub(crate) fn promote_members(
         Some(crate::host::NodeStatus {
             pinned,
             config_version: Some(version),
+            qualifying_copy: None,
+            clock_bound_lost: false,
             ..
         }) if !pinned.is_empty() => return Ok((pinned, version)),
         Some(_) => PromoteError::Unconfigured { node: to.0 },
@@ -1868,7 +1877,7 @@ pub(crate) async fn promote_looked(
     refused: Option<PromoteError>,
 ) -> Result<Promoted, PromoteError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
-    let (record, root, stored, mod_revision, _) = read_partition(&*ctx.store).await?;
+    let (record, root, stored, mod_revision, _, prior_record) = read_partition(&*ctx.store).await?;
     let (planned, planned_version) = match (&stored, refused) {
         // `to` did not answer at all: it is refused before anything is written whatever the
         // record pins, so no owner is fenced toward a node that is not there (A-R412).
@@ -1951,7 +1960,7 @@ pub(crate) async fn promote_looked(
     let fenced_at = cas(
         &*ctx.store,
         &ControlKey::Partition(PARTITION).encode(),
-        fencing.encode_with_members(&root, &written),
+        fencing.encode_with_members(&root, &written, Some(&prior_record.note)),
         mod_revision,
     )
     .await?;
@@ -1964,7 +1973,7 @@ pub(crate) async fn promote_looked(
     let (revocation, decided) = loop {
         let now = ctx.clock.now();
         let mut view = ClockView::new();
-        view.accept(HostClock::control_time(now, &ctx.budgets));
+        view.accept(ctx.clock.sample(now, &ctx.budgets));
         if let Some(revocation) = expiry_proven(&view, frozen.expiry_utc_ms, now, &ctx.budgets) {
             break (revocation, now);
         }
@@ -2001,7 +2010,7 @@ pub(crate) async fn promote_looked(
         .collect();
 
     // 6. The record again, after the freeze, and the plan.
-    let (fenced, fenced_root, fenced_members, control_revision, read_revision) =
+    let (fenced, fenced_root, fenced_members, control_revision, read_revision, _) =
         read_partition(&*ctx.store).await?;
     if read_revision < frozen_at.0 {
         return Err(PromoteError::Control(format!(
@@ -2055,6 +2064,7 @@ pub(crate) async fn promote_looked(
         to_boot,
         GrantId(1),
         AuthorityGeneration(1),
+        prior_record,
     );
     store_plan(&*ctx.store, fenced_at, &plan).await?;
     // What F1 pins in `partitions/1` when it commits this plan (A-R448): step 7 answers Ok only
@@ -2091,7 +2101,7 @@ pub(crate) async fn promote_looked(
     // 7. The commit, and that it is this run's (A-R448): another promote that fenced over this
     // one after it sent may be the one F1 committed.
     loop {
-        let (now, _, pinned, committed_at, _) = read_partition(&*ctx.store).await?;
+        let (now, _, pinned, committed_at, _, _) = read_partition(&*ctx.store).await?;
         let committed = pinned.as_deref().map(sorted_nodes);
         let left_out = |committed: &[NodeId]| -> Vec<u32> {
             written
@@ -2174,7 +2184,7 @@ pub(crate) async fn promote_looked(
 }
 
 /// `partitions/1` as a rooted record, the members it pins (`None` for layout 3), its
-/// `mod_revision` and the read's store revision.
+/// `mod_revision`, the read's store revision and what a recovery superseding it needs.
 pub(crate) async fn read_partition(
     store: &dyn ConfigStore,
 ) -> Result<
@@ -2184,6 +2194,7 @@ pub(crate) async fn read_partition(
         Option<Vec<RecordMember>>,
         u64,
         u64,
+        PriorRecord,
     ),
     PromoteError,
 > {
@@ -2201,13 +2212,15 @@ pub(crate) async fn read_partition(
     match (
         PartitionRecord::decode(&found.value),
         PartitionRoot::decode(&found.value),
+        prior_of(&found.value),
     ) {
-        (Some(record), Some(root)) => Ok((
+        (Some(record), Some(root), Some(prior)) => Ok((
             record,
             root,
             RecordMember::decode_all(&found.value),
             found.mod_revision,
             read.read_revision,
+            prior,
         )),
         _ => Err(PromoteError::Record(format!(
             "partitions/1 at revision {} carries no root (layout 3 or 4)",
@@ -2251,7 +2264,7 @@ pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
 
 /// The first byte of a stored promote plan: the layout of the postcard bytes after it. A build
 /// that reads another refuses it (`plan_unreadable`) instead of guessing at its fields.
-pub(crate) const PROMOTE_PLAN_VERSION: u8 = 1;
+pub(crate) const PROMOTE_PLAN_VERSION: u8 = 2;
 
 /// The `operations/` key of the plan the promote that fenced `partitions/1` at `revision` stored
 /// (A-R447): `operations/{PROMOTE_OPERATION_BASE + revision}`.
@@ -2501,7 +2514,7 @@ async fn freeze(
             }
             None => {
                 let now = ctx.clock.now();
-                let sample = HostClock::control_time(now, &ctx.budgets);
+                let sample = ctx.clock.sample(now, &ctx.budgets);
                 (
                     GrantRecord {
                         grant: GrantId(0),
@@ -4116,6 +4129,7 @@ mod tests {
             OPEN_2,
             GrantId(1),
             AuthorityGeneration(1),
+            PriorRecord::fresh(),
         ));
         let written = rt
             .block_on(taken.put(PutRequest {
@@ -4161,6 +4175,75 @@ mod tests {
                 && !refused.contains("write access"),
             "(d) {refused}"
         );
+    }
+
+    /// #80 S5n row 32: a promote stopped after its `Fencing` write and before its plan leaves
+    /// the note on the record. Cut: the `Fencing` CAS passes `None`: layout 4, red.
+    /// Unit (<500 ms): the freeze after it is refused.
+    #[test]
+    fn s5n_32_a_promote_stopped_after_its_fencing_write_keeps_the_note() {
+        use rdb_core::authority::partition::committed_without_of;
+        use rdb_core::contracts::recovery::{CommittedWithout, WithoutEntry};
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script {
+            pass_puts: 1,
+            drop_puts: u32::MAX,
+            ..Script::default()
+        }));
+        let mem = scripted.mem();
+        rooted(mem, &rt, BootId(5));
+        let found = rt
+            .block_on(mem.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        let note = CommittedWithout::default().with(WithoutEntry {
+            generation: Generation(3),
+            cutoff: Seq(7),
+            copies: vec![(CopyId(0), NodeId(1))],
+        });
+        let head = PartitionRecord::decode(&found.value).expect("a record");
+        let root = PartitionRoot::decode(&found.value).expect("a root");
+        let pinned: Vec<RecordMember> = members().iter().map(RecordMember::of).collect();
+        let noted = head.encode_with_members(&root, &pinned, Some(&note));
+        rt.block_on(mem.put(PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: noted,
+            expected_mod_revision: Some(found.mod_revision),
+            dedup: None,
+        }))
+        .expect("the noted record");
+        put_grant(mem, &rt, expired_grant());
+        let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+
+        let (promoted, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            all_known(),
+            crate::host::test_patience(Duration::from_secs(1)),
+        );
+
+        assert!(promoted.is_err(), "{promoted:?}");
+        assert!(sent.is_empty(), "no plan went out: {sent:?}");
+        let after = rt
+            .block_on(mem.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        assert_eq!(
+            PartitionRecord::decode(&after.value).map(|r| r.lifecycle),
+            Some(PartitionLifecycle::Fencing),
+            "the Fencing write landed"
+        );
+        assert_eq!(after.value[0], 5);
+        assert_eq!(committed_without_of(&after.value), Some(note));
     }
 
     /// A-R447 step 6: another promote fences `partitions/1` again between this run's `Fencing`
@@ -4339,7 +4422,7 @@ mod tests {
                 value: if layout_3 {
                     committed.encode_with(&root)
                 } else {
-                    committed.encode_with_members(&root, &RecordMember::pinned(&plan.config))
+                    committed.encode_with_members(&root, &RecordMember::pinned(&plan.config), None)
                 },
                 expected_mod_revision: Some(revision.0),
                 dedup: None,
@@ -4546,7 +4629,7 @@ mod tests {
         fenced
             .recv_timeout(patience)
             .expect("(5) the run sends its fence");
-        let (record, root, pinned, fenced_at, _) = rt
+        let (record, root, pinned, fenced_at, _, _) = rt
             .block_on(read_partition(&*store))
             .expect("(5) partitions/1");
         let readded = PartitionRecord {
@@ -4559,7 +4642,7 @@ mod tests {
         let put = rt
             .block_on(store.put(PutRequest {
                 key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-                value: readded.encode_with_members(&root, &pinned.expect("(5) layout 4")),
+                value: readded.encode_with_members(&root, &pinned.expect("(5) layout 4"), None),
                 expected_mod_revision: Some(fenced_at),
                 dedup: None,
             }))

@@ -1043,9 +1043,9 @@ impl Db {
         Ok(Self {
             nodes: Mutex::new(Vec::new()),
             respawn: None,
+            clock: links.clock(),
             links,
             control,
-            clock: HostClock::start(),
             timeouts: config.timeouts,
             next_request: AtomicU64::new(request_floor(n) + 1),
             ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
@@ -1185,8 +1185,8 @@ impl Db {
             request_floor = request_floor(n),
             "db_open_found"
         );
-        let clock = HostClock::start();
         let links = config.links.clone().unwrap_or_default();
+        let clock = links.clock();
         let control = ControlAdapter::new(Arc::clone(&store), rt.clone(), Arc::clone(&links));
         for (a, b) in &config.hold {
             links.hold(*a, *b);
@@ -4509,6 +4509,8 @@ fn roll_stops_before(dir: &Path, node: NodeId) -> bool {
 }
 
 #[cfg(test)]
+mod clock_guard_tests;
+#[cfg(test)]
 mod reopen_tests;
 
 #[cfg(test)]
@@ -7696,6 +7698,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -7781,6 +7786,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
         let remote = |blocked_looks: usize| {
@@ -7875,6 +7883,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
         lock(&db.nodes).clear();
@@ -7972,6 +7983,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -8083,6 +8097,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
         // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
@@ -8816,6 +8833,9 @@ mod tests {
                 lengths: None,
                 pinned: Vec::new(),
                 config_version: None,
+                qualifying_copy: None,
+                clock_bound_lost: false,
+                committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -9869,6 +9889,9 @@ mod tests {
             lengths: None,
             pinned: Vec::new(),
             config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {
@@ -11320,6 +11343,7 @@ mod tests {
                 past_horizon: DenyReason::NoGrant,
             },
             retention_millis: 1_000,
+            prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
             config,
         };
         let fence = FencingProof {

@@ -31,6 +31,14 @@
 //! [`wire::Frame::Reply`]. A link that goes down drops every `Sender` waiting on it, so a
 //! caller sees its channel close, as it would if a node thread in its own process stopped.
 //!
+//! # Clock probes (#80 S2c)
+//!
+//! Every link's reader sends a [`wire::Frame::ClockProbe`] on link-up and each
+//! [`PROBE_PERIOD`] after, and answers its peer's. A node peer's round feeds this process's
+//! [`crate::clock::ClockGuard`]; an app link is probed only for liveness. Echoes are the
+//! application keepalive: a link that answers none for [`PROBE_SILENCE`] is closed. No TCP or
+//! HTTP/2 keepalive runs beside it, so two timers cannot disagree about one link.
+//!
 //! # Faults
 //!
 //! [`faults::Faults`], read from a file, apply after TLS: a hold delays every frame on a
@@ -48,7 +56,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rdb_core::contracts::ids::{BootId, NodeId};
 use rdb_core::contracts::transport::LinkFault;
@@ -58,6 +66,7 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
+use crate::clock::{ClockSample, HostClock};
 use crate::db::ApiError;
 use crate::host::{Answer, Client, Msg, NodeStatus};
 use crate::transport::Links;
@@ -69,13 +78,21 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// handshake, naming both. Move it whenever a type in [`wire`] changes, once a build that speaks
 /// it has been released. `3` came with M10 S2 (41cc012) and no released build speaks it, so
 /// `WireNodeStatus::pinned` (review-s2 F-004, A-R412) was added under `3`, not `4`.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// `4` came with #80 S2c: `Frame::ClockProbe`, `Frame::ClockEcho`, and
+/// `WireNodeStatus::{qualifying_copy, clock_bound_lost, committed_without}`.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// How long a handshake may take before the link is dropped.
 const HANDSHAKE: Duration = Duration::from_secs(5);
+
+/// How often a link's reader probes the peer's clock (#80 S2c): also the link keepalive.
+const PROBE_PERIOD: Duration = Duration::from_secs(1);
+
+/// A link with no echo for this long is closed: the peer stopped answering without a FIN.
+const PROBE_SILENCE: Duration = Duration::from_secs(5);
 
 /// How long one dial may take to connect, TCP and TLS together. A listener that accepts and
 /// never answers the TLS hello would otherwise hold the dial forever.
@@ -155,6 +172,11 @@ struct Conn {
     /// Frames a hold keeps back, oldest first.
     held: Mutex<VecDeque<Frame>>,
     faults: Arc<Faults>,
+    /// The last probe id sent, and the last echoed.
+    probe_sent: AtomicU64,
+    probe_echoed: AtomicU64,
+    /// When the link last proved alive: an echo, or link-up.
+    answered_at: Mutex<Instant>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -218,6 +240,8 @@ struct Shared {
     protocol_version: u32,
     faults: Arc<Faults>,
     links: Weak<Links>,
+    /// This process's clock, the one its [`Links`] owns.
+    clock: HostClock,
     routes: Mutex<BTreeMap<NodeId, Route>>,
     conns: Mutex<BTreeMap<u64, Arc<Conn>>>,
     next_conn: AtomicU64,
@@ -264,6 +288,7 @@ impl Net {
             protocol_version: config.protocol_version,
             faults: Arc::clone(&config.faults),
             links: Arc::downgrade(links),
+            clock: links.clock(),
             routes: Mutex::new(
                 config
                     .peers
@@ -288,6 +313,14 @@ impl Net {
             span: tracing::Span::current(),
             on_boot: Mutex::new(None),
         });
+        // Only a process with peers has a bound to prove: an app with none, or a node alone,
+        // stays "no `Net` attached", always established, as before this guard.
+        if !config.peers.is_empty() {
+            let k = config.peers.len() + usize::from(matches!(config.label, Label::Node(_)));
+            if let Some(guard) = links.clock().guard() {
+                guard.attach(k);
+            }
+        }
         let mut tasks = Vec::new();
         let mut addr = None;
         if let Some(listener) = listener {
@@ -711,6 +744,9 @@ fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<
         next: AtomicU64::new(0),
         held: Mutex::new(VecDeque::new()),
         faults: Arc::clone(&shared.faults),
+        probe_sent: AtomicU64::new(0),
+        probe_echoed: AtomicU64::new(0),
+        answered_at: Mutex::new(Instant::now()),
     });
     lock(&shared.conns).insert(conn.id, Arc::clone(&conn));
     conn
@@ -721,6 +757,8 @@ fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<
 async fn read(shared: Arc<Shared>, conn: Arc<Conn>, mut inbound: Streaming<Envelope>) -> String {
     let mut held: VecDeque<Frame> = VecDeque::new();
     let mut tick = tokio::time::interval(faults::POLL);
+    let mut probe = tokio::time::interval(PROBE_PERIOD);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             next = inbound.next() => {
@@ -738,6 +776,23 @@ async fn read(shared: Arc<Shared>, conn: Arc<Conn>, mut inbound: Streaming<Envel
                 }
                 if let Err(reason) = handle(&shared, &conn, frame) {
                     return reason;
+                }
+            }
+            // A held link sends no probe and stops the silence timer: a hold is a delay, and
+            // an echo sitting in a hold is not a silent peer.
+            _ = probe.tick() => {
+                if shared.faults.holds(&conn.peer) {
+                    *lock(&conn.answered_at) = Instant::now();
+                    continue;
+                }
+                let silent = lock(&conn.answered_at).elapsed();
+                if silent >= PROBE_SILENCE {
+                    return format!("no clock echo for {silent:?}");
+                }
+                let id = conn.probe_sent.fetch_add(1, Ordering::Relaxed) + 1;
+                conn.out(Frame::ClockProbe { id, sent: shared.clock.now() });
+                if let Some(guard) = shared.clock.guard() {
+                    guard.refresh();
                 }
             }
             _ = tick.tick() => {
@@ -794,6 +849,28 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
                         "reply {correlation} does not match its call: {other:?}"
                     ))
                 }
+            }
+            Ok(())
+        }
+        Frame::ClockProbe { id, sent } => {
+            conn.out(Frame::ClockEcho {
+                id,
+                sent,
+                at: shared.clock.now(),
+            });
+            Ok(())
+        }
+        Frame::ClockEcho { id, sent, at } => {
+            if id > conn.probe_sent.load(Ordering::Relaxed)
+                || id <= conn.probe_echoed.fetch_max(id, Ordering::Relaxed)
+            {
+                tracing::debug!(peer = %conn.peer, id, "net_clock_echo_unmatched");
+                return Ok(());
+            }
+            *lock(&conn.answered_at) = Instant::now();
+            if let (Label::Node(peer), Some(guard)) = (&conn.peer, shared.clock.guard()) {
+                let received = shared.clock.now();
+                guard.observe(*peer, ClockSample { sent, at, received });
             }
             Ok(())
         }

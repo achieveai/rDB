@@ -92,6 +92,8 @@ pub struct Staged {
     pub reply_to: NodeId,
     /// The request it arrived in, reused as the completion's correlation.
     pub request: MessageId,
+    /// It arrived under a `FenceCredential`, so a seal does not withhold its ACK (#80 R4-1).
+    pub credentialed: bool,
 }
 
 /// The committed root's anchor, as the historical-envelope rule reads it (design §3.2, K-B-37).
@@ -153,6 +155,10 @@ pub struct AppendReceiver {
     /// `Recovered` (lead ruling A-R173): it serves recovery appends and catch-up sourcing only,
     /// and fences every plain append. `Recovered` drops it and builds today's side instead.
     dormant: bool,
+    /// The newest generation this copy has reported in a recovery inventory, raised only and
+    /// held in memory (issue #80 R4-1). At or below it the copy refuses plain appends and sends
+    /// no ACK. No code clears it: `Recovered` moves the lineage above it.
+    sealed_through: Option<Generation>,
 }
 
 /// What the ladder decided. Only `Accept` and `Quarantine` write state.
@@ -214,6 +220,7 @@ impl AppendReceiver {
             authority_seq: 0,
             retired: false,
             dormant: false,
+            sealed_through: None,
         })
     }
 
@@ -267,6 +274,7 @@ impl AppendReceiver {
             authority_seq: 0,
             retired: false,
             dormant: true,
+            sealed_through: None,
         })
     }
 
@@ -342,6 +350,19 @@ impl AppendReceiver {
     #[must_use]
     pub fn accept_head(&self) -> Head {
         self.staged.map_or(self.applied_head, |staged| staged.head)
+    }
+
+    /// Whether this copy has reported its current generation in a recovery inventory, so it
+    /// refuses plain appends of that generation and acknowledges none of them (#80 R4-1).
+    #[must_use]
+    pub fn sealed(&self) -> bool {
+        self.sealed_through
+            .is_some_and(|through| self.lineage.generation <= through)
+    }
+
+    /// Seal this copy through `generation`: raise-only, as an inventory's anchor names it.
+    pub fn seal(&mut self, generation: Generation) {
+        self.sealed_through = self.sealed_through.max(Some(generation));
     }
 
     /// The record in flight to storage, if any.
@@ -472,6 +493,14 @@ impl AppendReceiver {
         let request = frame.id;
         let reply = |outcome| self.send(from.node, request, outcome);
         match self.validate(from, frame, recovery) {
+            // A plain frame refused by the seal (#80 R4-1) answers nothing. On a live owner's
+            // re-plan the old stream and F1's catch-up go to one peer, and a reply would be
+            // taken for the catch-up's and stop it, as a dormant copy's would above.
+            Verdict::Reply(AppendOutcome::Rejected(AppendReject::StaleFence)) if !recovery => {
+                vec![ignored(KernelIgnoredReason::AppendRejected(
+                    AppendReject::StaleFence,
+                ))]
+            }
             Verdict::Reply(outcome) => vec![reply(outcome)],
             Verdict::Duplicate => vec![
                 reply(AppendOutcome::AlreadyHave),
@@ -484,7 +513,7 @@ impl AppendReceiver {
                 vec![answer, quarantine_alert()]
             }
             Verdict::Accept(envelope, record) => {
-                vec![self.stage(&envelope, record, from.node, request)]
+                vec![self.stage(&envelope, record, from.node, request, recovery)]
             }
         }
     }
@@ -609,6 +638,16 @@ impl AppendReceiver {
             }
             return (!self.sender_admitted(from, Some(fence))).then_some(AppendReject::NotAMember);
         }
+        // Issue #80 R4-1: below the credential branch, so only recovery's own appends pass.
+        if self.sealed() {
+            tracing::info!(
+                partition = partition.0,
+                generation = sender.generation.0,
+                from = from.node.0,
+                "r1.append_refused_sealed"
+            );
+            return Some(AppendReject::StaleFence);
+        }
         let current = self.lineage.owner_epoch;
         match sender.owner_epoch.cmp(&current) {
             Less => return Some(AppendReject::StaleEpoch { current }),
@@ -724,6 +763,7 @@ impl AppendReceiver {
         record: Bytes,
         reply_to: NodeId,
         request: MessageId,
+        credentialed: bool,
     ) -> EffectKind {
         let head = Head {
             seq: envelope.header.seq,
@@ -736,6 +776,7 @@ impl AppendReceiver {
             head,
             reply_to,
             request,
+            credentialed,
         });
         self.received = ReceivedSeq(head.seq.0);
         let mut progress = head.seq.0.to_le_bytes().to_vec();

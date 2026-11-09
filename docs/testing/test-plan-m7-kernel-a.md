@@ -1,6 +1,6 @@
 # Test Plan — M7, team kernel-a (A1, T1, P1)
 
-<!-- drift-basis: 0778f5312f5e7051b3d09c398cf8b013d8101318 -->
+<!-- drift-basis: 8d8ebdadfa05c204e4eb401fd87175dd325184e2 -->
 
 **Status:** Proposed — test planner deliverable, **correction round 5** (critic-kernel-a round 3
 findings **TD-12..TD-20** applied over round 4's TD-01..TD-11 and round 3's T-A-01..15; §8.7 holds
@@ -302,7 +302,7 @@ Kernel constants used by every row (design §2.1; a row that changes one says so
 
 | Constant | Default | Used by |
 |---|---|---|
-| `grant_duration_ms` | 3000 | local window; `E_new`; K-A-42 |
+| `grant_duration_ms` | 3000 (rows pin it; the product default is 6000 since issue #80) | local window; `E_new`; K-A-42 |
 | `renew_interval_ms` | 500 | `RenewDue` cadence |
 | `epsilon_bound_ms` | 100 | ceiling; over it is `ClockUnbounded` |
 | `delta_ms` | 100 | safety margin in `local_ok` and `utc_ok` |
@@ -413,7 +413,7 @@ predate any run, are marked provisional, and only until the first green run.
 
 | ID | Name | Proves | Input | Assertion | Class | Dep |
 |---|---|---|---|---|---|---|
-| M7A-59 | `control_unavailable_denies_control_unavailable_no_fence` | §1.2 deny-vs-fence "control Unavailable deny only" · ADR 0008 "control-quorum loss denies" | `Held`; `PlanReadUnavailable` on the pending `Get`; `Check{StorageDispatch}` | `AuthorityAnswer{Deny(ControlUnavailable)}`; no `Fence`; after `Value{Found{ours}}` the next `Check` answers `Allow` (twin, in the same test) | unit | none |
+| M7A-59 | `control_unavailable_admits_to_the_horizon_then_fences_expired` | ADR-rdb-0007 as amended for issue #80 · ADR 0008 "control-quorum loss stops new grants" | `Held`; `PlanReadUnavailable` on the pending `Get`; every write and read `Check`, at ticks up to the last one before `E - δ`; then one tick later | `AuthorityAnswer{Admit}` and no `Fence` up to the last tick; then `Deny(Expired)` and `Fence(Node, Expired)` | unit | none |
 | M7A-60 | `check_answer_pair_echoes_correlation_checkpoint_and_authority_seq` | §1.2 `Check{checkpoint, correlation}` / `AuthorityDecision{authority_seq}` (K-A-34) | `Check{StorageDispatch, corr 9}`; `Check{Publication, corr 10}`; `Check{Reply, corr 11}` | three `AuthorityAnswer`s with the same `correlation` and `checkpoint` values, in order, each carrying A1's current `authority_seq`; `decided_at` present as trace only | unit | K-A-34 |
 | M7A-61 | `outbox_dispatch_checkpoint_unused_in_m7` | §2.5 `OutboxDispatch` declared, unused | `Check{OutboxDispatch}` | answer is `Deny(ControlUnavailable)` **or** the variant is `#[cfg(feature = "m11")]`-gated (§13 Q-7); either way no row in this plan depends on it | unit | none |
 
@@ -2032,6 +2032,8 @@ re-read, not before it.
 **Re-read (2026-10-24, dev-w10, the merge of the F4 entry and the eighth event), basis moves trees `7ae48f7` and `073c1a4` → tree `fdc5423`.** `fdc5423` is the contracts tree of the merge of `m10-s2-int` (`1d3d547`) into `m10-s2-w10` (`0b1c504`). The two entries above touch disjoint files: the F4 entry only `storage.rs` (two doc comments), the eighth event only `authority.rs` and `errors.rs`. Checked on the merge with `git diff --quiet`: `storage.rs` is byte-identical to `0b1c504`'s, and `authority.rs` and `errors.rs` to `1d3d547`'s. So every declaration sits where the entry for its file says, and both entries hold as written against this tree. No row changes, nothing lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 **Re-read (2026-10-24, dev-w16, ninth event), basis moves tree `fdc5423` → tree `ee28792`.** `ee28792` is the contracts tree of the commit that adds this entry (M10 slice 2, branch `m10-s2-w5`, lead rulings A-R401 F4 and A-R402, critic-d4 Q3; ADR-rdb-0004 §5 and spec §5.4 amended the same day). `git diff --stat fdc5423 ee28792` touches one file, `errors.rs` (+7). One behaviour changes: `RdbError::proves_no_mutation` now also returns `true` for `RecoveryReadOnly`, whose retry rule stays `RetryAfterRecovery`. Its one producer, `admission::freeze_error` of `FreezeCause::RecoveryReadOnly`, answers only before apply. No type, variant or field changes, and no other error's proof changes. **Declarations that moved:** in `errors.rs`, `proves_no_mutation` moves +6 to `:419` (was `:413`), and `capability` (`:437`) and `unavailable` (`:446`) move +7; `Capability`, `RetryRule`, `ErrorKind`, `RdbError`, `kind` and `retry_rule` keep their lines. Re-read against this plan's §15 table: no row pins the `RecoveryReadOnly` proof (the read-only rows pin the mode and the refusal, not `no_mutation`), so no row changes here. The new row is `a_recovery_read_only_refusal_proves_no_mutation` in `crates/rdb-core/tests/transaction_t1.rs`. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
+
+**Re-read (2026-11-08, dev-80-s2d, issue #80 S2d), basis moves tree `0778f53` → tree `8d8ebda`.** `8d8ebda` is the contracts tree of this change as it stands uncommitted, written from a temporary index, because `git rev-parse HEAD:crates/rdb-core/src/contracts` cannot see an uncommitted change; it is the tree the commit will have if `contracts/` stays as it is. The diff against `0778f53` is one line of `event.rs`: `SPEC_DEFAULTS.grant_millis` 3 000 → 6 000. It adds and removes no type, field or variant, and moves no line, so every citation in this section stands. This section's lines on budgets, grants and defaults were read for a claim about the value, and none makes one. This plan's constants table keeps 3000 for its rows, which pin it at their fixtures and say so; M7A-59's row is rewritten above because the behaviour changed, and M7A-143 still states its literal against the old default.
 
 **Re-read discipline, and what round 4 got wrong about it.** This table is only as fresh as its
 last re-read, which is why the basis is now a gate stage rather than a convention. When

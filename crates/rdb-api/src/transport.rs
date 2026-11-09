@@ -26,13 +26,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rdb_core::contracts::ids::{BootId, NodeId};
 use rdb_core::contracts::transport::LinkFault;
 
+use crate::clock::HostClock;
 use crate::host::Msg;
 use crate::net::Net;
 
 /// The peer links of one process.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Links {
     inner: Mutex<Inner>,
+    /// The process's one clock (#80 S2c): `Db` and `Net` read this, and its guard compares it
+    /// with every peer's.
+    clock: HostClock,
+}
+
+impl Default for Links {
+    fn default() -> Self {
+        Self::with_clock(HostClock::guarded(0))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +73,26 @@ impl Links {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// As [`Self::new`], on a clock `offset_ms` off this host's: `rdb_node --clock-offset-ms`
+    /// and the skew rows (#80 S2c).
+    #[must_use]
+    pub fn with_clock_offset(offset_ms: i64) -> Arc<Self> {
+        Arc::new(Self::with_clock(HostClock::guarded(offset_ms)))
+    }
+
+    fn with_clock(clock: HostClock) -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            clock,
+        }
+    }
+
+    /// This process's one clock.
+    #[must_use]
+    pub const fn clock(&self) -> HostClock {
+        self.clock
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {

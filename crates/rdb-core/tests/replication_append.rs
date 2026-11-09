@@ -4300,6 +4300,133 @@ fn m7b_170_a_credentialed_recovery_append_passes_the_frame_fence_from_a_non_prim
     }
 }
 
+// --- A copy sealed by a recovery inventory (issue #80, R4-1) --------------------------------
+
+/// What a sealed copy answers in place of an ACK.
+fn seal_withheld() -> EffectKind {
+    ignored(KernelIgnoredReason::AppendRejected(
+        AppendReject::StaleFence,
+    ))
+}
+
+/// Row 27: a frame staged before the seal and committed after it sends no ACK at all, not a
+/// lower one, and the flush sends none either. The record stays on the copy: its head is what
+/// the copy reported, or a write the client was never told about. Cut: no sealed case in
+/// `ack_or_withhold`, red (the ACK is sent). Unit.
+#[retcd_test]
+fn s5_27_a_frame_staged_before_the_seal_and_committed_after_it_sends_no_ack() {
+    let mut module = module();
+    let effects = send(&mut module, label(A), &golden());
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+    module.seal(B, P, GEN);
+
+    assert_eq!(
+        step(&mut module, &committed(0, 11)),
+        vec![seal_withheld()],
+        "the commit sends no ACK"
+    );
+    assert_eq!(
+        rx(&module).applied_head(),
+        head(11),
+        "the record may remain"
+    );
+    assert_eq!(
+        step(&mut module, &flushed(&[(P, GEN, 11)])),
+        vec![seal_withheld()],
+        "nor does the flush"
+    );
+    assert_eq!(rx(&module).durable_seq(), DurableSeq(11));
+}
+
+/// Row 26's refusal at the receiver: a plain append and a duplicate of a held record are both
+/// refused on a sealed copy, change nothing and answer nothing. No reply, because on a live
+/// owner's re-plan the old stream and F1's catch-up share one peer: a reply would be taken for
+/// the catch-up's and stop it, as a dormant copy's would (`m10_s2_f007`, 2 barrier retries lost
+/// to it). Cuts: no seal check in `frame_fence`, red; a reply sent, red. Unit.
+#[retcd_test]
+fn s5_27b_a_sealed_copy_refuses_a_plain_append_and_a_duplicate_without_a_reply() {
+    let mut module = applied_to(12);
+    module.seal(B, P, GEN);
+    let before = rx(&module).clone();
+    for env in [chain(13).pop().expect("13"), chain(12).pop().expect("12")] {
+        let seq = env.header.seq;
+        assert_eq!(
+            send(&mut module, label(A), &env),
+            vec![seal_withheld()],
+            "{seq:?}"
+        );
+    }
+    assert_eq!(rx(&module), &before, "a refused frame changes nothing");
+}
+
+/// Row 28, the receiver half: a recovery append under a credential passes a sealed copy and is
+/// acknowledged to its source. Its flush's unsolicited ACK to the pinned primary is withheld,
+/// and the durable watermark still rises, so nothing waits on that ACK. Cuts: the seal check
+/// above the credential branch, red (`StaleFence`); `on_committed` passing `false`, red (the
+/// ACK is withheld). Unit.
+#[retcd_test]
+fn s5_28_a_recovery_append_passes_a_sealed_copy_and_is_acknowledged() {
+    let credential = fence(2, EPOCH, Revision(0));
+    let mut module = module();
+    module.seal(B, P, GEN);
+    let sender = Lineage {
+        partition: P,
+        generation: GEN,
+        owner_epoch: EPOCH,
+    };
+    let body = recovery_body(&credential, &golden());
+    let effects = step(&mut module, &framed(label(C), sender, CONFIG, body));
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+
+    let acked = step(&mut module, &committed(0, 11));
+    assert_eq!(acked.len(), 1, "{acked:?}");
+    assert!(
+        matches!(
+            reply_at(&acked[0], C, FRAME_ID, CONFIG),
+            AppendOutcome::Accepted(_)
+        ),
+        "{acked:?}"
+    );
+
+    assert_eq!(
+        step(&mut module, &flushed(&[(P, GEN, 11)])),
+        vec![seal_withheld()]
+    );
+    assert_eq!(rx(&module).durable_seq(), DurableSeq(11));
+}
+
+/// Row 29, the receiver half: the seal is raise-only, a plan that aborts leaves it in place, and
+/// the next plan's `Recovered` moves the copy above it with no clearing code: the new primary's
+/// plain appends stage and are acknowledged. Cut: `sealed()` reading only that a seal was set,
+/// red (the new generation is refused). Unit.
+#[retcd_test]
+fn s5_29_an_aborted_plan_leaves_the_copy_sealed_until_the_next_commit_moves_it_above() {
+    let mut module = applied_to(11);
+    module.seal(B, P, GEN);
+    module.seal(B, P, Generation(1));
+    assert!(rx(&module).sealed(), "a lower generation lowers nothing");
+
+    step(&mut module, &recovered(11, d(11), takeover_config()));
+    assert!(!rx(&module).sealed(), "the commit moved it above the seal");
+
+    let effects = send(
+        &mut module,
+        label(C),
+        &taken_over(chain(12).pop().expect("12")),
+    );
+    let (batch, generation, seq) = staged_batch(&effects);
+    assert_eq!((generation, seq), (NEW_GEN, Seq(12)));
+    let acked = step(&mut module, &committed(batch.0, 12));
+    assert_eq!(acked.len(), 1, "{acked:?}");
+    assert!(
+        matches!(
+            reply_at(&acked[0], C, FRAME_ID, NEW_CONFIG),
+            AppendOutcome::Accepted(_)
+        ),
+        "{acked:?}"
+    );
+}
+
 // --- The recovery source (lead rulings B-R59, B-R59a) --------------------------------------
 //
 // F1 asks B (copy 1), which holds 11..=15, to catch C (copy 2, node C) up through 15. Both

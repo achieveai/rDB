@@ -4585,6 +4585,7 @@ fn f1_rebuilding() -> (Recovery, RecoveryResult) {
             past_horizon: DenyReason::NoGrant,
         },
         retention_millis: 60_000,
+        prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
     };
     let mut f1 = Recovery::new();
     f1_rec(&mut f1, 0, RecoveryEvent::Plan(Box::new(plan)));

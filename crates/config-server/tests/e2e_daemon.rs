@@ -3610,6 +3610,8 @@ async fn e43_admin_rpc(harness: &Harness, endpoint: &str) -> AdminServiceClient<
 }
 
 /// One `RotateGossipKey` step against `endpoint`.
+// `tonic::Status` is large and is the error type of the call under test.
+#[allow(clippy::result_large_err)]
 async fn e43_gossip_op(
     harness: &Harness,
     endpoint: &str,

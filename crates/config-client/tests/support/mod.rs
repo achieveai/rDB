@@ -339,6 +339,8 @@ impl DeadlineSpy {
         }
     }
 
+    // `tonic::Status` is large and is the error type the gRPC trait fixes.
+    #[allow(clippy::result_large_err)]
     async fn answer<T>(&self) -> Result<tonic::Response<T>, tonic::Status> {
         let scripted = self.answer.lock().unwrap().clone();
         match scripted {

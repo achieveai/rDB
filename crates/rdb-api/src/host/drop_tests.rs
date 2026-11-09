@@ -3324,3 +3324,67 @@ fn m10_bb_67_b8_at_its_old_timing_drops_on_the_unreachable_clock() {
     let unreachable_ms = planned[0]["unreachable_ms"].as_str().unwrap_or_default();
     assert!(unreachable_ms.starts_with("Some("), "{planned:?}");
 }
+
+/// #80 S5 row 29, the live owner's route: `start_revoke`, `DurableDrain` and the owner's own
+/// plan, whose inventory seals node 2. The plan's barrier never completes, the rejoin is
+/// abandoned with node 2 still sealed, and the next plan commits without node 3 and moves node
+/// 2 above the seal: no copy is stuck, and writes land. Cut: `sealed()` reading only that a
+/// seal was set, red (node 2 refuses the new generation). Integration (~5 s), as b10.
+#[config_log::retcd_test]
+fn s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_above() {
+    const METHOD: &str =
+        "s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_above";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), |host| {
+        tuned(host);
+        host.restart_shadow = false;
+    });
+    trio.short_window_after_commit();
+    kill(&trio, 3, &[1, 2]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    trio.links.heal_all();
+    let reboot = BootId(trio.nodes[2].0.boot.0 + 1);
+    let mailbox = trio.nodes[2].1.clone();
+    trio.links.register(NodeId(3), mailbox, reboot);
+    for node in 0..2 {
+        trio.nodes[node]
+            .1
+            .send(Msg::PeerBooted {
+                node: NodeId(3),
+                boot: reboot,
+            })
+            .expect("node up");
+    }
+    trio.until("node 1 synchronizes node 3", |trio| {
+        let phase = trio.nodes[0]
+            .0
+            .recoveries
+            .get(&PartitionId(1))
+            .map(Recovery::phase);
+        (phase == Some(RecoveryPhase::Synchronizing)).then_some(())
+    });
+    let sealed = |trio: &Trio| {
+        trio.nodes[1]
+            .0
+            .replication
+            .receiver(NodeId(2), PartitionId(1))
+            .is_some_and(AppendReceiver::sealed)
+    };
+    assert!(sealed(&trio), "node 2 answered the plan's inventory");
+    hold_three(&trio);
+
+    let after = dropped_three(&mut trio, before);
+    assert!(
+        !logged!(METHOD, "rejoin_abandoned").is_empty(),
+        "the sealed plan was the abandoned one"
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert!(result.generation >= after, "{result:?}"),
+        other => panic!("a put after the abandon: {other:?}"),
+    }
+    assert!(
+        !sealed(&trio),
+        "the next commit moved node 2 above its seal"
+    );
+}
