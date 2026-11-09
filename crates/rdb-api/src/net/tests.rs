@@ -69,9 +69,10 @@ const fn kind(msg: &WireMsg) -> usize {
         WireMsg::Client { .. } => 6,
         WireMsg::Inspect { .. } => 7,
         WireMsg::Answered { .. } => 8,
+        WireMsg::DurableProved { .. } => 9,
     }
 }
-const KINDS: usize = 9;
+const KINDS: usize = 10;
 
 /// `msg` as the far side of a link posts it, and the kind it travelled as.
 fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
@@ -257,6 +258,11 @@ fn calls() -> Vec<ClientCall> {
         identity: identity(4, 32),
         generation: Some(zero()),
     });
+    calls.push(ClientCall::WaitDurable {
+        generation: zero(),
+        through: zero(),
+        remaining_millis: 5_000,
+    });
     calls.push(ClientCall::Rebuild {
         identity: identity(4, 33),
         node: NodeId(4),
@@ -357,6 +363,7 @@ fn answers() -> Vec<Answer> {
         Answer::Unchanged,
         Answer::Status(zero()),
         Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
+        Answer::Durable,
         Answer::Moved(MoveAnswer {
             done: true,
             line: "already moved: node 3 to node 4".to_owned(),
@@ -458,6 +465,24 @@ fn every_message_kind_crosses_the_wire_unchanged() {
                 generation: zero(),
                 post_commit: true,
             },
+        },
+        Msg::PeerAsk {
+            asker: NodeId(2),
+            partition: PartitionId(1),
+            correlation: zero(),
+            ask: PeerAsk::DurableThrough {
+                copy: CopyId(3),
+                through: zero(),
+                generation: zero(),
+                barrier: 7,
+            },
+        },
+        Msg::DurableProved {
+            partition: PartitionId(1),
+            barrier: 7,
+            copy: CopyId(3),
+            generation: zero(),
+            through: zero(),
         },
         Msg::CatchUp {
             asker: NodeId(1),
@@ -1610,7 +1635,7 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 6");
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 7");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a

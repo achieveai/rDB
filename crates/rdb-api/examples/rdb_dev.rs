@@ -106,6 +106,8 @@
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
+//! barrier [--group G] <generation> <seq> [<timeout-ms>]
+//!                                         `Db::wait_durable` on a put's position
 //! put --as <n> <object> <value> [--if-version N]
 //!                                         the same put under request id app_request_id(n),
 //!                                         your own number n below 2^63, used once; recorded
@@ -1998,6 +2000,14 @@ fn repl<'scope, 'env>(
                 })
             }
             ["put-loop", ..] => Err(PUT_LOOP_USAGE.to_owned()),
+            ["barrier", "--group", group, generation, seq, rest @ ..] => parse_group(group)
+                .and_then(|group| barrier_line(db, group, generation, seq, rest))
+                .map(|ok| bad |= !ok),
+            ["barrier", generation, seq, rest @ ..] => {
+                barrier_line(db, rdb_api::db::DEFAULT_GROUP, generation, seq, rest)
+                    .map(|ok| bad |= !ok)
+            }
+            ["barrier", ..] => Err(BARRIER_USAGE.to_owned()),
             ["client", "drop-reply"] => {
                 say(drop_reply_line(drop_reply));
                 drop_reply = true;
@@ -2833,10 +2843,10 @@ fn log_command(line: &str) {
 /// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
 /// object it writes or reads, when it names one. A line `split_words` refuses names no object.
 fn command_fields(line: &str) -> (&'static str, Option<String>) {
-    const VERBS: [&str; 27] = [
+    const VERBS: [&str; 28] = [
         "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
-        "sleep", "quit", "exit", "blob", "client", "put-loop",
+        "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier",
     ];
     const SUBVERBS: [&str; 27] = [
         "put --as",
@@ -4645,6 +4655,42 @@ fn lost_reply_text(request: RequestId) -> String {
 }
 
 const PUT_LOOP_USAGE: &str = "put-loop <count> <gap-ms> [<object>]";
+
+const BARRIER_USAGE: &str = "barrier [--group G] <generation> <seq> [<timeout-ms>]";
+
+/// `barrier`: `Db::wait_durable` on a position, and its answer. `false` when it was refused.
+fn barrier_line(
+    db: &Db,
+    group: rdb_api::AffinityId,
+    generation: &str,
+    seq: &str,
+    rest: &[&str],
+) -> Result<bool, String> {
+    let timeout = match rest {
+        [] => 5_000,
+        [millis] => millis.parse().map_err(|_| BARRIER_USAGE.to_owned())?,
+        _ => return Err(BARRIER_USAGE.to_owned()),
+    };
+    let position = (
+        rdb_api::Generation(generation.parse().map_err(|_| BARRIER_USAGE.to_owned())?),
+        rdb_api::Seq(seq.parse().map_err(|_| BARRIER_USAGE.to_owned())?),
+    );
+    let started = Instant::now();
+    match db.wait_durable(group, position, Duration::from_millis(timeout)) {
+        Ok(()) => {
+            let millis = started.elapsed().as_millis();
+            say(&format!(
+                "durable generation={} seq={} millis={millis}",
+                position.0 .0, position.1 .0
+            ));
+            Ok(true)
+        }
+        Err(error) => {
+            say(&format!("err {} ({})", error.name(), error.explain()));
+            Ok(false)
+        }
+    }
+}
 
 /// `put-loop`'s count, gap and object (default `loop`).
 fn parse_put_loop<'a>(

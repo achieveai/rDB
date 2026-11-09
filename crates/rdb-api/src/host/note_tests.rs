@@ -15,7 +15,7 @@ use rdb_core::contracts::recovery::WithoutEntry;
 const P: PartitionId = PartitionId(1);
 const INSTANCE: [u8; INSTANCE_LEN] = [9; INSTANCE_LEN];
 
-fn tune(host: &mut Host) {
+pub(super) fn tune(host: &mut Host) {
     Trio::fast(host);
     host.engine.bind_instance(INSTANCE).expect("bind instance");
     host.instance = Some(INSTANCE);
@@ -23,7 +23,7 @@ fn tune(host: &mut Host) {
     host.budgets.renew_millis = 300;
 }
 
-fn formed(dir: &std::path::Path, tuned: impl Fn(&mut Host)) -> Trio {
+pub(super) fn formed(dir: &std::path::Path, tuned: impl Fn(&mut Host)) -> Trio {
     let mut trio = Trio::new(dir, tuned);
     trio.rt
         .block_on(crate::admin::count_open(
@@ -151,7 +151,7 @@ fn s5n_31_34_a_recovery_without_the_primary_and_a_secondary_says_so_on_the_owner
 
 /// Node `n` restarts: its host closes and a new one opens its engine in `dir`, as
 /// `drop_tests::restart` does, tuned for these rows.
-fn restart(trio: &mut Trio, dir: &std::path::Path, n: u32, tuned: impl Fn(&mut Host)) {
+pub(super) fn restart(trio: &mut Trio, dir: &std::path::Path, n: u32, tuned: impl Fn(&mut Host)) {
     let at = usize::try_from(n - 1).expect("a trio node");
     let (old, _, _) = trio.nodes.remove(at);
     let boot = BootId(old.boot.0 + 1);

@@ -436,7 +436,7 @@ stateDiagram-v2
 
 | Setting | Initial default | Contract |
 |---|---|---|
-| Group WAL sync | 10 ms scheduling target | No guaranteed maximum; record completed sync latency and durable age |
+| Group WAL sync | Background flush every 100 ms, and a waited sync starts at once | No guaranteed maximum; record completed sync latency and durable age |
 | All-regular-copy propagation | p99 ≤20 ms healthy local target | Measured from local apply to minimum regular `buffered_applied_seq`; not guaranteed RPO |
 | Unsafe-age warning | 1,000 ms | Age of oldest applied transaction not durably present on required regular copies |
 | Unsafe-age pause | 2,000 ms | Reject new admission within additional 100 ms under tested scheduler budget |

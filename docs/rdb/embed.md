@@ -569,7 +569,10 @@ floor), so the table above no longer limits it.
 Writes can pause without any error in your code. Most pauses end by themselves, and none
 loses data. A write made meanwhile is refused.
 
-**What happened to the write is in `refused.error.no_mutation`, not in the refusal's name.**
+**What happened to the write is in `refused.error.no_mutation`, not in the refusal's name.** This
+is about a refused write. `db.wait_durable(..)` is not a write and has no earlier send: its `Err`
+always has `no_mutation` false, and that says nothing about the write it was asked about. Settle
+the write from the write's own answer. There is nothing to resend.
 
 - **`no_mutation` true:** this send wrote nothing, and no earlier send exists: a first send of
   a new write. Send it again as a **new** write (`db.put`, `db.txn` or `db.write`), not with
@@ -590,12 +593,30 @@ first send refused with it true goes again as a new write, and anything else as 
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
 | `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd answers this for as long as it is cut. | After `db.wait_ready(..)`. |
 | `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` re-reads the owner on this answer, so the retry goes to the new one. |
+| `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without proof from every regular copy; the message names the copies still owed. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
 | `UNAVAILABLE`, "went out of reach ...; a write sent here may have applied" | The owner's process stopped after the write was sent (`no_mutation` false). | Once it is back: `db.resend(..)` the request, or ask `db.status(..)`. |
 | `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
+
+`db.node_status()` answers for partition 1. `db.node_status_in(partition)` is the same answer for
+any partition, in node order, with a node that does not answer left out. Use it to read a
+partition's `committed_without`. A partition the database does not have is `INVALID_ARGUMENT`.
+
+Both ask only the nodes this process runs. **An app-only `Db` runs none, so both return an empty
+list there, every time.** That does not mean the database has no nodes, and it says nothing about
+a partition's note. In a `Db` that runs nodes, an empty list means none of them answered.
+
+**To know a write is on disk, use `db.wait_durable(group, (generation, seq), timeout)`** with the
+`generation` and `seq` of a `PutOk`. It makes every regular copy sync and answers `Ok` when all
+have. `Ok` proves every record in the current history at or below that position, and says nothing
+about a record a recovery cut. After `GENERATION_CHANGED`, read back. To know a set of keys is
+durable, finish only when each key's read `generation`, each rewrite's `PutOk.generation` and the
+marker's `PutOk.generation` are equal and the barrier on the marker answers `Ok`, and reject any
+read with `recovery_mode` true. Anything else starts the pass again. This comparison is not a
+fence, and can cost one extra pass at seq 0. A barrier never holds up a write.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote

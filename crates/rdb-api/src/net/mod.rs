@@ -80,8 +80,7 @@ use self::faults::Faults;
 use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, WireReply};
 
 /// The wire version this build speaks. A peer that speaks another is refused at the
-/// handshake, naming both. Move it whenever a type in [`wire`] changes, once a build that speaks
-/// it has been released. `3` came with M10 S2 (41cc012) and no released build speaks it, so
+/// handshake, naming both. `3` came with M10 S2 (41cc012) and no released build speaks it, so
 /// `WireNodeStatus::pinned` (review-s2 F-004, A-R412) was added under `3`, not `4`.
 /// `4` came with M11: `WireCall::Move` and `WireAnswer::Moved` (ruling A-R449), so a build
 /// speaking `3` is refused at the handshake rather than failing to decode a move.
@@ -93,7 +92,14 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireNodeStatus::{qualifying_copy, clock_bound_lost, committed_without}`, and
 /// `RecoveryPlan::prior`, which a routed `Plan` carries. Those were written as a `4` on a branch
 /// that never met `5`, and no build speaking that `4` was released.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// `7` came with #90: `WireCall::WaitDurable`, `WireAnswer::Durable`,
+/// `WirePeerAsk::DurableThrough`, `WireMsg::DurableProved` and the `DurabilityUnconfirmed` error
+/// kind. The rule from here on: a merge that changes a type in [`wire`] moves this to the next
+/// free number at that merge, and any build handed to a customer counts as released. No branch
+/// reserves a number. The same number with different types passes the handshake, and a frame
+/// that does not decode ends the connection.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -1022,8 +1028,8 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
             let identity = call.identity();
             tracing::info!(
                 n,
-                client = identity.client.0,
-                request = identity.request.0,
+                client = identity.map(|identity| identity.client.0),
+                request = identity.map(|identity| identity.request.0),
                 call = call.name(),
                 from = %conn.peer,
                 to = msg.to().0,

@@ -31,6 +31,13 @@ const OPEN_AGAIN: &str = "open the folder again";
 /// The tail `admin.rs` ends a store error with when a delete may have applied: it already says
 /// to run the call again, which a "retrying will not help" step would contradict (rdb_dev row
 /// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
+/// The next step of every `Err` of `Db::wait_durable` (#90, S5d-9). It replaces `step_for`,
+/// whose text for a kind with `no_mutation` false says to `Db::resend`: a barrier has nothing to
+/// resend.
+pub(crate) const BARRIER_STEP: &str = "the barrier wrote nothing and says nothing about the \
+     write; there is nothing to `Db::resend`; call `Db::wait_durable` again, or after \
+     `GENERATION_CHANGED` read back and write what is missing as new writes";
+
 const RUN_AGAIN: &str = "run it again to read where it stands";
 
 /// The tail of [`ApiError::owner_lost_admin`]: its detail names the step, and an admin call has
@@ -298,6 +305,7 @@ impl ApiError {
         if reopen
             || self.detail.ends_with(RUN_AGAIN)
             || self.detail.ends_with(REBUILD_STEP)
+            || self.detail.ends_with(BARRIER_STEP)
             || self.detail.ends_with(MOVE_STEP)
             || self.detail.ends_with(MOVE_ENDED)
             || self.detail.ends_with(ADMIN_LOST_STEP)
@@ -450,6 +458,12 @@ const fn step_for(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> &'sta
              `scripts/local-rdb.sh status`)"
         }
         ErrorKind::UploadChunkConflict => "start the upload again under a new upload id",
+        // `Db::wait_durable` ends every `Err` with [`BARRIER_STEP`], so this is not reached from
+        // there; `step_for` is total. Same meaning.
+        ErrorKind::DurabilityUnconfirmed => {
+            "the barrier wrote nothing and says nothing about the write; there is no request to \
+             send again; call `Db::wait_durable` again"
+        }
         ErrorKind::CorruptBlob => "write `Change::Clear` to the blob, then upload it again",
     }
 }
@@ -590,6 +604,7 @@ mod tests {
             Unavailable,
             UploadChunkConflict,
             CorruptBlob,
+            DurabilityUnconfirmed,
         ];
         for kind in &all {
             match kind {
@@ -613,7 +628,8 @@ mod tests {
                 | DivergenceRequiresOperator
                 | Unavailable
                 | UploadChunkConflict
-                | CorruptBlob => {}
+                | CorruptBlob
+                | DurabilityUnconfirmed => {}
             }
         }
         all

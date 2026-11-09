@@ -135,6 +135,9 @@ pub enum ErrorKind {
     UploadChunkConflict,
     /// A stored blob's manifest or chunks fail their checks. Quarantine and escalate.
     CorruptBlob,
+    /// `Db::wait_durable` ended without proof from every regular copy (#90). It says nothing
+    /// about the write it was asked about.
+    DurabilityUnconfirmed,
 }
 
 /// Every error the rDB kernel may return to a caller or to the harness.
@@ -409,6 +412,10 @@ impl RdbError {
     /// 1–10 run before the dedup lookup (ADR-rdb-0004 §3), so a resend of an identity that has
     /// already applied can be refused here, and `true` is still the right answer for that send.
     /// `false` means "not proven", never "written".
+    ///
+    /// This holds for a write refused with the error. A barrier (`Db::wait_durable`) has no write
+    /// of its own, and sets `no_mutation` false on every `Err` it returns, `GenerationChanged`
+    /// included (#90).
     ///
     /// [`RetryRule::NotWired`] is **not** proof (finding K-F-26). An unwired module has not
     /// mutated anything, but the module that returned `Unavailable` may not be the only one the

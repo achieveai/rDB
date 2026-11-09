@@ -88,6 +88,15 @@ pub(super) fn spawn_promote(
     trio: &Trio,
     to: u32,
 ) -> tokio::task::JoinHandle<Result<crate::admin::Promoted, crate::admin::PromoteError>> {
+    spawn_promote_dropping(trio, to, None)
+}
+
+/// [`spawn_promote`], dropping `drop` from the membership.
+pub(super) fn spawn_promote_dropping(
+    trio: &Trio,
+    to: u32,
+    drop: Option<NodeId>,
+) -> tokio::task::JoinHandle<Result<crate::admin::Promoted, crate::admin::PromoteError>> {
     let at = usize::try_from(to - 1).expect("a trio node");
     let (members, members_version) = crate::admin::promote_members(
         PartitionId(1),
@@ -104,7 +113,7 @@ pub(super) fn spawn_promote(
         clock: trio.clock,
         partition: PartitionId(1),
         to: NodeId(to),
-        drop: None,
+        drop,
         owner_must_be_dead: false,
         look_within: Duration::from_secs(1),
         within: test_patience(Duration::from_secs(10)),
@@ -246,6 +255,48 @@ fn late_put(method: &'static str, dir: &std::path::Path, refuse: bool) -> Late {
         admitted,
         copy_applied,
     }
+}
+
+/// Row 39 of #80 S5d, on row 26's schedule: node 1's clock lags and it still holds grant, node 3
+/// has answered the recovery's inventory, and node 1's barrier over the first put is never `Ok`,
+/// because node 3 refuses to prove more once it is sealed.
+/// Integration (~4 s): the promote waits out the grant.
+#[config_log::retcd_test]
+fn s5d_39_a_barrier_from_the_old_owner_after_the_seal_is_never_ok() {
+    const METHOD: &str = "s5d_39_a_barrier_from_the_old_owner_after_the_seal_is_never_ok";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, faults) = formed(dir.path());
+    let (generation, through) = super::barrier_tests::written(&mut trio, 1, b"a");
+    renewal_landed_then_no_more(&mut trio);
+    faults.apply("cut-control");
+
+    let promote = spawn_promote(&trio, 2);
+    only_until(&mut trio, &[1, 2], "node 3 answered the inventory", |_| {
+        logged!(METHOD, "inventory_reported")
+            .iter()
+            .any(|line| line["node"] == 3)
+            .then_some(())
+    });
+
+    let answer = trio.call(super::barrier_tests::wait_durable(generation, through, 400));
+    let got = only_until(&mut trio, &[0, 2], "node 1 answered the barrier", |_| {
+        answer.try_recv().ok()
+    });
+    assert!(!matches!(got, Answer::Durable), "{got:?}");
+    let lines = logged!(METHOD, "durable_through_refused");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["node"] == 3 && line["reason"] == "sealed"),
+        "{lines:?}"
+    );
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
 }
 
 /// The checkpoints A1 on node 1 admitted so far, oldest first.

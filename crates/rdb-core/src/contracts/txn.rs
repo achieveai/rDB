@@ -291,8 +291,8 @@ pub enum Durability {
     /// success class (spec §5.1). For `RecoveredApplied`, not a live copy count; the partition's
     /// mode says how many copies hold it.
     BufferedOnTwo,
-    /// Additionally confirmed by an fsync boundary on every required regular copy. Reported by
-    /// status, never the precondition for a client reply.
+    /// Additionally confirmed by an fsync boundary on every required regular copy. No write's
+    /// reply reports it and none waits for it; `Db::wait_durable` is how a caller asks (#90).
     DurableOnRequiredCopies,
 }
 

@@ -7,7 +7,7 @@ use rdb_server::{check_listen, code_for, rdb_error_of, to_status, wire_kind, wir
 
 /// Every kind, in the proto's order. `wire_kind` is exhaustive, so a new kind fails to compile
 /// there first; this list is then one more place to add it.
-const KINDS: [ErrorKind; 21] = [
+const KINDS: [ErrorKind; 22] = [
     ErrorKind::NotPrimary,
     ErrorKind::RouteChanged,
     ErrorKind::LeaseExpired,
@@ -29,6 +29,7 @@ const KINDS: [ErrorKind; 21] = [
     ErrorKind::Unavailable,
     ErrorKind::UploadChunkConflict,
     ErrorKind::CorruptBlob,
+    ErrorKind::DurabilityUnconfirmed,
 ];
 
 const RULES: [RetryRule; 8] = [
@@ -45,7 +46,7 @@ const RULES: [RetryRule; 8] = [
 /// Each kind's fixed place on the wire, written out by hand: its name and number in
 /// `proto/rdb/v1/rdb.proto`, and its advisory gRPC code. Not derived from the code under test,
 /// so swapping two arms of `wire_kind` or `code_for` turns a row red (review F-007).
-const KIND_TABLE: [(ErrorKind, &str, i32, tonic::Code); 21] = {
+const KIND_TABLE: [(ErrorKind, &str, i32, tonic::Code); 22] = {
     use tonic::Code as C;
     use ErrorKind as K;
     [
@@ -120,6 +121,12 @@ const KIND_TABLE: [(ErrorKind, &str, i32, tonic::Code); 21] = {
             C::FailedPrecondition,
         ),
         (K::CorruptBlob, "CORRUPT_BLOB", 21, C::DataLoss),
+        (
+            K::DurabilityUnconfirmed,
+            "DURABILITY_UNCONFIRMED",
+            22,
+            C::Unavailable,
+        ),
     ]
 };
 
