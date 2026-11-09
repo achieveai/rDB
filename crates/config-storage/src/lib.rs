@@ -14,6 +14,10 @@
 //! `state_hash` oracle is comparable across store kinds.
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
+// `openraft::StorageError` is 224 bytes and it is OpenRaft's type: the storage traits return it
+// directly, and so do the closures that run inside them (`in_scope(|| ...)`), which newer
+// clippy lints one by one. Boxing would only mean unboxing at every call site.
+#![allow(clippy::result_large_err)]
 
 pub mod ephemeral;
 pub mod fault;

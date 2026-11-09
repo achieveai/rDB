@@ -547,7 +547,7 @@ pub fn list_snapshots(data_dir: &Path) -> Result<Vec<(String, PathBuf)>, Snapsho
         }
         out.push((stem.to_string(), path));
     }
-    out.sort_by(|a, b| id_sort_key(&b.0).cmp(&id_sort_key(&a.0)));
+    out.sort_by_key(|a| std::cmp::Reverse(id_sort_key(&a.0)));
     Ok(out)
 }
 
