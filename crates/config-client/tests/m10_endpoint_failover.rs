@@ -17,7 +17,7 @@ use config_core::{
 use config_log::retcd_test;
 use config_testkit::tls::TlsFixture;
 
-use support::{Node, ResetServer};
+use support::{dead_endpoint, Node, ResetServer};
 
 const SEED: u64 = 0x5eed_d014;
 
@@ -37,14 +37,16 @@ fn put() -> PutRequest {
     }
 }
 
-/// An address nothing listens on: bound, read and released.
-async fn dead_endpoint() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener);
-    addr.to_string()
+/// Every row here depends on this: a released port goes back to the pool, and on
+/// 2026-11-09 a sibling test's node drew one, so a "dead" endpoint answered a read. Cut:
+/// release the socket in `dead_endpoint`, and this bind succeeds.
+#[retcd_test]
+async fn m10_a_dead_endpoint_keeps_its_port_for_the_whole_run() {
+    let dead = dead_endpoint().await;
+    assert!(
+        tokio::net::TcpListener::bind(dead.as_str()).await.is_err(),
+        "{dead} went back to the pool"
+    );
 }
 
 /// D14: the first endpoint is dead and the second is live. The put lands on the second,

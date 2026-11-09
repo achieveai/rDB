@@ -21,7 +21,7 @@ use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::MemStore;
 use futures::StreamExt;
 
-use support::{start_nodes, start_spy, Node};
+use support::{dead_endpoint, start_nodes, start_spy, Node};
 
 fn options() -> GrpcClientOptions {
     GrpcClientOptions {
@@ -44,16 +44,6 @@ fn watch_request(prefix: &'static [u8], start_after_revision: u64) -> WatchReque
         start_after_revision,
         progress_interval: None,
     }
-}
-
-/// An address nothing listens on: bound, read and released.
-async fn dead_endpoint() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener);
-    addr.to_string()
 }
 
 /// #57: the first endpoint answers `NotLeader` with a hint; the watch opens at the hinted

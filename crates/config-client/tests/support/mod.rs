@@ -177,6 +177,21 @@ pub struct Node {
     handle: ServerHandle,
 }
 
+/// An address nothing listens on, which stays that way for the life of the test binary.
+///
+/// The socket is bound and never listens, so a dial is refused. It is leaked on purpose:
+/// tests in one binary run in parallel and draw ports from one pool, so a port released
+/// here can be handed to a sibling's `Node`, and the "dead" endpoint then answers.
+pub async fn dead_endpoint() -> String {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind("127.0.0.1:0".parse().expect("loopback"))
+        .expect("bind");
+    let addr = socket.local_addr().expect("addr");
+    std::mem::forget(socket);
+    addr.to_string()
+}
+
 impl Node {
     pub async fn start() -> Node {
         Node::start_with(TlsMode::Insecure, cluster()).await

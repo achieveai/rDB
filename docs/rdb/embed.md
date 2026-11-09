@@ -622,7 +622,7 @@ read with `recovery_mode` true. Anything else starts the pass again. This compar
 fence, and can cost one extra pass at seq 0. A barrier never holds up a write.
 
 A copy that stops answering ends a barrier in `DURABILITY_UNCONFIRMED` at its timeout if that comes
-before the copy is dropped. With a timeout under `peer_drop_after_millis` (10 s by default), expect
+before the copy is dropped. With a timeout under `PEER_DROP_AFTER_MILLIS` (10 s), expect
 that, not `GENERATION_CHANGED`, and treat either as "read back".
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
