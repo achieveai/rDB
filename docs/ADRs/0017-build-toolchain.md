@@ -32,3 +32,15 @@ whenever `C:\Program Files\LLVM\bin` was not on `PATH` (the Windows loader ignor
 now in the workspace pin: `clang-sys` then loads `libclang` through `libloading` and honours
 `LIBCLANG_PATH` from `.cargo/config.toml`. Putting LLVM `bin` on `PATH` still works but is a
 per-machine workaround, not the recorded fix. Cold RocksDB build measured at ~2m47s.
+
+### Note (2026-11-08): `.cargo/config.toml` no longer sets `LIBCLANG_PATH` (issue #85)
+
+Cargo's `[env]` table cannot be limited to one OS. The Windows value in `.cargo/config.toml`
+(`force = false`) therefore reached Linux builds inside this repository too; with that path set,
+`bindgen` searched only there and failed with `Unable to find libclang ... (invalid: [])` until
+the caller set `LIBCLANG_PATH` by hand. Outside the repository the file is never read, so a
+consumer crate was never affected by it. The entry is removed. With `bindgen-runtime`, `clang-sys`
+finds the standard LLVM locations itself (Windows: `C:\Program Files*\LLVM`, Scoop, Visual Studio;
+Linux: `/usr/lib/llvm-*/lib` once `libclang-dev` is installed), and a `LIBCLANG_PATH` in the
+environment still wins. A Windows host with LLVM in a non-standard folder sets the variable in its
+own shell or user-level `~/.cargo/config.toml`. Linux prerequisite: `build-essential`, `libclang-dev`.
