@@ -77,6 +77,8 @@ pub(crate) struct Collecting {
     lost: BTreeMap<CopyId, InventoryOutcome>,
     transfers: BTreeMap<CopyId, TransferWatch>,
     highest_advertised: Seq,
+    /// Each copy that answered `TailHeld`, with the head it named (issue #105).
+    held: BTreeMap<CopyId, Seq>,
 }
 
 impl Collecting {
@@ -98,7 +100,13 @@ impl Collecting {
             lost: BTreeMap::new(),
             transfers: BTreeMap::new(),
             highest_advertised: Seq(0),
+            held: BTreeMap::new(),
         }
+    }
+
+    /// The copies that answered `TailHeld`, and the head each named.
+    pub(crate) fn held(&self) -> &BTreeMap<CopyId, Seq> {
+        &self.held
     }
 
     /// `Fenced` until the first report or transfer arrives.
@@ -190,6 +198,34 @@ impl Collecting {
             return self.shadows.contains(&copy);
         }
         false
+    }
+
+    /// A queried copy answered with a tail it cannot report as a survivor (issue #105). Its head
+    /// is kept for the mode whenever it lands, even after the copy was recorded lost or the
+    /// window closed: a tail is never dropped for being late. It counts as advertised, so the
+    /// loss record says the cut is uncertain. Admitted, the copy has answered: it is recorded
+    /// ineligible and does not hold the window.
+    pub(crate) fn tail_held(&mut self, copy: CopyId, head: Seq, emit: &mut Emit<'_>) {
+        if !self.queried.contains(&copy) {
+            emit.ignored(ReplicaIgnoreReason::NotASource);
+            return;
+        }
+        let held = self.held.entry(copy).or_insert(head);
+        *held = (*held).max(head);
+        self.highest_advertised = self.highest_advertised.max(head);
+        if matches!(self.window, Window::Probing { .. }) || self.lost.contains_key(&copy) {
+            emit.ignored(ReplicaIgnoreReason::Recorded);
+            return;
+        }
+        self.verified.remove(&copy);
+        self.transfers.remove(&copy);
+        let reason = UnavailableReason::TailHeld;
+        self.record_lost(
+            copy,
+            InventoryOutcome::Ineligible { copy, reason },
+            reason,
+            emit,
+        );
     }
 
     /// A source is still delivering its advertised prefix.

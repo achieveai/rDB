@@ -124,6 +124,16 @@ impl Replication {
             .insert((receiver.node(), receiver.partition()), receiver);
     }
 
+    /// Remove the receiver for `(node, partition)`, returning it, if one is installed. The next
+    /// `Recovered` then builds a fresh one at the root, which only a catch-up from seq 1 fills.
+    pub fn remove_receiver(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+    ) -> Option<AppendReceiver> {
+        self.receivers.remove(&(node, partition))
+    }
+
     /// The receiver for `(node, partition)`, if one is installed.
     #[must_use]
     pub fn receiver(&self, node: NodeId, partition: PartitionId) -> Option<&AppendReceiver> {

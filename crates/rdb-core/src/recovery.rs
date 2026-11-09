@@ -174,6 +174,18 @@ pub const fn mode_for(eligible_regulars: usize) -> PartitionMode {
     }
 }
 
+/// The mode a commit takes (issue #105): [`mode_for`] the eligible regular copies, but never
+/// writable while `capped`, because a queried copy holds a tail above the selected cutoff that
+/// writes may have been acknowledged on. Capped, the partition takes no writes and no rebuild
+/// arms; the records stay where they are.
+#[must_use]
+pub fn mode_after(eligible_regulars: usize, capped: bool) -> PartitionMode {
+    match mode_for(eligible_regulars) {
+        PartitionMode::DegradedRf2 | PartitionMode::Active if capped => PartitionMode::ReadOnly,
+        mode => mode,
+    }
+}
+
 /// The lineage a recovery commits: the next generation, and the next owner epoch
 /// (spec §8.1 "a new generation/epoch"; contract ask Q4).
 #[must_use]
@@ -259,6 +271,39 @@ struct Decided {
     /// The catch-up each lagging holder was sent at selection, kept so a retry can send it
     /// again: a held link drops what was posted, so a longer deadline alone recovers nothing.
     catch_ups: BTreeMap<CopyId, RecoveryEffect>,
+    /// Each copy that answered `TailHeld`, in any phase before the CAS, with the highest head it
+    /// named (issue #105, M6).
+    held: BTreeMap<CopyId, Seq>,
+    /// Fixed when the CAS is built: a held head is above the cutoff, so the commit is not
+    /// writable and arms no rebuild ([`mode_after`]). A tail heard after that is too late for
+    /// this run.
+    capped: bool,
+}
+
+impl Decided {
+    /// Record a tail heard after selection (M6). Only a head above the cutoff caps the commit,
+    /// but every one is kept, the highest per copy.
+    fn hold(&mut self, copy: CopyId, head: Seq, emit: &mut Emit<'_>) {
+        let held = self.held.entry(copy).or_insert(head);
+        *held = (*held).max(head);
+        tracing::info!(
+            partition = emit.event().partition.0,
+            copy = copy.0,
+            head = head.0,
+            cutoff = self.selected.cutoff_seq.0,
+            "recovery_tail_held_late"
+        );
+        emit.ignored(ReplicaIgnoreReason::Recorded);
+    }
+
+    /// The held copies whose head is above the selected cutoff, in copy order.
+    fn held_above_cutoff(&self) -> Vec<(CopyId, Seq)> {
+        self.held
+            .iter()
+            .filter(|(_, head)| **head > self.selected.cutoff_seq)
+            .map(|(copy, head)| (*copy, *head))
+            .collect()
+    }
 }
 
 impl Decided {
@@ -638,6 +683,12 @@ impl Recovery {
                     return self.decide(ctx, run, emit);
                 }
             }
+            Input::Recovery(RecoveryEvent::TailHeld { copy, head, .. }) => {
+                collect.tail_held(*copy, *head, emit);
+                if collect.close_if_all_answered(emit) {
+                    return self.decide(ctx, run, emit);
+                }
+            }
             Input::Recovery(RecoveryEvent::TransferProgress {
                 copy,
                 advertised_seq,
@@ -768,6 +819,18 @@ impl Recovery {
             }
             Input::Recovery(RecoveryEvent::Plan(plan)) => {
                 self.hold_plan(plan, emit);
+                None
+            }
+            // M6 (issue #105): a tail heard before the CAS is built still caps it.
+            Input::Recovery(RecoveryEvent::TailHeld { copy, head, .. }) => {
+                decided.hold(*copy, *head, emit);
+                None
+            }
+            // A late survivor above the cutoff holds records the commit would leave behind.
+            Input::Recovery(RecoveryEvent::InventoryReported(inv))
+                if inv.head.0 > decided.selected.cutoff_seq =>
+            {
+                decided.hold(inv.copy, inv.head.0, emit);
                 None
             }
             Input::Recovery(RecoveryEvent::FenceProven(proof))
@@ -919,6 +982,17 @@ impl Recovery {
         match RecoveryBarrier::try_new(&held, &decided.required, cutoff, digest) {
             Ok(barrier) => {
                 decided.note = note_after(&decided);
+                let held = decided.held_above_cutoff();
+                decided.capped = !held.is_empty();
+                if decided.capped {
+                    tracing::warn!(
+                        partition = emit.event().partition.0,
+                        generation = decided.selected.root.generation.0,
+                        cutoff = decided.selected.cutoff_seq.0,
+                        held = ?held.iter().map(|(copy, head)| (copy.0, head.0)).collect::<Vec<_>>(),
+                        "recovery_capped_by_tail"
+                    );
+                }
                 let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
                 let cas = Cas::new(
                     decided.record,
@@ -1563,7 +1637,10 @@ fn select(
         instance,
         run: proof.control_revision,
     });
+    let held = collect.held().clone();
     let decided = Decided {
+        held,
+        capped: false,
         loss: loss_record(&collect, &selected),
         inventories: collect.outcomes(),
         plan,
@@ -1652,8 +1729,10 @@ fn commit(
         deadline: _,
         attempt: _,
         catch_ups: _,
+        held: _,
+        capped,
     } = decided;
-    let mode = mode_for(required.len());
+    let mode = mode_after(required.len(), capped);
     let cutoff = selected.cutoff_seq;
     let retained_status_map = RetainedStatusMap {
         predecessor_generation: proof.prior_generation,
@@ -1672,7 +1751,10 @@ fn commit(
         .copied()
         .filter(|&copy| is_regular(&plan.config, copy))
         .collect();
-    let rebuild = (mode != PartitionMode::Active
+    // Capped by a held tail, no rebuild arms (issue #105): its completion would make the
+    // partition `Active` at a cutoff below records a live copy holds.
+    let rebuild = (!capped
+        && mode != PartitionMode::Active
         && mode_for(rebuild_required.len()) == PartitionMode::Active)
         .then(|| Rebuild::new(rebuild_required, (cutoff, selected.cutoff_digest)));
     let result = RecoveryResult {

@@ -603,3 +603,116 @@ fn s4d_a_lone_survivor_with_a_tail_holds_its_repair_and_stops_recommitting() {
     assert!(text.contains("on node 3"), "{text}");
     assert!(text.contains("held_past_base"), "{text}");
 }
+
+/// #105 W-C, walk C's schedule: K2 is acknowledged `BufferedOnTwo` on nodes 1 and 3 only, the
+/// operator promotes node 2 (which lacks it), node 3 returns live and still holds K2, and node 1
+/// comes back with its data gone. Before the guard the partition went writable at G5 with cutoff
+/// below K2: K2 read absent, and the next write took K2's seq, while node 3 held K2 and no error
+/// reached a client. Now no generation goes writable while node 3 answers.
+/// Cut: `Recovery`'s `mode_after` answers `mode_for`, red (the put is accepted at K2's seq).
+/// Integration (~45 s): the grant wait, the promote, a reopen and the window a repair would use.
+#[config_log::retcd_test]
+fn w_c_a_write_acked_on_two_copies_is_not_lost_while_a_live_copy_holds_it() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let mut formed = opened(&rt, dir.path(), &store);
+    formed.shutdown();
+    drop(formed);
+
+    let links = Links::new();
+    let mut nodes: Vec<Option<Db>> = [1, 2, 3]
+        .map(|node| Some(open_process(&rt, dir.path(), &store, node, &links)))
+        .into();
+    for db in nodes.iter().flatten() {
+        db.wait_ready(patience).expect("each node is ready");
+    }
+    let app_dir = config_testkit::fs::temp_dir();
+    let app = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::clone(&links)),
+                client: ClientId(2),
+                ..config(app_dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the app opens");
+    app.wait_ready(patience).expect("the app sees the owner");
+
+    let k1 = app.put(b"k1", b"one", None).expect("k1 in G");
+    app.wait_durable(GROUP_OF, position(&k1), LONG)
+        .expect("k1 is on every disk");
+    links.hold(NodeId(1), NodeId(2));
+    links.hold(NodeId(2), NodeId(3));
+    let k2 = app
+        .put(b"k2", b"two", None)
+        .expect("k2 in G, on nodes 1 and 3");
+    assert_eq!(k2.durability, Durability::BufferedOnTwo, "{k2:?}");
+    links.hold(NodeId(1), NodeId(3));
+    app.promote(NodeId(2), None).expect("the promote commits");
+    links.heal(NodeId(2), NodeId(3));
+
+    let status_of = |db: &Db| db.node_status().into_iter().next().expect("its own status");
+    let deadline = Instant::now() + patience;
+    let three = nodes[2].as_ref().expect("node 3");
+    while status_of(three).tail_refused.is_none() {
+        assert!(Instant::now() < deadline, "node 3 reported no refusal");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Node 1 loses its data: stopped, folder moved aside, started empty on healed links.
+    let mut one = nodes[0].take().expect("node 1");
+    one.shutdown();
+    drop(one);
+    let node_dir = dir.path().join("nodes").join("1");
+    std::fs::rename(&node_dir, dir.path().join("nodes").join("1.aside")).expect("moved aside");
+    links.heal(NodeId(1), NodeId(2));
+    links.heal(NodeId(1), NodeId(3));
+    nodes[0] = Some(open_process(&rt, dir.path(), &store, 1, &links));
+    // Separate `Db`s share no handshake, so nodes 2 and 3 hear node 1's new boot as a net
+    // handshake tells a node process (A-R249): the owner then re-plans to add it back.
+    let boot = links
+        .boot_of(NodeId(1))
+        .expect("node 1 registered its boot");
+    for (at, node) in [(1, NodeId(2)), (2, NodeId(3))] {
+        let db = nodes[at].as_ref().expect("a running node");
+        db.send_to(
+            node,
+            Msg::PeerBooted {
+                node: NodeId(1),
+                boot,
+            },
+        )
+        .expect("the node hears the boot");
+    }
+
+    // The walk wrote on its first try, about 5 s after the return. Give it 20 s.
+    let window = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    let mut last = None;
+    while Instant::now() < window {
+        match app.put(b"after", b"v", None) {
+            Ok(put) => panic!(
+                "a write resumed at {:?} seq {:?} while node 3 holds k2 at seq {:?} (k2 reads {:?})",
+                put.generation,
+                put.seq,
+                k2.seq,
+                app.get(b"k2").map(|got| got.value),
+            ),
+            Err(error) => last = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let refused = last.expect("the window saw at least one put");
+    assert_eq!(
+        refused.error.kind,
+        ErrorKind::RecoveryReadOnly,
+        "{refused:?}"
+    );
+    let text = refused.error.explain();
+    assert!(text.contains("on node 3"), "{text}");
+}

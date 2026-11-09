@@ -276,6 +276,10 @@ pub enum UnavailableReason {
     /// the budget" and "stopped" have the same consequence, and both must set
     /// [`LossRecord::uncertain`].
     Stalled,
+    /// The copy answered [`RecoveryEvent::TailHeld`]: it holds records above the anchor's base
+    /// that it cannot report as a survivor (issue #105). It answered, so it does not hold the
+    /// window open, and the head it named caps the commit's mode.
+    TailHeld,
 }
 
 /// What happened to one survivor's inventory (team kernel-b `design.md` §5.2 to §5.5).
@@ -684,6 +688,21 @@ pub enum RecoveryEvent {
     InventoryFailed {
         /// The copy.
         copy: CopyId,
+    },
+    /// A queried copy holds records above the anchor's base on a lineage it cannot report as a
+    /// survivor, so it answers with the tail instead of failing (issue #105). Writes that took
+    /// one of those records may have been acknowledged. F1 counts the copy as answered, not
+    /// verified, and while the head is above the selected cutoff no commit is writable and no
+    /// rebuild arms. Recorded in every phase before the CAS is built.
+    TailHeld {
+        /// The copy.
+        copy: CopyId,
+        /// The highest such record it holds.
+        head: Seq,
+        /// The generation that wrote the record at `head`; `None` when it could not be read.
+        stamp: Option<Generation>,
+        /// Why it cannot report it: one of the host's closed set of reasons.
+        reason: String,
     },
     /// A source is still sending its advertised prefix (`design.md` §5.5).
     TransferProgress {

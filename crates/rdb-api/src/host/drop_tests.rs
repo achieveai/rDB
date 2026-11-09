@@ -6025,17 +6025,20 @@ fn s4d_a_refusal_that_can_pass_still_retries() {
     assert!(tails.is_empty(), "a passing refusal held: {tails:?}");
 }
 
-/// Row "returned member" (#79 S4d): one member answering without a refusal runs the repair, even
-/// with another still refused, since that one may be enough to carry writes. Only the input is
-/// planted: node 1's commit is marked `ReadOnly` with all three pinned, as
+/// Row "returned member" (#79 S4d, flipped by #105 unit 1): one member answering without a
+/// refusal does not run the repair while another member's tail is held, since F1 caps every
+/// commit to `ReadOnly` while that tail is held and the repair would only recommit `ReadOnly`
+/// (`ws-79-tail-architect.md` section 7). Before #105 that member ran the repair. Only the input
+/// is planted: node 1's commit is marked `ReadOnly` with all three pinned, as
 /// `s5d_40_read_only_refuses_only_at_the_current_generation` does, and node 2 given a recorded
-/// refusal. A real `ReadOnly` commit with two linked regular members and a tail on one needs an
-/// owner restart the trio cannot do. `repair_duty`, the probes and node 3's `Inspect` are real.
-/// Cut: hold when any member is refused, red (no `membership_repair_planned`).
+/// refusal. `repair_duty`, the probes and node 3's `Inspect` are real. The adoptable case, which
+/// runs, is unit 2's.
+/// Cut: hold only when every answering member is refused (the pre-#105 rule), red (a repair is
+/// planned).
 /// Integration (~2 s): the trio's start and one repair decision.
 #[config_log::retcd_test]
-fn s4d_a_member_answering_without_a_refusal_runs_the_repair() {
-    const METHOD: &str = "s4d_a_member_answering_without_a_refusal_runs_the_repair";
+fn s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail() {
+    const METHOD: &str = "s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail";
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, before) = started(dir.path(), tuned);
     let committed = trio.nodes[0]
@@ -6053,14 +6056,29 @@ fn s4d_a_member_answering_without_a_refusal_runs_the_repair() {
             reason: "held_past_base",
         },
     );
-    trio.until("the repair ran", |_| {
-        (!logged!(METHOD, "membership_repair_planned").is_empty()).then_some(())
+    let held = trio.until("the repair held for node 2's tail", |_| {
+        let held: Vec<_> = logged!(METHOD, "membership_repair_held")
+            .into_iter()
+            .filter(|line| line["reason"] == "held_past_base")
+            .collect();
+        (!held.is_empty()).then_some(held)
     });
-    let tails: Vec<_> = logged!(METHOD, "membership_repair_held")
-        .into_iter()
-        .filter(|line| !line["reason"].is_null())
-        .collect();
-    assert!(tails.is_empty(), "held with one answering: {tails:?}");
+    assert!(
+        held.iter().all(|line| line["copy_node"] == 2),
+        "held for a copy other than node 2's: {held:?}"
+    );
+    // Two more holds' worth of checks: a repair that runs anyway would be planned in them.
+    let until = trio.clock.now();
+    trio.until("two more repair holds passed", |trio| {
+        (HostClock::millis_until(until, trio.clock.now())
+            >= 2 * trio.nodes[0].0.budgets.resume_hold_millis)
+            .then_some(())
+    });
+    let planned = logged!(METHOD, "membership_repair_planned");
+    assert!(
+        planned.is_empty(),
+        "a repair ran while node 2 holds a tail: {planned:?}"
+    );
 }
 
 /// #79 S4d: a full copy that stopped part way leaves a staged child, which no landing or inventory

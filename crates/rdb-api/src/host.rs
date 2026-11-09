@@ -1129,11 +1129,27 @@ impl Answer {
 
 /// The reasons a copy reports [`TailRefused`]: its own history, not a passing condition, stops a
 /// repair from taking it back (#79 S4d).
-pub const TAIL_REFUSED_REASONS: [&str; 3] = [
+pub const TAIL_REFUSED_REASONS: [&str; 5] = [
     "held_past_base",
     "missed_generation_held_past_base",
     "interrupted_copy",
+    "tail_on_older_lineage",
+    "tail_head_unreadable",
 ];
+
+/// A tail a copy holds above an inventory's base on a lineage other than the anchor's, that the
+/// copy cannot report as a survivor (issue #105): what [`Host::tail_scan`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TailHit {
+    /// The lineage holding it.
+    from: Generation,
+    /// Its highest record.
+    head: Seq,
+    /// The generation that wrote the record at `head`; `None` when it could not be read (N5).
+    stamp: Option<Generation>,
+    /// One of [`TAIL_REFUSED_REASONS`].
+    reason: &'static str,
+}
 
 /// A copy's own history stops a repair from taking it back, so re-planning cannot help: it holds
 /// a tail above a generation's base, or a copy interrupted part way through staging (#79 S4d). A
@@ -6928,12 +6944,12 @@ impl Host {
     /// The repair runs for the members that answered, and the rest are probed again. A
     /// half-open link never repairs, so it never fences reads for nothing.
     ///
-    /// Held (#79 S4d). When every member that answered reports [`TailRefused`], a repair cannot
-    /// take any of them back: `land_link` and `survivor` would refuse it again and F1 would
-    /// commit `ReadOnly` again, so the loop would never end. Nothing is planned, the copies and
-    /// reasons are logged `membership_repair_held` once per change, and the check runs again a
-    /// hold later. A member that answers without a refusal runs the repair at once. Other
-    /// refusals keep the back-off above.
+    /// Held (#79 S4d, widened by #105). When any member that answered reports [`TailRefused`], a
+    /// repair cannot take that copy back: `land_link` and `survivor` would refuse it again, and
+    /// F1 caps every commit to `ReadOnly` while its tail is held, so the loop would never end
+    /// even with other members answering clean. Nothing is planned, the copies and reasons are
+    /// logged `membership_repair_held` once per change, and the check runs again a hold later.
+    /// Other refusals keep the back-off above.
     fn repair_duty(&mut self, partition: PartitionId, now: Tick) {
         let read_only = self
             .committed
@@ -7068,25 +7084,23 @@ impl Host {
             );
             return;
         }
-        // #79 S4d: every member that answered holds a tail or an interrupted copy, so a repair
-        // cannot take any of them back; it would only commit `ReadOnly` again. It waits another
-        // hold, and a member that answers without a refusal runs the repair then.
-        if let Some(refused) = answers
+        // #79 S4d, widened by #105: a member that answered holds a tail or an interrupted copy,
+        // which no repair can take back. F1 caps any commit while that tail is held, so a repair
+        // would only commit `ReadOnly` again, however many other members answer clean. It waits
+        // another hold.
+        let holds: Vec<TailHold> = answers
             .iter()
-            .map(|(node, status)| status.tail_refused.map(|refused| (*node, refused)))
-            .collect::<Option<Vec<_>>>()
-        {
-            let holds: Vec<TailHold> = refused
-                .into_iter()
-                .filter_map(|(node, refused)| {
-                    let copy = members.iter().find(|member| member.node == node)?.copy;
-                    Some(TailHold {
-                        node,
-                        copy,
-                        refused,
-                    })
+            .filter_map(|(node, status)| {
+                let refused = status.tail_refused?;
+                let copy = members.iter().find(|member| member.node == *node)?.copy;
+                Some(TailHold {
+                    node: *node,
+                    copy,
+                    refused,
                 })
-                .collect();
+            })
+            .collect();
+        if !holds.is_empty() {
             self.hold_for_tails(partition, generation, holds);
             self.repair_since.insert(partition, now);
             return;
@@ -9410,11 +9424,18 @@ impl Host {
                 // No frame of the new generation reaches R1 before `Recovered` (pushed after
                 // this), so the receiver installed here sees nothing before it re-anchors.
                 let held = self.replication.receiver(self.node, partition);
-                if let Some(kept) = held.filter(|held| !held.is_dormant()) {
-                    // A live receiver re-anchors itself on `Recovered` from its own ladder, and a
-                    // quarantined one must stay quarantined: neither is replaced. A live one
-                    // still at the root is kept too; that needs two commits in one boot, which
-                    // slice 1 never has (critic-d7fix follow-up A2).
+                // Check A (`ws-readd-architect.md` 2.3, issue #105 unit 1): a live receiver is
+                // kept only at the linked head, where it re-anchors itself on `Recovered` from its
+                // own ladder, or while quarantined, which it must stay. Anywhere else its records
+                // above the link would sit over a hole, so it is replaced at the link below.
+                let linked = Head {
+                    seq: head,
+                    digest: at,
+                };
+                if let Some(kept) = held.filter(|held| {
+                    !held.is_dormant()
+                        && (held.quarantine().is_some() || held.applied_head() == linked)
+                }) {
                     tracing::info!(
                         node,
                         partition = partition.0,
@@ -9484,7 +9505,32 @@ impl Host {
                     digest,
                 }))
             }
-            Err(reason) => refused(reason),
+            Err(reason) => {
+                // Check A (`ws-readd-architect.md` 2.3, issue #105 unit 1): a copy refused in a
+                // commit that takes writes keeps no live receiver, so it walks up from seq 1 and
+                // no hole forms under the new generation. In a `ReadOnly` commit nothing is
+                // written, and the receiver stays, as the held tail does.
+                if result.mode != PartitionMode::ReadOnly {
+                    let live = self
+                        .replication
+                        .receiver(self.node, partition)
+                        .filter(|held| !held.is_dormant())
+                        .map(|held| held.quarantine().is_some());
+                    if let Some(quarantined) = live {
+                        self.replication.remove_receiver(self.node, partition);
+                        tracing::warn!(
+                            node,
+                            partition = partition.0,
+                            generation = generation.0,
+                            mode = ?result.mode,
+                            reason,
+                            quarantined,
+                            "land_receiver_dropped"
+                        );
+                    }
+                }
+                refused(reason)
+            }
         }
     }
 
@@ -11081,6 +11127,12 @@ impl Host {
             // from here on would not be in the head it reports.
             self.replication
                 .seal(self.node, partition, anchor.lineage.generation);
+            // Issue #105: a tail above the base on another lineage speaks before any refusal. A
+            // copy that answered `InventoryFailed` here was left out, and a commit then went on
+            // at a cutoff below records writes may have been acknowledged on.
+            if let Some(hit) = self.tail_scan(partition, anchor) {
+                return self.tail_held(partition, copy, anchor, hit);
+            }
             #[cfg(test)]
             let survived = if self.refuse_inventories {
                 Err("refused_by_test")
@@ -11174,6 +11226,114 @@ impl Host {
             ladder: vec![(Seq::ZERO, Digest::ROOT)],
             quarantined: None,
         }))
+    }
+
+    /// Issue #105 step 1a: the tail this copy holds above `anchor`'s base on the newest lineage
+    /// below the anchor's generation, the lineage a refusal names today. Every such tail is
+    /// treated as current, since no last writable generation is known yet. Not a hit: a staged
+    /// lineage (its own refusal, `interrupted_copy`), a head at or below the base, or the
+    /// anchor's lineage already holding the same record at that head. A head that cannot be read
+    /// is a hit with no stamp (N5), never "no tail". One point read per candidate lineage;
+    /// logged as `tail_scan` with its read count and micros.
+    fn tail_scan(&self, partition: PartitionId, anchor: LineageAnchor) -> Option<TailHit> {
+        let started = Instant::now();
+        let to = anchor.lineage.generation;
+        let base = anchor.base_seq;
+        let mut read = 0u32;
+        let generations = self.engine.generations(partition);
+        let from = generations.iter().copied().filter(|g| *g < to).max();
+        let hit = from.and_then(|from| {
+            if self.engine.staging(partition, from).is_some() {
+                return None;
+            }
+            let head = Seq(self.engine.buffered_applied(partition, from).0);
+            if head <= base {
+                return None;
+            }
+            read += 1;
+            let holds_anchor = generations.contains(&to);
+            let reason = if holds_anchor {
+                "tail_on_older_lineage"
+            } else {
+                "missed_generation_held_past_base"
+            };
+            let Ok((record, digest)) = self.checked(partition, from, head) else {
+                return Some(TailHit {
+                    from,
+                    head,
+                    stamp: None,
+                    reason: "tail_head_unreadable",
+                });
+            };
+            if holds_anchor && self.engine.buffered_applied(partition, to).0 >= head.0 {
+                read += 1;
+                if self
+                    .checked(partition, to, head)
+                    .is_ok_and(|(_, at)| at == digest)
+                {
+                    return None;
+                }
+            }
+            let stamp = ReplicationEnvelope::decode(&record)
+                .ok()
+                .map(|envelope| envelope.header.generation);
+            Some(TailHit {
+                from,
+                head,
+                stamp,
+                reason,
+            })
+        });
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = to.0,
+            base = base.0,
+            lineages = generations.len(),
+            read,
+            micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            hit = hit.is_some(),
+            "tail_scan"
+        );
+        hit
+    }
+
+    /// Answer `TailHeld` for `hit` (issue #105), and report the refusal in this node's status,
+    /// as a refused link does, so the owner holds its repair and names the copy to a client.
+    fn tail_held(
+        &mut self,
+        partition: PartitionId,
+        copy: CopyId,
+        anchor: LineageAnchor,
+        hit: TailHit,
+    ) -> RecoveryEvent {
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            generation = anchor.lineage.generation.0,
+            base = anchor.base_seq.0,
+            from = hit.from.0,
+            head = hit.head.0,
+            stamp = hit.stamp.map(|stamp| stamp.0),
+            reason = hit.reason,
+            "inventory_tail_held"
+        );
+        self.tail_refused.insert(
+            partition,
+            TailRefused {
+                generation: anchor.lineage.generation,
+                head: hit.head,
+                base: anchor.base_seq,
+                reason: hit.reason,
+            },
+        );
+        RecoveryEvent::TailHeld {
+            copy,
+            head: hit.head,
+            stamp: hit.stamp,
+            reason: hit.reason.to_owned(),
+        }
     }
 
     /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
