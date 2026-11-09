@@ -445,6 +445,33 @@ async fn the_gateway_serves_the_slice_1_contracts() {
     shut_down(db).await;
 }
 
+/// PR #78 round 3: the .NET client refuses a request over `RdbClient.MaxRequestBytes` and sends
+/// everything up to it, so the gateway must decode exactly that much. A lower limit here would
+/// refuse, with no `RdbError`, a write the client sent as fine, and the client would read it as
+/// an unknown outcome. The client's figure is read from its source, so either side moving alone
+/// is red.
+#[config_log::retcd_test]
+fn the_decode_limit_is_the_figure_the_dotnet_client_relies_on() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../clients/dotnet/src/Rdb.Client/RdbClient.cs");
+    let source = std::fs::read_to_string(&path).expect("read RdbClient.cs");
+    let figure = source
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("internal const int MaxRequestBytes = ")?
+                .strip_suffix(';')
+        })
+        .expect("RdbClient.cs declares MaxRequestBytes");
+    let client: usize = figure.replace('_', "").parse().expect("a decimal figure");
+    assert_eq!(
+        rdb_server::MAX_DECODE_BYTES,
+        client,
+        "the gateway decodes up to {} bytes; the .NET client sends up to {client}",
+        rdb_server::MAX_DECODE_BYTES
+    );
+}
+
 /// PR #78 item 2 (F-004 with a real limit): a call held on one connection fills a limit of 1, a
 /// call on a second connection is refused `OVERLOADED`, and once the held call ends a call on
 /// the second connection is admitted.

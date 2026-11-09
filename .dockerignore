@@ -1,0 +1,6 @@
+target
+.git
+.scratchpad
+docs/archive
+docs/progress/index.html
+**/node_modules
