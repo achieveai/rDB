@@ -81,7 +81,7 @@ run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warn
 # `#[cfg(debug_assertions)]` item without the same cfg passes all of them and breaks a consumer's
 # release build. `Msg::Damage`'s arm in net/wire.rs did exactly that (found 2026-11-08). The
 # examples are here because `local-rdb.sh up --release` builds them.
-run_release() { echo "== release check"; cargo check --release -p rdb-api --lib --examples; }
+run_release() { echo "== release check"; cargo check --release -p rdb-api --lib --examples --tests; }
 # `--workspace` is dropped when the caller names a package. Cargo treats `--workspace -p x` as
 # the workspace: the `-p` is not an error, it is ignored, and a "scoped" run on 2026-09-21 ran
 # rdb-sim's suite under the name `-p config-server`. The wrapper's exit code also hid cargo's

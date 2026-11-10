@@ -7,7 +7,9 @@
 //!   read-then-CAS, and a reopened `Db` takes a fresh grant in the same boot after a control store
 //!   outage (A-R96).
 
-use super::tests::{digest_at, owner_status, owner_when, put_through_pauses, stored_root};
+#[cfg(debug_assertions)]
+use super::tests::stored_root;
+use super::tests::{digest_at, owner_status, owner_when, put_through_pauses};
 use super::*;
 
 pub(super) fn config(dir: &Path) -> DbConfig {
@@ -3432,6 +3434,7 @@ fn m10_s2_59_a_copy_behind_two_writeless_reopens_catches_up_through_a_real_open(
 /// node 1 as owner; node 2's process opens alone. Cut: the joining branch reads `behind`
 /// through `serves()` (a staged copy left out), and the open logs `db_open_joining`, red.
 /// Integration (~4 s): a fresh open, a reopen until ready, one node-process open.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn m10_s2_f009_a_node_process_whose_copy_is_staged_into_the_generation_never_joins() {
     const METHOD: &str =
