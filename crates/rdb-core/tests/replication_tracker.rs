@@ -1032,6 +1032,7 @@ fn recovery(cutoff: u64, cutoff_digest: Digest, pinned: PartitionConfig) -> Reco
             discarded_from: None,
             uncertain: false,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     }
 }
 
@@ -4587,6 +4588,7 @@ fn f1_rebuilding() -> (Recovery, RecoveryResult) {
         retention_millis: 60_000,
         must_hold: std::collections::BTreeSet::new(),
         prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     };
     let mut f1 = Recovery::new();
     f1_rec(&mut f1, 0, RecoveryEvent::Plan(Box::new(plan)));
@@ -4598,6 +4600,7 @@ fn f1_rebuilding() -> (Recovery, RecoveryResult) {
         head: (Seq(HEAD), d(HEAD)),
         ladder: (5..=HEAD).map(|seq| (Seq(seq), d(seq))).collect(),
         quarantined: None,
+        holds_last_writable: false,
     };
     f1_rec(&mut f1, 10, RecoveryEvent::InventoryReported(Box::new(a)));
     for copy in [COPY_B, COPY_C] {

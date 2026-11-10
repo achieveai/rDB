@@ -335,6 +335,7 @@ fn run_demo() -> Result<String, String> {
                     .map(|seq| (Seq(seq), history.digest(seq)))
                     .collect(),
                 quarantined: None,
+                holds_last_writable: false,
             },
         ));
     }
@@ -461,6 +462,7 @@ fn run_demo() -> Result<String, String> {
         must_hold: std::collections::BTreeSet::new(),
         prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
         config: pinned,
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     };
     let fence = FencingProof {
         partition: PART,

@@ -241,6 +241,7 @@ fn recovered(generation: Generation, cutoff: u64, primary: NodeId, mode: Partiti
             discarded_from: None,
             uncertain: false,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     };
     kernel(KernelEvent::Recovered(Box::new(result)))
 }

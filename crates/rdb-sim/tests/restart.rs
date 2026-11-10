@@ -123,6 +123,7 @@ fn spine_survivor(copy: u8) -> rdb_core::contracts::recovery::SurvivorInventory 
             .map(|seq| (Seq(seq), spine_digest(seq)))
             .collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -173,6 +174,7 @@ fn spine_recovery_plan() -> rdb_core::contracts::recovery::RecoveryPlan {
         retention_millis: 1_000,
         must_hold: std::collections::BTreeSet::new(),
         prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     }
 }
 
@@ -761,6 +763,7 @@ fn catch_up_survivor(copy: u8, head: u64) -> rdb_core::contracts::recovery::Surv
             .map(|seq| (Seq(seq), catch_up_digest(seq)))
             .collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 

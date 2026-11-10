@@ -1175,6 +1175,7 @@ mod producers {
                 discarded_from: None,
                 uncertain: false,
             },
+            ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
         };
         let mut module = module();
         let recovered = event(EventKind::Kernel(KernelEvent::Recovered(Box::new(result))));

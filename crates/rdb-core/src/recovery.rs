@@ -118,7 +118,7 @@ use crate::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName, StepCtx,
 };
 use crate::contracts::ids::{
-    OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq, TimerId, TimerVersion,
+    Generation, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq, TimerId, TimerVersion,
 };
 use crate::contracts::ignore::ReplicaIgnoreReason;
 use crate::contracts::membership::{CopyId, PartitionConfig};
@@ -127,7 +127,9 @@ use crate::contracts::recovery::{
     RecoveryBarrier, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
     RetainedStatusMap, SelectedLineage,
 };
-use crate::contracts::recovery::{CommittedWithout, PriorMember, WithoutEntry};
+use crate::contracts::recovery::{
+    CommittedWithout, HeldTail, PriorMember, TailLedger, WithoutEntry,
+};
 use crate::contracts::time::{Tick, TimerEffect, TimerFired};
 
 pub use commit::RECOVERY_CONTROL_REQUEST_BASE;
@@ -274,10 +276,15 @@ struct Decided {
     /// Each copy that answered `TailHeld`, in any phase before the CAS, with the highest head it
     /// named (issue #105, M6).
     held: BTreeMap<CopyId, Seq>,
-    /// Fixed when the CAS is built: a held head is above the cutoff, so the commit is not
-    /// writable and arms no rebuild ([`mode_after`]). A tail heard after that is too late for
-    /// this run.
+    /// Fixed when the CAS is built: a held head is above the cutoff, or the intact rule fails,
+    /// so the commit is not writable and arms no rebuild ([`mode_after`]). A tail heard after
+    /// that is too late for this run.
     capped: bool,
+    /// The intact rule, settled at selection (issue #105, section 3.7): a verified copy of a
+    /// node in L's regulars holds L intact, or the rule is waived.
+    intact: bool,
+    /// The ledger the CAS writes, fixed with `capped` when it is built.
+    ledger: TailLedger,
 }
 
 impl Decided {
@@ -296,13 +303,79 @@ impl Decided {
         emit.ignored(ReplicaIgnoreReason::Recorded);
     }
 
-    /// The held copies whose head is above the selected cutoff, in copy order.
-    fn held_above_cutoff(&self) -> Vec<(CopyId, Seq)> {
-        self.held
+    /// Whether `--through` exempts a tail at `head` for this run.
+    fn released(&self, head: Seq) -> bool {
+        self.plan
+            .release
+            .through
+            .is_some_and(|through| head <= through)
+    }
+
+    /// The nodes holding a tail above the cutoff that caps this commit, with the head: this
+    /// run's `TailHeld` facts and late reports, then the ledger's entries for nodes that did not
+    /// verify this run (issue #105, section 3.4). A tail `--through` releases does not count.
+    fn held_above_cutoff(&self) -> BTreeMap<NodeId, Seq> {
+        let cutoff = self.selected.cutoff_seq;
+        let verified = self.verified_nodes();
+        let mut held = BTreeMap::new();
+        let marked = self
+            .plan
+            .prior
+            .ledger
+            .held
             .iter()
-            .filter(|(_, head)| **head > self.selected.cutoff_seq)
-            .map(|(copy, head)| (*copy, *head))
+            .filter(|entry| !verified.contains(&entry.node))
+            .map(|entry| (entry.node, entry.head));
+        let reported = self.held.iter().filter_map(|(copy, head)| {
+            let node = self.plan.config.member(*copy)?.node;
+            Some((node, *head))
+        });
+        for (node, head) in marked.chain(reported) {
+            if head > cutoff && !self.released(head) {
+                let at = held.entry(node).or_insert(head);
+                *at = (*at).max(head);
+            }
+        }
+        held
+    }
+
+    /// The nodes whose copy verified this run.
+    fn verified_nodes(&self) -> BTreeSet<NodeId> {
+        self.inventories
+            .iter()
+            .filter_map(|outcome| match outcome {
+                InventoryOutcome::Verified { copy } => {
+                    self.plan.config.member(*copy).map(|member| member.node)
+                }
+                _ => None,
+            })
             .collect()
+    }
+
+    /// The ledger the recovery CAS writes, given its mode (issue #105, section 4.3): a writable
+    /// commit makes its own generation L, with the plan's regulars; a `ReadOnly` one carries L.
+    /// The held entries are [`Self::held_above_cutoff`]: a verified node's entry clears, a
+    /// released one clears, one at or below the cutoff can never cap again and is dropped.
+    fn ledger_for(&self, mode: &PartitionMode) -> TailLedger {
+        let prior = &self.plan.prior.ledger;
+        let held = self
+            .held_above_cutoff()
+            .into_iter()
+            .map(|(node, head)| HeldTail { node, head })
+            .collect();
+        if matches!(mode, PartitionMode::Active | PartitionMode::DegradedRf2) {
+            TailLedger {
+                last_writable: Some(self.selected.root.generation),
+                last_writable_regulars: regular_nodes(&self.plan.config),
+                held,
+            }
+        } else {
+            TailLedger {
+                last_writable: prior.last_writable,
+                last_writable_regulars: prior.last_writable_regulars.clone(),
+                held,
+            }
+        }
     }
 }
 
@@ -344,6 +417,9 @@ struct Committed {
     /// The activation exchange ended `Unknown`, `Unavailable` or at its deadline and is being
     /// resolved (ruling A-R102 and its addendum). `activation` is kept; its `Cas` carries the request outstanding now, if any.
     resolving: Option<Resolving>,
+    /// The intact rule (issue #105, section 3.7) applied and failed at this commit, so it capped
+    /// the mode: what `admin forget-tail --no-intact-copy` is allowed to waive.
+    intact_failed: bool,
 }
 
 /// One resolving activation (ruling A-R102): at most one request outstanding at a time.
@@ -435,6 +511,17 @@ impl Recovery {
     #[must_use]
     pub const fn spy(&self) -> SelectionSpy {
         self.spy
+    }
+
+    /// Whether the intact rule (issue #105, section 3.7) capped this run's commit: `Some` once
+    /// committed, `None` before. The owner refuses `admin forget-tail --no-intact-copy` unless
+    /// it is `Some(true)`.
+    #[must_use]
+    pub fn intact_rule_capped(&self) -> Option<bool> {
+        match &self.phase {
+            Phase::Committed(committed) => Some(committed.intact_failed),
+            _ => None,
+        }
     }
 
     /// The current phase.
@@ -623,6 +710,16 @@ impl Recovery {
             emit.ignored(ReplicaIgnoreReason::RecoveryBlocked);
             return None;
         }
+        // Issue #105 (M4): a plan that leaves out a marked node would never ask it again, so its
+        // tail could never cap a commit nor its mark clear.
+        if let Some(node) = drops_marked(&plan) {
+            tracing::warn!(
+                partition = proof.partition.0,
+                node = node.0,
+                "recovery_drops_marked_holder"
+            );
+            return Some(block(BlockReason::DropsMarkedHolder { node }, emit));
+        }
         let deadline = emit
             .event()
             .at
@@ -639,7 +736,10 @@ impl Recovery {
             .filter(|m| m.role == ReplicaRole::Shadow)
             .map(|m| m.copy)
             .collect();
-        let collect = Collecting::new(proof.clone(), queried, shadows, deadline);
+        let mut collect = Collecting::new(proof.clone(), queried, shadows, deadline);
+        if intact_applies(&plan, proof) {
+            collect.await_intact(last_writable_copies(&plan));
+        }
         Some(Phase::Collecting(Box::new(Run { plan, collect })))
     }
 
@@ -983,22 +1083,41 @@ impl Recovery {
             Ok(barrier) => {
                 decided.note = note_after(&decided);
                 let held = decided.held_above_cutoff();
-                decided.capped = !held.is_empty();
-                if decided.capped {
+                decided.capped = !held.is_empty() || !decided.intact;
+                if !held.is_empty() {
                     tracing::warn!(
                         partition = emit.event().partition.0,
                         generation = decided.selected.root.generation.0,
                         cutoff = decided.selected.cutoff_seq.0,
-                        held = ?held.iter().map(|(copy, head)| (copy.0, head.0)).collect::<Vec<_>>(),
+                        held = ?held.iter().map(|(node, head)| (node.0, head.0)).collect::<Vec<_>>(),
                         "recovery_capped_by_tail"
                     );
                 }
+                if !decided.intact {
+                    tracing::warn!(
+                        partition = emit.event().partition.0,
+                        generation = decided.selected.root.generation.0,
+                        last_writable = ?decided.plan.prior.ledger.last_writable.map(|g| g.0),
+                        regulars = ?decided
+                            .plan
+                            .prior
+                            .ledger
+                            .last_writable_regulars
+                            .iter()
+                            .map(|node| node.0)
+                            .collect::<Vec<_>>(),
+                        "recovery_capped_no_intact_copy"
+                    );
+                }
+                let mode = mode_after(decided.required.len(), decided.capped);
+                decided.ledger = decided.ledger_for(&mode);
                 let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
                 let cas = Cas::new(
                     decided.record,
                     decided.root,
                     crate::authority::partition::RecordMember::pinned(&decided.plan.config),
                     decided.note.clone(),
+                    decided.ledger.clone(),
                     decided.proof.prior_owner_epoch,
                     self.requests.mint(),
                     deadline,
@@ -1301,6 +1420,7 @@ impl Recovery {
                             &committed.result.committed.pinned_config,
                         ),
                         committed.note.clone(),
+                        activated_ledger(&committed.result),
                         committed.record.owner_epoch,
                         self.requests.mint(),
                         deadline,
@@ -1512,6 +1632,82 @@ fn is_regular(config: &PartitionConfig, copy: CopyId) -> bool {
         .is_some_and(|member| member.role != ReplicaRole::Shadow)
 }
 
+/// The nodes `config` pins as regulars, in its order: L's regulars when it commits writable.
+fn regular_nodes(config: &PartitionConfig) -> Vec<NodeId> {
+    config
+        .members
+        .iter()
+        .filter(|member| member.role != ReplicaRole::Shadow)
+        .map(|member| member.node)
+        .collect()
+}
+
+/// The ledger the activation CAS writes (issue #105, section 4.1): the activated generation is L,
+/// with its pinned regulars. Nothing is held, or the rebuild would not have armed.
+fn activated_ledger(result: &RecoveryResult) -> TailLedger {
+    TailLedger {
+        last_writable: Some(result.new_generation),
+        last_writable_regulars: regular_nodes(&result.committed.pinned_config),
+        held: result.ledger.held.clone(),
+    }
+}
+
+/// The lowest node the plan's ledger marks and its config leaves out, unless `--through`
+/// releases its tail (issue #105, M4).
+fn drops_marked(plan: &RecoveryPlan) -> Option<NodeId> {
+    plan.prior
+        .ledger
+        .held
+        .iter()
+        .filter(|entry| {
+            !plan
+                .release
+                .through
+                .is_some_and(|through| entry.head <= through)
+        })
+        .map(|entry| entry.node)
+        .filter(|node| {
+            !plan
+                .config
+                .members
+                .iter()
+                .any(|member| member.node == *node)
+        })
+        .min()
+}
+
+/// Whether the intact rule applies to a run (issue #105, section 3.7): not while L is unknown,
+/// not over a first generation, and not when `--no-intact-copy` waives it.
+fn intact_applies(plan: &RecoveryPlan, proof: &FencingProof) -> bool {
+    plan.prior.ledger.last_writable.is_some()
+        && proof.prior_generation != Generation(0)
+        && !plan.release.no_intact_copy
+}
+
+/// The plan's copies whose node is one of L's regulars.
+fn last_writable_copies(plan: &RecoveryPlan) -> BTreeSet<CopyId> {
+    let regulars = &plan.prior.ledger.last_writable_regulars;
+    plan.config
+        .members
+        .iter()
+        .filter(|member| regulars.contains(&member.node))
+        .map(|member| member.copy)
+        .collect()
+}
+
+/// The intact rule (issue #105, section 3.7): some verified copy, of any role, on a node in L's
+/// regulars, holds L intact; or the rule does not apply.
+fn intact_holds(plan: &RecoveryPlan, collect: &Collecting) -> bool {
+    if !intact_applies(plan, &collect.proof) {
+        return true;
+    }
+    let regulars = last_writable_copies(plan);
+    collect
+        .intact_verified()
+        .iter()
+        .any(|copy| regulars.contains(copy))
+}
+
 /// The note the commit writes (#80 S5n, design 5.4.1): the old record's, with an entry naming
 /// every old non-shadow member this recovery did not verify. A member counts as verified only
 /// when its slot is required and the plan still pins that slot on the same node: a replacement
@@ -1638,9 +1834,12 @@ fn select(
         run: proof.control_revision,
     });
     let held = collect.held().clone();
+    let intact = intact_holds(&plan, &collect);
     let decided = Decided {
         held,
         capped: false,
+        intact,
+        ledger: TailLedger::unknown(),
         loss: loss_record(&collect, &selected),
         inventories: collect.outcomes(),
         plan,
@@ -1731,6 +1930,8 @@ fn commit(
         catch_ups: _,
         held: _,
         capped,
+        intact,
+        ledger,
     } = decided;
     let mode = mode_after(required.len(), capped);
     let cutoff = selected.cutoff_seq;
@@ -1771,6 +1972,7 @@ fn commit(
             authority_view,
         },
         retained_status_map,
+        ledger,
     };
     if let Some(root) = &root {
         emit.recovery(RecoveryEffect::CommittedWithout {
@@ -1797,6 +1999,7 @@ fn commit(
         activation: None,
         held: None,
         resolving: None,
+        intact_failed: !intact,
     }))
 }
 
@@ -1808,6 +2011,7 @@ fn activate(
     revision: Revision,
     emit: &mut Emit<'_>,
 ) {
+    committed.result.ledger = activated_ledger(&committed.result);
     committed.result.mode = PartitionMode::Active;
     committed.result.committed.revision = revision;
     committed.result.barrier = barrier;

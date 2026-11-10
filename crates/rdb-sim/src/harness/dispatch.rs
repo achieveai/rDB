@@ -2706,6 +2706,7 @@ impl Dispatcher {
             head: (head, head_digest),
             ladder,
             quarantined: placed.quarantined,
+            holds_last_writable: false,
         })
     }
 

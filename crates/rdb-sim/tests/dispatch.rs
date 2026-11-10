@@ -2220,6 +2220,7 @@ fn survivor(copy: u8, head: u64) -> rdb_core::contracts::recovery::SurvivorInven
         head: (Seq(head), digest(head)),
         ladder: (1..=head).map(|seq| (Seq(seq), digest(seq))).collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -2341,6 +2342,7 @@ fn placed_at_gen1(prior: &rdb_sim::storage::history::CanonicalHistory) -> Surviv
         head: (Seq(3), prior.digest(3)),
         ladder: (0..=3).map(|seq| (Seq(seq), prior.digest(seq))).collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -2426,6 +2428,7 @@ fn gen2_result(cutoff_digest: Digest) -> rdb_core::contracts::recovery::Recovery
             discarded_from: Some(Seq(3)),
             uncertain: false,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     }
 }
 
@@ -2501,6 +2504,7 @@ fn provider_a_survivor_that_adopted_a_newer_generation_answers_from_it() {
         head: (Seq(3), after.digest(3)),
         ladder: vec![(Seq(2), prior.digest(2)), (Seq(3), after.digest(3))],
         quarantined: None,
+        holds_last_writable: false,
     };
     tracing::info!(
         anchor_generation = current.anchor_seen.lineage.generation.0,
@@ -2634,6 +2638,7 @@ fn provider_a_survivor_that_landed_a_newer_generation_in_the_barrier_answers_fro
         head: (Seq(2), prior.digest(2)),
         ladder: vec![(Seq(2), prior.digest(2))],
         quarantined: None,
+        holds_last_writable: false,
     };
     assert_eq!(
         landed_under(true, query()),
@@ -2865,6 +2870,7 @@ fn spine_survivor(copy: u8) -> rdb_core::contracts::recovery::SurvivorInventory 
             .map(|seq| (Seq(seq), spine_digest(seq)))
             .collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -2917,6 +2923,7 @@ fn spine_recovery_plan() -> rdb_core::contracts::recovery::RecoveryPlan {
         retention_millis: 1_000,
         must_hold: std::collections::BTreeSet::new(),
         prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     }
 }
 
@@ -6214,6 +6221,7 @@ fn canonical_history_writes_what_t1_commits() {
             discarded_from: None,
             uncertain: false,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     };
     let event = |kind: EventKind| Event {
         id: EventId(0),

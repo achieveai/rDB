@@ -2307,6 +2307,7 @@ fn recovered(
             discarded_from: discarded_from.map(Seq),
             uncertain,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     })))
 }
 

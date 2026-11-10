@@ -1145,6 +1145,7 @@ mod l1_fixture {
                 discarded_from: None,
                 uncertain: false,
             },
+            ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
         }))
     }
 

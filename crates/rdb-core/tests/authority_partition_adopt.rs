@@ -3192,6 +3192,7 @@ fn recovered(id: u64, partition: PartitionId, prior: (u64, u64), new_generation:
             discarded_from: None,
             uncertain: false,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     };
     Event {
         partition,
