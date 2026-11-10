@@ -102,7 +102,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 ///
 /// `8` came with #79 S4d: `WireNodeStatus::tail_refused`.
 ///
-/// `9` came with issue #105: `WirePeerAsk::Inventory::last_writable`,
+/// `9` came with issue #105: `WirePeerAsk::Inventory::last_writable` and `release_through`,
 /// `SurvivorInventory::holds_last_writable`, `RecoveryEvent::TailHeld`, `RecoveryResult::ledger`,
 /// `RecoveryPlan::release`, `WireCall::ForgetTail` and `WireAnswer::TailForgotten`. It ships with
 /// `partitions/{p}` layout 6, which an older build cannot read, so the upgrade stops and restarts

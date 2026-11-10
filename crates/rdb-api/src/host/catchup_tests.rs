@@ -40,7 +40,7 @@ fn a_copy_that_holds_anything_never_reports_an_empty_inventory() {
     let report = |trio: &mut Trio, anchor| {
         trio.nodes[1]
             .0
-            .inventory(PartitionId(1), CopyId(1), anchor, None)
+            .inventory(PartitionId(1), CopyId(1), anchor, None, None)
     };
 
     assert!(
@@ -113,7 +113,13 @@ fn a_copy_that_missed_a_writeless_generation_links_it_at_inventory() {
     );
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
-    match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1]), None) {
+    match host.inventory(
+        PartitionId(1),
+        CopyId(1),
+        anchor_at(2, 2, digests[1]),
+        None,
+        None,
+    ) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head, (Seq(2), digests[1]));
         }
@@ -145,7 +151,13 @@ fn a_copy_that_missed_two_writeless_generations_links_the_newest_onto_its_own() 
     );
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
-    match host.inventory(PartitionId(1), CopyId(1), anchor_at(4, 2, digests[1]), None) {
+    match host.inventory(
+        PartitionId(1),
+        CopyId(1),
+        anchor_at(4, 2, digests[1]),
+        None,
+        None,
+    ) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head, (Seq(2), digests[1]));
         }
@@ -861,7 +873,8 @@ fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
         ),
     ] {
         assert_eq!(
-            host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
+            host.survivor(PartitionId(1), CopyId(1), anchor, None)
+                .map(drop),
             Err(reason)
         );
         let answer = if reason == "missed_generation_held_past_base" {
@@ -875,7 +888,7 @@ fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
             RecoveryEvent::InventoryFailed { copy: CopyId(1) }
         };
         assert_eq!(
-            host.inventory(PartitionId(1), CopyId(1), anchor, None),
+            host.inventory(PartitionId(1), CopyId(1), anchor, None, None),
             answer,
             "{reason}"
         );
@@ -903,7 +916,7 @@ fn a_tail_past_the_base_is_held_only_when_stamped_by_the_last_writable_generatio
     let held = host.engine.lineages();
     let anchor = anchor_at(2, 2, digests[1]);
     assert_eq!(
-        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(1))),
+        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(1)), None),
         RecoveryEvent::TailHeld {
             copy: CopyId(1),
             head: Seq(3),
@@ -913,7 +926,7 @@ fn a_tail_past_the_base_is_held_only_when_stamped_by_the_last_writable_generatio
         "stamped L: current"
     );
     assert_eq!(
-        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2))),
+        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2)), None),
         RecoveryEvent::InventoryFailed { copy: CopyId(1) },
         "stamped below L: superseded"
     );
@@ -953,18 +966,18 @@ fn issue105_a_tail_on_an_older_lineage_beside_the_anchor_is_held_and_a_shared_he
         reason: "tail_on_older_lineage".to_owned(),
     };
     assert_eq!(
-        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(1))),
+        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(1)), None),
         held,
         "stamped L"
     );
     assert_eq!(
-        host.inventory(PartitionId(1), CopyId(1), anchor, None),
+        host.inventory(PartitionId(1), CopyId(1), anchor, None, None),
         held,
         "L unknown: the newest lineage below the anchor"
     );
     assert!(
         matches!(
-            host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2))),
+            host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2)), None),
             RecoveryEvent::InventoryReported(_)
         ),
         "stamped below L: superseded, the copy reports"
@@ -989,6 +1002,7 @@ fn issue105_a_tail_on_an_older_lineage_beside_the_anchor_is_held_and_a_shared_he
             CopyId(1),
             anchor_at(2, 3, digests[2]),
             Some(Generation(1)),
+            None,
         ),
         RecoveryEvent::InventoryFailed { copy: CopyId(1) },
         "the same record at the head is no tail"
@@ -1012,6 +1026,7 @@ fn issue105_a_tail_on_an_older_lineage_beside_the_anchor_is_held_and_a_shared_he
         CopyId(1),
         anchor_at(2, 3, digests[2]),
         Some(Generation(2)),
+        None,
     ) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head.0, Seq(3));
@@ -1171,7 +1186,8 @@ fn a_missed_generation_is_not_linked_onto_a_parent_at_the_chain_ceiling() {
     let held = host.engine.lineages();
     let anchor = anchor_at(ceiling + 1, 2, digests[1]);
     assert_eq!(
-        host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
+        host.survivor(PartitionId(1), CopyId(1), anchor, None)
+            .map(drop),
         Err("missed_generation_link_depth_ceiling")
     );
     assert_eq!(host.engine.lineages(), held, "nothing staged or linked");
@@ -1193,10 +1209,12 @@ fn a_link_made_at_inventory_survives_a_restart_before_the_answer() {
     let rt = current_thread();
     {
         let mut host = host_over(&path, &rt);
-        assert!(host.survivor(PartitionId(1), CopyId(1), anchor).is_ok());
+        assert!(host
+            .survivor(PartitionId(1), CopyId(1), anchor, None)
+            .is_ok());
     }
     let mut host = host_over(&path, &rt);
-    match host.inventory(PartitionId(1), CopyId(1), anchor, None) {
+    match host.inventory(PartitionId(1), CopyId(1), anchor, None, None) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head, (Seq(2), digests[1]));
         }
@@ -1585,7 +1603,7 @@ fn a_copy_linked_below_the_anchor_base_reports_only_when_it_holds_the_base() {
     let digests = write_chain_after(&mut engine, Generation(2), digests, 1);
     drop(engine);
     let mut holding = host_over(&path, &rt);
-    match holding.survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[2])) {
+    match holding.survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[2]), None) {
         Ok(inventory) => {
             assert_eq!(inventory.head, (Seq(3), digests[2]));
             assert_eq!(inventory.ladder, vec![(Seq(3), digests[2])]);
@@ -1594,7 +1612,7 @@ fn a_copy_linked_below_the_anchor_base_reports_only_when_it_holds_the_base() {
     }
     assert_eq!(
         holding
-            .survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[1]))
+            .survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[1]), None)
             .map(drop),
         Err("base_digest_differs"),
         "another record at the base"
@@ -1605,7 +1623,7 @@ fn a_copy_linked_below_the_anchor_base_reports_only_when_it_holds_the_base() {
     let mut behind = host_over(&path, &rt);
     assert_eq!(
         behind
-            .survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[1]))
+            .survivor(PartitionId(1), CopyId(1), anchor_at(2, 3, digests[1]), None)
             .map(drop),
         Err("no_record"),
         "linked at 2 and holding only 2"
@@ -1962,6 +1980,7 @@ fn m11_a1_a_a_reopened_node_reads_its_first_ladder_from_the_base() {
         PartitionId(1),
         CopyId(1),
         anchor_at(2, 40, digests[39]),
+        None,
         None,
     ) {
         RecoveryEvent::InventoryReported(inventory) => {
@@ -2357,5 +2376,255 @@ fn issue105_a_landing_over_a_current_tail_marks_the_copy_and_a_superseded_one_do
         host.tail_refused.get(&PartitionId(1)),
         Some(&refused),
         "the landing's own reason stays"
+    );
+}
+
+/// Issue #105 (design section 13), walk C's shape: a copy that missed the anchor's generation
+/// and holds a tail past its base on the lineage below. Without a release it answers `TailHeld`;
+/// with `--through` below the tail's head it still does (a tail above `through` caps). With
+/// `--through` at the head the tail is released: not reported, logged `tail_released`, and the
+/// anchor's generation is inherited by copy at the base (`Copied`, the set-aside). The copy then
+/// reports at the base, its status clears, and the tail stays on disk on the sealed parent. Its
+/// post-commit proof is not withheld for the tail. A later ask with no release, as an
+/// automatic run after a `ReadOnly` commit makes it, finds the tail current again: `TailHeld`.
+/// Cut: `inventory` reports a released hit as `TailHeld`, red (the third answer).
+#[config_log::retcd_test]
+fn issue105_a_released_tail_on_a_missed_generation_is_copied_at_the_base_and_reported() {
+    const METHOD: &str =
+        "issue105_a_released_tail_on_a_missed_generation_is_copied_at_the_base_and_reported";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let l = Some(Generation(1));
+    let anchor = anchor_at(2, 2, digests[1]);
+    let held = host.engine.lineages();
+    let tail_held = RecoveryEvent::TailHeld {
+        copy: CopyId(1),
+        head: Seq(3),
+        stamp: Some(Generation(1)),
+        reason: "missed_generation_held_past_base".to_owned(),
+    };
+    assert_eq!(
+        host.inventory(p, CopyId(1), anchor, l, None),
+        tail_held,
+        "automatic"
+    );
+    assert_eq!(
+        host.inventory(p, CopyId(1), anchor, l, Some(Seq(2))),
+        tail_held,
+        "a tail above --through still holds"
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+
+    match host.inventory(p, CopyId(1), anchor, l, Some(Seq(3))) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(2), digests[1]), "reported at the base");
+        }
+        other => panic!("a released copy reports: {other:?}"),
+    }
+    assert_eq!(
+        host.engine
+            .link(p, Generation(2))
+            .map(|link| (link.parent, link.base, link.copied)),
+        Some((Generation(1), Seq(2), true)),
+        "copied at the base"
+    );
+    assert_eq!(host.tail_refused.get(&p), None, "the status clears");
+    assert_eq!(
+        host.engine.buffered_applied(p, Generation(1)),
+        AppliedSeq(3),
+        "the tail stays on its own lineage"
+    );
+    assert!(
+        host.engine
+            .history_at(p, Generation(1), Seq(3))
+            .expect("read")
+            .is_some(),
+        "the given-up record stays on disk"
+    );
+    assert_eq!(host.engine.sealed_by(p, Generation(1)), Some(Generation(2)));
+    let released = logged!(METHOD, "tail_released");
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["head"], 3);
+    assert_eq!(released[0]["through"], 3);
+    assert_eq!(logged!(METHOD, "inventory_tail_set_aside").len(), 1);
+
+    // The post-commit proof at the base is not withheld for the released tail. `write_chain`
+    // publishes no durability, so the answer is withheld as `short`, never `tail_held`.
+    let capture = CapturedPrefix {
+        partition: p,
+        generation: Generation(2),
+        through: AppliedSeq(2),
+    };
+    assert_eq!(host.sync_answer(capture, CopyId(1), true, true), None);
+    let reasons: Vec<_> = logged!(METHOD, "sync_withheld")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        [serde_json::json!("short")],
+        "not withheld for the tail"
+    );
+
+    // The release run committed `ReadOnly` (L stays generation 1); the next, automatic run.
+    assert_eq!(
+        host.inventory(p, CopyId(1), anchor_at(3, 2, digests[1]), l, None),
+        tail_held,
+        "the tail is current again with no release"
+    );
+}
+
+/// Issue #105 (design section 13, failure behaviour): a released tail this copy cannot report
+/// past still holds. Here the digest at the base differs from the anchor's: the answer is
+/// `TailHeld` naming that refusal, nothing is written, and the status keeps the tail.
+/// Cut: a release failure answers `InventoryFailed`, red.
+#[config_log::retcd_test]
+fn issue105_a_released_tail_that_cannot_be_copied_still_answers_tail_held_and_writes_nothing() {
+    const METHOD: &str =
+        "issue105_a_released_tail_that_cannot_be_copied_still_answers_tail_held_and_writes_nothing";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let held = host.engine.lineages();
+    assert_eq!(
+        host.inventory(
+            p,
+            CopyId(1),
+            anchor_at(2, 2, digests[0]),
+            Some(Generation(1)),
+            Some(Seq(3)),
+        ),
+        RecoveryEvent::TailHeld {
+            copy: CopyId(1),
+            head: Seq(3),
+            stamp: Some(Generation(1)),
+            reason: "missed_generation_base_digest_differs".to_owned(),
+        }
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+    assert_eq!(
+        host.tail_refused
+            .get(&p)
+            .map(|refused| (refused.head, refused.reason)),
+        Some((Seq(3), "missed_generation_held_past_base")),
+        "the status keeps the tail, with a reason the wire carries"
+    );
+    let refused = logged!(METHOD, "tail_release_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(
+        refused[0]["reason"],
+        "missed_generation_base_digest_differs"
+    );
+}
+
+/// Issue #105 (design section 13): a crash part way through the released copy leaves the
+/// anchor's generation staged. That ask answers `TailHeld`; the next ask with the release runs
+/// the same inherit again, which clears the staged keys and copies again, and the copy
+/// reports. Cut: `survivor` does not re-enter a staged anchor, red (the second answer fails).
+#[test]
+fn issue105_a_crash_during_the_released_copy_is_finished_by_the_next_ask() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let anchor = anchor_at(2, 2, digests[1]);
+    let release = Some(Seq(3));
+    host.engine
+        .inject_fault(rdb_storage::InjectedFault::CopyBatch);
+    assert!(
+        matches!(
+            host.inventory(p, CopyId(1), anchor, Some(Generation(1)), release),
+            RecoveryEvent::TailHeld { ref reason, .. } if reason == "missed_generation_link_refused"
+        ),
+        "the copy failed part way"
+    );
+    assert_eq!(
+        host.engine.staging(p, Generation(2)),
+        Some((Generation(1), Seq(2))),
+        "staged, not switched"
+    );
+    match host.inventory(p, CopyId(1), anchor, Some(Generation(1)), release) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(2), digests[1]));
+        }
+        other => panic!("the re-run reports: {other:?}"),
+    }
+    assert_eq!(host.engine.staging(p, Generation(2)), None, "switched");
+    assert_eq!(
+        host.engine.link(p, Generation(2)).map(|link| link.copied),
+        Some(true)
+    );
+}
+
+/// Issue #105 (design section 13), walk A's shape: a copy holding the anchor's generation at
+/// the base and a tail past it on an older lineage. Released, the tail is not reported: the copy
+/// reports the anchor's lineage as without a tail, nothing is written, and a refusal its landing
+/// recorded for that tail clears. Above `through` it still answers `TailHeld`.
+/// Cut: `inventory` reports a released hit as `TailHeld`, red.
+#[test]
+fn issue105_a_released_tail_beside_the_anchor_is_not_reported_and_nothing_is_written() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 5);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(3))
+            .expect("inherit");
+        digests
+    };
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let anchor = anchor_at(2, 3, digests[2]);
+    let held = host.engine.lineages();
+    host.tail_refused.insert(
+        p,
+        TailRefused {
+            generation: Generation(2),
+            head: Seq(5),
+            base: Seq(3),
+            reason: "tail_on_older_lineage",
+        },
+    );
+    assert!(
+        matches!(
+            host.inventory(p, CopyId(1), anchor, Some(Generation(1)), Some(Seq(4))),
+            RecoveryEvent::TailHeld { head: Seq(5), .. }
+        ),
+        "above --through"
+    );
+    match host.inventory(p, CopyId(1), anchor, Some(Generation(1)), Some(Seq(5))) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(3), digests[2]));
+        }
+        other => panic!("a released copy reports: {other:?}"),
+    }
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+    assert_eq!(
+        host.tail_refused.get(&p),
+        None,
+        "the landing's refusal clears"
     );
 }

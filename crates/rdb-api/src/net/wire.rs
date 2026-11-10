@@ -686,6 +686,7 @@ pub enum WirePeerAsk {
         copy: CopyId,
         anchor: LineageAnchor,
         last_writable: Option<Generation>,
+        release_through: Option<Seq>,
     },
     Sync {
         copy: CopyId,
@@ -708,10 +709,12 @@ impl From<PeerAsk> for WirePeerAsk {
                 copy,
                 anchor,
                 last_writable,
+                release_through,
             } => Self::Inventory {
                 copy,
                 anchor,
                 last_writable,
+                release_through,
             },
             PeerAsk::Sync {
                 copy,
@@ -746,10 +749,12 @@ impl From<WirePeerAsk> for PeerAsk {
                 copy,
                 anchor,
                 last_writable,
+                release_through,
             } => Self::Inventory {
                 copy,
                 anchor,
                 last_writable,
+                release_through,
             },
             WirePeerAsk::Sync {
                 copy,

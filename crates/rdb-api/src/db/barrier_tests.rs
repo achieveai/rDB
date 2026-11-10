@@ -3,6 +3,7 @@
 
 use super::reopen_tests::{config, fast, runtime};
 use super::*;
+use rdb_core::contracts::recovery::TailRelease;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const GROUP_OF: AffinityId = DEFAULT_GROUP;
@@ -715,4 +716,223 @@ fn w_c_a_write_acked_on_two_copies_is_not_lost_while_a_live_copy_holds_it() {
     );
     let text = refused.error.explain();
     assert!(text.contains("on node 3"), "{text}");
+}
+
+/// Walk C's held state, as the W-C row builds it, for the issue #105 section 13 rows: K2
+/// acknowledged on nodes 1 and 3 only, node 2 promoted without it, node 3 live and refusing its
+/// tail, node 1 cut off from both. Answers the app, the nodes, the links and K2.
+fn walk_c_held(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    dir: &Path,
+    app_dir: &Path,
+    patience: Duration,
+) -> (Db, Vec<Option<Db>>, Arc<Links>, PutOk) {
+    let mut formed = opened(rt, dir, store);
+    formed.shutdown();
+    drop(formed);
+    let links = Links::new();
+    let nodes: Vec<Option<Db>> = [1, 2, 3]
+        .map(|node| Some(open_process(rt, dir, store, node, &links)))
+        .into();
+    for db in nodes.iter().flatten() {
+        db.wait_ready(patience).expect("each node is ready");
+    }
+    let app = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::clone(&links)),
+                client: ClientId(2),
+                ..config(app_dir)
+            },
+            Arc::clone(store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the app opens");
+    app.wait_ready(patience).expect("the app sees the owner");
+    let k1 = app.put(b"k1", b"one", None).expect("k1 in G");
+    app.wait_durable(GROUP_OF, position(&k1), LONG)
+        .expect("k1 is on every disk");
+    links.hold(NodeId(1), NodeId(2));
+    links.hold(NodeId(2), NodeId(3));
+    let k2 = app
+        .put(b"k2", b"two", None)
+        .expect("k2 in G, on nodes 1 and 3");
+    assert_eq!(k2.durability, Durability::BufferedOnTwo, "{k2:?}");
+    links.hold(NodeId(1), NodeId(3));
+    app.promote(NodeId(2), None).expect("the promote commits");
+    links.heal(NodeId(2), NodeId(3));
+    let deadline = Instant::now() + patience;
+    let three = nodes[2].as_ref().expect("node 3");
+    while three
+        .node_status()
+        .into_iter()
+        .next()
+        .expect("its own status")
+        .tail_refused
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "node 3 reported no refusal");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (app, nodes, links, k2)
+}
+
+/// `forget-tail --through through --give-up-live-copy`, sent again until the owner accepts it:
+/// while the app's route still names the old owner (`NotPrimary`), and while the owner has not
+/// yet heard a holder's tail in its status probes ("nothing for --through to give up"), which
+/// cuts c5 and c6 hit at random on 2026-11-09.
+fn forget_k2(app: &Db, through: Seq, patience: Duration) {
+    let deadline = Instant::now() + patience;
+    loop {
+        let release = TailRelease {
+            through: Some(through),
+            no_intact_copy: false,
+        };
+        match app.forget_tail(release, true) {
+            Ok(_) => return,
+            Err(error)
+                if (error.kind == ErrorKind::NotPrimary
+                    || error.detail.contains("nothing for --through to give up"))
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("forget-tail refused: {error:?}"),
+        }
+    }
+}
+
+/// Puts until one succeeds or the window ends: the first success, or the last error.
+fn first_put(app: &Db, window: Duration) -> Result<PutOk, PutError> {
+    let end = Instant::now() + window;
+    loop {
+        match app.put(b"after", b"v", None) {
+            Ok(put) => return Ok(put),
+            Err(error) if Instant::now() >= end => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
+/// The modes node `node` logged `recovered` with, in order.
+fn recovered_modes(method: &str, node: u32) -> Vec<String> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "recovered" && line["node"] == node)
+        .map(|line| line["mode"].as_str().expect("a mode").to_owned())
+        .collect()
+}
+
+/// Issue #105 (design section 13), walk u1ft's acceptance: walk C's held state, the owner
+/// (node 2) and node 3 the only copies that answer, node 3 refusing K2's tail. `forget-tail
+/// --through K2 --give-up-live-copy` re-plans; node 3 is told the release, copies at the base
+/// and reports, so the commit is writable on two copies, L moves, and the next write takes K2's
+/// seq. K1 is kept. Cut: the owner sends no `release_through`, red (ReadOnly by count, no put).
+/// Integration (~45 s): the grant wait, the promote and the re-plan.
+#[config_log::retcd_test]
+fn issue105_forget_tail_with_the_holder_the_only_other_copy_resumes_writes() {
+    const METHOD: &str = "issue105_forget_tail_with_the_holder_the_only_other_copy_resumes_writes";
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let (app, _nodes, _links, k2) = walk_c_held(&rt, &store, dir.path(), app_dir.path(), patience);
+    forget_k2(&app, k2.seq, patience);
+    let put = first_put(&app, crate::host::test_patience(Duration::from_secs(20)))
+        .expect("writes resume after the release");
+    assert_eq!(put.seq, k2.seq, "the next write takes the given-up seq");
+    assert!(put.generation > k2.generation, "{put:?}");
+    let modes = recovered_modes(METHOD, 2);
+    assert!(
+        modes
+            .iter()
+            .any(|mode| mode == "DegradedRf2" || mode == "Active"),
+        "a writable commit: {modes:?}"
+    );
+    let released = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "tail_released" && line["node"] == 3)
+        .count();
+    assert!(released >= 1, "node 3 was told the release");
+    assert_eq!(
+        app.get(b"k1")
+            .expect("k1 reads")
+            .value
+            .map(|(_, value)| value),
+        Some(Bytes::from_static(b"one")),
+        "k1 kept"
+    );
+}
+
+/// Issue #105 (design section 13, section 7's M5 row): two live holders released together.
+/// Walk C's held state, then walk A: node 1, the old owner, comes back on its own data and
+/// lands holding K2 on an older lineage beside the anchor, while node 3 still holds K2 on the
+/// generation it missed. One `forget-tail --through K2 --give-up-live-copy` releases both:
+/// node 1 reports its anchor lineage with nothing written, node 3 copies at the base, and the
+/// commit is writable. Cut: the owner sends no `release_through`, red (no put).
+/// Integration (~60 s): the grant wait, the promote, a restart and the re-plan.
+#[config_log::retcd_test]
+fn issue105_forget_tail_releases_two_live_holders_together_and_writes_resume() {
+    const METHOD: &str =
+        "issue105_forget_tail_releases_two_live_holders_together_and_writes_resume";
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let (app, mut nodes, links, k2) =
+        walk_c_held(&rt, &store, dir.path(), app_dir.path(), patience);
+    let mut one = nodes[0].take().expect("node 1");
+    one.shutdown();
+    drop(one);
+    links.heal(NodeId(1), NodeId(2));
+    links.heal(NodeId(1), NodeId(3));
+    nodes[0] = Some(open_process(&rt, dir.path(), &store, 1, &links));
+    let boot = links
+        .boot_of(NodeId(1))
+        .expect("node 1 registered its boot");
+    for (at, node) in [(1, NodeId(2)), (2, NodeId(3))] {
+        let db = nodes[at].as_ref().expect("a running node");
+        db.send_to(
+            node,
+            Msg::PeerBooted {
+                node: NodeId(1),
+                boot,
+            },
+        )
+        .expect("the node hears the boot");
+    }
+    let deadline = Instant::now() + patience;
+    let one = nodes[0].as_ref().expect("node 1");
+    while one
+        .node_status()
+        .into_iter()
+        .next()
+        .is_none_or(|status| status.tail_refused.is_none())
+    {
+        assert!(Instant::now() < deadline, "node 1 reported no tail");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    forget_k2(&app, k2.seq, patience);
+    let put = first_put(&app, crate::host::test_patience(Duration::from_secs(30)))
+        .expect("writes resume after the release");
+    assert_eq!(put.seq, k2.seq, "the next write takes the given-up seq");
+    let released: BTreeSet<u64> =
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "tail_released")
+            .filter_map(|line| line["node"].as_u64())
+            .collect();
+    assert_eq!(released, BTreeSet::from([1, 3]), "both holders were told");
+    let modes = recovered_modes(METHOD, 2);
+    assert!(
+        modes
+            .iter()
+            .any(|mode| mode == "DegradedRf2" || mode == "Active"),
+        "a writable commit: {modes:?}"
+    );
 }

@@ -471,6 +471,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
                 copy: CopyId(2),
                 anchor: zero(),
                 last_writable: Some(Generation(4)),
+                release_through: Some(rdb_core::contracts::ids::Seq(7)),
             },
         },
         Msg::PeerAsk {
@@ -1053,6 +1054,7 @@ fn ask_from(asker: u32) -> Msg {
             copy: CopyId(1),
             anchor: zero(),
             last_writable: None,
+            release_through: None,
         },
     }
 }

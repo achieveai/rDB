@@ -705,6 +705,11 @@ pub enum PeerAsk {
         /// The last writable generation L the plan's ledger names, `None` when unknown (issue
         /// #105): what the holder's tail scan and its `holds_last_writable` answer are about.
         last_writable: Option<Generation>,
+        /// The plan's `release.through` (`admin forget-tail --through H`), `None` on an
+        /// automatic run (issue #105, design section 13). For this ask only, the holder does
+        /// not report a tail at or below it, and links a missed generation past it by copy.
+        /// Never stored on the holder.
+        release_through: Option<Seq>,
     },
     /// `SyncWalThrough` for one copy.
     Sync {
@@ -10328,6 +10333,7 @@ impl Host {
                 };
                 let anchor = plan.anchor;
                 let last_writable = plan.prior.ledger.last_writable;
+                let release_through = plan.release.through;
                 let holders: Vec<(CopyId, Option<NodeId>)> = copies
                     .iter()
                     .map(|copy| (*copy, holder_of(&plan.config.members, *copy)))
@@ -10352,6 +10358,7 @@ impl Host {
                                 copy,
                                 anchor,
                                 last_writable,
+                                release_through,
                             },
                         ),
                         None => self.answer_here(site, RecoveryEvent::InventoryFailed { copy }),
@@ -11293,7 +11300,8 @@ impl Host {
                 copy,
                 anchor,
                 last_writable,
-            } => Some(self.inventory(partition, copy, anchor, last_writable)),
+                release_through,
+            } => Some(self.inventory(partition, copy, anchor, last_writable, release_through)),
             PeerAsk::Sync {
                 copy,
                 cutoff,
@@ -11343,6 +11351,7 @@ impl Host {
         copy: CopyId,
         anchor: LineageAnchor,
         last_writable: Option<Generation>,
+        release_through: Option<Seq>,
     ) -> RecoveryEvent {
         if anchor.lineage.generation > Generation(0) {
             // #80 R4-1: first, so a failed inventory seals too. What this copy acknowledges
@@ -11351,18 +11360,54 @@ impl Host {
                 .seal(self.node, partition, anchor.lineage.generation);
             // Issue #105: a tail above the base on another lineage speaks before any refusal. A
             // copy that answered `InventoryFailed` here was left out, and a commit then went on
-            // at a cutoff below records writes may have been acknowledged on.
+            // at a cutoff below records writes may have been acknowledged on. A tail the
+            // operator gave up for this run (design section 13) is not reported.
+            let mut released = None;
             if let Some(hit) = self.tail_scan(partition, anchor, last_writable) {
-                return self.tail_held(partition, copy, anchor, hit);
+                match release_through.filter(|through| hit.head <= *through) {
+                    Some(through) => {
+                        self.tail_released(partition, copy, anchor, hit, through);
+                        released = Some(hit);
+                    }
+                    None => return self.tail_held(partition, copy, anchor, hit),
+                }
             }
             #[cfg(test)]
             let survived = if self.refuse_inventories {
                 Err("refused_by_test")
             } else {
-                self.survivor(partition, copy, anchor)
+                self.survivor(partition, copy, anchor, release_through)
             };
             #[cfg(not(test))]
-            let survived = self.survivor(partition, copy, anchor);
+            let survived = self.survivor(partition, copy, anchor, release_through);
+            // A released tail this copy cannot report past (digest at the base, history, a
+            // sealed parent, depth) still holds: `TailHeld`, naming the refusal, so the
+            // partition stays `ReadOnly` as without the release. Its status keeps the scan's
+            // reason, one of `TAIL_REFUSED_REASONS`.
+            if let (Some(hit), Err(refusal)) = (released, &survived) {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    generation = anchor.lineage.generation.0,
+                    from = hit.from.0,
+                    head = hit.head.0,
+                    reason = *refusal,
+                    "tail_release_refused"
+                );
+                let refusal = (*refusal).to_owned();
+                return match self.tail_held(partition, copy, anchor, hit) {
+                    RecoveryEvent::TailHeld {
+                        copy, head, stamp, ..
+                    } => RecoveryEvent::TailHeld {
+                        copy,
+                        head,
+                        stamp,
+                        reason: refusal,
+                    },
+                    other => other,
+                };
+            }
             return match survived {
                 Ok(mut inventory) => {
                     inventory.holds_last_writable =
@@ -11686,6 +11731,40 @@ impl Host {
         }
     }
 
+    /// `hit` is at or below this ask's `release_through` (issue #105, design section 13): the
+    /// operator gave it up for this run, so it is not reported. Nothing is written. A refusal
+    /// this copy reported for that tail clears, so its status no longer holds the owner's
+    /// repair and its post-commit proof is not withheld for it. If the run commits `ReadOnly`,
+    /// L does not move, and the next scan without a release finds the tail current again.
+    fn tail_released(
+        &mut self,
+        partition: PartitionId,
+        copy: CopyId,
+        anchor: LineageAnchor,
+        hit: TailHit,
+        through: Seq,
+    ) {
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            generation = anchor.lineage.generation.0,
+            base = anchor.base_seq.0,
+            from = hit.from.0,
+            head = hit.head.0,
+            stamp = hit.stamp.map(|stamp| stamp.0),
+            through = through.0,
+            "tail_released"
+        );
+        if self
+            .tail_refused
+            .get(&partition)
+            .is_some_and(|refused| refused.head <= through)
+        {
+            self.tail_refused.remove(&partition);
+        }
+    }
+
     /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
     /// `Dispatcher::current_inventory` reports, read from this engine alone.
     ///
@@ -11704,6 +11783,7 @@ impl Host {
         partition: PartitionId,
         copy: CopyId,
         anchor: LineageAnchor,
+        release_through: Option<Seq>,
     ) -> Result<SurvivorInventory, &'static str> {
         let generation = anchor.lineage.generation;
         let lineages = self.engine.lineages();
@@ -11713,8 +11793,13 @@ impl Host {
         {
             return Err("copy_ahead_of_anchor");
         }
-        if !lineages.contains(&(partition, generation)) {
-            let from = self.inherit_missed_link(partition, anchor)?;
+        // A released copy that crashed part way through its copy holds the anchor's
+        // generation staged: the same inherit again clears it and copies again (design
+        // section 13). Without a release the guards below refuse it as before.
+        let staged =
+            release_through.is_some() && self.engine.staging(partition, generation).is_some();
+        if !lineages.contains(&(partition, generation)) || staged {
+            let from = self.inherit_missed_link(partition, anchor, release_through)?;
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -11793,10 +11878,17 @@ impl Host {
     /// truncate); its digest at the base is the anchor's. Then only a link (C1): a parent
     /// already at [`MAX_CHAIN_DEPTH`] levels would need a multi-batch copy inside the discovery
     /// window, so it is refused. A refusal writes nothing and names its reason.
+    ///
+    /// Issue #105 (design section 13): when this ask's `release_through` covers the head, the
+    /// tail above the base was given up for this run. The same checks run in the same order,
+    /// and then the engine's `Copied` inherit is the set-aside: the child gets the parent's
+    /// state as of the base, and the parent keeps its tail, sealed, stamped below the L a
+    /// writable commit then sets.
     fn inherit_missed_link(
         &mut self,
         partition: PartitionId,
         anchor: LineageAnchor,
+        release_through: Option<Seq>,
     ) -> Result<Generation, &'static str> {
         let to = anchor.lineage.generation;
         let base = anchor.base_seq;
@@ -11812,7 +11904,8 @@ impl Host {
         if head < base {
             return Err("missed_generation_held_below_base");
         }
-        if head > base {
+        let released = head > base && release_through.is_some_and(|through| head <= through);
+        if head > base && !released {
             self.tail_refused.insert(
                 partition,
                 TailRefused {
@@ -11840,6 +11933,20 @@ impl Host {
             // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
             // generation is held, so `survivor` never calls here. Kept as success (A-R179).
             Ok(Inherited::Linked | Inherited::AlreadyInherited) => {
+                self.tail_refused.remove(&partition);
+                Ok(from)
+            }
+            Ok(Inherited::Copied { keys }) if released => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    from = from.0,
+                    to = to.0,
+                    base = base.0,
+                    head = head.0,
+                    keys,
+                    "inventory_tail_set_aside"
+                );
                 self.tail_refused.remove(&partition);
                 Ok(from)
             }
