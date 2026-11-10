@@ -13,19 +13,20 @@ built.
 ## 1. What you need
 
 - **Rust** stable, 1.89 or later, MSVC target on Windows.
-- **LLVM**, because RocksDB's build runs `bindgen`. Windows: `winget install LLVM.LLVM`.
-- **`LIBCLANG_PATH`** set to LLVM's `bin` folder. This repository sets it in
-  `.cargo/config.toml`, but that file **does not apply outside the repository**. Set it yourself,
-  either as an environment variable or in your own project's `.cargo/config.toml`:
-
-  ```toml
-  [env]
-  LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }
-  ```
-
+- **libclang**, because RocksDB's build runs `bindgen`. You set no environment variable for it:
+  - Linux (Debian/Ubuntu): `sudo apt-get install build-essential libclang-dev`. `libclang-dev`
+    is the package that provides the unversioned `libclang.so` that `bindgen` searches for
+    (`/usr/lib/llvm-*/lib`); install it rather than setting a path. Other
+    distributions: install their libclang development package.
+  - Windows: `winget install LLVM.LLVM`. The default install folder is found automatically.
+  - Only if LLVM is in an unusual place, set `LIBCLANG_PATH` to the folder that holds
+    `libclang.so` / `libclang.dll`. An environment variable always wins.
+  - This repository no longer sets `LIBCLANG_PATH` in `.cargo/config.toml` (ADR-0017, note
+    2026-11-08). Cargo's `[env]` cannot be limited to one OS, so it used to hand Linux builds a
+    Windows path and they failed with `Unable to find libclang`.
 - **Time for the first build.** It compiles RocksDB from source: 5 to 10 minutes on a cold
   build (7 min 08 s for an outside crate on the dev host, 2026-10-24). Later builds reuse it.
-- A checkout of this repository. You depend on its crates by path; nothing is published.
+- This repository, as a path or a git dependency (section 2). Nothing is published to crates.io.
 
 ## 2. Your `Cargo.toml`
 
@@ -49,9 +50,31 @@ serde_json = "1"                                          # to save a request (s
 opt-level = 2
 ```
 
+Or depend on a pinned commit instead of a checkout. A git dependency makes cargo clone the whole
+workspace and pick each crate out of it by name, so name every crate you use and pin one `rev`
+for all of them:
+
+```toml
+rdb-api       = { git = "https://github.com/achieveai/rDB", rev = "<commit>" }
+config-core   = { git = "https://github.com/achieveai/rDB", rev = "<commit>" }
+config-client = { git = "https://github.com/achieveai/rDB", rev = "<commit>" }
+```
+
+- **tonic.** rDB uses tonic 0.12 and prost 0.13 inside `rdb-api` and `config-client`. If your
+  crate has its own gRPC stack on another tonic version, cargo links both; that works, but the
+  two do not share types. Keep your own tonic types out of calls into rDB (rDB's public API
+  uses none). Do not try to unify the versions with `[patch]`.
+  Linking both costs build time and binary size (for example axum, prost and tower each appear
+  twice), not correctness.
+- **Disk.** RocksDB compiles from source. A debug target directory for a crate that uses rDB
+  reached 13 GB in one real workspace, so plan for that on build machines.
+
 - Never use `workspace = true` keys; they only work inside this repository.
-- Copy this repository's `Cargo.lock` into your crate before the first build. It pins the
-  versions rDB was tested with; cargo adds your crate and drops what you do not use.
+- **`Cargo.lock`.** A dependency's lock file is never read. If your crate has no lock yet, you may
+  copy this repository's `Cargo.lock` in before the first build to start from the versions rDB
+  was tested with; cargo adds your crate and drops what you do not use. If your workspace
+  already has a lock, keep it: cargo resolves rDB's crates into it and you do not need to copy
+  anything.
 - Optional: `config-log = { path = "<checkout>/crates/config-log" }` gives JSONL logs you can
   query with DuckDB. `pilot_kv` uses it.
 
@@ -268,7 +291,9 @@ To size a cap, use the upper bound for every put: `value_len + id_len + zero_byt
 
 - 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
   ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
-- The largest single value is 1,048,240 bytes less the id's length, for a create.
+- The largest single value, for a create, is 1,048,240 bytes less the id's length and less
+  one more for each zero byte in the id. For a one-byte id that is a zero byte, it is 1,048,238
+  bytes.
 
 A transaction one byte over is refused with `INVALID_ARGUMENT`, and nothing is written:
 
@@ -964,3 +989,22 @@ count grows. rDB caps it (ruling A-R166):
   reopen.
 
 Source: `crates/rdb-storage/README.md`, "Chain-depth ceiling".
+
+## 8. Container image (voter and data node)
+
+`docker/Dockerfile` builds one image, `rdb-bf-node:dev`, with both processes:
+
+```bash
+docker build -f docker/Dockerfile -t rdb-bf-node:dev .      # from the repository root
+docker run --rm rdb-bf-node:dev help
+```
+
+- `voter ...` runs `config-server` (the rEtcd voter) with the flags you give it; mount your own
+  `config.toml` and manifest.
+- `dev-voter` generates a one-voter, insecure rEtcd under `/data/voter` on first start and serves
+  it: client port 7002, health `http://127.0.0.1:7004/health` (loopback only, inside the container; config-server refuses any other address). For development only (no TLS,
+  allow-all). Mount a volume on `/data`.
+- `data ...` runs `rdb_node` (one rDB data node) with the flags in the header of
+  `crates/rdb-api/examples/rdb_node.rs`.
+- The build needs `build-essential` and `libclang-dev` in the builder stage and sets no
+  `LIBCLANG_PATH`. See `docker/README.md` for a worked run.

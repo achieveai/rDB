@@ -94,7 +94,10 @@ PARTITIONS_ARG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --base-port) BASE_PORT="$2"; shift 2 ;;
+        --base-port)
+            # Decimal from here on: `$((021800 + 1))` reads a leading 0 as octal and fails on 8 or 9.
+            case "${2:-}" in '' | *[!0-9]*) echo "lr: --base-port takes a port number, got '${2:-}'" >&2; exit 2 ;; esac
+            BASE_PORT=$((10#$2)); shift 2 ;;
         --root) ROOT="$2"; shift 2 ;;
         --run) RUN="$2"; shift 2 ;;
         --timeout-sec) TIMEOUT_SEC="$2"; shift 2 ;;
@@ -175,6 +178,9 @@ pick_run() {
         RUN="$(cat "$ROOT/current")"
     fi
     [ -d "$RUN" ] || die "run folder $RUN is gone"
+    # `down` and `clean` handle a run with neither run.env nor pids themselves (`no_pids`);
+    # every other case needs run.env, as before.
+    case "$COMMAND" in down | clean) [ -f "$RUN/run.env" ] || [ -f "$RUN/pids" ] || return 0 ;; esac
     # shellcheck disable=SC1091
     . "$RUN/run.env"
     NODES="${NODES:-3}" # a run from before M11 has no NODES line: three nodes
@@ -348,7 +354,7 @@ promote_hint() { # n line: a node that gave up waiting for an owner no link reac
     members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
     k="$(promote_target "$gone" "$members")"
     if [ -n "$k" ]; then
-        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN (above one partition, add --partition P once for each partition it owns; lr do "admin readiness" lists them)"
+        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN (above one partition, add --partition P once for each partition it owns; lr do \"admin readiness\" lists them)"
     else
         say "node $n waits for node $gone, the owner, and no link reaches it. No running node holds a regular copy to promote (${members:-admin status gave no members line})"
     fi
@@ -567,11 +573,27 @@ start_all() { # nodes 1 to K, then the wait for each: the tail of `up` and `up -
     say "pilot: $(printf %q "$PILOT_BIN") --dir $(printf %q "$RUN/pilot") --control $CONTROL --nodes $(peers) --cert-dir $(printf %q "$RUN/certs") --put k=v --get k"
 }
 
-# No pids file: nothing was started in this run, so nothing runs. Said, never a silent exit:
-# awk on a missing file failed `pid_of` under pipefail, and `lr down` exited 2 (PR #74 R3).
+# No pids file: lr cannot name this run's processes, so it asks the run's ports (run.env's
+# BASE_PORT and NODES, the span `up` checks). A port in use may be a live node of this run
+# whose pids file was lost: refuse, keep the folder (PR #74 R3, Revobot #78). Free ports:
+# nothing runs. No ports in run.env: say so; only the folder can go. Said, never a silent
+# exit: awk on a missing file failed `pid_of` under pipefail, and `lr down` exited 2.
 no_pids() {
     [ -f "$RUN/pids" ] && return 1
-    say "nothing runs: run $RUN has no pids file"
+    local base nodes lo hi p
+    base="$({ sed -n 's/^BASE_PORT=//p' "$RUN/run.env" 2>/dev/null || true; } | tr -d '\r' | tail -n1)"
+    case "$base" in
+        '' | *[!0-9]*)
+            say "run $RUN has no pids file and no BASE_PORT in run.env: lr cannot check its ports"
+            return 0 ;;
+    esac
+    nodes="$({ sed -n 's/^NODES=//p' "$RUN/run.env" 2>/dev/null || true; } | tr -d '\r' | tail -n1)"
+    case "$nodes" in [3-8]) ;; *) nodes=3 ;; esac
+    lo=$((10#$base + 1)) hi=$((10#$base + 40 + nodes))
+    for p in $(seq "$lo" "$hi"); do
+        port_free "$p" || die "port $p of run $RUN is in use and its pids file is missing; stop what holds it, then 'lr $COMMAND'"
+    done
+    say "nothing runs: run $RUN has no pids file and its ports $lo-$hi are free"
 }
 
 down() {
@@ -587,7 +609,8 @@ down() {
 }
 
 clean() {
-    # No pids file: nothing runs to stop, so only the folder goes, under the same root check.
+    # No pids file: `no_pids` refuses while a run port is held; else only the folder goes,
+    # under the same root check.
     no_pids || down
     case "$RUN" in
         "$ROOT"/*) ;;

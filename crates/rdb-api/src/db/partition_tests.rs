@@ -1657,6 +1657,171 @@ fn open_linked(
     ))
 }
 
+/// Three node processes on one set of links, each ready, and `apps` app handles over them, each
+/// having seen every owner. The nodes live under `root/db`, the apps under `root/app-N`.
+fn linked_apps(
+    rt: &tokio::runtime::Runtime,
+    root: &Path,
+    store: &Arc<dyn ConfigStore>,
+    partitions: u32,
+    apps: u32,
+    patience: Duration,
+) -> (Vec<Db>, Vec<Db>) {
+    let dir = root.join("db");
+    std::fs::create_dir_all(&dir).expect("the database folder");
+    let mut formed = ready(rt, &dir, store, Some(partitions));
+    formed.shutdown();
+    drop(formed);
+    let links = crate::transport::Links::new();
+    let nodes: Vec<Db> = [1, 2, 3]
+        .map(|node| {
+            open_linked(rt, &dir, store, node, &links)
+                .unwrap_or_else(|error| panic!("node {node} opens: {error}"))
+        })
+        .into();
+    for db in &nodes {
+        db.wait_ready(patience).expect("each leads its own");
+    }
+    let apps: Vec<Db> = (0..apps)
+        .map(|app| {
+            let app_dir = root.join(format!("app-{app}"));
+            std::fs::create_dir_all(&app_dir).expect("the app's folder");
+            let db = rt
+                .block_on(Db::open_with(
+                    DbConfig {
+                        local: Vec::new(),
+                        links: Some(Arc::clone(&links)),
+                        client: ClientId(2 + app),
+                        ..config(&app_dir, None)
+                    },
+                    Arc::clone(store),
+                    rt.handle().clone(),
+                    crate::host::test_budgets(),
+                ))
+                .expect("the app opens");
+            db.wait_ready(patience).expect("the app sees every owner");
+            db
+        })
+        .collect();
+    (nodes, apps)
+}
+
+/// Node 2 stalls, partition 2 moves to node 3 by another app's promote, and node 2 resumes: the
+/// other apps hear nothing, and node 2 answers without admitting, so their routes name it until
+/// they read the record again. Both `readiness` and `wait_ready` must move to node 3, with no
+/// dead link to prompt them. Cut: drop the re-read for an answer that does not admit, in either
+/// place, and that handle waits at node 2 until its patience runs out. Integration (~4 s): a
+/// promote waits out node 2's grant.
+#[test]
+fn s3_a_resumed_old_owner_does_not_hold_readiness_after_a_promote_from_another_app() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let (mut nodes, mut apps) = linked_apps(&rt, dir.path(), &store, 2, 3, patience);
+
+    let (release, stall) = mpsc::channel();
+    nodes[1]
+        .send_to(NodeId(2), Msg::Stall(stall))
+        .expect("a stall");
+    let promoted = apps[0]
+        .promote_partition(P2, NodeId(3), None)
+        .unwrap_or_else(|error| panic!("a stalled owner looks dead: {error}"));
+    assert_eq!(promoted.owner, NodeId(3), "{promoted:?}");
+    release.send(()).expect("the node is stalled");
+
+    // Node 2 is back and fenced: it answers, and does not admit.
+    let until = Instant::now() + patience;
+    loop {
+        match apps[1].look_in(P2, NodeId(2)) {
+            Ok(status) if status.admits != Some(true) => break,
+            _ => assert!(
+                Instant::now() < until,
+                "node 2 never answered without admitting"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(apps[1].owner_of(P2), Some(NodeId(2)), "it has not heard");
+    assert_eq!(apps[2].owner_of(P2), Some(NodeId(2)), "it has not heard");
+
+    let seen = loop {
+        let seen = readiness_of(&apps[1], P2);
+        if seen.owner == NodeId(3) && seen.ready {
+            break seen;
+        }
+        assert!(Instant::now() < until, "{seen:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(seen.owner, NodeId(3), "{seen:?}");
+    apps[2]
+        .wait_ready(patience)
+        .expect("wait_ready moves to the new owner");
+    assert_eq!(apps[2].owner_of(P2), Some(NodeId(3)), "its route moved");
+
+    for db in nodes.iter_mut().chain(apps.iter_mut()) {
+        db.shutdown();
+    }
+}
+
+/// The control for the row above: an owner the record still names, fenced, is not read as moved.
+/// Node 2 still owns partition 5 after partition 2 moved off it; a re-read names node 2 again, so
+/// the partition stays not ready. Cut: `not_ready` answers `None` for a fenced status. Integration
+/// (~4 s): a promote waits out node 2's grant.
+#[test]
+fn s3_a_current_fenced_owner_stays_not_ready() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let patience = crate::host::test_patience(Duration::from_secs(20));
+    let (mut nodes, mut apps) = linked_apps(&rt, dir.path(), &store, 8, 2, patience);
+
+    let (release, stall) = mpsc::channel();
+    nodes[1]
+        .send_to(NodeId(2), Msg::Stall(stall))
+        .expect("a stall");
+    apps[0]
+        .promote_partition(PART2, NodeId(3), None)
+        .unwrap_or_else(|error| panic!("a stalled owner looks dead: {error}"));
+    release.send(()).expect("the node is stalled");
+
+    let until = Instant::now() + patience;
+    let fenced = loop {
+        let seen = readiness_of(&apps[1], PART5);
+        if matches!(seen.reason, Some(NotReady::Fenced(_))) {
+            break seen;
+        }
+        assert!(Instant::now() < until, "node 2 never fenced: {seen:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!fenced.ready, "{fenced:?}");
+    assert_eq!(fenced.owner, NodeId(2), "{fenced:?}");
+    assert_eq!(
+        apps[1].owner_of(PART5),
+        Some(NodeId(2)),
+        "it stays the owner"
+    );
+    // Partition 2 and every other partition ready first, so the wait below is about partition 5.
+    until_ready(&apps[1], PART2);
+    let refused = apps[1]
+        .wait_ready(Duration::from_secs(2))
+        .expect_err("a fenced owner does not become ready");
+    assert!(
+        matches!(
+            refused,
+            ReadyError::TimedOut {
+                owner: NodeId(2),
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+
+    for db in nodes.iter_mut().chain(apps.iter_mut()) {
+        db.shutdown();
+    }
+}
+
 /// S3 acceptance finding 3: an app-only `Db` asking to move a partition off a live owner gets a
 /// refusal the caller can match on, `PromoteError::OwnerAlive`, not only its text. Integration
 /// (~2 s): node processes and an app over one set of links.

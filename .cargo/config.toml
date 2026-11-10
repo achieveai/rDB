@@ -1,3 +1,11 @@
-# ADR-0017: RocksDB bindgen needs libclang; LLVM installed via winget on the dev host.
-[env]
-LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }
+# No [env] section on purpose (ADR-0017, note 2026-11-08; issue #85).
+#
+# This file used to force LIBCLANG_PATH="C:\Program Files\LLVM\bin" when unset. Cargo's [env]
+# table cannot be limited to one OS, so on Linux it handed the RocksDB build script a Windows
+# path: bindgen then looked only there and failed with "Unable to find libclang ... (invalid: [])"
+# until the caller set LIBCLANG_PATH by hand.
+#
+# It is not needed. `librocksdb-sys` builds with `bindgen-runtime`, and `clang-sys` searches the
+# standard install locations itself (Windows: C:\Program Files*\LLVM, Scoop, Visual Studio's LLVM;
+# Linux: /usr/lib/llvm-*/lib and /usr/lib/<arch>-linux-gnu when libclang-dev is installed).
+# If LLVM lives somewhere unusual, set LIBCLANG_PATH in your own shell; it always wins.
