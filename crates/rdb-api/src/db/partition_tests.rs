@@ -1709,7 +1709,8 @@ fn linked_apps(
 /// Node 2 stalls, partition 2 moves to node 3 by another app's promote, and node 2 resumes: the
 /// other apps hear nothing, and node 2 answers without admitting, so their routes name it until
 /// they read the record again. Both `readiness` and `wait_ready` must move to node 3, with no
-/// dead link to prompt them. Cut: drop the re-read for an answer that does not admit, in either
+/// dead link to prompt them, and a `wait_ready` whose re-read finds node 3 after its `within`
+/// is still a timeout. Cut: drop the re-read for an answer that does not admit, in either
 /// place, and that handle waits at node 2 until its patience runs out. Integration (~4 s): a
 /// promote waits out node 2's grant.
 #[test]
@@ -1718,7 +1719,7 @@ fn s3_a_resumed_old_owner_does_not_hold_readiness_after_a_promote_from_another_a
     let rt = runtime();
     let store = store();
     let patience = crate::host::test_patience(Duration::from_secs(20));
-    let (mut nodes, mut apps) = linked_apps(&rt, dir.path(), &store, 2, 3, patience);
+    let (mut nodes, mut apps) = linked_apps(&rt, dir.path(), &store, 2, 4, patience);
 
     let (release, stall) = mpsc::channel();
     nodes[1]
@@ -1744,6 +1745,7 @@ fn s3_a_resumed_old_owner_does_not_hold_readiness_after_a_promote_from_another_a
     }
     assert_eq!(apps[1].owner_of(P2), Some(NodeId(2)), "it has not heard");
     assert_eq!(apps[2].owner_of(P2), Some(NodeId(2)), "it has not heard");
+    assert_eq!(apps[3].owner_of(P2), Some(NodeId(2)), "it has not heard");
 
     let seen = loop {
         let seen = readiness_of(&apps[1], P2);
@@ -1754,6 +1756,24 @@ fn s3_a_resumed_old_owner_does_not_hold_readiness_after_a_promote_from_another_a
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(seen.owner, NodeId(3), "{seen:?}");
+    // PR #102 review, round 2: a re-read that finds the new owner after `within` has passed is
+    // still a timeout. Node 3 admits by now (`readiness` above saw it). `within` is zero, so the
+    // deadline has passed before the first look; the owner it names is node 3, so the re-read
+    // did happen. Waited past `OWNER_REREAD_GAP` first, so the re-read is not skipped. Cut: no
+    // deadline check before the `continue`, and this call looks again at node 3, which admits,
+    // and answers `Ok`.
+    std::thread::sleep(OWNER_REREAD_GAP + Duration::from_millis(50));
+    let late = apps[3].wait_ready(Duration::ZERO);
+    assert!(
+        matches!(
+            late,
+            Err(ReadyError::TimedOut {
+                owner: NodeId(3),
+                ..
+            })
+        ),
+        "a new owner found after the deadline is a timeout: {late:?}"
+    );
     apps[2]
         .wait_ready(patience)
         .expect("wait_ready moves to the new owner");
