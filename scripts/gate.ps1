@@ -156,7 +156,7 @@ if ($Stage -in 'deps', 'all') { Write-Host '== deps';   Test-Deps }
 if ($Stage -in 'drift', 'all') { Test-Drift }
 if ($Stage -in 'purity', 'all') { Test-Purity }
 if ($Stage -in 'lint', 'all') { Write-Host '== clippy'; Invoke-Cargo @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') }
-if ($Stage -in 'release', 'all') { Write-Host '== release check'; Invoke-Cargo @('check', '--release', '-p', 'rdb-api', '--lib', '--examples') }
+if ($Stage -in 'release', 'all') { Write-Host '== release check'; Invoke-Cargo @('check', '--release', '-p', 'rdb-api', '--lib', '--examples', '--tests') }
 if ($Stage -in 'test', 'all') {
     Write-Host '== test'
     Show-PortPreflight
