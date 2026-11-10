@@ -87,7 +87,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireCall::Rebuild` and `WireAnswer::Rebuilt` (M11 T12 over processes) were added under `4`
 /// too: no released build speaks it. So was `RecoveryPlan::must_hold` (PR #74, A-R477), which a
 /// routed `Plan` carries: a build speaking `3` is refused before it could misread one.
-/// `5` is #79's many-partitions wire.
+/// `5` came with issue #79: `WireCall::Get` names the `group` it reads.
 /// `6` came with #80: `Frame::ClockProbe`, `Frame::ClockEcho`,
 /// `WireNodeStatus::{qualifying_copy, clock_bound_lost, committed_without}`, and
 /// `RecoveryPlan::prior`, which a routed `Plan` carries. Those were written as a `4` on a branch

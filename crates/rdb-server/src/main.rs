@@ -325,7 +325,10 @@ async fn connect(args: &Args) -> Result<(Arc<Links>, Arc<Net>), ExitCode> {
             dial,
             protocol_version: PROTOCOL_VERSION,
             faults: Faults::new(),
-            // The gateway is not an admin app: it may not Move or Rebuild.
+            // Required, but unused here: the list filters the Move and Rebuild calls that a node
+            // of this process receives, and the gateway hosts no node (`local` is empty). It
+            // sends no Move or Rebuild either: its wire has none. Whether app `--app` may is up
+            // to each node's own `--admin-apps`.
             admin_apps: BTreeSet::new(),
         },
         &links,

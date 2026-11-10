@@ -663,6 +663,13 @@ fn not_ready(status: &NodeStatus) -> Option<NotReady> {
     })
 }
 
+/// Whether a partition reported as `reason` may have moved to another owner by a promote this
+/// `Db` did not hear of: its owner cannot be reached, or answered without admitting. An owner
+/// that gave no answer at all is not one this tells anything about.
+const fn may_have_moved(reason: &NotReady) -> bool {
+    !matches!(reason, NotReady::NoAnswer)
+}
+
 /// The kind a node refused a call with, for a put's or a status look's error and a read's
 /// rejection alike; `None` for an answer that is not a refusal.
 const fn refusal_kind(answer: &Answer) -> Option<ErrorKind> {
@@ -2225,6 +2232,13 @@ impl Db {
                     self.ready_seen.store(true, Ordering::Relaxed);
                     return Ok(());
                 }
+                // It answered without admitting: a resumed old owner stays this way after a
+                // promote it never heard of (PR #102 review). Read the owner again, within
+                // `OWNER_REREAD_GAP`, and look at the owner `partitions/{p}` names now.
+                self.refresh_owner(partition);
+                if self.route.owner_of(partition) != owner.node {
+                    continue;
+                }
                 match stuck_recovery(&owner) {
                     Some(ReadyError::Blocked {
                         owner: node,
@@ -2297,19 +2311,20 @@ impl Db {
 
     /// Every partition's state now, one entry each in partition order (issue #79 S3). An owner
     /// with no link is `NoLink` at once; the rest share one read timeout. A partition with no
-    /// link has its record read once more, so one moved by another process is asked at its new
-    /// owner rather than reported lost. Holds no state between calls.
+    /// link, or whose owner answers without admitting, has its record read once more, at most
+    /// once per [`OWNER_REREAD_GAP`], so one moved by another process is asked at its new owner
+    /// rather than reported lost or fenced. An owner that does not answer is left as it is.
     #[must_use]
     pub fn readiness(&self) -> Vec<PartitionReady> {
         let all: Vec<PartitionId> = (1..=self.route.partitions()).map(PartitionId).collect();
         let mut seen = self.look_at(&all);
-        let unlinked: Vec<PartitionId> = seen
+        let unadmitted: Vec<PartitionId> = seen
             .iter()
-            .filter(|ready| ready.reason == Some(NotReady::NoLink))
+            .filter(|ready| ready.reason.as_ref().is_some_and(may_have_moved))
             .map(|ready| ready.partition)
             .collect();
-        self.refresh_owners(&unlinked);
-        let moved: Vec<PartitionId> = unlinked
+        self.refresh_owners(&unadmitted);
+        let moved: Vec<PartitionId> = unadmitted
             .into_iter()
             .filter(|partition| {
                 self.route.owner_of(*partition) != seen[partition.0 as usize - 1].owner
