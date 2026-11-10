@@ -2886,3 +2886,185 @@ fn issue105_a_released_tail_beside_the_anchor_is_not_reported_and_nothing_is_wri
         "the landing's refusal clears"
     );
 }
+
+/// Section 15.4 R6-7 (rule 15): adoption ends the copy's tail fact, so the copy proves the
+/// adopted head after the commit. A copy whose landing marked its tail `Adoptable` (the fact a
+/// later inventory finds) adopts it onto the anchor's lineage; the fact is gone, and the
+/// post-commit sync at the adopted head, the cutoff the plan brings, is not withheld for the
+/// tail (`tail_held`). Rule 15's "above": a fact whose head equals the cutoff withholds nothing,
+/// while one above it still does.
+/// Cuts: `Host::adopt` keeps the fact, red (the fact is still there); `sync_answer` withholds at
+/// a head equal to the cutoff (`>=`), red (the second sync is withheld `tail_held`).
+#[config_log::retcd_test]
+fn u2_r6_7_an_adopted_tail_clears_its_fact_and_its_post_commit_proof_is_not_withheld() {
+    const METHOD: &str =
+        "u2_r6_7_an_adopted_tail_clears_its_fact_and_its_post_commit_proof_is_not_withheld";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let fact = |head: u64| TailRefused {
+        generation: Generation(2),
+        head: Seq(head),
+        base: Seq(2),
+        reason: "tail_on_older_lineage",
+        adoption: TailAdoption::Adoptable,
+    };
+    host.tail_refused.insert(PartitionId(1), fact(3));
+    match host.inventory(
+        PartitionId(1),
+        CopyId(1),
+        anchor_at(2, 2, digests[1]),
+        Some(Generation(1)),
+        None,
+    ) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(3), digests[2]), "adopted");
+        }
+        other => panic!("an adoptable tail is adopted and reported, not {other:?}"),
+    }
+    assert_eq!(
+        host.tail_refused.get(&PartitionId(1)),
+        None,
+        "adoption ends the fact"
+    );
+    let first = host.sync(PartitionId(1), CopyId(1), Seq(3), Generation(2), true);
+    // A fact at the cutoff, as a landing that recorded the adopted head would leave it: not
+    // above the cutoff, so it withholds nothing. One above it does (the control).
+    host.tail_refused.insert(PartitionId(1), fact(3));
+    let at = host.sync(PartitionId(1), CopyId(1), Seq(3), Generation(2), true);
+    host.tail_refused.insert(PartitionId(1), fact(4));
+    let above = host.sync(PartitionId(1), CopyId(1), Seq(3), Generation(2), true);
+    let reasons: Vec<_> = logged!(METHOD, "sync_withheld")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        [serde_json::json!("tail_held")],
+        "only the fact above the cutoff withholds: {first:?} {at:?} {above:?}"
+    );
+    for proof in [first, at] {
+        assert!(
+            matches!(proof, Some(RecoveryEvent::DurableAt(ref p)) if p.seq == DurableSeq(3)),
+            "the adopted head is proven: {proof:?}"
+        );
+    }
+    assert_eq!(above, None);
+}
+
+/// critic-s15 M2 (1), the host half: the owner's anchor lineage holds a staged record below a
+/// cutoff that quarantined (rdb-core `u2_m2_1_a_divergent_record_below_the_cutoff_is_caught_at_the_cutoff`):
+/// seq 3, stamped L (generation 2) but not L's record, staged onto the anchor's lineage
+/// (generation 3, linked at base 2). The next run's inventory reports that head as it is, with
+/// its own digest, so F1 sees the fork (rdb-core
+/// `before_commit_a_foreign_digest_at_the_cutoff_is_divergence`). The scan never reads the
+/// anchor's own lineage, so it is no tail: not `TailHeld`, no fact, nothing written.
+/// Two guards hold it. `tail_scan` reads only lineages below the anchor's, and its same-record
+/// check skips a lineage whose head the anchor's lineage holds; the anchor's lineage always
+/// holds its own. Cut either alone, green (observed for `<=`). Cut both, red (the answer is
+/// `TailHeld`).
+#[config_log::retcd_test]
+fn u2_m2_1_a_divergent_record_staged_below_the_cutoff_is_reported_as_the_head_not_held() {
+    use rdb_core::contracts::digest::Domain;
+    use rdb_core::contracts::envelope::EnvelopeHeader;
+    use rdb_core::contracts::ids::{BatchId, ClientId, LeaseId, TenantId};
+    use rdb_core::contracts::storage::{Batch, Write};
+    use rdb_core::contracts::txn::Outcome;
+    use rdb_core::contracts::version::ENVELOPE_VERSION;
+    const METHOD: &str =
+        "u2_m2_1_a_divergent_record_staged_below_the_cutoff_is_reported_as_the_head_not_held";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let (digests, forged) = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 2);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(3), Seq(2))
+            .expect("inherit");
+        // As the receiver stages a catch-up record: L's stamp, onto the anchor's lineage.
+        let mut env = ReplicationEnvelope {
+            header: EnvelopeHeader {
+                protocol_version: ENVELOPE_VERSION,
+                partition: PartitionId(1),
+                generation: Generation(2),
+                config_version: ConfigVersion(1),
+                owner_epoch: OwnerEpoch(2),
+                seq: Seq(3),
+                body_len: 0,
+            },
+            lease_id: LeaseId(1),
+            prev_digest: digests[1],
+            request_identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(3),
+            },
+            request_digest: Digest::of(Domain::Record, &[b"forged"]),
+            conditions_result: Vec::new(),
+            mutations: vec![Write {
+                ns: Namespace::User,
+                key: Bytes::from_static(b"k"),
+                value: Some(Bytes::from_static(b"forged")),
+            }],
+            result: Outcome::Published,
+            record_digest: Digest::ROOT,
+        };
+        env.record_digest = env.compute_record_digest().expect("digest");
+        let mut progress = 3u64.to_le_bytes().to_vec();
+        progress.extend_from_slice(&env.record_digest.0);
+        let mut writes = env.mutations.clone();
+        writes.push(Write {
+            ns: Namespace::History,
+            key: Bytes::copy_from_slice(&3u64.to_be_bytes()),
+            value: Some(env.encode().expect("encode")),
+        });
+        writes.push(Write {
+            ns: Namespace::Progress,
+            key: Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+            value: Some(Bytes::from(progress)),
+        });
+        engine
+            .commit(Batch {
+                id: BatchId(3),
+                partition: PartitionId(1),
+                generation: Generation(3),
+                seq: Seq(3),
+                writes,
+            })
+            .expect("commit");
+        (digests, env.record_digest)
+    };
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let held = host.engine.lineages();
+    match host.inventory(
+        PartitionId(1),
+        CopyId(1),
+        anchor_at(3, 2, digests[1]),
+        Some(Generation(2)),
+        None,
+    ) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(
+                inventory.head,
+                (Seq(3), forged),
+                "the staged head, as it is"
+            );
+            assert!(!inventory.holds_last_writable, "{inventory:?}");
+        }
+        other => panic!("the owner reports its staged head, not {other:?}"),
+    }
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+    assert_eq!(host.tail_refused.get(&PartitionId(1)), None, "no tail fact");
+    let hits: Vec<_> = logged!(METHOD, "tail_scan")
+        .into_iter()
+        .map(|line| line["hit"].clone())
+        .collect();
+    assert_eq!(hits, [serde_json::Value::Bool(false)], "one scan, no hit");
+}

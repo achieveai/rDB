@@ -1039,3 +1039,507 @@ fn issue105_forget_tail_tells_both_live_holders_and_writes_resume() {
         "a writable commit: {modes:?}"
     );
 }
+
+/// Section 14 (d) row 10, walk WA-5 as a row: walk A's schedule, node 3 stopped, and the old
+/// owner (node 1) back on its own data. K2 is acknowledged on nodes 1 and 3 only; node 2 is
+/// promoted without it; node 3 then stops, so node 1 is the only copy that holds K2, on the
+/// older lineage beside the anchor generation it also holds. Node 1 adopts K2 by replay onto the
+/// anchor's lineage (`tail_adopted` with `how = replay`), the commit is writable at K2, K2 reads
+/// `two`, and the next write takes the seq after K2.
+/// Cut: `Host::adoption` answers `replay_not_ready` where it would replay, red (no put).
+/// Integration (~45 s): the grant wait, the promote, a reopen and the re-plan.
+#[config_log::retcd_test]
+fn u2_10_the_old_owner_back_on_its_own_data_replays_k2_onto_the_anchor_lineage() {
+    const METHOD: &str =
+        "u2_10_the_old_owner_back_on_its_own_data_replays_k2_onto_the_anchor_lineage";
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let mut formed = opened(&rt, dir.path(), &store);
+    formed.shutdown();
+    drop(formed);
+    let links = Links::new();
+    let mut nodes: Vec<Option<Db>> = [1, 2, 3]
+        .map(|node| Some(open_process(&rt, dir.path(), &store, node, &links)))
+        .into();
+    for db in nodes.iter().flatten() {
+        db.wait_ready(patience).expect("each node is ready");
+    }
+    let app_dir = config_testkit::fs::temp_dir();
+    let app = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::clone(&links)),
+                client: ClientId(2),
+                ..config(app_dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the app opens");
+    app.wait_ready(patience).expect("the app sees the owner");
+    let k1 = app.put(b"k1", b"one", None).expect("k1 in G");
+    app.wait_durable(GROUP_OF, position(&k1), LONG)
+        .expect("k1 is on every disk");
+    links.hold(NodeId(1), NodeId(2));
+    links.hold(NodeId(2), NodeId(3));
+    let k2 = app
+        .put(b"k2", b"two", None)
+        .expect("k2 in G, on nodes 1 and 3");
+    assert_eq!(k2.durability, Durability::BufferedOnTwo, "{k2:?}");
+    links.hold(NodeId(1), NodeId(3));
+    app.promote(NodeId(2), None).expect("the promote commits");
+
+    // Node 3 stops, so only node 1 can bring K2 back.
+    let mut three = nodes[2].take().expect("node 3");
+    three.shutdown();
+    drop(three);
+    let mut one = nodes[0].take().expect("node 1");
+    one.shutdown();
+    drop(one);
+    links.heal(NodeId(1), NodeId(2));
+    links.heal(NodeId(1), NodeId(3));
+    nodes[0] = Some(open_process(&rt, dir.path(), &store, 1, &links));
+    let boot = links
+        .boot_of(NodeId(1))
+        .expect("node 1 registered its boot");
+    nodes[1]
+        .as_ref()
+        .expect("node 2")
+        .send_to(
+            NodeId(2),
+            Msg::PeerBooted {
+                node: NodeId(1),
+                boot,
+            },
+        )
+        .expect("node 2 hears the boot");
+
+    let put = first_put(&app, crate::host::test_patience(Duration::from_secs(30)))
+        .expect("writes come back once node 1 replays k2");
+    assert_eq!(
+        put.seq,
+        Seq(k2.seq.0 + 1),
+        "the next write follows k2: {put:?}"
+    );
+    assert!(put.generation > k2.generation, "{put:?}");
+    assert_eq!(
+        app.get(b"k2")
+            .expect("k2 reads")
+            .value
+            .map(|(_, value)| value),
+        Some(Bytes::from_static(b"two")),
+        "k2 came back"
+    );
+    let replays = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "tail_adopted" && line["node"] == 1 && line["how"] == "replay")
+        .count();
+    assert_eq!(replays, 1, "node 1 replayed k2 once");
+}
+
+/// What [`w_c_promoted`] answers: the app, the nodes, the links, the control store and the
+/// tail's puts.
+type WcPromoted = (
+    Db,
+    Vec<Option<Db>>,
+    Arc<Links>,
+    Arc<config_testkit::MemStore>,
+    Vec<PutOk>,
+);
+
+/// Issue #105 unit 2's owner-crash rows (section 14 (d)): W-C's schedule up to the promote,
+/// with no holder's proofs fixed. `tail` is written while links 1-2 and 2-3 are held, so it is
+/// acknowledged on nodes 1 and 3 only; node 2 is promoted without it and node 3, healed to node
+/// 2, adopts it. Node 1 stays cut off. Answers the app, the nodes, the links, the control store
+/// and the tail's puts.
+fn w_c_promoted(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    app_dir: &Path,
+    patience: Duration,
+    tail: &[&[u8]],
+) -> WcPromoted {
+    let mem = Arc::new(config_testkit::MemStore::new());
+    let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as Arc<dyn ConfigStore>;
+    let mut formed = opened(rt, dir, &store);
+    formed.shutdown();
+    drop(formed);
+    let links = Links::new();
+    let nodes: Vec<Option<Db>> = [1, 2, 3]
+        .map(|node| Some(open_process(rt, dir, &store, node, &links)))
+        .into();
+    for db in nodes.iter().flatten() {
+        db.wait_ready(patience).expect("each node is ready");
+    }
+    let app = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::clone(&links)),
+                client: ClientId(2),
+                ..config(app_dir)
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the app opens");
+    app.wait_ready(patience).expect("the app sees the owner");
+    let k1 = app.put(b"k1", b"one", None).expect("k1 in G");
+    app.wait_durable(GROUP_OF, position(&k1), LONG)
+        .expect("k1 is on every disk");
+    links.hold(NodeId(1), NodeId(2));
+    links.hold(NodeId(2), NodeId(3));
+    let puts: Vec<PutOk> = tail
+        .iter()
+        .map(|key| {
+            let put = app.put(key, b"two", None).expect("in G, on nodes 1 and 3");
+            assert_eq!(put.durability, Durability::BufferedOnTwo, "{put:?}");
+            put
+        })
+        .collect();
+    links.hold(NodeId(1), NodeId(3));
+    app.promote(NodeId(2), None).expect("the promote commits");
+    (app, nodes, links, mem, puts)
+}
+
+/// This test's log lines with message `message`.
+fn lines_of(method: &str, message: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == message)
+        .collect()
+}
+
+/// Waits until `done` holds, polling every 20 ms.
+fn wait_for(what: &str, patience: Duration, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + patience;
+    while !done() {
+        assert!(Instant::now() < deadline, "not within {patience:?}: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Node `node` stopped and started again on its own data, and node 3 told of its new boot.
+fn reopen(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    store: &Arc<dyn ConfigStore>,
+    nodes: &mut [Option<Db>],
+    links: &Arc<Links>,
+    node: u32,
+    before_open: impl FnOnce(),
+) {
+    let at = usize::try_from(node - 1).expect("a node index");
+    let mut old = nodes[at].take().expect("the node runs");
+    old.shutdown();
+    drop(old);
+    before_open();
+    nodes[at] = Some(open_process(rt, dir, store, node, links));
+    let boot = links.boot_of(NodeId(node)).expect("its boot registered");
+    for (other, db) in nodes.iter().enumerate() {
+        let other = u32::try_from(other).expect("a node index") + 1;
+        if other != node {
+            if let Some(db) = db {
+                db.send_to(
+                    NodeId(other),
+                    Msg::PeerBooted {
+                        node: NodeId(node),
+                        boot,
+                    },
+                )
+                .expect("the node hears the boot");
+            }
+        }
+    }
+}
+
+/// The way back after an owner crash: a put lands at the seq after the tail, in a newer
+/// generation, and every tail key reads `two`.
+fn writes_follow_the_tail(app: &Db, tail: &[PutOk], keys: &[&[u8]]) -> PutOk {
+    let last = tail.last().expect("a tail");
+    let put = first_put(app, crate::host::test_patience(Duration::from_secs(30)))
+        .expect("writes come back after the owner's restart");
+    assert_eq!(
+        put.seq,
+        Seq(last.seq.0 + 1),
+        "the next write follows the tail: {put:?}"
+    );
+    assert!(put.generation > last.generation, "{put:?}");
+    for key in keys {
+        assert_eq!(
+            app.get(key).expect("reads").value.map(|(_, value)| value),
+            Some(Bytes::from_static(b"two")),
+            "{} came back",
+            String::from_utf8_lossy(key)
+        );
+    }
+    put
+}
+
+/// Whether node 2 committed past `generation` (a `recovered` line above it).
+fn committed_past(method: &str, generation: u64) -> bool {
+    lines_of(method, "recovered")
+        .iter()
+        .any(|line| line["node"] == 2 && line["generation"].as_u64() > Some(generation))
+}
+
+/// The generation node 2 stood down in.
+fn stood_down_in(method: &str) -> u64 {
+    lines_of(method, "primary_stood_down")[0]["generation"]
+        .as_u64()
+        .expect("a generation")
+}
+
+/// Node 3, healed to node 2, has landed the promote's commit and marked its tail, and node 2's
+/// repair has not yet asked its inventory. Then node 3 pauses `pause` before it answers that
+/// inventory, once, so a row can act while node 2 has stood down and is not yet caught up.
+fn heal_and_pause_the_holder(
+    dir: &Path,
+    nodes: &[Option<Db>],
+    links: &Arc<Links>,
+    method: &str,
+    patience: Duration,
+    pause: Duration,
+) {
+    links.heal(NodeId(2), NodeId(3));
+    let three = nodes[2].as_ref().expect("node 3");
+    wait_for("node 3 marked its tail", patience, || {
+        three
+            .node_status()
+            .into_iter()
+            .next()
+            .is_some_and(|status| status.tail_refused.is_some())
+    });
+    crate::host::pause_before_inventory(&dir.join("nodes").join("3"), pause);
+    assert!(
+        lines_of(method, "tail_adopted").is_empty(),
+        "paused before node 3 adopted"
+    );
+}
+
+/// Node 2's applied head.
+fn applied_on_two(nodes: &[Option<Db>]) -> u64 {
+    nodes[1]
+        .as_ref()
+        .expect("node 2")
+        .node_status()
+        .into_iter()
+        .next()
+        .and_then(|status| status.holds)
+        .map_or(0, |held| held.applied)
+}
+
+/// Section 14 (d), crash "node 2 after the catch-up records land, before the CAS": node 2, the
+/// owner, stands down for node 3's adopted K2, and the control store goes down before the plan's
+/// commit. Node 2 is caught up to K2 from node 3, its CAS cannot land, and it restarts. Its
+/// anchor lineage holds K2's seq, which is not a hit, so after the restart its scans find no
+/// tail; the next run commits at K2, K2 reads `two`, and the next write takes the seq after K2.
+/// Cuts: `Host::tail_scan` drops its same-record check on the anchor lineage, red (observed:
+/// node 2 is never caught up to K2, so the row fails before the restart, not at its scan
+/// assertion); `Primary::on_view` reads the trigger after the tracker adopts the view, red (node
+/// 2 never stands down).
+/// Integration (~45 s): the grant wait, the promote, the store outage and a reopen.
+#[config_log::retcd_test]
+fn u2_c1_an_owner_restarted_after_its_catch_up_and_before_the_cas_commits_at_the_tail() {
+    const METHOD: &str =
+        "u2_c1_an_owner_restarted_after_its_catch_up_and_before_the_cas_commits_at_the_tail";
+    let rt = runtime();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let keys: [&[u8]; 1] = [b"k2"];
+    let (app, mut nodes, links, mem, tail) =
+        w_c_promoted(&rt, dir.path(), app_dir.path(), patience, &keys);
+    let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as Arc<dyn ConfigStore>;
+    let k2 = tail[0].seq;
+    heal_and_pause_the_holder(
+        dir.path(),
+        &nodes,
+        &links,
+        METHOD,
+        patience,
+        Duration::from_secs(1),
+    );
+    wait_for("node 2 stood down", patience, || {
+        !lines_of(METHOD, "primary_stood_down").is_empty()
+    });
+    let stood_down = stood_down_in(METHOD);
+    mem.failing_with(config_core::ConfigError::Unavailable {
+        reason: "the control store is down".to_owned(),
+    });
+    wait_for("node 2 caught up to K2", patience, || {
+        applied_on_two(&nodes) >= k2.0
+    });
+    assert!(
+        !committed_past(METHOD, stood_down),
+        "no commit before the restart"
+    );
+    let restarted_at = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    reopen(&rt, dir.path(), &store, &mut nodes, &links, 2, || {
+        mem.stop_failing()
+    });
+    writes_follow_the_tail(&app, &tail, &keys);
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let scans: Vec<_> = lines[restarted_at..]
+        .iter()
+        .filter(|line| line["@m"] == "tail_scan" && line["node"] == 2)
+        .map(|line| line["hit"].clone())
+        .collect();
+    assert!(!scans.is_empty(), "node 2 scanned after the restart");
+    assert!(
+        scans.iter().all(|hit| *hit == false),
+        "after the restart node 2's scans find no tail: {scans:?}"
+    );
+}
+
+/// Section 14 (d), crash "node 2 restarts while stood down": node 2, the owner, stands down for
+/// node 3's tail, and restarts before node 3 answers the plan's inventory, so it was never caught
+/// up. No primary of the stood-down generation serves again: the next write lands in a newer
+/// generation, at the seq after K2, and K2 reads `two`.
+/// Cut: `Primary::on_view` reads the trigger after the tracker adopts the view, red (node 2 never
+/// stands down).
+/// Integration (~45 s): the grant wait, the promote, the stand-down and a reopen.
+#[config_log::retcd_test]
+fn u2_c2_an_owner_restarted_while_stood_down_serves_no_old_generation() {
+    const METHOD: &str = "u2_c2_an_owner_restarted_while_stood_down_serves_no_old_generation";
+    let rt = runtime();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let keys: [&[u8]; 1] = [b"k2"];
+    let (app, mut nodes, links, mem, tail) =
+        w_c_promoted(&rt, dir.path(), app_dir.path(), patience, &keys);
+    let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as Arc<dyn ConfigStore>;
+    heal_and_pause_the_holder(
+        dir.path(),
+        &nodes,
+        &links,
+        METHOD,
+        patience,
+        Duration::from_secs(1),
+    );
+    wait_for("node 2 stood down", patience, || {
+        !lines_of(METHOD, "primary_stood_down").is_empty()
+    });
+    let stood_down = stood_down_in(METHOD);
+    assert!(applied_on_two(&nodes) < tail[0].seq.0, "not yet caught up");
+    assert!(
+        !committed_past(METHOD, stood_down),
+        "restarted while stood down"
+    );
+    reopen(&rt, dir.path(), &store, &mut nodes, &links, 2, || {});
+    let put = writes_follow_the_tail(&app, &tail, &keys);
+    assert!(
+        put.generation.0 > stood_down,
+        "no primary of the stood-down generation served: {put:?}"
+    );
+}
+
+/// Section 14 (d), crash "between the CAS and `Recovered` on node 2": node 2, the owner, stands
+/// down for node 3's adopted K2, is caught up, and its commit lands in the control store; node 2
+/// then faults before anything after the commit runs (`crate::host::fault_next_commit`).
+/// Reopened, it rolls the commit forward as today: K2 reads `two` and the next write takes the
+/// seq after K2.
+/// Cut: none of its own. This is today's roll-forward; the stand-down and adoption it follows are
+/// cut in rows 9 and 10 and C1 to C4.
+/// Integration (~45 s): the grant wait, the promote, the fault and a reopen.
+#[config_log::retcd_test]
+fn u2_c5_an_owner_faulted_between_the_cas_and_recovered_rolls_forward() {
+    const METHOD: &str = "u2_c5_an_owner_faulted_between_the_cas_and_recovered_rolls_forward";
+    let rt = runtime();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let keys: [&[u8]; 1] = [b"k2"];
+    let (app, mut nodes, links, mem, tail) =
+        w_c_promoted(&rt, dir.path(), app_dir.path(), patience, &keys);
+    let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as Arc<dyn ConfigStore>;
+    let node_dir = dir.path().join("nodes").join("2");
+    heal_and_pause_the_holder(dir.path(), &nodes, &links, METHOD, patience, Duration::ZERO);
+    crate::host::fault_next_commit(&node_dir);
+    let two = nodes[1].as_ref().expect("node 2");
+    wait_for("node 2 faulted after the commit", patience, || {
+        two.node_status()
+            .into_iter()
+            .next()
+            .is_some_and(|status| status.fault.is_some())
+    });
+    let hooked = lines_of(METHOD, "after_commit_hook");
+    assert_eq!(hooked.len(), 1, "{hooked:?}");
+    assert!(
+        !lines_of(METHOD, "primary_stood_down").is_empty(),
+        "node 2 stood down before its commit"
+    );
+    assert!(
+        hooked[0]["generation"].as_u64() > Some(stood_down_in(METHOD)),
+        "the faulted commit is the adopting one: {hooked:?}"
+    );
+    reopen(&rt, dir.path(), &store, &mut nodes, &links, 2, || {});
+    writes_follow_the_tail(&app, &tail, &keys);
+}
+
+/// critic-s15 M2 (2): node 2, the owner, restarts part-way through a multi-record catch-up from
+/// node 3. Its plan was memory only and is gone; its anchor lineage keeps the records it staged.
+/// Link 2-3 is held as soon as node 2 is strictly inside the tail, and node 2 restarts there. The
+/// next run reports node 2's partial head, keeps its plan again on the receiver it installs
+/// (B1), and finishes the tail from there: every tail key reads `two` and the next write follows
+/// the tail.
+/// Cut: `Host::restore_dormant` keeps the plan before it installs the receiver (critic-s15 B1),
+/// red. Observed: the first catch-up is already refused `StaleGeneration`, node 2 reaches the
+/// tail's head later by another path, and the row fails at its mid-tail precondition. The
+/// restart's re-keep is the same `restore_dormant`, so no cut separates the two.
+/// Integration (~45 s): the grant wait, a 40-record tail, the promote and a reopen.
+#[config_log::retcd_test]
+fn u2_m2_2_an_owner_restarted_part_way_through_its_catch_up_finishes_from_its_partial_head() {
+    const METHOD: &str =
+        "u2_m2_2_an_owner_restarted_part_way_through_its_catch_up_finishes_from_its_partial_head";
+    let rt = runtime();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(60));
+    let names: Vec<Vec<u8>> = (0..40)
+        .map(|at| format!("k2-{at:02}").into_bytes())
+        .collect();
+    let keys: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let (app, mut nodes, links, mem, tail) =
+        w_c_promoted(&rt, dir.path(), app_dir.path(), patience, &keys);
+    let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as Arc<dyn ConfigStore>;
+    let (first, last) = (tail[0].seq.0, tail[tail.len() - 1].seq.0);
+    let base = applied_on_two(&nodes);
+    assert!(base < first, "node 2 was promoted without the tail: {base}");
+    links.heal(NodeId(2), NodeId(3));
+    let deadline = Instant::now() + patience;
+    while applied_on_two(&nodes) < first {
+        assert!(Instant::now() < deadline, "node 2 began its catch-up");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    links.hold(NodeId(2), NodeId(3));
+    let partial = applied_on_two(&nodes);
+    assert!(
+        first <= partial && partial < last,
+        "held strictly inside the tail {first}..={last}: {partial}"
+    );
+    assert!(
+        !lines_of(METHOD, "primary_stood_down").is_empty(),
+        "stood down"
+    );
+    let restarted_at = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    reopen(&rt, dir.path(), &store, &mut nodes, &links, 2, || {});
+    links.heal(NodeId(2), NodeId(3));
+    writes_follow_the_tail(&app, &tail, &keys);
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let heads: Vec<u64> = lines[restarted_at..]
+        .iter()
+        .filter(|line| line["@m"] == "inventory_reported" && line["node"] == 2)
+        .filter_map(|line| line["head"].as_u64())
+        .collect();
+    assert!(
+        heads.first().is_some_and(|head| *head >= partial),
+        "the next run starts from node 2's partial head {partial}: {heads:?}"
+    );
+}

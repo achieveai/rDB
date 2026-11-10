@@ -2181,6 +2181,23 @@ pub(crate) fn stall_loop_armed(node_dir: &std::path::Path) -> bool {
         .any(|(dir, _, _)| dir == node_dir)
 }
 
+/// Test-only: node directories whose running host faults at its next commit report, once, as
+/// [`AfterCommit::Fault`] does for a host started after [`set_after_commit`]. Read at the report,
+/// so a row can arm a host that is already running (issue #105 unit 2, crash "between the CAS and
+/// `Recovered`").
+#[cfg(test)]
+static FAULT_NEXT_COMMIT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Arm [`FAULT_NEXT_COMMIT`] for the host on `node_dir`, as `DbConfig::dir` joined with
+/// `nodes/<n>`.
+#[cfg(test)]
+pub(crate) fn fault_next_commit(node_dir: &std::path::Path) {
+    FAULT_NEXT_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(node_dir.to_path_buf());
+}
+
 fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
     AFTER_COMMIT
         .lock()
@@ -5979,7 +5996,19 @@ impl Host {
     /// F1 committed a recovery here: inherit, tell the other members, wake A1 if primary.
     fn recovered(&mut self, result: &RecoveryResult, site: Site) -> Result<(), Fault> {
         let partition = site.partition;
-        if let Some(what) = self.after_commit {
+        #[cfg(test)]
+        let armed = {
+            let mut armed = FAULT_NEXT_COMMIT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let at = armed
+                .iter()
+                .position(|dir| self.engine.path().starts_with(dir));
+            at.map(|at| armed.remove(at)).map(|_| AfterCommit::Fault)
+        };
+        #[cfg(not(test))]
+        let armed = None;
+        if let Some(what) = self.after_commit.or(armed) {
             tracing::warn!(
                 node = self.node.0,
                 partition = partition.0,

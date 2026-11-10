@@ -5882,6 +5882,11 @@ fn s4a_a_node_late_past_the_clock_is_dropped_and_its_arrival_re_adds_it() {
 /// tail of 500 records past every later cutoff, as an unreplicated owner write would be, so its
 /// landing of that commit refuses when its link heals. Returns the commit's generation.
 fn read_only_with_a_tail(trio: &mut Trio, before: Generation) -> Generation {
+    read_only_with_a_tail_of(trio, before, 500)
+}
+
+/// [`read_only_with_a_tail`] with a tail of `n` records.
+fn read_only_with_a_tail_of(trio: &mut Trio, before: Generation, n: u64) -> Generation {
     kill(trio, 3, &[1, 2]);
     put_until_paused(trio, 1);
     trio.until("node 3 blamed for half the drop clock", |trio| {
@@ -5916,7 +5921,7 @@ fn read_only_with_a_tail(trio: &mut Trio, before: Generation) -> Generation {
     if let Some(last) = digests.last_mut() {
         *last = two.checked(PartitionId(1), held, head).expect("its head").1;
     }
-    super::trio::write_chain_after(&mut two.engine, held, digests, 500);
+    super::trio::write_chain_after(&mut two.engine, held, digests, n);
     read_only.0
 }
 
@@ -6179,4 +6184,394 @@ fn s4d_a_staged_copy_on_the_newest_lineage_is_reported_and_a_remnant_is_not() {
         None,
         "a remnant below"
     );
+}
+
+// Issue #105 unit 2 (`ws-79-tail-architect.md` section 14 (d) and section 15.4): the owner
+// stands down for an adopted tail, on stepped hosts. b19's read-only commit on {1, 2} with a tail
+// of [`ADOPTED_TAIL`] records on node 2, stamped by the last writable generation, so node 2 adopts
+// it once its link heals and node 1, the owner, is caught up from it.
+
+/// The adopted tail's length in these rows: more than one record, so a catch-up takes several
+/// envelopes (critic-s15 M2).
+const ADOPTED_TAIL: u64 = 3;
+
+/// b19's read-only commit with node 2 holding [`ADOPTED_TAIL`] records past it, node 2 still held.
+/// Answers the trio, the read-only generation and node 2's head, the cutoff adoption brings.
+fn read_only_beside_an_adoptable_tail(dir: &std::path::Path) -> (Trio, Generation, Seq) {
+    let (mut trio, before) = started(dir, tuned);
+    trio.nodes[0].0.repair_retry_first_millis = 100;
+    let read_only = read_only_with_a_tail_of(&mut trio, before, ADOPTED_TAIL);
+    let two = &trio.nodes[1].0;
+    let held = two
+        .engine
+        .lineages()
+        .into_iter()
+        .filter(|(p, _)| *p == PartitionId(1))
+        .map(|(_, g)| g)
+        .max()
+        .expect("node 2 holds a generation");
+    let head = Seq(two.engine.buffered_applied(PartitionId(1), held).0);
+    (trio, read_only, head)
+}
+
+/// The generation node 1's primary stood down in, if it has.
+fn stood_down(trio: &Trio) -> Option<Generation> {
+    trio.nodes[0]
+        .0
+        .replication
+        .primary(NodeId(1), PartitionId(1))
+        .and_then(|primary| primary.tracker().stood_down())
+}
+
+/// Node 1's commit once it is writable again.
+fn writable_commit(trio: &mut Trio) -> (Generation, PartitionMode, Vec<u32>) {
+    trio.until("node 1 commits writable", |trio| {
+        commit_of(trio).filter(|(_, mode, _)| *mode != PartitionMode::ReadOnly)
+    })
+}
+
+/// The index in this test's log of the first line with message `message` that `keep` keeps.
+fn first_at(
+    method: &str,
+    message: &str,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) -> Option<usize> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .iter()
+        .position(|line| line["@m"] == message && keep(line))
+}
+
+/// The put after the way back lands at the seq after the adopted tail's head.
+fn next_put_follows(trio: &mut Trio, request: u64, head: Seq, generation: Generation) {
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(
+            (result.generation, result.seq),
+            (generation, Seq(head.0 + 1)),
+            "the next write follows the adopted tail"
+        ),
+        other => panic!("a put after the way back: {other:?}"),
+    }
+}
+
+/// Section 14 (d) row 7, critic-s14 m1: a revoke asked while A1 holds no grant emits no view and
+/// no `DrainProof`, so the plan cannot run ahead of the view. Node 1's grant lapses (the control
+/// store is down) before the repair revokes, so the repair's revoke is asked unheld; once the
+/// store answers and the grant is held, the host asks again. The stand-down follows that ask, and
+/// comes before node 1 answers the plan's inventory or restores its receiver for the catch-up.
+/// The plan then commits writable at the adopted head.
+/// Cut: `Primary::on_view` reads the trigger after the tracker adopts the view, red (no
+/// stand-down; F1 ends `BarrierIncomplete`).
+/// Integration (~11 s): b19's drop, the grant's lapse, the re-acquire and the plan.
+#[config_log::retcd_test]
+fn u2_07_a_revoke_asked_unheld_then_held_stands_down_before_the_plan_runs() {
+    const METHOD: &str = "u2_07_a_revoke_asked_unheld_then_held_stands_down_before_the_plan_runs";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, head) = read_only_beside_an_adoptable_tail(dir.path());
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    trio.until("node 1's grant lapsed", |trio| {
+        (!trio.nodes[0].0.authority.state().is_held()).then_some(())
+    });
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.until("the repair's revoke is asked unheld", |trio| {
+        trio.nodes[0]
+            .0
+            .revoke_unheld
+            .contains(&PartitionId(1))
+            .then_some(())
+    });
+    assert_eq!(stood_down(&trio), None, "an unheld revoke emits no view");
+    trio.mem.stop_failing();
+    let (generation, mode, members) = writable_commit(&mut trio);
+    assert_eq!(
+        (mode, members),
+        (PartitionMode::DegradedRf2, vec![1, 2]),
+        "the plan commits writable"
+    );
+
+    let node_1 = |line: &serde_json::Value| line["node"] == 1;
+    let unheld = first_at(METHOD, "revoke_asked_unheld", node_1).expect("asked unheld");
+    let reasked = first_at(METHOD, "rejoin_revoke_reasked_held", node_1).expect("asked again");
+    let down = first_at(METHOD, "primary_stood_down", |line| {
+        line["generation"] == read_only.0
+    })
+    .expect("node 1 stood down");
+    let plan = first_at(METHOD, "rejoin_plan", |line| {
+        line["node"] == 1 && line["generation"] == generation.0
+    })
+    .expect("the plan");
+    let answered = first_at(METHOD, "inventory_reported", |line| {
+        line["node"] == 1 && line["generation"] == read_only.0
+    })
+    .expect("node 1 answered the plan's inventory");
+    let restored = first_at(METHOD, "dormant_restored", |line| {
+        line["node"] == 1 && line["generation"] == read_only.0
+    })
+    .expect("node 1 restored its receiver for the catch-up");
+    assert!(unheld < reasked, "asked unheld, then held");
+    assert!(reasked < down, "no stand-down before the held ask");
+    assert!(reasked < plan, "no plan before the held ask");
+    assert!(down < answered, "stood down before it answers the plan");
+    assert!(down < restored, "stood down before the catch-up reaches it");
+    let recovered = logged!(METHOD, "recovered")
+        .into_iter()
+        .find(|line| line["node"] == 1 && line["generation"] == generation.0)
+        .expect("node 1 logged the commit");
+    assert_eq!(recovered["cutoff"], head.0, "{recovered}");
+}
+
+/// Section 14 (d) row 11 and the stood-down window: an owner that has stood down admits no write
+/// until the `Recovered` that brings it back. Node 1 stands down, then its link to node 2 is held,
+/// so the catch-up waits and the window stays open. A put there is refused by the fence on the
+/// revoked epoch, `LEASE_EXPIRED`, writes nothing, and node 1's head does not move. After the heal
+/// the commit is writable at the adopted head, and the next put lands at the seq after it, so no
+/// put in the window took a seq.
+/// Cut: the revoked epoch fences nothing (`Authority::may_admit_at`, `admit`'s horizon check and
+/// the queue's freeze), red (the put in the window is admitted and answers `UNKNOWN_OUTCOME`, not a
+/// `no_mutation` refusal).
+/// Integration (~5 s): b19's drop, the stand-down, the held window and the heal.
+#[config_log::retcd_test]
+fn u2_11_an_owner_that_stood_down_admits_no_write_until_it_recovers() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, head) = read_only_beside_an_adoptable_tail(dir.path());
+    trio.links.heal(NodeId(1), NodeId(2));
+    assert_eq!(
+        trio.until("node 1 stood down", stood_down),
+        read_only,
+        "stood down in the read-only generation"
+    );
+    trio.links.hold(NodeId(1), NodeId(2));
+    let before = trio.head();
+    assert_eq!(trio.status(0).admits, Some(false), "{:?}", trio.status(0));
+    for request in 9_001..9_004 {
+        match trio.ask(put(request)) {
+            Answer::Error { error, .. } => {
+                assert_eq!(error.name(), "LEASE_EXPIRED", "{error:?}");
+                assert!(error.no_mutation, "{error:?}");
+            }
+            other => panic!("a put while stood down: {other:?}"),
+        }
+        assert_eq!(stood_down(&trio), Some(read_only), "still stood down");
+    }
+    assert_eq!(trio.head(), before, "nothing written while stood down");
+    trio.links.heal(NodeId(1), NodeId(2));
+    let (generation, _, _) = writable_commit(&mut trio);
+    next_put_follows(&mut trio, 9_100, head, generation);
+}
+
+/// Section 14 (d) row 12: a read in the stood-down window answers as it does today under the
+/// `EpochRevoked` fence. Asserted as observed on 2026-11-10: the read is `Rejected(LEASE_EXPIRED)`,
+/// sees nothing, names the read-only generation at node 1's head, and is marked a recovery read.
+/// Cut: the revoked epoch fences no read (`Authority::may_admit_at`, and the publication kernel's
+/// `read_answer` serves under `AuthorityLost(EpochRevoked)`), red (the read answers
+/// `GENERATION_CHANGED`).
+/// Integration (~5 s): b19's drop, the stand-down and the held window.
+#[config_log::retcd_test]
+fn u2_12_a_read_while_the_owner_stood_down_answers_as_under_the_fence() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, _) = read_only_beside_an_adoptable_tail(dir.path());
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.until("node 1 stood down", stood_down);
+    trio.links.hold(NodeId(1), NodeId(2));
+    let at = trio.head().expect("node 1's head");
+    let get = ClientCall::Get {
+        identity: identity(9_001),
+        group: AffinityId(1),
+        object: key(1),
+        look: Look::Doc,
+    };
+    match trio.ask(get) {
+        Answer::Read {
+            outcome,
+            seen,
+            generation,
+            at: read_at,
+            recovery_mode,
+        } => {
+            assert_eq!(
+                outcome,
+                ReadServiceOutcome::Rejected(ErrorKind::LeaseExpired)
+            );
+            assert!(matches!(seen, Seen::Absent), "{seen:?}");
+            assert_eq!((generation, read_at), (read_only, Seq(at)));
+            assert!(recovery_mode);
+        }
+        other => panic!("a read while stood down: {other:?}"),
+    }
+    assert_eq!(stood_down(&trio), Some(read_only), "still stood down");
+}
+
+/// Section 15.4 R6-9: a Rebuild after the adopting commit is not stalled by the adopted tail.
+/// Node 2 adopts its tail and the plan commits writable on {1, 2} at the adopted head. Node 3
+/// then returns on its own data holding a superseded tail (as b15's re-add), is re-added as a
+/// shadow, caught up and promoted, and the activation's post-commit syncs at the adopted head reach node 2, which proves it (rule 15: a
+/// tail fact withholds only above the cutoff, and adoption ended it). No `sync_withheld` with
+/// reason `tail_held`, the commit is `Active` on three copies, and the next put follows the tail.
+/// Three guards each hold this alone: `Host::adopt` ends the fact, the landing ends it again, and
+/// rule 15 withholds only above the cutoff. The adoption's and rule 15's cut together stay green
+/// here, because the landing still ends the fact (checked 2026-11-10).
+/// Cut: all three (the fact kept by the adoption and both landing paths, and `>=`), red (the
+/// Rebuild stalls; no `Active`).
+/// Integration (~8 s): b19's drop, the adoption, the re-add, the catch-up and the promote.
+#[config_log::retcd_test]
+fn u2_r6_9_a_rebuild_after_the_adopting_commit_is_not_withheld_for_the_adopted_tail() {
+    const METHOD: &str =
+        "u2_r6_9_a_rebuild_after_the_adopting_commit_is_not_withheld_for_the_adopted_tail";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _, head) = read_only_beside_an_adoptable_tail(dir.path());
+    trio.links.heal(NodeId(1), NodeId(2));
+    let (adopting, _, members) = writable_commit(&mut trio);
+    assert_eq!(members, vec![1, 2]);
+    // As `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up`: node 3 holds a
+    // superseded tail past every cutoff, so no plan can prove it before its commit; it is walked
+    // up as a shadow and the activation proves every member after the commit.
+    let three = &mut trio.nodes[2].0;
+    let held = three
+        .engine
+        .lineages()
+        .into_iter()
+        .filter(|(p, _)| *p == PartitionId(1))
+        .map(|(_, g)| g)
+        .max()
+        .expect("node 3 holds a generation");
+    let at = Seq(three.engine.buffered_applied(PartitionId(1), held).0);
+    let mut digests = vec![Digest::ROOT; usize::try_from(at.0).expect("a small head")];
+    if let Some(last) = digests.last_mut() {
+        *last = three.checked(PartitionId(1), held, at).expect("its head").1;
+    }
+    super::trio::write_chain_after(&mut three.engine, held, digests, 500);
+    trio.links.heal_all();
+    restart(&mut trio, dir.path(), 3);
+    let (generation, _, members) = trio.until("node 1 commits Active on three copies", |trio| {
+        commit_of(trio).filter(|(_, mode, _)| *mode == PartitionMode::Active)
+    });
+    assert_eq!(members, vec![1, 2, 3]);
+    assert!(generation > adopting);
+    let post_commit: Vec<_> = logged!(METHOD, "sync_proven")
+        .into_iter()
+        .filter(|line| line["node"] == 2 && line["post_commit"] == true)
+        .map(|line| line["cutoff"].clone())
+        .collect();
+    assert!(
+        post_commit.contains(&serde_json::json!(head.0)),
+        "node 2 proved the adopted head after the commit: {post_commit:?}"
+    );
+    let tail_held: Vec<_> = logged!(METHOD, "sync_withheld")
+        .into_iter()
+        .filter(|line| line["reason"] == "tail_held")
+        .collect();
+    assert!(tail_held.is_empty(), "{tail_held:?}");
+    next_put_follows(&mut trio, 9_200, head, generation);
+}
+
+/// Section 14 (d), crash "node 3 after the link, before the commit" (here the holder is node 2):
+/// node 2 links the read-only generation onto its tail, then restarts before the plan commits.
+/// Its new process reads the tail as the anchor lineage's own records (the same record at the
+/// head through the link), so its scan has no hit and it adopts nothing again: one
+/// `tail_adopted` in the whole row, every `tail_scan` after the restart is `hit = false`, the
+/// plan commits writable at the adopted head, and the next put follows it.
+/// Cut: `Host::tail_scan` drops its same-record check on the anchor lineage, red (node 2 adopts a
+/// second time after the restart).
+/// Integration (~19 s at the gate's scale 3): b19's drop, the adoption, the restart, the blocked
+/// run's window and the re-plan.
+#[config_log::retcd_test]
+fn u2_c3_a_holder_restarted_after_the_link_and_before_the_commit_adopts_nothing_again() {
+    const METHOD: &str =
+        "u2_c3_a_holder_restarted_after_the_link_and_before_the_commit_adopts_nothing_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, head) = read_only_beside_an_adoptable_tail(dir.path());
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.until("node 2 linked its tail", |trio| {
+        trio.nodes[1]
+            .0
+            .engine
+            .link(PartitionId(1), read_only)
+            .map(|_| ())
+    });
+    assert!(
+        commit_of(&trio).is_some_and(|(g, _, _)| g == read_only),
+        "no commit yet past the read-only one"
+    );
+    let restarted_at = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    restart(&mut trio, dir.path(), 2);
+    // The run in flight loses node 2 and ends `Blocked`; the repair plans again.
+    let (generation, mode, members) =
+        until_through_blocks(&mut trio, "node 1 commits writable", |trio| {
+            commit_of(trio).filter(|(_, mode, _)| *mode != PartitionMode::ReadOnly)
+        });
+    assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2]));
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let adopted = lines
+        .iter()
+        .filter(|line| line["@m"] == "tail_adopted")
+        .count();
+    assert_eq!(adopted, 1, "adopted once, before the restart");
+    let scans: Vec<_> = lines[restarted_at..]
+        .iter()
+        .filter(|line| line["@m"] == "tail_scan" && line["node"] == 2)
+        .map(|line| line["hit"].clone())
+        .collect();
+    assert!(
+        !scans.is_empty() && scans.iter().all(|hit| *hit == false),
+        "after the restart node 2's scans find no tail: {scans:?}"
+    );
+    let recovered = lines
+        .iter()
+        .find(|line| {
+            line["@m"] == "recovered" && line["node"] == 1 && line["generation"] == generation.0
+        })
+        .expect("node 1 logged the commit");
+    assert_eq!(recovered["cutoff"], head.0, "{recovered}");
+    next_put_follows(&mut trio, 9_300, head, generation);
+}
+
+/// Section 14 (d), crash "node 3 during the catch-up, so the run ends `Blocked` after stand-down"
+/// (here the holder is node 2): node 1 stands down, then node 2 is cut off before the catch-up
+/// finishes, so the run ends `Blocked` with node 1 stood down. No write is admitted in that
+/// window: each put is refused with `no_mutation`. When node 2 answers again the repair plans
+/// again, commits writable at the adopted head, and the next put follows it, so no put in the
+/// window took a seq.
+/// Cut: `Primary::on_view` reads the trigger after the tracker adopts the view, red (no stand-down;
+/// F1 ends `BarrierIncomplete` before node 2 is cut off). Row 11's fence cut stays green here: in
+/// this window the puts are refused again further on, at the dispatch check (`LEASE_EXPIRED`) and,
+/// once the repair re-plans, as `GENERATION_CHANGED` and `PROTECTION_PAUSED` (checked 2026-11-10).
+/// Integration (~19 s at the gate's scale 3): b19's drop, the stand-down, the blocked run's window
+/// and the re-plan.
+#[config_log::retcd_test]
+fn u2_c4_a_holder_lost_during_the_catch_up_blocks_the_run_and_no_write_lands_until_the_re_plan() {
+    const METHOD: &str =
+        "u2_c4_a_holder_lost_during_the_catch_up_blocks_the_run_and_no_write_lands_until_the_re_plan";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, head) = read_only_beside_an_adoptable_tail(dir.path());
+    trio.links.heal(NodeId(1), NodeId(2));
+    trio.until("node 1 stood down", stood_down);
+    let caught_up = trio.head();
+    kill(&trio, 2, &[1]);
+    assert!(
+        caught_up.is_some_and(|at| at < head.0),
+        "cut off before the catch-up finished: {caught_up:?} of {head:?}"
+    );
+    until_through_blocks(&mut trio, "the run ends Blocked", |_| {
+        (!logged!(METHOD, "rejoin_blocked").is_empty()).then_some(())
+    });
+    assert_eq!(stood_down(&trio), Some(read_only), "still stood down");
+    for request in 9_400..9_403 {
+        let answer = trio.call(put(request));
+        let answer =
+            until_through_blocks(&mut trio, "the put is answered", |_| answer.try_recv().ok());
+        match answer {
+            Answer::Error { error, .. } => assert!(error.no_mutation, "{error:?}"),
+            other => panic!("a put while the run is blocked: {other:?}"),
+        }
+    }
+    trio.links.heal(NodeId(1), NodeId(2));
+    let (generation, mode, members) =
+        until_through_blocks(&mut trio, "node 1 commits writable", |trio| {
+            commit_of(trio).filter(|(_, mode, _)| *mode != PartitionMode::ReadOnly)
+        });
+    assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2]));
+    next_put_follows(&mut trio, 9_500, head, generation);
 }
